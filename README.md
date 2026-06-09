@@ -17,4 +17,4 @@ cargo build --release
 
 ## CI
 
-GitHub Actions workflow (`/home/runner/work/pb/pb/Jc2k/pb/.github/workflows/ci-release.yml`) builds with cache, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
+GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds with cache, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
