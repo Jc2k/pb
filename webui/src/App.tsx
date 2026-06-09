@@ -76,7 +76,7 @@ export default function App() {
 
   useEffect(() => {
     refreshSessions();
-    const timer = window.setInterval(refreshSessions, 2000);
+    const timer = window.setInterval(refreshSessions, 5000);
     return () => {
       window.clearInterval(timer);
       if (sourceRef.current) {
@@ -95,7 +95,6 @@ export default function App() {
     const data = (await res.json()) as { session_id: string };
     setSessionId(data.session_id);
     setEvents([]);
-    await refreshSessions();
     openEvents(data.session_id);
   };
 
@@ -107,7 +106,6 @@ export default function App() {
       body: JSON.stringify({ task: followUp }),
     });
     setFollowUp("");
-    await refreshSessions();
   };
 
   return (

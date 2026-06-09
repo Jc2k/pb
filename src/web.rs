@@ -20,6 +20,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 
+const MAX_HISTORY_EVENTS: usize = 1_000;
+const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
+
 #[derive(Debug, Clone)]
 pub struct ServeArgs {
     pub host: String,
@@ -210,7 +213,14 @@ async fn get_session(
 ) -> Result<Json<SessionDetails>, StatusCode> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    let events = session.history.lock().map(|history| history.clone()).unwrap_or_default();
+    let events = session
+        .history
+        .lock()
+        .map(|history| {
+            let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
+            history[start..].to_vec()
+        })
+        .unwrap_or_default();
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
@@ -346,5 +356,9 @@ fn publish_event(
     let _ = sender.send(envelope.clone());
     if let Ok(mut entries) = history.lock() {
         entries.push(envelope);
+        if entries.len() > MAX_HISTORY_EVENTS {
+            let overflow = entries.len() - MAX_HISTORY_EVENTS;
+            entries.drain(..overflow);
+        }
     }
 }
