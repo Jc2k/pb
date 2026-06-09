@@ -56,7 +56,6 @@ struct SessionResponse {
 
 #[derive(Debug, Clone)]
 struct SessionState {
-    id: String,
     branch: Option<String>,
     workdir: Option<PathBuf>,
     request_template: AgentRequest,
@@ -119,7 +118,6 @@ async fn start_session(
     request.seed = req.seed.unwrap_or(request.seed);
 
     let session = SessionState {
-        id: session_id.clone(),
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
         request_template: request.clone(),
