@@ -17,6 +17,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build web UI assets
+        run: npm run build:web
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -65,6 +73,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build web UI assets
+        run: npm run build:web
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
