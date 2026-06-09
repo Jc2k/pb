@@ -94,6 +94,10 @@ pub struct AgentArgs {
     #[arg(long)]
     pub workdir: Option<PathBuf>,
 
+    /// Continue work on an existing branch (must already exist locally); if omitted a new pb/<task-slug> branch is created
+    #[arg(long)]
+    pub branch: Option<String>,
+
     /// Maximum number of think/tool iterations
     #[arg(long, default_value_t = DEFAULT_AGENT_MAX_STEPS)]
     pub max_steps: usize,
@@ -377,10 +381,97 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve workdir {}", workdir.display()))?;
 
+    // Set up the session branch.
+    let (branch, is_continuation) = if let Some(b) = &args.branch {
+        git_checkout_branch(b, &workspace_root)
+            .with_context(|| format!("failed to checkout branch '{b}'"))?;
+        (b.clone(), true)
+    } else {
+        let b = branch_name_from_task(&args.task);
+        git_create_branch(&b, &workspace_root)
+            .with_context(|| format!("failed to create branch '{b}'"))?;
+        (b, false)
+    };
+
     print_header("local agent", &format!("task: {}", args.task));
     print_header("model", &model_path.display().to_string());
     print_header("workspace", &workspace_root.display().to_string());
+    print_header("branch", &branch);
 
+    let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
+    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        .with_context(|| format!("failed to load model {}", model_path.display()))?;
+
+    let mut current_task = args.task.clone();
+    let mut iteration = 0u32;
+
+    loop {
+        iteration += 1;
+        let continuing = is_continuation || iteration > 1;
+        let instructions =
+            build_agent_instructions(&args, &workspace_root, &branch, continuing)?;
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "system",
+                content: instructions,
+            },
+            ChatMessage {
+                role: "user",
+                content: current_task.clone(),
+            },
+        ];
+
+        print_header("started", &current_task);
+
+        let reached_final =
+            run_agent_steps(&backend, &model, &args, &mut messages, &workspace_root)?;
+
+        // Auto-commit any changes left uncommitted by the agent.
+        if git_has_changes(&workspace_root).unwrap_or(false) {
+            let summary: String = current_task.chars().take(60).collect();
+            let commit_msg = format!("agent: {summary}");
+            match git_commit_all(&commit_msg, &workspace_root) {
+                Ok(true) => print_header("committed", &commit_msg),
+                Ok(false) => {}
+                Err(e) => eprintln!("warning: auto-commit failed: {e}"),
+            }
+        }
+
+        print_session_summary(&branch, &workspace_root);
+
+        if !reached_final {
+            // Max steps exhausted — stop without offering continuation.
+            break;
+        }
+
+        // Offer the user a chance to add a follow-up prompt.
+        print!("\x1b[1;32m[session]\x1b[0m Follow-up prompt (or Enter to finish): ");
+        std::io::stdout().flush().ok();
+        let mut next_task = String::new();
+        std::io::stdin()
+            .read_line(&mut next_task)
+            .context("failed to read follow-up prompt")?;
+        let next_task = next_task.trim().to_string();
+
+        if next_task.is_empty() {
+            break;
+        }
+
+        current_task = next_task;
+    }
+
+    Ok(())
+}
+
+/// Build the system-prompt instructions, injecting git-log context when continuing a branch.
+fn build_agent_instructions(
+    _args: &AgentArgs,
+    workspace_root: &Path,
+    branch: &str,
+    continuing: bool,
+) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
     );
@@ -388,36 +479,56 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} \
 for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
-    instructions.push_str("Available tools: read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), skill(name).\n");
-    instructions.push_str("When editing, keep changes minimal and safe.\n");
-    if let Ok(copilot_instructions) = std::fs::read_to_string(".github/copilot-instructions.md") {
+    instructions.push_str(
+        "Available tools: read_file(path,start,end), search(pattern,path), \
+edit_file(path,old_text,new_text), git_commit(message), git_log(), skill(name).\n",
+    );
+    instructions.push_str(
+        "When editing, keep changes minimal and safe. \
+Use git_commit with a semantic commit message after each logical change.\n",
+    );
+
+    if let Ok(copilot_instructions) =
+        std::fs::read_to_string(workspace_root.join(".github/copilot-instructions.md"))
+    {
         instructions.push_str("Repository instructions:\n");
         instructions.push_str(&copilot_instructions);
         instructions.push('\n');
     }
 
-    print_header("started", &args.task);
+    if continuing {
+        instructions.push_str(&format!(
+            "You are continuing work on branch '{branch}'. \
+Review the recent commits below before proceeding.\n"
+        ));
+        match git_log_recent(workspace_root, 10) {
+            Ok(log) if !log.is_empty() => {
+                instructions.push_str("Recent commits:\n");
+                instructions.push_str(&log);
+                instructions.push('\n');
+            }
+            _ => {}
+        }
+    } else {
+        instructions.push_str(&format!("You are working on branch '{branch}'.\n"));
+    }
 
-    let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-        .with_context(|| format!("failed to load model {}", model_path.display()))?;
+    Ok(instructions)
+}
 
-    let mut messages = vec![
-        ChatMessage {
-            role: "system",
-            content: instructions,
-        },
-        ChatMessage {
-            role: "user",
-            content: args.task.clone(),
-        },
-    ];
-
+/// Run the inner agent loop. Returns `true` if the agent emitted a `Final` action,
+/// `false` if it ran out of steps.
+fn run_agent_steps(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    args: &AgentArgs,
+    messages: &mut Vec<ChatMessage>,
+    workspace_root: &Path,
+) -> Result<bool> {
     for step in 1..=args.max_steps {
         print_header("step", &format!("{step}/{}", args.max_steps));
-        let prompt = render_prompt(&messages);
-        let output = generate_completion(&backend, &model, &args, &prompt)?;
+        let prompt = render_prompt(messages);
+        let output = generate_completion(backend, model, args, &prompt)?;
         let action = parse_action(&output)?;
 
         match action {
@@ -426,7 +537,7 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
                     print_header("reasoning", &reasoning);
                 }
                 print_header("final", &content);
-                break;
+                return Ok(true);
             }
             AgentAction::ToolCall {
                 tool,
@@ -437,7 +548,7 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
                     print_header("reasoning", &reasoning);
                 }
                 print_header("tool", &tool);
-                let tool_result = run_tool(&tool, &arguments, &workspace_root)?;
+                let tool_result = run_tool(&tool, &arguments, workspace_root)?;
                 print_block("tool result", &tool_result);
 
                 messages.push(ChatMessage {
@@ -452,7 +563,80 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
         }
     }
 
+    Ok(false)
+}
+
+/// Print a compact session summary: branch name and the most-recent commits.
+fn print_session_summary(branch: &str, workspace_root: &Path) {
+    println!("\x1b[1;32m[session]\x1b[0m branch: {branch}");
+    match git_log_recent(workspace_root, 5) {
+        Ok(log) if !log.is_empty() => print_block("session commits", &log),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
+/// Derive a valid branch name from a free-form task description.
+fn branch_name_from_task(task: &str) -> String {
+    let slug: String = task
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let truncated: String = slug.chars().take(50).collect();
+    format!("pb/{truncated}")
+}
+
+/// Run a git sub-command in `workdir` and return its stdout on success.
+fn git_run(args: &[&str], workdir: &Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .context("failed to run git")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git {} failed: {}", args.join(" "), stderr)
+    }
+}
+
+fn git_create_branch(name: &str, workdir: &Path) -> Result<()> {
+    git_run(&["checkout", "-b", name], workdir)?;
     Ok(())
+}
+
+fn git_checkout_branch(name: &str, workdir: &Path) -> Result<()> {
+    git_run(&["checkout", name], workdir)?;
+    Ok(())
+}
+
+fn git_has_changes(workdir: &Path) -> Result<bool> {
+    let out = git_run(&["status", "--porcelain"], workdir)?;
+    Ok(!out.is_empty())
+}
+
+/// Stage all changes and create a commit. Returns `true` if a commit was made.
+fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
+    if !git_has_changes(workdir)? {
+        return Ok(false);
+    }
+    git_run(&["add", "-A"], workdir)?;
+    git_run(&["commit", "-m", message], workdir)?;
+    Ok(true)
+}
+
+/// Return the last `n` commits as a one-line log string.
+fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
+    git_run(&["log", "--oneline", &format!("-{n}")], workdir)
 }
 
 fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
@@ -766,6 +950,24 @@ fn run_tool(tool: &str, arguments: &Value, workspace_root: &Path) -> Result<Stri
             print_block("diff", &diff);
             Ok(format!("updated {}", resolved.display()))
         }
+        "git_commit" => {
+            let message = arguments
+                .get("message")
+                .and_then(Value::as_str)
+                .context("git_commit requires string argument: message")?;
+            match git_commit_all(message, workspace_root)? {
+                true => Ok(format!("committed: {message}")),
+                false => Ok("nothing to commit".to_string()),
+            }
+        }
+        "git_log" => {
+            let log = git_log_recent(workspace_root, 10)?;
+            if log.is_empty() {
+                Ok("no commits yet".to_string())
+            } else {
+                Ok(log)
+            }
+        }
         "skill" => {
             let name = arguments
                 .get("name")
@@ -1002,5 +1204,41 @@ mod tests {
         let path = find_model_in_cache_in(tmp.path(), "mymodel")
             .expect("should find GGUF");
         assert_eq!(path.file_name().unwrap(), "sha256_large");
+    }
+
+    #[test]
+    fn branch_name_from_task_basic() {
+        assert_eq!(branch_name_from_task("Fix the login bug"), "pb/fix-the-login-bug");
+    }
+
+    #[test]
+    fn branch_name_from_task_special_chars() {
+        assert_eq!(
+            branch_name_from_task("Add feat: update foo/bar!"),
+            "pb/add-feat-update-foo-bar"
+        );
+    }
+
+    #[test]
+    fn branch_name_from_task_truncates_at_50() {
+        let long_task = "a".repeat(200);
+        let name = branch_name_from_task(&long_task);
+        // "pb/" prefix + at most 50 chars of slug
+        assert!(name.len() <= "pb/".len() + 50);
+        assert!(name.starts_with("pb/"));
+    }
+
+    #[test]
+    fn git_commit_all_no_changes_returns_false() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Init a bare repo so git_has_changes works without a real working tree.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        // No files → nothing to commit.
+        let committed = git_commit_all("test commit", tmp.path()).unwrap();
+        assert!(!committed);
     }
 }
