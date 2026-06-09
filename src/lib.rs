@@ -9,9 +9,8 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use similar::TextDiff;
-use std::ffi::c_int;
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -110,7 +109,7 @@ pub struct AgentArgs {
 
     /// Number of transformer layers to offload to GPU
     #[arg(long, default_value_t = default_gpu_layers())]
-    pub gpu_layers: i32,
+    pub gpu_layers: u32,
 
     /// Temperature
     #[arg(long, default_value_t = 0.2)]
@@ -407,7 +406,7 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
     }
 
     let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers as c_int);
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
@@ -827,7 +826,7 @@ fn default_parallelism() -> usize {
         .unwrap_or(8)
 }
 
-fn default_gpu_layers() -> i32 {
+fn default_gpu_layers() -> u32 {
     if cfg!(target_os = "macos") {
         999
     } else {
