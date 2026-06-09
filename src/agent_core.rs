@@ -135,7 +135,7 @@ pub fn run_agent<S: EventSink>(
 
     if git_has_changes(&workspace_root).unwrap_or(false) {
         let summary: String = args.task.chars().take(60).collect();
-        let commit_msg = format!("chore: agent {summary}");
+        let commit_msg = format!("chore(agent): {summary}");
         let _ = git_commit_all(&commit_msg, &workspace_root);
     }
 
