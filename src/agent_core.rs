@@ -135,7 +135,7 @@ pub fn run_agent<S: EventSink>(
 
     if git_has_changes(&workspace_root).unwrap_or(false) {
         let summary: String = args.task.chars().take(60).collect();
-        let commit_msg = format!("chore(agent): {summary}");
+        let commit_msg = format!("refactor(agent): {summary}");
         let _ = git_commit_all(&commit_msg, &workspace_root);
     }
 
@@ -233,7 +233,7 @@ fn run_agent_steps<S: EventSink>(
                 });
                 let tool_result = run_tool(&tool, &arguments, workspace_root, sink)?;
                 sink.emit(AgentEvent::ToolResult {
-                    tool,
+                    tool: tool.clone(),
                     result: tool_result.clone(),
                 });
 
@@ -243,12 +243,7 @@ fn run_agent_steps<S: EventSink>(
                 });
                 messages.push(ChatMessage {
                     role: "tool",
-                    content: format!(
-                        "tool={}\nargs={}\nresult={}",
-                        tool_result.lines().next().unwrap_or("tool"),
-                        arguments,
-                        tool_result
-                    ),
+                    content: format!("tool={tool}\nargs={arguments}\nresult={tool_result}"),
                 });
             }
         }
