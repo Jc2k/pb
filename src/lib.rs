@@ -25,6 +25,7 @@ const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
 const LLAMA_BATCH_SIZE: usize = 512;
 const MAX_SEARCH_RESULTS: usize = 200;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
+const GPU_FULL_OFFLOAD: u32 = 999;
 
 #[derive(Parser, Debug)]
 #[command(name = "pb", about = "A local coding agent CLI")]
@@ -625,6 +626,11 @@ fn run_tool(tool: &str, arguments: &Value, workspace_root: &Path) -> Result<Stri
                 .with_context(|| format!("failed to read {}", resolved.display()))?;
 
             let lines: Vec<_> = text.lines().collect();
+            if let Some(end) = end {
+                if (end as usize) < start {
+                    return Ok("(no content in requested range)".to_string());
+                }
+            }
             // Keep end_line >= start so reversed ranges safely produce no output.
             let end_line = end.map_or(lines.len(), |v| v as usize).max(start);
             let mut out = String::new();
@@ -815,7 +821,7 @@ fn default_parallelism() -> usize {
 fn default_gpu_layers() -> u32 {
     if cfg!(target_os = "macos") {
         // Large value requests full offload; llama.cpp clamps to model layer count.
-        999
+        GPU_FULL_OFFLOAD
     } else {
         0
     }
