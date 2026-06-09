@@ -5,8 +5,18 @@ A local coding agent CLI.
 ## Commands
 
 - `pb self update` - self update from the latest GitHub release binary.
-- `pb pull [model]` - pull `qwen3-coder-next` (default) from the Ollama model registry with retry, batching, and parallel download.
-- `pb agent <task>` - run a simple terminal-first agent workflow and stream progress to the console.
+- `pb pull [model]` - pull model blobs with retry, batching, and parallel download.
+- `pb agent <task> --model-path /absolute/path/to/model.gguf` - run a local in-process coding agent with streamed output, tool calls (read/search/edit/skill), and inline diffs.
+
+### Agent usage
+
+```bash
+pb agent "fix failing test in src/lib.rs" \
+  --model-path /absolute/path/to/model.gguf \
+  --workdir /absolute/path/to/repo
+```
+
+The agent runs the model in-process (no LLM subprocess), streams token output to terminal, executes tool calls inside the workspace root, prints edit diffs, and supports `skill` lookups for `copilot`, `codex`, and `claude-code`.
 
 ## Build and test
 

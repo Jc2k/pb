@@ -1,15 +1,31 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
+use serde_json::Value;
+use similar::TextDiff;
+use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
+use walkdir::WalkDir;
 
 const DEFAULT_MODEL: &str = "qwen3-coder-next";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
+const DEFAULT_AGENT_MAX_STEPS: usize = 12;
+const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
+const LLAMA_BATCH_SIZE: usize = 512;
+const MAX_SEARCH_RESULTS: usize = 200;
+const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
+const GPU_FULL_OFFLOAD: u32 = 999;
 
 #[derive(Parser, Debug)]
 #[command(name = "pb", about = "A local coding agent CLI")]
@@ -28,11 +44,8 @@ pub enum Commands {
     },
     /// Pull model blobs from the Ollama-compatible registry
     Pull(PullArgs),
-    /// Run a simple local coding agent workflow with streamed progress
-    Agent {
-        /// Task to execute
-        task: String,
-    },
+    /// Run a local in-process coding agent and stream progress
+    Agent(AgentArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -64,6 +77,56 @@ pub struct PullArgs {
     pub out_dir: Option<PathBuf>,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct AgentArgs {
+    /// Task to execute
+    pub task: String,
+
+    /// Path to a local GGUF model file
+    #[arg(long)]
+    pub model_path: Option<PathBuf>,
+
+    /// Working directory where tools can read/search/edit
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Maximum number of think/tool iterations
+    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_STEPS)]
+    pub max_steps: usize,
+
+    /// Maximum new tokens per model turn
+    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_TOKENS)]
+    pub max_tokens: i32,
+
+    /// Context size
+    #[arg(long, default_value_t = 8192)]
+    pub ctx_size: u32,
+
+    /// Number of CPU threads for decoding
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    /// Number of CPU threads for prompt processing
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    /// Number of transformer layers to offload to GPU
+    #[arg(long, default_value_t = default_gpu_layers())]
+    pub gpu_layers: u32,
+
+    /// Temperature
+    #[arg(long, default_value_t = 0.2)]
+    pub temperature: f32,
+
+    /// Top-k for sampling
+    #[arg(long, default_value_t = 40)]
+    pub top_k: i32,
+
+    /// RNG seed
+    #[arg(long, default_value_t = 1337)]
+    pub seed: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestDescriptor {
     digest: String,
@@ -76,15 +139,27 @@ struct Manifest {
     layers: Vec<ManifestDescriptor>,
 }
 
-#[derive(Debug)]
-enum AgentEvent {
-    Started(String),
-    Step {
-        index: usize,
-        total: usize,
-        message: String,
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AgentAction {
+    ToolCall {
+        tool: String,
+        #[serde(default)]
+        arguments: Value,
+        #[serde(default)]
+        thinking: Option<String>,
     },
-    Complete,
+    Final {
+        content: String,
+        #[serde(default)]
+        thinking: Option<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -93,7 +168,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             SelfCommand::Update => run_self_update(),
         },
         Commands::Pull(args) => pull_model(&args).await,
-        Commands::Agent { task } => run_agent(&task).await,
+        Commands::Agent(args) => run_agent(args).await,
     }
 }
 
@@ -287,53 +362,440 @@ async fn download_blob(
     Ok(())
 }
 
-pub async fn run_agent(task: &str) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
-    let task_name = task.to_owned();
+pub async fn run_agent(args: AgentArgs) -> Result<()> {
+    let model_path = resolve_model_path(args.model_path.as_deref())?;
+    let workdir = args
+        .workdir
+        .clone()
+        .unwrap_or(std::env::current_dir().context("failed to get current working directory")?);
+    let workspace_root = workdir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workdir {}", workdir.display()))?;
 
-    tokio::spawn(async move {
-        let _ = tx.send(AgentEvent::Started(task_name)).await;
+    print_header("local agent", &format!("task: {}", args.task));
+    print_header("model", &model_path.display().to_string());
+    print_header("workspace", &workspace_root.display().to_string());
 
-        let steps = [
-            "Understand task context",
-            "Build a short plan",
-            "Apply code changes",
-            "Run checks and summarize",
-        ];
+    let mut instructions = String::from(
+        "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
+    );
+    instructions.push_str(
+        "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} \
+for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
+    );
+    instructions.push_str("Available tools: read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), skill(name).\n");
+    instructions.push_str("When editing, keep changes minimal and safe.\n");
+    if let Ok(copilot_instructions) = std::fs::read_to_string(".github/copilot-instructions.md") {
+        instructions.push_str("Repository instructions:\n");
+        instructions.push_str(&copilot_instructions);
+        instructions.push('\n');
+    }
 
-        for (index, step) in steps.into_iter().enumerate() {
-            let _ = tx
-                .send(AgentEvent::Step {
-                    index: index + 1,
-                    total: steps.len(),
-                    message: step.to_string(),
-                })
-                .await;
-            sleep(Duration::from_millis(250)).await;
-        }
+    print_header("started", &args.task);
 
-        let _ = tx.send(AgentEvent::Complete).await;
-    });
+    let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
+    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::Started(task_name) => {
-                println!("agent started: {task_name}");
+    let mut messages = vec![
+        ChatMessage {
+            role: "system",
+            content: instructions,
+        },
+        ChatMessage {
+            role: "user",
+            content: args.task.clone(),
+        },
+    ];
+
+    for step in 1..=args.max_steps {
+        print_header("step", &format!("{step}/{}", args.max_steps));
+        let prompt = render_prompt(&messages);
+        let output = generate_completion(&backend, &model, &args, &prompt)?;
+        let action = parse_action(&output)?;
+
+        match action {
+            AgentAction::Final { content, thinking } => {
+                if let Some(reasoning) = thinking {
+                    print_header("reasoning", &reasoning);
+                }
+                print_header("final", &content);
+                break;
             }
-            AgentEvent::Step {
-                index,
-                total,
-                message,
+            AgentAction::ToolCall {
+                tool,
+                arguments,
+                thinking,
             } => {
-                println!("[{index}/{total}] {message}");
-            }
-            AgentEvent::Complete => {
-                println!("agent complete");
+                if let Some(reasoning) = thinking {
+                    print_header("reasoning", &reasoning);
+                }
+                print_header("tool", &tool);
+                let tool_result = run_tool(&tool, &arguments, &workspace_root)?;
+                print_block("tool result", &tool_result);
+
+                messages.push(ChatMessage {
+                    role: "assistant",
+                    content: output,
+                });
+                messages.push(ChatMessage {
+                    role: "tool",
+                    content: format!("tool={tool}\nargs={arguments}\nresult={tool_result}"),
+                });
             }
         }
     }
 
     Ok(())
+}
+
+fn resolve_model_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+
+    if let Ok(from_env) = std::env::var("PB_MODEL_PATH") {
+        return Ok(PathBuf::from(from_env));
+    }
+
+    bail!(
+        "model path is required: pass --model-path <file.gguf> or set PB_MODEL_PATH"
+    )
+}
+
+fn render_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("<conversation>\n");
+    for message in messages {
+        prompt.push_str("[");
+        prompt.push_str(message.role);
+        prompt.push_str("]\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("[assistant]\n");
+    prompt
+}
+
+fn generate_completion(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    args: &AgentArgs,
+    prompt: &str,
+) -> Result<String> {
+    let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
+    let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+    if let Some(threads) = args.threads {
+        ctx_params = ctx_params.with_n_threads(threads);
+    }
+    if let Some(threads_batch) = args.threads_batch.or(args.threads) {
+        ctx_params = ctx_params.with_n_threads_batch(threads_batch);
+    }
+
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .context("failed to create llama context")?;
+
+    let tokens = model
+        .str_to_token(prompt, AddBos::Always)
+        .with_context(|| "failed to tokenize prompt")?;
+
+    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
+    let last_index = (tokens.len().saturating_sub(1)) as i32;
+    for (i, token) in (0_i32..).zip(tokens.into_iter()) {
+        let is_last = i == last_index;
+        batch
+            .add(token, i, &[0], is_last)
+            .context("failed to add prompt token to batch")?;
+    }
+
+    ctx.decode(&mut batch)
+        .context("failed to decode prompt batch")?;
+
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::dist(args.seed),
+        LlamaSampler::top_k(args.top_k),
+        LlamaSampler::temp(args.temperature),
+    ]);
+
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut output = String::new();
+    let mut n_cur = batch.n_tokens();
+
+    print!("\x1b[1;33massistant > \x1b[0m");
+    std::io::stdout().flush().ok();
+
+    while n_cur <= args.max_tokens {
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let piece = model
+            .token_to_piece(token, &mut decoder, true, None)
+            .context("failed to decode output token")?;
+        output.push_str(&piece);
+        print!("{piece}");
+        std::io::stdout().flush().ok();
+
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .context("failed to queue generated token")?;
+        ctx.decode(&mut batch)
+            .context("failed to decode generated token")?;
+        n_cur += 1;
+    }
+    println!();
+
+    Ok(output)
+}
+
+fn parse_action(output: &str) -> Result<AgentAction> {
+    if let Ok(action) = serde_json::from_str::<AgentAction>(output.trim()) {
+        return Ok(action);
+    }
+
+    let json_candidate = extract_json_object(output)
+        .with_context(|| "model output did not contain a valid JSON action")?;
+    serde_json::from_str::<AgentAction>(&json_candidate)
+        .with_context(|| "failed to parse agent JSON action")
+}
+
+fn extract_json_object(input: &str) -> Option<String> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, ch) in input.char_indices() {
+        if start.is_none() {
+            if ch == '{' {
+                start = Some(i);
+                depth = 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let s = start?;
+                    return Some(input[s..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn run_tool(tool: &str, arguments: &Value, workspace_root: &Path) -> Result<String> {
+    match tool {
+        "read_file" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .context("read_file requires string argument: path")?;
+            let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let end = arguments.get("end").and_then(Value::as_u64);
+            let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            let text = std::fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+
+            let lines: Vec<_> = text.lines().collect();
+            if let Some(end) = end {
+                if (end as usize) < start {
+                    return Ok("(no content in requested range)".to_string());
+                }
+            }
+            // Keep end_line >= start so reversed ranges safely produce no output.
+            let end_line = end.map_or(lines.len(), |v| v as usize).max(start);
+            let mut out = String::new();
+            for idx in (start.saturating_sub(1))..lines.len().min(end_line) {
+                out.push_str(&format!("{}: {}\n", idx + 1, lines[idx]));
+            }
+            if out.is_empty() {
+                out.push_str("(no content in requested range)");
+            }
+            Ok(out)
+        }
+        "search" => {
+            let pattern = arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .context("search requires string argument: pattern")?;
+            let relative_path = arguments.get("path").and_then(Value::as_str);
+            let search_root = if let Some(path) = relative_path {
+                resolve_workspace_path(workspace_root, path, true)?
+            } else {
+                workspace_root.to_path_buf()
+            };
+
+            let regex = regex::Regex::new(pattern)
+                .with_context(|| format!("invalid regex pattern: {pattern}"))?;
+
+            let mut hits = Vec::new();
+            for entry in WalkDir::new(&search_root)
+                .into_iter()
+                .filter_entry(|e| {
+                    !SEARCH_EXCLUDED_DIRS
+                        .iter()
+                        .any(|excluded| e.file_name() == std::ffi::OsStr::new(excluded))
+                })
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file())
+            {
+                let path = entry.path();
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                for (line_idx, line) in content.lines().enumerate() {
+                    if regex.is_match(line) {
+                        let rel = path.strip_prefix(workspace_root).unwrap_or(path);
+                        hits.push(format!("{}:{}:{}", rel.display(), line_idx + 1, line.trim()));
+                        if hits.len() >= MAX_SEARCH_RESULTS {
+                            break;
+                        }
+                    }
+                }
+                if hits.len() >= MAX_SEARCH_RESULTS {
+                    break;
+                }
+            }
+
+            if hits.is_empty() {
+                Ok("no matches".to_string())
+            } else {
+                Ok(hits.join("\n"))
+            }
+        }
+        "edit_file" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .context("edit_file requires string argument: path")?;
+            let old_text = arguments
+                .get("old_text")
+                .and_then(Value::as_str)
+                .context("edit_file requires string argument: old_text")?;
+            let new_text = arguments
+                .get("new_text")
+                .and_then(Value::as_str)
+                .context("edit_file requires string argument: new_text")?;
+
+            let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            let existing = std::fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+
+            if !existing.contains(old_text) {
+                bail!("old_text not found in file");
+            }
+
+            // Replace only the first match to keep edits targeted and predictable.
+            let updated = existing.replacen(old_text, new_text, 1);
+            std::fs::write(&resolved, &updated)
+                .with_context(|| format!("failed to write {}", resolved.display()))?;
+
+            let diff = unified_diff(&existing, &updated, path);
+            print_block("diff", &diff);
+            Ok(format!("updated {}", resolved.display()))
+        }
+        "skill" => {
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .context("skill requires string argument: name")?;
+            Ok(skill_text(name))
+        }
+        _ => bail!("unknown tool: {tool}"),
+    }
+}
+
+fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) -> Result<PathBuf> {
+    let candidate = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        workspace_root.join(input)
+    };
+
+    let normalized = if must_exist {
+        candidate
+            .canonicalize()
+            .with_context(|| format!("failed to resolve path {}", candidate.display()))?
+    } else if let Some(parent) = candidate.parent() {
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("failed to resolve parent {}", parent.display()))?;
+        parent.join(candidate.file_name().unwrap_or_default())
+    } else {
+        candidate
+    };
+
+    if !normalized.starts_with(workspace_root) {
+        bail!(
+            "path escapes workspace root: {} not under {}",
+            normalized.display(),
+            workspace_root.display()
+        );
+    }
+
+    Ok(normalized)
+}
+
+fn unified_diff(old: &str, new: &str, path: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            similar::ChangeTag::Delete => "-",
+            similar::ChangeTag::Insert => "+",
+            similar::ChangeTag::Equal => " ",
+        };
+        out.push_str(sign);
+        out.push_str(change.value());
+    }
+    out
+}
+
+fn skill_text(name: &str) -> String {
+    match name {
+        "copilot" => "Use repository instructions first; keep edits minimal; run tests before finalizing.".to_string(),
+        "codex" => "Prefer structured tool calls, verify edits with diffs, and keep responses concise.".to_string(),
+        "claude-code" => "Think in small steps, use safe file boundaries, and report reasoning clearly.".to_string(),
+        "list" => "Available skills: copilot, codex, claude-code".to_string(),
+        _ => format!("unknown skill '{name}'. Try: copilot, codex, claude-code, list"),
+    }
+}
+
+fn print_header(label: &str, value: &str) {
+    println!("\x1b[1;36m[{label}]\x1b[0m {value}");
+}
+
+fn print_block(label: &str, content: &str) {
+    println!("\x1b[1;35m[{label}]\x1b[0m\n{content}");
 }
 
 fn release_target() -> String {
@@ -354,6 +816,15 @@ fn default_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().min(32))
         .unwrap_or(8)
+}
+
+fn default_gpu_layers() -> u32 {
+    if cfg!(target_os = "macos") {
+        // Large value requests full offload; llama.cpp clamps to model layer count.
+        GPU_FULL_OFFLOAD
+    } else {
+        0
+    }
 }
 
 fn default_pull_dir() -> PathBuf {
@@ -413,5 +884,12 @@ mod tests {
     #[test]
     fn release_target_is_not_empty() {
         assert!(!release_target().is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_handles_noise() {
+        let output = "hello {\"type\":\"final\",\"content\":\"ok\"} trailing";
+        let extracted = extract_json_object(output).expect("json should be extracted");
+        assert_eq!(extracted, "{\"type\":\"final\",\"content\":\"ok\"}");
     }
 }
