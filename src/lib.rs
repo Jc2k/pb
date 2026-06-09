@@ -15,7 +15,6 @@ use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use walkdir::WalkDir;
 
@@ -134,14 +133,6 @@ struct ManifestDescriptor {
 struct Manifest {
     config: ManifestDescriptor,
     layers: Vec<ManifestDescriptor>,
-}
-
-#[derive(Debug)]
-enum AgentEvent {
-    Started(String),
-    ToolCall(String),
-    ToolResult(String),
-    Complete,
 }
 
 #[derive(Debug, Clone)]
@@ -396,14 +387,7 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
         instructions.push('\n');
     }
 
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
-    let task = args.task.clone();
-    tokio::spawn(async move {
-        let _ = tx.send(AgentEvent::Started(task)).await;
-    });
-    if let Some(AgentEvent::Started(task)) = rx.recv().await {
-        print_header("started", &task);
-    }
+    print_header("started", &args.task);
 
     let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
@@ -433,7 +417,6 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
                     print_header("reasoning", &reasoning);
                 }
                 print_header("final", &content);
-                let _ = tx.send(AgentEvent::Complete).await;
                 break;
             }
             AgentAction::ToolCall {
@@ -444,15 +427,9 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
                 if let Some(reasoning) = thinking {
                     print_header("reasoning", &reasoning);
                 }
-                let _ = tx.send(AgentEvent::ToolCall(tool.clone())).await;
-                if let Some(AgentEvent::ToolCall(tool_name)) = rx.recv().await {
-                    print_header("tool", &tool_name);
-                }
+                print_header("tool", &tool);
                 let tool_result = run_tool(&tool, &arguments, &workspace_root)?;
-                let _ = tx.send(AgentEvent::ToolResult(tool_result.clone())).await;
-                if let Some(AgentEvent::ToolResult(result)) = rx.recv().await {
-                    print_block("tool result", &result);
-                }
+                print_block("tool result", &tool_result);
 
                 messages.push(ChatMessage {
                     role: "assistant",
