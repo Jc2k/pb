@@ -74,6 +74,10 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Update version in Cargo.toml
+        run: |
+          sed -i '' "s/^version = \".*\"/version = \"${{ needs.semantic-release.outputs.new_release_version }}\"/" Cargo.toml
+
       - name: Build optimized macOS arm64 binary
         run: cargo build --release --target aarch64-apple-darwin
 
