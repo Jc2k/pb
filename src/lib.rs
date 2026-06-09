@@ -82,9 +82,9 @@ pub struct AgentArgs {
     /// Task to execute
     pub task: String,
 
-    /// Path to a local GGUF model file
-    #[arg(long)]
-    pub model_path: Option<PathBuf>,
+    /// Model name in Ollama format (e.g. qwen3-coder-next); looked up in the pull cache
+    #[arg(long, default_value = DEFAULT_MODEL)]
+    pub model: String,
 
     /// Working directory where tools can read/search/edit
     #[arg(long)]
@@ -363,7 +363,7 @@ async fn download_blob(
 }
 
 pub async fn run_agent(args: AgentArgs) -> Result<()> {
-    let model_path = resolve_model_path(args.model_path.as_deref())?;
+    let model_path = find_model_in_cache(&args.model)?;
     let workdir = args
         .workdir
         .clone()
@@ -450,18 +450,60 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
     Ok(())
 }
 
-fn resolve_model_path(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+fn find_model_in_cache(model: &str) -> Result<PathBuf> {
+    find_model_in_cache_in(&default_pull_dir(), model)
+}
+
+fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
+    let model_dir = pull_root.join(model);
+
+    if !model_dir.exists() {
+        bail!(
+            "model '{}' not found in pull cache. Run: pb pull {}",
+            model, model
+        );
     }
 
-    if let Ok(from_env) = std::env::var("PB_MODEL_PATH") {
-        return Ok(PathBuf::from(from_env));
+    // GGUF files start with the magic bytes b"GGUF" (0x47 0x47 0x55 0x46).
+    const GGUF_MAGIC: &[u8] = b"GGUF";
+    let mut gguf_files: Vec<PathBuf> = std::fs::read_dir(&model_dir)
+        .with_context(|| format!("failed to read model directory {}", model_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            let mut buf = [0u8; 4];
+            std::fs::File::open(p)
+                .and_then(|mut f| {
+                    use std::io::Read;
+                    f.read_exact(&mut buf)
+                })
+                .map(|_| buf == GGUF_MAGIC)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if gguf_files.is_empty() {
+        bail!(
+            "model '{}' cache is incomplete (no GGUF blobs found). Run: pb pull {}",
+            model, model
+        );
     }
 
-    bail!(
-        "model path is required: pass --model-path <file.gguf> or set PB_MODEL_PATH"
-    )
+    // If there are multiple GGUF files (split shards), pick the largest one as the primary shard.
+    // Files where metadata is unavailable are excluded rather than treated as size 0.
+    gguf_files.retain(|p| std::fs::metadata(p).is_ok());
+    if gguf_files.is_empty() {
+        bail!(
+            "model '{}' cache is incomplete (GGUF blobs are inaccessible). Run: pb pull {}",
+            model, model
+        );
+    }
+    gguf_files.sort_by_key(|p| {
+        std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+    });
+
+    Ok(gguf_files.into_iter().next().unwrap())
 }
 
 fn render_prompt(messages: &[ChatMessage]) -> String {
@@ -891,5 +933,60 @@ mod tests {
         let output = "hello {\"type\":\"final\",\"content\":\"ok\"} trailing";
         let extracted = extract_json_object(output).expect("json should be extracted");
         assert_eq!(extracted, "{\"type\":\"final\",\"content\":\"ok\"}");
+    }
+
+    #[test]
+    fn find_model_in_cache_missing_dir_suggests_pull() {
+        let err = find_model_in_cache_in(Path::new("/tmp/pb-test-nonexistent-dir"), "mymodel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pb pull mymodel"), "error was: {err}");
+    }
+
+    #[test]
+    fn find_model_in_cache_empty_dir_suggests_pull() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("mymodel");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        // No files: should report incomplete cache.
+        let err = find_model_in_cache_in(tmp.path(), "mymodel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pb pull mymodel"), "error was: {err}");
+    }
+
+    #[test]
+    fn find_model_in_cache_finds_gguf_by_magic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("mymodel");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Write a fake config blob (JSON, not GGUF).
+        std::fs::write(model_dir.join("sha256_config"), b"{}").unwrap();
+        // Write a fake GGUF layer blob.
+        let mut gguf_data = b"GGUF".to_vec();
+        gguf_data.extend_from_slice(&[0u8; 16]);
+        std::fs::write(model_dir.join("sha256_layer1"), &gguf_data).unwrap();
+
+        let path = find_model_in_cache_in(tmp.path(), "mymodel")
+            .expect("should find GGUF");
+        assert_eq!(path.file_name().unwrap(), "sha256_layer1");
+    }
+
+    #[test]
+    fn find_model_in_cache_picks_largest_gguf() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("mymodel");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Two GGUF blobs of different sizes; larger should be picked first.
+        let small: Vec<u8> = b"GGUF".iter().chain(&[0u8; 4]).copied().collect();
+        let large: Vec<u8> = b"GGUF".iter().chain(&[0u8; 100]).copied().collect();
+        std::fs::write(model_dir.join("sha256_small"), &small).unwrap();
+        std::fs::write(model_dir.join("sha256_large"), &large).unwrap();
+
+        let path = find_model_in_cache_in(tmp.path(), "mymodel")
+            .expect("should find GGUF");
+        assert_eq!(path.file_name().unwrap(), "sha256_large");
     }
 }
