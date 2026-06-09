@@ -590,7 +590,7 @@ fn branch_name_from_task(task: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let truncated = &slug[..slug.len().min(50)];
+    let truncated: String = slug.chars().take(50).collect();
     format!("pb/{truncated}")
 }
 
@@ -636,8 +636,7 @@ fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
 
 /// Return the last `n` commits as a one-line log string.
 fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
-    let n_str = n.to_string();
-    git_run(&["log", "--oneline", &format!("-{n_str}")], workdir)
+    git_run(&["log", "--oneline", &format!("-{n}")], workdir)
 }
 
 fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
