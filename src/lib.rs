@@ -86,6 +86,10 @@ pub struct AgentArgs {
     #[arg(long, default_value = DEFAULT_MODEL)]
     pub model: String,
 
+    /// Directory containing pulled model blobs; defaults to the XDG data directory (e.g. ~/.local/share/pb/models on Linux)
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
     /// Working directory where tools can read/search/edit
     #[arg(long)]
     pub workdir: Option<PathBuf>,
@@ -198,7 +202,7 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         bail!("parallel must be greater than 0");
     }
 
-    let output_root = args.out_dir.clone().unwrap_or_else(default_pull_dir);
+    let output_root = args.out_dir.clone().unwrap_or_else(default_models_dir);
     tokio::fs::create_dir_all(&output_root)
         .await
         .with_context(|| {
@@ -363,7 +367,8 @@ async fn download_blob(
 }
 
 pub async fn run_agent(args: AgentArgs) -> Result<()> {
-    let model_path = find_model_in_cache(&args.model)?;
+    let models_root = args.model_dir.clone().unwrap_or_else(default_models_dir);
+    let model_path = find_model_in_cache_in(&models_root, &args.model)?;
     let workdir = args
         .workdir
         .clone()
@@ -448,10 +453,6 @@ for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} wh
     }
 
     Ok(())
-}
-
-fn find_model_in_cache(model: &str) -> Result<PathBuf> {
-    find_model_in_cache_in(&default_pull_dir(), model)
 }
 
 fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
@@ -869,11 +870,18 @@ fn default_gpu_layers() -> u32 {
     }
 }
 
-fn default_pull_dir() -> PathBuf {
-    let mut root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    root.push(".pb");
-    root.push("models");
-    root
+fn xdg_base_dir(preferred: Option<PathBuf>) -> PathBuf {
+    preferred
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_data_dir() -> PathBuf {
+    xdg_base_dir(dirs::data_local_dir()).join("pb")
+}
+
+fn default_models_dir() -> PathBuf {
+    default_data_dir().join("models")
 }
 
 fn blob_path(root: &Path, model: &str, digest: &str) -> PathBuf {
