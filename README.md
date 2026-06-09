@@ -1,30 +1,31 @@
 # pb
 
-A local coding agent CLI.
+A local coding agent CLI with an optional web front end.
 
 ## Commands
 
 - `pb self update` - self update from the latest GitHub release binary.
 - `pb pull [model]` - pull model blobs with retry, batching, and parallel download.
-- `pb agent <task> --model-path /absolute/path/to/model.gguf` - run a local in-process coding agent with streamed output, tool calls (read/search/edit/skill), and inline diffs.
+- `pb agent <task> --model-dir /absolute/path/to/models --workdir /absolute/path/to/repo` - run the local in-process coding agent with streamed output and follow-up prompts.
+- `pb serve` - start a Rust web server and serve the embedded SPA for browser-based sessions.
 
-### Agent usage
+## Web UI (`pb serve`)
 
-```bash
-pb agent "fix failing test in src/lib.rs" \
-  --model-path /absolute/path/to/model.gguf \
-  --workdir /absolute/path/to/repo
-```
+`pb serve` hosts a Bootstrap-themed SPA that can:
 
-The agent runs the model in-process (no LLM subprocess), streams token output to terminal, executes tool calls inside the workspace root, prints edit diffs, and supports `skill` lookups for `copilot`, `codex`, and `claude-code`.
+- create sessions,
+- stream typed live events over SSE,
+- continue existing sessions with follow-up prompts,
+- show the same agent progress contract used by the CLI adapter.
 
 ## Build and test
 
 ```bash
-cargo test
+npm run build:web
+cargo test --all-targets
 cargo build --release
 ```
 
 ## CI
 
-GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds with cache, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
+GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
