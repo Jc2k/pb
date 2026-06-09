@@ -14,7 +14,9 @@ A local coding agent CLI with an optional web front end.
 `pb serve` hosts a Bootstrap-themed SPA that can:
 
 - create sessions,
+- list and re-attach to existing sessions from any device,
 - stream typed live events over SSE,
+- replay recent session history when you reconnect,
 - continue existing sessions with follow-up prompts,
 - show the same agent progress contract used by the CLI adapter.
 
