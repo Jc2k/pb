@@ -870,14 +870,20 @@ fn default_gpu_layers() -> u32 {
     }
 }
 
-fn xdg_base_dir(preferred: Option<PathBuf>) -> PathBuf {
-    preferred
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn default_data_dir() -> PathBuf {
-    xdg_base_dir(dirs::data_local_dir()).join("pb")
+    // Honour $XDG_DATA_HOME if the user has set it explicitly.
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pb");
+        }
+    }
+    // Use the Linux XDG default (~/.local/share/pb) on all platforms, including macOS,
+    // so that pb data lives in a consistent, XDG-ish location.
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".local").join("share").join("pb");
+    }
+    // Last resort: hidden directory relative to the current directory.
+    PathBuf::from(".pb")
 }
 
 fn default_models_dir() -> PathBuf {
