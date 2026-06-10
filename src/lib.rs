@@ -20,7 +20,7 @@ pub mod init;
 pub mod service;
 pub mod web;
 
-pub const DEFAULT_MODEL: &str = "hf://ggml-org/Qwen3-Coder-Next-GGUF";
+pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -146,7 +146,7 @@ pub struct InitArgs {
 #[derive(Args, Debug)]
 pub struct PullArgs {
     /// Model to pull: Ollama library name (e.g. qwen3-coder-next) or Hugging Face URI
-    /// (e.g. hf://ggml-org/Qwen3-Coder-Next-GGUF or hf://owner/repo/filename.gguf)
+    /// (e.g. hf://unsloth/Qwen3-Coder-Next-GGUF or hf://owner/repo/filename.gguf)
     #[arg(default_value = DEFAULT_MODEL)]
     pub model: String,
 
@@ -173,7 +173,7 @@ pub struct AgentArgs {
     pub task: String,
 
     /// Model identifier: Ollama name (e.g. qwen3-coder-next) or Hugging Face URI
-    /// (e.g. hf://ggml-org/Qwen3-Coder-Next-GGUF); looked up in the pull cache
+    /// (e.g. hf://unsloth/Qwen3-Coder-Next-GGUF); looked up in the pull cache
     #[arg(long, default_value = DEFAULT_MODEL)]
     pub model: String,
 
@@ -1197,16 +1197,16 @@ mod tests {
     #[test]
     fn cache_dir_name_hf_uri_without_filename() {
         assert_eq!(
-            cache_dir_name("hf://ggml-org/Qwen3-Coder-Next-GGUF"),
-            "ggml-org_Qwen3-Coder-Next-GGUF"
+            cache_dir_name("hf://unsloth/Qwen3-Coder-Next-GGUF"),
+            "unsloth_Qwen3-Coder-Next-GGUF"
         );
     }
 
     #[test]
     fn cache_dir_name_hf_uri_with_filename() {
         assert_eq!(
-            cache_dir_name("hf://ggml-org/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
-            "ggml-org_Qwen3-Coder-Next-GGUF"
+            cache_dir_name("hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
+            "unsloth_Qwen3-Coder-Next-GGUF"
         );
     }
 
@@ -1242,20 +1242,20 @@ mod tests {
 
     #[test]
     fn parse_hf_uri_without_filename() {
-        let result = parse_hf_uri("hf://ggml-org/Qwen3-Coder-Next-GGUF");
+        let result = parse_hf_uri("hf://unsloth/Qwen3-Coder-Next-GGUF");
         assert_eq!(
             result,
-            Some(("ggml-org".to_owned(), "Qwen3-Coder-Next-GGUF".to_owned(), None))
+            Some(("unsloth".to_owned(), "Qwen3-Coder-Next-GGUF".to_owned(), None))
         );
     }
 
     #[test]
     fn parse_hf_uri_with_filename() {
-        let result = parse_hf_uri("hf://ggml-org/Qwen3-Coder-Next-GGUF/model.gguf");
+        let result = parse_hf_uri("hf://unsloth/Qwen3-Coder-Next-GGUF/model.gguf");
         assert_eq!(
             result,
             Some((
-                "ggml-org".to_owned(),
+                "unsloth".to_owned(),
                 "Qwen3-Coder-Next-GGUF".to_owned(),
                 Some("model.gguf".to_owned())
             ))
