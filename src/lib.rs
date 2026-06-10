@@ -7,8 +7,12 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, sleep};
 
+use crate::environment::{EnvironmentConfig, EnvironmentMode};
+
 pub mod agent_core;
 pub mod cli_ui;
+pub mod container;
+pub mod environment;
 pub mod events;
 pub mod web;
 
@@ -39,12 +43,70 @@ pub enum Commands {
     Agent(AgentArgs),
     /// Start the web UI server
     Serve(ServeArgs),
+    /// Manage the per-project container environment for sandboxed task execution
+    #[command(name = "env")]
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum SelfCommand {
     /// Update pb from the latest GitHub release
     Update,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EnvCommand {
+    /// Pull a ready-made dev-environment image and save it as the project environment
+    Pull(EnvPullArgs),
+    /// Build a dev-environment image from a Dockerfile and save it as the project environment
+    Build(EnvBuildArgs),
+    /// Verify the configured environment by creating a test container and running init commands
+    Start(EnvWorkdirArgs),
+    /// Show the current project environment configuration
+    Status(EnvWorkdirArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct EnvPullArgs {
+    /// Container image reference to pull (e.g. ghcr.io/myorg/dev:latest)
+    pub image: String,
+
+    /// Shell commands to run inside the container after creation (may be repeated)
+    #[arg(long = "init", value_name = "CMD")]
+    pub init_commands: Vec<String>,
+
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct EnvBuildArgs {
+    /// Path to the Dockerfile
+    #[arg(long, default_value = "Dockerfile")]
+    pub dockerfile: PathBuf,
+
+    /// Tag for the built image (e.g. pb-dev:latest)
+    #[arg(long, default_value = "pb-dev:latest")]
+    pub tag: String,
+
+    /// Shell commands to run inside the container after creation (may be repeated)
+    #[arg(long = "init", value_name = "CMD")]
+    pub init_commands: Vec<String>,
+
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct EnvWorkdirArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -226,6 +288,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 temperature: args.temperature,
                 top_k: args.top_k,
                 seed: args.seed,
+                environment: None,
             };
             web::run_server(
                 web::ServeArgs {
@@ -236,6 +299,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Env { command } => run_env_command(command),
     }
 }
 
@@ -255,6 +319,7 @@ fn to_agent_request(args: AgentArgs) -> agent_core::AgentRequest {
         temperature: args.temperature,
         top_k: args.top_k,
         seed: args.seed,
+        environment: None,
     }
 }
 
@@ -273,6 +338,125 @@ fn run_self_update() -> Result<()> {
         .context("self-update failed")?;
 
     println!("Updated to {}", status.version());
+    Ok(())
+}
+
+fn run_env_command(command: EnvCommand) -> Result<()> {
+    match command {
+        EnvCommand::Pull(args) => env_pull(args),
+        EnvCommand::Build(args) => env_build(args),
+        EnvCommand::Start(args) => env_start(args),
+        EnvCommand::Status(args) => env_status(args),
+    }
+}
+
+/// Resolve the project root from an optional `--workdir` flag.
+/// Walks up from the given directory (or CWD) to the nearest `.git` ancestor.
+fn resolve_env_root(workdir: Option<PathBuf>) -> Result<PathBuf> {
+    let start = workdir
+        .map(|p| p.canonicalize().context("failed to resolve --workdir"))
+        .transpose()?
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    Ok(agent_core::find_git_root(&start).unwrap_or(start))
+}
+
+fn env_pull(args: EnvPullArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    println!("Pulling image {}…", args.image);
+    runtime.pull(&args.image)?;
+    let config = EnvironmentConfig {
+        mode: EnvironmentMode::Pull,
+        image: args.image.clone(),
+        init_commands: args.init_commands,
+        dockerfile: None,
+    };
+    config.save(&root)?;
+    println!(
+        "Environment saved to {}",
+        root.join(".pb").join("environment.toml").display()
+    );
+    Ok(())
+}
+
+fn env_build(args: EnvBuildArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let dockerfile = if args.dockerfile.is_absolute() {
+        args.dockerfile.clone()
+    } else {
+        root.join(&args.dockerfile)
+    };
+    if !dockerfile.exists() {
+        bail!("Dockerfile not found: {}", dockerfile.display());
+    }
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    println!("Building image {} from {}…", args.tag, dockerfile.display());
+    runtime.build(&dockerfile, &args.tag)?;
+    let config = EnvironmentConfig {
+        mode: EnvironmentMode::Build,
+        image: args.tag.clone(),
+        init_commands: args.init_commands,
+        dockerfile: Some(args.dockerfile),
+    };
+    config.save(&root)?;
+    println!(
+        "Environment saved to {}",
+        root.join(".pb").join("environment.toml").display()
+    );
+    Ok(())
+}
+
+fn env_start(args: EnvWorkdirArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let config = EnvironmentConfig::load(&root)?
+        .context("no environment configured; run `pb env pull` or `pb env build` first")?;
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    println!("Creating test container from {}…", config.image);
+    let container_id = runtime.create(&config.image, &root)?;
+    println!("Container {} started", container_id);
+    for cmd in &config.init_commands {
+        println!("Running init command: {cmd}");
+        let output = runtime.exec(&container_id, cmd)?;
+        if !output.is_empty() {
+            println!("{output}");
+        }
+    }
+    println!("Removing test container…");
+    runtime.remove(&container_id)?;
+    println!("Environment verified successfully.");
+    Ok(())
+}
+
+fn env_status(args: EnvWorkdirArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    match EnvironmentConfig::load(&root)? {
+        None => println!(
+            "No environment configured at {}\nRun `pb env pull <image>` or `pb env build` to set one up.",
+            root.join(".pb").join("environment.toml").display()
+        ),
+        Some(config) => {
+            let mode = match config.mode {
+                EnvironmentMode::Pull => "pull",
+                EnvironmentMode::Build => "build",
+            };
+            println!("mode:  {mode}");
+            println!("image: {}", config.image);
+            if let Some(df) = &config.dockerfile {
+                println!("dockerfile: {}", df.display());
+            }
+            if config.init_commands.is_empty() {
+                println!("init_commands: (none)");
+            } else {
+                println!("init_commands:");
+                for cmd in &config.init_commands {
+                    println!("  - {cmd}");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
