@@ -701,8 +701,7 @@ fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
         (pb, template)
     } else {
         let pb = ProgressBar::new_spinner();
-        let template =
-            "{spinner:.green} [{elapsed_precise}] {bytes} downloaded".to_owned();
+        let template = format!("{{spinner:.green}} [{{elapsed_precise}}] {{bytes}} downloaded");
         (pb, template)
     };
     let style = ProgressStyle::with_template(&template)
@@ -737,7 +736,7 @@ async fn pull_from_hf(
             .find(|s| s.rfilename == f)
             .with_context(|| format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face"))?;
         let size = match hf_sibling_size(sibling) {
-            Some(s) => Some(s),
+            s @ Some(_) => s,
             None => {
                 let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{f}");
                 fetch_content_length(client, &url).await
@@ -754,7 +753,7 @@ async fn pull_from_hf(
                 .find(|s| s.rfilename == filename)
                 .with_context(|| format!("file metadata missing for {filename}"))?;
             let size = match hf_sibling_size(sibling) {
-                Some(s) => Some(s),
+                s @ Some(_) => s,
                 None => {
                     let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
                     fetch_content_length(client, &url).await
@@ -855,7 +854,8 @@ async fn download_file_with_resume(
                 .with_context(|| format!("failed to remove stale file {}", path.display()))?;
         }
     } else if path.exists() {
-        // Size unknown: assume existing destination file is complete.
+        // Size unknown: cannot verify the file is intact, but assume it is
+        // complete to avoid re-downloading a potentially large file.
         return Ok(());
     }
 
@@ -1366,6 +1366,8 @@ mod tests {
         let pb = build_progress_bar(0, 0).unwrap();
         // Spinner has no fixed length.
         assert_eq!(pb.length(), None);
+        // Incrementing should not panic.
+        pb.inc(1024);
         pb.finish_and_clear();
     }
 }
