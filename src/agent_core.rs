@@ -782,13 +782,17 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
-                || ip.is_documentation()
+                || is_documentation_v6(ip)
         }
     }
 }
 
 fn is_shared_v4(ip: Ipv4Addr) -> bool {
     matches!(ip.octets(), [100, second, ..] if (64..=127).contains(&second))
+}
+
+fn is_documentation_v6(ip: Ipv6Addr) -> bool {
+    matches!(ip.segments(), [0x2001, 0x0db8, ..])
 }
 
 fn normalize_web_content(body: &str, content_type: &str) -> String {
