@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::UTF_8;
 use futures::StreamExt;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -645,18 +645,23 @@ where
 }
 
 fn tool_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_try_init(|| {
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to start runtime for web tool")
+            .map_err(|error| error.to_string())
     })
+    {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
 }
 
 fn http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_try_init(|| {
+    static CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .user_agent(TOOL_USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
@@ -664,7 +669,12 @@ fn http_client() -> Result<&'static reqwest::Client> {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .context("failed to build web client")
+            .map_err(|error| error.to_string())
     })
+    {
+        Ok(client) => Ok(client),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
 }
 
 async fn run_web_search(query: &str) -> Result<String> {
