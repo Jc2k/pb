@@ -12,13 +12,16 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
+
+const MAX_HISTORY_EVENTS: usize = 1_000;
+const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct ServeArgs {
@@ -54,13 +57,34 @@ struct SessionResponse {
     session_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SessionListItem {
+    session_id: String,
+    task: String,
+    running: bool,
+    branch: Option<String>,
+    updated_at_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDetails {
+    session_id: String,
+    task: String,
+    running: bool,
+    branch: Option<String>,
+    events: Vec<EventEnvelope>,
+}
+
 #[derive(Debug, Clone)]
 struct SessionState {
+    task: String,
     branch: Option<String>,
     workdir: Option<PathBuf>,
     request_template: AgentRequest,
     running: bool,
     sender: broadcast::Sender<EventEnvelope>,
+    history: Arc<StdMutex<Vec<EventEnvelope>>>,
+    updated_at_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +102,8 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
     };
 
     let app = Router::new()
-        .route("/api/sessions", post(start_session))
+        .route("/api/sessions", post(start_session).get(list_sessions))
+        .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/", get(index))
@@ -117,12 +142,16 @@ async fn start_session(
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
 
+    let now = now_millis();
     let session = SessionState {
+        task: req.task,
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
         request_template: request.clone(),
         running: true,
         sender: sender.clone(),
+        history: Arc::new(StdMutex::new(Vec::new())),
+        updated_at_ms: now,
     };
 
     {
@@ -150,7 +179,9 @@ async fn continue_session(
     request.task = req.task;
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
+    session.task = request.task.clone();
     session.running = true;
+    session.updated_at_ms = now_millis();
 
     drop(sessions);
     spawn_agent_run(state.clone(), id.clone(), request);
@@ -158,9 +189,50 @@ async fn continue_session(
     Ok(Json(SessionResponse { session_id: id }))
 }
 
+async fn list_sessions(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Json<Vec<SessionListItem>> {
+    let sessions = state.sessions.lock().await;
+    let mut items = sessions
+        .iter()
+        .map(|(session_id, session)| SessionListItem {
+            session_id: session_id.clone(),
+            task: session.task.clone(),
+            running: session.running,
+            branch: session.branch.clone(),
+            updated_at_ms: session.updated_at_ms,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    Json(items)
+}
+
+async fn get_session(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionDetails>, StatusCode> {
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let events = session
+        .history
+        .lock()
+        .map(|history| {
+            let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
+            history[start..].to_vec()
+        })
+        .unwrap_or_default();
+    Ok(Json(SessionDetails {
+        session_id: id,
+        task: session.task.clone(),
+        running: session.running,
+        branch: session.branch.clone(),
+        events,
+    }))
+}
+
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
     tokio::spawn(async move {
-        let (models_root, sender) = {
+        let (models_root, sender, history) = {
             let sessions = state.sessions.lock().await;
             let Some(session) = sessions.get(&session_id) else {
                 return;
@@ -171,12 +243,15 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     .clone()
                     .unwrap_or_else(crate::default_models_dir),
                 session.sender.clone(),
+                Arc::clone(&session.history),
             )
         };
 
         let result = tokio::task::spawn_blocking(move || {
+            let sender = sender.clone();
+            let history = Arc::clone(&history);
             run_agent(request, &models_root, |event| {
-                let _ = sender.send(EventEnvelope::new(event));
+                publish_event(&sender, &history, event);
             })
         })
         .await;
@@ -184,20 +259,29 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
             session.running = false;
+            session.updated_at_ms = now_millis();
             match result {
                 Ok(Ok(run_result)) => {
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.workspace_root);
                 }
                 Ok(Err(err)) => {
-                    let _ = session.sender.send(EventEnvelope::new(AgentEvent::Error {
-                        message: err.to_string(),
-                    }));
+                    publish_event(
+                        &session.sender,
+                        &session.history,
+                        AgentEvent::Error {
+                            message: err.to_string(),
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = session.sender.send(EventEnvelope::new(AgentEvent::Error {
-                        message: err.to_string(),
-                    }));
+                    publish_event(
+                        &session.sender,
+                        &session.history,
+                        AgentEvent::Error {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -252,9 +336,29 @@ fn serve_asset(path: &str) -> Response {
 }
 
 fn new_session_id() -> String {
-    let now = SystemTime::now()
+    let now = now_millis();
+    format!("session-{now}")
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    format!("session-{now}")
+        .as_millis()
+}
+
+fn publish_event(
+    sender: &broadcast::Sender<EventEnvelope>,
+    history: &StdMutex<Vec<EventEnvelope>>,
+    event: AgentEvent,
+) {
+    let envelope = EventEnvelope::new(event);
+    let _ = sender.send(envelope.clone());
+    if let Ok(mut entries) = history.lock() {
+        entries.push(envelope);
+        if entries.len() > MAX_HISTORY_EVENTS {
+            let overflow = entries.len() - MAX_HISTORY_EVENTS;
+            entries.drain(..overflow);
+        }
+    }
 }
