@@ -23,6 +23,8 @@ pub mod web;
 pub const DEFAULT_MODEL: &str = "hf://ggml-org/Qwen3-Coder-Next-GGUF";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
+const PROGRESS_BAR_WIDTH: usize = 40;
+const PROGRESS_TICK_MS: u64 = 120;
 pub const DEFAULT_AGENT_MAX_STEPS: usize = 12;
 pub const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
 const GPU_FULL_OFFLOAD: u32 = 999;
@@ -625,10 +627,14 @@ async fn list_hf_gguf_files(
         .collect())
 }
 
+/// Return the size for a Hugging Face sibling, preferring top-level `size`
+/// and falling back to `lfs.size` when needed.
 fn hf_sibling_size(sibling: &HfSibling) -> Option<u64> {
     sibling.size.or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
 }
 
+/// Build a temp file path by appending `.tmp` to the target filename.
+/// Falls back to `download.tmp` when no filename component exists.
 fn download_tmp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -637,6 +643,8 @@ fn download_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+/// Return already-downloaded bytes for a target path.
+/// Prefers a complete destination file, then a valid partial `.tmp` file.
 fn existing_bytes(path: &Path, expected_size: u64) -> Result<u64> {
     if path.exists() {
         let size = std::fs::metadata(path)
@@ -660,16 +668,22 @@ fn existing_bytes(path: &Path, expected_size: u64) -> Result<u64> {
     Ok(0)
 }
 
+/// Build a byte-oriented progress bar with elapsed time, percentage, and ETA.
+/// Validates that the starting position does not exceed the total.
 fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
+    if initial > total {
+        bail!("initial progress {initial} is greater than total {total}");
+    }
     let pb = ProgressBar::new(total);
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) ETA {eta_precise}",
-    )
+    let template = format!(
+        "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:{PROGRESS_BAR_WIDTH}.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{percent}}%) ETA {{eta_precise}}"
+    );
+    let style = ProgressStyle::with_template(&template)
     .context("failed to configure progress bar style")?
     .progress_chars("=>-");
     pb.set_style(style);
-    pb.set_position(initial.min(total));
-    pb.enable_steady_tick(Duration::from_millis(120));
+    pb.set_position(initial);
+    pb.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_MS));
     Ok(pb)
 }
 
@@ -781,6 +795,9 @@ async fn download_file_with_retry(
     }
 }
 
+/// Download a file to `path` with resume support via HTTP range requests.
+/// If the server ignores ranges and returns a full `200 OK`, the partial
+/// state is discarded and the transfer restarts from zero.
 async fn download_file_with_resume(
     client: &reqwest::Client,
     url: &str,
@@ -840,6 +857,8 @@ async fn download_file_with_resume(
         .error_for_status()
         .with_context(|| format!("download request failed for {url}"))?;
 
+    // Some servers ignore `Range` and return full content with `200 OK`.
+    // In that case we restart from zero and remove previously-accounted partial progress.
     if resume_from > 0 && response.status() == StatusCode::OK {
         progress.dec(resume_from);
         resume_from = 0;
@@ -1069,6 +1088,8 @@ fn blob_path(root: &Path, model: &str, digest: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn descriptors_include_config_then_layers() {
@@ -1212,8 +1233,65 @@ mod tests {
     }
 
     #[test]
+    fn hf_sibling_size_returns_none_when_unknown() {
+        let sibling = HfSibling {
+            rfilename: "model.gguf".to_owned(),
+            size: None,
+            lfs: None,
+        };
+        assert_eq!(hf_sibling_size(&sibling), None);
+    }
+
+    #[test]
     fn download_tmp_path_adds_tmp_suffix() {
         let path = Path::new("/tmp/model.gguf");
         assert_eq!(download_tmp_path(path), PathBuf::from("/tmp/model.gguf.tmp"));
+    }
+
+    #[test]
+    fn download_tmp_path_uses_default_when_no_filename() {
+        let path = Path::new("/");
+        assert_eq!(download_tmp_path(path), PathBuf::from("/download.tmp"));
+    }
+
+    #[test]
+    fn existing_bytes_prefers_complete_destination_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        fs::write(&dest, vec![0u8; 16]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 16);
+    }
+
+    #[test]
+    fn existing_bytes_uses_partial_tmp_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let tmp = download_tmp_path(&dest);
+        fs::write(&tmp, vec![0u8; 8]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 8);
+    }
+
+    #[test]
+    fn existing_bytes_returns_zero_when_no_state() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn existing_bytes_ignores_oversized_tmp_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let tmp = download_tmp_path(&dest);
+        fs::write(&tmp, vec![0u8; 32]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn build_progress_bar_initializes_position() {
+        let pb = build_progress_bar(100, 25).unwrap();
+        assert_eq!(pb.length(), Some(100));
+        assert_eq!(pb.position(), 25);
+        pb.finish_and_clear();
     }
 }
