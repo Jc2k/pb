@@ -1,7 +1,7 @@
 {
   "nodeModulesDir": "auto",
   "tasks": {
-    "build:web": "deno run --allow-all npm:@rsbuild/core/bin/rsbuild build"
+    "build:web": "deno run --allow-all npm:@rsbuild/core/rsbuild build"
   },
   "imports": {
     "@rsbuild/core": "npm:@rsbuild/core@^2.0.11",
