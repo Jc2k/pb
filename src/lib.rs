@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
-use reqwest::header::ACCEPT;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::header::{ACCEPT, RANGE};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -21,6 +23,8 @@ pub mod web;
 pub const DEFAULT_MODEL: &str = "hf://ggml-org/Qwen3-Coder-Next-GGUF";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
+const PROGRESS_BAR_WIDTH: usize = 40;
+const PROGRESS_TICK_MS: u64 = 120;
 pub const DEFAULT_AGENT_MAX_STEPS: usize = 12;
 pub const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
 const GPU_FULL_OFFLOAD: u32 = 999;
@@ -296,6 +300,13 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 struct HfSibling {
     rfilename: String,
+    size: Option<u64>,
+    lfs: Option<HfLfs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfLfs {
+    size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,7 +548,14 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         .context("failed to build HTTP client")?;
 
     if args.model.starts_with("hf://") {
-        pull_from_hf(&client, &args.model, &output_root, args.retries).await
+        pull_from_hf(
+            &client,
+            &args.model,
+            &output_root,
+            args.parallel,
+            args.retries,
+        )
+        .await
     } else {
         pull_from_ollama(&client, &args.model, &output_root, args.batch_size, args.parallel, args.retries).await
     }
@@ -589,7 +607,7 @@ async fn list_hf_gguf_files(
     client: &reqwest::Client,
     owner: &str,
     repo: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<HfSibling>> {
     let url = format!("{HF_ENDPOINT}/api/models/{owner}/{repo}");
     let info: HfModelInfo = client
         .get(&url)
@@ -605,28 +623,110 @@ async fn list_hf_gguf_files(
     Ok(info
         .siblings
         .into_iter()
-        .map(|s| s.rfilename)
-        .filter(|f| f.ends_with(".gguf"))
+        .filter(|s| s.rfilename.ends_with(".gguf"))
         .collect())
+}
+
+/// Return the size for a Hugging Face sibling, preferring top-level `size`
+/// and falling back to `lfs.size` when needed.
+fn hf_sibling_size(sibling: &HfSibling) -> Option<u64> {
+    sibling.size.or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
+}
+
+/// Build a temp file path by appending `.tmp` to the target filename.
+/// Falls back to `download.tmp` when no filename component exists.
+fn download_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| format!("{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| "download.tmp".to_owned());
+    path.with_file_name(file_name)
+}
+
+/// Return already-downloaded bytes for a target path.
+/// Prefers a complete destination file, then a valid partial `.tmp` file.
+fn existing_bytes(path: &Path, expected_size: u64) -> Result<u64> {
+    if path.exists() {
+        let size = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len();
+        if size == expected_size {
+            return Ok(size);
+        }
+    }
+
+    let tmp_path = download_tmp_path(path);
+    if tmp_path.exists() {
+        let size = std::fs::metadata(&tmp_path)
+            .with_context(|| format!("failed to stat {}", tmp_path.display()))?
+            .len();
+        if size < expected_size {
+            return Ok(size);
+        }
+    }
+
+    Ok(0)
+}
+
+/// Build a byte-oriented progress bar with elapsed time, percentage, and ETA.
+/// Validates that the starting position does not exceed the total.
+fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
+    if initial > total {
+        bail!("initial progress {initial} is greater than total {total}");
+    }
+    let pb = ProgressBar::new(total);
+    let template = format!(
+        "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:{PROGRESS_BAR_WIDTH}.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{percent}}%) ETA {{eta_precise}}"
+    );
+    let style = ProgressStyle::with_template(&template)
+    .context("failed to configure progress bar style")?
+    .progress_chars("=>-");
+    pb.set_style(style);
+    pb.set_position(initial);
+    pb.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_MS));
+    Ok(pb)
 }
 
 async fn pull_from_hf(
     client: &reqwest::Client,
     hf_uri: &str,
     output_root: &Path,
+    parallel: usize,
     retries: u32,
 ) -> Result<()> {
     let (owner, repo, explicit_filename) = parse_hf_uri(hf_uri)
         .with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
 
+    let siblings = list_hf_gguf_files(client, &owner, &repo).await?;
+    if siblings.is_empty() {
+        bail!("no GGUF files found in {owner}/{repo} on Hugging Face");
+    }
+
     let files = if let Some(f) = explicit_filename {
-        vec![f]
+        let sibling = siblings
+            .iter()
+            .find(|s| s.rfilename == f)
+            .with_context(|| format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face"))?;
+        let size = hf_sibling_size(sibling).with_context(|| {
+            format!("unable to determine content length for {owner}/{repo}/{}", sibling.rfilename)
+        })?;
+        vec![(f, size)]
     } else {
-        let all_gguf = list_hf_gguf_files(client, &owner, &repo).await?;
-        if all_gguf.is_empty() {
-            bail!("no GGUF files found in {owner}/{repo} on Hugging Face");
-        }
-        select_hf_gguf_files(&all_gguf)
+        let all_names: Vec<String> = siblings.iter().map(|s| s.rfilename.clone()).collect();
+        let selected = select_hf_gguf_files(&all_names);
+        selected
+            .into_iter()
+            .map(|filename| {
+                let sibling = siblings
+                    .iter()
+                    .find(|s| s.rfilename == filename)
+                    .with_context(|| format!("file metadata missing for {filename}"))?;
+                let size = hf_sibling_size(sibling).with_context(|| {
+                    format!("unable to determine content length for {owner}/{repo}/{filename}")
+                })?;
+                Ok((filename, size))
+            })
+            .collect::<Result<Vec<_>>>()?
     };
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
@@ -634,82 +734,153 @@ async fn pull_from_hf(
         format!("failed to create cache directory {}", cache_dir.display())
     })?;
 
-    let total = files.len();
-    for (i, filename) in files.iter().enumerate() {
+    let total_bytes: u64 = files.iter().map(|(_, size)| *size).sum();
+    let initial_bytes = files.iter().try_fold(0u64, |acc, (filename, size)| {
+        existing_bytes(&cache_dir.join(filename), *size).map(|n| acc + n)
+    })?;
+    let progress = build_progress_bar(total_bytes, initial_bytes)?;
+
+    let total_files = files.len();
+    let tasks = stream::iter(files.into_iter().map(|(filename, size)| {
+        let client = client.clone();
         let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
-        let dest = cache_dir.join(filename);
-        println!("Downloading {filename} ({}/{total})", i + 1);
-        download_hf_file_with_retry(client, &url, &dest, retries).await?;
-        println!("Progress: {}/{total} files downloaded", i + 1);
+        let dest = cache_dir.join(&filename);
+        let progress = progress.clone();
+        async move {
+            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries).await
+        }
+    }))
+    .buffer_unordered(parallel)
+    .collect::<Vec<_>>();
+
+    let results = tasks.await;
+    for result in results {
+        result?;
     }
 
+    progress.finish_with_message("download complete");
     println!(
-        "Pull complete: {total} file(s) available in {}",
+        "Pull complete: {total_files} file(s) available in {}",
         cache_dir.display()
     );
     Ok(())
 }
 
-async fn download_hf_file_with_retry(
+async fn download_file_with_retry(
     client: &reqwest::Client,
     url: &str,
     path: &Path,
+    expected_size: u64,
+    progress: &ProgressBar,
+    label: &str,
     retries: u32,
 ) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match download_hf_file(client, url, path).await {
+        match download_file_with_resume(client, url, path, expected_size, progress).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
                 eprintln!(
-                    "Download of {} failed (attempt {attempt}/{retries}): {err}",
-                    path.display()
+                    "Download of {label} failed (attempt {attempt}/{retries}): {err}"
                 );
                 sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!(
-                        "download of {} failed after {attempt} attempts",
-                        path.display()
-                    )
+                    format!("download of {label} failed after {attempt} attempts")
                 });
             }
         }
     }
 }
 
-async fn download_hf_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+/// Download a file to `path` with resume support via HTTP range requests.
+/// If the server ignores ranges and returns a full `200 OK`, the partial
+/// state is discarded and the transfer restarts from zero.
+async fn download_file_with_resume(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    expected_size: u64,
+    progress: &ProgressBar,
+) -> Result<()> {
     if path.exists() {
-        println!("Skipping existing file {}", path.display());
+        let metadata =
+            std::fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.len() == expected_size {
+            return Ok(());
+        }
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove stale file {}", path.display()))?;
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let tmp_path = download_tmp_path(path);
+    let mut resume_from = if tmp_path.exists() {
+        std::fs::metadata(&tmp_path)
+            .with_context(|| format!("failed to stat {}", tmp_path.display()))?
+            .len()
+    } else {
+        0
+    };
+    if resume_from > expected_size {
+        std::fs::remove_file(&tmp_path)
+            .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
+        resume_from = 0;
+    }
+    if resume_from == expected_size {
+        tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
         return Ok(());
     }
 
-    let file_name = path
-        .file_name()
-        .map(|n| format!("{}.tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| "download.tmp".to_owned());
-    let tmp_path = path.with_file_name(file_name);
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(RANGE, format!("bytes={resume_from}-"));
+    }
 
-    let response = client
-        .get(url)
+    let response = request
         .send()
         .await
         .with_context(|| format!("failed to request {url}"))?
         .error_for_status()
         .with_context(|| format!("download request failed for {url}"))?;
 
-    let expected_size = response.content_length();
-    if expected_size.is_none() {
-        eprintln!("Warning: no Content-Length for {url}; size verification will be skipped");
+    // Some servers ignore `Range` and return full content with `200 OK`.
+    // In that case we restart from zero and remove previously-accounted partial progress.
+    if resume_from > 0 && response.status() == StatusCode::OK {
+        progress.dec(resume_from);
+        resume_from = 0;
     }
 
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    let mut file = if resume_from > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| format!("failed to open {}", tmp_path.display()))?
+    } else {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?
+    };
 
-    let mut bytes_written = 0u64;
+    let mut bytes_written = resume_from;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -717,20 +888,19 @@ async fn download_hf_file(client: &reqwest::Client, url: &str, path: &Path) -> R
         file.write_all(&chunk)
             .await
             .with_context(|| format!("failed writing to {}", tmp_path.display()))?;
-        bytes_written += chunk.len() as u64;
+        let chunk_len = chunk.len() as u64;
+        bytes_written += chunk_len;
+        progress.inc(chunk_len);
     }
 
     file.flush().await.context("failed to flush file")?;
     drop(file);
 
-    if let Some(expected) = expected_size {
-        if bytes_written != expected {
-            tokio::fs::remove_file(&tmp_path).await.ok();
-            bail!(
-                "size mismatch for {}: expected {expected}, wrote {bytes_written}",
-                path.display()
-            );
-        }
+    if bytes_written != expected_size {
+        bail!(
+            "size mismatch for {}: expected {expected_size}, wrote {bytes_written}",
+            path.display()
+        );
     }
 
     tokio::fs::rename(&tmp_path, path).await.with_context(|| {
@@ -755,18 +925,28 @@ async fn pull_from_ollama(
     let manifest = fetch_manifest(client, model).await?;
     let descriptors = descriptors_from_manifest(manifest);
 
-    let total = descriptors.len();
-    let mut completed = 0usize;
+    let total_bytes: u64 = descriptors.iter().map(|d| d.size).sum();
+    let initial_bytes = descriptors.iter().try_fold(0u64, |acc, descriptor| {
+        existing_bytes(&blob_path(output_root, model, &descriptor.digest), descriptor.size)
+            .map(|n| acc + n)
+    })?;
+    let progress = build_progress_bar(total_bytes, initial_bytes)?;
 
     for batch in descriptors.chunks(batch_size) {
-        println!("Starting batch with {} blobs", batch.len());
-
         let futures = stream::iter(batch.iter().cloned().map(|descriptor| {
             let client = client.clone();
             let model = model.to_owned();
             let output_root = output_root.to_owned();
+            let progress = progress.clone();
             async move {
-                download_blob_with_retry(&client, &model, &output_root, &descriptor, retries)
+                download_blob_with_retry(
+                    &client,
+                    &model,
+                    &output_root,
+                    &descriptor,
+                    &progress,
+                    retries,
+                )
                     .await
             }
         }))
@@ -776,14 +956,13 @@ async fn pull_from_ollama(
         let results = futures.await;
         for result in results {
             result?;
-            completed += 1;
-            println!("Progress: {completed}/{total} blobs downloaded");
         }
     }
 
+    progress.finish_with_message("download complete");
     println!(
         "Pull complete: {} blobs available in {}",
-        total,
+        descriptors.len(),
         output_root.display()
     );
     Ok(())
@@ -818,13 +997,14 @@ async fn download_blob_with_retry(
     model: &str,
     output_root: &Path,
     descriptor: &ManifestDescriptor,
+    progress: &ProgressBar,
     retries: u32,
 ) -> Result<()> {
     let digest = descriptor.digest.clone();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match download_blob(client, model, output_root, &digest, descriptor.size).await {
+        match download_blob(client, model, output_root, &digest, descriptor.size, progress).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
                 eprintln!(
@@ -847,57 +1027,13 @@ async fn download_blob(
     output_root: &Path,
     digest: &str,
     expected_size: u64,
+    progress: &ProgressBar,
 ) -> Result<()> {
     let path = blob_path(output_root, model, digest);
-    if path.exists() {
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("failed to stat existing blob {}", path.display()))?;
-        if metadata.len() == expected_size {
-            println!("Skipping existing blob {}", path.display());
-            return Ok(());
-        }
-        eprintln!("Existing blob has wrong size, re-downloading: {}", path.display());
-        std::fs::remove_file(&path)
-            .with_context(|| format!("failed to remove stale blob {}", path.display()))?;
-    }
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create blob directory {}", parent.display()))?;
-    }
-
     let url = format!("{OLLAMA_REGISTRY}/v2/library/{model}/blobs/{digest}");
-    let response = client
-        .get(&url)
-        .send()
+    download_file_with_resume(client, &url, &path, expected_size, progress)
         .await
-        .with_context(|| format!("failed to request blob {digest}"))?
-        .error_for_status()
-        .with_context(|| format!("blob request failed for {digest}"))?;
-
-    let mut file = tokio::fs::File::create(&path)
-        .await
-        .with_context(|| format!("failed to create blob file {}", path.display()))?;
-
-    let mut bytes_written = 0u64;
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("failed reading stream for {digest}"))?;
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("failed writing blob {digest}"))?;
-        bytes_written += chunk.len() as u64;
-    }
-
-    file.flush().await.context("failed to flush blob file")?;
-
-    if bytes_written != expected_size {
-        bail!("blob {digest} size mismatch: expected {expected_size}, wrote {bytes_written}");
-    }
-
-    Ok(())
+        .with_context(|| format!("blob request failed for {digest}"))
 }
 
 fn release_target() -> String {
@@ -952,6 +1088,8 @@ fn blob_path(root: &Path, model: &str, digest: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn descriptors_include_config_then_layers() {
@@ -1072,5 +1210,88 @@ mod tests {
     fn parse_hf_uri_returns_none_for_invalid() {
         assert!(parse_hf_uri("ollama://model").is_none());
         assert!(parse_hf_uri("hf://only-owner").is_none());
+    }
+
+    #[test]
+    fn hf_sibling_size_prefers_top_level_size() {
+        let sibling = HfSibling {
+            rfilename: "model.gguf".to_owned(),
+            size: Some(42),
+            lfs: Some(HfLfs { size: Some(99) }),
+        };
+        assert_eq!(hf_sibling_size(&sibling), Some(42));
+    }
+
+    #[test]
+    fn hf_sibling_size_falls_back_to_lfs_size() {
+        let sibling = HfSibling {
+            rfilename: "model.gguf".to_owned(),
+            size: None,
+            lfs: Some(HfLfs { size: Some(99) }),
+        };
+        assert_eq!(hf_sibling_size(&sibling), Some(99));
+    }
+
+    #[test]
+    fn hf_sibling_size_returns_none_when_unknown() {
+        let sibling = HfSibling {
+            rfilename: "model.gguf".to_owned(),
+            size: None,
+            lfs: None,
+        };
+        assert_eq!(hf_sibling_size(&sibling), None);
+    }
+
+    #[test]
+    fn download_tmp_path_adds_tmp_suffix() {
+        let path = Path::new("/tmp/model.gguf");
+        assert_eq!(download_tmp_path(path), PathBuf::from("/tmp/model.gguf.tmp"));
+    }
+
+    #[test]
+    fn download_tmp_path_uses_default_when_no_filename() {
+        let path = Path::new("/");
+        assert_eq!(download_tmp_path(path), PathBuf::from("/download.tmp"));
+    }
+
+    #[test]
+    fn existing_bytes_prefers_complete_destination_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        fs::write(&dest, vec![0u8; 16]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 16);
+    }
+
+    #[test]
+    fn existing_bytes_uses_partial_tmp_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let tmp = download_tmp_path(&dest);
+        fs::write(&tmp, vec![0u8; 8]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 8);
+    }
+
+    #[test]
+    fn existing_bytes_returns_zero_when_no_state() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn existing_bytes_ignores_oversized_tmp_file() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let tmp = download_tmp_path(&dest);
+        fs::write(&tmp, vec![0u8; 32]).unwrap();
+        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn build_progress_bar_initializes_position() {
+        let pb = build_progress_bar(100, 25).unwrap();
+        assert_eq!(pb.length(), Some(100));
+        assert_eq!(pb.position(), 25);
+        pb.finish_and_clear();
     }
 }

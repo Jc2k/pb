@@ -1193,6 +1193,7 @@ dependencies = [
  "dirs",
  "encoding_rs",
  "futures",
+ "indicatif",
  "llama-cpp-2",
  "mime_guess",
  "regex",
