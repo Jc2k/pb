@@ -15,6 +15,7 @@ pub mod container;
 pub mod environment;
 pub mod events;
 pub mod init;
+pub mod service;
 pub mod web;
 
 pub const DEFAULT_MODEL: &str = "qwen3-coder-next";
@@ -50,6 +51,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Manage the pb serve launchd service (macOS)
+    #[command(name = "service")]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Inspect a project and configure it for use with pb
     Init(InitArgs),
 }
@@ -70,6 +77,18 @@ pub enum EnvCommand {
     Start(EnvWorkdirArgs),
     /// Show the current project environment configuration
     Status(EnvWorkdirArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Write a LaunchAgent plist and load it so pb serve runs on login
+    Enable(ServeArgs),
+    /// Unload the LaunchAgent and remove the plist
+    Disable,
+    /// Start the pb serve service immediately
+    Start,
+    /// Stop the pb serve service
+    Stop,
 }
 
 #[derive(Args, Debug)]
@@ -310,6 +329,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Env { command } => run_env_command(command),
+        Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir),
     }
 }
@@ -358,6 +378,15 @@ fn run_env_command(command: EnvCommand) -> Result<()> {
         EnvCommand::Build(args) => env_build(args),
         EnvCommand::Start(args) => env_start(args),
         EnvCommand::Status(args) => env_status(args),
+    }
+}
+
+fn run_service_command(command: ServiceCommand) -> Result<()> {
+    match command {
+        ServiceCommand::Enable(args) => service::enable(&args),
+        ServiceCommand::Disable => service::disable(),
+        ServiceCommand::Start => service::start(),
+        ServiceCommand::Stop => service::stop(),
     }
 }
 
