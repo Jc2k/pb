@@ -10,6 +10,7 @@ clap = { version = "4.5.8", features = ["derive"] }
 dirs = "5.0.1"
 encoding_rs = "0.8.35"
 futures = "0.3.30"
+indicatif = "0.17.11"
 llama-cpp-2 = "0.1.146"
 mime_guess = "2.0.5"
 regex = "1.12.4"
