@@ -133,7 +133,13 @@ pub fn enable(args: &ServeArgs) -> Result<()> {
         println!("Wrote {}", plist.display());
 
         let status = Command::new("launchctl")
-            .args(["load", "-w", plist.to_str().unwrap()])
+            .args([
+                "load",
+                "-w",
+                plist
+                    .to_str()
+                    .context("plist path contains invalid UTF-8")?,
+            ])
             .status()
             .context("failed to run launchctl")?;
         if !status.success() {
@@ -157,7 +163,13 @@ pub fn disable() -> Result<()> {
 
         if plist.exists() {
             let status = Command::new("launchctl")
-                .args(["unload", "-w", plist.to_str().unwrap()])
+                .args([
+                    "unload",
+                    "-w",
+                    plist
+                        .to_str()
+                        .context("plist path contains invalid UTF-8")?,
+                ])
                 .status()
                 .context("failed to run launchctl")?;
             if !status.success() {
