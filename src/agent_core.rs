@@ -353,7 +353,7 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     prompt.push_str("<conversation>\n");
     for message in messages {
-        prompt.push_str("[");
+        prompt.push('[');
         prompt.push_str(message.role);
         prompt.push_str("]\n");
         prompt.push_str(&message.content);
@@ -388,7 +388,7 @@ fn generate_completion(
 
     let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
     let last_index = (tokens.len().saturating_sub(1)) as i32;
-    for (i, token) in (0_i32..).zip(tokens.into_iter()) {
+    for (i, token) in (0_i32..).zip(tokens) {
         let is_last = i == last_index;
         batch
             .add(token, i, &[0], is_last)
@@ -511,15 +511,19 @@ fn run_tool<S: EventSink>(
                 .with_context(|| format!("failed to read {}", resolved.display()))?;
 
             let lines: Vec<_> = text.lines().collect();
-            if let Some(end) = end {
-                if (end as usize) < start {
+            if let Some(end) = end
+                && (end as usize) < start {
                     return Ok("(no content in requested range)".to_string());
                 }
-            }
             let end_line = end.map_or(lines.len(), |v| v as usize).max(start);
             let mut out = String::new();
-            for idx in (start.saturating_sub(1))..lines.len().min(end_line) {
-                out.push_str(&format!("{}: {}\n", idx + 1, lines[idx]));
+            for (idx, line) in lines
+                .iter()
+                .enumerate()
+                .take(lines.len().min(end_line))
+                .skip(start.saturating_sub(1))
+            {
+                out.push_str(&format!("{}: {}\n", idx + 1, line));
             }
             if out.is_empty() {
                 out.push_str("(no content in requested range)");
@@ -864,11 +868,10 @@ fn validate_public_web_url(url: &Url) -> Result<()> {
     {
         bail!("local network URLs are not allowed");
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) {
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_private_ip(ip) {
             bail!("private or loopback IP URLs are not allowed");
         }
-    }
     Ok(())
 }
 
@@ -965,15 +968,13 @@ fn normalize_search_result_url(raw_url: &str) -> String {
     if joined
         .host_str()
         .is_some_and(|host| host.ends_with("duckduckgo.com"))
-    {
-        if let Some(target) = joined
+        && let Some(target) = joined
             .query_pairs()
             .find(|(key, _)| key == "uddg")
             .map(|(_, value)| value.into_owned())
         {
             return target;
         }
-    }
 
     joined.to_string()
 }
@@ -998,8 +999,8 @@ fn decode_html_entities(input: &str) -> String {
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index] == b'&' {
-            if let Some(end) = input[index..].find(';') {
+        if bytes[index] == b'&'
+            && let Some(end) = input[index..].find(';') {
                 let entity = &input[index + 1..index + end];
                 if let Some(decoded) = decode_html_entity(entity) {
                     output.push(decoded);
@@ -1007,7 +1008,6 @@ fn decode_html_entities(input: &str) -> String {
                     continue;
                 }
             }
-        }
         if let Some(ch) = input[index..].chars().next() {
             output.push(ch);
             index += ch.len_utf8();

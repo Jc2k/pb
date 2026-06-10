@@ -4,16 +4,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EnvironmentMode {
+    #[default]
     Pull,
     Build,
 }
 
-impl Default for EnvironmentMode {
-    fn default() -> Self {
-        EnvironmentMode::Pull
-    }
-}
 
 /// Project environment configuration stored at `.pb/environment.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

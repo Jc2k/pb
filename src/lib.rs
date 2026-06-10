@@ -700,11 +700,10 @@ fn default_gpu_layers() -> u32 {
 }
 
 fn default_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty() {
             return PathBuf::from(xdg).join("pb");
         }
-    }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local").join("share").join("pb");
     }

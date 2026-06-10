@@ -48,12 +48,11 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     let dc_json_top = root.join("devcontainer.json");
     for dc_path in [&dc_json, &dc_json_top] {
         if dc_path.exists() {
-            if let Ok(text) = std::fs::read_to_string(dc_path) {
-                if let Some((image, inits)) = parse_devcontainer_json(&text) {
+            if let Ok(text) = std::fs::read_to_string(dc_path)
+                && let Some((image, inits)) = parse_devcontainer_json(&text) {
                     info.devcontainer_image = Some(image);
                     info.devcontainer_init_commands = inits;
                 }
-            }
             break;
         }
     }
@@ -65,11 +64,10 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
 
     // --- GitLab CI ---
     let gitlab_ci = root.join(".gitlab-ci.yml");
-    if gitlab_ci.exists() {
-        if let Ok(text) = std::fs::read_to_string(&gitlab_ci) {
+    if gitlab_ci.exists()
+        && let Ok(text) = std::fs::read_to_string(&gitlab_ci) {
             info.gitlab_ci_image = parse_gitlab_ci_image(&text);
         }
-    }
 
     // --- Language ecosystems ---
     info.has_cargo_toml = root.join("Cargo.toml").exists();
