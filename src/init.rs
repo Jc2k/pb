@@ -359,31 +359,43 @@ fn parse_devcontainer_json(text: &str) -> Option<(String, Vec<String>)> {
 fn strip_jsonc_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
-    let mut prev = '\0';
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        match ch {
-            '"' if prev != '\\' => {
-                in_string = !in_string;
-                out.push(ch);
+        if in_string {
+            out.push(ch);
+            if ch == '\\' {
+                // consume and pass through the escaped character — handles
+                // all sequences: `\"`, `\\`, `\/`, etc. correctly including
+                // `\\"` where the second `"` ends the string.
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if ch == '"' {
+                in_string = false;
             }
-            '/' if !in_string => {
-                if chars.peek() == Some(&'/') {
-                    // consume rest of line
-                    for c in chars.by_ref() {
-                        if c == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                } else {
+        } else {
+            match ch {
+                '"' => {
+                    in_string = true;
                     out.push(ch);
                 }
+                '/' => {
+                    if chars.peek() == Some(&'/') {
+                        // consume rest of line
+                        for c in chars.by_ref() {
+                            if c == '\n' {
+                                out.push('\n');
+                                break;
+                            }
+                        }
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                _ => out.push(ch),
             }
-            _ => out.push(ch),
         }
-        prev = ch;
     }
     out
 }
@@ -432,6 +444,16 @@ mod tests {
         let stripped = strip_jsonc_comments(input);
         let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
         assert_eq!(v["image"], "foo");
+    }
+
+    #[test]
+    fn strip_jsonc_handles_escaped_backslash_before_quote() {
+        // "path" value contains `\\` (escaped backslash); the following `"`
+        // must be treated as closing the string, not as an escaped quote.
+        let input = r#"{ "path": "C:\\\\foo", "image": "bar" }"#;
+        let stripped = strip_jsonc_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(v["image"], "bar");
     }
 
     // ── devcontainer parsing ──
