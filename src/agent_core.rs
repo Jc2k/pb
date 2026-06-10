@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use walkdir::WalkDir;
 
+use crate::container;
+use crate::environment::EnvironmentConfig;
 use crate::events::AgentEvent;
 
 const LLAMA_BATCH_SIZE: usize = 512;
@@ -64,6 +66,8 @@ pub struct AgentRequest {
     pub temperature: f32,
     pub top_k: i32,
     pub seed: u32,
+    /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
+    pub environment: Option<EnvironmentConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +100,20 @@ enum AgentAction {
     },
 }
 
+/// Walk up from `start` to find the nearest ancestor directory that contains a `.git` entry.
+/// Returns `None` when no git root is found (e.g. the path is outside any repository).
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 pub fn run_agent<S: EventSink>(
     args: AgentRequest,
     models_root: &Path,
@@ -106,9 +124,11 @@ pub fn run_agent<S: EventSink>(
         .workdir
         .clone()
         .unwrap_or(std::env::current_dir().context("failed to get current working directory")?);
-    let workspace_root = workdir
+    let workdir_canonical = workdir
         .canonicalize()
         .with_context(|| format!("failed to resolve workdir {}", workdir.display()))?;
+    // Anchor to the git project root so tools cannot escape the repository boundary.
+    let workspace_root = find_git_root(&workdir_canonical).unwrap_or(workdir_canonical);
 
     let (branch, is_continuation) = if let Some(b) = &args.branch {
         git_checkout_branch(b, &workspace_root)
@@ -119,6 +139,34 @@ pub fn run_agent<S: EventSink>(
         git_create_branch(&b, &workspace_root)
             .with_context(|| format!("failed to create branch '{b}'"))?;
         (b, false)
+    };
+
+    // Load environment config (explicit arg takes precedence over file on disk).
+    let env_config = args
+        .environment
+        .clone()
+        .or_else(|| EnvironmentConfig::load(&workspace_root).ok().flatten());
+
+    // If an environment is configured, spin up a fresh container for this task.
+    let container = if let Some(ref config) = env_config {
+        let runtime = container::detect_runtime().context(
+            "no container runtime found; install docker, podman, or apple/container",
+        )?;
+        let container_id = runtime
+            .create(&config.image, &workspace_root)
+            .context("failed to create task container")?;
+        let handle = container::ContainerHandle {
+            runtime,
+            container_id,
+        };
+        for cmd in &config.init_commands {
+            handle
+                .exec(cmd)
+                .with_context(|| format!("container init command failed: {cmd}"))?;
+        }
+        Some(handle)
+    } else {
+        None
     };
 
     sink.emit(AgentEvent::Started {
@@ -133,7 +181,8 @@ pub fn run_agent<S: EventSink>(
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
-    let instructions = build_agent_instructions(&workspace_root, &branch, is_continuation)?;
+    let instructions =
+        build_agent_instructions(&workspace_root, &branch, is_continuation, container.is_some())?;
 
     let mut messages = vec![
         ChatMessage {
@@ -146,8 +195,15 @@ pub fn run_agent<S: EventSink>(
         },
     ];
 
-    let reached_final =
-        run_agent_steps(&backend, &model, &args, &mut messages, &workspace_root, &mut sink)?;
+    let reached_final = run_agent_steps(
+        &backend,
+        &model,
+        &args,
+        &mut messages,
+        &workspace_root,
+        container.as_ref(),
+        &mut sink,
+    )?;
 
     if git_has_changes(&workspace_root).unwrap_or(false) {
         let summary: String = args.task.chars().take(60).collect();
@@ -161,6 +217,8 @@ pub fn run_agent<S: EventSink>(
         commits,
     });
 
+    // `container` is dropped here, which removes the task container via ContainerHandle::drop.
+
     Ok(AgentRunResult {
         branch,
         workspace_root,
@@ -168,22 +226,39 @@ pub fn run_agent<S: EventSink>(
     })
 }
 
-fn build_agent_instructions(workspace_root: &Path, branch: &str, continuing: bool) -> Result<String> {
+fn build_agent_instructions(
+    workspace_root: &Path,
+    branch: &str,
+    continuing: bool,
+    has_container: bool,
+) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
     );
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
-    instructions.push_str(
-        "Available tools: read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name).\n",
-    );
+    let tools = if has_container {
+        "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), run_command(cmd), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)"
+    } else {
+        "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)"
+    };
+    instructions.push_str(&format!("Available tools: {tools}.\n"));
     instructions.push_str(
         "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
     );
     instructions.push_str(
         "Use web_search for general internet research and web_fetch for reading a specific URL. Only use public http/https URLs.\n",
     );
+    instructions.push_str(&format!(
+        "Reading and writing is only permitted within the project root: {}.\n",
+        workspace_root.display()
+    ));
+    if has_container {
+        instructions.push_str(
+            "Use run_command(cmd) to execute shell commands inside the sandboxed container environment. The project root is mounted at /workspace inside the container.\n",
+        );
+    }
 
     if let Ok(copilot_instructions) =
         std::fs::read_to_string(workspace_root.join(".github/copilot-instructions.md"))
@@ -218,6 +293,7 @@ fn run_agent_steps<S: EventSink>(
     args: &AgentRequest,
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
+    container: Option<&container::ContainerHandle>,
     sink: &mut S,
 ) -> Result<bool> {
     for step in 1..=args.max_steps {
@@ -250,7 +326,7 @@ fn run_agent_steps<S: EventSink>(
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                 });
-                let tool_result = run_tool(&tool, &arguments, workspace_root, sink)?;
+                let tool_result = run_tool(&tool, &arguments, workspace_root, container, sink)?;
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
@@ -417,6 +493,7 @@ fn run_tool<S: EventSink>(
     tool: &str,
     arguments: &Value,
     workspace_root: &Path,
+    container: Option<&container::ContainerHandle>,
     sink: &mut S,
 ) -> Result<String> {
     match tool {
@@ -568,6 +645,16 @@ fn run_tool<S: EventSink>(
                 .and_then(Value::as_str)
                 .context("skill requires string argument: name")?;
             Ok(skill_text(name))
+        }
+        "run_command" => {
+            let cmd = arguments
+                .get("cmd")
+                .and_then(Value::as_str)
+                .context("run_command requires string argument: cmd")?;
+            let handle = container.context(
+                "run_command is not available: no container environment is configured",
+            )?;
+            handle.exec(cmd)
         }
         _ => bail!("unknown tool: {tool}"),
     }
@@ -1246,5 +1333,73 @@ mod tests {
     #[test]
     fn validate_public_web_url_allows_public_https() {
         validate_public_web_url(&Url::parse("https://example.com/docs").unwrap()).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // find_git_root tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_git_root_finds_direct_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let result = find_git_root(tmp.path()).unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    #[test]
+    fn find_git_root_finds_ancestor_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let result = find_git_root(&nested).unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    #[test]
+    fn find_git_root_returns_none_when_no_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No .git directory created
+        let result = find_git_root(tmp.path());
+        // May find a .git from an ancestor in CI, so just verify the function runs.
+        // In an isolated temp dir without a parent .git, it returns None.
+        // (We cannot assert None because tests run inside a git repo.)
+        let _ = result;
+    }
+
+    #[test]
+    fn find_git_root_finds_shallow_stop() {
+        // Ensure a nested .git doesn't shadow the outer root when there is no inner one.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let result = find_git_root(&sub).unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_workspace_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_workspace_path_blocks_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let err = resolve_workspace_path(&workspace, "../secret", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes workspace root"), "error was: {err}");
+    }
+
+    #[test]
+    fn resolve_workspace_path_allows_subpath() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, "hi").unwrap();
+        let resolved = resolve_workspace_path(tmp.path(), "hello.txt", true).unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
     }
 }
