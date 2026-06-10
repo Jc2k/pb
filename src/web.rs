@@ -203,7 +203,7 @@ async fn list_sessions(
             updated_at_ms: session.updated_at_ms,
         })
         .collect::<Vec<_>>();
-    items.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
     Json(items)
 }
 
