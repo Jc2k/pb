@@ -686,7 +686,11 @@ async fn download_hf_file(client: &reqwest::Client, url: &str, path: &Path) -> R
         return Ok(());
     }
 
-    let tmp_path = path.with_extension("gguf.tmp");
+    let file_name = path
+        .file_name()
+        .map(|n| format!("{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| "download.tmp".to_owned());
+    let tmp_path = path.with_file_name(file_name);
 
     let response = client
         .get(url)
@@ -697,6 +701,9 @@ async fn download_hf_file(client: &reqwest::Client, url: &str, path: &Path) -> R
         .with_context(|| format!("download request failed for {url}"))?;
 
     let expected_size = response.content_length();
+    if expected_size.is_none() {
+        eprintln!("Warning: no Content-Length for {url}; size verification will be skipped");
+    }
 
     let mut file = tokio::fs::File::create(&tmp_path)
         .await
