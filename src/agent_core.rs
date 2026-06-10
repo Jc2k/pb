@@ -641,21 +641,30 @@ fn block_on_tool<F>(future: F) -> Result<String>
 where
     F: Future<Output = Result<String>>,
 {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to start runtime for web tool")?
-        .block_on(future)
+    tool_runtime()?.block_on(future)
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(TOOL_USER_AGENT)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .context("failed to build web client")
+fn tool_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_try_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to start runtime for web tool")
+    })
+}
+
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_try_init(|| {
+        reqwest::Client::builder()
+            .user_agent(TOOL_USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .context("failed to build web client")
+    })
 }
 
 async fn run_web_search(query: &str) -> Result<String> {
@@ -664,8 +673,7 @@ async fn run_web_search(query: &str) -> Result<String> {
         bail!("web_search query must not be empty");
     }
 
-    let client = http_client()?;
-    let response = client
+    let response = http_client()?
         .get("https://duckduckgo.com/html/")
         .query(&[("q", query)])
         .send()
@@ -687,8 +695,7 @@ async fn run_web_search(query: &str) -> Result<String> {
 
 async fn run_web_fetch(url: &str) -> Result<String> {
     let url = parse_public_web_url(url)?;
-    let client = http_client()?;
-    let response = client
+    let response = http_client()?
         .get(url.clone())
         .send()
         .await
@@ -902,9 +909,12 @@ fn decode_html_entities(input: &str) -> String {
                 }
             }
         }
-        let ch = input[index..].chars().next().unwrap();
-        output.push(ch);
-        index += ch.len_utf8();
+        if let Some(ch) = input[index..].chars().next() {
+            output.push(ch);
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
     }
 
     output
@@ -1169,6 +1179,20 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_deduplicates_urls() {
+        let html = r#"
+        <a class="result__a" href="https://example.com/one">First</a>
+        <a class="result__a" href="https://example.com/one">Duplicate</a>
+        "#;
+
+        let results = parse_duckduckgo_results(html);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "First");
+        assert_eq!(results[0].url, "https://example.com/one");
     }
 
     #[test]
