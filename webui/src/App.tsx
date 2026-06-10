@@ -316,8 +316,11 @@ function HomePage() {
 
   return (
     <>
-      <nav className="navbar bg-body-secondary border-bottom px-3 py-2 mb-3">
-        <span className="navbar-brand fw-bold mb-0 h5">pb</span>
+      <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
+        <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
+          <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+          pb
+        </span>
       </nav>
 
       <div className="container-fluid px-3 pb-4">
@@ -467,15 +470,18 @@ function SessionPage({ sessionId }: { sessionId: string }) {
 
   return (
     <>
-      <nav className="navbar bg-body-secondary border-bottom px-3 py-2 mb-3">
+      <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
         <button
           type="button"
-          className="btn btn-sm btn-outline-secondary me-3"
+          className="btn btn-sm btn-outline-light me-3"
           onClick={() => navigate("/")}
         >
           ← Back
         </button>
-        <span className="navbar-brand fw-bold mb-0 h5">pb</span>
+        <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
+          <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+          pb
+        </span>
         {session && (
           <span className="navbar-text small text-body-secondary ms-auto">
             {session.running ? (
