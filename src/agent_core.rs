@@ -1110,7 +1110,7 @@ fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
 }
 
 pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
-    let model_dir = pull_root.join(model);
+    let model_dir = pull_root.join(crate::cache_dir_name(model));
 
     if !model_dir.exists() {
         bail!(
