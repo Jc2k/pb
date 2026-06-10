@@ -17,13 +17,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
         with:
-          node-version: 22
+          deno-version: v2.x
+
+      - name: Install dependencies
+        run: deno install
 
       - name: Build web UI assets
-        run: npm run build:web
+        run: deno task build:web
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -74,13 +77,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
         with:
-          node-version: 22
+          deno-version: v2.x
+
+      - name: Install dependencies
+        run: deno install
 
       - name: Build web UI assets
-        run: npm run build:web
+        run: deno task build:web
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
