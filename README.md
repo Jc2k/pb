@@ -7,6 +7,7 @@ A local coding agent CLI with an optional web front end.
 - `pb self update` - self update from the latest GitHub release binary.
 - `pb pull [model]` - pull model blobs with retry, batching, and parallel download.
 - `pb agent <task> --model-dir /absolute/path/to/models --workdir /absolute/path/to/repo` - run the local in-process coding agent with streamed output and follow-up prompts.
+- the local agent can use built-in workspace editing tools plus read-only `web_search(query)` and `web_fetch(url)` actions for public web research.
 - `pb serve` - start a Rust web server and serve the embedded SPA for browser-based sessions.
 
 ## Web UI (`pb serve`)
