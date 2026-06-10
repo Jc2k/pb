@@ -14,6 +14,7 @@ pub mod cli_ui;
 pub mod container;
 pub mod environment;
 pub mod events;
+pub mod init;
 pub mod web;
 
 pub const DEFAULT_MODEL: &str = "qwen3-coder-next";
@@ -49,6 +50,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Inspect a project and configure it for use with pb
+    Init(InitArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -104,6 +107,13 @@ pub struct EnvBuildArgs {
 
 #[derive(Args, Debug)]
 pub struct EnvWorkdirArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
     /// Project root; defaults to the nearest git repository root
     #[arg(long)]
     pub workdir: Option<PathBuf>,
@@ -300,6 +310,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Env { command } => run_env_command(command),
+        Commands::Init(args) => init::run_init(args.workdir),
     }
 }
 
