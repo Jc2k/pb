@@ -23,7 +23,7 @@ A local coding agent CLI with an optional web front end.
 ## Build and test
 
 ```bash
-npm run build:web
+deno task build:web
 cargo test --all-targets
 cargo build --release
 ```

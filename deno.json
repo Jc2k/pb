@@ -1,0 +1,13 @@
+{
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "build:web": "deno run --allow-all npm:@rsbuild/core/bin/rsbuild build"
+  },
+  "imports": {
+    "@rsbuild/core": "npm:@rsbuild/core@^2.0.11",
+    "@rsbuild/plugin-react": "npm:@rsbuild/plugin-react@^2.0.1",
+    "bootstrap": "npm:bootstrap@^5.3.8",
+    "react": "npm:react@^19.2.7",
+    "react-dom": "npm:react-dom@^19.2.7"
+  }
+}

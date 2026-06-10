@@ -1,21 +1,5 @@
 {
   "name": "pb-release",
   "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "build:web": "rsbuild build"
-  },
-  "dependencies": {
-    "bootstrap": "^5.3.8",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
-  },
-  "devDependencies": {
-    "@rsbuild/core": "^2.0.11",
-    "@rsbuild/plugin-react": "^2.0.1",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
-    "typescript": "^5.8.3"
-  }
+  "version": "0.0.0"
 }
