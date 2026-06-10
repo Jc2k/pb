@@ -63,6 +63,7 @@ struct SessionListItem {
     task: String,
     running: bool,
     branch: Option<String>,
+    workdir: Option<String>,
     updated_at_ms: u128,
 }
 
@@ -106,6 +107,7 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/events", get(session_events))
+        .route("/api/projects", get(list_projects))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state((state, defaults));
@@ -200,6 +202,10 @@ async fn list_sessions(
             task: session.task.clone(),
             running: session.running,
             branch: session.branch.clone(),
+            workdir: session
+                .workdir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             updated_at_ms: session.updated_at_ms,
         })
         .collect::<Vec<_>>();
@@ -228,6 +234,20 @@ async fn get_session(
         branch: session.branch.clone(),
         events,
     }))
+}
+
+async fn list_projects(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Json<Vec<String>> {
+    let sessions = state.sessions.lock().await;
+    let mut projects: Vec<String> = sessions
+        .values()
+        .filter_map(|s| s.workdir.as_ref())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    projects.sort();
+    projects.dedup();
+    Json(projects)
 }
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {

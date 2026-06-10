@@ -11,28 +11,55 @@ body {
   padding-left: env(safe-area-inset-left);
 }
 
-.main-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1rem;
+.event-feed {
+  max-height: calc(100vh - 260px);
+  min-height: 300px;
 }
 
-.log-box {
-  height: 68vh;
-  overflow: auto;
-  background: #fff;
-  border: 1px solid #dee2e6;
-  border-radius: 0.5rem;
-  padding: 0.75rem;
-}
-
-.mono {
+/* diff viewer */
+.diff-block {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  white-space: pre-wrap;
+  font-size: 0.8125rem;
+  white-space: pre;
+  overflow-x: auto;
+  padding: 0.75rem;
+  margin: 0;
 }
 
-@media (max-width: 992px) {
-  .main-grid {
-    grid-template-columns: 1fr;
-  }
+.diff-add {
+  color: var(--bs-success);
+}
+
+.diff-del {
+  color: var(--bs-danger);
+}
+
+.diff-hunk {
+  color: var(--bs-info);
+}
+
+/* tool result scroll cap */
+.result-pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* collapsible details/summary */
+details > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+details > summary::before {
+  content: "▶ ";
+  font-size: 0.6875rem;
+  opacity: 0.5;
+}
+
+details[open] > summary::before {
+  content: "▼ ";
 }
