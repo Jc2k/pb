@@ -1,4 +1,9 @@
+import type React from "react";
 import { useEffect, useRef, useState } from "react";
+
+/* ─── constants ──────────────────────────────────────────────── */
+
+const SCROLL_THRESHOLD = 80;
 
 /* ─── types ──────────────────────────────────────────────────── */
 
@@ -243,8 +248,6 @@ function SessionCard({
 
 /* ─── main app ───────────────────────────────────────────────── */
 
-import type React from "react";
-
 export default function App() {
   const [task, setTask] = useState("");
   const [workdir, setWorkdir] = useState("");
@@ -347,7 +350,7 @@ export default function App() {
   const onFeedScroll = () => {
     const el = feedRef.current;
     if (!el) return;
-    atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
+    atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD;
   };
 
   useEffect(() => {
@@ -364,6 +367,8 @@ export default function App() {
       window.clearInterval(timer);
       sourceRef.current?.close();
     };
+    // fetchSessions and fetchProjects are stable async closures defined in
+    // this component; we intentionally run them only once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
