@@ -805,7 +805,7 @@ fn is_private_ip(ip: IpAddr) -> bool {
 }
 
 fn is_shared_v4(ip: Ipv4Addr) -> bool {
-    matches!(ip.octets(), [100, second, ..] if (64..=127).contains(&second))
+    matches!(ip.octets(), [100, second_octet, ..] if (64..=127).contains(&second_octet))
 }
 
 fn is_documentation_v6(ip: Ipv6Addr) -> bool {
@@ -1206,6 +1206,14 @@ mod tests {
     }
 
     #[test]
+    fn normalize_search_result_url_unwraps_duckduckgo_redirect() {
+        let url = normalize_search_result_url(
+            "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs",
+        );
+        assert_eq!(url, "https://example.com/docs");
+    }
+
+    #[test]
     fn html_to_text_strips_tags_and_decodes_entities() {
         let html = "<div>Hello <strong>world</strong> &amp; universe</div>";
         assert_eq!(html_to_text(html), "Hello world & universe");
@@ -1217,6 +1225,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local network URLs are not allowed"));
+    }
+
+    #[test]
+    fn validate_public_web_url_rejects_embedded_credentials() {
+        let err = validate_public_web_url(&Url::parse("http://user@example.com").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("embedded credentials"));
+    }
+
+    #[test]
+    fn validate_public_web_url_rejects_shared_ipv4_range() {
+        let err = validate_public_web_url(&Url::parse("https://100.64.0.1").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private or loopback IP"));
     }
 
     #[test]
