@@ -18,8 +18,9 @@ pub mod init;
 pub mod service;
 pub mod web;
 
-pub const DEFAULT_MODEL: &str = "qwen3-coder-next";
+pub const DEFAULT_MODEL: &str = "hf://ggml-org/Qwen3-Coder-Next-GGUF";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
+const HF_ENDPOINT: &str = "https://huggingface.co";
 pub const DEFAULT_AGENT_MAX_STEPS: usize = 12;
 pub const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
 const GPU_FULL_OFFLOAD: u32 = 999;
@@ -39,7 +40,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: SelfCommand,
     },
-    /// Pull model blobs from the Ollama-compatible registry
+    /// Pull model blobs from the Ollama-compatible registry or Hugging Face (hf://owner/repo)
     Pull(PullArgs),
     /// Run a local in-process coding agent and stream progress
     Agent(AgentArgs),
@@ -140,7 +141,8 @@ pub struct InitArgs {
 
 #[derive(Args, Debug)]
 pub struct PullArgs {
-    /// Model name in Ollama library
+    /// Model to pull: Ollama library name (e.g. qwen3-coder-next) or Hugging Face URI
+    /// (e.g. hf://ggml-org/Qwen3-Coder-Next-GGUF or hf://owner/repo/filename.gguf)
     #[arg(default_value = DEFAULT_MODEL)]
     pub model: String,
 
@@ -166,7 +168,8 @@ pub struct AgentArgs {
     /// Task to execute
     pub task: String,
 
-    /// Model name in Ollama format (e.g. qwen3-coder-next); looked up in the pull cache
+    /// Model identifier: Ollama name (e.g. qwen3-coder-next) or Hugging Face URI
+    /// (e.g. hf://ggml-org/Qwen3-Coder-Next-GGUF); looked up in the pull cache
     #[arg(long, default_value = DEFAULT_MODEL)]
     pub model: String,
 
@@ -288,6 +291,16 @@ struct ManifestDescriptor {
 struct Manifest {
     config: ManifestDescriptor,
     layers: Vec<ManifestDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfSibling {
+    rfilename: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfModelInfo {
+    siblings: Vec<HfSibling>,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -523,25 +536,241 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let manifest = fetch_manifest(&client, &args.model).await?;
+    if args.model.starts_with("hf://") {
+        pull_from_hf(&client, &args.model, &output_root, args.retries).await
+    } else {
+        pull_from_ollama(&client, &args.model, &output_root, args.batch_size, args.parallel, args.retries).await
+    }
+}
+
+/// Convert a model URI to a filesystem-safe cache directory name.
+///
+/// `hf://owner/repo` and `hf://owner/repo/filename.gguf` both map to `owner_repo`.
+/// Plain Ollama model names are returned unchanged.
+pub fn cache_dir_name(model: &str) -> String {
+    if let Some(path) = model.strip_prefix("hf://") {
+        let mut parts = path.splitn(3, '/');
+        let owner = parts.next().unwrap_or(path);
+        let repo = parts.next().unwrap_or("");
+        if repo.is_empty() {
+            owner.to_owned()
+        } else {
+            format!("{owner}_{repo}")
+        }
+    } else {
+        model.to_owned()
+    }
+}
+
+fn parse_hf_uri(uri: &str) -> Option<(String, String, Option<String>)> {
+    let path = uri.strip_prefix("hf://")?;
+    let mut parts = path.splitn(3, '/');
+    let owner = parts.next()?.to_owned();
+    let repo = parts.next()?.to_owned();
+    let filename = parts.next().map(str::to_owned);
+    Some((owner, repo, filename))
+}
+
+/// Given a list of GGUF filenames, return those belonging to the best available quantization.
+///
+/// Prefers `Q4_K_M` → `Q4_K_S` → `Q5_K_M` → `Q4_0` → `Q8_0`; falls back to the full list.
+fn select_hf_gguf_files(files: &[String]) -> Vec<String> {
+    const PREFS: &[&str] = &["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q4_0", "Q8_0"];
+    for quant in PREFS {
+        let matches: Vec<String> = files.iter().filter(|f| f.contains(quant)).cloned().collect();
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+    files.to_vec()
+}
+
+async fn list_hf_gguf_files(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<String>> {
+    let url = format!("{HF_ENDPOINT}/api/models/{owner}/{repo}");
+    let info: HfModelInfo = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to query {owner}/{repo} on Hugging Face"))?
+        .error_for_status()
+        .with_context(|| format!("Hugging Face API returned an error for {owner}/{repo}"))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Hugging Face model info for {owner}/{repo}"))?;
+
+    Ok(info
+        .siblings
+        .into_iter()
+        .map(|s| s.rfilename)
+        .filter(|f| f.ends_with(".gguf"))
+        .collect())
+}
+
+async fn pull_from_hf(
+    client: &reqwest::Client,
+    hf_uri: &str,
+    output_root: &Path,
+    retries: u32,
+) -> Result<()> {
+    let (owner, repo, explicit_filename) = parse_hf_uri(hf_uri)
+        .with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
+
+    let files = if let Some(f) = explicit_filename {
+        vec![f]
+    } else {
+        let all_gguf = list_hf_gguf_files(client, &owner, &repo).await?;
+        if all_gguf.is_empty() {
+            bail!("no GGUF files found in {owner}/{repo} on Hugging Face");
+        }
+        select_hf_gguf_files(&all_gguf)
+    };
+
+    let cache_dir = output_root.join(cache_dir_name(hf_uri));
+    tokio::fs::create_dir_all(&cache_dir).await.with_context(|| {
+        format!("failed to create cache directory {}", cache_dir.display())
+    })?;
+
+    let total = files.len();
+    for (i, filename) in files.iter().enumerate() {
+        let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+        let dest = cache_dir.join(filename);
+        println!("Downloading {filename} ({}/{total})", i + 1);
+        download_hf_file_with_retry(client, &url, &dest, retries).await?;
+        println!("Progress: {}/{total} files downloaded", i + 1);
+    }
+
+    println!(
+        "Pull complete: {total} file(s) available in {}",
+        cache_dir.display()
+    );
+    Ok(())
+}
+
+async fn download_hf_file_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    retries: u32,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match download_hf_file(client, url, path).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt <= retries => {
+                eprintln!(
+                    "Download of {} failed (attempt {attempt}/{retries}): {err}",
+                    path.display()
+                );
+                sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "download of {} failed after {attempt} attempts",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+async fn download_hf_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+    if path.exists() {
+        println!("Skipping existing file {}", path.display());
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .map(|n| format!("{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| "download.tmp".to_owned());
+    let tmp_path = path.with_file_name(file_name);
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to request {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download request failed for {url}"))?;
+
+    let expected_size = response.content_length();
+    if expected_size.is_none() {
+        eprintln!("Warning: no Content-Length for {url}; size verification will be skipped");
+    }
+
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+
+    let mut bytes_written = 0u64;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("failed reading stream from {url}"))?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("failed writing to {}", tmp_path.display()))?;
+        bytes_written += chunk.len() as u64;
+    }
+
+    file.flush().await.context("failed to flush file")?;
+    drop(file);
+
+    if let Some(expected) = expected_size {
+        if bytes_written != expected {
+            tokio::fs::remove_file(&tmp_path).await.ok();
+            bail!(
+                "size mismatch for {}: expected {expected}, wrote {bytes_written}",
+                path.display()
+            );
+        }
+    }
+
+    tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+async fn pull_from_ollama(
+    client: &reqwest::Client,
+    model: &str,
+    output_root: &Path,
+    batch_size: usize,
+    parallel: usize,
+    retries: u32,
+) -> Result<()> {
+    let manifest = fetch_manifest(client, model).await?;
     let descriptors = descriptors_from_manifest(manifest);
 
     let total = descriptors.len();
     let mut completed = 0usize;
 
-    for batch in descriptors.chunks(args.batch_size) {
+    for batch in descriptors.chunks(batch_size) {
         println!("Starting batch with {} blobs", batch.len());
 
         let futures = stream::iter(batch.iter().cloned().map(|descriptor| {
             let client = client.clone();
-            let model = args.model.clone();
-            let output_root = output_root.clone();
+            let model = model.to_owned();
+            let output_root = output_root.to_owned();
             async move {
-                download_blob_with_retry(&client, &model, &output_root, &descriptor, args.retries)
+                download_blob_with_retry(&client, &model, &output_root, &descriptor, retries)
                     .await
             }
         }))
-        .buffer_unordered(args.parallel)
+        .buffer_unordered(parallel)
         .collect::<Vec<_>>();
 
         let results = futures.await;
@@ -764,5 +993,84 @@ mod tests {
     #[test]
     fn release_target_is_not_empty() {
         assert!(!release_target().is_empty());
+    }
+
+    #[test]
+    fn cache_dir_name_passthrough_for_ollama() {
+        assert_eq!(cache_dir_name("qwen3-coder-next"), "qwen3-coder-next");
+    }
+
+    #[test]
+    fn cache_dir_name_hf_uri_without_filename() {
+        assert_eq!(
+            cache_dir_name("hf://ggml-org/Qwen3-Coder-Next-GGUF"),
+            "ggml-org_Qwen3-Coder-Next-GGUF"
+        );
+    }
+
+    #[test]
+    fn cache_dir_name_hf_uri_with_filename() {
+        assert_eq!(
+            cache_dir_name("hf://ggml-org/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
+            "ggml-org_Qwen3-Coder-Next-GGUF"
+        );
+    }
+
+    #[test]
+    fn select_hf_gguf_files_prefers_q4_k_m() {
+        let files = vec![
+            "model-Q8_0.gguf".to_owned(),
+            "model-Q4_K_M.gguf".to_owned(),
+            "model-Q4_K_S.gguf".to_owned(),
+        ];
+        let selected = select_hf_gguf_files(&files);
+        assert_eq!(selected, vec!["model-Q4_K_M.gguf"]);
+    }
+
+    #[test]
+    fn select_hf_gguf_files_falls_back_to_all() {
+        let files = vec!["model-IQ3_XS.gguf".to_owned(), "model-IQ4_XS.gguf".to_owned()];
+        let selected = select_hf_gguf_files(&files);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn select_hf_gguf_files_returns_all_shards_of_quant() {
+        let files = vec![
+            "model-Q4_K_M-00001-of-00002.gguf".to_owned(),
+            "model-Q4_K_M-00002-of-00002.gguf".to_owned(),
+            "model-Q8_0.gguf".to_owned(),
+        ];
+        let selected = select_hf_gguf_files(&files);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|f| f.contains("Q4_K_M")));
+    }
+
+    #[test]
+    fn parse_hf_uri_without_filename() {
+        let result = parse_hf_uri("hf://ggml-org/Qwen3-Coder-Next-GGUF");
+        assert_eq!(
+            result,
+            Some(("ggml-org".to_owned(), "Qwen3-Coder-Next-GGUF".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn parse_hf_uri_with_filename() {
+        let result = parse_hf_uri("hf://ggml-org/Qwen3-Coder-Next-GGUF/model.gguf");
+        assert_eq!(
+            result,
+            Some((
+                "ggml-org".to_owned(),
+                "Qwen3-Coder-Next-GGUF".to_owned(),
+                Some("model.gguf".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_hf_uri_returns_none_for_invalid() {
+        assert!(parse_hf_uri("ollama://model").is_none());
+        assert!(parse_hf_uri("hf://only-owner").is_none());
     }
 }
