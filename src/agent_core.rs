@@ -238,12 +238,14 @@ fn build_agent_instructions(
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
-    let tools = if has_container {
-        "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), run_command(cmd), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)"
+    const BASE_TOOLS: &str = "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)";
+    if has_container {
+        instructions.push_str(&format!(
+            "Available tools: {BASE_TOOLS}, run_command(cmd).\n"
+        ));
     } else {
-        "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)"
-    };
-    instructions.push_str(&format!("Available tools: {tools}.\n"));
+        instructions.push_str(&format!("Available tools: {BASE_TOOLS}.\n"));
+    }
     instructions.push_str(
         "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
     );
@@ -1359,13 +1361,16 @@ mod tests {
 
     #[test]
     fn find_git_root_returns_none_when_no_git() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // No .git directory created
-        let result = find_git_root(tmp.path());
-        // May find a .git from an ancestor in CI, so just verify the function runs.
-        // In an isolated temp dir without a parent .git, it returns None.
-        // (We cannot assert None because tests run inside a git repo.)
-        let _ = result;
+        // Create a temp directory tree that has no .git entry anywhere within it.
+        // We verify this by creating the tree under /tmp directly so it cannot
+        // accidentally be inside the test runner's own git repository.
+        let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        // /tmp itself does not contain .git, so walking up from our nested dir
+        // should exhaust the filesystem without finding one.
+        let result = find_git_root(&nested);
+        assert!(result.is_none(), "expected None but got {result:?}");
     }
 
     #[test]
