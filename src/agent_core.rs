@@ -1,23 +1,39 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::UTF_8;
+use futures::StreamExt;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use similar::TextDiff;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 use walkdir::WalkDir;
 
 use crate::events::AgentEvent;
 
 const LLAMA_BATCH_SIZE: usize = 512;
 const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_WEB_SEARCH_RESULTS: usize = 8;
+const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_WEB_RESULT_CHARS: usize = 20_000;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
+const TOOL_USER_AGENT: &str = "pb-agent/1.0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSearchResult {
+    title: String,
+    url: String,
+}
 
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
@@ -160,10 +176,13 @@ fn build_agent_instructions(workspace_root: &Path, branch: &str, continuing: boo
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
     instructions.push_str(
-        "Available tools: read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), git_commit(message), git_log(), skill(name).\n",
+        "Available tools: read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name).\n",
     );
     instructions.push_str(
         "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
+    );
+    instructions.push_str(
+        "Use web_search for general internet research and web_fetch for reading a specific URL. Only use public http/https URLs.\n",
     );
 
     if let Ok(copilot_instructions) =
@@ -511,6 +530,20 @@ fn run_tool<S: EventSink>(
             });
             Ok(format!("updated {}", resolved.display()))
         }
+        "web_search" => {
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .context("web_search requires string argument: query")?;
+            block_on_tool(run_web_search(query))
+        }
+        "web_fetch" => {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .context("web_fetch requires string argument: url")?;
+            block_on_tool(run_web_fetch(url))
+        }
         "git_commit" => {
             let message = arguments
                 .get("message")
@@ -601,6 +634,333 @@ fn skill_text(name: &str) -> String {
         }
         "list" => "Available skills: copilot, codex, claude-code".to_string(),
         _ => format!("unknown skill '{name}'. Try: copilot, codex, claude-code, list"),
+    }
+}
+
+fn block_on_tool<F>(future: F) -> Result<String>
+where
+    F: Future<Output = Result<String>>,
+{
+    tool_runtime()?.block_on(future)
+}
+
+fn tool_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to start runtime for web tool")
+            .map_err(|error| error.to_string())
+    })
+    {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
+}
+
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(TOOL_USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .context("failed to build web client")
+            .map_err(|error| error.to_string())
+    })
+    {
+        Ok(client) => Ok(client),
+        Err(error) => Err(anyhow!(error.clone())),
+    }
+}
+
+async fn run_web_search(query: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("web_search query must not be empty");
+    }
+
+    let response = http_client()?
+        .get("https://duckduckgo.com/html/")
+        .query(&[("q", query)])
+        .send()
+        .await
+        .with_context(|| format!("failed to search the web for '{query}'"))?;
+    let body = read_response_text(response).await?;
+    let results = parse_duckduckgo_results(&body);
+
+    if results.is_empty() {
+        return Ok(format!("No public web results found for: {query}"));
+    }
+
+    let mut out = format!("Web search results for: {query}\n");
+    for (index, result) in results.iter().take(MAX_WEB_SEARCH_RESULTS).enumerate() {
+        out.push_str(&format!("{}. {}\n   URL: {}\n", index + 1, result.title, result.url));
+    }
+    Ok(out)
+}
+
+async fn run_web_fetch(url: &str) -> Result<String> {
+    let url = parse_public_web_url(url)?;
+    let response = http_client()?
+        .get(url.clone())
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch {}", url))?;
+    let final_url = response.url().clone();
+    validate_public_web_url(&final_url)?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let body = read_response_text(response).await?;
+    let content = normalize_web_content(&body, &content_type);
+
+    Ok(format!(
+        "Fetched: {final_url}\nContent-Type: {content_type}\n\n{}",
+        truncate_chars(&content, MAX_WEB_RESULT_CHARS)
+    ))
+}
+
+async fn read_response_text(response: reqwest::Response) -> Result<String> {
+    let status = response.status();
+    if !status.is_success() {
+        bail!("request failed with status {status}");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEB_RESPONSE_BYTES as u64)
+    {
+        bail!("response exceeded {} bytes", MAX_WEB_RESPONSE_BYTES);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read response body")?;
+        if body.len() >= MAX_WEB_RESPONSE_BYTES {
+            break;
+        }
+        let remaining = MAX_WEB_RESPONSE_BYTES - body.len();
+        let take = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn parse_public_web_url(input: &str) -> Result<Url> {
+    let url = Url::parse(input).with_context(|| format!("invalid URL: {input}"))?;
+    validate_public_web_url(&url)?;
+    Ok(url)
+}
+
+fn validate_public_web_url(url: &Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("only http and https URLs are supported");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("URLs with embedded credentials are not allowed");
+    }
+    let host = url.host_str().context("URL is missing a host")?;
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.eq_ignore_ascii_case("local")
+        || host.ends_with(".local")
+    {
+        bail!("local network URLs are not allowed");
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            bail!("private or loopback IP URLs are not allowed");
+        }
+    }
+    Ok(())
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || is_shared_v4(ip)
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || is_documentation_v6(ip)
+        }
+    }
+}
+
+fn is_shared_v4(ip: Ipv4Addr) -> bool {
+    matches!(ip.octets(), [100, second_octet, ..] if (64..=127).contains(&second_octet))
+}
+
+fn is_documentation_v6(ip: Ipv6Addr) -> bool {
+    matches!(ip.segments(), [0x2001, 0x0db8, ..])
+}
+
+fn normalize_web_content(body: &str, content_type: &str) -> String {
+    if content_type.contains("html") {
+        let text = html_to_text(body);
+        if text.is_empty() {
+            "(empty HTML response)".to_string()
+        } else {
+            text
+        }
+    } else {
+        let text = body.trim();
+        if text.is_empty() {
+            "(empty response body)".to_string()
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+fn parse_duckduckgo_results(html: &str) -> Vec<WebSearchResult> {
+    static RESULT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let regex = RESULT_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<a[^>]*class=['"][^'"]*(?:result__a|result-link)[^'"]*['"][^>]*href=['"]([^'"]+)['"][^>]*>(.*?)</a>"#,
+        )
+        .expect("valid search result regex")
+    });
+
+    let mut results = Vec::new();
+    for capture in regex.captures_iter(html) {
+        let Some(raw_url) = capture.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(raw_title) = capture.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let title = html_to_text(raw_title);
+        let url = normalize_search_result_url(raw_url);
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        if results.iter().any(|existing: &WebSearchResult| existing.url == url) {
+            continue;
+        }
+        results.push(WebSearchResult { title, url });
+        if results.len() >= MAX_WEB_SEARCH_RESULTS {
+            break;
+        }
+    }
+    results
+}
+
+fn normalize_search_result_url(raw_url: &str) -> String {
+    let decoded = decode_html_entities(raw_url.trim());
+    let joined = match Url::parse(&decoded) {
+        Ok(url) => url,
+        Err(_) => match Url::parse("https://duckduckgo.com/").and_then(|base| base.join(&decoded)) {
+            Ok(url) => url,
+            Err(_) => return decoded,
+        },
+    };
+
+    if joined
+        .host_str()
+        .is_some_and(|host| host.ends_with("duckduckgo.com"))
+    {
+        if let Some(target) = joined
+            .query_pairs()
+            .find(|(key, _)| key == "uddg")
+            .map(|(_, value)| value.into_owned())
+        {
+            return target;
+        }
+    }
+
+    joined.to_string()
+}
+
+fn html_to_text(html: &str) -> String {
+    static SCRIPT_STYLE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static TAG_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let script_style = SCRIPT_STYLE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>")
+            .expect("valid script/style regex")
+    });
+    let tag = TAG_RE.get_or_init(|| regex::Regex::new(r"(?is)<[^>]+>").expect("valid tag regex"));
+
+    let without_scripts = script_style.replace_all(html, " ");
+    let without_tags = tag.replace_all(&without_scripts, " ");
+    collapse_whitespace(&decode_html_entities(&without_tags))
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'&' {
+            if let Some(end) = input[index..].find(';') {
+                let entity = &input[index + 1..index + end];
+                if let Some(decoded) = decode_html_entity(entity) {
+                    output.push(decoded);
+                    index += end + 1;
+                    continue;
+                }
+            }
+        }
+        if let Some(ch) = input[index..].chars().next() {
+            output.push(ch);
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    output
+}
+
+fn decode_html_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let number = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X"));
+            if let Some(number) = number {
+                u32::from_str_radix(number, 16).ok().and_then(char::from_u32)
+            } else if let Some(number) = entity.strip_prefix('#') {
+                number.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let truncated: String = input.chars().take(max_chars).collect();
+    if input.chars().count() > max_chars {
+        format!("{truncated}\n\n[truncated]")
+    } else {
+        truncated
     }
 }
 
@@ -801,5 +1161,90 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_extracts_titles_and_links() {
+        let html = r#"
+        <html>
+          <body>
+            <a class="result__a" href="https://example.com/one">First &amp; Result</a>
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Ftwo">Second Result</a>
+          </body>
+        </html>
+        "#;
+
+        let results = parse_duckduckgo_results(html);
+
+        assert_eq!(
+            results,
+            vec![
+                WebSearchResult {
+                    title: "First & Result".to_string(),
+                    url: "https://example.com/one".to_string(),
+                },
+                WebSearchResult {
+                    title: "Second Result".to_string(),
+                    url: "https://example.com/two".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_deduplicates_urls() {
+        let html = r#"
+        <a class="result__a" href="https://example.com/one">First</a>
+        <a class="result__a" href="https://example.com/one">Duplicate</a>
+        "#;
+
+        let results = parse_duckduckgo_results(html);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "First");
+        assert_eq!(results[0].url, "https://example.com/one");
+    }
+
+    #[test]
+    fn normalize_search_result_url_unwraps_duckduckgo_redirect() {
+        let url = normalize_search_result_url(
+            "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs",
+        );
+        assert_eq!(url, "https://example.com/docs");
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_and_decodes_entities() {
+        let html = "<div>Hello <strong>world</strong> &amp; universe</div>";
+        assert_eq!(html_to_text(html), "Hello world & universe");
+    }
+
+    #[test]
+    fn validate_public_web_url_rejects_localhost() {
+        let err = validate_public_web_url(&Url::parse("http://localhost:8080").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local network URLs are not allowed"));
+    }
+
+    #[test]
+    fn validate_public_web_url_rejects_embedded_credentials() {
+        let err = validate_public_web_url(&Url::parse("http://user@example.com").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("embedded credentials"));
+    }
+
+    #[test]
+    fn validate_public_web_url_rejects_shared_ipv4_range() {
+        let err = validate_public_web_url(&Url::parse("https://100.64.0.1").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private or loopback IP"));
+    }
+
+    #[test]
+    fn validate_public_web_url_allows_public_https() {
+        validate_public_web_url(&Url::parse("https://example.com/docs").unwrap()).unwrap();
     }
 }
