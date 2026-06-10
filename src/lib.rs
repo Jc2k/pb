@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT, RANGE};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -633,6 +633,20 @@ fn hf_sibling_size(sibling: &HfSibling) -> Option<u64> {
     sibling.size.or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
 }
 
+/// Issue a HEAD request and return the `Content-Length` value, if available.
+async fn fetch_content_length(client: &reqwest::Client, url: &str) -> Option<u64> {
+    let resp = client.head(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.headers()
+        .get(CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+}
+
 /// Build a temp file path by appending `.tmp` to the target filename.
 /// Falls back to `download.tmp` when no filename component exists.
 fn download_tmp_path(path: &Path) -> PathBuf {
@@ -645,7 +659,11 @@ fn download_tmp_path(path: &Path) -> PathBuf {
 
 /// Return already-downloaded bytes for a target path.
 /// Prefers a complete destination file, then a valid partial `.tmp` file.
-fn existing_bytes(path: &Path, expected_size: u64) -> Result<u64> {
+fn existing_bytes(path: &Path, expected_size: Option<u64>) -> Result<u64> {
+    let Some(expected_size) = expected_size else {
+        return Ok(0);
+    };
+
     if path.exists() {
         let size = std::fs::metadata(path)
             .with_context(|| format!("failed to stat {}", path.display()))?
@@ -670,19 +688,30 @@ fn existing_bytes(path: &Path, expected_size: u64) -> Result<u64> {
 
 /// Build a byte-oriented progress bar with elapsed time, percentage, and ETA.
 /// Validates that the starting position does not exceed the total.
+/// When `total` is 0 (size unknown), uses a spinner with a bytes-only display.
 fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
-    if initial > total {
+    if total > 0 && initial > total {
         bail!("initial progress {initial} is greater than total {total}");
     }
-    let pb = ProgressBar::new(total);
-    let template = format!(
-        "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:{PROGRESS_BAR_WIDTH}.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{percent}}%) ETA {{eta_precise}}"
-    );
+    let (pb, template) = if total > 0 {
+        let pb = ProgressBar::new(total);
+        let template = format!(
+            "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:{PROGRESS_BAR_WIDTH}.cyan/blue}}] {{bytes}}/{{total_bytes}} ({{percent}}%) ETA {{eta_precise}}"
+        );
+        (pb, template)
+    } else {
+        let pb = ProgressBar::new_spinner();
+        let template =
+            "{spinner:.green} [{elapsed_precise}] {bytes} downloaded".to_owned();
+        (pb, template)
+    };
     let style = ProgressStyle::with_template(&template)
-    .context("failed to configure progress bar style")?
-    .progress_chars("=>-");
+        .context("failed to configure progress bar style")?
+        .progress_chars("=>-");
     pb.set_style(style);
-    pb.set_position(initial);
+    if total > 0 {
+        pb.set_position(initial);
+    }
     pb.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_MS));
     Ok(pb)
 }
@@ -702,31 +731,38 @@ async fn pull_from_hf(
         bail!("no GGUF files found in {owner}/{repo} on Hugging Face");
     }
 
-    let files = if let Some(f) = explicit_filename {
+    let files: Vec<(String, Option<u64>)> = if let Some(f) = explicit_filename {
         let sibling = siblings
             .iter()
             .find(|s| s.rfilename == f)
             .with_context(|| format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face"))?;
-        let size = hf_sibling_size(sibling).with_context(|| {
-            format!("unable to determine content length for {owner}/{repo}/{}", sibling.rfilename)
-        })?;
+        let size = match hf_sibling_size(sibling) {
+            Some(s) => Some(s),
+            None => {
+                let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{f}");
+                fetch_content_length(client, &url).await
+            }
+        };
         vec![(f, size)]
     } else {
         let all_names: Vec<String> = siblings.iter().map(|s| s.rfilename.clone()).collect();
         let selected = select_hf_gguf_files(&all_names);
-        selected
-            .into_iter()
-            .map(|filename| {
-                let sibling = siblings
-                    .iter()
-                    .find(|s| s.rfilename == filename)
-                    .with_context(|| format!("file metadata missing for {filename}"))?;
-                let size = hf_sibling_size(sibling).with_context(|| {
-                    format!("unable to determine content length for {owner}/{repo}/{filename}")
-                })?;
-                Ok((filename, size))
-            })
-            .collect::<Result<Vec<_>>>()?
+        let mut result = Vec::new();
+        for filename in selected {
+            let sibling = siblings
+                .iter()
+                .find(|s| s.rfilename == filename)
+                .with_context(|| format!("file metadata missing for {filename}"))?;
+            let size = match hf_sibling_size(sibling) {
+                Some(s) => Some(s),
+                None => {
+                    let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+                    fetch_content_length(client, &url).await
+                }
+            };
+            result.push((filename, size));
+        }
+        result
     };
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
@@ -734,7 +770,7 @@ async fn pull_from_hf(
         format!("failed to create cache directory {}", cache_dir.display())
     })?;
 
-    let total_bytes: u64 = files.iter().map(|(_, size)| *size).sum();
+    let total_bytes: u64 = files.iter().map(|(_, size)| size.unwrap_or(0)).sum();
     let initial_bytes = files.iter().try_fold(0u64, |acc, (filename, size)| {
         existing_bytes(&cache_dir.join(filename), *size).map(|n| acc + n)
     })?;
@@ -770,7 +806,7 @@ async fn download_file_with_retry(
     client: &reqwest::Client,
     url: &str,
     path: &Path,
-    expected_size: u64,
+    expected_size: Option<u64>,
     progress: &ProgressBar,
     label: &str,
     retries: u32,
@@ -798,21 +834,29 @@ async fn download_file_with_retry(
 /// Download a file to `path` with resume support via HTTP range requests.
 /// If the server ignores ranges and returns a full `200 OK`, the partial
 /// state is discarded and the transfer restarts from zero.
+/// When `expected_size` is `None` the file size is unknown: an existing
+/// destination file is assumed complete, resume is skipped, and the final
+/// size validation is omitted.
 async fn download_file_with_resume(
     client: &reqwest::Client,
     url: &str,
     path: &Path,
-    expected_size: u64,
+    expected_size: Option<u64>,
     progress: &ProgressBar,
 ) -> Result<()> {
-    if path.exists() {
-        let metadata =
-            std::fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-        if metadata.len() == expected_size {
-            return Ok(());
+    if let Some(size) = expected_size {
+        if path.exists() {
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.len() == size {
+                return Ok(());
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("failed to remove stale file {}", path.display()))?;
         }
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove stale file {}", path.display()))?;
+    } else if path.exists() {
+        // Size unknown: assume existing destination file is complete.
+        return Ok(());
     }
 
     if let Some(parent) = path.parent() {
@@ -822,28 +866,38 @@ async fn download_file_with_resume(
     }
 
     let tmp_path = download_tmp_path(path);
-    let mut resume_from = if tmp_path.exists() {
-        std::fs::metadata(&tmp_path)
-            .with_context(|| format!("failed to stat {}", tmp_path.display()))?
-            .len()
+    let mut resume_from = if let Some(size) = expected_size {
+        let partial = if tmp_path.exists() {
+            std::fs::metadata(&tmp_path)
+                .with_context(|| format!("failed to stat {}", tmp_path.display()))?
+                .len()
+        } else {
+            0
+        };
+        if partial > size {
+            std::fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
+            0
+        } else if partial == size {
+            tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+                format!(
+                    "failed to rename {} to {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            return Ok(());
+        } else {
+            partial
+        }
     } else {
+        // No resume when size is unknown: discard any stale partial download.
+        if tmp_path.exists() {
+            std::fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
+        }
         0
     };
-    if resume_from > expected_size {
-        std::fs::remove_file(&tmp_path)
-            .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
-        resume_from = 0;
-    }
-    if resume_from == expected_size {
-        tokio::fs::rename(&tmp_path, path).await.with_context(|| {
-            format!(
-                "failed to rename {} to {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-        return Ok(());
-    }
 
     let mut request = client.get(url);
     if resume_from > 0 {
@@ -896,11 +950,13 @@ async fn download_file_with_resume(
     file.flush().await.context("failed to flush file")?;
     drop(file);
 
-    if bytes_written != expected_size {
-        bail!(
-            "size mismatch for {}: expected {expected_size}, wrote {bytes_written}",
-            path.display()
-        );
+    if let Some(size) = expected_size {
+        if bytes_written != size {
+            bail!(
+                "size mismatch for {}: expected {size}, wrote {bytes_written}",
+                path.display()
+            );
+        }
     }
 
     tokio::fs::rename(&tmp_path, path).await.with_context(|| {
@@ -927,7 +983,7 @@ async fn pull_from_ollama(
 
     let total_bytes: u64 = descriptors.iter().map(|d| d.size).sum();
     let initial_bytes = descriptors.iter().try_fold(0u64, |acc, descriptor| {
-        existing_bytes(&blob_path(output_root, model, &descriptor.digest), descriptor.size)
+        existing_bytes(&blob_path(output_root, model, &descriptor.digest), Some(descriptor.size))
             .map(|n| acc + n)
     })?;
     let progress = build_progress_bar(total_bytes, initial_bytes)?;
@@ -1031,7 +1087,7 @@ async fn download_blob(
 ) -> Result<()> {
     let path = blob_path(output_root, model, digest);
     let url = format!("{OLLAMA_REGISTRY}/v2/library/{model}/blobs/{digest}");
-    download_file_with_resume(client, &url, &path, expected_size, progress)
+    download_file_with_resume(client, &url, &path, Some(expected_size), progress)
         .await
         .with_context(|| format!("blob request failed for {digest}"))
 }
@@ -1259,7 +1315,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
         fs::write(&dest, vec![0u8; 16]).unwrap();
-        assert_eq!(existing_bytes(&dest, 16).unwrap(), 16);
+        assert_eq!(existing_bytes(&dest, Some(16)).unwrap(), 16);
     }
 
     #[test]
@@ -1268,14 +1324,14 @@ mod tests {
         let dest = dir.path().join("model.gguf");
         let tmp = download_tmp_path(&dest);
         fs::write(&tmp, vec![0u8; 8]).unwrap();
-        assert_eq!(existing_bytes(&dest, 16).unwrap(), 8);
+        assert_eq!(existing_bytes(&dest, Some(16)).unwrap(), 8);
     }
 
     #[test]
     fn existing_bytes_returns_zero_when_no_state() {
         let dir = tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
-        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+        assert_eq!(existing_bytes(&dest, Some(16)).unwrap(), 0);
     }
 
     #[test]
@@ -1284,7 +1340,17 @@ mod tests {
         let dest = dir.path().join("model.gguf");
         let tmp = download_tmp_path(&dest);
         fs::write(&tmp, vec![0u8; 32]).unwrap();
-        assert_eq!(existing_bytes(&dest, 16).unwrap(), 0);
+        assert_eq!(existing_bytes(&dest, Some(16)).unwrap(), 0);
+    }
+
+    #[test]
+    fn existing_bytes_returns_zero_when_size_unknown() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        // Even with a partial tmp file present, unknown size yields 0.
+        let tmp = download_tmp_path(&dest);
+        fs::write(&tmp, vec![0u8; 8]).unwrap();
+        assert_eq!(existing_bytes(&dest, None).unwrap(), 0);
     }
 
     #[test]
@@ -1292,6 +1358,14 @@ mod tests {
         let pb = build_progress_bar(100, 25).unwrap();
         assert_eq!(pb.length(), Some(100));
         assert_eq!(pb.position(), 25);
+        pb.finish_and_clear();
+    }
+
+    #[test]
+    fn build_progress_bar_uses_spinner_when_total_is_zero() {
+        let pb = build_progress_bar(0, 0).unwrap();
+        // Spinner has no fixed length.
+        assert_eq!(pb.length(), None);
         pb.finish_and_clear();
     }
 }
