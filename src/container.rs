@@ -65,7 +65,10 @@ impl ContainerRuntime for AppleContainerRuntime {
 
     fn create(&self, image: &str, workspace: &Path) -> Result<String> {
         let mount = format!("{}:/workspace", workspace.to_string_lossy());
-        run_capture("container", &["run", "-d", "-v", &mount, image, "sleep", "infinity"])
+        run_capture(
+            "container",
+            &["run", "-d", "-v", &mount, image, "sleep", "infinity"],
+        )
     }
 
     fn exec(&self, container_id: &str, cmd: &str) -> Result<String> {
@@ -225,7 +228,10 @@ mod tests {
             Ok(())
         }
         fn create(&self, image: &str, _workspace: &Path) -> Result<String> {
-            self.commands.lock().unwrap().push(format!("create {image}"));
+            self.commands
+                .lock()
+                .unwrap()
+                .push(format!("create {image}"));
             Ok("mock-container-id".to_string())
         }
         fn exec(&self, container_id: &str, cmd: &str) -> Result<String> {
@@ -281,10 +287,18 @@ mod tests {
 
         struct TrackingRuntime(Arc<Mutex<Vec<String>>>);
         impl ContainerRuntime for TrackingRuntime {
-            fn pull(&self, _: &str) -> Result<()> { Ok(()) }
-            fn build(&self, _: &Path, _: &str) -> Result<()> { Ok(()) }
-            fn create(&self, _: &str, _: &Path) -> Result<String> { Ok("x".into()) }
-            fn exec(&self, _: &str, _: &str) -> Result<String> { Ok(String::new()) }
+            fn pull(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn build(&self, _: &Path, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn create(&self, _: &str, _: &Path) -> Result<String> {
+                Ok("x".into())
+            }
+            fn exec(&self, _: &str, _: &str) -> Result<String> {
+                Ok(String::new())
+            }
             fn remove(&self, id: &str) -> Result<()> {
                 self.0.lock().unwrap().push(id.to_string());
                 Ok(())
