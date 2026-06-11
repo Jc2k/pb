@@ -1,13 +1,12 @@
 //! `pb service` — integrate `pb serve` with launchd (macOS).
 //!
 //! Sub-commands:
-//! - `enable`  — write a LaunchAgent plist referencing the current binary and load it
-//! - `disable` — unload the LaunchAgent and remove the plist
 //! - `start`   — ask launchd to start the service immediately
 //! - `stop`    — ask launchd to stop the service
+//! - `restart` — ask launchd to restart the service
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ServeArgs;
 
@@ -151,20 +150,17 @@ fn render_tray_plist(exe: &str, args: &ServeArgs) -> String {
     )
 }
 
-/// `pb service enable` — write the plist and load it with launchctl.
-pub fn enable(args: &ServeArgs) -> Result<()> {
+/// Install the LaunchAgent plists for a specific pb binary path and load them with launchctl.
+pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = args;
+        let _ = (exe, args);
         bail!("pb service is only supported on macOS");
     }
 
     #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe()
-            .context("cannot determine path to pb binary")?
-            .to_string_lossy()
-            .into_owned();
+        let exe = exe.to_string_lossy().into_owned();
 
         let plist = plist_path()?;
         let tray_plist = tray_plist_path()?;
@@ -215,27 +211,41 @@ fn load_plist(path: &PathBuf) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn unload_and_remove_plist(label: &str, path: &PathBuf) -> Result<()> {
+fn unload_plist(label: &str, path: &PathBuf) -> Result<()> {
     use std::process::Command;
 
+    if !path.exists() {
+        println!(
+            "No plist found at {}; nothing to unload for {label}.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let status = Command::new("launchctl")
+        .args([
+            "unload",
+            "-w",
+            path.to_str().context("plist path contains invalid UTF-8")?,
+        ])
+        .status()
+        .context("failed to run launchctl")?;
+    if !status.success() {
+        bail!("launchctl unload failed for {label} (exit {})", status);
+    }
+    println!("Service {label} unloaded.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_plist(label: &str, path: &PathBuf) -> Result<()> {
     if path.exists() {
-        let status = Command::new("launchctl")
-            .args([
-                "unload",
-                "-w",
-                path.to_str().context("plist path contains invalid UTF-8")?,
-            ])
-            .status()
-            .context("failed to run launchctl")?;
-        if !status.success() {
-            bail!("launchctl unload failed for {label} (exit {})", status);
-        }
         std::fs::remove_file(path)
             .with_context(|| format!("failed to remove {}", path.display()))?;
-        println!("Service {label} unloaded and plist removed.");
+        println!("Removed plist for {label}: {}", path.display());
     } else {
         println!(
-            "No plist found at {}; nothing to disable for {label}.",
+            "No plist found at {}; nothing to remove for {label}.",
             path.display()
         );
     }
@@ -256,15 +266,47 @@ fn launchctl_signal(action: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// `pb service disable` — unload the service and remove the plist.
-pub fn disable() -> Result<()> {
+#[cfg(target_os = "macos")]
+fn service_is_running(label: &str) -> Result<bool> {
+    use std::process::Command;
+
+    let uid_output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("failed to determine current user id")?;
+    if !uid_output.status.success() {
+        bail!("id -u failed (exit {})", uid_output.status);
+    }
+    let uid = String::from_utf8_lossy(&uid_output.stdout);
+    let domain_target = format!("gui/{}/{}", uid.trim(), label);
+
+    let output = Command::new("launchctl")
+        .args(["print", &domain_target])
+        .output()
+        .context("failed to run launchctl")?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("state = running") || trimmed.starts_with("pid =")
+    }))
+}
+
+/// Stop the service, remove LaunchAgent plists, and leave the binary untouched.
+pub fn remove() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     bail!("pb service is only supported on macOS");
 
     #[cfg(target_os = "macos")]
     {
-        unload_and_remove_plist(TRAY_LABEL, &tray_plist_path()?)?;
-        unload_and_remove_plist(LABEL, &plist_path()?)?;
+        let tray = tray_plist_path()?;
+        let serve = plist_path()?;
+        unload_plist(TRAY_LABEL, &tray)?;
+        unload_plist(LABEL, &serve)?;
+        remove_plist(TRAY_LABEL, &tray)?;
+        remove_plist(LABEL, &serve)?;
         Ok(())
     }
 }
@@ -294,6 +336,42 @@ pub fn stop() -> Result<()> {
         launchctl_signal("stop", LABEL)?;
         println!("Services {LABEL} and {TRAY_LABEL} stopped.");
         Ok(())
+    }
+}
+
+/// `pb service restart` — stop and then start the service via launchctl.
+pub fn restart() -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    bail!("pb service is only supported on macOS");
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = launchctl_signal("stop", TRAY_LABEL);
+        let _ = launchctl_signal("stop", LABEL);
+        launchctl_signal("start", LABEL)?;
+        launchctl_signal("start", TRAY_LABEL)?;
+        println!("Services {LABEL} and {TRAY_LABEL} restarted.");
+        Ok(())
+    }
+}
+
+/// Restart installed services if they are running; otherwise start them.
+pub fn restart_or_start_if_installed() -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    return Ok(());
+
+    #[cfg(target_os = "macos")]
+    {
+        if !plist_path()?.exists() && !tray_plist_path()?.exists() {
+            println!("pb launchd service is not installed; skipping service restart.");
+            return Ok(());
+        }
+
+        if service_is_running(LABEL)? || service_is_running(TRAY_LABEL)? {
+            restart()
+        } else {
+            start()
+        }
     }
 }
 
