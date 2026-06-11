@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -20,7 +20,8 @@ pub mod init;
 pub mod service;
 pub mod web;
 
-pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str =
+    "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -563,20 +564,17 @@ fn remove_data_dirs() -> Result<()> {
     ];
 
     if let Ok(xdg_cache_home) = std::env::var("XDG_CACHE_HOME")
-        && !xdg_cache_home.is_empty()
-    {
-        paths.push(PathBuf::from(xdg_cache_home).join("pb"));
-    }
+        && !xdg_cache_home.is_empty() {
+            paths.push(PathBuf::from(xdg_cache_home).join("pb"));
+        }
     if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg_config_home.is_empty()
-    {
-        paths.push(PathBuf::from(xdg_config_home).join("pb"));
-    }
+        && !xdg_config_home.is_empty() {
+            paths.push(PathBuf::from(xdg_config_home).join("pb"));
+        }
     if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME")
-        && !xdg_state_home.is_empty()
-    {
-        paths.push(PathBuf::from(xdg_state_home).join("pb"));
-    }
+        && !xdg_state_home.is_empty() {
+            paths.push(PathBuf::from(xdg_state_home).join("pb"));
+        }
 
     paths.sort();
     paths.dedup();
@@ -617,8 +615,8 @@ fn resolve_env_root(workdir: Option<PathBuf>) -> Result<PathBuf> {
 
 fn env_pull(args: EnvPullArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
-    let runtime = container::detect_runtime()
-        .context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Pulling image {}…", args.image);
     runtime.pull(&args.image)?;
     let config = EnvironmentConfig {
@@ -645,8 +643,8 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     if !dockerfile.exists() {
         bail!("Dockerfile not found: {}", dockerfile.display());
     }
-    let runtime = container::detect_runtime()
-        .context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Building image {} from {}…", args.tag, dockerfile.display());
     runtime.build(&dockerfile, &args.tag)?;
     let config = EnvironmentConfig {
@@ -667,8 +665,8 @@ fn env_start(args: EnvWorkdirArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
     let config = EnvironmentConfig::load(&root)?
         .context("no environment configured; run `pb env pull` or `pb env build` first")?;
-    let runtime = container::detect_runtime()
-        .context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime =
+        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Creating test container from {}…", config.image);
     let container_id = runtime.create(&config.image, &root)?;
     println!("Container {} started", container_id);
@@ -748,15 +746,7 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         )
         .await
     } else {
-        pull_from_ollama(
-            &client,
-            &args.model,
-            &output_root,
-            args.batch_size,
-            args.parallel,
-            args.retries,
-        )
-        .await
+        pull_from_ollama(&client, &args.model, &output_root, args.batch_size, args.parallel, args.retries).await
     }
 }
 
@@ -794,11 +784,7 @@ fn parse_hf_uri(uri: &str) -> Option<(String, String, Option<String>)> {
 fn select_hf_gguf_files(files: &[String]) -> Vec<String> {
     const PREFS: &[&str] = &["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q4_0", "Q8_0"];
     for quant in PREFS {
-        let matches: Vec<String> = files
-            .iter()
-            .filter(|f| f.contains(quant))
-            .cloned()
-            .collect();
+        let matches: Vec<String> = files.iter().filter(|f| f.contains(quant)).cloned().collect();
         if !matches.is_empty() {
             return matches;
         }
@@ -833,9 +819,7 @@ async fn list_hf_gguf_files(
 /// Return the size for a Hugging Face sibling, preferring top-level `size`
 /// and falling back to `lfs.size` when needed.
 fn hf_sibling_size(sibling: &HfSibling) -> Option<u64> {
-    sibling
-        .size
-        .or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
+    sibling.size.or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
 }
 
 /// Issue a HEAD request and return the `Content-Length` value, if available.
@@ -927,8 +911,8 @@ async fn pull_from_hf(
     parallel: usize,
     retries: u32,
 ) -> Result<()> {
-    let (owner, repo, explicit_filename) =
-        parse_hf_uri(hf_uri).with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
+    let (owner, repo, explicit_filename) = parse_hf_uri(hf_uri)
+        .with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
 
     let siblings = list_hf_gguf_files(client, &owner, &repo).await?;
     if siblings.is_empty() {
@@ -939,9 +923,7 @@ async fn pull_from_hf(
         let sibling = siblings
             .iter()
             .find(|s| s.rfilename == f)
-            .with_context(|| {
-                format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face")
-            })?;
+            .with_context(|| format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face"))?;
         let size = match hf_sibling_size(sibling) {
             s @ Some(_) => s,
             None => {
@@ -972,9 +954,9 @@ async fn pull_from_hf(
     };
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+    tokio::fs::create_dir_all(&cache_dir).await.with_context(|| {
+        format!("failed to create cache directory {}", cache_dir.display())
+    })?;
 
     let total_bytes: u64 = files.iter().map(|(_, size)| size.unwrap_or(0)).sum();
     let initial_bytes = files.iter().try_fold(0u64, |acc, (filename, size)| {
@@ -989,8 +971,7 @@ async fn pull_from_hf(
         let dest = cache_dir.join(&filename);
         let progress = progress.clone();
         async move {
-            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries)
-                .await
+            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries).await
         }
     }))
     .buffer_unordered(parallel)
@@ -1024,7 +1005,9 @@ async fn download_file_with_retry(
         match download_file_with_resume(client, url, path, expected_size, progress).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
-                eprintln!("Download of {label} failed (attempt {attempt}/{retries}): {err}");
+                eprintln!(
+                    "Download of {label} failed (attempt {attempt}/{retries}): {err}"
+                );
                 sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
             Err(err) => {
@@ -1081,9 +1064,8 @@ async fn download_file_with_resume(
             0
         };
         if partial > size {
-            std::fs::remove_file(&tmp_path).with_context(|| {
-                format!("failed to remove stale temp file {}", tmp_path.display())
-            })?;
+            std::fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
             0
         } else if partial == size {
             tokio::fs::rename(&tmp_path, path).await.with_context(|| {
@@ -1100,9 +1082,8 @@ async fn download_file_with_resume(
     } else {
         // No resume when size is unknown: discard any stale partial download.
         if tmp_path.exists() {
-            std::fs::remove_file(&tmp_path).with_context(|| {
-                format!("failed to remove stale temp file {}", tmp_path.display())
-            })?;
+            std::fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
         }
         0
     };
@@ -1191,11 +1172,8 @@ async fn pull_from_ollama(
 
     let total_bytes: u64 = descriptors.iter().map(|d| d.size).sum();
     let initial_bytes = descriptors.iter().try_fold(0u64, |acc, descriptor| {
-        existing_bytes(
-            &blob_path(output_root, model, &descriptor.digest),
-            Some(descriptor.size),
-        )
-        .map(|n| acc + n)
+        existing_bytes(&blob_path(output_root, model, &descriptor.digest), Some(descriptor.size))
+            .map(|n| acc + n)
     })?;
     let progress = build_progress_bar(total_bytes, initial_bytes)?;
 
@@ -1214,7 +1192,7 @@ async fn pull_from_ollama(
                     &progress,
                     retries,
                 )
-                .await
+                    .await
             }
         }))
         .buffer_unordered(parallel)
@@ -1271,16 +1249,7 @@ async fn download_blob_with_retry(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match download_blob(
-            client,
-            model,
-            output_root,
-            &digest,
-            descriptor.size,
-            progress,
-        )
-        .await
-        {
+        match download_blob(client, model, output_root, &digest, descriptor.size, progress).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
                 eprintln!(
@@ -1342,10 +1311,9 @@ fn default_gpu_layers() -> u32 {
 
 fn default_data_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("pb");
-    }
+        && !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pb");
+        }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local").join("share").join("pb");
     }
@@ -1456,10 +1424,7 @@ mod tests {
 
     #[test]
     fn select_hf_gguf_files_falls_back_to_all() {
-        let files = vec![
-            "model-IQ3_XS.gguf".to_owned(),
-            "model-IQ4_XS.gguf".to_owned(),
-        ];
+        let files = vec!["model-IQ3_XS.gguf".to_owned(), "model-IQ4_XS.gguf".to_owned()];
         let selected = select_hf_gguf_files(&files);
         assert_eq!(selected.len(), 2);
     }
@@ -1481,11 +1446,7 @@ mod tests {
         let result = parse_hf_uri("hf://unsloth/Qwen3-Coder-Next-GGUF");
         assert_eq!(
             result,
-            Some((
-                "unsloth".to_owned(),
-                "Qwen3-Coder-Next-GGUF".to_owned(),
-                None
-            ))
+            Some(("unsloth".to_owned(), "Qwen3-Coder-Next-GGUF".to_owned(), None))
         );
     }
 
@@ -1541,10 +1502,7 @@ mod tests {
     #[test]
     fn download_tmp_path_adds_tmp_suffix() {
         let path = Path::new("/tmp/model.gguf");
-        assert_eq!(
-            download_tmp_path(path),
-            PathBuf::from("/tmp/model.gguf.tmp")
-        );
+        assert_eq!(download_tmp_path(path), PathBuf::from("/tmp/model.gguf.tmp"));
     }
 
     #[test]

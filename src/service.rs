@@ -50,11 +50,17 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
 
     if let Some(ref model_dir) = args.model_dir {
         program_args.push("        <string>--model-dir</string>".to_string());
-        program_args.push(format!("        <string>{}</string>", model_dir.display()));
+        program_args.push(format!(
+            "        <string>{}</string>",
+            model_dir.display()
+        ));
     }
     if let Some(ref workdir) = args.workdir {
         program_args.push("        <string>--workdir</string>".to_string());
-        program_args.push(format!("        <string>{}</string>", workdir.display()));
+        program_args.push(format!(
+            "        <string>{}</string>",
+            workdir.display()
+        ));
     }
     if let Some(threads) = args.threads {
         program_args.push("        <string>--threads</string>".to_string());
@@ -168,10 +174,7 @@ pub fn uninstall() -> Result<()> {
                 .with_context(|| format!("failed to remove {}", plist.display()))?;
             println!("Service {LABEL} unloaded and plist removed.");
         } else {
-            println!(
-                "No plist found at {}; nothing to uninstall.",
-                plist.display()
-            );
+            println!("No plist found at {}; nothing to uninstall.", plist.display());
         }
         Ok(())
     }
@@ -305,9 +308,7 @@ pub fn restart_or_start() -> Result<()> {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::{
-        DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers,
-    };
+    use crate::{DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers};
 
     #[cfg(target_os = "macos")]
     fn default_serve_args() -> ServeArgs {
