@@ -18,6 +18,7 @@ pub mod environment;
 pub mod events;
 pub mod init;
 pub mod service;
+pub mod tray;
 pub mod web;
 
 pub const DEFAULT_MODEL: &str =
@@ -51,6 +52,9 @@ pub enum Commands {
     Agent(AgentArgs),
     /// Start the web UI server
     Serve(ServeArgs),
+    /// Run the macOS menu bar status item for a pb serve instance
+    #[command(hide = true)]
+    Tray(TrayArgs),
     /// Manage the per-project container environment for sandboxed task execution
     #[command(name = "env")]
     Env {
@@ -286,6 +290,17 @@ pub struct ServeArgs {
     pub seed: u32,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct TrayArgs {
+    /// Web UI host to open and poll
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Web UI port to open and poll
+    #[arg(long, default_value_t = 8311)]
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestDescriptor {
     digest: String,
@@ -353,6 +368,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Tray(args) => tray::run(tray::TrayArgs {
+            host: args.host,
+            port: args.port,
+        }),
         Commands::Env { command } => run_env_command(command),
         Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir),

@@ -12,13 +12,23 @@ use std::path::PathBuf;
 use crate::ServeArgs;
 
 pub const LABEL: &str = "com.jc2k.pb";
+pub const TRAY_LABEL: &str = "com.jc2k.pb.tray";
 
-/// Path to the LaunchAgent plist file.
+/// Path to the pb serve LaunchAgent plist file.
 pub fn plist_path() -> Result<PathBuf> {
+    launch_agent_plist_path(LABEL)
+}
+
+/// Path to the menu bar tray LaunchAgent plist file.
+pub fn tray_plist_path() -> Result<PathBuf> {
+    launch_agent_plist_path(TRAY_LABEL)
+}
+
+fn launch_agent_plist_path(label: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     Ok(home
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist")))
+        .join(format!("{label}.plist")))
 }
 
 /// Render the plist XML for a given `pb serve` invocation.
@@ -51,17 +61,11 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
 
     if let Some(ref model_dir) = args.model_dir {
         program_args.push("        <string>--model-dir</string>".to_string());
-        program_args.push(format!(
-            "        <string>{}</string>",
-            model_dir.display()
-        ));
+        program_args.push(format!("        <string>{}</string>", model_dir.display()));
     }
     if let Some(ref workdir) = args.workdir {
         program_args.push("        <string>--workdir</string>".to_string());
-        program_args.push(format!(
-            "        <string>{}</string>",
-            workdir.display()
-        ));
+        program_args.push(format!("        <string>{}</string>", workdir.display()));
     }
     if let Some(threads) = args.threads {
         program_args.push("        <string>--threads</string>".to_string());
@@ -105,6 +109,48 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn render_tray_plist(exe: &str, args: &ServeArgs) -> String {
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join("Library/Logs"))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>tray</string>
+        <string>--host</string>
+        <string>{host}</string>
+        <string>--port</string>
+        <string>{port}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log_out}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_err}</string>
+</dict>
+</plist>
+"#,
+        label = TRAY_LABEL,
+        exe = exe,
+        host = args.host,
+        port = args.port,
+        log_out = log_dir.join("pb.tray.stdout.log").display(),
+        log_err = log_dir.join("pb.tray.stderr.log").display(),
+    )
+}
+
 /// `pb service enable` — write the plist and load it with launchctl.
 pub fn enable(args: &ServeArgs) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
@@ -115,39 +161,99 @@ pub fn enable(args: &ServeArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-
         let exe = std::env::current_exe()
             .context("cannot determine path to pb binary")?
             .to_string_lossy()
             .into_owned();
 
         let plist = plist_path()?;
+        let tray_plist = tray_plist_path()?;
         let plist_dir = plist.parent().expect("plist path has no parent");
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("failed to create {}", plist_dir.display()))?;
 
-        let content = render_plist(&exe, args);
-        std::fs::write(&plist, &content)
-            .with_context(|| format!("failed to write {}", plist.display()))?;
-        println!("Wrote {}", plist.display());
+        write_plist(&plist, &render_plist(&exe, args))?;
+        write_plist(&tray_plist, &render_tray_plist(&exe, args))?;
 
+        load_plist(&plist)?;
+        load_plist(&tray_plist)?;
+
+        println!(
+            "Services {LABEL} and {TRAY_LABEL} loaded. They will start automatically on login."
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_plist(path: &PathBuf, content: &str) -> Result<()> {
+    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn load_plist(path: &PathBuf) -> Result<()> {
+    use std::process::Command;
+
+    let status = Command::new("launchctl")
+        .args([
+            "load",
+            "-w",
+            path.to_str().context("plist path contains invalid UTF-8")?,
+        ])
+        .status()
+        .context("failed to run launchctl")?;
+    if !status.success() {
+        bail!(
+            "launchctl load failed for {} (exit {})",
+            path.display(),
+            status
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn unload_and_remove_plist(label: &str, path: &PathBuf) -> Result<()> {
+    use std::process::Command;
+
+    if path.exists() {
         let status = Command::new("launchctl")
             .args([
-                "load",
+                "unload",
                 "-w",
-                plist
-                    .to_str()
-                    .context("plist path contains invalid UTF-8")?,
+                path.to_str().context("plist path contains invalid UTF-8")?,
             ])
             .status()
             .context("failed to run launchctl")?;
         if !status.success() {
-            bail!("launchctl load failed (exit {})", status);
+            bail!("launchctl unload failed for {label} (exit {})", status);
         }
-        println!("Service {LABEL} loaded. It will start automatically on login.");
-        Ok(())
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        println!("Service {label} unloaded and plist removed.");
+    } else {
+        println!(
+            "No plist found at {}; nothing to disable for {label}.",
+            path.display()
+        );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_signal(action: &str, label: &str) -> Result<()> {
+    use std::process::Command;
+
+    let status = Command::new("launchctl")
+        .args([action, label])
+        .status()
+        .context("failed to run launchctl")?;
+    if !status.success() {
+        bail!("launchctl {action} failed for {label} (exit {status})");
+    }
+    Ok(())
 }
 
 /// `pb service disable` — unload the service and remove the plist.
@@ -157,30 +263,8 @@ pub fn disable() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-
-        let plist = plist_path()?;
-
-        if plist.exists() {
-            let status = Command::new("launchctl")
-                .args([
-                    "unload",
-                    "-w",
-                    plist
-                        .to_str()
-                        .context("plist path contains invalid UTF-8")?,
-                ])
-                .status()
-                .context("failed to run launchctl")?;
-            if !status.success() {
-                bail!("launchctl unload failed (exit {})", status);
-            }
-            std::fs::remove_file(&plist)
-                .with_context(|| format!("failed to remove {}", plist.display()))?;
-            println!("Service {LABEL} unloaded and plist removed.");
-        } else {
-            println!("No plist found at {}; nothing to disable.", plist.display());
-        }
+        unload_and_remove_plist(TRAY_LABEL, &tray_plist_path()?)?;
+        unload_and_remove_plist(LABEL, &plist_path()?)?;
         Ok(())
     }
 }
@@ -192,19 +276,9 @@ pub fn start() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-
-        let status = Command::new("launchctl")
-            .args(["start", LABEL])
-            .status()
-            .context("failed to run launchctl")?;
-        if !status.success() {
-            bail!(
-                "launchctl start failed (exit {}). Is the service enabled?",
-                status
-            );
-        }
-        println!("Service {LABEL} started.");
+        launchctl_signal("start", LABEL)?;
+        launchctl_signal("start", TRAY_LABEL)?;
+        println!("Services {LABEL} and {TRAY_LABEL} started.");
         Ok(())
     }
 }
@@ -216,19 +290,9 @@ pub fn stop() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-
-        let status = Command::new("launchctl")
-            .args(["stop", LABEL])
-            .status()
-            .context("failed to run launchctl")?;
-        if !status.success() {
-            bail!(
-                "launchctl stop failed (exit {}). Is the service running?",
-                status
-            );
-        }
-        println!("Service {LABEL} stopped.");
+        launchctl_signal("stop", TRAY_LABEL)?;
+        launchctl_signal("stop", LABEL)?;
+        println!("Services {LABEL} and {TRAY_LABEL} stopped.");
         Ok(())
     }
 }
@@ -236,8 +300,12 @@ pub fn stop() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers};
+    #[cfg(target_os = "macos")]
+    use crate::{
+        DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers,
+    };
 
+    #[cfg(target_os = "macos")]
     fn default_serve_args() -> ServeArgs {
         ServeArgs {
             host: "127.0.0.1".to_string(),
@@ -261,6 +329,13 @@ mod tests {
     fn test_plist_path_contains_label() {
         let path = plist_path().unwrap();
         assert!(path.to_string_lossy().contains(LABEL));
+        assert!(path.extension().map(|e| e == "plist").unwrap_or(false));
+    }
+
+    #[test]
+    fn test_tray_plist_path_contains_label() {
+        let path = tray_plist_path().unwrap();
+        assert!(path.to_string_lossy().contains(TRAY_LABEL));
         assert!(path.extension().map(|e| e == "plist").unwrap_or(false));
     }
 
