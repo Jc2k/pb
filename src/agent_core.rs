@@ -15,6 +15,7 @@ use similar::TextDiff;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use crate::environment::EnvironmentConfig;
 use crate::events::AgentEvent;
 
 const LLAMA_BATCH_SIZE: usize = 512;
+const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
@@ -157,9 +159,8 @@ pub fn run_agent<S: EventSink>(
 
     // If an environment is configured, spin up a fresh container for this task.
     let container = if let Some(ref config) = env_config {
-        let runtime = container::detect_runtime().context(
-            "no container runtime found; install docker, podman, or apple/container",
-        )?;
+        let runtime = container::detect_runtime()
+            .context("no container runtime found; install docker, podman, or apple/container")?;
         let container_id = runtime
             .create(&config.image, &workspace_root)
             .context("failed to create task container")?;
@@ -191,8 +192,12 @@ pub fn run_agent<S: EventSink>(
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
-    let instructions =
-        build_agent_instructions(&workspace_root, &branch, is_continuation, container.is_some())?;
+    let instructions = build_agent_instructions(
+        &workspace_root,
+        &branch,
+        is_continuation,
+        container.is_some(),
+    )?;
 
     let mut messages = vec![
         ChatMessage {
@@ -396,17 +401,31 @@ fn generate_completion(
         .str_to_token(prompt, AddBos::Always)
         .with_context(|| "failed to tokenize prompt")?;
 
-    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
-    let last_index = (tokens.len().saturating_sub(1)) as i32;
-    for (i, token) in (0_i32..).zip(tokens) {
-        let is_last = i == last_index;
-        batch
-            .add(token, i, &[0], is_last)
-            .context("failed to add prompt token to batch")?;
-    }
+    ensure_prompt_fits_context(tokens.len(), args.max_tokens, ctx.n_ctx())?;
 
-    ctx.decode(&mut batch)
-        .context("failed to decode prompt batch")?;
+    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
+    for range in prompt_batch_ranges(tokens.len(), LLAMA_BATCH_SIZE) {
+        batch.clear();
+        let is_final_batch = range.end == tokens.len();
+        for token_index in range.clone() {
+            let is_last_prompt_token = is_final_batch && token_index + 1 == tokens.len();
+            batch
+                .add(tokens[token_index], token_index as i32, &[0], is_last_prompt_token)
+                .with_context(|| {
+                    format!(
+                        "failed to add prompt token {token_index} to batch (batch capacity: {LLAMA_BATCH_SIZE}, prompt tokens: {})",
+                        tokens.len()
+                    )
+                })?;
+        }
+
+        ctx.decode(&mut batch).with_context(|| {
+            format!(
+                "failed to decode prompt batch {}..{}",
+                range.start, range.end
+            )
+        })?;
+    }
 
     let mut sampler = LlamaSampler::chain_simple([
         LlamaSampler::top_k(args.top_k),
@@ -416,7 +435,7 @@ fn generate_completion(
 
     let mut decoder = UTF_8.new_decoder();
     let mut output = String::new();
-    let mut n_cur = batch.n_tokens();
+    let mut n_cur = i32::try_from(tokens.len()).context("prompt token count exceeds i32::MAX")?;
     let mut generated_tokens = 0;
 
     while generated_tokens < args.max_tokens {
@@ -443,6 +462,27 @@ fn generate_completion(
     }
 
     Ok(output)
+}
+
+fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {
+    let n_ctx = usize::try_from(n_ctx).context("context size does not fit usize")?;
+    let requested_generation_tokens = usize::try_from(max_tokens.max(0))
+        .context("requested generation token count does not fit usize")?;
+    let reserved_generation_tokens = requested_generation_tokens.max(MIN_GENERATION_CONTEXT_TOKENS);
+    if prompt_tokens + reserved_generation_tokens > n_ctx {
+        bail!(
+            "prompt is too long for the configured context: {prompt_tokens} prompt tokens + {reserved_generation_tokens} reserved generation tokens exceeds ctx-size {n_ctx}. Increase --ctx-size or reduce the task/history size."
+        );
+    }
+    Ok(())
+}
+
+fn prompt_batch_ranges(token_count: usize, batch_size: usize) -> Vec<Range<usize>> {
+    assert!(batch_size > 0, "batch_size must be greater than zero");
+    (0..token_count)
+        .step_by(batch_size)
+        .map(|start| start..std::cmp::min(start + batch_size, token_count))
+        .collect()
 }
 
 fn parse_action(output: &str) -> Result<AgentAction> {
@@ -533,9 +573,10 @@ fn run_tool<S: EventSink>(
 
             let lines: Vec<_> = text.lines().collect();
             if let Some(end) = end
-                && (end as usize) < start {
-                    return Ok("(no content in requested range)".to_string());
-                }
+                && (end as usize) < start
+            {
+                return Ok("(no content in requested range)".to_string());
+            }
             let end_line = end.map_or(lines.len(), |v| v as usize).max(start);
             let mut out = String::new();
             for (idx, line) in lines
@@ -584,7 +625,12 @@ fn run_tool<S: EventSink>(
                 for (line_idx, line) in content.lines().enumerate() {
                     if regex.is_match(line) {
                         let rel = path.strip_prefix(workspace_root).unwrap_or(path);
-                        hits.push(format!("{}:{}:{}", rel.display(), line_idx + 1, line.trim()));
+                        hits.push(format!(
+                            "{}:{}:{}",
+                            rel.display(),
+                            line_idx + 1,
+                            line.trim()
+                        ));
                         if hits.len() >= MAX_SEARCH_RESULTS {
                             break;
                         }
@@ -685,9 +731,8 @@ fn run_tool<S: EventSink>(
                 .get("cmd")
                 .and_then(Value::as_str)
                 .context("run_command requires string argument: cmd")?;
-            let handle = container.context(
-                "run_command is not available: no container environment is configured",
-            )?;
+            let handle = container
+                .context("run_command is not available: no container environment is configured")?;
             handle.exec(cmd)
         }
         _ => bail!("unknown tool: {tool}"),
@@ -751,7 +796,8 @@ fn skill_text(name: &str) -> String {
                 .to_string()
         }
         "claude-code" => {
-            "Think in small steps, use safe file boundaries, and report reasoning clearly.".to_string()
+            "Think in small steps, use safe file boundaries, and report reasoning clearly."
+                .to_string()
         }
         "list" => "Available skills: copilot, codex, claude-code".to_string(),
         _ => format!("unknown skill '{name}'. Try: copilot, codex, claude-code, list"),
@@ -766,15 +812,15 @@ where
 }
 
 fn tool_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        OnceLock::new();
     match RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to start runtime for web tool")
             .map_err(|error| error.to_string())
-    })
-    {
+    }) {
         Ok(runtime) => Ok(runtime),
         Err(error) => Err(anyhow!(error.clone())),
     }
@@ -791,8 +837,7 @@ fn http_client() -> Result<&'static reqwest::Client> {
             .build()
             .context("failed to build web client")
             .map_err(|error| error.to_string())
-    })
-    {
+    }) {
         Ok(client) => Ok(client),
         Err(error) => Err(anyhow!(error.clone())),
     }
@@ -819,7 +864,12 @@ async fn run_web_search(query: &str) -> Result<String> {
 
     let mut out = format!("Web search results for: {query}\n");
     for (index, result) in results.iter().take(MAX_WEB_SEARCH_RESULTS).enumerate() {
-        out.push_str(&format!("{}. {}\n   URL: {}\n", index + 1, result.title, result.url));
+        out.push_str(&format!(
+            "{}. {}\n   URL: {}\n",
+            index + 1,
+            result.title,
+            result.url
+        ));
     }
     Ok(out)
 }
@@ -897,9 +947,10 @@ fn validate_public_web_url(url: &Url) -> Result<()> {
         bail!("local network URLs are not allowed");
     }
     if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_ip(ip) {
-            bail!("private or loopback IP URLs are not allowed");
-        }
+        && is_private_ip(ip)
+    {
+        bail!("private or loopback IP URLs are not allowed");
+    }
     Ok(())
 }
 
@@ -972,7 +1023,10 @@ fn parse_duckduckgo_results(html: &str) -> Vec<WebSearchResult> {
         if title.is_empty() || url.is_empty() {
             continue;
         }
-        if results.iter().any(|existing: &WebSearchResult| existing.url == url) {
+        if results
+            .iter()
+            .any(|existing: &WebSearchResult| existing.url == url)
+        {
             continue;
         }
         results.push(WebSearchResult { title, url });
@@ -987,10 +1041,12 @@ fn normalize_search_result_url(raw_url: &str) -> String {
     let decoded = decode_html_entities(raw_url.trim());
     let joined = match Url::parse(&decoded) {
         Ok(url) => url,
-        Err(_) => match Url::parse("https://duckduckgo.com/").and_then(|base| base.join(&decoded)) {
-            Ok(url) => url,
-            Err(_) => return decoded,
-        },
+        Err(_) => {
+            match Url::parse("https://duckduckgo.com/").and_then(|base| base.join(&decoded)) {
+                Ok(url) => url,
+                Err(_) => return decoded,
+            }
+        }
     };
 
     if joined
@@ -1000,9 +1056,9 @@ fn normalize_search_result_url(raw_url: &str) -> String {
             .query_pairs()
             .find(|(key, _)| key == "uddg")
             .map(|(_, value)| value.into_owned())
-        {
-            return target;
-        }
+    {
+        return target;
+    }
 
     joined.to_string()
 }
@@ -1028,14 +1084,15 @@ fn decode_html_entities(input: &str) -> String {
 
     while index < bytes.len() {
         if bytes[index] == b'&'
-            && let Some(end) = input[index..].find(';') {
-                let entity = &input[index + 1..index + end];
-                if let Some(decoded) = decode_html_entity(entity) {
-                    output.push(decoded);
-                    index += end + 1;
-                    continue;
-                }
+            && let Some(end) = input[index..].find(';')
+        {
+            let entity = &input[index + 1..index + end];
+            if let Some(decoded) = decode_html_entity(entity) {
+                output.push(decoded);
+                index += end + 1;
+                continue;
             }
+        }
         if let Some(ch) = input[index..].chars().next() {
             output.push(ch);
             index += ch.len_utf8();
@@ -1056,9 +1113,13 @@ fn decode_html_entity(entity: &str) -> Option<char> {
         "apos" | "#39" => Some('\''),
         "nbsp" => Some(' '),
         _ => {
-            let number = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X"));
+            let number = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"));
             if let Some(number) = number {
-                u32::from_str_radix(number, 16).ok().and_then(char::from_u32)
+                u32::from_str_radix(number, 16)
+                    .ok()
+                    .and_then(char::from_u32)
             } else if let Some(number) = entity.strip_prefix('#') {
                 number.parse::<u32>().ok().and_then(char::from_u32)
             } else {
@@ -1085,7 +1146,13 @@ pub fn branch_name_from_task(task: &str) -> String {
     let slug: String = task
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -1188,7 +1255,8 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
             model
         );
     }
-    gguf_files.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    gguf_files
+        .sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
 
     Ok(gguf_files.into_iter().next().unwrap())
 }
@@ -1209,11 +1277,37 @@ mod tests {
         let output = r#"{"type":"tool_call","tool":"git_revert","arguments":{"commit":"a707c16"},"thinking":"I will revert this commit.""#;
         let action = parse_action(output).expect("truncated JSON action should be repaired");
 
-        let AgentAction::ToolCall { tool, arguments, .. } = action else {
+        let AgentAction::ToolCall {
+            tool, arguments, ..
+        } = action
+        else {
             panic!("expected tool call");
         };
         assert_eq!(tool, "git_revert");
         assert_eq!(arguments["commit"], "a707c16");
+    }
+
+    #[test]
+    fn prompt_batch_ranges_splits_prompts_larger_than_batch_capacity() {
+        assert_eq!(
+            prompt_batch_ranges(1_025, 512),
+            vec![0..512, 512..1_024, 1_024..1_025]
+        );
+    }
+
+    #[test]
+    fn ensure_prompt_fits_context_allows_generation_room() {
+        ensure_prompt_fits_context(8_000, 128, 8_192).unwrap();
+    }
+
+    #[test]
+    fn ensure_prompt_fits_context_rejects_overflow_with_actionable_message() {
+        let err = ensure_prompt_fits_context(8_100, 128, 8_192)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("prompt is too long"), "error was: {err}");
+        assert!(err.contains("--ctx-size"), "error was: {err}");
     }
 
     #[test]
@@ -1267,7 +1361,10 @@ mod tests {
 
     #[test]
     fn branch_name_from_task_basic() {
-        assert_eq!(branch_name_from_task("Fix the login bug"), "pb/fix-the-login-bug");
+        assert_eq!(
+            branch_name_from_task("Fix the login bug"),
+            "pb/fix-the-login-bug"
+        );
     }
 
     #[test]
