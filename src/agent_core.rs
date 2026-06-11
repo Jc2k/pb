@@ -439,9 +439,9 @@ fn parse_action(output: &str) -> Result<AgentAction> {
     }
 
     let json_candidate = extract_json_object(output)
-        .with_context(|| "model output did not contain a valid JSON action")?;
+        .with_context(|| format!("model output did not contain a valid JSON action:\n{output}"))?;
     serde_json::from_str::<AgentAction>(&json_candidate)
-        .with_context(|| "failed to parse agent JSON action")
+        .with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
 }
 
 fn extract_json_object(input: &str) -> Option<String> {
