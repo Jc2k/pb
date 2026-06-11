@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
 use reqwest::StatusCode;
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -20,8 +20,7 @@ pub mod init;
 pub mod service;
 pub mod web;
 
-pub const DEFAULT_MODEL: &str =
-    "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -69,8 +68,19 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum SelfCommand {
+    /// Install pb into ~/.local/bin and register the launchd service
+    Install(ServeArgs),
+    /// Stop the launchd service, remove its plist, and delete the installed binary
+    Uninstall(SelfUninstallArgs),
     /// Update pb from the latest GitHub release
     Update,
+}
+
+#[derive(Args, Debug)]
+pub struct SelfUninstallArgs {
+    /// Also delete pb data and cache directories under ~/.local, ~/.cache, and related locations
+    #[arg(long)]
+    pub delete_data: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -87,14 +97,12 @@ pub enum EnvCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ServiceCommand {
-    /// Write a LaunchAgent plist and load it so pb serve runs on login
-    Enable(ServeArgs),
-    /// Unload the LaunchAgent and remove the plist
-    Disable,
     /// Start the pb serve service immediately
     Start,
     /// Stop the pb serve service
     Stop,
+    /// Restart the pb serve service
+    Restart,
 }
 
 #[derive(Args, Debug)]
@@ -318,6 +326,8 @@ struct HfModelInfo {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::SelfCmd { command } => match command {
+            SelfCommand::Install(args) => run_self_install(&args),
+            SelfCommand::Uninstall(args) => run_self_uninstall(&args),
             SelfCommand::Update => run_self_update(),
         },
         Commands::Pull(args) => pull_model(&args).await,
@@ -379,6 +389,73 @@ fn to_agent_request(args: AgentArgs) -> agent_core::AgentRequest {
     }
 }
 
+fn run_self_install(args: &ServeArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        bail!("pb self install is only supported on macOS because it installs a launchd service");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let source = std::env::current_exe().context("cannot determine path to pb binary")?;
+        let target = installed_binary_path()?;
+        confirm(&format!(
+            "Install pb by moving {} to {} and starting the launchd service?",
+            source.display(),
+            target.display()
+        ))?;
+
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        move_binary(&source, &target)?;
+        service::install(
+            target
+                .to_str()
+                .context("installed binary path contains invalid UTF-8")?,
+            args,
+        )?;
+        service::start()?;
+        println!("Installed pb to {}.", target.display());
+        Ok(())
+    }
+}
+
+fn run_self_uninstall(args: &SelfUninstallArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        bail!("pb self uninstall is only supported on macOS because it manages a launchd service");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let target = installed_binary_path()?;
+        let data_note = if args.delete_data {
+            " This will also delete pb data and cache directories."
+        } else {
+            ""
+        };
+        confirm(&format!(
+            "Uninstall pb, stop the launchd service, remove its plist, and delete {}?{}",
+            target.display(),
+            data_note
+        ))?;
+
+        let _ = service::stop();
+        service::uninstall()?;
+        remove_file_if_exists(&target)?;
+        if args.delete_data {
+            remove_data_dirs()?;
+        }
+        println!("Uninstalled pb.");
+        Ok(())
+    }
+}
+
 fn run_self_update() -> Result<()> {
     let target = release_target();
     let status = self_update::backends::github::Update::configure()
@@ -394,6 +471,120 @@ fn run_self_update() -> Result<()> {
         .context("self-update failed")?;
 
     println!("Updated to {}", status.version());
+    #[cfg(target_os = "macos")]
+    if let Err(err) = service::restart_or_start() {
+        eprintln!(
+            "Warning: updated pb, but failed to restart or start the launchd service: {err:#}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn installed_binary_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    Ok(home.join(".local").join("bin").join("pb"))
+}
+
+#[cfg(target_os = "macos")]
+fn confirm(prompt: &str) -> Result<()> {
+    use std::io::{self, Write};
+
+    print!("{prompt} [y/N] ");
+    io::stdout().flush().context("failed to flush stdout")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read confirmation")?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => bail!("aborted"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_binary(source: &Path, target: &Path) -> Result<()> {
+    if source == target {
+        return Ok(());
+    }
+
+    match std::fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            std::fs::copy(source, target).with_context(|| {
+                format!(
+                    "failed to copy {} to {} after rename failed: {rename_err}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+            remove_file_if_exists(source)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            println!("Removed {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            println!("Removed {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_data_dirs() -> Result<()> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let mut paths = vec![
+        default_data_dir(),
+        home.join(".cache").join("pb"),
+        home.join(".config").join("pb"),
+        home.join(".local").join("state").join("pb"),
+        home.join("Library").join("Application Support").join("pb"),
+        home.join("Library").join("Caches").join("pb"),
+        home.join("Library").join("Logs").join("pb"),
+    ];
+
+    if let Ok(xdg_cache_home) = std::env::var("XDG_CACHE_HOME")
+        && !xdg_cache_home.is_empty()
+    {
+        paths.push(PathBuf::from(xdg_cache_home).join("pb"));
+    }
+    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg_config_home.is_empty()
+    {
+        paths.push(PathBuf::from(xdg_config_home).join("pb"));
+    }
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME")
+        && !xdg_state_home.is_empty()
+    {
+        paths.push(PathBuf::from(xdg_state_home).join("pb"));
+    }
+
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        remove_dir_if_exists(&path)?;
+    }
+    remove_file_if_exists(&home.join("Library").join("Logs").join("pb.stdout.log"))?;
+    remove_file_if_exists(&home.join("Library").join("Logs").join("pb.stderr.log"))?;
     Ok(())
 }
 
@@ -408,10 +599,9 @@ fn run_env_command(command: EnvCommand) -> Result<()> {
 
 fn run_service_command(command: ServiceCommand) -> Result<()> {
     match command {
-        ServiceCommand::Enable(args) => service::enable(&args),
-        ServiceCommand::Disable => service::disable(),
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
+        ServiceCommand::Restart => service::restart(),
     }
 }
 
@@ -427,8 +617,8 @@ fn resolve_env_root(workdir: Option<PathBuf>) -> Result<PathBuf> {
 
 fn env_pull(args: EnvPullArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
-    let runtime =
-        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime = container::detect_runtime()
+        .context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Pulling image {}…", args.image);
     runtime.pull(&args.image)?;
     let config = EnvironmentConfig {
@@ -455,8 +645,8 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     if !dockerfile.exists() {
         bail!("Dockerfile not found: {}", dockerfile.display());
     }
-    let runtime =
-        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime = container::detect_runtime()
+        .context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Building image {} from {}…", args.tag, dockerfile.display());
     runtime.build(&dockerfile, &args.tag)?;
     let config = EnvironmentConfig {
@@ -477,8 +667,8 @@ fn env_start(args: EnvWorkdirArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
     let config = EnvironmentConfig::load(&root)?
         .context("no environment configured; run `pb env pull` or `pb env build` first")?;
-    let runtime =
-        container::detect_runtime().context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime = container::detect_runtime()
+        .context("no container runtime found; install docker, podman, or apple/container")?;
     println!("Creating test container from {}…", config.image);
     let container_id = runtime.create(&config.image, &root)?;
     println!("Container {} started", container_id);
@@ -558,7 +748,15 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         )
         .await
     } else {
-        pull_from_ollama(&client, &args.model, &output_root, args.batch_size, args.parallel, args.retries).await
+        pull_from_ollama(
+            &client,
+            &args.model,
+            &output_root,
+            args.batch_size,
+            args.parallel,
+            args.retries,
+        )
+        .await
     }
 }
 
@@ -596,7 +794,11 @@ fn parse_hf_uri(uri: &str) -> Option<(String, String, Option<String>)> {
 fn select_hf_gguf_files(files: &[String]) -> Vec<String> {
     const PREFS: &[&str] = &["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q4_0", "Q8_0"];
     for quant in PREFS {
-        let matches: Vec<String> = files.iter().filter(|f| f.contains(quant)).cloned().collect();
+        let matches: Vec<String> = files
+            .iter()
+            .filter(|f| f.contains(quant))
+            .cloned()
+            .collect();
         if !matches.is_empty() {
             return matches;
         }
@@ -631,7 +833,9 @@ async fn list_hf_gguf_files(
 /// Return the size for a Hugging Face sibling, preferring top-level `size`
 /// and falling back to `lfs.size` when needed.
 fn hf_sibling_size(sibling: &HfSibling) -> Option<u64> {
-    sibling.size.or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
+    sibling
+        .size
+        .or_else(|| sibling.lfs.as_ref().and_then(|lfs| lfs.size))
 }
 
 /// Issue a HEAD request and return the `Content-Length` value, if available.
@@ -723,8 +927,8 @@ async fn pull_from_hf(
     parallel: usize,
     retries: u32,
 ) -> Result<()> {
-    let (owner, repo, explicit_filename) = parse_hf_uri(hf_uri)
-        .with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
+    let (owner, repo, explicit_filename) =
+        parse_hf_uri(hf_uri).with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
 
     let siblings = list_hf_gguf_files(client, &owner, &repo).await?;
     if siblings.is_empty() {
@@ -735,7 +939,9 @@ async fn pull_from_hf(
         let sibling = siblings
             .iter()
             .find(|s| s.rfilename == f)
-            .with_context(|| format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face"))?;
+            .with_context(|| {
+                format!("GGUF file {f} not found in {owner}/{repo} on Hugging Face")
+            })?;
         let size = match hf_sibling_size(sibling) {
             s @ Some(_) => s,
             None => {
@@ -766,9 +972,9 @@ async fn pull_from_hf(
     };
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
-    tokio::fs::create_dir_all(&cache_dir).await.with_context(|| {
-        format!("failed to create cache directory {}", cache_dir.display())
-    })?;
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let total_bytes: u64 = files.iter().map(|(_, size)| size.unwrap_or(0)).sum();
     let initial_bytes = files.iter().try_fold(0u64, |acc, (filename, size)| {
@@ -783,7 +989,8 @@ async fn pull_from_hf(
         let dest = cache_dir.join(&filename);
         let progress = progress.clone();
         async move {
-            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries).await
+            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries)
+                .await
         }
     }))
     .buffer_unordered(parallel)
@@ -817,9 +1024,7 @@ async fn download_file_with_retry(
         match download_file_with_resume(client, url, path, expected_size, progress).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
-                eprintln!(
-                    "Download of {label} failed (attempt {attempt}/{retries}): {err}"
-                );
+                eprintln!("Download of {label} failed (attempt {attempt}/{retries}): {err}");
                 sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
             Err(err) => {
@@ -876,8 +1081,9 @@ async fn download_file_with_resume(
             0
         };
         if partial > size {
-            std::fs::remove_file(&tmp_path)
-                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
+            std::fs::remove_file(&tmp_path).with_context(|| {
+                format!("failed to remove stale temp file {}", tmp_path.display())
+            })?;
             0
         } else if partial == size {
             tokio::fs::rename(&tmp_path, path).await.with_context(|| {
@@ -894,8 +1100,9 @@ async fn download_file_with_resume(
     } else {
         // No resume when size is unknown: discard any stale partial download.
         if tmp_path.exists() {
-            std::fs::remove_file(&tmp_path)
-                .with_context(|| format!("failed to remove stale temp file {}", tmp_path.display()))?;
+            std::fs::remove_file(&tmp_path).with_context(|| {
+                format!("failed to remove stale temp file {}", tmp_path.display())
+            })?;
         }
         0
     };
@@ -984,8 +1191,11 @@ async fn pull_from_ollama(
 
     let total_bytes: u64 = descriptors.iter().map(|d| d.size).sum();
     let initial_bytes = descriptors.iter().try_fold(0u64, |acc, descriptor| {
-        existing_bytes(&blob_path(output_root, model, &descriptor.digest), Some(descriptor.size))
-            .map(|n| acc + n)
+        existing_bytes(
+            &blob_path(output_root, model, &descriptor.digest),
+            Some(descriptor.size),
+        )
+        .map(|n| acc + n)
     })?;
     let progress = build_progress_bar(total_bytes, initial_bytes)?;
 
@@ -1004,7 +1214,7 @@ async fn pull_from_ollama(
                     &progress,
                     retries,
                 )
-                    .await
+                .await
             }
         }))
         .buffer_unordered(parallel)
@@ -1061,7 +1271,16 @@ async fn download_blob_with_retry(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match download_blob(client, model, output_root, &digest, descriptor.size, progress).await {
+        match download_blob(
+            client,
+            model,
+            output_root,
+            &digest,
+            descriptor.size,
+            progress,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) if attempt <= retries => {
                 eprintln!(
@@ -1123,9 +1342,10 @@ fn default_gpu_layers() -> u32 {
 
 fn default_data_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty() {
-            return PathBuf::from(xdg).join("pb");
-        }
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("pb");
+    }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local").join("share").join("pb");
     }
@@ -1236,7 +1456,10 @@ mod tests {
 
     #[test]
     fn select_hf_gguf_files_falls_back_to_all() {
-        let files = vec!["model-IQ3_XS.gguf".to_owned(), "model-IQ4_XS.gguf".to_owned()];
+        let files = vec![
+            "model-IQ3_XS.gguf".to_owned(),
+            "model-IQ4_XS.gguf".to_owned(),
+        ];
         let selected = select_hf_gguf_files(&files);
         assert_eq!(selected.len(), 2);
     }
@@ -1258,7 +1481,11 @@ mod tests {
         let result = parse_hf_uri("hf://unsloth/Qwen3-Coder-Next-GGUF");
         assert_eq!(
             result,
-            Some(("unsloth".to_owned(), "Qwen3-Coder-Next-GGUF".to_owned(), None))
+            Some((
+                "unsloth".to_owned(),
+                "Qwen3-Coder-Next-GGUF".to_owned(),
+                None
+            ))
         );
     }
 
@@ -1314,7 +1541,10 @@ mod tests {
     #[test]
     fn download_tmp_path_adds_tmp_suffix() {
         let path = Path::new("/tmp/model.gguf");
-        assert_eq!(download_tmp_path(path), PathBuf::from("/tmp/model.gguf.tmp"));
+        assert_eq!(
+            download_tmp_path(path),
+            PathBuf::from("/tmp/model.gguf.tmp")
+        );
     }
 
     #[test]

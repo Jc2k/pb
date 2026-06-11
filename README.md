@@ -4,7 +4,9 @@ A local coding agent CLI with an optional web front end.
 
 ## Commands
 
-- `pb self update` - self update from the latest GitHub release binary.
+- `pb self install [serve options]` - move the current binary to `~/.local/bin/pb`, install the launchd config, and start the service after confirmation.
+- `pb self uninstall [--delete-data]` - stop the launchd service, remove the config, delete the installed binary, and optionally delete pb data/cache files after confirmation.
+- `pb self update` - self update from the latest GitHub release binary and restart or start the launchd service.
 - `pb pull [model]` - pull model blobs with retry, batching, and parallel download.
 - `pb agent <task> --model-dir /absolute/path/to/models --workdir /absolute/path/to/repo` - run the local in-process coding agent with streamed output and follow-up prompts.
 - the local agent can use built-in workspace editing tools plus read-only `web_search(query)` and `web_fetch(url)` actions for public web research.

@@ -1,10 +1,9 @@
 //! `pb service` — integrate `pb serve` with launchd (macOS).
 //!
 //! Sub-commands:
-//! - `enable`  — write a LaunchAgent plist referencing the current binary and load it
-//! - `disable` — unload the LaunchAgent and remove the plist
 //! - `start`   — ask launchd to start the service immediately
 //! - `stop`    — ask launchd to stop the service
+//! - `restart` — restart the service immediately
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -51,17 +50,11 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
 
     if let Some(ref model_dir) = args.model_dir {
         program_args.push("        <string>--model-dir</string>".to_string());
-        program_args.push(format!(
-            "        <string>{}</string>",
-            model_dir.display()
-        ));
+        program_args.push(format!("        <string>{}</string>", model_dir.display()));
     }
     if let Some(ref workdir) = args.workdir {
         program_args.push("        <string>--workdir</string>".to_string());
-        program_args.push(format!(
-            "        <string>{}</string>",
-            workdir.display()
-        ));
+        program_args.push(format!("        <string>{}</string>", workdir.display()));
     }
     if let Some(threads) = args.threads {
         program_args.push("        <string>--threads</string>".to_string());
@@ -105,10 +98,11 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
     )
 }
 
-/// `pb service enable` — write the plist and load it with launchctl.
-pub fn enable(args: &ServeArgs) -> Result<()> {
+/// Install the LaunchAgent plist for a given pb binary and load it with launchctl.
+pub fn install(exe: &str, args: &ServeArgs) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = exe;
         let _ = args;
         bail!("pb service is only supported on macOS");
     }
@@ -117,17 +111,12 @@ pub fn enable(args: &ServeArgs) -> Result<()> {
     {
         use std::process::Command;
 
-        let exe = std::env::current_exe()
-            .context("cannot determine path to pb binary")?
-            .to_string_lossy()
-            .into_owned();
-
         let plist = plist_path()?;
         let plist_dir = plist.parent().expect("plist path has no parent");
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("failed to create {}", plist_dir.display()))?;
 
-        let content = render_plist(&exe, args);
+        let content = render_plist(exe, args);
         std::fs::write(&plist, &content)
             .with_context(|| format!("failed to write {}", plist.display()))?;
         println!("Wrote {}", plist.display());
@@ -150,8 +139,8 @@ pub fn enable(args: &ServeArgs) -> Result<()> {
     }
 }
 
-/// `pb service disable` — unload the service and remove the plist.
-pub fn disable() -> Result<()> {
+/// Unload the service and remove the LaunchAgent plist.
+pub fn uninstall() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     bail!("pb service is only supported on macOS");
 
@@ -179,7 +168,10 @@ pub fn disable() -> Result<()> {
                 .with_context(|| format!("failed to remove {}", plist.display()))?;
             println!("Service {LABEL} unloaded and plist removed.");
         } else {
-            println!("No plist found at {}; nothing to disable.", plist.display());
+            println!(
+                "No plist found at {}; nothing to uninstall.",
+                plist.display()
+            );
         }
         Ok(())
     }
@@ -233,11 +225,91 @@ pub fn stop() -> Result<()> {
     }
 }
 
+/// Return true when launchd knows about the pb service.
+pub fn is_loaded() -> Result<bool> {
+    #[cfg(not(target_os = "macos"))]
+    bail!("pb service is only supported on macOS");
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .context("failed to determine current user id")?;
+        if !uid.status.success() {
+            bail!("id -u failed (exit {})", uid.status);
+        }
+        let uid = String::from_utf8(uid.stdout)
+            .context("id -u output was not UTF-8")?
+            .trim()
+            .to_owned();
+        let status = Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{LABEL}")])
+            .status()
+            .context("failed to run launchctl")?;
+        Ok(status.success())
+    }
+}
+
+/// `pb service restart` — restart the service via launchctl.
+pub fn restart() -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    bail!("pb service is only supported on macOS");
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = stop();
+        start()
+    }
+}
+
+/// Restart the service if loaded; otherwise start it from the LaunchAgent plist.
+pub fn restart_or_start() -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    bail!("pb service is only supported on macOS");
+
+    #[cfg(target_os = "macos")]
+    {
+        if is_loaded()? {
+            restart()
+        } else {
+            let plist = plist_path()?;
+            if plist.exists() {
+                use std::process::Command;
+
+                let status = Command::new("launchctl")
+                    .args([
+                        "load",
+                        "-w",
+                        plist
+                            .to_str()
+                            .context("plist path contains invalid UTF-8")?,
+                    ])
+                    .status()
+                    .context("failed to run launchctl")?;
+                if !status.success() {
+                    bail!("launchctl load failed (exit {})", status);
+                }
+                println!("Service {LABEL} loaded and started.");
+                Ok(())
+            } else {
+                start()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers};
+    #[cfg(target_os = "macos")]
+    use crate::{
+        DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers,
+    };
 
+    #[cfg(target_os = "macos")]
     fn default_serve_args() -> ServeArgs {
         ServeArgs {
             host: "127.0.0.1".to_string(),
