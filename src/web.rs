@@ -76,6 +76,13 @@ struct SessionDetails {
     events: Vec<EventEnvelope>,
 }
 
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    busy: bool,
+    running_sessions: usize,
+    total_sessions: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SessionState {
     task: String,
@@ -108,6 +115,7 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
+        .route("/api/status", get(status))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state((state, defaults));
@@ -234,6 +242,18 @@ async fn get_session(
         branch: session.branch.clone(),
         events,
     }))
+}
+
+async fn status(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Json<StatusResponse> {
+    let sessions = state.sessions.lock().await;
+    let running_sessions = sessions.values().filter(|session| session.running).count();
+    Json(StatusResponse {
+        busy: running_sessions > 0,
+        running_sessions,
+        total_sessions: sessions.len(),
+    })
 }
 
 async fn list_projects(

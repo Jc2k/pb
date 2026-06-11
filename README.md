@@ -9,6 +9,7 @@ A local coding agent CLI with an optional web front end.
 - `pb agent <task> --model-dir /absolute/path/to/models --workdir /absolute/path/to/repo` - run the local in-process coding agent with streamed output and follow-up prompts.
 - the local agent can use built-in workspace editing tools plus read-only `web_search(query)` and `web_fetch(url)` actions for public web research.
 - `pb serve` - start a Rust web server and serve the embedded SPA for browser-based sessions.
+- `pb service enable` - on macOS, install launchd agents for both `pb serve` and a menu bar item that opens the web UI and indicates when sessions are busy.
 
 ## Web UI (`pb serve`)
 
@@ -19,7 +20,8 @@ A local coding agent CLI with an optional web front end.
 - stream typed live events over SSE,
 - replay recent session history when you reconnect,
 - continue existing sessions with follow-up prompts,
-- show the same agent progress contract used by the CLI adapter.
+- show the same agent progress contract used by the CLI adapter,
+- report `/api/status` so the macOS menu bar item can show when any session is running.
 
 ## Build and test
 
