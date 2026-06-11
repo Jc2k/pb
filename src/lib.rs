@@ -20,7 +20,8 @@ pub mod init;
 pub mod service;
 pub mod web;
 
-pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF";
+pub const DEFAULT_MODEL: &str =
+    "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -1187,6 +1188,18 @@ mod tests {
     #[test]
     fn release_target_is_not_empty() {
         assert!(!release_target().is_empty());
+    }
+
+    #[test]
+    fn default_model_pins_q4_k_m_quantization() {
+        assert_eq!(
+            parse_hf_uri(DEFAULT_MODEL),
+            Some((
+                "unsloth".to_owned(),
+                "Qwen3-Coder-Next-GGUF".to_owned(),
+                Some("Qwen3-Coder-Next-Q4_K_M.gguf".to_owned())
+            ))
+        );
     }
 
     #[test]
