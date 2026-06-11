@@ -407,8 +407,9 @@ fn generate_completion(
     let mut decoder = UTF_8.new_decoder();
     let mut output = String::new();
     let mut n_cur = batch.n_tokens();
+    let mut generated_tokens = 0;
 
-    while n_cur <= args.max_tokens {
+    while generated_tokens < args.max_tokens {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
@@ -428,6 +429,7 @@ fn generate_completion(
         ctx.decode(&mut batch)
             .context("failed to decode generated token")?;
         n_cur += 1;
+        generated_tokens += 1;
     }
 
     Ok(output)
@@ -486,6 +488,15 @@ fn extract_json_object(input: &str) -> Option<String> {
             }
             _ => {}
         }
+    }
+
+    if let Some(s) = start
+        && depth > 0
+        && !in_string
+    {
+        let mut candidate = input[s..].trim_end().to_string();
+        candidate.extend(std::iter::repeat('}').take(depth));
+        return Some(candidate);
     }
 
     None
@@ -1181,6 +1192,18 @@ mod tests {
         let output = "hello {\"type\":\"final\",\"content\":\"ok\"} trailing";
         let extracted = extract_json_object(output).expect("json should be extracted");
         assert_eq!(extracted, "{\"type\":\"final\",\"content\":\"ok\"}");
+    }
+
+    #[test]
+    fn parse_action_repairs_missing_closing_brace() {
+        let output = r#"{"type":"tool_call","tool":"git_revert","arguments":{"commit":"a707c16"},"thinking":"I will revert this commit.""#;
+        let action = parse_action(output).expect("truncated JSON action should be repaired");
+
+        let AgentAction::ToolCall { tool, arguments, .. } = action else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool, "git_revert");
+        assert_eq!(arguments["commit"], "a707c16");
     }
 
     #[test]
