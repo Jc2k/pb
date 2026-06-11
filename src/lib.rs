@@ -18,6 +18,7 @@ pub mod daemon_client;
 pub mod environment;
 pub mod events;
 pub mod init;
+pub mod projects;
 pub mod service;
 pub mod tray;
 pub mod web;
@@ -52,6 +53,12 @@ pub enum Commands {
     Queue(QueueArgs),
     /// Start the web UI server
     Serve(ServeArgs),
+    /// Manage named projects in the user-global registry
+    #[command(name = "projects", alias = "project")]
+    Projects {
+        #[command(subcommand)]
+        command: ProjectsCommand,
+    },
     /// Run the macOS menu bar status item for a pb serve instance
     #[command(hide = true)]
     Tray(TrayArgs),
@@ -100,6 +107,49 @@ pub enum EnvCommand {
     Start(EnvWorkdirArgs),
     /// Show the current project environment configuration
     Status(EnvWorkdirArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectsCommand {
+    /// Add a project to the user-global registry
+    Add(ProjectAddArgs),
+    /// List registered projects
+    List(ProjectListArgs),
+    /// Remove a project from the registry by name
+    #[command(alias = "remove")]
+    Rm(ProjectRemoveArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProjectAddArgs {
+    /// Project directory; defaults to the current directory
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Project name; defaults to the directory name
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Unix socket path for the pb daemon
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProjectListArgs {
+    /// Unix socket path for the pb daemon
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProjectRemoveArgs {
+    /// Registered project name to remove
+    pub name: String,
+
+    /// Unix socket path for the pb daemon
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -420,10 +470,58 @@ pub async fn run(cli: Cli) -> Result<()> {
             host: args.host,
             port: args.port,
         }),
+        Commands::Projects { command } => run_projects_command(command).await,
         Commands::Env { command } => run_env_command(command),
         Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
+}
+
+async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
+    match command {
+        ProjectsCommand::Add(args) => {
+            let socket_path = args
+                .socket_path
+                .clone()
+                .unwrap_or_else(daemon_client::default_socket_path);
+            let entry = daemon_client::add_project(
+                &socket_path,
+                projects::AddProjectRequest {
+                    name: args.name,
+                    path: args.path.to_string_lossy().into_owned(),
+                },
+            )
+            .await?;
+            println!("added project {}\t{}", entry.name, entry.path);
+        }
+        ProjectsCommand::List(args) => {
+            let socket_path = args
+                .socket_path
+                .clone()
+                .unwrap_or_else(daemon_client::default_socket_path);
+            let projects = daemon_client::list_projects(&socket_path).await?;
+            if projects.is_empty() {
+                println!("no projects registered");
+                return Ok(());
+            }
+            for project in projects {
+                println!("{}\t{}", project.name, project.path);
+            }
+        }
+        ProjectsCommand::Rm(args) => {
+            let socket_path = args
+                .socket_path
+                .clone()
+                .unwrap_or_else(daemon_client::default_socket_path);
+            let entry = daemon_client::remove_project(
+                &socket_path,
+                projects::RemoveProjectRequest { name: args.name },
+            )
+            .await?;
+            println!("removed project {}\t{}", entry.name, entry.path);
+        }
+    }
+    Ok(())
 }
 
 async fn run_queue(args: QueueArgs) -> Result<()> {

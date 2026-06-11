@@ -20,6 +20,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
+use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -135,6 +136,7 @@ struct SessionState {
 #[derive(Debug, Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    projects: Arc<Mutex<Vec<ProjectEntry>>>,
 }
 
 #[derive(RustEmbed)]
@@ -144,6 +146,7 @@ struct WebAssets;
 pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        projects: Arc::new(Mutex::new(projects::load_projects()?)),
     };
 
     let app = Router::new()
@@ -312,16 +315,8 @@ async fn status(
 
 async fn list_projects(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Json<Vec<String>> {
-    let sessions = state.sessions.lock().await;
-    let mut projects: Vec<String> = sessions
-        .values()
-        .filter_map(|s| s.workdir.as_ref())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    projects.sort();
-    projects.dedup();
-    Json(projects)
+) -> Json<Vec<ProjectEntry>> {
+    Json(project_list_snapshot(&state).await)
 }
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
@@ -461,6 +456,23 @@ async fn handle_rpc_connection(
         }
         "pb.session.list" => {
             let result = session_list_snapshot(&state).await;
+            write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.projects.add" => {
+            let params: AddProjectRequest = serde_json::from_value(request.params)?;
+            let result = projects::add_project(params)?;
+            reload_projects(&state).await?;
+            write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.projects.list" => {
+            reload_projects(&state).await?;
+            let result = project_list_snapshot(&state).await;
+            write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.projects.rm" => {
+            let params: RemoveProjectRequest = serde_json::from_value(request.params)?;
+            let result = projects::remove_project(&params.name)?;
+            reload_projects(&state).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
         "pb.session.get" => {
@@ -627,6 +639,17 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .collect::<Vec<_>>();
     items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
     items
+}
+
+async fn reload_projects(state: &AppState) -> Result<()> {
+    let projects = projects::load_projects()?;
+    let mut current = state.projects.lock().await;
+    *current = projects;
+    Ok(())
+}
+
+async fn project_list_snapshot(state: &AppState) -> Vec<ProjectEntry> {
+    state.projects.lock().await.clone()
 }
 
 async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionDetails> {
