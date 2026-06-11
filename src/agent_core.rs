@@ -1117,6 +1117,7 @@ fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
 }
 
 fn git_revert(commit: &str, workdir: &Path) -> Result<String> {
+    let commit = commit.trim();
     git_run(&["revert", "--no-edit", commit], workdir)?;
     Ok(format!("reverted commit: {commit}"))
 }
