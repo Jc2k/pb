@@ -399,9 +399,9 @@ fn generate_completion(
         .context("failed to decode prompt batch")?;
 
     let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::dist(args.seed),
         LlamaSampler::top_k(args.top_k),
         LlamaSampler::temp(args.temperature),
+        LlamaSampler::dist(args.seed),
     ]);
 
     let mut decoder = UTF_8.new_decoder();
