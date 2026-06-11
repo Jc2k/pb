@@ -41,6 +41,11 @@ interface SessionDetails {
   events: EventEnvelope[];
 }
 
+interface ProjectEntry {
+  name: string;
+  path: string;
+}
+
 /* ─── simple router ──────────────────────────────────────────── */
 
 function useRoute(): string {
@@ -268,7 +273,7 @@ function HomePage() {
   const [workdir, setWorkdir] = useState("");
   const [branch, setBranch] = useState("main");
   const [sessions, setSessions] = useState<SessionItem[]>([]);
-  const [projects, setProjects] = useState<string[]>([]);
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fetchSessions = async () => {
@@ -280,11 +285,13 @@ function HomePage() {
   const fetchProjects = async () => {
     const res = await fetch("/api/projects");
     if (!res.ok) return;
-    setProjects((await res.json()) as string[]);
+    const entries = (await res.json()) as ProjectEntry[];
+    setProjects(entries);
+    setWorkdir((current) => current || entries[0]?.path || "");
   };
 
   const startSession = async () => {
-    if (!task.trim()) return;
+    if (!task.trim() || !workdir) return;
     setIsSubmitting(true);
     try {
       const res = await fetch("/api/sessions", {
@@ -339,18 +346,25 @@ function HomePage() {
                   }}
                 />
                 <div>
-                  <input
-                    className="form-control"
-                    list="projects-list"
+                  <select
+                    className="form-select"
                     value={workdir}
                     onChange={(e) => setWorkdir(e.target.value)}
-                    placeholder="Project folder (optional)"
-                  />
-                  <datalist id="projects-list">
-                    {projects.map((p) => (
-                      <option key={p} value={p} />
-                    ))}
-                  </datalist>
+                    disabled={projects.length === 0}
+                  >
+                    {projects.length === 0 ? (
+                      <option value="">No registered projects</option>
+                    ) : (
+                      projects.map((project) => (
+                        <option key={project.name} value={project.path}>
+                          {project.name} — {project.path}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <div className="form-text">
+                    Register projects with <code>pb projects add</code>.
+                  </div>
                 </div>
                 <input
                   className="form-control"
@@ -361,7 +375,7 @@ function HomePage() {
                 <button
                   className="btn btn-primary"
                   onClick={() => void startSession()}
-                  disabled={!task.trim() || isSubmitting}
+                  disabled={!task.trim() || !workdir || isSubmitting}
                 >
                   {isSubmitting ? (
                     <>

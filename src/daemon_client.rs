@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 
 use crate::cli_ui::render_event;
 use crate::events::EventEnvelope;
+use crate::projects::{AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 use crate::web::{
     SessionFinished, SessionListItem, SessionResponse, StartSessionRequest, WatchSessionRequest,
 };
@@ -55,6 +56,21 @@ pub async fn start_session(
 
 pub async fn list_sessions(socket_path: &PathBuf) -> Result<Vec<SessionListItem>> {
     request(socket_path, "pb.session.list", serde_json::json!({})).await
+}
+
+pub async fn add_project(socket_path: &PathBuf, params: AddProjectRequest) -> Result<ProjectEntry> {
+    request(socket_path, "pb.projects.add", params).await
+}
+
+pub async fn list_projects(socket_path: &PathBuf) -> Result<Vec<ProjectEntry>> {
+    request(socket_path, "pb.projects.list", serde_json::json!({})).await
+}
+
+pub async fn remove_project(
+    socket_path: &PathBuf,
+    params: RemoveProjectRequest,
+) -> Result<ProjectEntry> {
+    request(socket_path, "pb.projects.rm", params).await
 }
 
 pub async fn watch_session(socket_path: &PathBuf, session_id: String) -> Result<()> {

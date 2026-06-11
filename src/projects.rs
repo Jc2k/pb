@@ -1,0 +1,130 @@
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProjectRegistry {
+    #[serde(default)]
+    projects: Vec<ProjectEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddProjectRequest {
+    pub name: Option<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveProjectRequest {
+    pub name: String,
+}
+
+pub fn registry_path() -> Result<PathBuf> {
+    let config_dir = dirs::config_dir().context("cannot determine config directory")?;
+    Ok(config_dir.join("pb").join("projects.toml"))
+}
+
+pub fn default_project_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.to_string())
+        .with_context(|| format!("cannot infer project name from {}", path.display()))
+}
+
+pub fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    path.as_ref()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project path {}", path.as_ref().display()))
+}
+
+pub fn load_projects() -> Result<Vec<ProjectEntry>> {
+    let path = registry_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let registry: ProjectRegistry =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut projects = registry.projects;
+    sort_projects(&mut projects);
+    Ok(projects)
+}
+
+pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
+    let path = canonical_project_path(&request.path)?;
+    let name = match request.name {
+        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => default_project_name(&path)?,
+    };
+    validate_project_name(&name)?;
+
+    let entry = ProjectEntry {
+        name: name.clone(),
+        path: path.to_string_lossy().into_owned(),
+    };
+
+    let mut projects = load_projects()?;
+    projects.retain(|project| project.name != name && project.path != entry.path);
+    projects.push(entry.clone());
+    sort_projects(&mut projects);
+    save_projects(&projects)?;
+    Ok(entry)
+}
+
+pub fn remove_project(name: &str) -> Result<ProjectEntry> {
+    validate_project_name(name)?;
+    let mut projects = load_projects()?;
+    let Some(index) = projects.iter().position(|project| project.name == name) else {
+        bail!("project not found: {name}");
+    };
+    let removed = projects.remove(index);
+    save_projects(&projects)?;
+    Ok(removed)
+}
+
+fn save_projects(projects: &[ProjectEntry]) -> Result<()> {
+    let path = registry_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(&ProjectRegistry {
+        projects: projects.to_vec(),
+    })?;
+    std::fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn validate_project_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("project name cannot be empty");
+    }
+    if name.contains('\n') || name.contains('\r') {
+        bail!("project name cannot contain newlines");
+    }
+    Ok(())
+}
+
+fn sort_projects(projects: &mut [ProjectEntry]) {
+    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_name_uses_folder_name() {
+        assert_eq!(
+            default_project_name(Path::new("/tmp/example-project")).unwrap(),
+            "example-project"
+        );
+    }
+}
