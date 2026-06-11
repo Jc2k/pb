@@ -7,6 +7,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,6 +31,13 @@ const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
+
+fn suppress_llama_logs() {
+    static LLAMA_LOGS_SUPPRESSED: OnceLock<()> = OnceLock::new();
+    LLAMA_LOGS_SUPPRESSED.get_or_init(|| {
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSearchResult {
@@ -176,7 +184,9 @@ pub fn run_agent<S: EventSink>(
         branch: branch.clone(),
     });
 
-    let backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    suppress_llama_logs();
+    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    backend.void_logs();
     let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
