@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -9,15 +10,31 @@ pub enum EnvironmentMode {
     #[default]
     Pull,
     Build,
+    Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum EnvironmentBackend {
+    /// Execute commands in an Apple/container-backed project environment.
+    #[default]
+    AppleContainers,
+    /// Execute commands directly on the host from the project root.
+    Local,
+}
 
 /// Project environment configuration stored at `.pb/environment.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
-    /// Whether the image was pulled from a registry (`pull`) or built locally (`build`).
+    /// Whether the image was pulled from a registry (`pull`), built locally (`build`), or run on the host (`local`).
     #[serde(default)]
     pub mode: EnvironmentMode,
+
+    /// Execution backend for running project commands. Defaults to Apple containers.
+    #[serde(default)]
+    pub backend: EnvironmentBackend,
 
     /// Container image reference (e.g. `ghcr.io/myorg/dev:latest` or a locally built tag).
     pub image: String,
@@ -41,8 +58,8 @@ impl EnvironmentConfig {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: Self = toml::from_str(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
         Ok(Some(config))
     }
 
@@ -52,7 +69,8 @@ impl EnvironmentConfig {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create directory {}", dir.display()))?;
         let path = dir.join("environment.toml");
-        let text = toml::to_string_pretty(self).context("failed to serialize environment config")?;
+        let text =
+            toml::to_string_pretty(self).context("failed to serialize environment config")?;
         std::fs::write(&path, text)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
@@ -69,6 +87,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "ghcr.io/example/dev:latest".to_string(),
             init_commands: vec!["npm ci".to_string()],
             dockerfile: None,
@@ -86,6 +105,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = EnvironmentConfig {
             mode: EnvironmentMode::Build,
+            backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
             dockerfile: Some(PathBuf::from("Dockerfile")),
@@ -94,6 +114,23 @@ mod tests {
         let loaded = EnvironmentConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.mode, EnvironmentMode::Build);
         assert_eq!(loaded.dockerfile, Some(PathBuf::from("Dockerfile")));
+    }
+
+    #[test]
+    fn round_trip_local_backend_config() {
+        let dir = TempDir::new().unwrap();
+        let config = EnvironmentConfig {
+            mode: EnvironmentMode::Local,
+            backend: EnvironmentBackend::Local,
+            image: "local".to_string(),
+            init_commands: vec!["cargo check".to_string()],
+            dockerfile: None,
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = EnvironmentConfig::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.mode, EnvironmentMode::Local);
+        assert_eq!(loaded.backend, EnvironmentBackend::Local);
+        assert_eq!(loaded.init_commands, vec!["cargo check"]);
     }
 
     #[test]

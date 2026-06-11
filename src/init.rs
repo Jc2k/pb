@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::environment::{EnvironmentConfig, EnvironmentMode};
+use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 
 // ── detection results ────────────────────────────────────────────────────────
 
@@ -49,10 +49,11 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     for dc_path in [&dc_json, &dc_json_top] {
         if dc_path.exists() {
             if let Ok(text) = std::fs::read_to_string(dc_path)
-                && let Some((image, inits)) = parse_devcontainer_json(&text) {
-                    info.devcontainer_image = Some(image);
-                    info.devcontainer_init_commands = inits;
-                }
+                && let Some((image, inits)) = parse_devcontainer_json(&text)
+            {
+                info.devcontainer_image = Some(image);
+                info.devcontainer_init_commands = inits;
+            }
             break;
         }
     }
@@ -65,9 +66,10 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     // --- GitLab CI ---
     let gitlab_ci = root.join(".gitlab-ci.yml");
     if gitlab_ci.exists()
-        && let Ok(text) = std::fs::read_to_string(&gitlab_ci) {
-            info.gitlab_ci_image = parse_gitlab_ci_image(&text);
-        }
+        && let Ok(text) = std::fs::read_to_string(&gitlab_ci)
+    {
+        info.gitlab_ci_image = parse_gitlab_ci_image(&text);
+    }
 
     // --- Language ecosystems ---
     info.has_cargo_toml = root.join("Cargo.toml").exists();
@@ -110,6 +112,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if let Some(image) = &info.devcontainer_image {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
             init_commands: info.devcontainer_init_commands.clone(),
             dockerfile: None,
@@ -120,6 +123,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if info.has_dockerfile {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Build,
+            backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
             dockerfile: Some(PathBuf::from("Dockerfile")),
@@ -131,6 +135,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
         let init_commands = language_init_commands(info);
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
             init_commands,
             dockerfile: None,
@@ -141,6 +146,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if info.has_cargo_toml {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "rust:latest".to_string(),
             init_commands: vec![],
             dockerfile: None,
@@ -154,6 +160,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
         };
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "python:3-slim".to_string(),
             init_commands,
             dockerfile: None,
@@ -162,6 +169,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if info.has_deno_lock {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "denoland/deno:latest".to_string(),
             init_commands: vec!["deno install".to_string()],
             dockerfile: None,
@@ -170,6 +178,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if info.has_package_json {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "node:lts-slim".to_string(),
             init_commands: vec!["npm ci".to_string()],
             dockerfile: None,
@@ -178,6 +187,7 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     if info.has_go_mod {
         return Some(EnvironmentConfig {
             mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
             image: "golang:latest".to_string(),
             init_commands: vec!["go mod download".to_string()],
             dockerfile: None,
@@ -207,10 +217,20 @@ fn language_init_commands(info: &ProjectInspection) -> Vec<String> {
     cmds
 }
 
+pub fn local_environment(info: &ProjectInspection) -> EnvironmentConfig {
+    EnvironmentConfig {
+        mode: EnvironmentMode::Local,
+        backend: EnvironmentBackend::Local,
+        image: "local".to_string(),
+        init_commands: language_init_commands(info),
+        dockerfile: None,
+    }
+}
+
 // ── run ───────────────────────────────────────────────────────────────────────
 
 /// Entry-point for `pb init`.
-pub fn run_init(workdir: Option<PathBuf>) -> Result<()> {
+pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -> Result<()> {
     let root = super::resolve_env_root(workdir)?;
     println!("Inspecting project at {}…", root.display());
 
@@ -241,24 +261,13 @@ pub fn run_init(workdir: Option<PathBuf>) -> Result<()> {
         );
         println!("Skipping environment setup (remove .pb/environment.toml to reconfigure).");
     } else {
-        match suggest_environment(&info) {
+        let env = match backend {
+            Some(EnvironmentBackend::Local) => Some(local_environment(&info)),
+            Some(EnvironmentBackend::AppleContainers) | None => suggest_environment(&info),
+        };
+        match env {
             Some(env) => {
-                let mode_str = match env.mode {
-                    EnvironmentMode::Pull => "pull",
-                    EnvironmentMode::Build => "build",
-                };
-                println!("Suggested environment:");
-                println!("  mode:  {mode_str}");
-                println!("  image: {}", env.image);
-                if let Some(df) = &env.dockerfile {
-                    println!("  dockerfile: {}", df.display());
-                }
-                if !env.init_commands.is_empty() {
-                    println!("  init_commands:");
-                    for cmd in &env.init_commands {
-                        println!("    - {cmd}");
-                    }
-                }
+                print_environment_config("Suggested environment", &env);
                 env.save(&root)?;
                 println!(
                     "Environment config written to {}.",
@@ -268,13 +277,40 @@ pub fn run_init(workdir: Option<PathBuf>) -> Result<()> {
             None => {
                 println!(
                     "No environment could be automatically detected. \
-                     Run `pb env pull <image>` or `pb env build` to configure one."
+                     Run `pb env pull <image>`, `pb env build`, or `pb env local` to configure one."
                 );
             }
         }
     }
 
     Ok(())
+}
+
+fn print_environment_config(label: &str, env: &EnvironmentConfig) {
+    let mode_str = match env.mode {
+        EnvironmentMode::Pull => "pull",
+        EnvironmentMode::Build => "build",
+        EnvironmentMode::Local => "local",
+    };
+    let backend_str = match env.backend {
+        EnvironmentBackend::AppleContainers => "apple-containers",
+        EnvironmentBackend::Local => "local",
+    };
+    println!("{label}:");
+    println!("  mode:  {mode_str}");
+    println!("  backend: {backend_str}");
+    if env.backend != EnvironmentBackend::Local {
+        println!("  image: {}", env.image);
+    }
+    if let Some(df) = &env.dockerfile {
+        println!("  dockerfile: {}", df.display());
+    }
+    if !env.init_commands.is_empty() {
+        println!("  init_commands:");
+        for cmd in &env.init_commands {
+            println!("    - {cmd}");
+        }
+    }
 }
 
 fn print_detection_summary(info: &ProjectInspection) {
@@ -676,6 +712,19 @@ mod tests {
         let env = suggest_environment(&info).unwrap();
         assert!(matches!(env.mode, EnvironmentMode::Build));
         assert_eq!(env.dockerfile, Some(PathBuf::from("Dockerfile")));
+    }
+
+    #[test]
+    fn local_environment_forces_local_backend_with_language_init() {
+        let info = ProjectInspection {
+            has_package_json: true,
+            ..Default::default()
+        };
+        let env = local_environment(&info);
+        assert_eq!(env.mode, EnvironmentMode::Local);
+        assert_eq!(env.backend, EnvironmentBackend::Local);
+        assert_eq!(env.image, "local");
+        assert_eq!(env.init_commands, vec!["npm ci"]);
     }
 
     #[test]

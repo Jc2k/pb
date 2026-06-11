@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, sleep};
 
-use crate::environment::{EnvironmentConfig, EnvironmentMode};
+use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 
 pub mod agent_core;
 pub mod cli_ui;
@@ -94,7 +94,9 @@ pub enum EnvCommand {
     Pull(EnvPullArgs),
     /// Build a dev-environment image from a Dockerfile and save it as the project environment
     Build(EnvBuildArgs),
-    /// Verify the configured environment by creating a test container and running init commands
+    /// Configure this project to run commands directly on the local host
+    Local(EnvLocalArgs),
+    /// Verify the configured environment by creating a test container or running local init commands
     Start(EnvWorkdirArgs),
     /// Show the current project environment configuration
     Status(EnvWorkdirArgs),
@@ -144,6 +146,17 @@ pub struct EnvBuildArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct EnvLocalArgs {
+    /// Shell commands to run locally before agent work begins (may be repeated)
+    #[arg(long = "init", value_name = "CMD")]
+    pub init_commands: Vec<String>,
+
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct EnvWorkdirArgs {
     /// Project root; defaults to the nearest git repository root
     #[arg(long)]
@@ -155,6 +168,10 @@ pub struct InitArgs {
     /// Project root; defaults to the nearest git repository root
     #[arg(long)]
     pub workdir: Option<PathBuf>,
+
+    /// Force the project execution backend; defaults to Apple containers
+    #[arg(long, value_enum)]
+    pub backend: Option<EnvironmentBackend>,
 }
 
 #[derive(Args, Debug)]
@@ -405,7 +422,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }),
         Commands::Env { command } => run_env_command(command),
         Commands::Service { command } => run_service_command(command),
-        Commands::Init(args) => init::run_init(args.workdir),
+        Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
 }
 
@@ -648,6 +665,7 @@ fn run_env_command(command: EnvCommand) -> Result<()> {
     match command {
         EnvCommand::Pull(args) => env_pull(args),
         EnvCommand::Build(args) => env_build(args),
+        EnvCommand::Local(args) => env_local(args),
         EnvCommand::Start(args) => env_start(args),
         EnvCommand::Status(args) => env_status(args),
     }
@@ -679,6 +697,7 @@ fn env_pull(args: EnvPullArgs) -> Result<()> {
     runtime.pull(&args.image)?;
     let config = EnvironmentConfig {
         mode: EnvironmentMode::Pull,
+        backend: EnvironmentBackend::AppleContainers,
         image: args.image.clone(),
         init_commands: args.init_commands,
         dockerfile: None,
@@ -707,6 +726,7 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     runtime.build(&dockerfile, &args.tag)?;
     let config = EnvironmentConfig {
         mode: EnvironmentMode::Build,
+        backend: EnvironmentBackend::AppleContainers,
         image: args.tag.clone(),
         init_commands: args.init_commands,
         dockerfile: Some(args.dockerfile),
@@ -719,26 +739,72 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     Ok(())
 }
 
+fn env_local(args: EnvLocalArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let config = EnvironmentConfig {
+        mode: EnvironmentMode::Local,
+        backend: EnvironmentBackend::Local,
+        image: "local".to_string(),
+        init_commands: args.init_commands,
+        dockerfile: None,
+    };
+    config.save(&root)?;
+    println!(
+        "Local environment saved to {}",
+        root.join(".pb").join("environment.toml").display()
+    );
+    Ok(())
+}
+
 fn env_start(args: EnvWorkdirArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
     let config = EnvironmentConfig::load(&root)?
         .context("no environment configured; run `pb env pull` or `pb env build` first")?;
-    let runtime = container::detect_runtime()
-        .context("no container runtime found; install docker, podman, or apple/container")?;
-    println!("Creating test container from {}…", config.image);
-    let container_id = runtime.create(&config.image, &root)?;
-    println!("Container {} started", container_id);
-    for cmd in &config.init_commands {
-        println!("Running init command: {cmd}");
-        let output = runtime.exec(&container_id, cmd)?;
-        if !output.is_empty() {
-            println!("{output}");
+    match config.backend {
+        EnvironmentBackend::AppleContainers => {
+            let runtime = container::detect_runtime().context(
+                "no container runtime found; install docker, podman, or apple/container",
+            )?;
+            println!("Creating test container from {}…", config.image);
+            let container_id = runtime.create(&config.image, &root)?;
+            println!("Container {} started", container_id);
+            for cmd in &config.init_commands {
+                println!("Running init command: {cmd}");
+                let output = runtime.exec(&container_id, cmd)?;
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+            }
+            println!("Removing test container…");
+            runtime.remove(&container_id)?;
+        }
+        EnvironmentBackend::Local => {
+            println!("Verifying local environment at {}…", root.display());
+            for cmd in &config.init_commands {
+                println!("Running init command locally: {cmd}");
+                let output = run_local_command(cmd, &root)?;
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+            }
         }
     }
-    println!("Removing test container…");
-    runtime.remove(&container_id)?;
     println!("Environment verified successfully.");
     Ok(())
+}
+
+fn run_local_command(cmd: &str, workdir: &Path) -> Result<String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to spawn local shell for command: {cmd}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("local command failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn env_status(args: EnvWorkdirArgs) -> Result<()> {
@@ -752,9 +818,17 @@ fn env_status(args: EnvWorkdirArgs) -> Result<()> {
             let mode = match config.mode {
                 EnvironmentMode::Pull => "pull",
                 EnvironmentMode::Build => "build",
+                EnvironmentMode::Local => "local",
+            };
+            let backend = match config.backend {
+                EnvironmentBackend::AppleContainers => "apple-containers",
+                EnvironmentBackend::Local => "local",
             };
             println!("mode:  {mode}");
-            println!("image: {}", config.image);
+            println!("backend: {backend}");
+            if config.backend != EnvironmentBackend::Local {
+                println!("image: {}", config.image);
+            }
             if let Some(df) = &config.dockerfile {
                 println!("dockerfile: {}", df.display());
             }

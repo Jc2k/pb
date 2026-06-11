@@ -17,12 +17,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 use walkdir::WalkDir;
 
 use crate::container;
-use crate::environment::EnvironmentConfig;
+use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
 
 const LLAMA_BATCH_SIZE: usize = 512;
@@ -124,6 +125,83 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandBackendKind {
+    Container,
+    Local,
+}
+
+enum CommandBackend {
+    Container(container::ContainerHandle),
+    Local { workspace_root: PathBuf },
+}
+
+impl CommandBackend {
+    fn start(config: &EnvironmentConfig, workspace_root: &Path) -> Result<Self> {
+        match config.backend {
+            EnvironmentBackend::AppleContainers => {
+                let runtime = container::detect_runtime().context(
+                    "no container runtime found; install docker, podman, or apple/container",
+                )?;
+                let container_id = runtime
+                    .create(&config.image, workspace_root)
+                    .context("failed to create task container")?;
+                let handle = container::ContainerHandle {
+                    runtime,
+                    container_id,
+                };
+                for cmd in &config.init_commands {
+                    handle
+                        .exec(cmd)
+                        .with_context(|| format!("container init command failed: {cmd}"))?;
+                }
+                Ok(CommandBackend::Container(handle))
+            }
+            EnvironmentBackend::Local => {
+                let backend = CommandBackend::Local {
+                    workspace_root: workspace_root.to_path_buf(),
+                };
+                for cmd in &config.init_commands {
+                    backend
+                        .exec(cmd)
+                        .with_context(|| format!("local init command failed: {cmd}"))?;
+                }
+                Ok(backend)
+            }
+        }
+    }
+
+    fn kind(&self) -> CommandBackendKind {
+        match self {
+            CommandBackend::Container(_) => CommandBackendKind::Container,
+            CommandBackend::Local { .. } => CommandBackendKind::Local,
+        }
+    }
+
+    fn exec(&self, cmd: &str) -> Result<String> {
+        match self {
+            CommandBackend::Container(handle) => handle.exec(cmd),
+            CommandBackend::Local { workspace_root } => {
+                run_local_shell_command(cmd, workspace_root)
+            }
+        }
+    }
+}
+
+fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to spawn local shell for command: {cmd}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("local command failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn run_agent<S: EventSink>(
     args: AgentRequest,
     models_root: &Path,
@@ -157,23 +235,9 @@ pub fn run_agent<S: EventSink>(
         .clone()
         .or_else(|| EnvironmentConfig::load(&workspace_root).ok().flatten());
 
-    // If an environment is configured, spin up a fresh container for this task.
-    let container = if let Some(ref config) = env_config {
-        let runtime = container::detect_runtime()
-            .context("no container runtime found; install docker, podman, or apple/container")?;
-        let container_id = runtime
-            .create(&config.image, &workspace_root)
-            .context("failed to create task container")?;
-        let handle = container::ContainerHandle {
-            runtime,
-            container_id,
-        };
-        for cmd in &config.init_commands {
-            handle
-                .exec(cmd)
-                .with_context(|| format!("container init command failed: {cmd}"))?;
-        }
-        Some(handle)
+    // If an environment is configured, prepare the requested command backend for this task.
+    let command_backend = if let Some(ref config) = env_config {
+        Some(CommandBackend::start(config, &workspace_root)?)
     } else {
         None
     };
@@ -196,7 +260,7 @@ pub fn run_agent<S: EventSink>(
         &workspace_root,
         &branch,
         is_continuation,
-        container.is_some(),
+        command_backend.as_ref().map(CommandBackend::kind),
     )?;
 
     let mut messages = vec![
@@ -216,7 +280,7 @@ pub fn run_agent<S: EventSink>(
         &args,
         &mut messages,
         &workspace_root,
-        container.as_ref(),
+        command_backend.as_ref(),
         &mut sink,
     )?;
 
@@ -232,7 +296,7 @@ pub fn run_agent<S: EventSink>(
         commits,
     });
 
-    // `container` is dropped here, which removes the task container via ContainerHandle::drop.
+    // `command_backend` is dropped here, which removes task containers when used.
 
     Ok(AgentRunResult {
         branch,
@@ -245,7 +309,7 @@ fn build_agent_instructions(
     workspace_root: &Path,
     branch: &str,
     continuing: bool,
-    has_container: bool,
+    command_backend_kind: Option<CommandBackendKind>,
 ) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
@@ -254,7 +318,7 @@ fn build_agent_instructions(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
     const BASE_TOOLS: &str = "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), git_revert(commit), skill(name)";
-    if has_container {
+    if command_backend_kind.is_some() {
         instructions.push_str(&format!(
             "Available tools: {BASE_TOOLS}, run_command(cmd).\n"
         ));
@@ -271,10 +335,14 @@ fn build_agent_instructions(
         "Reading and writing is only permitted within the project root: {}.\n",
         workspace_root.display()
     ));
-    if has_container {
-        instructions.push_str(
+    match command_backend_kind {
+        Some(CommandBackendKind::Container) => instructions.push_str(
             "Use run_command(cmd) to execute shell commands inside the sandboxed container environment. The project root is mounted at /workspace inside the container.\n",
-        );
+        ),
+        Some(CommandBackendKind::Local) => instructions.push_str(
+            "Use run_command(cmd) to execute shell commands locally from the project root on the host machine.\n",
+        ),
+        None => {}
     }
 
     if let Ok(copilot_instructions) =
@@ -310,7 +378,7 @@ fn run_agent_steps<S: EventSink>(
     args: &AgentRequest,
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
-    container: Option<&container::ContainerHandle>,
+    command_backend: Option<&CommandBackend>,
     sink: &mut S,
 ) -> Result<bool> {
     for step in 1..=args.max_steps {
@@ -343,7 +411,8 @@ fn run_agent_steps<S: EventSink>(
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                 });
-                let tool_result = run_tool(&tool, &arguments, workspace_root, container, sink)?;
+                let tool_result =
+                    run_tool(&tool, &arguments, workspace_root, command_backend, sink)?;
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
@@ -556,7 +625,7 @@ fn run_tool<S: EventSink>(
     tool: &str,
     arguments: &Value,
     workspace_root: &Path,
-    container: Option<&container::ContainerHandle>,
+    command_backend: Option<&CommandBackend>,
     sink: &mut S,
 ) -> Result<String> {
     match tool {
@@ -731,9 +800,9 @@ fn run_tool<S: EventSink>(
                 .get("cmd")
                 .and_then(Value::as_str)
                 .context("run_command requires string argument: cmd")?;
-            let handle = container
-                .context("run_command is not available: no container environment is configured")?;
-            handle.exec(cmd)
+            let backend = command_backend
+                .context("run_command is not available: no project environment is configured")?;
+            backend.exec(cmd)
         }
         _ => bail!("unknown tool: {tool}"),
     }
@@ -1308,6 +1377,28 @@ mod tests {
 
         assert!(err.contains("prompt is too long"), "error was: {err}");
         assert!(err.contains("--ctx-size"), "error was: {err}");
+    }
+
+    #[test]
+    fn local_backend_instructions_describe_host_commands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+        )
+        .unwrap();
+        assert!(instructions.contains("run_command(cmd)"));
+        assert!(instructions.contains("locally from the project root on the host machine"));
+    }
+
+    #[test]
+    fn local_shell_command_runs_from_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("marker.txt"), "ok").unwrap();
+        let output = run_local_shell_command("cat marker.txt", tmp.path()).unwrap();
+        assert_eq!(output, "ok");
     }
 
     #[test]
