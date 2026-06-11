@@ -66,6 +66,13 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
         program_args.push("        <string>--workdir</string>".to_string());
         program_args.push(format!("        <string>{}</string>", workdir.display()));
     }
+    if let Some(ref socket_path) = args.socket_path {
+        program_args.push("        <string>--socket-path</string>".to_string());
+        program_args.push(format!(
+            "        <string>{}</string>",
+            socket_path.display()
+        ));
+    }
     if let Some(threads) = args.threads {
         program_args.push("        <string>--threads</string>".to_string());
         program_args.push(format!("        <string>{threads}</string>"));
@@ -391,6 +398,7 @@ mod tests {
             model: DEFAULT_MODEL.to_string(),
             model_dir: None,
             workdir: None,
+            socket_path: None,
             max_steps: DEFAULT_AGENT_MAX_STEPS,
             max_tokens: DEFAULT_AGENT_MAX_TOKENS,
             ctx_size: 8192,

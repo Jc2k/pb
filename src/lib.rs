@@ -14,6 +14,7 @@ use crate::environment::{EnvironmentConfig, EnvironmentMode};
 pub mod agent_core;
 pub mod cli_ui;
 pub mod container;
+pub mod daemon_client;
 pub mod environment;
 pub mod events;
 pub mod init;
@@ -47,8 +48,8 @@ pub enum Commands {
     },
     /// Pull model blobs from the Ollama-compatible registry or Hugging Face (hf://owner/repo)
     Pull(PullArgs),
-    /// Run a local in-process coding agent and stream progress
-    Agent(AgentArgs),
+    /// Submit or attach to a daemon-backed session over the pb unix socket
+    Queue(QueueArgs),
     /// Start the web UI server
     Serve(ServeArgs),
     /// Run the macOS menu bar status item for a pb serve instance
@@ -181,14 +182,14 @@ pub struct PullArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct AgentArgs {
-    /// Task to execute
-    pub task: String,
+pub struct QueueArgs {
+    /// Task to execute. Omit with --session to attach to an existing session.
+    pub task: Option<String>,
 
     /// Model identifier: Ollama name (e.g. qwen3-coder-next) or Hugging Face URI
     /// (e.g. hf://unsloth/Qwen3-Coder-Next-GGUF); looked up in the pull cache
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    pub model: String,
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Directory containing pulled model blobs; defaults to the XDG data directory
     #[arg(long)]
@@ -203,16 +204,16 @@ pub struct AgentArgs {
     pub branch: Option<String>,
 
     /// Maximum number of think/tool iterations
-    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_STEPS)]
-    pub max_steps: usize,
+    #[arg(long)]
+    pub max_steps: Option<usize>,
 
     /// Maximum new tokens per model turn
-    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_TOKENS)]
-    pub max_tokens: i32,
+    #[arg(long)]
+    pub max_tokens: Option<i32>,
 
     /// Context size
-    #[arg(long, default_value_t = 8192)]
-    pub ctx_size: u32,
+    #[arg(long)]
+    pub ctx_size: Option<u32>,
 
     /// Number of CPU threads for decoding
     #[arg(long)]
@@ -223,20 +224,36 @@ pub struct AgentArgs {
     pub threads_batch: Option<i32>,
 
     /// Number of transformer layers to offload to GPU
-    #[arg(long, default_value_t = default_gpu_layers())]
-    pub gpu_layers: u32,
+    #[arg(long)]
+    pub gpu_layers: Option<u32>,
 
     /// Temperature
-    #[arg(long, default_value_t = 0.2)]
-    pub temperature: f32,
+    #[arg(long)]
+    pub temperature: Option<f32>,
 
     /// Top-k for sampling
-    #[arg(long, default_value_t = 40)]
-    pub top_k: i32,
+    #[arg(long)]
+    pub top_k: Option<i32>,
 
     /// RNG seed
-    #[arg(long, default_value_t = 1337)]
-    pub seed: u32,
+    #[arg(long)]
+    pub seed: Option<u32>,
+
+    /// Attach to an existing daemon session instead of starting a new one
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// List daemon sessions instead of starting or attaching
+    #[arg(long)]
+    pub list: bool,
+
+    /// Submit the session without streaming events
+    #[arg(long)]
+    pub no_follow: bool,
+
+    /// Unix socket path for the pb daemon
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -248,6 +265,10 @@ pub struct ServeArgs {
     /// Bind port
     #[arg(long, default_value_t = 8311)]
     pub port: u16,
+
+    /// Unix socket path for local daemon clients
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
 
     /// Default model for API sessions
     #[arg(long, default_value = DEFAULT_MODEL)]
@@ -346,11 +367,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             SelfCommand::Update => run_self_update(),
         },
         Commands::Pull(args) => pull_model(&args).await,
-        Commands::Agent(args) => {
-            let request = to_agent_request(args.clone());
-            let models_root = args.model_dir.clone().unwrap_or_else(default_models_dir);
-            cli_ui::run_agent_cli(request, &models_root).await
-        }
+        Commands::Queue(args) => run_queue(args).await,
         Commands::Serve(args) => {
             let defaults = agent_core::AgentRequest {
                 task: String::new(),
@@ -373,6 +390,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 web::ServeArgs {
                     host: args.host,
                     port: args.port,
+                    socket_path: args
+                        .socket_path
+                        .clone()
+                        .unwrap_or_else(daemon_client::default_socket_path),
                 },
                 defaults,
             )
@@ -388,24 +409,71 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn to_agent_request(args: AgentArgs) -> agent_core::AgentRequest {
-    agent_core::AgentRequest {
-        task: args.task,
-        model: args.model,
-        model_dir: args.model_dir,
-        workdir: args.workdir,
-        branch: args.branch,
-        max_steps: args.max_steps,
-        max_tokens: args.max_tokens,
-        ctx_size: args.ctx_size,
-        threads: args.threads,
-        threads_batch: args.threads_batch,
-        gpu_layers: args.gpu_layers,
-        temperature: args.temperature,
-        top_k: args.top_k,
-        seed: args.seed,
-        environment: None,
+async fn run_queue(args: QueueArgs) -> Result<()> {
+    let socket_path = args
+        .socket_path
+        .clone()
+        .unwrap_or_else(daemon_client::default_socket_path);
+
+    if args.list {
+        let sessions = daemon_client::list_sessions(&socket_path).await?;
+        if sessions.is_empty() {
+            println!("no sessions queued in daemon");
+            return Ok(());
+        }
+        for session in sessions {
+            let status = if session.running { "running" } else { "idle" };
+            let workdir = session.workdir.unwrap_or_else(|| "-".to_string());
+            println!(
+                "{}\t{}\t{}\t{}",
+                session.session_id, status, workdir, session.task
+            );
+        }
+        return Ok(());
     }
+
+    let session_id = if let Some(session_id) = args.session.clone() {
+        session_id
+    } else {
+        let task = args
+            .task
+            .clone()
+            .context("missing task; pass a task, --session <id>, or --list")?;
+        let response = daemon_client::start_session(
+            &socket_path,
+            web::StartSessionRequest {
+                task,
+                model: args.model.clone(),
+                model_dir: args
+                    .model_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                workdir: args
+                    .workdir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                branch: args.branch.clone(),
+                max_steps: args.max_steps,
+                max_tokens: args.max_tokens,
+                ctx_size: args.ctx_size,
+                threads: args.threads,
+                threads_batch: args.threads_batch,
+                gpu_layers: args.gpu_layers,
+                temperature: args.temperature,
+                top_k: args.top_k,
+                seed: args.seed,
+            },
+        )
+        .await?;
+        println!("queued session {}", response.session_id);
+        response.session_id
+    };
+
+    if !args.no_follow {
+        daemon_client::watch_session(&socket_path, session_id).await?;
+    }
+
+    Ok(())
 }
 
 fn run_self_install(args: &ServeArgs) -> Result<()> {

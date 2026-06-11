@@ -45,14 +45,14 @@ pub enum AgentEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
-    pub version: &'static str,
+    pub version: String,
     pub event: AgentEvent,
 }
 
 impl EventEnvelope {
     pub fn new(event: AgentEvent) -> Self {
         Self {
-            version: EVENT_SCHEMA_VERSION,
+            version: EVENT_SCHEMA_VERSION.to_string(),
             event,
         }
     }
