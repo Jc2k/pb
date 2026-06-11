@@ -238,7 +238,7 @@ fn build_agent_instructions(
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
-    const BASE_TOOLS: &str = "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), skill(name)";
+    const BASE_TOOLS: &str = "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), git_revert(commit), skill(name)";
     if has_container {
         instructions.push_str(&format!(
             "Available tools: {BASE_TOOLS}, run_command(cmd).\n"
@@ -644,6 +644,13 @@ fn run_tool<S: EventSink>(
             } else {
                 Ok(log)
             }
+        }
+        "git_revert" => {
+            let commit = arguments
+                .get("commit")
+                .and_then(Value::as_str)
+                .context("git_revert requires string argument: commit")?;
+            git_revert(commit, workspace_root)
         }
         "skill" => {
             let name = arguments
@@ -1109,6 +1116,12 @@ fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
     git_run(&["log", "--oneline", &format!("-{n}")], workdir)
 }
 
+fn git_revert(commit: &str, workdir: &Path) -> Result<String> {
+    let commit = commit.trim();
+    git_run(&["revert", "--no-edit", commit], workdir)?;
+    Ok(format!("reverted commit: {commit}"))
+}
+
 pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
     let model_dir = pull_root.join(crate::cache_dir_name(model));
 
@@ -1250,6 +1263,54 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn git_revert_creates_revert_commit() {
+        let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
+        let dir = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        // Configure a minimal git identity so git commit works in CI.
+        for (key, val) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            std::process::Command::new("git")
+                .args(["config", key, val])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
+
+        // Create an initial commit so the repo has a HEAD.
+        std::fs::write(dir.join("base.txt"), "base").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        // Create the commit we want to revert.
+        std::fs::write(dir.join("change.txt"), "change").unwrap();
+        git_commit_all("add change", dir).unwrap();
+
+        // Capture the SHA we are reverting.
+        let sha = git_run(&["rev-parse", "HEAD"], dir).unwrap();
+
+        // Revert it.
+        let result = git_revert(&sha, dir).unwrap();
+        assert!(result.contains("reverted commit"), "result: {result}");
+
+        // The reverted file should no longer exist (git revert removes it).
+        assert!(!dir.join("change.txt").exists());
     }
 
     #[test]
