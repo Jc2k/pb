@@ -13,6 +13,20 @@ const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionQueueStatus {
+    Queued,
+    Running,
+    Completed,
+}
+
+impl SessionQueueStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub session_id: String,
@@ -21,6 +35,8 @@ pub struct PersistedSession {
     pub workdir: Option<PathBuf>,
     pub request_template: AgentRequest,
     pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_status: Option<SessionQueueStatus>,
     pub updated_at_ms: u128,
     pub events: Vec<EventEnvelope>,
 }
@@ -31,7 +47,7 @@ impl PersistedSession {
         request_template: AgentRequest,
         branch: Option<String>,
         workdir: Option<PathBuf>,
-        running: bool,
+        queue_status: SessionQueueStatus,
         events: Vec<EventEnvelope>,
     ) -> Self {
         Self {
@@ -40,7 +56,8 @@ impl PersistedSession {
             branch,
             workdir,
             request_template,
-            running,
+            running: queue_status == SessionQueueStatus::Running,
+            queue_status: Some(queue_status),
             updated_at_ms: now_millis(),
             events: trim_events(events),
         }
@@ -109,7 +126,6 @@ fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSessio
     for note_ref in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match read_note(workspace_root, note_ref).and_then(|payload| parse_session(&payload)) {
             Ok(mut session) => {
-                session.running = false;
                 session.events = trim_events(session.events);
                 sessions.push(session);
             }
@@ -297,7 +313,7 @@ mod tests {
             request,
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            true,
+            SessionQueueStatus::Running,
             vec![EventEnvelope::new(AgentEvent::Final {
                 content: "done".to_string(),
             })],
@@ -307,7 +323,8 @@ mod tests {
         let restored = restore_project_sessions(dir.path()).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].session_id, "session-123");
-        assert!(!restored[0].running);
+        assert!(restored[0].running);
+        assert_eq!(restored[0].queue_status, Some(SessionQueueStatus::Running));
         assert_eq!(restored[0].events.len(), 1);
 
         delete_session(dir.path(), "session-123").unwrap();

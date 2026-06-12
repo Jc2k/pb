@@ -21,7 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{AgentProfile, AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
-use crate::session_store::{self, PersistedSession};
+use crate::session_store::{self, PersistedSession, SessionQueueStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -67,6 +67,7 @@ pub struct SessionListItem {
     pub session_id: String,
     pub task: String,
     pub running: bool,
+    pub queue_status: SessionQueueStatus,
     pub branch: Option<String>,
     pub workdir: Option<String>,
     pub updated_at_ms: u128,
@@ -77,6 +78,7 @@ pub struct SessionDetails {
     pub session_id: String,
     pub task: String,
     pub running: bool,
+    pub queue_status: SessionQueueStatus,
     pub branch: Option<String>,
     pub events: Vec<EventEnvelope>,
 }
@@ -91,7 +93,16 @@ pub struct DeleteSessionResponse {
 pub struct StatusResponse {
     pub busy: bool,
     pub running_sessions: usize,
+    pub queued_sessions: usize,
     pub total_sessions: usize,
+    pub queue_paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueStatusResponse {
+    pub queue_paused: bool,
+    pub running_sessions: usize,
+    pub queued_sessions: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,7 +146,7 @@ struct SessionState {
     branch: Option<String>,
     workdir: Option<PathBuf>,
     request_template: AgentRequest,
-    running: bool,
+    queue_status: SessionQueueStatus,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     updated_at_ms: u128,
@@ -145,6 +156,7 @@ struct SessionState {
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
+    queue_paused: Arc<Mutex<bool>>,
 }
 
 #[derive(RustEmbed)]
@@ -154,9 +166,13 @@ struct WebAssets;
 pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
     let project_entries = projects::load_projects()?;
     let restored_sessions = restore_sessions(&project_entries);
+    let restored_queue_paused = restored_sessions
+        .values()
+        .any(|session| session.queue_status.is_active());
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
+        queue_paused: Arc::new(Mutex::new(restored_queue_paused)),
     };
 
     let app = Router::new()
@@ -167,6 +183,7 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/events", get(session_events))
+        .route("/api/queue/resume", post(resume_queue))
         .route("/api/projects", get(list_projects))
         .route("/api/status", get(status))
         .route("/", get(index))
@@ -230,7 +247,7 @@ async fn start_session_inner(
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
         request_template: request.clone(),
-        running: true,
+        queue_status: SessionQueueStatus::Queued,
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
         updated_at_ms: now,
@@ -247,11 +264,11 @@ async fn start_session_inner(
         &request,
         request.branch.clone(),
         request.workdir.clone(),
-        true,
+        SessionQueueStatus::Queued,
         &empty_history,
     );
 
-    spawn_agent_run(state.clone(), session_id.clone(), request);
+    process_queue(state.clone()).await;
 
     Ok(SessionResponse { session_id })
 }
@@ -263,7 +280,7 @@ async fn continue_session(
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if session.running {
+    if session.queue_status != SessionQueueStatus::Completed {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -273,11 +290,20 @@ async fn continue_session(
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
     session.task = request.task.clone();
-    session.running = true;
+    session.request_template = request.clone();
+    session.queue_status = SessionQueueStatus::Queued;
     session.updated_at_ms = now_millis();
+    persist_session_snapshot(
+        &id,
+        &request,
+        session.branch.clone(),
+        session.workdir.clone(),
+        SessionQueueStatus::Queued,
+        &session.history,
+    );
 
     drop(sessions);
-    spawn_agent_run(state.clone(), id.clone(), request);
+    process_queue(state.clone()).await;
 
     Ok(Json(SessionResponse { session_id: id }))
 }
@@ -291,7 +317,8 @@ async fn list_sessions(
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
-            running: session.running,
+            running: session.queue_status == SessionQueueStatus::Running,
+            queue_status: session.queue_status.clone(),
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -321,7 +348,8 @@ async fn get_session(
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
-        running: session.running,
+        running: session.queue_status == SessionQueueStatus::Running,
+        queue_status: session.queue_status.clone(),
         branch: session.branch.clone(),
         events,
     }))
@@ -330,13 +358,34 @@ async fn get_session(
 async fn status(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<StatusResponse> {
+    let queue_paused = *state.queue_paused.lock().await;
     let sessions = state.sessions.lock().await;
-    let running_sessions = sessions.values().filter(|session| session.running).count();
+    let running_sessions = sessions
+        .values()
+        .filter(|session| session.queue_status == SessionQueueStatus::Running)
+        .count();
+    let queued_sessions = sessions
+        .values()
+        .filter(|session| session.queue_status == SessionQueueStatus::Queued)
+        .count();
     Json(StatusResponse {
         busy: running_sessions > 0,
         running_sessions,
+        queued_sessions,
         total_sessions: sessions.len(),
+        queue_paused,
     })
+}
+
+async fn resume_queue(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Json<QueueStatusResponse> {
+    {
+        let mut queue_paused = state.queue_paused.lock().await;
+        *queue_paused = false;
+    }
+    process_queue(state.clone()).await;
+    Json(queue_status_snapshot(&state).await)
 }
 
 async fn delete_session(
@@ -355,7 +404,7 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
         let Some(session) = sessions.get(id) else {
             anyhow::bail!("session not found: {id}");
         };
-        if session.running {
+        if session.queue_status == SessionQueueStatus::Running {
             anyhow::bail!("session is running: {id}");
         }
         sessions.remove(id).expect("session exists")
@@ -375,6 +424,47 @@ async fn list_projects(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<ProjectEntry>> {
     Json(project_list_snapshot(&state).await)
+}
+
+async fn process_queue(state: AppState) {
+    if *state.queue_paused.lock().await {
+        return;
+    }
+
+    let next = {
+        let mut sessions = state.sessions.lock().await;
+        if sessions
+            .values()
+            .any(|session| session.queue_status == SessionQueueStatus::Running)
+        {
+            return;
+        }
+
+        let next_id = sessions
+            .iter()
+            .filter(|(_, session)| session.queue_status == SessionQueueStatus::Queued)
+            .min_by_key(|(_, session)| session.updated_at_ms)
+            .map(|(session_id, _)| session_id.clone());
+
+        next_id.and_then(|session_id| {
+            let session = sessions.get_mut(&session_id)?;
+            session.queue_status = SessionQueueStatus::Running;
+            session.updated_at_ms = now_millis();
+            persist_session_snapshot(
+                &session_id,
+                &session.request_template,
+                session.branch.clone(),
+                session.workdir.clone(),
+                SessionQueueStatus::Running,
+                &session.history,
+            );
+            Some((session_id, session.request_template.clone()))
+        })
+    };
+
+    if let Some((session_id, request)) = next {
+        spawn_agent_run(state, session_id, request);
+    }
 }
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
@@ -415,7 +505,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     &request_for_run,
                     persisted_branch.clone(),
                     persisted_workdir.clone(),
-                    true,
+                    SessionQueueStatus::Running,
                     &history,
                 );
             })
@@ -424,7 +514,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
 
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
-            session.running = false;
+            session.queue_status = SessionQueueStatus::Completed;
             session.updated_at_ms = now_millis();
             match result {
                 Ok(Ok(run_result)) => {
@@ -455,10 +545,12 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 &session.request_template,
                 session.branch.clone(),
                 session.workdir.clone(),
-                false,
+                SessionQueueStatus::Completed,
                 &session.history,
             );
         }
+        drop(sessions);
+        process_queue(state).await;
     });
 }
 
@@ -541,6 +633,15 @@ async fn handle_rpc_connection(
         }
         "pb.session.list" => {
             let result = session_list_snapshot(&state).await;
+            write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.queue.resume" => {
+            {
+                let mut queue_paused = state.queue_paused.lock().await;
+                *queue_paused = false;
+            }
+            process_queue(state.clone()).await;
+            let result = queue_status_snapshot(&state).await;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
         "pb.projects.add" => {
@@ -655,7 +756,11 @@ async fn watch_session(
             .lock()
             .map(|history| history.clone())
             .unwrap_or_default();
-        (session.sender.subscribe(), history, session.running)
+        (
+            session.sender.subscribe(),
+            history,
+            session.queue_status == SessionQueueStatus::Running,
+        )
     };
 
     write_rpc_response(
@@ -677,14 +782,14 @@ async fn watch_session(
     }
 
     loop {
-        let is_running = {
+        let is_finished = {
             let sessions = state.sessions.lock().await;
             sessions
                 .get(&session_id)
-                .map(|session| session.running)
-                .unwrap_or(false)
+                .map(|session| session.queue_status == SessionQueueStatus::Completed)
+                .unwrap_or(true)
         };
-        if !is_running {
+        if is_finished {
             let notification = RpcNotification {
                 method: "pb.session.finished",
                 params: SessionFinished {
@@ -724,6 +829,7 @@ fn restore_sessions(project_entries: &[ProjectEntry]) -> HashMap<String, Session
 fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
+    let queue_status = restored_queue_status(&persisted);
     let history = Arc::new(StdMutex::new(persisted.events));
     (
         session_id,
@@ -732,7 +838,7 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             branch: persisted.branch,
             workdir: persisted.workdir,
             request_template: persisted.request_template,
-            running: false,
+            queue_status,
             sender,
             history,
             updated_at_ms: persisted.updated_at_ms,
@@ -740,12 +846,41 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
     )
 }
 
+fn restored_queue_status(persisted: &PersistedSession) -> SessionQueueStatus {
+    match persisted.queue_status.clone() {
+        Some(SessionQueueStatus::Running | SessionQueueStatus::Queued) => {
+            SessionQueueStatus::Queued
+        }
+        Some(SessionQueueStatus::Completed) => SessionQueueStatus::Completed,
+        None if persisted.running => SessionQueueStatus::Queued,
+        None => SessionQueueStatus::Completed,
+    }
+}
+
+async fn queue_status_snapshot(state: &AppState) -> QueueStatusResponse {
+    let queue_paused = *state.queue_paused.lock().await;
+    let sessions = state.sessions.lock().await;
+    let running_sessions = sessions
+        .values()
+        .filter(|session| session.queue_status == SessionQueueStatus::Running)
+        .count();
+    let queued_sessions = sessions
+        .values()
+        .filter(|session| session.queue_status == SessionQueueStatus::Queued)
+        .count();
+    QueueStatusResponse {
+        queue_paused,
+        running_sessions,
+        queued_sessions,
+    }
+}
+
 fn persist_session_snapshot(
     session_id: &str,
     request_template: &AgentRequest,
     branch: Option<String>,
     workdir: Option<PathBuf>,
-    running: bool,
+    queue_status: SessionQueueStatus,
     history: &StdMutex<Vec<EventEnvelope>>,
 ) {
     let events = history
@@ -757,7 +892,7 @@ fn persist_session_snapshot(
         request_template.clone(),
         branch,
         workdir,
-        running,
+        queue_status,
         events,
     );
     if let Err(err) = session_store::save_session(&persisted) {
@@ -772,7 +907,8 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
-            running: session.running,
+            running: session.queue_status == SessionQueueStatus::Running,
+            queue_status: session.queue_status.clone(),
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -810,7 +946,8 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
-        running: session.running,
+        running: session.queue_status == SessionQueueStatus::Running,
+        queue_status: session.queue_status.clone(),
         branch: session.branch.clone(),
         events,
     })

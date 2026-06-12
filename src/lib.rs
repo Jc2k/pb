@@ -560,7 +560,11 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             return Ok(());
         }
         for session in sessions {
-            let status = if session.running { "running" } else { "idle" };
+            let status = match session.queue_status {
+                session_store::SessionQueueStatus::Queued => "queued",
+                session_store::SessionQueueStatus::Running => "running",
+                session_store::SessionQueueStatus::Completed => "completed",
+            };
             let workdir = session.workdir.unwrap_or_else(|| "-".to_string());
             println!(
                 "{}\t{}\t{}\t{}",

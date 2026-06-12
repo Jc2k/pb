@@ -26,10 +26,13 @@ interface EventEnvelope {
   event: AgentEvent;
 }
 
+type QueueStatus = "queued" | "running" | "completed";
+
 interface SessionItem {
   session_id: string;
   task: string;
   running: boolean;
+  queue_status: QueueStatus;
   branch?: string;
   workdir?: string;
   updated_at_ms: number;
@@ -39,6 +42,7 @@ interface SessionDetails {
   session_id: string;
   task: string;
   running: boolean;
+  queue_status: QueueStatus;
   branch?: string;
   events: EventEnvelope[];
 }
@@ -46,6 +50,12 @@ interface SessionDetails {
 interface ProjectEntry {
   name: string;
   path: string;
+}
+
+interface QueueStatusResponse {
+  queue_paused: boolean;
+  running_sessions: number;
+  queued_sessions: number;
 }
 
 /* ─── simple router ──────────────────────────────────────────── */
@@ -258,7 +268,7 @@ function SessionCard({
   onClick: () => void;
 }) {
   let badge: React.ReactNode;
-  if (session.running) {
+  if (session.queue_status === "running") {
     badge = (
       <span className="badge bg-primary d-flex align-items-center gap-1">
         <span
@@ -268,6 +278,8 @@ function SessionCard({
         In&nbsp;progress
       </span>
     );
+  } else if (session.queue_status === "queued") {
+    badge = <span className="badge bg-warning text-dark">Queued</span>;
   } else if (session.branch) {
     badge = <span className="badge bg-success">{session.branch}</span>;
   } else {
@@ -301,11 +313,24 @@ function HomePage() {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [queueStatus, setQueueStatus] = useState<QueueStatusResponse | null>(null);
 
   const fetchSessions = async () => {
     const res = await fetch("/api/sessions");
     if (!res.ok) return;
     setSessions((await res.json()) as SessionItem[]);
+  };
+
+  const fetchQueueStatus = async () => {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    setQueueStatus((await res.json()) as QueueStatusResponse);
+  };
+
+  const resumeQueue = async () => {
+    const res = await fetch("/api/queue/resume", { method: "POST" });
+    if (res.ok) setQueueStatus((await res.json()) as QueueStatusResponse);
+    await fetchSessions();
   };
 
   const fetchProjects = async () => {
@@ -331,6 +356,7 @@ function HomePage() {
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
+      await fetchQueueStatus();
       navigate(`/sessions/${data.session_id}`);
     } finally {
       setIsSubmitting(false);
@@ -340,7 +366,11 @@ function HomePage() {
   useEffect(() => {
     void fetchSessions();
     void fetchProjects();
-    const timer = window.setInterval(() => void fetchSessions(), 5000);
+    void fetchQueueStatus();
+    const timer = window.setInterval(() => {
+      void fetchSessions();
+      void fetchQueueStatus();
+    }, 5000);
     return () => window.clearInterval(timer);
     // fetchSessions and fetchProjects are stable async closures defined in
     // this component; we intentionally run them only once on mount.
@@ -409,11 +439,27 @@ function HomePage() {
                       Starting…
                     </>
                   ) : (
-                    "Start task"
+                    "Queue task"
                   )}
                 </button>
               </div>
             </div>
+
+            {queueStatus?.queue_paused && queueStatus.queued_sessions > 0 && (
+              <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2 mb-0">
+                <div>
+                  <div className="fw-semibold">Queue paused after restart</div>
+                  <div className="small">
+                    {queueStatus.queued_sessions} queued task
+                    {queueStatus.queued_sessions === 1 ? "" : "s"} waiting. Press play to resume one
+                    task at a time.
+                  </div>
+                </div>
+                <button className="btn btn-sm btn-warning" onClick={() => void resumeQueue()}>
+                  ▶ Play
+                </button>
+              </div>
+            )}
 
             <div className="list-group">
               {sessions.length === 0 ? (
@@ -469,12 +515,13 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       session_id: details.session_id,
       task: details.task,
       running: details.running,
+      queue_status: details.queue_status,
       branch: details.branch,
       workdir: undefined,
       updated_at_ms: 0,
     });
     setEvents(details.events);
-    setSessionRunning(details.running);
+    setSessionRunning(details.queue_status === "running" || details.queue_status === "queued");
   };
 
   const continueSession = async () => {
@@ -486,6 +533,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     });
     setFollowUp("");
     setSessionRunning(true);
+    await fetchSession();
   };
 
   const onFeedScroll = () => {
@@ -524,8 +572,10 @@ function SessionPage({ sessionId }: { sessionId: string }) {
         </span>
         {session && (
           <span className="navbar-text small text-body-secondary ms-auto">
-            {session.running ? (
+            {session.queue_status === "running" ? (
               <span className="text-primary">in progress</span>
+            ) : session.queue_status === "queued" ? (
+              <span className="text-warning">queued</span>
             ) : session.branch ? (
               <code>{session.branch}</code>
             ) : (
@@ -548,7 +598,9 @@ function SessionPage({ sessionId }: { sessionId: string }) {
             onScroll={onFeedScroll}
           >
             {events.length === 0 ? (
-              <div className="text-body-secondary small">Waiting for events…</div>
+              <div className="text-body-secondary small">
+                {session?.queue_status === "queued" ? "Queued and waiting to run…" : "Waiting for events…"}
+              </div>
             ) : (
               events.map((env, i) => <EventItem key={i} envelope={env} />)
             )}
