@@ -18,8 +18,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::TextDiff;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -74,6 +76,7 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum AgentProfile {
     Build,
+    Scout,
     Review,
     Explore,
     Plan,
@@ -96,6 +99,7 @@ impl AgentProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::Build => "build",
+            Self::Scout => "scout",
             Self::Review => "review",
             Self::Explore => "explore",
             Self::Plan => "plan",
@@ -106,12 +110,13 @@ impl AgentProfile {
     fn parse(input: &str) -> Result<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "build" => Ok(Self::Build),
+            "scout" => Ok(Self::Scout),
             "review" => Ok(Self::Review),
             "explore" => Ok(Self::Explore),
             "plan" => Ok(Self::Plan),
             "ask" => Ok(Self::Ask),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, review, explore, plan, ask"
+                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask"
             ),
         }
     }
@@ -120,6 +125,9 @@ impl AgentProfile {
         match self {
             Self::Build => {
                 "Profile: build. Implement the requested change with minimal safe edits. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. Use explore sub-agents to gather context before invasive work and review sub-agents to check your result before finalizing when useful. You may edit files and commit logical changes."
+            }
+            Self::Scout => {
+                "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
             }
             Self::Review => {
                 "Profile: review. Inspect the current workspace and recent changes for correctness, missing requirements, regressions, and test gaps. Run checks when available. Use todo(action=add,...) for required follow-up work found during review. Do not edit files or create commits. Return concise findings with severity and evidence."
@@ -314,17 +322,29 @@ impl CommandBackend {
                 let runtime = container::detect_runtime().context(
                     "no container runtime found; install docker, podman, or apple/container",
                 )?;
+                let image = prepare_container_image(config, workspace_root, runtime.as_ref())?;
                 let container_id = runtime
-                    .create(&config.image, workspace_root)
-                    .context("failed to create task container")?;
+                    .create(&image, workspace_root)
+                    .or_else(|create_err| {
+                        if config.prepared_image.is_some() {
+                            let rebuilt = rebuild_container_image(config, workspace_root, runtime.as_ref())?;
+                            runtime.create(&rebuilt, workspace_root).with_context(|| {
+                                format!(
+                                    "failed to create task container after rebuilding environment; original error: {create_err:#}"
+                                )
+                            })
+                        } else {
+                            Err(create_err).context("failed to create task container")
+                        }
+                    })?;
                 let handle = container::ContainerHandle {
                     runtime,
                     container_id,
                 };
-                for cmd in &config.init_commands {
+                for cmd in config.session_commands() {
                     handle
                         .exec(cmd)
-                        .with_context(|| format!("container init command failed: {cmd}"))?;
+                        .with_context(|| format!("container session command failed: {cmd}"))?;
                 }
                 Ok(CommandBackend::Container(handle))
             }
@@ -332,10 +352,13 @@ impl CommandBackend {
                 let backend = CommandBackend::Local {
                     workspace_root: workspace_root.to_path_buf(),
                 };
-                for cmd in &config.init_commands {
+                // Local setups are intentionally not refreshed for every session; the
+                // scout assumes host dependencies are present unless a later command failure
+                // shows otherwise. Only documented per-session refresh commands run here.
+                for cmd in config.session_commands() {
                     backend
                         .exec(cmd)
-                        .with_context(|| format!("local init command failed: {cmd}"))?;
+                        .with_context(|| format!("local session command failed: {cmd}"))?;
                 }
                 Ok(backend)
             }
@@ -357,6 +380,56 @@ impl CommandBackend {
             }
         }
     }
+}
+
+fn prepare_container_image(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<String> {
+    if let Some(image) = &config.prepared_image {
+        if runtime.image_exists(image)? {
+            return Ok(image.clone());
+        }
+        return rebuild_container_image(config, workspace_root, runtime);
+    }
+    Ok(config.image.clone())
+}
+
+fn rebuild_container_image(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<String> {
+    let image = config
+        .prepared_image
+        .clone()
+        .unwrap_or_else(|| scouted_image_tag(workspace_root, config));
+    let container_id = runtime
+        .create(&config.image, workspace_root)
+        .with_context(|| format!("failed to create setup container from {}", config.image))?;
+    let setup_result = (|| -> Result<()> {
+        for cmd in config.setup_commands() {
+            runtime
+                .exec(&container_id, &cmd)
+                .with_context(|| format!("container setup command failed: {cmd}"))?;
+        }
+        runtime
+            .commit(&container_id, &image)
+            .with_context(|| format!("failed to tag prepared environment as {image}"))?;
+        Ok(())
+    })();
+    let _ = runtime.remove(&container_id);
+    setup_result?;
+    Ok(image)
+}
+
+fn scouted_image_tag(workspace_root: &Path, config: &EnvironmentConfig) -> String {
+    let mut hasher = DefaultHasher::new();
+    workspace_root.to_string_lossy().hash(&mut hasher);
+    config.image.hash(&mut hasher);
+    config.setup_commands().hash(&mut hasher);
+    format!("pb-scout:{:016x}", hasher.finish())
 }
 
 fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
@@ -401,10 +474,15 @@ pub fn run_agent<S: EventSink>(
     };
 
     // Load environment config (explicit arg takes precedence over file on disk).
-    let env_config = args
-        .environment
-        .clone()
-        .or_else(|| EnvironmentConfig::load(&workspace_root).ok().flatten());
+    let env_config = args.environment.clone().or_else(|| {
+        if args.profile == AgentProfile::Scout {
+            crate::init::scout_environment(&workspace_root)
+                .ok()
+                .flatten()
+        } else {
+            EnvironmentConfig::load(&workspace_root).ok().flatten()
+        }
+    });
 
     // If an environment is configured, prepare the requested command backend for this task.
     let command_backend = if let Some(ref config) = env_config {
@@ -432,6 +510,7 @@ pub fn run_agent<S: EventSink>(
         &branch,
         is_continuation,
         command_backend.as_ref().map(CommandBackend::kind),
+        env_config.as_ref(),
         args.profile,
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
     )?;
@@ -456,6 +535,7 @@ pub fn run_agent<S: EventSink>(
         &mut messages,
         &workspace_root,
         command_backend.as_ref(),
+        env_config.as_ref(),
         &todo_memory,
         &mut sink,
     )?;
@@ -487,6 +567,7 @@ fn build_agent_instructions(
     branch: &str,
     continuing: bool,
     command_backend_kind: Option<CommandBackendKind>,
+    env_config: Option<&EnvironmentConfig>,
     profile: AgentProfile,
     allow_sub_agents: bool,
 ) -> Result<String> {
@@ -505,10 +586,10 @@ fn build_agent_instructions(
     ));
     if allow_sub_agents {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, and build. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, scout, and build. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
-    if profile == AgentProfile::Build {
+    if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         instructions.push_str(
             "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
         );
@@ -532,6 +613,23 @@ fn build_agent_instructions(
             "Use run_command(cmd) to execute shell commands locally from the project root on the host machine.\n",
         ),
         None => {}
+    }
+    if let Some(config) = env_config {
+        if let Some(source) = &config.source {
+            instructions.push_str("Scouted environment: ");
+            instructions.push_str(source);
+            instructions.push('\n');
+        }
+        if !config.guard_commands.is_empty() {
+            instructions.push_str(
+                "Commit guard commands to run before git_commit unless clearly impossible:\n",
+            );
+            for cmd in &config.guard_commands {
+                instructions.push_str("- ");
+                instructions.push_str(cmd);
+                instructions.push('\n');
+            }
+        }
     }
 
     if let Ok(copilot_instructions) =
@@ -580,7 +678,7 @@ fn available_tool_specs(
     if command_backend_kind.is_some() {
         tools.push("run_command(cmd)");
     }
-    if profile == AgentProfile::Build {
+    if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         tools.push("edit_file(path,old_text,new_text)");
         tools.push("git_commit(message)");
         tools.push("git_revert(commit)");
@@ -601,7 +699,9 @@ fn tool_allowed(
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
         | "todo" | "skill" => true,
         "run_command" => command_backend_kind.is_some(),
-        "edit_file" | "git_commit" | "git_revert" => profile == AgentProfile::Build,
+        "edit_file" | "git_commit" | "git_revert" => {
+            matches!(profile, AgentProfile::Build | AgentProfile::Scout)
+        }
         "sub_agent" => allow_sub_agents,
         _ => false,
     }
@@ -620,6 +720,7 @@ fn run_agent_steps<S: EventSink>(
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
     command_backend: Option<&CommandBackend>,
+    env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
     sink: &mut S,
 ) -> Result<StepRunOutcome> {
@@ -664,6 +765,7 @@ fn run_agent_steps<S: EventSink>(
                     request: args,
                     workspace_root,
                     command_backend,
+                    env_config,
                     todo_memory,
                 };
                 let tool_result = run_tool(&tool, &arguments, &tool_context, sink)?;
@@ -884,6 +986,7 @@ struct ToolContext<'a> {
     request: &'a AgentRequest,
     workspace_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
+    env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
 }
 
@@ -1131,6 +1234,9 @@ fn run_tool<S: EventSink>(
                 .get("message")
                 .and_then(Value::as_str)
                 .context("git_commit requires string argument: message")?;
+            if let Some(config) = context.env_config {
+                run_guard_commands(config, command_backend, workspace_root)?;
+            }
             match git_commit_all(message, workspace_root)? {
                 true => Ok(format!("committed: {message}")),
                 false => Ok("nothing to commit".to_string()),
@@ -1191,6 +1297,27 @@ impl EventSink for SubAgentEventCollector {
     }
 }
 
+fn run_guard_commands(
+    config: &EnvironmentConfig,
+    command_backend: Option<&CommandBackend>,
+    workspace_root: &Path,
+) -> Result<()> {
+    for cmd in &config.guard_commands {
+        match command_backend {
+            Some(backend) => {
+                backend
+                    .exec(cmd)
+                    .with_context(|| format!("commit guard command failed: {cmd}"))?;
+            }
+            None => {
+                run_local_shell_command(cmd, workspace_root)
+                    .with_context(|| format!("commit guard command failed: {cmd}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_sub_agent<S: EventSink>(
     arguments: &Value,
     context: &ToolContext<'_>,
@@ -1222,6 +1349,7 @@ fn run_sub_agent<S: EventSink>(
         context.request.branch.as_deref().unwrap_or("sub-agent"),
         true,
         context.command_backend.map(CommandBackend::kind),
+        context.env_config,
         profile,
         false,
     )?;
@@ -1250,6 +1378,7 @@ fn run_sub_agent<S: EventSink>(
         &mut messages,
         context.workspace_root,
         context.command_backend,
+        context.env_config,
         context.todo_memory,
         &mut collector,
     )?;
@@ -1977,6 +2106,7 @@ mod tests {
             "test-branch",
             false,
             Some(CommandBackendKind::Local),
+            None,
             AgentProfile::Build,
             true,
         )
@@ -1993,6 +2123,7 @@ mod tests {
             "test-branch",
             false,
             Some(CommandBackendKind::Local),
+            None,
             AgentProfile::Build,
             true,
         )
@@ -2010,6 +2141,7 @@ mod tests {
             "test-branch",
             false,
             Some(CommandBackendKind::Local),
+            None,
             AgentProfile::Review,
             false,
         )

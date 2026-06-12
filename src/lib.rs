@@ -820,6 +820,11 @@ fn env_pull(args: EnvPullArgs) -> Result<()> {
         backend: EnvironmentBackend::AppleContainers,
         image: args.image.clone(),
         init_commands: args.init_commands,
+        setup_commands: vec![],
+        session_commands: vec![],
+        guard_commands: vec![],
+        prepared_image: None,
+        source: None,
         dockerfile: None,
     };
     config.save(&root)?;
@@ -849,6 +854,11 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
         backend: EnvironmentBackend::AppleContainers,
         image: args.tag.clone(),
         init_commands: args.init_commands,
+        setup_commands: vec![],
+        session_commands: vec![],
+        guard_commands: vec![],
+        prepared_image: None,
+        source: None,
         dockerfile: Some(args.dockerfile),
     };
     config.save(&root)?;
@@ -866,6 +876,11 @@ fn env_local(args: EnvLocalArgs) -> Result<()> {
         backend: EnvironmentBackend::Local,
         image: "local".to_string(),
         init_commands: args.init_commands,
+        setup_commands: vec![],
+        session_commands: vec![],
+        guard_commands: vec![],
+        prepared_image: None,
+        source: None,
         dockerfile: None,
     };
     config.save(&root)?;
@@ -888,8 +903,15 @@ fn env_start(args: EnvWorkdirArgs) -> Result<()> {
             println!("Creating test container from {}…", config.image);
             let container_id = runtime.create(&config.image, &root)?;
             println!("Container {} started", container_id);
-            for cmd in &config.init_commands {
-                println!("Running init command: {cmd}");
+            for cmd in config.setup_commands() {
+                println!("Running setup command: {cmd}");
+                let output = runtime.exec(&container_id, &cmd)?;
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+            }
+            for cmd in config.session_commands() {
+                println!("Running session command: {cmd}");
                 let output = runtime.exec(&container_id, cmd)?;
                 if !output.is_empty() {
                     println!("{output}");
@@ -900,8 +922,15 @@ fn env_start(args: EnvWorkdirArgs) -> Result<()> {
         }
         EnvironmentBackend::Local => {
             println!("Verifying local environment at {}…", root.display());
-            for cmd in &config.init_commands {
-                println!("Running init command locally: {cmd}");
+            for cmd in config.setup_commands() {
+                println!("Running setup command locally: {cmd}");
+                let output = run_local_command(&cmd, &root)?;
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+            }
+            for cmd in config.session_commands() {
+                println!("Running session command locally: {cmd}");
                 let output = run_local_command(cmd, &root)?;
                 if !output.is_empty() {
                     println!("{output}");
@@ -952,13 +981,36 @@ fn env_status(args: EnvWorkdirArgs) -> Result<()> {
             if let Some(df) = &config.dockerfile {
                 println!("dockerfile: {}", df.display());
             }
-            if config.init_commands.is_empty() {
-                println!("init_commands: (none)");
+            let setup_commands = config.setup_commands();
+            if setup_commands.is_empty() {
+                println!("setup_commands: (none)");
             } else {
-                println!("init_commands:");
-                for cmd in &config.init_commands {
+                println!("setup_commands:");
+                for cmd in &setup_commands {
                     println!("  - {cmd}");
                 }
+            }
+            if config.session_commands.is_empty() {
+                println!("session_commands: (none)");
+            } else {
+                println!("session_commands:");
+                for cmd in &config.session_commands {
+                    println!("  - {cmd}");
+                }
+            }
+            if config.guard_commands.is_empty() {
+                println!("guard_commands: (none)");
+            } else {
+                println!("guard_commands:");
+                for cmd in &config.guard_commands {
+                    println!("  - {cmd}");
+                }
+            }
+            if let Some(image) = &config.prepared_image {
+                println!("prepared_image: {image}");
+            }
+            if let Some(source) = &config.source {
+                println!("source: {source}");
             }
         }
     }
