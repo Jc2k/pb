@@ -52,6 +52,8 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
         format!("        <string>{}</string>", args.ctx_size),
         "        <string>--temperature</string>".to_string(),
         format!("        <string>{}</string>", args.temperature),
+        "        <string>--profile</string>".to_string(),
+        format!("        <string>{}</string>", args.profile),
         "        <string>--top-k</string>".to_string(),
         format!("        <string>{}</string>", args.top_k),
         "        <string>--seed</string>".to_string(),
@@ -406,6 +408,7 @@ mod tests {
             threads_batch: None,
             gpu_layers: default_gpu_layers(),
             temperature: 0.2,
+            profile: crate::agent_core::AgentProfile::Build,
             top_k: 40,
             seed: 1337,
         }

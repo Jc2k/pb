@@ -19,6 +19,12 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::Reasoning { content } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
         AgentEvent::ToolResult { result, .. } => print_block("tool result", result),
+        AgentEvent::SubAgentStarted { profile, task } => {
+            print_header("sub-agent", &format!("{profile}: {task}"));
+        }
+        AgentEvent::SubAgentFinished { profile, result } => {
+            print_block(&format!("sub-agent {profile}"), result);
+        }
         AgentEvent::Diff { diff, .. } => print_block("diff", diff),
         AgentEvent::Final { content } => print_header("final", content),
         AgentEvent::SessionSummary { branch, commits } => {

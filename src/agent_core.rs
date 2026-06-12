@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
 use encoding_rs::UTF_8;
 use futures::StreamExt;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -12,6 +13,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use similar::TextDiff;
+use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
@@ -34,6 +36,8 @@ const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
+const MAX_SUB_AGENT_DEPTH: usize = 1;
+const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
 
 fn suppress_llama_logs() {
     static LLAMA_LOGS_SUPPRESSED: OnceLock<()> = OnceLock::new();
@@ -61,6 +65,73 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProfile {
+    Build,
+    Review,
+    Explore,
+    Plan,
+    Ask,
+}
+
+impl Default for AgentProfile {
+    fn default() -> Self {
+        Self::Build
+    }
+}
+
+impl fmt::Display for AgentProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AgentProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Review => "review",
+            Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Ask => "ask",
+        }
+    }
+
+    fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "build" => Ok(Self::Build),
+            "review" => Ok(Self::Review),
+            "explore" => Ok(Self::Explore),
+            "plan" => Ok(Self::Plan),
+            "ask" => Ok(Self::Ask),
+            other => bail!(
+                "unknown agent profile '{other}'; expected one of: build, review, explore, plan, ask"
+            ),
+        }
+    }
+
+    fn instructions(self) -> &'static str {
+        match self {
+            Self::Build => {
+                "Profile: build. Implement the requested change with minimal safe edits. Use explore sub-agents to gather context before invasive work and review sub-agents to check your result before finalizing when useful. You may edit files and commit logical changes."
+            }
+            Self::Review => {
+                "Profile: review. Inspect the current workspace and recent changes for correctness, missing requirements, regressions, and test gaps. Run checks when available. Do not edit files or create commits. Return concise findings with severity and evidence."
+            }
+            Self::Explore => {
+                "Profile: explore. Investigate the codebase as it pertains to the task. Prefer search/read_file and targeted commands. Do not edit files or create commits. Return a compact map of relevant files, behaviors, and recommendations."
+            }
+            Self::Plan => {
+                "Profile: plan. Produce an actionable implementation plan from the available context. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
+            }
+            Self::Ask => {
+                "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Do not edit files or create commits. Return a direct answer with supporting evidence."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRequest {
     pub task: String,
@@ -75,6 +146,10 @@ pub struct AgentRequest {
     pub threads_batch: Option<i32>,
     pub gpu_layers: u32,
     pub temperature: f32,
+    #[serde(default)]
+    pub profile: AgentProfile,
+    #[serde(default)]
+    pub sub_agent_depth: usize,
     pub top_k: i32,
     pub seed: u32,
     /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
@@ -261,6 +336,8 @@ pub fn run_agent<S: EventSink>(
         &branch,
         is_continuation,
         command_backend.as_ref().map(CommandBackend::kind),
+        args.profile,
+        args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
     )?;
 
     let mut messages = vec![
@@ -274,7 +351,7 @@ pub fn run_agent<S: EventSink>(
         },
     ];
 
-    let reached_final = run_agent_steps(
+    let outcome = run_agent_steps(
         &backend,
         &model,
         &args,
@@ -283,6 +360,7 @@ pub fn run_agent<S: EventSink>(
         command_backend.as_ref(),
         &mut sink,
     )?;
+    let reached_final = outcome.reached_final;
 
     if git_has_changes(&workspace_root).unwrap_or(false) {
         let summary: String = args.task.chars().take(60).collect();
@@ -310,6 +388,8 @@ fn build_agent_instructions(
     branch: &str,
     continuing: bool,
     command_backend_kind: Option<CommandBackendKind>,
+    profile: AgentProfile,
+    allow_sub_agents: bool,
 ) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
@@ -317,17 +397,27 @@ fn build_agent_instructions(
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
-    const BASE_TOOLS: &str = "read_file(path,start,end), search(pattern,path), edit_file(path,old_text,new_text), web_search(query), web_fetch(url), git_commit(message), git_log(), git_revert(commit), skill(name)";
-    if command_backend_kind.is_some() {
-        instructions.push_str(&format!(
-            "Available tools: {BASE_TOOLS}, run_command(cmd).\n"
-        ));
-    } else {
-        instructions.push_str(&format!("Available tools: {BASE_TOOLS}.\n"));
+    instructions.push_str(profile.instructions());
+    instructions.push('\n');
+    let available_tools = available_tool_specs(profile, command_backend_kind, allow_sub_agents);
+    instructions.push_str(&format!(
+        "Available tools: {}.\n",
+        available_tools.join(", ")
+    ));
+    if allow_sub_agents {
+        instructions.push_str(
+            "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, and build. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+        );
     }
-    instructions.push_str(
-        "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
-    );
+    if profile == AgentProfile::Build {
+        instructions.push_str(
+            "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
+        );
+    } else {
+        instructions.push_str(
+            "This profile is read-only: do not call edit_file, git_commit, or git_revert.\n",
+        );
+    }
     instructions.push_str(
         "Use web_search for general internet research and web_fetch for reading a specific URL. Only use public http/https URLs.\n",
     );
@@ -372,6 +462,54 @@ fn build_agent_instructions(
     Ok(instructions)
 }
 
+fn available_tool_specs(
+    profile: AgentProfile,
+    command_backend_kind: Option<CommandBackendKind>,
+    allow_sub_agents: bool,
+) -> Vec<&'static str> {
+    let mut tools = vec![
+        "read_file(path,start,end)",
+        "search(pattern,path)",
+        "web_search(query)",
+        "web_fetch(url)",
+        "git_log()",
+        "skill(name)",
+    ];
+    if command_backend_kind.is_some() {
+        tools.push("run_command(cmd)");
+    }
+    if profile == AgentProfile::Build {
+        tools.push("edit_file(path,old_text,new_text)");
+        tools.push("git_commit(message)");
+        tools.push("git_revert(commit)");
+    }
+    if allow_sub_agents {
+        tools.push("sub_agent(profile,task,max_steps)");
+    }
+    tools
+}
+
+fn tool_allowed(
+    tool: &str,
+    profile: AgentProfile,
+    command_backend_kind: Option<CommandBackendKind>,
+    allow_sub_agents: bool,
+) -> bool {
+    match tool {
+        "read_file" | "search" | "web_search" | "web_fetch" | "git_log" | "skill" => true,
+        "run_command" => command_backend_kind.is_some(),
+        "edit_file" | "git_commit" | "git_revert" => profile == AgentProfile::Build,
+        "sub_agent" => allow_sub_agents,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StepRunOutcome {
+    reached_final: bool,
+    final_content: Option<String>,
+}
+
 fn run_agent_steps<S: EventSink>(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -380,7 +518,7 @@ fn run_agent_steps<S: EventSink>(
     workspace_root: &Path,
     command_backend: Option<&CommandBackend>,
     sink: &mut S,
-) -> Result<bool> {
+) -> Result<StepRunOutcome> {
     for step in 1..=args.max_steps {
         sink.emit(AgentEvent::StepStarted {
             step,
@@ -396,8 +534,13 @@ fn run_agent_steps<S: EventSink>(
                 if let Some(reasoning) = thinking {
                     sink.emit(AgentEvent::Reasoning { content: reasoning });
                 }
-                sink.emit(AgentEvent::Final { content });
-                return Ok(true);
+                sink.emit(AgentEvent::Final {
+                    content: content.clone(),
+                });
+                return Ok(StepRunOutcome {
+                    reached_final: true,
+                    final_content: Some(content),
+                });
             }
             AgentAction::ToolCall {
                 tool,
@@ -411,8 +554,14 @@ fn run_agent_steps<S: EventSink>(
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                 });
-                let tool_result =
-                    run_tool(&tool, &arguments, workspace_root, command_backend, sink)?;
+                let tool_context = ToolContext {
+                    backend,
+                    model,
+                    request: args,
+                    workspace_root,
+                    command_backend,
+                };
+                let tool_result = run_tool(&tool, &arguments, &tool_context, sink)?;
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
@@ -430,7 +579,10 @@ fn run_agent_steps<S: EventSink>(
         }
     }
 
-    Ok(false)
+    Ok(StepRunOutcome {
+        reached_final: false,
+        final_content: None,
+    })
 }
 
 fn render_prompt(messages: &[ChatMessage]) -> String {
@@ -621,13 +773,33 @@ fn extract_json_object(input: &str) -> Option<String> {
     None
 }
 
+struct ToolContext<'a> {
+    backend: &'a LlamaBackend,
+    model: &'a LlamaModel,
+    request: &'a AgentRequest,
+    workspace_root: &'a Path,
+    command_backend: Option<&'a CommandBackend>,
+}
+
 fn run_tool<S: EventSink>(
     tool: &str,
     arguments: &Value,
-    workspace_root: &Path,
-    command_backend: Option<&CommandBackend>,
+    context: &ToolContext<'_>,
     sink: &mut S,
 ) -> Result<String> {
+    if !tool_allowed(
+        tool,
+        context.request.profile,
+        context.command_backend.map(CommandBackend::kind),
+        context.request.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+    ) {
+        bail!(
+            "tool '{tool}' is not available for the {} profile",
+            context.request.profile.as_str()
+        );
+    }
+    let workspace_root = context.workspace_root;
+    let command_backend = context.command_backend;
     match tool {
         "read_file" => {
             let path = arguments
@@ -795,6 +967,7 @@ fn run_tool<S: EventSink>(
                 .context("skill requires string argument: name")?;
             Ok(skill_text(name))
         }
+        "sub_agent" => run_sub_agent(arguments, context, sink),
         "run_command" => {
             let cmd = arguments
                 .get("cmd")
@@ -806,6 +979,126 @@ fn run_tool<S: EventSink>(
         }
         _ => bail!("unknown tool: {tool}"),
     }
+}
+
+#[derive(Default)]
+struct SubAgentEventCollector {
+    final_content: Option<String>,
+    errors: Vec<String>,
+    diffs: usize,
+}
+
+impl EventSink for SubAgentEventCollector {
+    fn emit(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Final { content } => self.final_content = Some(content),
+            AgentEvent::Error { message } => self.errors.push(message),
+            AgentEvent::Diff { .. } => self.diffs += 1,
+            _ => {}
+        }
+    }
+}
+
+fn run_sub_agent<S: EventSink>(
+    arguments: &Value,
+    context: &ToolContext<'_>,
+    sink: &mut S,
+) -> Result<String> {
+    let profile_name = arguments
+        .get("profile")
+        .and_then(Value::as_str)
+        .context("sub_agent requires string argument: profile")?;
+    let profile = AgentProfile::parse(profile_name)?;
+    let task = arguments
+        .get("task")
+        .and_then(Value::as_str)
+        .context("sub_agent requires string argument: task")?;
+    let max_steps = arguments
+        .get("max_steps")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(DEFAULT_SUB_AGENT_MAX_STEPS)
+        .clamp(1, context.request.max_steps.max(1));
+
+    sink.emit(AgentEvent::SubAgentStarted {
+        profile: profile.as_str().to_string(),
+        task: task.to_string(),
+    });
+
+    let instructions = build_agent_instructions(
+        context.workspace_root,
+        context.request.branch.as_deref().unwrap_or("sub-agent"),
+        true,
+        context.command_backend.map(CommandBackend::kind),
+        profile,
+        false,
+    )?;
+    let mut messages = vec![
+        ChatMessage {
+            role: "system",
+            content: instructions,
+        },
+        ChatMessage {
+            role: "user",
+            content: task.to_string(),
+        },
+    ];
+
+    let mut sub_request = context.request.clone();
+    sub_request.task = task.to_string();
+    sub_request.profile = profile;
+    sub_request.max_steps = max_steps;
+    sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
+
+    let mut collector = SubAgentEventCollector::default();
+    let outcome = run_agent_steps(
+        context.backend,
+        context.model,
+        &sub_request,
+        &mut messages,
+        context.workspace_root,
+        context.command_backend,
+        &mut collector,
+    )?;
+
+    let mut result = String::new();
+    if outcome.reached_final {
+        result.push_str(
+            collector
+                .final_content
+                .as_deref()
+                .or(outcome.final_content.as_deref())
+                .unwrap_or("sub-agent finished without a final message"),
+        );
+    } else {
+        result.push_str("sub-agent reached its step limit before finalizing");
+    }
+    if collector.diffs > 0 {
+        result.push_str(&format!(
+            "
+
+Workspace edits emitted: {} diff(s).",
+            collector.diffs
+        ));
+    }
+    if !collector.errors.is_empty() {
+        result.push_str(
+            "
+
+Errors:
+",
+        );
+        result.push_str(&collector.errors.join(
+            "
+",
+        ));
+    }
+
+    sink.emit(AgentEvent::SubAgentFinished {
+        profile: profile.as_str().to_string(),
+        result: result.clone(),
+    });
+    Ok(result)
 }
 
 fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) -> Result<PathBuf> {
@@ -1387,10 +1680,47 @@ mod tests {
             "test-branch",
             false,
             Some(CommandBackendKind::Local),
+            AgentProfile::Build,
+            true,
         )
         .unwrap();
         assert!(instructions.contains("run_command(cmd)"));
         assert!(instructions.contains("locally from the project root on the host machine"));
+    }
+
+    #[test]
+    fn build_profile_instructions_include_sub_agent_tool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            AgentProfile::Build,
+            true,
+        )
+        .unwrap();
+        assert!(instructions.contains("Profile: build"));
+        assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
+        assert!(instructions.contains("edit_file(path,old_text,new_text)"));
+    }
+
+    #[test]
+    fn review_profile_instructions_are_read_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            AgentProfile::Review,
+            false,
+        )
+        .unwrap();
+        assert!(instructions.contains("Profile: review"));
+        assert!(instructions.contains("This profile is read-only"));
+        assert!(!instructions.contains("edit_file(path,old_text,new_text)"));
+        assert!(!instructions.contains("sub_agent(profile,task,max_steps)"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent_core::{AgentRequest, run_agent};
+use crate::agent_core::{AgentProfile, AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 use crate::session_store::{self, PersistedSession};
@@ -47,6 +47,7 @@ pub struct StartSessionRequest {
     pub threads_batch: Option<i32>,
     pub gpu_layers: Option<u32>,
     pub temperature: Option<f32>,
+    pub profile: Option<AgentProfile>,
     pub top_k: Option<i32>,
     pub seed: Option<u32>,
 }
@@ -218,6 +219,7 @@ async fn start_session_inner(
     request.threads_batch = req.threads_batch.or(request.threads_batch);
     request.gpu_layers = req.gpu_layers.unwrap_or(request.gpu_layers);
     request.temperature = req.temperature.unwrap_or(request.temperature);
+    request.profile = req.profile.unwrap_or(request.profile);
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
 

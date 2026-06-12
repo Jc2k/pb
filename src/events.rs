@@ -27,6 +27,14 @@ pub enum AgentEvent {
         tool: String,
         result: String,
     },
+    SubAgentStarted {
+        profile: String,
+        task: String,
+    },
+    SubAgentFinished {
+        profile: String,
+        result: String,
+    },
     Diff {
         path: String,
         diff: String,
