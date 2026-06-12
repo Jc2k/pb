@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent_core::{AgentProfile, AgentRequest, run_agent};
+use crate::agent_core::{AgentProfile, AgentRequest, infer_agent_profile, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 use crate::session_store::{self, PersistedSession};
@@ -219,7 +219,9 @@ async fn start_session_inner(
     request.threads_batch = req.threads_batch.or(request.threads_batch);
     request.gpu_layers = req.gpu_layers.unwrap_or(request.gpu_layers);
     request.temperature = req.temperature.unwrap_or(request.temperature);
-    request.profile = req.profile.unwrap_or(request.profile);
+    request.profile = req
+        .profile
+        .unwrap_or_else(|| infer_agent_profile(&request.task));
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
 
@@ -268,6 +270,7 @@ async fn continue_session(
 
     let mut request = session.request_template.clone();
     request.task = req.task;
+    request.profile = infer_agent_profile(&request.task);
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
     session.task = request.task.clone();
