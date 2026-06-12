@@ -1,6 +1,6 @@
 //! macOS menu bar status item for a `pb serve` instance.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 #[derive(Debug, Clone)]
 pub struct TrayArgs {
@@ -8,10 +8,17 @@ pub struct TrayArgs {
     pub port: u16,
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn run(args: TrayArgs) -> Result<()> {
-    let _ = args;
-    bail!("pb tray is only supported on macOS");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        anyhow::bail!("pb tray is only supported on macOS");
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        macos::run(args)
+    }
 }
 
 #[cfg(target_os = "macos")]
