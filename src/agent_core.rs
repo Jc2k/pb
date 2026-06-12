@@ -95,6 +95,131 @@ impl fmt::Display for AgentProfile {
     }
 }
 
+/// Infer the primary agent profile from a user message so callers do not need to
+/// choose one explicitly. Requests to make or fix code route to the build
+/// orchestrator; focused questions and planning requests route to read-only
+/// profiles unless they clearly ask for implementation.
+pub fn infer_agent_profile(task: &str) -> AgentProfile {
+    let normalized = task.to_ascii_lowercase();
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    let has_word = |candidates: &[&str]| -> bool {
+        words
+            .iter()
+            .any(|word| candidates.iter().any(|candidate| word == candidate))
+    };
+    let has_phrase = |candidates: &[&str]| -> bool {
+        candidates
+            .iter()
+            .any(|candidate| normalized.contains(candidate))
+    };
+
+    let plan_phrases = [
+        "make a plan",
+        "create a plan",
+        "implementation plan",
+        "plan for",
+        "plan how",
+        "roadmap",
+    ];
+    let explicit_plan_request = has_word(&["plan", "roadmap"]) || has_phrase(&plan_phrases);
+
+    let implementation_words = [
+        "add",
+        "build",
+        "change",
+        "create",
+        "delete",
+        "edit",
+        "fix",
+        "implement",
+        "make",
+        "modify",
+        "patch",
+        "refactor",
+        "remove",
+        "rename",
+        "replace",
+        "update",
+        "upgrade",
+        "write",
+    ];
+    let implementation_phrases = [
+        "can you add",
+        "can you build",
+        "can you change",
+        "can you create",
+        "can you fix",
+        "can you implement",
+        "can you make",
+        "can you update",
+        "please add",
+        "please build",
+        "please change",
+        "please create",
+        "please fix",
+        "please implement",
+        "please make",
+        "please update",
+    ];
+    let implementation_request =
+        has_word(&implementation_words) || has_phrase(&implementation_phrases);
+    if implementation_request && !explicit_plan_request {
+        return AgentProfile::Build;
+    }
+    if explicit_plan_request {
+        return AgentProfile::Plan;
+    }
+
+    let review_words = ["audit", "check", "inspect", "review"];
+    let review_phrases = [
+        "look over",
+        "code review",
+        "review my",
+        "review the",
+        "check my",
+        "check the diff",
+    ];
+    if has_word(&review_words) || has_phrase(&review_phrases) {
+        return AgentProfile::Review;
+    }
+
+    let scout_phrases = [
+        "dev environment",
+        "development environment",
+        "setup environment",
+        "set up environment",
+        "working environment",
+        "environment setup",
+        "install dependencies",
+    ];
+    if has_word(&["environment", "dependencies", "setup", "bootstrap"])
+        || has_phrase(&scout_phrases)
+    {
+        return AgentProfile::Scout;
+    }
+
+    let explore_phrases = [
+        "find where",
+        "figure out where",
+        "investigate",
+        "where is",
+        "where are",
+        "how does",
+        "trace",
+    ];
+    if has_word(&["explore", "investigate", "trace", "locate", "find"])
+        || has_phrase(&explore_phrases)
+    {
+        return AgentProfile::Explore;
+    }
+
+    AgentProfile::Ask
+}
+
 impl AgentProfile {
     fn as_str(self) -> &'static str {
         match self {
@@ -124,7 +249,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. Implement the requested change with minimal safe edits. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. Use explore sub-agents to gather context before invasive work and review sub-agents to check your result before finalizing when useful. You may edit files and commit logical changes."
+                "Profile: build. Orchestrate implementation work for requests that make, change, or fix something. First call a plan sub-agent to break the request into concrete build tasks. Then call one or more build sub-agents to implement those tasks, requiring each build sub-agent to git_commit after its logical change. Automatically call a scout sub-agent when you need to establish or refresh a working development environment. After implementation, call a review sub-agent to inspect the committed work before finalizing. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes, but prefer delegating planned implementation to build sub-agents."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -2096,6 +2221,39 @@ mod tests {
 
         assert!(err.contains("prompt is too long"), "error was: {err}");
         assert!(err.contains("--ctx-size"), "error was: {err}");
+    }
+
+    #[test]
+    fn infer_agent_profile_routes_implementation_to_build() {
+        assert_eq!(
+            infer_agent_profile("Fix the login bug"),
+            AgentProfile::Build
+        );
+        assert_eq!(
+            infer_agent_profile("Please add export support"),
+            AgentProfile::Build
+        );
+    }
+
+    #[test]
+    fn infer_agent_profile_routes_read_only_requests() {
+        assert_eq!(
+            infer_agent_profile("Create an implementation plan for auth"),
+            AgentProfile::Plan
+        );
+        assert_eq!(
+            infer_agent_profile("Review the current diff"),
+            AgentProfile::Review
+        );
+        assert_eq!(
+            infer_agent_profile("Set up the development environment"),
+            AgentProfile::Scout
+        );
+        assert_eq!(
+            infer_agent_profile("How does session persistence work?"),
+            AgentProfile::Explore
+        );
+        assert_eq!(infer_agent_profile("What is pb?"), AgentProfile::Ask);
     }
 
     #[test]
