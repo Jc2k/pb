@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
@@ -189,7 +189,22 @@ struct AppState {
 struct WebAssets;
 
 pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
-    let project_entries = projects::load_projects()?;
+    run_server_with_ready(args, defaults, None).await
+}
+
+pub async fn run_server_with_ready(
+    args: ServeArgs,
+    defaults: AgentRequest,
+    ready: Option<mpsc::Sender<Result<SocketAddr, String>>>,
+) -> Result<()> {
+    let mut ready = ready;
+    let project_entries = match projects::load_projects() {
+        Ok(project_entries) => project_entries,
+        Err(err) => {
+            notify_ready(&mut ready, Err(err.to_string()));
+            return Err(err);
+        }
+    };
     let restored_sessions = restore_sessions(&project_entries);
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
@@ -212,13 +227,38 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
         .route("/{*path}", get(static_asset))
         .with_state((state.clone(), defaults.clone()));
 
-    spawn_unix_rpc_server(args.socket_path.clone(), state, defaults).await?;
+    if let Err(err) = spawn_unix_rpc_server(args.socket_path.clone(), state, defaults).await {
+        notify_ready(&mut ready, Err(err.to_string()));
+        return Err(err);
+    }
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+    let addr: SocketAddr = match format!("{}:{}", args.host, args.port).parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            notify_ready(&mut ready, Err(err.to_string()));
+            return Err(err.into());
+        }
+    };
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            notify_ready(&mut ready, Err(err.to_string()));
+            return Err(err.into());
+        }
+    };
     println!("pb serve listening on http://{}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    notify_ready(&mut ready, Ok(addr));
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn notify_ready(
+    ready: &mut Option<mpsc::Sender<Result<SocketAddr, String>>>,
+    result: Result<SocketAddr, String>,
+) {
+    if let Some(sender) = ready.take() {
+        let _ = sender.send(result);
+    }
 }
 
 async fn start_session(
