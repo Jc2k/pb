@@ -338,8 +338,14 @@ mod tests {
             fn build(&self, _: &Path, _: &str) -> Result<()> {
                 Ok(())
             }
+            fn image_exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
             fn create(&self, _: &str, _: &Path) -> Result<String> {
                 Ok("x".into())
+            }
+            fn commit(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
             }
             fn exec(&self, _: &str, _: &str) -> Result<String> {
                 Ok(String::new())
