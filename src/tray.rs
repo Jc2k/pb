@@ -14,7 +14,7 @@ pub fn run(args: TrayArgs) -> Result<()> {
         let _ = args;
         anyhow::bail!("pb tray is only supported on macOS");
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         macos::run(args)

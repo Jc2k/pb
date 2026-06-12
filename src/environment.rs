@@ -39,13 +39,50 @@ pub struct EnvironmentConfig {
     /// Container image reference (e.g. `ghcr.io/myorg/dev:latest` or a locally built tag).
     pub image: String,
 
-    /// Shell commands run inside the container after it is created, before agent work begins.
+    /// Legacy setup commands. Kept for compatibility with existing `.pb/environment.toml` files.
+    /// New scouted environments store one-time dependency installation in `setup_commands`.
     #[serde(default)]
     pub init_commands: Vec<String>,
+
+    /// Commands that prepare a reusable development environment image.
+    /// Container backends run these once, commit the result, and reuse the tagged image.
+    /// Local backends only run them when the agent determines an environment refresh is needed.
+    #[serde(default)]
+    pub setup_commands: Vec<String>,
+
+    /// Commands documented as per-session refresh steps. Most projects leave this empty.
+    #[serde(default)]
+    pub session_commands: Vec<String>,
+
+    /// Commands that should pass before committing changes.
+    #[serde(default)]
+    pub guard_commands: Vec<String>,
+
+    /// Image tag used for a prepared scout environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepared_image: Option<String>,
+
+    /// Human-readable source/reason for the selected backend and commands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 
     /// Path to the Dockerfile used for `build` mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<PathBuf>,
+}
+
+impl EnvironmentConfig {
+    /// One-time setup commands, including legacy `init_commands` for old configs.
+    pub fn setup_commands(&self) -> Vec<String> {
+        let mut commands = self.init_commands.clone();
+        commands.extend(self.setup_commands.clone());
+        commands
+    }
+
+    /// Commands that should run for every fresh agent session.
+    pub fn session_commands(&self) -> &[String] {
+        &self.session_commands
+    }
 }
 
 impl EnvironmentConfig {
@@ -90,6 +127,11 @@ mod tests {
             backend: EnvironmentBackend::AppleContainers,
             image: "ghcr.io/example/dev:latest".to_string(),
             init_commands: vec!["npm ci".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         };
         config.save(dir.path()).unwrap();
@@ -108,6 +150,11 @@ mod tests {
             backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: Some(PathBuf::from("Dockerfile")),
         };
         config.save(dir.path()).unwrap();
@@ -124,6 +171,11 @@ mod tests {
             backend: EnvironmentBackend::Local,
             image: "local".to_string(),
             init_commands: vec!["cargo check".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         };
         config.save(dir.path()).unwrap();

@@ -9,6 +9,8 @@
 //! prints a summary of what it found and what it configured.
 
 use anyhow::Result;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
@@ -23,6 +25,8 @@ pub struct ProjectInspection {
     pub devcontainer_init_commands: Vec<String>,
     pub has_dockerfile: bool,
     pub gitlab_ci_image: Option<String>,
+    pub has_github_workflows: bool,
+    pub has_kubernetes_config: bool,
 
     // Language ecosystems
     pub has_cargo_toml: bool,
@@ -37,6 +41,14 @@ pub struct ProjectInspection {
 
     // Already configured?
     pub has_pb_environment: bool,
+
+    // Scout signals
+    pub setup_commands: Vec<String>,
+    pub session_commands: Vec<String>,
+    pub guard_commands: Vec<String>,
+    pub prefers_local_backend: bool,
+    pub prefers_container_backend: bool,
+    pub scout_sources: Vec<PathBuf>,
 }
 
 /// Inspect a project directory and return everything we detected.
@@ -69,21 +81,42 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
         && let Ok(text) = std::fs::read_to_string(&gitlab_ci)
     {
         info.gitlab_ci_image = parse_gitlab_ci_image(&text);
+        inspect_scout_text(root, &gitlab_ci, &text, &mut info);
+    }
+
+    // --- GitHub Actions and Kubernetes manifests ---
+    let workflow_dir = root.join(".github").join("workflows");
+    if let Ok(entries) = std::fs::read_dir(&workflow_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yml" | "yaml")
+            ) {
+                info.has_github_workflows = true;
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    inspect_scout_text(root, &path, &text, &mut info);
+                }
+            }
+        }
+    }
+    for rel in ["k8s", "kubernetes", "helm", "charts"] {
+        if root.join(rel).exists() {
+            info.has_kubernetes_config = true;
+            info.prefers_container_backend = true;
+        }
     }
 
     // --- Language ecosystems ---
-    info.has_cargo_toml = root.join("Cargo.toml").exists();
-    info.has_pyproject_toml = root.join("pyproject.toml").exists();
-    info.has_requirements_txt = root.join("requirements.txt").exists();
-    info.has_package_json = root.join("package.json").exists();
-    info.has_deno_lock = root.join("deno.lock").exists();
-    info.has_go_mod = root.join("go.mod").exists();
+    inspect_language_manifests(root, root, 0, &mut info);
 
     // --- Existing agent docs ---
     let agent_doc_candidates = [
+        "AGENT.md",
+        "AGENTS.md",
+        "README.md",
         ".github/copilot-instructions.md",
         "CLAUDE.md",
-        "AGENTS.md",
         ".cursor/rules",
         "GEMINI.md",
         ".aider.conf.yml",
@@ -93,14 +126,83 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     for rel in &agent_doc_candidates {
         let p = root.join(rel);
         if p.exists() {
-            info.existing_agent_docs.push(p);
+            info.existing_agent_docs.push(p.clone());
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                inspect_scout_text(root, &p, &text, &mut info);
+            }
         }
+    }
+
+    let dockerfile = root.join("Dockerfile");
+    if dockerfile.exists()
+        && let Ok(text) = std::fs::read_to_string(&dockerfile)
+    {
+        inspect_scout_text(root, &dockerfile, &text, &mut info);
     }
 
     // --- Already configured? ---
     info.has_pb_environment = root.join(".pb").join("environment.toml").exists();
 
     Ok(info)
+}
+
+fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut ProjectInspection) {
+    if depth > 4 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | "dist" | "build"
+            ) {
+                continue;
+            }
+            inspect_language_manifests(root, &path, depth + 1, info);
+            continue;
+        }
+        let rel_parent = path.parent().unwrap_or(root);
+        let command = |cmd: &str| normalize_command(root, &rel_parent.join("README.md"), cmd);
+        match name.as_ref() {
+            "Cargo.toml" => {
+                info.has_cargo_toml = true;
+                info.guard_commands.push(command("cargo test"));
+            }
+            "pyproject.toml" => {
+                info.has_pyproject_toml = true;
+                info.setup_commands.push(command("pip install -e ."));
+            }
+            "requirements.txt" => {
+                info.has_requirements_txt = true;
+                info.setup_commands
+                    .push(command("pip install -r requirements.txt"));
+            }
+            "package.json" => {
+                info.has_package_json = true;
+                info.setup_commands.push(command("npm ci"));
+            }
+            "deno.lock" => {
+                info.has_deno_lock = true;
+                info.setup_commands.push(command("deno install"));
+            }
+            "go.mod" => {
+                info.has_go_mod = true;
+                info.setup_commands.push(command("go mod download"));
+            }
+            "Dockerfile" => {
+                info.has_dockerfile = info.has_dockerfile || path == root.join("Dockerfile");
+                info.prefers_container_backend = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── environment suggestion ────────────────────────────────────────────────────
@@ -115,6 +217,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
             init_commands: info.devcontainer_init_commands.clone(),
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -126,6 +233,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: Some(PathBuf::from("Dockerfile")),
         });
     }
@@ -138,6 +250,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
             init_commands,
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -149,6 +266,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "rust:latest".to_string(),
             init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -163,6 +285,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "python:3-slim".to_string(),
             init_commands,
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -172,6 +299,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "denoland/deno:latest".to_string(),
             init_commands: vec!["deno install".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -181,6 +313,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "node:lts-slim".to_string(),
             init_commands: vec!["npm ci".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -190,6 +327,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
             backend: EnvironmentBackend::AppleContainers,
             image: "golang:latest".to_string(),
             init_commands: vec!["go mod download".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
             dockerfile: None,
         });
     }
@@ -223,6 +365,11 @@ pub fn local_environment(info: &ProjectInspection) -> EnvironmentConfig {
         backend: EnvironmentBackend::Local,
         image: "local".to_string(),
         init_commands: language_init_commands(info),
+        setup_commands: vec![],
+        session_commands: vec![],
+        guard_commands: vec![],
+        prepared_image: None,
+        source: None,
         dockerfile: None,
     }
 }
@@ -263,7 +410,8 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
     } else {
         let env = match backend {
             Some(EnvironmentBackend::Local) => Some(local_environment(&info)),
-            Some(EnvironmentBackend::AppleContainers) | None => suggest_environment(&info),
+            Some(EnvironmentBackend::AppleContainers) => suggest_environment(&info),
+            None => suggest_scout_environment(&root, &info),
         };
         match env {
             Some(env) => {
@@ -305,11 +453,30 @@ fn print_environment_config(label: &str, env: &EnvironmentConfig) {
     if let Some(df) = &env.dockerfile {
         println!("  dockerfile: {}", df.display());
     }
-    if !env.init_commands.is_empty() {
-        println!("  init_commands:");
-        for cmd in &env.init_commands {
+    let setup_commands = env.setup_commands();
+    if !setup_commands.is_empty() {
+        println!("  setup_commands:");
+        for cmd in &setup_commands {
             println!("    - {cmd}");
         }
+    }
+    if !env.session_commands.is_empty() {
+        println!("  session_commands:");
+        for cmd in &env.session_commands {
+            println!("    - {cmd}");
+        }
+    }
+    if !env.guard_commands.is_empty() {
+        println!("  guard_commands:");
+        for cmd in &env.guard_commands {
+            println!("    - {cmd}");
+        }
+    }
+    if let Some(image) = &env.prepared_image {
+        println!("  prepared_image: {image}");
+    }
+    if let Some(source) = &env.source {
+        println!("  source: {source}");
     }
 }
 
@@ -330,6 +497,18 @@ fn print_detection_summary(info: &ProjectInspection) {
     }
     if let Some(img) = &info.gitlab_ci_image {
         println!("  GitLab CI image: {img}");
+    }
+    if info.has_github_workflows {
+        println!("  GitHub Actions workflows: found");
+    }
+    if info.has_kubernetes_config {
+        println!("  Kubernetes/deployment config: found");
+    }
+    if info.prefers_local_backend {
+        println!("  scout backend signal: local (macOS-specific)");
+    }
+    if info.prefers_container_backend {
+        println!("  scout backend signal: containers (Linux/deployment)");
     }
 
     let mut langs = Vec::new();
@@ -356,6 +535,285 @@ fn print_detection_summary(info: &ProjectInspection) {
     } else {
         println!("  languages: {}", langs.join(", "));
     }
+}
+
+/// Scout an environment without requiring a per-project config file.
+pub fn scout_environment(root: &Path) -> Result<Option<EnvironmentConfig>> {
+    let info = inspect(root)?;
+    Ok(suggest_scout_environment(root, &info))
+}
+
+pub fn suggest_scout_environment(
+    root: &Path,
+    info: &ProjectInspection,
+) -> Option<EnvironmentConfig> {
+    let base = suggest_environment(info).or_else(|| {
+        Some(EnvironmentConfig {
+            mode: EnvironmentMode::Local,
+            backend: EnvironmentBackend::Local,
+            image: "local".to_string(),
+            init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
+            dockerfile: None,
+        })
+    })?;
+
+    let backend = choose_backend(&base, info);
+    let mut setup_commands = unique_commands(info.setup_commands.clone());
+    if setup_commands.is_empty() {
+        setup_commands = language_init_commands(info);
+    }
+    let guard_commands = unique_commands(info.guard_commands.clone());
+    let source = scout_source_summary(info, backend);
+
+    let image = if backend == EnvironmentBackend::Local {
+        "local".to_string()
+    } else {
+        base.image.clone()
+    };
+    let prepared_image =
+        if backend == EnvironmentBackend::AppleContainers && !setup_commands.is_empty() {
+            Some(scouted_image_tag(root, &image, &setup_commands))
+        } else {
+            None
+        };
+
+    Some(EnvironmentConfig {
+        mode: if backend == EnvironmentBackend::Local {
+            EnvironmentMode::Local
+        } else {
+            base.mode
+        },
+        backend,
+        image,
+        init_commands: vec![],
+        setup_commands,
+        session_commands: unique_commands(info.session_commands.clone()),
+        guard_commands,
+        prepared_image,
+        source: Some(source),
+        dockerfile: if backend == EnvironmentBackend::Local {
+            None
+        } else {
+            base.dockerfile
+        },
+    })
+}
+
+fn choose_backend(base: &EnvironmentConfig, info: &ProjectInspection) -> EnvironmentBackend {
+    if info.prefers_local_backend && !info.prefers_container_backend {
+        return EnvironmentBackend::Local;
+    }
+    if info.prefers_container_backend
+        || info.has_dockerfile
+        || info.devcontainer_image.is_some()
+        || info.gitlab_ci_image.is_some()
+        || info.has_github_workflows
+        || info.has_kubernetes_config
+    {
+        return EnvironmentBackend::AppleContainers;
+    }
+    if info.prefers_local_backend {
+        EnvironmentBackend::Local
+    } else {
+        base.backend
+    }
+}
+
+fn scouted_image_tag(root: &Path, base_image: &str, setup_commands: &[String]) -> String {
+    let mut hasher = DefaultHasher::new();
+    root.to_string_lossy().hash(&mut hasher);
+    base_image.hash(&mut hasher);
+    setup_commands.hash(&mut hasher);
+    format!("pb-scout:{:016x}", hasher.finish())
+}
+
+fn scout_source_summary(info: &ProjectInspection, backend: EnvironmentBackend) -> String {
+    let mut parts = Vec::new();
+    let backend_name = match backend {
+        EnvironmentBackend::AppleContainers => "container backend",
+        EnvironmentBackend::Local => "local backend",
+    };
+    parts.push(format!("scout selected {backend_name}"));
+    if info.prefers_local_backend {
+        parts.push("macOS-specific signals found".to_string());
+    }
+    if info.prefers_container_backend {
+        parts.push("Linux/container/deployment signals found".to_string());
+    }
+    if !info.scout_sources.is_empty() {
+        let names: Vec<String> = info
+            .scout_sources
+            .iter()
+            .take(6)
+            .map(|p| p.display().to_string())
+            .collect();
+        parts.push(format!("sources: {}", names.join(", ")));
+    }
+    parts.join("; ")
+}
+
+fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectInspection) {
+    if !info.scout_sources.iter().any(|p| p == path) {
+        info.scout_sources.push(path.to_path_buf());
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("macos-latest")
+        || lower.contains("xcodebuild")
+        || lower.contains("swift build")
+        || lower.contains("aarch64-apple-darwin")
+        || lower.contains("launchd")
+        || lower.contains("cocoapods")
+    {
+        info.prefers_local_backend = true;
+    }
+    if lower.contains("dockerfile")
+        || lower.contains("docker build")
+        || lower.contains("docker compose")
+        || lower.contains("ubuntu")
+        || lower.contains("debian")
+        || lower.contains("alpine")
+        || lower.contains("kubernetes")
+        || lower.contains("kubectl")
+        || lower.contains("helm")
+        || lower.contains("linux")
+    {
+        info.prefers_container_backend = true;
+    }
+    for line in text.lines() {
+        let command = extract_documented_command(line);
+        if let Some(command) = command {
+            let normalized = normalize_command(root, path, &command);
+            let cmd_lower = normalized.to_ascii_lowercase();
+            if is_setup_command(&cmd_lower) {
+                info.setup_commands.push(normalized.clone());
+            }
+            if is_session_refresh_command(&cmd_lower, line) {
+                info.session_commands.push(normalized.clone());
+            }
+            if is_guard_command(&cmd_lower, line) {
+                info.guard_commands.push(normalized);
+            }
+        }
+    }
+}
+
+fn extract_documented_command(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let mut candidate = trimmed
+        .trim_start_matches(['-', '*'])
+        .trim()
+        .trim_start_matches("run ")
+        .trim();
+    if let Some(start) = candidate.find('`') {
+        let rest = &candidate[start + 1..];
+        if let Some(end) = rest.find('`') {
+            candidate = &rest[..end];
+        }
+    } else if let Some(rest) = candidate.strip_prefix('$') {
+        candidate = rest.trim();
+    } else if candidate.contains(':') {
+        candidate = candidate.split_once(':')?.1.trim();
+    }
+    let first = candidate.split_whitespace().next()?;
+    const COMMAND_PREFIXES: &[&str] = &[
+        "cargo",
+        "npm",
+        "pnpm",
+        "yarn",
+        "deno",
+        "pip",
+        "python",
+        "uv",
+        "poetry",
+        "go",
+        "make",
+        "docker",
+        "docker-compose",
+        "xcodebuild",
+        "swift",
+    ];
+    if COMMAND_PREFIXES.contains(&first) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn normalize_command(root: &Path, source: &Path, command: &str) -> String {
+    let parent = source.parent().unwrap_or(root);
+    if parent == root || command.starts_with("cd ") {
+        return command.to_string();
+    }
+    if let Ok(rel) = parent.strip_prefix(root) {
+        if !rel.as_os_str().is_empty() {
+            return format!("cd {} && {command}", shell_escape_path(rel));
+        }
+    }
+    command.to_string()
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn is_setup_command(command: &str) -> bool {
+    command.contains("npm ci")
+        || command.contains("npm install")
+        || command.contains("pnpm install")
+        || command.contains("yarn install")
+        || command.contains("deno install")
+        || command.contains("pip install")
+        || command.contains("poetry install")
+        || command.contains("uv sync")
+        || command.contains("go mod download")
+        || command.contains("cargo fetch")
+        || command.contains("make deps")
+        || command.contains("make setup")
+}
+
+fn is_session_refresh_command(command: &str, line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("per session")
+        || lower.contains("each session")
+        || lower.contains("before every"))
+        && (is_setup_command(command)
+            || command.contains("generate")
+            || command.contains("codegen"))
+}
+
+fn is_guard_command(command: &str, line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    command.contains(" test")
+        || command.starts_with("cargo test")
+        || command.contains(" check")
+        || command.contains(" lint")
+        || command.contains(" fmt")
+        || command.contains(" build")
+        || lower.contains("before commit")
+        || lower.contains("required before")
+        || lower.contains("guard")
+}
+
+fn unique_commands(commands: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for command in commands {
+        if !out.contains(&command) {
+            out.push(command);
+        }
+    }
+    out
 }
 
 // ── devcontainer parsing ──────────────────────────────────────────────────────
@@ -740,6 +1198,62 @@ mod tests {
         assert_eq!(env.image, "ghcr.io/myorg/dev:latest");
         assert!(matches!(env.mode, EnvironmentMode::Pull));
         assert_eq!(env.init_commands, vec!["npm ci"]);
+    }
+
+    #[test]
+    fn scout_prefers_local_for_macos_specific_docs() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "AGENT.md",
+            "Use `xcodebuild test` before commit on macos-latest.",
+        );
+        let info = inspect(dir.path()).unwrap();
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+        assert_eq!(env.backend, EnvironmentBackend::Local);
+        assert_eq!(env.guard_commands, vec!["xcodebuild test"]);
+    }
+
+    #[test]
+    fn scout_prefers_containers_and_prepares_reusable_image() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "Dockerfile", "FROM node:lts\n");
+        write(
+            dir.path(),
+            "README.md",
+            "Run `npm ci`
+Run `npm test` before commit.",
+        );
+        let info = inspect(dir.path()).unwrap();
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+        assert_eq!(env.backend, EnvironmentBackend::AppleContainers);
+        assert!(
+            env.prepared_image
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("pb-scout:"))
+        );
+        assert_eq!(env.setup_commands, vec!["npm ci"]);
+        assert_eq!(env.guard_commands, vec!["npm test"]);
+    }
+
+    #[test]
+    fn scout_detects_subproject_setup_commands() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "crates/api/Cargo.toml",
+            "[package]\nname = \"api\"\n",
+        );
+        write(dir.path(), "web/package.json", "{}");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_cargo_toml);
+        assert!(info.has_package_json);
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+        assert!(env.setup_commands.contains(&"cd web && npm ci".to_string()));
+        assert!(
+            env.guard_commands
+                .contains(&"cd crates/api && cargo test".to_string())
+        );
     }
 
     #[test]

@@ -12,9 +12,15 @@ pub trait ContainerRuntime: Send + Sync {
     /// Build an image from a Dockerfile, tagging it with `tag`.
     fn build(&self, dockerfile: &Path, tag: &str) -> Result<()>;
 
+    /// Return true when the runtime already has an image tag available locally.
+    fn image_exists(&self, image: &str) -> Result<bool>;
+
     /// Create a long-running container from `image`, mounting `workspace` at `/workspace`.
     /// Returns the container ID / name produced by the runtime.
     fn create(&self, image: &str, workspace: &Path) -> Result<String>;
+
+    /// Commit a prepared container to a reusable image tag.
+    fn commit(&self, container_id: &str, image: &str) -> Result<()>;
 
     /// Execute a shell command inside a running container.
     fn exec(&self, container_id: &str, cmd: &str) -> Result<String>;
@@ -63,12 +69,20 @@ impl ContainerRuntime for AppleContainerRuntime {
         run_silent("container", &["build", "-t", tag, "-f", &df, &ctx])
     }
 
+    fn image_exists(&self, image: &str) -> Result<bool> {
+        run_status("container", &["image", "inspect", image])
+    }
+
     fn create(&self, image: &str, workspace: &Path) -> Result<String> {
         let mount = format!("{}:/workspace", workspace.to_string_lossy());
         run_capture(
             "container",
             &["run", "-d", "-v", &mount, image, "sleep", "infinity"],
         )
+    }
+
+    fn commit(&self, container_id: &str, image: &str) -> Result<()> {
+        run_silent("container", &["commit", container_id, image])
     }
 
     fn exec(&self, container_id: &str, cmd: &str) -> Result<String> {
@@ -117,12 +131,20 @@ impl ContainerRuntime for OciRuntime {
         run_silent(&self.binary, &["build", "-t", tag, "-f", &df, &ctx])
     }
 
+    fn image_exists(&self, image: &str) -> Result<bool> {
+        run_status(&self.binary, &["image", "inspect", image])
+    }
+
     fn create(&self, image: &str, workspace: &Path) -> Result<String> {
         let mount = format!("{}:/workspace", workspace.to_string_lossy());
         run_capture(
             &self.binary,
             &["run", "-d", "-v", &mount, image, "sleep", "infinity"],
         )
+    }
+
+    fn commit(&self, container_id: &str, image: &str) -> Result<()> {
+        run_silent(&self.binary, &["commit", container_id, image])
     }
 
     fn exec(&self, container_id: &str, cmd: &str) -> Result<String> {
@@ -168,6 +190,15 @@ fn which_exists(binary: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Run a command and return whether it exited successfully.
+fn run_status(binary: &str, args: &[&str]) -> Result<bool> {
+    let status = Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to spawn {binary}"))?;
+    Ok(status.success())
 }
 
 /// Run a command, inheriting stdio, failing on non-zero exit.
@@ -227,12 +258,26 @@ mod tests {
             self.commands.lock().unwrap().push(format!("build {tag}"));
             Ok(())
         }
+        fn image_exists(&self, image: &str) -> Result<bool> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push(format!("image_exists {image}"));
+            Ok(false)
+        }
         fn create(&self, image: &str, _workspace: &Path) -> Result<String> {
             self.commands
                 .lock()
                 .unwrap()
                 .push(format!("create {image}"));
             Ok("mock-container-id".to_string())
+        }
+        fn commit(&self, container_id: &str, image: &str) -> Result<()> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push(format!("commit {container_id} {image}"));
+            Ok(())
         }
         fn exec(&self, container_id: &str, cmd: &str) -> Result<String> {
             self.commands

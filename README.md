@@ -11,7 +11,8 @@ A local coding agent CLI with an optional web front end.
 - `pb queue <task> --workdir /absolute/path/to/repo` - submit a daemon-backed session over the local Unix socket and stream its terminal events.
 - `pb queue --session <session-id>` - attach the terminal event stream for any daemon session, including sessions started from the web UI.
 - `pb queue --list` - list sessions currently known to the daemon.
-- `pb queue --profile build|review|explore|plan|ask <task>` - choose the primary agent profile. Build sessions can spawn focused sub-agents with the same profile names so exploration, planning, Q&A, and review happen in fresh contexts and return only compact summaries to the primary agent.
+- `pb queue --profile build|scout|review|explore|plan|ask <task>` - choose the primary agent profile. Build sessions can spawn focused sub-agents with the same profile names so exploration, planning, Q&A, and review happen in fresh contexts and return only compact summaries to the primary agent.
+  The `scout` profile auto-detects the development environment from AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests instead of requiring a per-project `.pb/environment.toml`; it prefers containers for Linux/deployment-oriented projects and local execution for macOS-specific projects.
 - `pb init [--backend apple-containers|local]` - inspect a project and configure it; Apple containers are the default backend.
 - `pb env pull <image>` / `pb env build` - configure the default Apple-container-backed project environment.
 - `pb env local [--init <cmd>]` - force the project environment to run commands locally from the repository root, useful for macOS-only builds that cannot run inside Apple containers.
