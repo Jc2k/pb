@@ -19,6 +19,14 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::Reasoning { content } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
         AgentEvent::ToolResult { result, .. } => print_block("tool result", result),
+        AgentEvent::UserQuestion {
+            question_id,
+            question,
+        } => print_block(&format!("question {question_id}"), question),
+        AgentEvent::UserAnswer {
+            question_id,
+            answer,
+        } => print_block(&format!("answer {question_id}"), answer),
         AgentEvent::SubAgentStarted { profile, task } => {
             print_header("sub-agent", &format!("{profile}: {task}"));
         }

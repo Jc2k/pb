@@ -27,6 +27,14 @@ pub enum AgentEvent {
         tool: String,
         result: String,
     },
+    UserQuestion {
+        question_id: String,
+        question: String,
+    },
+    UserAnswer {
+        question_id: String,
+        answer: String,
+    },
     SubAgentStarted {
         profile: String,
         task: String,

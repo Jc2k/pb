@@ -13,6 +13,8 @@ type AgentEvent =
   | { type: "reasoning"; content: string }
   | { type: "tool_call"; tool: string; arguments: unknown }
   | { type: "tool_result"; tool: string; result: string }
+  | { type: "user_question"; question_id: string; question: string }
+  | { type: "user_answer"; question_id: string; answer: string }
   | { type: "sub_agent_started"; profile: string; task: string }
   | { type: "sub_agent_finished"; profile: string; result: string }
   | { type: "diff"; path: string; diff: string }
@@ -30,8 +32,10 @@ interface SessionItem {
   session_id: string;
   task: string;
   running: boolean;
+  paused: boolean;
   branch?: string;
   workdir?: string;
+  pending_question?: { question_id: string; question: string };
   updated_at_ms: number;
 }
 
@@ -39,7 +43,9 @@ interface SessionDetails {
   session_id: string;
   task: string;
   running: boolean;
+  paused: boolean;
   branch?: string;
+  pending_question?: { question_id: string; question: string };
   events: EventEnvelope[];
 }
 
@@ -176,6 +182,22 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
         </details>
       );
 
+    case "user_question":
+      return (
+        <div className="alert alert-warning py-2 mb-2">
+          <div className="fw-semibold mb-1">Question for you</div>
+          <div>{e.question}</div>
+        </div>
+      );
+
+    case "user_answer":
+      return (
+        <div className="alert alert-light border py-2 mb-2">
+          <div className="fw-semibold mb-1">Your answer</div>
+          <pre className="mb-0 small">{e.answer}</pre>
+        </div>
+      );
+
     case "sub_agent_started":
       return (
         <div className="alert alert-secondary py-2 mb-2">
@@ -268,6 +290,8 @@ function SessionCard({
         In&nbsp;progress
       </span>
     );
+  } else if (session.paused) {
+    badge = <span className="badge bg-warning text-dark">Needs answer</span>;
   } else if (session.branch) {
     badge = <span className="badge bg-success">{session.branch}</span>;
   } else {
@@ -442,6 +466,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
+  const [answer, setAnswer] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
   const feedRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -454,6 +479,30 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       try {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((prev) => [...prev, parsed]);
+        if (parsed.event.type === "user_question") {
+          setSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  running: false,
+                  paused: true,
+                  pending_question: {
+                    question_id: parsed.event.question_id,
+                    question: parsed.event.question,
+                  },
+                }
+              : prev,
+          );
+          setSessionRunning(false);
+        } else if (parsed.event.type === "user_answer") {
+          setSession((prev) =>
+            prev ? { ...prev, running: true, paused: false, pending_question: undefined } : prev,
+          );
+          setSessionRunning(true);
+        } else if (parsed.event.type === "final" || parsed.event.type === "session_summary") {
+          setSession((prev) => (prev ? { ...prev, running: false, paused: false } : prev));
+          setSessionRunning(false);
+        }
       } catch (err) {
         console.error(err);
       }
@@ -469,12 +518,15 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       session_id: details.session_id,
       task: details.task,
       running: details.running,
+      paused: details.paused,
       branch: details.branch,
       workdir: undefined,
+      pending_question: details.pending_question,
       updated_at_ms: 0,
     });
     setEvents(details.events);
     setSessionRunning(details.running);
+    setAnswer("");
   };
 
   const continueSession = async () => {
@@ -485,6 +537,22 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       body: JSON.stringify({ task: followUp.trim() }),
     });
     setFollowUp("");
+    setSessionRunning(true);
+  };
+
+
+  const answerQuestion = async () => {
+    if (!answer.trim() || !session?.pending_question) return;
+    await fetch(`/api/sessions/${sessionId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question_id: session.pending_question.question_id,
+        answer: answer.trim(),
+      }),
+    });
+    setAnswer("");
+    setSession((prev) => (prev ? { ...prev, paused: false, running: true } : prev));
     setSessionRunning(true);
   };
 
@@ -526,6 +594,8 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           <span className="navbar-text small text-body-secondary ms-auto">
             {session.running ? (
               <span className="text-primary">in progress</span>
+            ) : session.paused ? (
+              <span className="text-warning">waiting for answer</span>
             ) : session.branch ? (
               <code>{session.branch}</code>
             ) : (
@@ -553,7 +623,27 @@ function SessionPage({ sessionId }: { sessionId: string }) {
               events.map((env, i) => <EventItem key={i} envelope={env} />)
             )}
           </div>
-          {!sessionRunning && (
+          {session?.paused && session.pending_question ? (
+            <div className="card-footer bg-warning-subtle">
+              <div className="small fw-semibold mb-2">{session.pending_question.question}</div>
+              <div className="input-group">
+                <textarea
+                  className="form-control"
+                  rows={2}
+                  value={answer}
+                  onChange={(e) => setAnswer(e.target.value)}
+                  placeholder="Answer the planning question…"
+                />
+                <button
+                  className="btn btn-warning"
+                  onClick={() => void answerQuestion()}
+                  disabled={!answer.trim()}
+                >
+                  Answer
+                </button>
+              </div>
+            </div>
+          ) : !sessionRunning && (
             <div className="card-footer">
               <div className="input-group">
                 <textarea

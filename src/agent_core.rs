@@ -64,6 +64,10 @@ struct WebSearchResult {
 
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
+
+    fn ask_user(&mut self, _question: &str) -> Result<String> {
+        bail!("ask_user is not available in this execution context")
+    }
 }
 
 impl<F> EventSink for F
@@ -216,7 +220,7 @@ impl AgentProfile {
                 "Profile: explore. Investigate the codebase as it pertains to the task. Prefer search/read_file and targeted commands. Do not edit files or create commits. Return a compact map of relevant files, behaviors, and recommendations."
             }
             Self::Plan => {
-                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Use skill_search to find relevant reusable workflows or framework guidance; either incorporate invoked skills into the plan or plan explicit skill invocations for build/research agents. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
+                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Use ask_user(question) only when a human decision or missing requirement blocks a safe plan; the session pauses until the human answers, and you must incorporate the answer before finalizing. Use skill_search to find relevant reusable workflows or framework guidance; either incorporate invoked skills into the plan or plan explicit skill invocations for build/research agents. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
             }
             Self::Ask => {
                 "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Launch a research sub-agent when the answer depends on deeper external knowledge, current documentation, ecosystem behavior, or non-trivial source synthesis. Do not edit files or create commits. Return a direct answer with supporting evidence."
@@ -769,6 +773,9 @@ fn available_tool_specs(
         "skill_search(query,max_results)",
         "skill(name)",
     ];
+    if profile == AgentProfile::Plan {
+        tools.push("ask_user(question)");
+    }
     if command_backend_kind.is_some() {
         tools.push("run_command(cmd)");
     }
@@ -795,6 +802,7 @@ fn tool_allowed(
     match tool {
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
         | "todo" | "skill_search" | "skill" => true,
+        "ask_user" => profile == AgentProfile::Plan,
         "run_command" => command_backend_kind.is_some(),
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
@@ -810,7 +818,7 @@ struct StepRunOutcome {
     final_content: Option<String>,
 }
 
-fn run_agent_steps<S: EventSink>(
+fn run_agent_steps(
     backend: &LlamaBackend,
     model: &LlamaModel,
     args: &AgentRequest,
@@ -819,7 +827,7 @@ fn run_agent_steps<S: EventSink>(
     command_backend: Option<&CommandBackend>,
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
-    sink: &mut S,
+    sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
     for step in 1..=args.max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -1209,11 +1217,11 @@ fn run_ripgrep(
     }
 }
 
-fn run_tool<S: EventSink>(
+fn run_tool(
     tool: &str,
     arguments: &Value,
     context: &ToolContext<'_>,
-    sink: &mut S,
+    sink: &mut dyn EventSink,
 ) -> Result<String> {
     if !tool_allowed(
         tool,
@@ -1443,6 +1451,13 @@ fn run_tool<S: EventSink>(
                 .context("skill requires string argument: name")?;
             run_skill_tool(name, workspace_root)
         }
+        "ask_user" => {
+            let question = arguments
+                .get("question")
+                .and_then(Value::as_str)
+                .context("ask_user requires string argument: question")?;
+            sink.ask_user(question)
+        }
         "sub_agent" => run_sub_agent(arguments, context, sink),
         "run_command" => {
             let cmd = arguments
@@ -1464,14 +1479,35 @@ struct SubAgentEventCollector {
     diffs: usize,
 }
 
-impl EventSink for SubAgentEventCollector {
-    fn emit(&mut self, event: AgentEvent) {
+impl SubAgentEventCollector {
+    fn collect(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Final { content } => self.final_content = Some(content),
             AgentEvent::Error { message } => self.errors.push(message),
             AgentEvent::Diff { .. } => self.diffs += 1,
             _ => {}
         }
+    }
+}
+
+impl EventSink for SubAgentEventCollector {
+    fn emit(&mut self, event: AgentEvent) {
+        self.collect(event);
+    }
+}
+
+struct SubAgentSink<'a> {
+    parent: &'a mut dyn EventSink,
+    collector: SubAgentEventCollector,
+}
+
+impl EventSink for SubAgentSink<'_> {
+    fn emit(&mut self, event: AgentEvent) {
+        self.collector.collect(event);
+    }
+
+    fn ask_user(&mut self, question: &str) -> Result<String> {
+        self.parent.ask_user(question)
     }
 }
 
@@ -1496,10 +1532,10 @@ fn run_guard_commands(
     Ok(())
 }
 
-fn run_sub_agent<S: EventSink>(
+fn run_sub_agent(
     arguments: &Value,
     context: &ToolContext<'_>,
-    sink: &mut S,
+    sink: &mut dyn EventSink,
 ) -> Result<String> {
     let profile_name = arguments
         .get("profile")
@@ -1548,7 +1584,10 @@ fn run_sub_agent<S: EventSink>(
     sub_request.max_steps = max_steps;
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
 
-    let mut collector = SubAgentEventCollector::default();
+    let mut sub_sink = SubAgentSink {
+        parent: sink,
+        collector: SubAgentEventCollector::default(),
+    };
     let outcome = run_agent_steps(
         context.backend,
         context.model,
@@ -1558,8 +1597,9 @@ fn run_sub_agent<S: EventSink>(
         context.command_backend,
         context.env_config,
         context.todo_memory,
-        &mut collector,
+        &mut sub_sink,
     )?;
+    let collector = sub_sink.collector;
 
     let mut result = String::new();
     if outcome.reached_final {
