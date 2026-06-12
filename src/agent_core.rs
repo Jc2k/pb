@@ -614,7 +614,7 @@ fn extract_json_object(input: &str) -> Option<String> {
         && !in_string
     {
         let mut candidate = input[s..].trim_end().to_string();
-        candidate.extend(std::iter::repeat('}').take(depth));
+        candidate.extend(std::iter::repeat_n('}', depth));
         return Some(candidate);
     }
 
