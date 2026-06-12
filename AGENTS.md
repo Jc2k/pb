@@ -11,7 +11,7 @@
 - **Entry point**: `src/main.rs` → `pb::run(Cli::parse()).async`
 - **CLI commands** defined in `src/lib.rs`: `serve`, `queue`, `self`, `tray`, `projects`, `env`, `service`, `init`
 - **Web UI**: React app in `webui/` served by Rust backend; builds to `webui/dist/`
-- **Agent profiles**: `build|scout|review|explore|plan|ask` - see `src/agent_core.rs`
+- **Agent profiles**: `build|scout|review|explore|plan|ask|research` - see `src/agent_core.rs`
 
 ## Platform-specific behavior
 
