@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::TextDiff;
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -42,6 +42,8 @@ const MAX_GLOB_RESULTS: usize = 200;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
+const MAX_SKILL_SEARCH_RESULTS: usize = 50;
+const MAX_SKILL_TEXT_CHARS: usize = 40_000;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
@@ -214,13 +216,13 @@ impl AgentProfile {
                 "Profile: explore. Investigate the codebase as it pertains to the task. Prefer search/read_file and targeted commands. Do not edit files or create commits. Return a compact map of relevant files, behaviors, and recommendations."
             }
             Self::Plan => {
-                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
+                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Use skill_search to find relevant reusable workflows or framework guidance; either incorporate invoked skills into the plan or plan explicit skill invocations for build/research agents. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
             }
             Self::Ask => {
                 "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Launch a research sub-agent when the answer depends on deeper external knowledge, current documentation, ecosystem behavior, or non-trivial source synthesis. Do not edit files or create commits. Return a direct answer with supporting evidence."
             }
             Self::Research => {
-                "Profile: research. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or launch sub-agents. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
+                "Profile: research. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or launch sub-agents. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
             }
         }
     }
@@ -689,6 +691,9 @@ fn build_agent_instructions(
     instructions.push_str(
         "Use web_search for general internet research and web_fetch for reading a specific URL. Only use public http/https URLs.\n",
     );
+    instructions.push_str(
+        "Skills are discovered from repo Codex, Claude, OpenCode, and Copilot locations by metadata only. Use skill_search(query,max_results) to find relevant skills without loading full bodies, then skill(name) to load one selected skill when it applies. Build agents can use framework skills to improve implementation; plan agents can plan skill invocations; research agents can use research skills for targeted source gathering.\n",
+    );
     instructions.push_str(&format!(
         "Reading and writing is only permitted within the project root: {}.\n",
         workspace_root.display()
@@ -761,6 +766,7 @@ fn available_tool_specs(
         "web_fetch(url)",
         "git_log()",
         "todo(action,id,title,description,status,parent_id,note)",
+        "skill_search(query,max_results)",
         "skill(name)",
     ];
     if command_backend_kind.is_some() {
@@ -788,7 +794,7 @@ fn tool_allowed(
 ) -> bool {
     match tool {
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
-        | "todo" | "skill" => true,
+        | "todo" | "skill_search" | "skill" => true,
         "run_command" => command_backend_kind.is_some(),
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
@@ -1425,12 +1431,17 @@ fn run_tool<S: EventSink>(
                 .context("git_revert requires string argument: commit")?;
             git_revert(commit, workspace_root)
         }
+        "skill_search" => {
+            let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+            let limit = tool_result_limit(arguments, "skill_search", MAX_SKILL_SEARCH_RESULTS)?;
+            run_skill_search(query, limit, workspace_root)
+        }
         "skill" => {
             let name = arguments
                 .get("name")
                 .and_then(Value::as_str)
                 .context("skill requires string argument: name")?;
-            Ok(skill_text(name))
+            run_skill_tool(name, workspace_root)
         }
         "sub_agent" => run_sub_agent(arguments, context, sink),
         "run_command" => {
@@ -1875,23 +1886,445 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
     out
 }
 
-fn skill_text(name: &str) -> String {
-    match name {
-        "copilot" => {
-            "Use repository instructions first; keep edits minimal; run tests before finalizing."
-                .to_string()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillMetadata {
+    provider: &'static str,
+    name: String,
+    description: String,
+    relative_path: String,
+    kind: SkillKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillKind {
+    AgentSkill,
+    CopilotInstructions,
+    CopilotInstructionFile,
+    CopilotPromptFile,
+}
+
+impl SkillKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentSkill => "agent_skill",
+            Self::CopilotInstructions => "copilot_instructions",
+            Self::CopilotInstructionFile => "copilot_instruction_file",
+            Self::CopilotPromptFile => "copilot_prompt_file",
         }
-        "codex" => {
-            "Prefer structured tool calls, verify edits with diffs, and keep responses concise."
-                .to_string()
-        }
-        "claude-code" => {
-            "Think in small steps, use safe file boundaries, and report reasoning clearly."
-                .to_string()
-        }
-        "list" => "Available skills: copilot, codex, claude-code".to_string(),
-        _ => format!("unknown skill '{name}'. Try: copilot, codex, claude-code, list"),
     }
+}
+
+fn run_skill_search(query: &str, limit: usize, workspace_root: &Path) -> Result<String> {
+    let mut skills = discover_skills(workspace_root)?;
+    let query = query.trim().to_ascii_lowercase();
+    if !query.is_empty() {
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        skills.retain(|skill| skill_matches(skill, &terms));
+        skills.sort_by_key(|skill| std::cmp::Reverse(skill_score(skill, &terms)));
+    }
+
+    if skills.is_empty() {
+        return Ok("no matching skills found in repo skill locations".to_string());
+    }
+
+    let mut out = String::from(
+        "Skill metadata search results (full skill bodies are not loaded until skill(name) is called):\n",
+    );
+    for skill in skills.iter().take(limit) {
+        out.push_str(&format!(
+            "- name: {}\n  provider: {}\n  kind: {}\n  path: {}\n  description: {}\n",
+            skill.name,
+            skill.provider,
+            skill.kind.as_str(),
+            skill.relative_path,
+            skill.description
+        ));
+    }
+    Ok(out)
+}
+
+fn run_skill_tool(name: &str, workspace_root: &Path) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("skill name must not be empty");
+    }
+
+    let skills = discover_skills(workspace_root)?;
+    if name.eq_ignore_ascii_case("list") {
+        return format_skill_list(&skills);
+    }
+
+    let matches: Vec<_> = skills
+        .iter()
+        .filter(|skill| skill_identifier_matches(skill, name))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Ok(format!(
+            "unknown skill '{name}'. Use skill_search(query,max_results) or skill(name=\"list\") to find available repo skills."
+        )),
+        [skill] => load_skill_body(skill, workspace_root),
+        many => {
+            let choices = many
+                .iter()
+                .map(|skill| {
+                    format!(
+                        "{}/{} ({})",
+                        skill.provider, skill.name, skill.relative_path
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "skill name '{name}' is ambiguous. Invoke one of:\n{choices}"
+            ))
+        }
+    }
+}
+
+fn format_skill_list(skills: &[SkillMetadata]) -> Result<String> {
+    if skills.is_empty() {
+        return Ok("no repo skills found".to_string());
+    }
+    let mut out = String::from("Available repo skills:\n");
+    for skill in skills {
+        out.push_str(&format!(
+            "- {}/{} — {} ({})\n",
+            skill.provider, skill.name, skill.description, skill.relative_path
+        ));
+    }
+    Ok(out)
+}
+
+fn skill_identifier_matches(skill: &SkillMetadata, requested: &str) -> bool {
+    let requested = requested.trim();
+    skill.name.eq_ignore_ascii_case(requested)
+        || skill
+            .relative_path
+            .eq_ignore_ascii_case(requested.trim_start_matches("./"))
+        || format!("{}/{}", skill.provider, skill.name).eq_ignore_ascii_case(requested)
+}
+
+fn load_skill_body(skill: &SkillMetadata, workspace_root: &Path) -> Result<String> {
+    let resolved = resolve_workspace_path(workspace_root, &skill.relative_path, true)?;
+    let text = std::fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read skill {}", resolved.display()))?;
+    let resource_hint = skill_resource_hint(&resolved, workspace_root)?;
+    let truncated = truncate_chars(&text, MAX_SKILL_TEXT_CHARS);
+    let truncation_note = if text.chars().count() > MAX_SKILL_TEXT_CHARS {
+        format!("\n\n[truncated to {MAX_SKILL_TEXT_CHARS} characters]")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "Skill: {}\nProvider: {}\nKind: {}\nPath: {}\nDescription: {}\n{}\n---\n{}{}",
+        skill.name,
+        skill.provider,
+        skill.kind.as_str(),
+        skill.relative_path,
+        skill.description,
+        resource_hint,
+        truncated,
+        truncation_note
+    ))
+}
+
+fn skill_resource_hint(skill_path: &Path, workspace_root: &Path) -> Result<String> {
+    let Some(skill_dir) = skill_path.parent() else {
+        return Ok("Resources: none".to_string());
+    };
+    let mut resources = Vec::new();
+    for resource_dir in ["scripts", "references", "assets", "agents"] {
+        let dir = skill_dir.join(resource_dir);
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in workspace_walk(&dir).max_depth(Some(3)).build() {
+            let entry = entry.with_context(|| format!("failed to walk {}", dir.display()))?;
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                let path = entry
+                    .path()
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(entry.path());
+                resources.push(path.display().to_string());
+                if resources.len() >= 30 {
+                    break;
+                }
+            }
+        }
+    }
+    if resources.is_empty() {
+        Ok("Resources: none".to_string())
+    } else {
+        Ok(format!(
+            "Resources (load with read_file only as needed):\n- {}",
+            resources.join("\n- ")
+        ))
+    }
+}
+
+fn discover_skills(workspace_root: &Path) -> Result<Vec<SkillMetadata>> {
+    let mut skills = Vec::new();
+    for entry in workspace_walk(workspace_root).build() {
+        let entry =
+            entry.with_context(|| format!("failed to walk {}", workspace_root.display()))?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path.strip_prefix(workspace_root).unwrap_or(path);
+        let rel_string = rel.display().to_string();
+        if let Some(skill) = parse_repo_skill_file(path, rel, &rel_string)? {
+            skills.push(skill);
+        }
+    }
+    skills.sort_by(|left, right| {
+        left.provider
+            .cmp(right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    Ok(skills)
+}
+
+fn parse_repo_skill_file(
+    path: &Path,
+    rel: &Path,
+    rel_string: &str,
+) -> Result<Option<SkillMetadata>> {
+    let components = rel_components(rel);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    if file_name == "SKILL.md" {
+        if let Some(provider) = agent_skill_provider(&components) {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
+            let (metadata, _) = parse_markdown_frontmatter(&text);
+            let fallback_name = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("skill")
+                .to_string();
+            return Ok(Some(SkillMetadata {
+                provider,
+                name: metadata.get("name").cloned().unwrap_or(fallback_name),
+                description: metadata
+                    .get("description")
+                    .or_else(|| metadata.get("summary"))
+                    .cloned()
+                    .unwrap_or_else(|| first_heading_or_default(&text, "Agent skill")),
+                relative_path: rel_string.to_string(),
+                kind: SkillKind::AgentSkill,
+            }));
+        }
+    }
+
+    if components == [".github", "copilot-instructions.md"] {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
+        return Ok(Some(SkillMetadata {
+            provider: "copilot",
+            name: "copilot-instructions".to_string(),
+            description: first_heading_or_default(&text, "Repository Copilot custom instructions"),
+            relative_path: rel_string.to_string(),
+            kind: SkillKind::CopilotInstructions,
+        }));
+    }
+
+    if components.first().is_some_and(|part| *part == ".github")
+        && components.iter().any(|part| *part == "instructions")
+        && file_name.ends_with(".instructions.md")
+    {
+        return parse_copilot_markdown_skill(
+            path,
+            rel_string,
+            SkillKind::CopilotInstructionFile,
+            "Copilot instruction file",
+        )
+        .map(Some);
+    }
+
+    if components.first().is_some_and(|part| *part == ".github")
+        && components.iter().any(|part| *part == "prompts")
+        && file_name.ends_with(".prompt.md")
+    {
+        return parse_copilot_markdown_skill(
+            path,
+            rel_string,
+            SkillKind::CopilotPromptFile,
+            "Copilot prompt file",
+        )
+        .map(Some);
+    }
+
+    Ok(None)
+}
+
+fn parse_copilot_markdown_skill(
+    path: &Path,
+    rel_string: &str,
+    kind: SkillKind,
+    default_description: &str,
+) -> Result<SkillMetadata> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
+    let (metadata, _) = parse_markdown_frontmatter(&text);
+    let name = metadata.get("name").cloned().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("copilot-skill")
+            .trim_end_matches(".instructions")
+            .trim_end_matches(".prompt")
+            .to_string()
+    });
+    let description = metadata
+        .get("description")
+        .or_else(|| metadata.get("summary"))
+        .or_else(|| metadata.get("applyTo"))
+        .cloned()
+        .unwrap_or_else(|| first_heading_or_default(&text, default_description));
+    Ok(SkillMetadata {
+        provider: "copilot",
+        name,
+        description,
+        relative_path: rel_string.to_string(),
+        kind,
+    })
+}
+
+fn agent_skill_provider(components: &[&str]) -> Option<&'static str> {
+    if path_contains_sequence(components, &[".codex", "skills"]) {
+        return Some("codex");
+    }
+    if path_contains_sequence(components, &[".agents", "skills"]) {
+        return Some("codex");
+    }
+    if path_contains_sequence(components, &[".claude", "skills"]) {
+        return Some("claude");
+    }
+    if path_contains_sequence(components, &[".opencode", "skill"])
+        || path_contains_sequence(components, &[".opencode", "skills"])
+    {
+        return Some("opencode");
+    }
+    None
+}
+
+fn path_contains_sequence(components: &[&str], sequence: &[&str]) -> bool {
+    !sequence.is_empty()
+        && components
+            .windows(sequence.len())
+            .any(|window| window == sequence)
+}
+
+fn rel_components(path: &Path) -> Vec<&str> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_markdown_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+    let mut metadata = HashMap::new();
+    let Some(rest) = text.strip_prefix("---") else {
+        return (metadata, text);
+    };
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"));
+    let Some(rest) = rest else {
+        return (metadata, text);
+    };
+    let mut body_start = None;
+    let mut offset = text.len() - rest.len();
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            body_start = Some(offset + line.len());
+            break;
+        }
+        if !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && let Some((key, value)) = line.split_once(':')
+        {
+            let key = key.trim();
+            if !key.is_empty() {
+                metadata.insert(key.to_string(), clean_frontmatter_value(value));
+            }
+        }
+        offset += line.len();
+    }
+    if let Some(start) = body_start {
+        (metadata, &text[start..])
+    } else {
+        (HashMap::new(), text)
+    }
+}
+
+fn clean_frontmatter_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .to_string()
+}
+
+fn first_heading_or_default(text: &str, default: &str) -> String {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("# "))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn skill_matches(skill: &SkillMetadata, terms: &[&str]) -> bool {
+    let haystack = format!(
+        "{} {} {} {} {}",
+        skill.provider,
+        skill.name,
+        skill.description,
+        skill.relative_path,
+        skill.kind.as_str()
+    )
+    .to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn skill_score(skill: &SkillMetadata, terms: &[&str]) -> usize {
+    let name = skill.name.to_ascii_lowercase();
+    let description = skill.description.to_ascii_lowercase();
+    let path = skill.relative_path.to_ascii_lowercase();
+    terms
+        .iter()
+        .map(|term| {
+            let mut score = 0;
+            if name == *term {
+                score += 20;
+            }
+            if name.contains(term) {
+                score += 10;
+            }
+            if description.contains(term) {
+                score += 5;
+            }
+            if path.contains(term) {
+                score += 2;
+            }
+            score
+        })
+        .sum()
 }
 
 fn block_on_tool<F>(future: F) -> Result<String>
@@ -2986,5 +3419,72 @@ mod tests {
         std::fs::write(&file, "hi").unwrap();
         let resolved = resolve_workspace_path(tmp.path(), "hello.txt", true).unwrap();
         assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn discover_skills_reads_agent_skill_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join(".claude/skills/rust-web");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: rust-web\ndescription: Build Rust web handlers safely\n---\n# Rust Web\nFull body\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills(tmp.path()).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].provider, "claude");
+        assert_eq!(skills[0].name, "rust-web");
+        assert_eq!(skills[0].description, "Build Rust web handlers safely");
+        assert_eq!(skills[0].relative_path, ".claude/skills/rust-web/SKILL.md");
+    }
+
+    #[test]
+    fn skill_search_matches_open_code_and_copilot_locations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let opencode_skill = tmp.path().join(".opencode/skill/research/SKILL.md");
+        std::fs::create_dir_all(opencode_skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &opencode_skill,
+            "---\nname: targeted-research\ndescription: Find authoritative sources\n---\nbody",
+        )
+        .unwrap();
+        let copilot_prompt = tmp.path().join(".github/prompts/review.prompt.md");
+        std::fs::create_dir_all(copilot_prompt.parent().unwrap()).unwrap();
+        std::fs::write(
+            &copilot_prompt,
+            "---\ndescription: Review changed code\n---\n# Review Prompt\nbody",
+        )
+        .unwrap();
+
+        let result = run_skill_search("research", 10, tmp.path()).unwrap();
+
+        assert!(result.contains("targeted-research"), "{result}");
+        assert!(result.contains("provider: opencode"), "{result}");
+        assert!(!result.contains("Review changed code"), "{result}");
+    }
+
+    #[test]
+    fn skill_tool_loads_selected_skill_body_and_resource_hint() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join(".codex/skills/frontend");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: frontend\ndescription: Build frontend features\n---\n# Frontend\nUse framework conventions.\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("references/patterns.md"), "patterns").unwrap();
+
+        let result = run_skill_tool("codex/frontend", tmp.path()).unwrap();
+
+        assert!(result.contains("Skill: frontend"), "{result}");
+        assert!(result.contains("Use framework conventions."), "{result}");
+        assert!(
+            result.contains(".codex/skills/frontend/references/patterns.md"),
+            "{result}"
+        );
     }
 }
