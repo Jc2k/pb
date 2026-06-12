@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, sleep};
 
+use crate::agent_core::AgentProfile;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 
 pub mod agent_core;
@@ -299,6 +300,10 @@ pub struct QueueArgs {
     #[arg(long)]
     pub temperature: Option<f32>,
 
+    /// Agent profile for the primary session
+    #[arg(long, value_enum)]
+    pub profile: Option<AgentProfile>,
+
     /// Top-k for sampling
     #[arg(long)]
     pub top_k: Option<i32>,
@@ -382,6 +387,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.2)]
     pub temperature: f32,
 
+    /// Default agent profile for new sessions
+    #[arg(long, value_enum, default_value_t = AgentProfile::Build)]
+    pub profile: AgentProfile,
+
     /// Default top-k for sampling
     #[arg(long, default_value_t = 40)]
     pub top_k: i32,
@@ -454,6 +463,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 threads_batch: args.threads_batch,
                 gpu_layers: args.gpu_layers,
                 temperature: args.temperature,
+                profile: args.profile,
+                sub_agent_depth: 0,
                 top_k: args.top_k,
                 seed: args.seed,
                 environment: None,
@@ -585,6 +596,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
                 threads_batch: args.threads_batch,
                 gpu_layers: args.gpu_layers,
                 temperature: args.temperature,
+                profile: args.profile,
                 top_k: args.top_k,
                 seed: args.seed,
             },

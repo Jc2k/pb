@@ -13,6 +13,8 @@ type AgentEvent =
   | { type: "reasoning"; content: string }
   | { type: "tool_call"; tool: string; arguments: unknown }
   | { type: "tool_result"; tool: string; result: string }
+  | { type: "sub_agent_started"; profile: string; task: string }
+  | { type: "sub_agent_finished"; profile: string; result: string }
   | { type: "diff"; path: string; diff: string }
   | { type: "final"; content: string }
   | { type: "session_summary"; branch: string; commits: string }
@@ -167,6 +169,30 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
           <summary className="card-header border-0 bg-body-tertiary py-2 small d-flex align-items-center gap-2">
             <span className="badge bg-light text-dark">result</span>
             <code>{e.tool}</code>
+          </summary>
+          <div className="card-body py-2">
+            <pre className="mb-0 small result-pre">{e.result}</pre>
+          </div>
+        </details>
+      );
+
+    case "sub_agent_started":
+      return (
+        <div className="alert alert-secondary py-2 mb-2">
+          <div className="small text-uppercase text-body-secondary">Sub-agent</div>
+          <div>
+            <span className="badge bg-primary me-2">{e.profile}</span>
+            {e.task}
+          </div>
+        </div>
+      );
+
+    case "sub_agent_finished":
+      return (
+        <details className="card border-primary mb-2" open>
+          <summary className="card-header py-2 small d-flex align-items-center gap-2">
+            <span className="badge bg-primary">sub-agent</span>
+            <code>{e.profile}</code>
           </summary>
           <div className="card-body py-2">
             <pre className="mb-0 small result-pre">{e.result}</pre>
