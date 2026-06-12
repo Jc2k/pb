@@ -1144,7 +1144,7 @@ fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
         (pb, template)
     } else {
         let pb = ProgressBar::new_spinner();
-        let template = format!("{{spinner:.green}} [{{elapsed_precise}}] {{bytes}} downloaded");
+        let template = "{spinner:.green} [{elapsed_precise}] {bytes} downloaded".to_string();
         (pb, template)
     };
     let style = ProgressStyle::with_template(&template)
@@ -1396,13 +1396,13 @@ async fn download_file_with_resume(
     file.flush().await.context("failed to flush file")?;
     drop(file);
 
-    if let Some(size) = expected_size {
-        if bytes_written != size {
-            bail!(
-                "size mismatch for {}: expected {size}, wrote {bytes_written}",
-                path.display()
-            );
-        }
+    if let Some(size) = expected_size
+        && bytes_written != size
+    {
+        bail!(
+            "size mismatch for {}: expected {size}, wrote {bytes_written}",
+            path.display()
+        );
     }
 
     tokio::fs::rename(&tmp_path, path).await.with_context(|| {

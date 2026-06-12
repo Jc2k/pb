@@ -10,6 +10,8 @@ use crate::projects::ProjectEntry;
 
 const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
+const SESSION_GIT_NAME: &str = "pb";
+const SESSION_GIT_EMAIL: &str = "pb@localhost";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
@@ -157,7 +159,7 @@ fn ensure_git_repository(workspace_root: &Path) -> Result<()> {
 }
 
 fn note_target(workspace_root: &Path, session_id: &str) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut child = session_git_command()
         .args(["hash-object", "-w", "--stdin"])
         .current_dir(workspace_root)
         .stdin(std::process::Stdio::piped())
@@ -205,12 +207,24 @@ fn write_temp_note(session_id: &str, payload: &str) -> Result<PathBuf> {
 }
 
 fn run_git<const N: usize>(workspace_root: &Path, args: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
+    let output = session_git_command()
         .args(args)
         .current_dir(workspace_root)
         .output()
         .with_context(|| format!("failed to run git in {}", workspace_root.display()))?;
     command_output(output, workspace_root, "git")
+}
+
+fn session_git_command() -> Command {
+    // Git notes writes create commits, so provide an internal identity instead of
+    // requiring CI or user machines to configure one globally.
+    let mut command = Command::new("git");
+    command
+        .env("GIT_AUTHOR_NAME", SESSION_GIT_NAME)
+        .env("GIT_AUTHOR_EMAIL", SESSION_GIT_EMAIL)
+        .env("GIT_COMMITTER_NAME", SESSION_GIT_NAME)
+        .env("GIT_COMMITTER_EMAIL", SESSION_GIT_EMAIL);
+    command
 }
 
 fn command_output(
