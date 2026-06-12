@@ -76,6 +76,15 @@ pub async fn answer_question(
     .await
 }
 
+pub async fn resume_session(socket_path: &PathBuf, session_id: String) -> Result<SessionResponse> {
+    request(
+        socket_path,
+        "pb.session.resume",
+        WatchSessionRequest { session_id },
+    )
+    .await
+}
+
 pub async fn delete_session(
     socket_path: &PathBuf,
     session_id: String,

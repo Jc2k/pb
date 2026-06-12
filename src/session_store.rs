@@ -13,6 +13,15 @@ const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Queued,
+    Running,
+    Paused,
+    Completed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub session_id: String,
@@ -21,6 +30,8 @@ pub struct PersistedSession {
     pub workdir: Option<PathBuf>,
     pub request_template: AgentRequest,
     pub running: bool,
+    #[serde(default)]
+    pub status: Option<SessionStatus>,
     pub updated_at_ms: u128,
     pub events: Vec<EventEnvelope>,
 }
@@ -32,6 +43,7 @@ impl PersistedSession {
         branch: Option<String>,
         workdir: Option<PathBuf>,
         running: bool,
+        status: SessionStatus,
         events: Vec<EventEnvelope>,
     ) -> Self {
         Self {
@@ -41,6 +53,7 @@ impl PersistedSession {
             workdir,
             request_template,
             running,
+            status: Some(status),
             updated_at_ms: now_millis(),
             events: trim_events(events),
         }
@@ -109,6 +122,20 @@ fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSessio
     for note_ref in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match read_note(workspace_root, note_ref).and_then(|payload| parse_session(&payload)) {
             Ok(mut session) => {
+                session.status = Some(
+                    match session.status.unwrap_or_else(|| {
+                        if session.running {
+                            SessionStatus::Running
+                        } else {
+                            SessionStatus::Completed
+                        }
+                    }) {
+                        SessionStatus::Running | SessionStatus::Queued | SessionStatus::Paused => {
+                            SessionStatus::Paused
+                        }
+                        SessionStatus::Completed => SessionStatus::Completed,
+                    },
+                );
                 session.running = false;
                 session.events = trim_events(session.events);
                 sessions.push(session);
@@ -298,6 +325,7 @@ mod tests {
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
             true,
+            SessionStatus::Running,
             vec![EventEnvelope::new(AgentEvent::Final {
                 content: "done".to_string(),
             })],

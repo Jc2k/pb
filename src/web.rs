@@ -21,7 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
-use crate::session_store::{self, PersistedSession};
+use crate::session_store::{self, PersistedSession, SessionStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -81,6 +81,7 @@ pub struct SessionListItem {
     pub task: String,
     pub running: bool,
     pub paused: bool,
+    pub status: SessionStatus,
     pub branch: Option<String>,
     pub workdir: Option<String>,
     pub updated_at_ms: u128,
@@ -92,6 +93,7 @@ pub struct SessionDetails {
     pub task: String,
     pub running: bool,
     pub paused: bool,
+    pub status: SessionStatus,
     pub branch: Option<String>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
@@ -113,6 +115,9 @@ pub struct DeleteSessionResponse {
 pub struct StatusResponse {
     pub busy: bool,
     pub running_sessions: usize,
+    pub queued_sessions: usize,
+    pub paused_sessions: usize,
+    pub completed_sessions: usize,
     pub total_sessions: usize,
 }
 
@@ -166,6 +171,7 @@ struct SessionState {
     request_template: AgentRequest,
     running: bool,
     paused: bool,
+    status: SessionStatus,
     pending_question: Option<PendingQuestionState>,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
@@ -197,6 +203,7 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
+        .route("/api/sessions/{id}/resume", post(resume_session))
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
@@ -262,8 +269,9 @@ async fn start_session_inner(
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
         request_template: request.clone(),
-        running: true,
+        running: false,
         paused: false,
+        status: SessionStatus::Queued,
         pending_question: None,
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
@@ -281,11 +289,11 @@ async fn start_session_inner(
         &request,
         request.branch.clone(),
         request.workdir.clone(),
-        true,
+        SessionStatus::Queued,
         &empty_history,
     );
 
-    spawn_agent_run(state.clone(), session_id.clone(), request);
+    dispatch_next_session(state.clone());
 
     Ok(SessionResponse { session_id })
 }
@@ -297,7 +305,7 @@ async fn continue_session(
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if session.running || session.paused {
+    if session.status != SessionStatus::Completed {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -307,15 +315,85 @@ async fn continue_session(
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
     session.task = request.task.clone();
-    session.running = true;
+    session.request_template = request.clone();
+    session.running = false;
     session.paused = false;
+    session.status = SessionStatus::Queued;
     session.pending_question = None;
     session.updated_at_ms = now_millis();
 
+    let history = Arc::clone(&session.history);
+    let branch = session.branch.clone();
+    let workdir = session.workdir.clone();
     drop(sessions);
-    spawn_agent_run(state.clone(), id.clone(), request);
+    persist_session_snapshot(
+        &id,
+        &request,
+        branch,
+        workdir,
+        SessionStatus::Queued,
+        &history,
+    );
+    dispatch_next_session(state.clone());
 
     Ok(Json(SessionResponse { session_id: id }))
+}
+
+async fn resume_session(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    resume_session_inner(state, id)
+        .await
+        .map(Json)
+        .map_err(|err| match err.downcast_ref::<ResumeSessionError>() {
+            Some(ResumeSessionError::NotFound) => StatusCode::NOT_FOUND,
+            Some(ResumeSessionError::Conflict) | None => StatusCode::CONFLICT,
+        })
+}
+
+#[derive(Debug)]
+enum ResumeSessionError {
+    NotFound,
+    Conflict,
+}
+
+impl std::fmt::Display for ResumeSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("session not found"),
+            Self::Conflict => f.write_str("session is not a resumable restored queue"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeSessionError {}
+
+async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResponse> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(&id).ok_or(ResumeSessionError::NotFound)?;
+    if session.status != SessionStatus::Paused || session.pending_question.is_some() {
+        anyhow::bail!(ResumeSessionError::Conflict);
+    }
+    session.running = false;
+    session.paused = false;
+    session.status = SessionStatus::Queued;
+    session.updated_at_ms = now_millis();
+    let request = session.request_template.clone();
+    let branch = session.branch.clone();
+    let workdir = session.workdir.clone();
+    let history = Arc::clone(&session.history);
+    drop(sessions);
+    persist_session_snapshot(
+        &id,
+        &request,
+        branch,
+        workdir,
+        SessionStatus::Queued,
+        &history,
+    );
+    dispatch_next_session(state.clone());
+    Ok(SessionResponse { session_id: id })
 }
 
 async fn answer_question(
@@ -371,6 +449,7 @@ async fn answer_question_inner(
 
     session.paused = false;
     session.running = true;
+    session.status = SessionStatus::Running;
     session.updated_at_ms = now_millis();
     let sender = session.sender.clone();
     let history = Arc::clone(&session.history);
@@ -391,7 +470,14 @@ async fn answer_question_inner(
             answer,
         },
     );
-    persist_session_snapshot(&id, &request_template, branch, workdir, true, &history);
+    persist_session_snapshot(
+        &id,
+        &request_template,
+        branch,
+        workdir,
+        SessionStatus::Running,
+        &history,
+    );
     Ok(SessionResponse { session_id: id })
 }
 
@@ -406,6 +492,7 @@ async fn list_sessions(
             task: session.task.clone(),
             running: session.running,
             paused: session.paused,
+            status: session.status,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -437,6 +524,7 @@ async fn get_session(
         task: session.task.clone(),
         running: session.running,
         paused: session.paused,
+        status: session.status,
         branch: session.branch.clone(),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
@@ -447,10 +535,28 @@ async fn status(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<StatusResponse> {
     let sessions = state.sessions.lock().await;
-    let running_sessions = sessions.values().filter(|session| session.running).count();
+    let running_sessions = sessions
+        .values()
+        .filter(|session| session.status == SessionStatus::Running)
+        .count();
+    let queued_sessions = sessions
+        .values()
+        .filter(|session| session.status == SessionStatus::Queued)
+        .count();
+    let paused_sessions = sessions
+        .values()
+        .filter(|session| session.status == SessionStatus::Paused)
+        .count();
+    let completed_sessions = sessions
+        .values()
+        .filter(|session| session.status == SessionStatus::Completed)
+        .count();
     Json(StatusResponse {
         busy: running_sessions > 0,
         running_sessions,
+        queued_sessions,
+        paused_sessions,
+        completed_sessions,
         total_sessions: sessions.len(),
     })
 }
@@ -471,7 +577,10 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
         let Some(session) = sessions.get(id) else {
             anyhow::bail!("session not found: {id}");
         };
-        if session.running || session.paused {
+        if session.status == SessionStatus::Running
+            || session.status == SessionStatus::Queued
+            || session.pending_question.is_some()
+        {
             anyhow::bail!("session is active: {id}");
         }
         sessions.remove(id).expect("session exists")
@@ -518,7 +627,7 @@ impl EventSink for WebEventSink {
             &self.request_template,
             self.persisted_branch.clone(),
             self.persisted_workdir.clone(),
-            true,
+            SessionStatus::Running,
             &self.history,
         );
     }
@@ -542,6 +651,7 @@ impl EventSink for WebEventSink {
             };
             session.running = false;
             session.paused = true;
+            session.status = SessionStatus::Paused;
             session.pending_question = Some(PendingQuestionState {
                 question_id: question_id.clone(),
                 question: question.to_string(),
@@ -554,7 +664,7 @@ impl EventSink for WebEventSink {
                 &session.request_template,
                 session.branch.clone(),
                 session.workdir.clone(),
-                false,
+                SessionStatus::Paused,
                 &session.history,
             );
             Ok::<(), anyhow::Error>(())
@@ -563,6 +673,53 @@ impl EventSink for WebEventSink {
         rx.recv()
             .context("session stopped before the user answered the question")
     }
+}
+
+fn dispatch_next_session(state: AppState) {
+    tokio::spawn(async move {
+        let next = {
+            let mut sessions = state.sessions.lock().await;
+            let has_active = sessions.values().any(|session| {
+                session.status == SessionStatus::Running || session.pending_question.is_some()
+            });
+            if has_active {
+                return;
+            }
+            let Some(session_id) = sessions
+                .iter()
+                .filter(|(_, session)| session.status == SessionStatus::Queued)
+                .min_by_key(|(_, session)| session.updated_at_ms)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                return;
+            };
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("queued session selected from sessions map");
+            session.running = true;
+            session.paused = false;
+            session.status = SessionStatus::Running;
+            session.updated_at_ms = now_millis();
+            (
+                session_id,
+                session.request_template.clone(),
+                session.branch.clone(),
+                session.workdir.clone(),
+                Arc::clone(&session.history),
+            )
+        };
+
+        let (session_id, request, branch, workdir, history) = next;
+        persist_session_snapshot(
+            &session_id,
+            &request,
+            branch,
+            workdir,
+            SessionStatus::Running,
+            &history,
+        );
+        spawn_agent_run(state, session_id, request);
+    });
 }
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
@@ -603,6 +760,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         if let Some(session) = sessions.get_mut(&session_id) {
             session.running = false;
             session.paused = false;
+            session.status = SessionStatus::Completed;
             session.pending_question = None;
             session.updated_at_ms = now_millis();
             match result {
@@ -634,10 +792,12 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 &session.request_template,
                 session.branch.clone(),
                 session.workdir.clone(),
-                false,
+                SessionStatus::Completed,
                 &session.history,
             );
         }
+        drop(sessions);
+        dispatch_next_session(state.clone());
     });
 }
 
@@ -738,6 +898,13 @@ async fn handle_rpc_connection(
             let result = projects::remove_project(&params.name)?;
             reload_projects(&state).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.session.resume" => {
+            let params: WatchSessionRequest = serde_json::from_value(request.params)?;
+            match resume_session_inner(state, params.session_id).await {
+                Ok(result) => write_rpc_response(reader.get_mut(), request.id, result).await?,
+                Err(err) => write_rpc_error(reader.get_mut(), request.id, err.to_string()).await?,
+            }
         }
         "pb.session.answer" => {
             let params: AnswerSessionQuestionRequest = serde_json::from_value(request.params)?;
@@ -853,7 +1020,9 @@ async fn watch_session(
         (
             session.sender.subscribe(),
             history,
-            session.running || session.paused,
+            session.status == SessionStatus::Queued
+                || session.status == SessionStatus::Running
+                || session.pending_question.is_some(),
         )
     };
 
@@ -880,7 +1049,11 @@ async fn watch_session(
             let sessions = state.sessions.lock().await;
             sessions
                 .get(&session_id)
-                .map(|session| session.running || session.paused)
+                .map(|session| {
+                    session.status == SessionStatus::Queued
+                        || session.status == SessionStatus::Running
+                        || session.pending_question.is_some()
+                })
                 .unwrap_or(false)
         };
         if !is_running {
@@ -932,7 +1105,8 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             workdir: persisted.workdir,
             request_template: persisted.request_template,
             running: false,
-            paused: false,
+            paused: persisted.status == Some(SessionStatus::Paused),
+            status: persisted.status.unwrap_or(SessionStatus::Completed),
             pending_question: None,
             sender,
             history,
@@ -953,7 +1127,7 @@ fn persist_session_snapshot(
     request_template: &AgentRequest,
     branch: Option<String>,
     workdir: Option<PathBuf>,
-    running: bool,
+    status: SessionStatus,
     history: &StdMutex<Vec<EventEnvelope>>,
 ) {
     let events = history
@@ -965,7 +1139,8 @@ fn persist_session_snapshot(
         request_template.clone(),
         branch,
         workdir,
-        running,
+        status == SessionStatus::Running,
+        status,
         events,
     );
     if let Err(err) = session_store::save_session(&persisted) {
@@ -982,6 +1157,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
             task: session.task.clone(),
             running: session.running,
             paused: session.paused,
+            status: session.status,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -1021,6 +1197,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         task: session.task.clone(),
         running: session.running,
         paused: session.paused,
+        status: session.status,
         branch: session.branch.clone(),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,

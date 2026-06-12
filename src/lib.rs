@@ -324,6 +324,10 @@ pub struct QueueArgs {
     #[arg(long = "delete-session", value_name = "ID")]
     pub delete_session: Option<String>,
 
+    /// Resume a restored paused queue entry
+    #[arg(long = "resume-session", value_name = "ID")]
+    pub resume_session: Option<String>,
+
     /// Answer a pending planning question for a daemon session
     #[arg(long = "answer-question", value_name = "QUESTION_ID")]
     pub answer_question: Option<String>,
@@ -561,6 +565,15 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(session_id) = args.resume_session.clone() {
+        daemon_client::resume_session(&socket_path, session_id.clone()).await?;
+        println!("resumed queued session {session_id}");
+        if !args.no_follow {
+            daemon_client::watch_session(&socket_path, session_id).await?;
+        }
+        return Ok(());
+    }
+
     if let Some(question_id) = args.answer_question.clone() {
         let session_id = args
             .session
@@ -590,12 +603,17 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             return Ok(());
         }
         for session in sessions {
-            let status = if session.running {
-                "running"
-            } else if session.paused {
-                "paused"
-            } else {
-                "idle"
+            let status = match session.status {
+                session_store::SessionStatus::Queued => "queued",
+                session_store::SessionStatus::Running => "running",
+                session_store::SessionStatus::Paused => {
+                    if session.paused {
+                        "paused"
+                    } else {
+                        "paused-restored"
+                    }
+                }
+                session_store::SessionStatus::Completed => "completed",
             };
             let workdir = session.workdir.unwrap_or_else(|| "-".to_string());
             println!(
