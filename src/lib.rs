@@ -20,6 +20,7 @@ pub mod events;
 pub mod init;
 pub mod projects;
 pub mod service;
+pub mod session_store;
 pub mod tray;
 pub mod web;
 
@@ -314,6 +315,10 @@ pub struct QueueArgs {
     #[arg(long)]
     pub list: bool,
 
+    /// Delete a finished daemon session and its git notes ref
+    #[arg(long = "delete-session", value_name = "ID")]
+    pub delete_session: Option<String>,
+
     /// Submit the session without streaming events
     #[arg(long)]
     pub no_follow: bool,
@@ -530,6 +535,12 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(daemon_client::default_socket_path);
 
+    if let Some(session_id) = args.delete_session.clone() {
+        let deleted = daemon_client::delete_session(&socket_path, session_id).await?;
+        println!("deleted session {}", deleted.session_id);
+        return Ok(());
+    }
+
     if args.list {
         let sessions = daemon_client::list_sessions(&socket_path).await?;
         if sessions.is_empty() {
@@ -550,10 +561,9 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
     let session_id = if let Some(session_id) = args.session.clone() {
         session_id
     } else {
-        let task = args
-            .task
-            .clone()
-            .context("missing task; pass a task, --session <id>, or --list")?;
+        let task = args.task.clone().context(
+            "missing task; pass a task, --session <id>, --delete-session <id>, or --list",
+        )?;
         let response = daemon_client::start_session(
             &socket_path,
             web::StartSessionRequest {
