@@ -82,6 +82,7 @@ pub enum AgentProfile {
     Explore,
     Plan,
     Ask,
+    Research,
 }
 
 impl Default for AgentProfile {
@@ -129,7 +130,8 @@ Profiles:\n\
 - explore: investigate how the codebase works or where behavior lives without editing.\n\
 - plan: produce an implementation plan or roadmap without editing.\n\
 - ask: answer a focused question that does not require codebase investigation or edits.\n\
-Choose one of: build, scout, review, explore, plan, ask.\n\n\
+- research: deep dive into external information, documentation, errors, ecosystem behavior, or public sources to inform a plan, answer, review, or fix without editing.\n\
+Choose one of: build, scout, review, explore, plan, ask, research.\n\n\
 [user]\n\
 Task:\n{task}\n\n\
 [assistant]\n"
@@ -178,6 +180,7 @@ impl AgentProfile {
             Self::Explore => "explore",
             Self::Plan => "plan",
             Self::Ask => "ask",
+            Self::Research => "research",
         }
     }
 
@@ -189,8 +192,9 @@ impl AgentProfile {
             "explore" => Ok(Self::Explore),
             "plan" => Ok(Self::Plan),
             "ask" => Ok(Self::Ask),
+            "research" => Ok(Self::Research),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask"
+                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research"
             ),
         }
     }
@@ -213,7 +217,10 @@ impl AgentProfile {
                 "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
             }
             Self::Ask => {
-                "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Do not edit files or create commits. Return a direct answer with supporting evidence."
+                "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Launch a research sub-agent when the answer depends on deeper external knowledge, current documentation, ecosystem behavior, or non-trivial source synthesis. Do not edit files or create commits. Return a direct answer with supporting evidence."
+            }
+            Self::Research => {
+                "Profile: research. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or launch sub-agents. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
             }
         }
     }
@@ -665,9 +672,9 @@ fn build_agent_instructions(
         "Available tools: {}.\n",
         available_tools.join(", ")
     ));
-    if allow_sub_agents {
+    if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, scout, and build. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, research, scout, and build. Launch a research sub-agent when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
@@ -767,7 +774,7 @@ fn available_tool_specs(
         tools.push("git_commit(message)");
         tools.push("git_revert(commit)");
     }
-    if allow_sub_agents {
+    if allow_sub_agents && profile != AgentProfile::Research {
         tools.push("sub_agent(profile,task,max_steps)");
     }
     tools
@@ -786,7 +793,7 @@ fn tool_allowed(
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
-        "sub_agent" => allow_sub_agents,
+        "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
         _ => false,
     }
 }
@@ -2404,6 +2411,7 @@ mod tests {
         assert!(prompt.contains("explore"));
         assert!(prompt.contains("plan"));
         assert!(prompt.contains("ask"));
+        assert!(prompt.contains("research"));
         assert!(prompt.contains("Fix the login bug"));
     }
 
@@ -2420,6 +2428,10 @@ mod tests {
         assert_eq!(
             parse_inferred_agent_profile("```json\n{\"profile\":\"review\"}\n```").unwrap(),
             AgentProfile::Review
+        );
+        assert_eq!(
+            parse_inferred_agent_profile(r#"{"profile":"research"}"#).unwrap(),
+            AgentProfile::Research
         );
     }
 
@@ -2484,6 +2496,58 @@ mod tests {
         assert!(instructions.contains("This profile is read-only"));
         assert!(!instructions.contains("edit_file(path,old_text,new_text)"));
         assert!(!instructions.contains("sub_agent(profile,task,max_steps)"));
+    }
+
+    #[test]
+    fn non_research_profiles_can_delegate_to_research() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for profile in [
+            AgentProfile::Build,
+            AgentProfile::Scout,
+            AgentProfile::Review,
+            AgentProfile::Explore,
+            AgentProfile::Plan,
+            AgentProfile::Ask,
+        ] {
+            let instructions = build_agent_instructions(
+                tmp.path(),
+                "test-branch",
+                false,
+                Some(CommandBackendKind::Local),
+                None,
+                profile,
+                true,
+            )
+            .unwrap();
+            assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
+            assert!(instructions.contains("research"));
+            assert!(tool_allowed("sub_agent", profile, None, true));
+        }
+    }
+
+    #[test]
+    fn research_profile_is_read_only_and_cannot_delegate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Research,
+            true,
+        )
+        .unwrap();
+        assert!(instructions.contains("Profile: research"));
+        assert!(instructions.contains("This profile is read-only"));
+        assert!(!instructions.contains("edit_file(path,old_text,new_text)"));
+        assert!(!instructions.contains("sub_agent(profile,task,max_steps)"));
+        assert!(!tool_allowed(
+            "sub_agent",
+            AgentProfile::Research,
+            None,
+            true
+        ));
     }
 
     #[test]
@@ -2911,6 +2975,7 @@ mod tests {
             assert!(tool_allowed(tool, AgentProfile::Scout, None, false));
             assert!(!tool_allowed(tool, AgentProfile::Review, None, false));
             assert!(!tool_allowed(tool, AgentProfile::Explore, None, false));
+            assert!(!tool_allowed(tool, AgentProfile::Research, None, false));
         }
     }
 
