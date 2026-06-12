@@ -22,11 +22,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -671,11 +672,11 @@ fn build_agent_instructions(
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         instructions.push_str(
-            "When editing, keep changes minimal and safe. Use git_commit with a semantic commit message after each logical change.\n",
+            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. Use git_commit with a semantic commit message after each logical change.\n",
         );
     } else {
         instructions.push_str(
-            "This profile is read-only: do not call edit_file, git_commit, or git_revert.\n",
+            "This profile is read-only: do not call edit_file, apply_patch, mv, rm, git_commit, or git_revert.\n",
         );
     }
     instructions.push_str(
@@ -760,6 +761,9 @@ fn available_tool_specs(
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         tools.push("edit_file(path,old_text,new_text)");
+        tools.push("apply_patch(patch)");
+        tools.push("mv(source,destination)");
+        tools.push("rm(path,recursive)");
         tools.push("git_commit(message)");
         tools.push("git_revert(commit)");
     }
@@ -779,7 +783,7 @@ fn tool_allowed(
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
         | "todo" | "skill" => true,
         "run_command" => command_backend_kind.is_some(),
-        "edit_file" | "git_commit" | "git_revert" => {
+        "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
         "sub_agent" => allow_sub_agents,
@@ -1295,6 +1299,82 @@ fn run_tool<S: EventSink>(
             });
             Ok(format!("updated {}", resolved.display()))
         }
+        "apply_patch" => {
+            let patch = arguments
+                .get("patch")
+                .and_then(Value::as_str)
+                .context("apply_patch requires string argument: patch")?;
+            let changed_paths = validate_patch_paths(patch, workspace_root)?;
+            run_git_apply_patch(patch, workspace_root)?;
+            let diff = git_diff_paths(workspace_root, &changed_paths)?;
+            if !diff.trim().is_empty() {
+                sink.emit(AgentEvent::Diff {
+                    path: "apply_patch".to_string(),
+                    diff,
+                });
+            }
+            Ok(format!("applied patch to {}", changed_paths.join(", ")))
+        }
+        "mv" => {
+            let source = arguments
+                .get("source")
+                .and_then(Value::as_str)
+                .context("mv requires string argument: source")?;
+            let destination = arguments
+                .get("destination")
+                .and_then(Value::as_str)
+                .context("mv requires string argument: destination")?;
+            let source_path = resolve_workspace_path(workspace_root, source, true)?;
+            let destination_path = resolve_workspace_path(workspace_root, destination, false)?;
+            if source_path == workspace_root {
+                bail!("mv cannot move the workspace root");
+            }
+            if destination_path.exists() {
+                bail!(
+                    "mv destination already exists: {}",
+                    destination_path.display()
+                );
+            }
+            std::fs::rename(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            Ok(format!(
+                "moved {} to {}",
+                source_path.display(),
+                destination_path.display()
+            ))
+        }
+        "rm" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .context("rm requires string argument: path")?;
+            let recursive = arguments
+                .get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            if resolved == workspace_root {
+                bail!("rm cannot remove the workspace root");
+            }
+            let metadata = std::fs::symlink_metadata(&resolved)
+                .with_context(|| format!("failed to stat {}", resolved.display()))?;
+            if metadata.is_dir() {
+                if recursive {
+                    std::fs::remove_dir_all(&resolved)
+                } else {
+                    std::fs::remove_dir(&resolved)
+                }
+            } else {
+                std::fs::remove_file(&resolved)
+            }
+            .with_context(|| format!("failed to remove {}", resolved.display()))?;
+            Ok(format!("removed {}", resolved.display()))
+        }
         "web_search" => {
             let query = arguments
                 .get("query")
@@ -1607,27 +1687,162 @@ fn format_todo_tasks(tasks: &[TodoTask]) -> Result<String> {
     serde_json::to_string_pretty(tasks).context("failed to serialize todos")
 }
 
+fn validate_patch_paths(patch: &str, workspace_root: &Path) -> Result<Vec<String>> {
+    if patch.trim().is_empty() {
+        bail!("apply_patch patch must not be empty");
+    }
+
+    let mut paths = Vec::<String>::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(path) = parts.next() {
+                collect_patch_path(path, workspace_root, &mut paths)?;
+            }
+            if let Some(path) = parts.next() {
+                collect_patch_path(path, workspace_root, &mut paths)?;
+            }
+        } else if let Some(path) = line.strip_prefix("--- ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        } else if let Some(path) = line.strip_prefix("+++ ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        } else if let Some(path) = line.strip_prefix("*** Add File: ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        } else if let Some(path) = line.strip_prefix("*** Move to: ") {
+            collect_patch_path(path, workspace_root, &mut paths)?;
+        }
+    }
+
+    if paths.is_empty() {
+        bail!("apply_patch patch does not declare any file paths");
+    }
+    Ok(paths)
+}
+
+fn collect_patch_path(path: &str, workspace_root: &Path, paths: &mut Vec<String>) -> Result<()> {
+    let path = path.split_whitespace().next().unwrap_or(path).trim();
+    if path.is_empty() || path == "/dev/null" {
+        return Ok(());
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    let resolved = resolve_workspace_path(workspace_root, path, false)?;
+    if resolved == workspace_root {
+        bail!("patch path targets the workspace root");
+    }
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
+    git_apply_stdin(&["apply", "--check", "-"], patch, workspace_root)?;
+    git_apply_stdin(&["apply", "-"], patch, workspace_root)?;
+    Ok(())
+}
+
+fn git_apply_stdin(args: &[&str], input: &str, workdir: &Path) -> Result<String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run git apply")?;
+    child
+        .stdin
+        .as_mut()
+        .context("failed to open git apply stdin")?
+        .write_all(input.as_bytes())
+        .context("failed to write patch to git apply")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git apply")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git {} failed: {}", args.join(" "), stderr)
+    }
+}
+
+fn git_diff_paths(workdir: &Path, paths: &[String]) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .arg("diff")
+        .arg("--")
+        .args(paths)
+        .current_dir(workdir);
+    let output = command.output().context("failed to run git diff")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git diff failed: {stderr}")
+    }
+}
+
+fn lexical_normalize(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path escapes workspace root: {}", path.display());
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) -> Result<PathBuf> {
+    let workspace_root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve workspace root {}",
+            workspace_root.display()
+        )
+    })?;
     let candidate = if Path::new(input).is_absolute() {
         PathBuf::from(input)
     } else {
         workspace_root.join(input)
     };
+    let candidate = lexical_normalize(&candidate)?;
 
     let normalized = if must_exist {
         candidate
             .canonicalize()
             .with_context(|| format!("failed to resolve path {}", candidate.display()))?
-    } else if let Some(parent) = candidate.parent() {
-        let parent = parent
-            .canonicalize()
-            .with_context(|| format!("failed to resolve parent {}", parent.display()))?;
-        parent.join(candidate.file_name().unwrap_or_default())
     } else {
-        candidate
+        let mut ancestor = candidate.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().with_context(|| {
+                format!("failed to resolve ancestor for {}", candidate.display())
+            })?;
+        }
+        let ancestor_canonical = ancestor
+            .canonicalize()
+            .with_context(|| format!("failed to resolve ancestor {}", ancestor.display()))?;
+        let suffix = candidate
+            .strip_prefix(ancestor)
+            .with_context(|| format!("failed to normalize path {}", candidate.display()))?;
+        ancestor_canonical.join(suffix)
     };
 
-    if !normalized.starts_with(workspace_root) {
+    if !normalized.starts_with(&workspace_root) {
         bail!(
             "path escapes workspace root: {} not under {}",
             normalized.display(),
@@ -2650,6 +2865,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("escapes workspace root"), "error was: {err}");
+    }
+
+    #[test]
+    fn resolve_workspace_path_allows_missing_nested_subpath() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let resolved = resolve_workspace_path(&workspace, "new/dir/file.txt", false).unwrap();
+        assert_eq!(
+            resolved,
+            workspace
+                .join("new/dir/file.txt")
+                .canonicalize()
+                .unwrap_or(workspace.join("new/dir/file.txt"))
+        );
+    }
+
+    #[test]
+    fn validate_patch_paths_blocks_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let patch = "diff --git a/../secret b/../secret\n--- a/../secret\n+++ b/../secret\n";
+        let err = validate_patch_paths(patch, &workspace)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes workspace root"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_patch_paths_accepts_project_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n";
+        let paths = validate_patch_paths(patch, &workspace).unwrap();
+        assert_eq!(paths, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn write_tools_are_only_available_for_write_profiles() {
+        for tool in ["apply_patch", "mv", "rm"] {
+            assert!(tool_allowed(tool, AgentProfile::Build, None, false));
+            assert!(tool_allowed(tool, AgentProfile::Scout, None, false));
+            assert!(!tool_allowed(tool, AgentProfile::Review, None, false));
+            assert!(!tool_allowed(tool, AgentProfile::Explore, None, false));
+        }
     }
 
     #[test]
