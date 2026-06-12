@@ -8,7 +8,13 @@ const SCROLL_THRESHOLD = 80;
 /* ─── types ──────────────────────────────────────────────────── */
 
 type AgentEvent =
-  | { type: "started"; task: string; model: string; workspace: string; branch: string }
+  | {
+      type: "started";
+      task: string;
+      model: string;
+      workspace: string;
+      branch: string;
+    }
   | { type: "step_started"; step: number; max_steps: number }
   | { type: "reasoning"; content: string }
   | { type: "tool_call"; tool: string; arguments: unknown }
@@ -28,11 +34,14 @@ interface EventEnvelope {
   event: AgentEvent;
 }
 
+type SessionStatus = "queued" | "running" | "paused" | "completed";
+
 interface SessionItem {
   session_id: string;
   task: string;
   running: boolean;
   paused: boolean;
+  status: SessionStatus;
   branch?: string;
   workdir?: string;
   pending_question?: { question_id: string; question: string };
@@ -44,6 +53,7 @@ interface SessionDetails {
   task: string;
   running: boolean;
   paused: boolean;
+  status: SessionStatus;
   branch?: string;
   pending_question?: { question_id: string; question: string };
   events: EventEnvelope[];
@@ -164,7 +174,9 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
             <code>{e.tool}</code>
           </summary>
           <div className="card-body py-2">
-            <pre className="mb-0 small">{JSON.stringify(e.arguments, null, 2)}</pre>
+            <pre className="mb-0 small">
+              {JSON.stringify(e.arguments, null, 2)}
+            </pre>
           </div>
         </details>
       );
@@ -201,7 +213,9 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
     case "sub_agent_started":
       return (
         <div className="alert alert-secondary py-2 mb-2">
-          <div className="small text-uppercase text-body-secondary">Sub-agent</div>
+          <div className="small text-uppercase text-body-secondary">
+            Sub-agent
+          </div>
           <div>
             <span className="badge bg-primary me-2">{e.profile}</span>
             {e.task}
@@ -280,22 +294,28 @@ function SessionCard({
   onClick: () => void;
 }) {
   let badge: React.ReactNode;
-  if (session.running) {
+  if (session.status === "running") {
     badge = (
       <span className="badge bg-primary d-flex align-items-center gap-1">
         <span
           className="spinner-border spinner-border-sm"
           style={{ width: "0.6rem", height: "0.6rem" }}
         />
-        In&nbsp;progress
+        Running
       </span>
     );
-  } else if (session.paused) {
-    badge = <span className="badge bg-warning text-dark">Needs answer</span>;
+  } else if (session.status === "queued") {
+    badge = <span className="badge bg-info text-dark">Queued</span>;
+  } else if (session.status === "paused") {
+    badge = session.pending_question ? (
+      <span className="badge bg-warning text-dark">Needs answer</span>
+    ) : (
+      <span className="badge bg-warning text-dark">Paused after restart</span>
+    );
   } else if (session.branch) {
     badge = <span className="badge bg-success">{session.branch}</span>;
   } else {
-    badge = <span className="badge bg-secondary">Done</span>;
+    badge = <span className="badge bg-secondary">Completed</span>;
   }
 
   return (
@@ -305,7 +325,9 @@ function SessionCard({
       onClick={onClick}
     >
       <div className="d-flex justify-content-between align-items-start gap-2">
-        <div className="fw-semibold text-truncate flex-grow-1 small">{session.task}</div>
+        <div className="fw-semibold text-truncate flex-grow-1 small">
+          {session.task}
+        </div>
         {badge}
       </div>
       <div className="small mt-1 text-body-secondary">
@@ -325,6 +347,19 @@ function HomePage() {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const queuedCount = sessions.filter(
+    (session) => session.status === "queued",
+  ).length;
+  const runningCount = sessions.filter(
+    (session) => session.status === "running",
+  ).length;
+  const pausedCount = sessions.filter(
+    (session) => session.status === "paused",
+  ).length;
+  const completedCount = sessions.filter(
+    (session) => session.status === "completed",
+  ).length;
 
   const fetchSessions = async () => {
     const res = await fetch("/api/sessions");
@@ -375,7 +410,13 @@ function HomePage() {
     <>
       <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
         <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-          <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+          <img
+            src="/logo.svg"
+            alt="pb"
+            width="32"
+            height="32"
+            style={{ borderRadius: "6px" }}
+          />
           pb
         </span>
       </nav>
@@ -392,7 +433,8 @@ function HomePage() {
                   onChange={(e) => setTask(e.target.value)}
                   placeholder="Describe the task…"
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void startSession();
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
+                      void startSession();
                   }}
                 />
                 <div>
@@ -430,18 +472,36 @@ function HomePage() {
                   {isSubmitting ? (
                     <>
                       <span className="spinner-border spinner-border-sm me-2" />
-                      Starting…
+                      Queueing…
                     </>
                   ) : (
-                    "Start task"
+                    "Queue task"
                   )}
                 </button>
               </div>
             </div>
 
+            <div className="card">
+              <div className="card-body py-2 small d-flex flex-wrap gap-2 align-items-center">
+                <span className="fw-semibold me-1">Queue state</span>
+                <span className="badge bg-info text-dark">
+                  {queuedCount} queued
+                </span>
+                <span className="badge bg-primary">{runningCount} running</span>
+                <span className="badge bg-warning text-dark">
+                  {pausedCount} paused
+                </span>
+                <span className="badge bg-secondary">
+                  {completedCount} completed
+                </span>
+              </div>
+            </div>
+
             <div className="list-group">
               {sessions.length === 0 ? (
-                <div className="list-group-item text-body-secondary small">No sessions yet</div>
+                <div className="list-group-item text-body-secondary small">
+                  No sessions yet
+                </div>
               ) : (
                 sessions.map((s) => (
                   <SessionCard
@@ -486,6 +546,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                   ...prev,
                   running: false,
                   paused: true,
+                  status: "paused",
                   pending_question: {
                     question_id: parsed.event.question_id,
                     question: parsed.event.question,
@@ -496,11 +557,26 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           setSessionRunning(false);
         } else if (parsed.event.type === "user_answer") {
           setSession((prev) =>
-            prev ? { ...prev, running: true, paused: false, pending_question: undefined } : prev,
+            prev
+              ? {
+                  ...prev,
+                  running: true,
+                  paused: false,
+                  status: "running",
+                  pending_question: undefined,
+                }
+              : prev,
           );
           setSessionRunning(true);
-        } else if (parsed.event.type === "final" || parsed.event.type === "session_summary") {
-          setSession((prev) => (prev ? { ...prev, running: false, paused: false } : prev));
+        } else if (
+          parsed.event.type === "final" ||
+          parsed.event.type === "session_summary"
+        ) {
+          setSession((prev) =>
+            prev
+              ? { ...prev, running: false, paused: false, status: "completed" }
+              : prev,
+          );
           setSessionRunning(false);
         }
       } catch (err) {
@@ -519,6 +595,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       task: details.task,
       running: details.running,
       paused: details.paused,
+      status: details.status,
       branch: details.branch,
       workdir: undefined,
       pending_question: details.pending_question,
@@ -537,9 +614,23 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       body: JSON.stringify({ task: followUp.trim() }),
     });
     setFollowUp("");
-    setSessionRunning(true);
+    setSession((prev) =>
+      prev
+        ? { ...prev, status: "queued", running: false, paused: false }
+        : prev,
+    );
+    setSessionRunning(false);
   };
 
+  const resumeSession = async () => {
+    await fetch(`/api/sessions/${sessionId}/resume`, { method: "POST" });
+    setSession((prev) =>
+      prev
+        ? { ...prev, status: "queued", running: false, paused: false }
+        : prev,
+    );
+    setSessionRunning(false);
+  };
 
   const answerQuestion = async () => {
     if (!answer.trim() || !session?.pending_question) return;
@@ -552,14 +643,19 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       }),
     });
     setAnswer("");
-    setSession((prev) => (prev ? { ...prev, paused: false, running: true } : prev));
+    setSession((prev) =>
+      prev
+        ? { ...prev, paused: false, running: true, status: "running" }
+        : prev,
+    );
     setSessionRunning(true);
   };
 
   const onFeedScroll = () => {
     const el = feedRef.current;
     if (!el) return;
-    atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD;
+    atBottomRef.current =
+      el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD;
   };
 
   useEffect(() => {
@@ -587,19 +683,31 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           ← Back
         </button>
         <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-          <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+          <img
+            src="/logo.svg"
+            alt="pb"
+            width="32"
+            height="32"
+            style={{ borderRadius: "6px" }}
+          />
           pb
         </span>
         {session && (
           <span className="navbar-text small text-body-secondary ms-auto">
-            {session.running ? (
-              <span className="text-primary">in progress</span>
-            ) : session.paused ? (
-              <span className="text-warning">waiting for answer</span>
+            {session.status === "running" ? (
+              <span className="text-primary">running</span>
+            ) : session.status === "queued" ? (
+              <span className="text-info">queued</span>
+            ) : session.status === "paused" ? (
+              <span className="text-warning">
+                {session.pending_question
+                  ? "waiting for answer"
+                  : "paused after restart"}
+              </span>
             ) : session.branch ? (
               <code>{session.branch}</code>
             ) : (
-              "done"
+              "completed"
             )}
           </span>
         )}
@@ -618,14 +726,18 @@ function SessionPage({ sessionId }: { sessionId: string }) {
             onScroll={onFeedScroll}
           >
             {events.length === 0 ? (
-              <div className="text-body-secondary small">Waiting for events…</div>
+              <div className="text-body-secondary small">
+                Waiting for queue events…
+              </div>
             ) : (
               events.map((env, i) => <EventItem key={i} envelope={env} />)
             )}
           </div>
-          {session?.paused && session.pending_question ? (
+          {session?.status === "paused" && session.pending_question ? (
             <div className="card-footer bg-warning-subtle">
-              <div className="small fw-semibold mb-2">{session.pending_question.question}</div>
+              <div className="small fw-semibold mb-2">
+                {session.pending_question.question}
+              </div>
               <div className="input-group">
                 <textarea
                   className="form-control"
@@ -643,25 +755,41 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                 </button>
               </div>
             </div>
-          ) : !sessionRunning && (
-            <div className="card-footer">
-              <div className="input-group">
-                <textarea
-                  className="form-control"
-                  rows={2}
-                  value={followUp}
-                  onChange={(e) => setFollowUp(e.target.value)}
-                  placeholder="Follow-up task…"
-                />
-                <button
-                  className="btn btn-outline-primary"
-                  onClick={() => void continueSession()}
-                  disabled={!followUp.trim()}
-                >
-                  Continue
-                </button>
+          ) : session?.status === "paused" ? (
+            <div className="card-footer bg-warning-subtle d-flex justify-content-between align-items-center gap-2">
+              <div className="small">
+                This session was restored after a daemon restart and is paused
+                until you resume it.
               </div>
+              <button
+                className="btn btn-warning"
+                onClick={() => void resumeSession()}
+              >
+                Resume queued task
+              </button>
             </div>
+          ) : (
+            !sessionRunning &&
+            session?.status === "completed" && (
+              <div className="card-footer">
+                <div className="input-group">
+                  <textarea
+                    className="form-control"
+                    rows={2}
+                    value={followUp}
+                    onChange={(e) => setFollowUp(e.target.value)}
+                    placeholder="Follow-up task…"
+                  />
+                  <button
+                    className="btn btn-outline-primary"
+                    onClick={() => void continueSession()}
+                    disabled={!followUp.trim()}
+                  >
+                    Continue
+                  </button>
+                </div>
+              </div>
+            )
           )}
         </div>
       </div>
