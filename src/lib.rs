@@ -324,6 +324,14 @@ pub struct QueueArgs {
     #[arg(long = "delete-session", value_name = "ID")]
     pub delete_session: Option<String>,
 
+    /// Answer a pending planning question for a daemon session
+    #[arg(long = "answer-question", value_name = "QUESTION_ID")]
+    pub answer_question: Option<String>,
+
+    /// Answer text to send with --answer-question
+    #[arg(long, requires = "answer_question")]
+    pub answer: Option<String>,
+
     /// Submit the session without streaming events
     #[arg(long)]
     pub no_follow: bool,
@@ -553,6 +561,28 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(question_id) = args.answer_question.clone() {
+        let session_id = args
+            .session
+            .clone()
+            .context("--answer-question requires --session <id>")?;
+        let answer = args
+            .answer
+            .clone()
+            .context("--answer-question requires --answer <text>")?;
+        daemon_client::answer_question(
+            &socket_path,
+            session_id.clone(),
+            web::AnswerQuestionRequest {
+                question_id,
+                answer,
+            },
+        )
+        .await?;
+        println!("answered question for session {session_id}");
+        return Ok(());
+    }
+
     if args.list {
         let sessions = daemon_client::list_sessions(&socket_path).await?;
         if sessions.is_empty() {
@@ -560,7 +590,13 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             return Ok(());
         }
         for session in sessions {
-            let status = if session.running { "running" } else { "idle" };
+            let status = if session.running {
+                "running"
+            } else if session.paused {
+                "paused"
+            } else {
+                "idle"
+            };
             let workdir = session.workdir.unwrap_or_else(|| "-".to_string());
             println!(
                 "{}\t{}\t{}\t{}",
@@ -574,7 +610,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
         session_id
     } else {
         let task = args.task.clone().context(
-            "missing task; pass a task, --session <id>, --delete-session <id>, or --list",
+            "missing task; pass a task, --session <id>, --delete-session <id>, --answer-question <id>, or --list",
         )?;
         let response = daemon_client::start_session(
             &socket_path,

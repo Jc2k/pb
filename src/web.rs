@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent_core::{AgentProfile, AgentRequest, run_agent};
+use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 use crate::session_store::{self, PersistedSession};
@@ -58,6 +58,19 @@ pub struct ContinueSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerQuestionRequest {
+    pub question_id: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerSessionQuestionRequest {
+    pub session_id: String,
+    pub question_id: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub session_id: String,
 }
@@ -67,6 +80,7 @@ pub struct SessionListItem {
     pub session_id: String,
     pub task: String,
     pub running: bool,
+    pub paused: bool,
     pub branch: Option<String>,
     pub workdir: Option<String>,
     pub updated_at_ms: u128,
@@ -77,8 +91,16 @@ pub struct SessionDetails {
     pub session_id: String,
     pub task: String,
     pub running: bool,
+    pub paused: bool,
     pub branch: Option<String>,
+    pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingQuestionView {
+    pub question_id: String,
+    pub question: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,12 +152,21 @@ pub struct SessionFinished {
 }
 
 #[derive(Debug, Clone)]
+struct PendingQuestionState {
+    question_id: String,
+    question: String,
+    responder: std::sync::mpsc::Sender<String>,
+}
+
+#[derive(Debug)]
 struct SessionState {
     task: String,
     branch: Option<String>,
     workdir: Option<PathBuf>,
     request_template: AgentRequest,
     running: bool,
+    paused: bool,
+    pending_question: Option<PendingQuestionState>,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     updated_at_ms: u128,
@@ -166,6 +197,7 @@ pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
+        .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
         .route("/api/status", get(status))
@@ -231,6 +263,8 @@ async fn start_session_inner(
         workdir: request.workdir.clone(),
         request_template: request.clone(),
         running: true,
+        paused: false,
+        pending_question: None,
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
         updated_at_ms: now,
@@ -263,7 +297,7 @@ async fn continue_session(
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if session.running {
+    if session.running || session.paused {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -274,12 +308,91 @@ async fn continue_session(
     request.workdir = session.workdir.clone();
     session.task = request.task.clone();
     session.running = true;
+    session.paused = false;
+    session.pending_question = None;
     session.updated_at_ms = now_millis();
 
     drop(sessions);
     spawn_agent_run(state.clone(), id.clone(), request);
 
     Ok(Json(SessionResponse { session_id: id }))
+}
+
+async fn answer_question(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<AnswerQuestionRequest>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    answer_question_inner(state, id, req)
+        .await
+        .map(Json)
+        .map_err(|err| match err.downcast_ref::<AnswerQuestionError>() {
+            Some(AnswerQuestionError::NotFound) => StatusCode::NOT_FOUND,
+            Some(AnswerQuestionError::Gone) => StatusCode::GONE,
+            Some(AnswerQuestionError::Conflict) | None => StatusCode::CONFLICT,
+        })
+}
+
+#[derive(Debug)]
+enum AnswerQuestionError {
+    NotFound,
+    Conflict,
+    Gone,
+}
+
+impl std::fmt::Display for AnswerQuestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("session not found"),
+            Self::Conflict => f.write_str(
+                "session does not have a pending question matching the requested question id",
+            ),
+            Self::Gone => f.write_str("session stopped before the answer could be delivered"),
+        }
+    }
+}
+
+impl std::error::Error for AnswerQuestionError {}
+
+async fn answer_question_inner(
+    state: AppState,
+    id: String,
+    req: AnswerQuestionRequest,
+) -> Result<SessionResponse> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(&id).ok_or(AnswerQuestionError::NotFound)?;
+    let Some(pending) = session.pending_question.take() else {
+        anyhow::bail!(AnswerQuestionError::Conflict);
+    };
+    if pending.question_id != req.question_id {
+        session.pending_question = Some(pending);
+        anyhow::bail!(AnswerQuestionError::Conflict);
+    }
+
+    session.paused = false;
+    session.running = true;
+    session.updated_at_ms = now_millis();
+    let sender = session.sender.clone();
+    let history = Arc::clone(&session.history);
+    let request_template = session.request_template.clone();
+    let branch = session.branch.clone();
+    let workdir = session.workdir.clone();
+    let answer = req.answer.trim().to_string();
+    let question_id = req.question_id.clone();
+    pending
+        .responder
+        .send(answer.clone())
+        .map_err(|_| AnswerQuestionError::Gone)?;
+    publish_event(
+        &sender,
+        &history,
+        AgentEvent::UserAnswer {
+            question_id,
+            answer,
+        },
+    );
+    persist_session_snapshot(&id, &request_template, branch, workdir, true, &history);
+    Ok(SessionResponse { session_id: id })
 }
 
 async fn list_sessions(
@@ -292,6 +405,7 @@ async fn list_sessions(
             session_id: session_id.clone(),
             task: session.task.clone(),
             running: session.running,
+            paused: session.paused,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -322,7 +436,9 @@ async fn get_session(
         session_id: id,
         task: session.task.clone(),
         running: session.running,
+        paused: session.paused,
         branch: session.branch.clone(),
+        pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
     }))
 }
@@ -355,8 +471,8 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
         let Some(session) = sessions.get(id) else {
             anyhow::bail!("session not found: {id}");
         };
-        if session.running {
-            anyhow::bail!("session is running: {id}");
+        if session.running || session.paused {
+            anyhow::bail!("session is active: {id}");
         }
         sessions.remove(id).expect("session exists")
     };
@@ -377,6 +493,78 @@ async fn list_projects(
     Json(project_list_snapshot(&state).await)
 }
 
+struct WebEventSink {
+    state: AppState,
+    session_id: String,
+    request_template: AgentRequest,
+    sender: broadcast::Sender<EventEnvelope>,
+    history: Arc<StdMutex<Vec<EventEnvelope>>>,
+    persisted_branch: Option<String>,
+    persisted_workdir: Option<PathBuf>,
+}
+
+impl EventSink for WebEventSink {
+    fn emit(&mut self, event: AgentEvent) {
+        if let AgentEvent::Started {
+            workspace, branch, ..
+        } = &event
+        {
+            self.persisted_workdir = Some(PathBuf::from(workspace));
+            self.persisted_branch = Some(branch.clone());
+        }
+        publish_event(&self.sender, &self.history, event);
+        persist_session_snapshot(
+            &self.session_id,
+            &self.request_template,
+            self.persisted_branch.clone(),
+            self.persisted_workdir.clone(),
+            true,
+            &self.history,
+        );
+    }
+
+    fn ask_user(&mut self, question: &str) -> Result<String> {
+        let question = question.trim();
+        if question.is_empty() {
+            anyhow::bail!("ask_user question must not be empty");
+        }
+        let question_id = format!("question-{}", now_millis());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let event = AgentEvent::UserQuestion {
+            question_id: question_id.clone(),
+            question: question.to_string(),
+        };
+
+        tokio::runtime::Handle::current().block_on(async {
+            let mut sessions = self.state.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&self.session_id) else {
+                anyhow::bail!("session not found: {}", self.session_id);
+            };
+            session.running = false;
+            session.paused = true;
+            session.pending_question = Some(PendingQuestionState {
+                question_id: question_id.clone(),
+                question: question.to_string(),
+                responder: tx,
+            });
+            session.updated_at_ms = now_millis();
+            publish_event(&session.sender, &session.history, event);
+            persist_session_snapshot(
+                &self.session_id,
+                &session.request_template,
+                session.branch.clone(),
+                session.workdir.clone(),
+                false,
+                &session.history,
+            );
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        rx.recv()
+            .context("session stopped before the user answered the question")
+    }
+}
+
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
     tokio::spawn(async move {
         let (models_root, sender, history) = {
@@ -395,36 +583,27 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         };
 
         let request_for_run = request.clone();
+        let state_for_run = state.clone();
         let session_id_for_run = session_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let sender = sender.clone();
-            let history = Arc::clone(&history);
-            let mut persisted_branch = request_for_run.branch.clone();
-            let mut persisted_workdir = request_for_run.workdir.clone();
-            run_agent(request_for_run.clone(), &models_root, |event| {
-                if let AgentEvent::Started {
-                    workspace, branch, ..
-                } = &event
-                {
-                    persisted_workdir = Some(PathBuf::from(workspace));
-                    persisted_branch = Some(branch.clone());
-                }
-                publish_event(&sender, &history, event);
-                persist_session_snapshot(
-                    &session_id_for_run,
-                    &request_for_run,
-                    persisted_branch.clone(),
-                    persisted_workdir.clone(),
-                    true,
-                    &history,
-                );
-            })
+            let sink = WebEventSink {
+                state: state_for_run,
+                session_id: session_id_for_run,
+                request_template: request_for_run.clone(),
+                sender,
+                history,
+                persisted_branch: request_for_run.branch.clone(),
+                persisted_workdir: request_for_run.workdir.clone(),
+            };
+            run_agent(request_for_run.clone(), &models_root, sink)
         })
         .await;
 
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
             session.running = false;
+            session.paused = false;
+            session.pending_question = None;
             session.updated_at_ms = now_millis();
             match result {
                 Ok(Ok(run_result)) => {
@@ -560,6 +739,22 @@ async fn handle_rpc_connection(
             reload_projects(&state).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
+        "pb.session.answer" => {
+            let params: AnswerSessionQuestionRequest = serde_json::from_value(request.params)?;
+            match answer_question_inner(
+                state,
+                params.session_id,
+                AnswerQuestionRequest {
+                    question_id: params.question_id,
+                    answer: params.answer,
+                },
+            )
+            .await
+            {
+                Ok(result) => write_rpc_response(reader.get_mut(), request.id, result).await?,
+                Err(err) => write_rpc_error(reader.get_mut(), request.id, err.to_string()).await?,
+            }
+        }
         "pb.session.delete" => {
             let params: WatchSessionRequest = serde_json::from_value(request.params)?;
             match delete_session_inner(state, &params.session_id).await {
@@ -655,7 +850,11 @@ async fn watch_session(
             .lock()
             .map(|history| history.clone())
             .unwrap_or_default();
-        (session.sender.subscribe(), history, session.running)
+        (
+            session.sender.subscribe(),
+            history,
+            session.running || session.paused,
+        )
     };
 
     write_rpc_response(
@@ -681,7 +880,7 @@ async fn watch_session(
             let sessions = state.sessions.lock().await;
             sessions
                 .get(&session_id)
-                .map(|session| session.running)
+                .map(|session| session.running || session.paused)
                 .unwrap_or(false)
         };
         if !is_running {
@@ -733,11 +932,20 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             workdir: persisted.workdir,
             request_template: persisted.request_template,
             running: false,
+            paused: false,
+            pending_question: None,
             sender,
             history,
             updated_at_ms: persisted.updated_at_ms,
         },
     )
+}
+
+fn pending_question_view(pending: &PendingQuestionState) -> PendingQuestionView {
+    PendingQuestionView {
+        question_id: pending.question_id.clone(),
+        question: pending.question.clone(),
+    }
 }
 
 fn persist_session_snapshot(
@@ -773,6 +981,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
             session_id: session_id.clone(),
             task: session.task.clone(),
             running: session.running,
+            paused: session.paused,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -811,7 +1020,9 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         session_id: id.to_string(),
         task: session.task.clone(),
         running: session.running,
+        paused: session.paused,
         branch: session.branch.clone(),
+        pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
     })
 }
