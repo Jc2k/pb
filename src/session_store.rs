@@ -268,6 +268,7 @@ mod tests {
             gpu_layers: 0,
             temperature: 0.0,
             profile: crate::agent_core::AgentProfile::Build,
+            infer_profile: false,
             sub_agent_depth: 0,
             top_k: 1,
             seed: 0,

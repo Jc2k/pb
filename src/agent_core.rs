@@ -95,129 +95,77 @@ impl fmt::Display for AgentProfile {
     }
 }
 
-/// Infer the primary agent profile from a user message so callers do not need to
-/// choose one explicitly. Requests to make or fix code route to the build
-/// orchestrator; focused questions and planning requests route to read-only
-/// profiles unless they clearly ask for implementation.
-pub fn infer_agent_profile(task: &str) -> AgentProfile {
-    let normalized = task.to_ascii_lowercase();
-    let words: Vec<&str> = normalized
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
+/// Ask the model to choose the primary agent profile from a user message so
+/// callers do not need to choose one explicitly. The prompt describes the
+/// profile responsibilities and lets the model classify the request instead of
+/// relying on hard-coded trigger phrases.
+pub fn infer_agent_profile(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    args: &AgentRequest,
+    task: &str,
+) -> Result<AgentProfile> {
+    let mut inference_args = args.clone();
+    inference_args.max_tokens = args.max_tokens.clamp(8, 32);
+    inference_args.temperature = 0.0;
+    inference_args.top_k = 1;
 
-    let has_word = |candidates: &[&str]| -> bool {
-        words
-            .iter()
-            .any(|word| candidates.iter().any(|candidate| word == candidate))
-    };
-    let has_phrase = |candidates: &[&str]| -> bool {
-        candidates
-            .iter()
-            .any(|candidate| normalized.contains(candidate))
-    };
+    let prompt = profile_inference_prompt(task);
+    let output = generate_completion(backend, model, &inference_args, &prompt)?;
+    parse_inferred_agent_profile(&output)
+        .with_context(|| format!("failed to infer an agent profile from model output: {output}"))
+}
 
-    let plan_phrases = [
-        "make a plan",
-        "create a plan",
-        "implementation plan",
-        "plan for",
-        "plan how",
-        "roadmap",
-    ];
-    let explicit_plan_request = has_word(&["plan", "roadmap"]) || has_phrase(&plan_phrases);
+fn profile_inference_prompt(task: &str) -> String {
+    format!(
+        "<conversation>\n\
+[system]\n\
+You choose the best pb agent profile for a user's task. Return exactly one JSON object in the form {{\"profile\":\"build\"}} and no other text.\n\
+Profiles:\n\
+- build: make, change, fix, refactor, or otherwise implement changes in the repository.\n\
+- scout: establish or refresh the development environment, dependency setup, or runnable project configuration.\n\
+- review: inspect existing code or diffs for correctness, risks, regressions, or test gaps without editing.\n\
+- explore: investigate how the codebase works or where behavior lives without editing.\n\
+- plan: produce an implementation plan or roadmap without editing.\n\
+- ask: answer a focused question that does not require codebase investigation or edits.\n\
+Choose one of: build, scout, review, explore, plan, ask.\n\n\
+[user]\n\
+Task:\n{task}\n\n\
+[assistant]\n"
+    )
+}
 
-    let implementation_words = [
-        "add",
-        "build",
-        "change",
-        "create",
-        "delete",
-        "edit",
-        "fix",
-        "implement",
-        "make",
-        "modify",
-        "patch",
-        "refactor",
-        "remove",
-        "rename",
-        "replace",
-        "update",
-        "upgrade",
-        "write",
-    ];
-    let implementation_phrases = [
-        "can you add",
-        "can you build",
-        "can you change",
-        "can you create",
-        "can you fix",
-        "can you implement",
-        "can you make",
-        "can you update",
-        "please add",
-        "please build",
-        "please change",
-        "please create",
-        "please fix",
-        "please implement",
-        "please make",
-        "please update",
-    ];
-    let implementation_request =
-        has_word(&implementation_words) || has_phrase(&implementation_phrases);
-    if implementation_request && !explicit_plan_request {
-        return AgentProfile::Build;
+fn parse_inferred_agent_profile(output: &str) -> Result<AgentProfile> {
+    let trimmed = output.trim();
+    if let Some(profile) = parse_profile_json(trimmed)? {
+        return Ok(profile);
     }
-    if explicit_plan_request {
-        return AgentProfile::Plan;
-    }
-
-    let review_words = ["audit", "check", "inspect", "review"];
-    let review_phrases = [
-        "look over",
-        "code review",
-        "review my",
-        "review the",
-        "check my",
-        "check the diff",
-    ];
-    if has_word(&review_words) || has_phrase(&review_phrases) {
-        return AgentProfile::Review;
-    }
-
-    let scout_phrases = [
-        "dev environment",
-        "development environment",
-        "setup environment",
-        "set up environment",
-        "working environment",
-        "environment setup",
-        "install dependencies",
-    ];
-    if has_word(&["environment", "dependencies", "setup", "bootstrap"])
-        || has_phrase(&scout_phrases)
+    if let Some((start, end)) = trimmed.find('{').zip(trimmed.rfind('}'))
+        && start < end
+        && let Some(profile) = parse_profile_json(&trimmed[start..=end])?
     {
-        return AgentProfile::Scout;
+        return Ok(profile);
     }
 
-    let explore_phrases = [
-        "find where",
-        "figure out where",
-        "investigate",
-        "where is",
-        "where are",
-        "how does",
-        "trace",
-    ];
-    if has_word(&["explore", "investigate", "trace", "locate", "find"])
-        || has_phrase(&explore_phrases)
-    {
-        return AgentProfile::Explore;
+    if let Ok(profile) = AgentProfile::parse(
+        trimmed
+            .trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c.is_ascii_whitespace()),
+    ) {
+        return Ok(profile);
     }
 
-    AgentProfile::Ask
+    bail!("expected JSON object with profile field or a profile name")
+}
+
+fn parse_profile_json(output: &str) -> Result<Option<AgentProfile>> {
+    match serde_json::from_str::<Value>(output) {
+        Ok(value) => value
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(AgentProfile::parse)
+            .transpose(),
+        Err(_) => Ok(None),
+    }
 }
 
 impl AgentProfile {
@@ -377,6 +325,8 @@ pub struct AgentRequest {
     pub temperature: f32,
     #[serde(default)]
     pub profile: AgentProfile,
+    #[serde(default)]
+    pub infer_profile: bool,
     #[serde(default)]
     pub sub_agent_depth: usize,
     pub top_k: i32,
@@ -572,7 +522,7 @@ fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
 }
 
 pub fn run_agent<S: EventSink>(
-    args: AgentRequest,
+    mut args: AgentRequest,
     models_root: &Path,
     mut sink: S,
 ) -> Result<AgentRunResult> {
@@ -598,6 +548,18 @@ pub fn run_agent<S: EventSink>(
         (b, false)
     };
 
+    suppress_llama_logs();
+    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    backend.void_logs();
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
+    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        .with_context(|| format!("failed to load model {}", model_path.display()))?;
+
+    if args.infer_profile {
+        args.profile = infer_agent_profile(&backend, &model, &args, &args.task)?;
+        args.infer_profile = false;
+    }
+
     // Load environment config (explicit arg takes precedence over file on disk).
     let env_config = args.environment.clone().or_else(|| {
         if args.profile == AgentProfile::Scout {
@@ -622,13 +584,6 @@ pub fn run_agent<S: EventSink>(
         workspace: workspace_root.display().to_string(),
         branch: branch.clone(),
     });
-
-    suppress_llama_logs();
-    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    backend.void_logs();
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-        .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
     let instructions = build_agent_instructions(
         &workspace_root,
@@ -2224,36 +2179,42 @@ mod tests {
     }
 
     #[test]
-    fn infer_agent_profile_routes_implementation_to_build() {
+    fn profile_inference_prompt_describes_profiles_and_task() {
+        let prompt = profile_inference_prompt("Fix the login bug");
+
+        assert!(prompt.contains("Return exactly one JSON object"));
+        assert!(prompt.contains("build"));
+        assert!(prompt.contains("scout"));
+        assert!(prompt.contains("review"));
+        assert!(prompt.contains("explore"));
+        assert!(prompt.contains("plan"));
+        assert!(prompt.contains("ask"));
+        assert!(prompt.contains("Fix the login bug"));
+    }
+
+    #[test]
+    fn parse_inferred_agent_profile_accepts_json_and_plain_profile() {
         assert_eq!(
-            infer_agent_profile("Fix the login bug"),
+            parse_inferred_agent_profile(r#"{"profile":"build"}"#).unwrap(),
             AgentProfile::Build
         );
         assert_eq!(
-            infer_agent_profile("Please add export support"),
-            AgentProfile::Build
+            parse_inferred_agent_profile("plan").unwrap(),
+            AgentProfile::Plan
+        );
+        assert_eq!(
+            parse_inferred_agent_profile("```json\n{\"profile\":\"review\"}\n```").unwrap(),
+            AgentProfile::Review
         );
     }
 
     #[test]
-    fn infer_agent_profile_routes_read_only_requests() {
-        assert_eq!(
-            infer_agent_profile("Create an implementation plan for auth"),
-            AgentProfile::Plan
-        );
-        assert_eq!(
-            infer_agent_profile("Review the current diff"),
-            AgentProfile::Review
-        );
-        assert_eq!(
-            infer_agent_profile("Set up the development environment"),
-            AgentProfile::Scout
-        );
-        assert_eq!(
-            infer_agent_profile("How does session persistence work?"),
-            AgentProfile::Explore
-        );
-        assert_eq!(infer_agent_profile("What is pb?"), AgentProfile::Ask);
+    fn parse_inferred_agent_profile_rejects_unknown_output() {
+        let err = parse_inferred_agent_profile("not a profile")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expected JSON object"), "error was: {err}");
     }
 
     #[test]

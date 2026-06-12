@@ -464,6 +464,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 gpu_layers: args.gpu_layers,
                 temperature: args.temperature,
                 profile: args.profile,
+                infer_profile: false,
                 sub_agent_depth: 0,
                 top_k: args.top_k,
                 seed: args.seed,
