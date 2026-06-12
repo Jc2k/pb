@@ -10,7 +10,8 @@ use crate::cli_ui::render_event;
 use crate::events::EventEnvelope;
 use crate::projects::{AddProjectRequest, ProjectEntry, RemoveProjectRequest};
 use crate::web::{
-    SessionFinished, SessionListItem, SessionResponse, StartSessionRequest, WatchSessionRequest,
+    DeleteSessionResponse, SessionFinished, SessionListItem, SessionResponse, StartSessionRequest,
+    WatchSessionRequest,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -56,6 +57,18 @@ pub async fn start_session(
 
 pub async fn list_sessions(socket_path: &PathBuf) -> Result<Vec<SessionListItem>> {
     request(socket_path, "pb.session.list", serde_json::json!({})).await
+}
+
+pub async fn delete_session(
+    socket_path: &PathBuf,
+    session_id: String,
+) -> Result<DeleteSessionResponse> {
+    request(
+        socket_path,
+        "pb.session.delete",
+        WatchSessionRequest { session_id },
+    )
+    .await
 }
 
 pub async fn add_project(socket_path: &PathBuf, params: AddProjectRequest) -> Result<ProjectEntry> {

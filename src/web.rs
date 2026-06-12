@@ -21,6 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{AgentRequest, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
+use crate::session_store::{self, PersistedSession};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -77,6 +78,12 @@ pub struct SessionDetails {
     pub running: bool,
     pub branch: Option<String>,
     pub events: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteSessionResponse {
+    pub session_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,14 +151,19 @@ struct AppState {
 struct WebAssets;
 
 pub async fn run_server(args: ServeArgs, defaults: AgentRequest) -> Result<()> {
+    let project_entries = projects::load_projects()?;
+    let restored_sessions = restore_sessions(&project_entries);
     let state = AppState {
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        projects: Arc::new(Mutex::new(projects::load_projects()?)),
+        sessions: Arc::new(Mutex::new(restored_sessions)),
+        projects: Arc::new(Mutex::new(project_entries)),
     };
 
     let app = Router::new()
         .route("/api/sessions", post(start_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(get_session))
+        .route(
+            "/api/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
@@ -225,6 +237,16 @@ async fn start_session_inner(
         let mut sessions = state.sessions.lock().await;
         sessions.insert(session_id.clone(), session);
     }
+
+    let empty_history = StdMutex::new(Vec::new());
+    persist_session_snapshot(
+        &session_id,
+        &request,
+        request.branch.clone(),
+        request.workdir.clone(),
+        true,
+        &empty_history,
+    );
 
     spawn_agent_run(state.clone(), session_id.clone(), request);
 
@@ -313,6 +335,38 @@ async fn status(
     })
 }
 
+async fn delete_session(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<DeleteSessionResponse>, StatusCode> {
+    delete_session_inner(state, &id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::NOT_FOUND)
+}
+
+async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSessionResponse> {
+    let session = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(id) else {
+            anyhow::bail!("session not found: {id}");
+        };
+        if session.running {
+            anyhow::bail!("session is running: {id}");
+        }
+        sessions.remove(id).expect("session exists")
+    };
+
+    if let Some(workdir) = session.workdir.or(session.request_template.workdir) {
+        session_store::delete_session(&workdir, id)?;
+    }
+
+    Ok(DeleteSessionResponse {
+        session_id: id.to_string(),
+        deleted: true,
+    })
+}
+
 async fn list_projects(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<ProjectEntry>> {
@@ -336,11 +390,30 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             )
         };
 
+        let request_for_run = request.clone();
+        let session_id_for_run = session_id.clone();
         let result = tokio::task::spawn_blocking(move || {
             let sender = sender.clone();
             let history = Arc::clone(&history);
-            run_agent(request, &models_root, |event| {
+            let mut persisted_branch = request_for_run.branch.clone();
+            let mut persisted_workdir = request_for_run.workdir.clone();
+            run_agent(request_for_run.clone(), &models_root, |event| {
+                if let AgentEvent::Started {
+                    workspace, branch, ..
+                } = &event
+                {
+                    persisted_workdir = Some(PathBuf::from(workspace));
+                    persisted_branch = Some(branch.clone());
+                }
                 publish_event(&sender, &history, event);
+                persist_session_snapshot(
+                    &session_id_for_run,
+                    &request_for_run,
+                    persisted_branch.clone(),
+                    persisted_workdir.clone(),
+                    true,
+                    &history,
+                );
             })
         })
         .await;
@@ -373,6 +446,14 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     );
                 }
             }
+            persist_session_snapshot(
+                &session_id,
+                &session.request_template,
+                session.branch.clone(),
+                session.workdir.clone(),
+                false,
+                &session.history,
+            );
         }
     });
 }
@@ -474,6 +555,13 @@ async fn handle_rpc_connection(
             let result = projects::remove_project(&params.name)?;
             reload_projects(&state).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.session.delete" => {
+            let params: WatchSessionRequest = serde_json::from_value(request.params)?;
+            match delete_session_inner(state, &params.session_id).await {
+                Ok(result) => write_rpc_response(reader.get_mut(), request.id, result).await?,
+                Err(err) => write_rpc_error(reader.get_mut(), request.id, err.to_string()).await?,
+            }
         }
         "pb.session.get" => {
             let params: WatchSessionRequest = serde_json::from_value(request.params)?;
@@ -619,6 +707,58 @@ async fn watch_session(
     }
 
     Ok(())
+}
+
+fn restore_sessions(project_entries: &[ProjectEntry]) -> HashMap<String, SessionState> {
+    session_store::restore_registered_sessions(project_entries)
+        .into_iter()
+        .map(session_from_persisted)
+        .map(|session| (session.0, session.1))
+        .collect()
+}
+
+fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
+    let (sender, _) = broadcast::channel(256);
+    let session_id = persisted.session_id.clone();
+    let history = Arc::new(StdMutex::new(persisted.events));
+    (
+        session_id,
+        SessionState {
+            task: persisted.task,
+            branch: persisted.branch,
+            workdir: persisted.workdir,
+            request_template: persisted.request_template,
+            running: false,
+            sender,
+            history,
+            updated_at_ms: persisted.updated_at_ms,
+        },
+    )
+}
+
+fn persist_session_snapshot(
+    session_id: &str,
+    request_template: &AgentRequest,
+    branch: Option<String>,
+    workdir: Option<PathBuf>,
+    running: bool,
+    history: &StdMutex<Vec<EventEnvelope>>,
+) {
+    let events = history
+        .lock()
+        .map(|history| history.clone())
+        .unwrap_or_default();
+    let persisted = PersistedSession::from_parts(
+        session_id.to_string(),
+        request_template.clone(),
+        branch,
+        workdir,
+        running,
+        events,
+    );
+    if let Err(err) = session_store::save_session(&persisted) {
+        eprintln!("failed to persist pb session {session_id}: {err:#}");
+    }
 }
 
 async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
