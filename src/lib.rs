@@ -461,40 +461,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Pull(args) => pull_model(&args).await,
         Commands::Queue(args) => run_queue(args).await,
-        Commands::Serve(args) => {
-            let defaults = agent_core::AgentRequest {
-                task: String::new(),
-                model: args.model.clone(),
-                model_dir: args.model_dir.clone(),
-                workdir: args.workdir.clone(),
-                branch: None,
-                max_steps: args.max_steps,
-                max_tokens: args.max_tokens,
-                ctx_size: args.ctx_size,
-                threads: args.threads,
-                threads_batch: args.threads_batch,
-                gpu_layers: args.gpu_layers,
-                temperature: args.temperature,
-                profile: args.profile,
-                infer_profile: false,
-                sub_agent_depth: 0,
-                top_k: args.top_k,
-                seed: args.seed,
-                environment: None,
-            };
-            web::run_server(
-                web::ServeArgs {
-                    host: args.host,
-                    port: args.port,
-                    socket_path: args
-                        .socket_path
-                        .clone()
-                        .unwrap_or_else(daemon_client::default_socket_path),
-                },
-                defaults,
-            )
-            .await
-        }
+        Commands::Serve(args) => run_serve(args).await,
         Commands::Tray(args) => tray::run(tray::TrayArgs {
             host: args.host,
             port: args.port,
@@ -503,6 +470,86 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Env { command } => run_env_command(command),
         Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
+    }
+}
+
+async fn run_serve(args: ServeArgs) -> Result<()> {
+    let defaults = agent_core::AgentRequest {
+        task: String::new(),
+        model: args.model.clone(),
+        model_dir: args.model_dir.clone(),
+        workdir: args.workdir.clone(),
+        branch: None,
+        max_steps: args.max_steps,
+        max_tokens: args.max_tokens,
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        temperature: args.temperature,
+        profile: args.profile,
+        infer_profile: false,
+        sub_agent_depth: 0,
+        top_k: args.top_k,
+        seed: args.seed,
+        environment: None,
+    };
+    let server_args = web::ServeArgs {
+        host: args.host.clone(),
+        port: args.port,
+        socket_path: args
+            .socket_path
+            .clone()
+            .unwrap_or_else(daemon_client::default_socket_path),
+    };
+
+    run_serve_platform(args, server_args, defaults).await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn run_serve_platform(
+    _cli_args: ServeArgs,
+    server_args: web::ServeArgs,
+    defaults: agent_core::AgentRequest,
+) -> Result<()> {
+    web::run_server(server_args, defaults).await
+}
+
+#[cfg(target_os = "macos")]
+async fn run_serve_platform(
+    cli_args: ServeArgs,
+    server_args: web::ServeArgs,
+    defaults: agent_core::AgentRequest,
+) -> Result<()> {
+    use std::sync::mpsc;
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server_thread = std::thread::Builder::new()
+        .name("pb-web-server".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(web::run_server_with_ready(
+                server_args,
+                defaults,
+                Some(ready_tx),
+            ))
+        })
+        .context("failed to start pb web server thread")?;
+
+    match ready_rx
+        .recv()
+        .context("pb web server exited before startup")?
+    {
+        Ok(_) => tray::run(tray::TrayArgs {
+            host: cli_args.host,
+            port: cli_args.port,
+        }),
+        Err(err) => {
+            let _ = server_thread.join();
+            bail!(err);
+        }
     }
 }
 

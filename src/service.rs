@@ -11,16 +11,19 @@ use std::path::{Path, PathBuf};
 use crate::ServeArgs;
 
 pub const LABEL: &str = "com.jc2k.pb";
-pub const TRAY_LABEL: &str = "com.jc2k.pb.tray";
+pub const LEGACY_TRAY_LABEL: &str = "com.jc2k.pb.tray";
 
 /// Path to the pb serve LaunchAgent plist file.
 pub fn plist_path() -> Result<PathBuf> {
     launch_agent_plist_path(LABEL)
 }
 
-/// Path to the menu bar tray LaunchAgent plist file.
-pub fn tray_plist_path() -> Result<PathBuf> {
-    launch_agent_plist_path(TRAY_LABEL)
+/// Path to the pre-merged menu bar tray LaunchAgent plist file.
+///
+/// The tray now starts inside `pb serve`, but service removal still cleans up
+/// older installs that wrote a second LaunchAgent.
+pub fn legacy_tray_plist_path() -> Result<PathBuf> {
+    launch_agent_plist_path(LEGACY_TRAY_LABEL)
 }
 
 fn launch_agent_plist_path(label: &str) -> Result<PathBuf> {
@@ -117,49 +120,7 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn render_tray_plist(exe: &str, args: &ServeArgs) -> String {
-    let log_dir = dirs::home_dir()
-        .map(|h| h.join("Library/Logs"))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>tray</string>
-        <string>--host</string>
-        <string>{host}</string>
-        <string>--port</string>
-        <string>{port}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log_out}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_err}</string>
-</dict>
-</plist>
-"#,
-        label = TRAY_LABEL,
-        exe = exe,
-        host = args.host,
-        port = args.port,
-        log_out = log_dir.join("pb.tray.stdout.log").display(),
-        log_err = log_dir.join("pb.tray.stderr.log").display(),
-    )
-}
-
-/// Install the LaunchAgent plists for a specific pb binary path and load them with launchctl.
+/// Install the LaunchAgent plist for a specific pb binary path and load it with launchctl.
 pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -172,20 +133,20 @@ pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
         let exe = exe.to_string_lossy().into_owned();
 
         let plist = plist_path()?;
-        let tray_plist = tray_plist_path()?;
+        let legacy_tray_plist = legacy_tray_plist_path()?;
         let plist_dir = plist.parent().expect("plist path has no parent");
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("failed to create {}", plist_dir.display()))?;
 
         write_plist(&plist, &render_plist(&exe, args))?;
-        write_plist(&tray_plist, &render_tray_plist(&exe, args))?;
+        if legacy_tray_plist.exists() {
+            unload_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
+            remove_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
+        }
 
         load_plist(&plist)?;
-        load_plist(&tray_plist)?;
 
-        println!(
-            "Services {LABEL} and {TRAY_LABEL} loaded. They will start automatically on login."
-        );
+        println!("Service {LABEL} loaded. It will start automatically on login.");
         Ok(())
     }
 }
@@ -310,11 +271,11 @@ pub fn remove() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let tray = tray_plist_path()?;
+        let legacy_tray = legacy_tray_plist_path()?;
         let serve = plist_path()?;
-        unload_plist(TRAY_LABEL, &tray)?;
+        unload_plist(LEGACY_TRAY_LABEL, &legacy_tray)?;
         unload_plist(LABEL, &serve)?;
-        remove_plist(TRAY_LABEL, &tray)?;
+        remove_plist(LEGACY_TRAY_LABEL, &legacy_tray)?;
         remove_plist(LABEL, &serve)?;
         Ok(())
     }
@@ -328,8 +289,7 @@ pub fn start() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         launchctl_signal("start", LABEL)?;
-        launchctl_signal("start", TRAY_LABEL)?;
-        println!("Services {LABEL} and {TRAY_LABEL} started.");
+        println!("Service {LABEL} started.");
         Ok(())
     }
 }
@@ -341,9 +301,9 @@ pub fn stop() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        launchctl_signal("stop", TRAY_LABEL)?;
+        let _ = launchctl_signal("stop", LEGACY_TRAY_LABEL);
         launchctl_signal("stop", LABEL)?;
-        println!("Services {LABEL} and {TRAY_LABEL} stopped.");
+        println!("Service {LABEL} stopped.");
         Ok(())
     }
 }
@@ -355,11 +315,10 @@ pub fn restart() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = launchctl_signal("stop", TRAY_LABEL);
+        let _ = launchctl_signal("stop", LEGACY_TRAY_LABEL);
         let _ = launchctl_signal("stop", LABEL);
         launchctl_signal("start", LABEL)?;
-        launchctl_signal("start", TRAY_LABEL)?;
-        println!("Services {LABEL} and {TRAY_LABEL} restarted.");
+        println!("Service {LABEL} restarted.");
         Ok(())
     }
 }
@@ -371,12 +330,12 @@ pub fn restart_or_start_if_installed() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        if !plist_path()?.exists() && !tray_plist_path()?.exists() {
+        if !plist_path()?.exists() && !legacy_tray_plist_path()?.exists() {
             println!("pb launchd service is not installed; skipping service restart.");
             return Ok(());
         }
 
-        if service_is_running(LABEL)? || service_is_running(TRAY_LABEL)? {
+        if service_is_running(LABEL)? || service_is_running(LEGACY_TRAY_LABEL)? {
             restart()
         } else {
             start()
@@ -422,9 +381,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tray_plist_path_contains_label() {
-        let path = tray_plist_path().unwrap();
-        assert!(path.to_string_lossy().contains(TRAY_LABEL));
+    fn test_legacy_tray_plist_path_contains_label() {
+        let path = legacy_tray_plist_path().unwrap();
+        assert!(path.to_string_lossy().contains(LEGACY_TRAY_LABEL));
         assert!(path.extension().map(|e| e == "plist").unwrap_or(false));
     }
 
