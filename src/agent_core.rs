@@ -2,6 +2,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use encoding_rs::UTF_8;
 use futures::StreamExt;
+use globset::GlobBuilder;
+use grep_regex::RegexMatcher;
+use grep_searcher::{Searcher, sinks::UTF8 as GrepUtf8};
+use ignore::WalkBuilder;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -23,7 +27,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
-use walkdir::WalkDir;
 
 use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
@@ -32,6 +35,7 @@ use crate::events::AgentEvent;
 const LLAMA_BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_GLOB_RESULTS: usize = 200;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
@@ -564,6 +568,8 @@ fn available_tool_specs(
 ) -> Vec<&'static str> {
     let mut tools = vec![
         "read_file(path,start,end)",
+        "glob(pattern,path,max_results)",
+        "ripgrep(pattern,path,max_results)",
         "search(pattern,path)",
         "web_search(query)",
         "web_fetch(url)",
@@ -592,7 +598,8 @@ fn tool_allowed(
     allow_sub_agents: bool,
 ) -> bool {
     match tool {
-        "read_file" | "search" | "web_search" | "web_fetch" | "git_log" | "todo" | "skill" => true,
+        "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
+        | "todo" | "skill" => true,
         "run_command" => command_backend_kind.is_some(),
         "edit_file" | "git_commit" | "git_revert" => profile == AgentProfile::Build,
         "sub_agent" => allow_sub_agents,
@@ -880,6 +887,128 @@ struct ToolContext<'a> {
     todo_memory: &'a RefCell<TodoMemory>,
 }
 
+fn tool_result_limit(arguments: &Value, tool: &str, default_limit: usize) -> Result<usize> {
+    let Some(value) = arguments.get("max_results") else {
+        return Ok(default_limit);
+    };
+    let requested = value
+        .as_u64()
+        .with_context(|| format!("{tool} max_results must be an integer"))?
+        as usize;
+    Ok(requested.clamp(1, default_limit))
+}
+
+fn workspace_walk(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(false).filter_entry(|entry| {
+        !SEARCH_EXCLUDED_DIRS
+            .iter()
+            .any(|excluded| entry.file_name() == std::ffi::OsStr::new(excluded))
+    });
+    builder
+}
+
+fn run_glob(
+    pattern: &str,
+    relative_path: Option<&str>,
+    limit: usize,
+    workspace_root: &Path,
+) -> Result<String> {
+    let search_root = if let Some(path) = relative_path {
+        resolve_workspace_path(workspace_root, path, true)?
+    } else {
+        workspace_root.to_path_buf()
+    };
+    let matcher = GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .with_context(|| format!("invalid glob pattern: {pattern}"))?
+        .compile_matcher();
+
+    let mut matches = Vec::new();
+    for entry in workspace_walk(&search_root).build() {
+        let entry = entry.with_context(|| format!("failed to walk {}", search_root.display()))?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path.strip_prefix(workspace_root).unwrap_or(path);
+        let file_name = path.file_name().unwrap_or_default();
+        if matcher.is_match(rel) || matcher.is_match(Path::new(file_name)) {
+            matches.push(rel.display().to_string());
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        Ok("no matches".to_string())
+    } else {
+        Ok(matches.join("\n"))
+    }
+}
+
+fn run_ripgrep(
+    pattern: &str,
+    relative_path: Option<&str>,
+    limit: usize,
+    workspace_root: &Path,
+) -> Result<String> {
+    let search_root = if let Some(path) = relative_path {
+        resolve_workspace_path(workspace_root, path, true)?
+    } else {
+        workspace_root.to_path_buf()
+    };
+    let matcher = RegexMatcher::new_line_matcher(pattern)
+        .with_context(|| format!("invalid regex pattern: {pattern}"))?;
+    let mut searcher = Searcher::new();
+    let mut hits = Vec::new();
+
+    for entry in workspace_walk(&search_root).build() {
+        let entry = entry.with_context(|| format!("failed to walk {}", search_root.display()))?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .to_path_buf();
+        let result = searcher.search_path(
+            matcher.clone(),
+            path,
+            GrepUtf8(|line_number, line| {
+                hits.push(format!("{}:{}:{}", rel.display(), line_number, line.trim()));
+                Ok::<bool, std::io::Error>(hits.len() < limit)
+            }),
+        );
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("failed to search {}", path.display()));
+            }
+        }
+        if hits.len() >= limit {
+            break;
+        }
+    }
+
+    if hits.is_empty() {
+        Ok("no matches".to_string())
+    } else {
+        Ok(hits.join("\n"))
+    }
+}
+
 fn run_tool<S: EventSink>(
     tool: &str,
     arguments: &Value,
@@ -932,60 +1061,23 @@ fn run_tool<S: EventSink>(
             }
             Ok(out)
         }
-        "search" => {
+        "glob" => {
             let pattern = arguments
                 .get("pattern")
                 .and_then(Value::as_str)
-                .context("search requires string argument: pattern")?;
+                .context("glob requires string argument: pattern")?;
             let relative_path = arguments.get("path").and_then(Value::as_str);
-            let search_root = if let Some(path) = relative_path {
-                resolve_workspace_path(workspace_root, path, true)?
-            } else {
-                workspace_root.to_path_buf()
-            };
-
-            let regex = regex::Regex::new(pattern)
-                .with_context(|| format!("invalid regex pattern: {pattern}"))?;
-
-            let mut hits = Vec::new();
-            for entry in WalkDir::new(&search_root)
-                .into_iter()
-                .filter_entry(|e| {
-                    !SEARCH_EXCLUDED_DIRS
-                        .iter()
-                        .any(|excluded| e.file_name() == std::ffi::OsStr::new(excluded))
-                })
-                .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_file())
-            {
-                let path = entry.path();
-                let Ok(content) = std::fs::read_to_string(path) else {
-                    continue;
-                };
-                for (line_idx, line) in content.lines().enumerate() {
-                    if regex.is_match(line) {
-                        let rel = path.strip_prefix(workspace_root).unwrap_or(path);
-                        hits.push(format!(
-                            "{}:{}:{}",
-                            rel.display(),
-                            line_idx + 1,
-                            line.trim()
-                        ));
-                        if hits.len() >= MAX_SEARCH_RESULTS {
-                            break;
-                        }
-                    }
-                }
-                if hits.len() >= MAX_SEARCH_RESULTS {
-                    break;
-                }
-            }
-
-            if hits.is_empty() {
-                Ok("no matches".to_string())
-            } else {
-                Ok(hits.join("\n"))
-            }
+            let limit = tool_result_limit(arguments, "glob", MAX_GLOB_RESULTS)?;
+            run_glob(pattern, relative_path, limit, workspace_root)
+        }
+        "ripgrep" | "search" => {
+            let pattern = arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .with_context(|| format!("{tool} requires string argument: pattern"))?;
+            let relative_path = arguments.get("path").and_then(Value::as_str);
+            let limit = tool_result_limit(arguments, tool, MAX_SEARCH_RESULTS)?;
+            run_ripgrep(pattern, relative_path, limit, workspace_root)
         }
         "edit_file" => {
             let path = arguments
@@ -2117,6 +2209,49 @@ mod tests {
 
         // The reverted file should no longer exist (git revert removes it).
         assert!(!dir.join("change.txt").exists());
+    }
+
+    #[test]
+    fn glob_finds_files_by_name_and_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("src/nested/lib.rs"), "pub fn lib() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "docs\n").unwrap();
+
+        let by_path = run_glob("**/*.rs", None, MAX_GLOB_RESULTS, root).unwrap();
+        assert!(by_path.contains("src/main.rs"), "result: {by_path}");
+        assert!(by_path.contains("src/nested/lib.rs"), "result: {by_path}");
+
+        let by_name = run_glob("README.md", None, MAX_GLOB_RESULTS, root).unwrap();
+        assert_eq!(by_name, "README.md");
+    }
+
+    #[test]
+    fn ripgrep_finds_regex_matches_with_locations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.txt"), "nothing here\n").unwrap();
+
+        let result = run_ripgrep("println!", None, MAX_SEARCH_RESULTS, root).unwrap();
+        assert_eq!(result, "src/main.rs:2:println!(\"hello\");");
+    }
+
+    #[test]
+    fn ripgrep_limits_results() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("one.txt"), "needle\nneedle\n").unwrap();
+
+        let result = run_ripgrep("needle", None, 1, root).unwrap();
+        assert_eq!(result.lines().count(), 1);
     }
 
     #[test]
