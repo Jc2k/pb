@@ -11,8 +11,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use reqwest::Url;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use similar::TextDiff;
+use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -114,21 +115,112 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. Implement the requested change with minimal safe edits. Use explore sub-agents to gather context before invasive work and review sub-agents to check your result before finalizing when useful. You may edit files and commit logical changes."
+                "Profile: build. Implement the requested change with minimal safe edits. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. Use explore sub-agents to gather context before invasive work and review sub-agents to check your result before finalizing when useful. You may edit files and commit logical changes."
             }
             Self::Review => {
-                "Profile: review. Inspect the current workspace and recent changes for correctness, missing requirements, regressions, and test gaps. Run checks when available. Do not edit files or create commits. Return concise findings with severity and evidence."
+                "Profile: review. Inspect the current workspace and recent changes for correctness, missing requirements, regressions, and test gaps. Run checks when available. Use todo(action=add,...) for required follow-up work found during review. Do not edit files or create commits. Return concise findings with severity and evidence."
             }
             Self::Explore => {
                 "Profile: explore. Investigate the codebase as it pertains to the task. Prefer search/read_file and targeted commands. Do not edit files or create commits. Return a compact map of relevant files, behaviors, and recommendations."
             }
             Self::Plan => {
-                "Profile: plan. Produce an actionable implementation plan from the available context. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
+                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
             }
             Self::Ask => {
                 "Profile: ask. Answer the focused question using repository context and, when necessary, public web research. Do not edit files or create commits. Return a direct answer with supporting evidence."
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+impl TodoStatus {
+    fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "in_progress" | "in-progress" | "started" => Ok(Self::InProgress),
+            "completed" | "complete" | "done" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            other => bail!(
+                "unknown todo status '{other}'; expected one of: pending, in_progress, completed, blocked"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TodoTask {
+    id: usize,
+    title: String,
+    description: String,
+    status: TodoStatus,
+    parent_id: Option<usize>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct TodoMemory {
+    next_id: usize,
+    tasks: Vec<TodoTask>,
+}
+
+impl TodoMemory {
+    fn add(&mut self, title: String, description: String, parent_id: Option<usize>) -> &TodoTask {
+        self.next_id += 1;
+        self.tasks.push(TodoTask {
+            id: self.next_id,
+            title,
+            description,
+            status: TodoStatus::Pending,
+            parent_id,
+            notes: Vec::new(),
+        });
+        self.tasks.last().expect("todo was just pushed")
+    }
+
+    fn update(
+        &mut self,
+        id: usize,
+        status: Option<TodoStatus>,
+        title: Option<String>,
+        description: Option<String>,
+        note: Option<String>,
+    ) -> Result<&TodoTask> {
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .with_context(|| format!("todo id {id} was not found"))?;
+        if let Some(status) = status {
+            task.status = status;
+        }
+        if let Some(title) = title {
+            task.title = title;
+        }
+        if let Some(description) = description {
+            task.description = description;
+        }
+        if let Some(note) = note
+            && !note.trim().is_empty()
+        {
+            task.notes.push(note);
+        }
+        Ok(task)
+    }
+
+    fn pending_tasks(&self) -> Vec<&TodoTask> {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == TodoStatus::Pending)
+            .collect()
     }
 }
 
@@ -340,6 +432,8 @@ pub fn run_agent<S: EventSink>(
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
     )?;
 
+    let todo_memory = RefCell::new(TodoMemory::default());
+
     let mut messages = vec![
         ChatMessage {
             role: "system",
@@ -358,6 +452,7 @@ pub fn run_agent<S: EventSink>(
         &mut messages,
         &workspace_root,
         command_backend.as_ref(),
+        &todo_memory,
         &mut sink,
     )?;
     let reached_final = outcome.reached_final;
@@ -473,6 +568,7 @@ fn available_tool_specs(
         "web_search(query)",
         "web_fetch(url)",
         "git_log()",
+        "todo(action,id,title,description,status,parent_id,note)",
         "skill(name)",
     ];
     if command_backend_kind.is_some() {
@@ -496,7 +592,7 @@ fn tool_allowed(
     allow_sub_agents: bool,
 ) -> bool {
     match tool {
-        "read_file" | "search" | "web_search" | "web_fetch" | "git_log" | "skill" => true,
+        "read_file" | "search" | "web_search" | "web_fetch" | "git_log" | "todo" | "skill" => true,
         "run_command" => command_backend_kind.is_some(),
         "edit_file" | "git_commit" | "git_revert" => profile == AgentProfile::Build,
         "sub_agent" => allow_sub_agents,
@@ -517,6 +613,7 @@ fn run_agent_steps<S: EventSink>(
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
     command_backend: Option<&CommandBackend>,
+    todo_memory: &RefCell<TodoMemory>,
     sink: &mut S,
 ) -> Result<StepRunOutcome> {
     for step in 1..=args.max_steps {
@@ -560,6 +657,7 @@ fn run_agent_steps<S: EventSink>(
                     request: args,
                     workspace_root,
                     command_backend,
+                    todo_memory,
                 };
                 let tool_result = run_tool(&tool, &arguments, &tool_context, sink)?;
                 sink.emit(AgentEvent::ToolResult {
@@ -779,6 +877,7 @@ struct ToolContext<'a> {
     request: &'a AgentRequest,
     workspace_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
+    todo_memory: &'a RefCell<TodoMemory>,
 }
 
 fn run_tool<S: EventSink>(
@@ -953,6 +1052,7 @@ fn run_tool<S: EventSink>(
                 Ok(log)
             }
         }
+        "todo" => run_todo_tool(arguments, context.todo_memory),
         "git_revert" => {
             let commit = arguments
                 .get("commit")
@@ -1058,6 +1158,7 @@ fn run_sub_agent<S: EventSink>(
         &mut messages,
         context.workspace_root,
         context.command_backend,
+        context.todo_memory,
         &mut collector,
     )?;
 
@@ -1099,6 +1200,110 @@ Errors:
         result: result.clone(),
     });
     Ok(result)
+}
+
+fn run_todo_tool(arguments: &Value, todo_memory: &RefCell<TodoMemory>) -> Result<String> {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("list")
+        .trim()
+        .to_ascii_lowercase();
+
+    match action.as_str() {
+        "list" => {
+            let memory = todo_memory.borrow();
+            format_todo_tasks(&memory.tasks)
+        }
+        "next" => {
+            let memory = todo_memory.borrow();
+            let pending = memory.pending_tasks();
+            if pending.is_empty() {
+                Ok("no pending todos".to_string())
+            } else {
+                serde_json::to_string_pretty(&pending).context("failed to serialize pending todos")
+            }
+        }
+        "add" => {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .context("todo add requires string argument: title")?
+                .trim();
+            if title.is_empty() {
+                bail!("todo add title must not be empty");
+            }
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let parent_id = arguments
+                .get("parent_id")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let mut memory = todo_memory.borrow_mut();
+            if let Some(parent_id) = parent_id
+                && !memory.tasks.iter().any(|task| task.id == parent_id)
+            {
+                bail!("parent todo id {parent_id} was not found");
+            }
+            let task = memory
+                .add(title.to_string(), description, parent_id)
+                .clone();
+            serde_json::to_string_pretty(&json!({ "added": task }))
+                .context("failed to serialize added todo")
+        }
+        "update" | "complete" | "block" | "start" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_u64)
+                .context("todo update/complete requires integer argument: id")?
+                as usize;
+            let status = match action.as_str() {
+                "complete" => Some(TodoStatus::Completed),
+                "block" => Some(TodoStatus::Blocked),
+                "start" => Some(TodoStatus::InProgress),
+                _ => arguments
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(TodoStatus::parse)
+                    .transpose()?,
+            };
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_string);
+            let note = arguments
+                .get("note")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let mut memory = todo_memory.borrow_mut();
+            let task = memory.update(id, status, title, description, note)?.clone();
+            serde_json::to_string_pretty(&json!({ "updated": task }))
+                .context("failed to serialize updated todo")
+        }
+        other => bail!(
+            "unknown todo action '{other}'; expected one of: list, next, add, update, start, complete, block"
+        ),
+    }
+}
+
+fn format_todo_tasks(tasks: &[TodoTask]) -> Result<String> {
+    if tasks.is_empty() {
+        return Ok("no todos".to_string());
+    }
+    serde_json::to_string_pretty(tasks).context("failed to serialize todos")
 }
 
 fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) -> Result<PathBuf> {
@@ -1721,6 +1926,56 @@ mod tests {
         assert!(instructions.contains("This profile is read-only"));
         assert!(!instructions.contains("edit_file(path,old_text,new_text)"));
         assert!(!instructions.contains("sub_agent(profile,task,max_steps)"));
+    }
+
+    #[test]
+    fn todo_tool_adds_lists_and_completes_tasks() {
+        let todo_memory = RefCell::new(TodoMemory::default());
+
+        let added = run_todo_tool(
+            &json!({
+                "action": "add",
+                "title": "Implement parser",
+                "description": "Add task memory support"
+            }),
+            &todo_memory,
+        )
+        .unwrap();
+        assert!(added.contains("Implement parser"));
+
+        let pending = run_todo_tool(&json!({ "action": "next" }), &todo_memory).unwrap();
+        assert!(pending.contains("pending"));
+
+        let completed = run_todo_tool(
+            &json!({
+                "action": "complete",
+                "id": 1,
+                "note": "done by build sub-agent"
+            }),
+            &todo_memory,
+        )
+        .unwrap();
+        assert!(completed.contains("completed"));
+        assert!(completed.contains("done by build sub-agent"));
+
+        let pending = run_todo_tool(&json!({ "action": "next" }), &todo_memory).unwrap();
+        assert_eq!(pending, "no pending todos");
+    }
+
+    #[test]
+    fn todo_tool_validates_parent_tasks() {
+        let todo_memory = RefCell::new(TodoMemory::default());
+        let err = run_todo_tool(
+            &json!({
+                "action": "add",
+                "title": "Follow-up",
+                "parent_id": 99
+            }),
+            &todo_memory,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("parent todo id 99 was not found"));
     }
 
     #[test]
