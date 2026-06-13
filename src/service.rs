@@ -99,7 +99,10 @@ pub fn install(exe: &Path) -> Result<()> {
 }
 
 /// Rewrite the installed LaunchAgent plist so it points at the given binary path.
-pub fn refresh_plist_if_installed(exe: &Path) -> Result<()> {
+///
+/// If the rendered plist changed, unload and load it so launchd observes the new
+/// configuration before the service is restarted or started.
+pub fn refresh_plist_and_reload_if_changed(exe: &Path) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = exe;
@@ -111,6 +114,7 @@ pub fn refresh_plist_if_installed(exe: &Path) -> Result<()> {
         let plist = plist_path()?;
         let legacy_tray_plist = legacy_tray_plist_path()?;
         if !plist.exists() && !legacy_tray_plist.exists() {
+            println!("pb launchd service is not installed; skipping plist refresh.");
             return Ok(());
         }
 
@@ -119,14 +123,30 @@ pub fn refresh_plist_if_installed(exe: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", plist_dir.display()))?;
         }
 
+        let was_loaded = service_is_loaded(LABEL)?;
         let exe = exe.to_string_lossy().into_owned();
-        write_plist(&plist, &render_plist(&exe))?;
+        let plist_changed = write_plist_if_changed(&plist, &render_plist(&exe))?;
+        if plist_changed {
+            if was_loaded {
+                unload_plist(LABEL, &plist)?;
+            }
+            load_plist(&plist)?;
+        } else if !was_loaded {
+            load_plist(&plist)?;
+        }
+
         if legacy_tray_plist.exists() {
-            unload_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
+            unload_plist_if_loaded(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
             remove_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
         }
-        Ok(())
+
+        restart_or_start_if_installed()
     }
+}
+
+/// Rewrite the installed LaunchAgent plist so it points at the given binary path.
+pub fn refresh_plist_if_installed(exe: &Path) -> Result<()> {
+    refresh_plist_and_reload_if_changed(exe)
 }
 
 #[cfg(target_os = "macos")]
@@ -134,6 +154,21 @@ fn write_plist(path: &PathBuf, content: &str) -> Result<()> {
     std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
     println!("Wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_plist_if_changed(path: &PathBuf, content: &str) -> Result<bool> {
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if existing == content {
+            println!("{} is already up to date.", path.display());
+            return Ok(false);
+        }
+    }
+
+    write_plist(path, content)?;
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -215,6 +250,27 @@ fn launchctl_signal(action: &str, label: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn service_is_loaded(label: &str) -> Result<bool> {
+    use std::process::Command;
+
+    let uid_output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("failed to determine current user id")?;
+    if !uid_output.status.success() {
+        bail!("id -u failed (exit {})", uid_output.status);
+    }
+    let uid = String::from_utf8_lossy(&uid_output.stdout);
+    let domain_target = format!("gui/{}/{}", uid.trim(), label);
+
+    let output = Command::new("launchctl")
+        .args(["print", &domain_target])
+        .output()
+        .context("failed to run launchctl")?;
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "macos")]
 fn service_is_running(label: &str) -> Result<bool> {
     use std::process::Command;
 
@@ -240,6 +296,14 @@ fn service_is_running(label: &str) -> Result<bool> {
         let trimmed = line.trim_start();
         trimmed.starts_with("state = running") || trimmed.starts_with("pid =")
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn unload_plist_if_loaded(label: &str, path: &PathBuf) -> Result<()> {
+    if service_is_loaded(label)? {
+        unload_plist(label, path)?;
+    }
+    Ok(())
 }
 
 /// Stop the service, remove LaunchAgent plists, and leave the binary untouched.
