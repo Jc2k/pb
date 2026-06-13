@@ -36,8 +36,8 @@ mod macos {
     type Sel = *mut c_void;
     type Bool = i8;
 
-    const ICON_BYTES: &[u8] = include_bytes!("../public/icon-192.png");
-    const TRAY_ICON_SIZE: c_double = 18.0;
+    const ICON_BYTES: &[u8] = include_bytes!("../public/tray/64x64/BotHeadTemplate.png");
+    const TRAY_ICON_SIZE: c_double = 24.0;
 
     static WEB_URL: OnceLock<String> = OnceLock::new();
     static STATUS_HOST: OnceLock<String> = OnceLock::new();
