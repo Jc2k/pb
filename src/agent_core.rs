@@ -2774,6 +2774,7 @@ fn git_revert(commit: &str, workdir: &Path) -> Result<String> {
 }
 
 pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
+    let model = crate::canonical_model_ref(model);
     let model_dir = pull_root.join(crate::cache_dir_name(model));
 
     if !model_dir.exists() {
@@ -3079,6 +3080,21 @@ mod tests {
         std::fs::write(tmp.path().join("marker.txt"), "ok").unwrap();
         let output = run_local_shell_command("cat marker.txt", tmp.path()).unwrap();
         assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn find_model_in_cache_accepts_deprecated_default_when_current_default_is_cached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_dir = tmp.path().join(crate::cache_dir_name(crate::DEFAULT_MODEL));
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let mut gguf_data = b"GGUF".to_vec();
+        gguf_data.extend_from_slice(&[0u8; 16]);
+        std::fs::write(model_dir.join("Qwen3-Coder-Next-Q4_K_M.gguf"), &gguf_data).unwrap();
+
+        let path = find_model_in_cache_in(tmp.path(), "hf://ggml-org/Qwen3-Coder-Next-GGUF")
+            .expect("deprecated default should resolve to cached current default");
+
+        assert_eq!(path.file_name().unwrap(), "Qwen3-Coder-Next-Q4_K_M.gguf");
     }
 
     #[test]

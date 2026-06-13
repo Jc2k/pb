@@ -26,6 +26,10 @@ pub mod tray;
 pub mod web;
 
 pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
+const DEPRECATED_DEFAULT_MODELS: &[&str] = &[
+    "hf://ggml-org/Qwen3-Coder-Next-GGUF",
+    "hf://ggml-org/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf",
+];
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -476,7 +480,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 async fn run_serve(args: ServeArgs) -> Result<()> {
     let defaults = agent_core::AgentRequest {
         task: String::new(),
-        model: args.model.clone(),
+        model: canonical_model_ref(&args.model).to_owned(),
         model_dir: args.model_dir.clone(),
         workdir: args.workdir.clone(),
         branch: None,
@@ -1120,6 +1124,7 @@ fn env_status(args: EnvWorkdirArgs) -> Result<()> {
 }
 
 pub async fn pull_model(args: &PullArgs) -> Result<()> {
+    let model = canonical_model_ref(&args.model);
     if args.batch_size == 0 {
         bail!("batch-size must be greater than 0");
     }
@@ -1142,25 +1147,28 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    if args.model.starts_with("hf://") {
-        pull_from_hf(
-            &client,
-            &args.model,
-            &output_root,
-            args.parallel,
-            args.retries,
-        )
-        .await
+    if model.starts_with("hf://") {
+        pull_from_hf(&client, model, &output_root, args.parallel, args.retries).await
     } else {
         pull_from_ollama(
             &client,
-            &args.model,
+            model,
             &output_root,
             args.batch_size,
             args.parallel,
             args.retries,
         )
         .await
+    }
+}
+
+/// Return the current canonical model for stale default identifiers that may
+/// still be present in older LaunchAgent plists or queued requests.
+pub fn canonical_model_ref(model: &str) -> &str {
+    if DEPRECATED_DEFAULT_MODELS.contains(&model) {
+        DEFAULT_MODEL
+    } else {
+        model
     }
 }
 
@@ -1824,6 +1832,19 @@ mod tests {
                 Some("Qwen3-Coder-Next-Q4_K_M.gguf".to_owned())
             ))
         );
+    }
+
+    #[test]
+    fn canonical_model_ref_rewrites_deprecated_default_repo() {
+        assert_eq!(
+            canonical_model_ref("hf://ggml-org/Qwen3-Coder-Next-GGUF"),
+            DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn canonical_model_ref_preserves_non_default_models() {
+        assert_eq!(canonical_model_ref("custom-model"), "custom-model");
     }
 
     #[test]
