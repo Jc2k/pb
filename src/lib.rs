@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep};
 use crate::agent_core::AgentProfile;
 use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
+use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 pub mod agent_core;
 pub mod cli_ui;
@@ -76,6 +77,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Set up common MCP servers for this project
+    #[command(name = "mcp")]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Manage the pb serve launchd service (macOS)
     #[command(name = "service")]
     Service {
@@ -128,6 +135,44 @@ pub enum ConfigCommand {
     Get(ConfigGetArgs),
     /// Show the user configuration TOML
     Show,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Set up an MCP server
+    Setup {
+        #[command(subcommand)]
+        command: McpSetupCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpSetupCommand {
+    /// Configure the official GitHub MCP server for the current project
+    Github(McpSetupGithubArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpSetupGithubArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// MCP server name to write under [servers.<name>]
+    #[arg(long, default_value = "github")]
+    pub server_name: String,
+
+    /// Container runtime command used to run ghcr.io/github/github-mcp-server
+    #[arg(long, default_value = "docker")]
+    pub runtime: String,
+
+    /// Skip `gh auth login`; fail if GitHub CLI is not already authenticated
+    #[arg(long)]
+    pub no_auth: bool,
+
+    /// Do not overwrite an existing server with the same name
+    #[arg(long)]
+    pub no_overwrite: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -422,6 +467,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Config { command } => run_config_command(command),
         Commands::Projects { command } => run_projects_command(command).await,
         Commands::Env { command } => run_env_command(command),
+        Commands::Mcp { command } => run_mcp_command(command),
         Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
@@ -534,6 +580,133 @@ fn run_config_command(command: ConfigCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_mcp_command(command: McpCommand) -> Result<()> {
+    match command {
+        McpCommand::Setup { command } => match command {
+            McpSetupCommand::Github(args) => mcp_setup_github(args),
+        },
+    }
+}
+
+fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    if args.server_name.trim().is_empty() {
+        bail!("--server-name cannot be empty");
+    }
+    ensure_github_cli_auth(args.no_auth)?;
+
+    let mut config = ProjectMcpConfig::load(&root)?.unwrap_or_default();
+    if args.no_overwrite && config.servers.contains_key(&args.server_name) {
+        bail!(
+            "MCP server '{}' already exists in {}; remove --no-overwrite to replace it",
+            args.server_name,
+            mcp::project_mcp_config_path(&root).display()
+        );
+    }
+
+    config.servers.insert(
+        args.server_name.clone(),
+        github_mcp_server_config(&args.runtime),
+    );
+    config.save(&root)?;
+
+    println!(
+        "GitHub MCP server '{}' saved to {}.",
+        args.server_name,
+        mcp::project_mcp_config_path(&root).display()
+    );
+    if let Some(repo) = current_github_repo(&root)? {
+        println!("Detected GitHub repository: {repo}");
+    }
+    println!(
+        "Authentication is delegated to `gh auth token` at MCP startup, so no token was written to disk."
+    );
+    println!(
+        "Note: GitHub's CLI OAuth flow cannot mint a token limited to only this repository. For strict repo-only access, create a fine-grained GitHub token for this repo and configure the server manually."
+    );
+    Ok(())
+}
+
+fn github_mcp_server_config(runtime: &str) -> McpServerConfig {
+    McpServerConfig {
+        command: Some("sh".to_string()),
+        args: vec![
+            "-c".to_string(),
+            format!(
+                "GITHUB_PERSONAL_ACCESS_TOKEN=\"$(gh auth token)\" exec {runtime} run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server"
+            ),
+        ],
+        env: Default::default(),
+        working_directory: None,
+        disabled: false,
+    }
+}
+
+fn ensure_github_cli_auth(no_auth: bool) -> Result<()> {
+    if command_succeeds("gh", &["auth", "status", "--hostname", "github.com"]) {
+        return Ok(());
+    }
+    if no_auth {
+        bail!("GitHub CLI is not authenticated; run `gh auth login` first");
+    }
+    println!("Starting GitHub CLI OAuth login in your browser…");
+    let status = std::process::Command::new("gh")
+        .args([
+            "auth",
+            "login",
+            "--hostname",
+            "github.com",
+            "--git-protocol",
+            "https",
+            "--web",
+            "--scopes",
+            "repo,read:org",
+        ])
+        .status()
+        .context(
+            "failed to start `gh auth login`; install GitHub CLI from https://cli.github.com/",
+        )?;
+    if !status.success() {
+        bail!("`gh auth login` did not complete successfully");
+    }
+    Ok(())
+}
+
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn current_github_repo(root: &Path) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .output()
+        .context("failed to read git remote.origin.url")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_github_repo_url(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+fn parse_github_repo_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches(".git");
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    for prefix in ["https://github.com/", "ssh://git@github.com/"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
@@ -2021,5 +2194,35 @@ mod tests {
         // Incrementing should not panic.
         pb.inc(1024);
         pb.finish_and_clear();
+    }
+
+    #[test]
+    fn parse_github_repo_url_accepts_common_origin_formats() {
+        assert_eq!(
+            parse_github_repo_url("git@github.com:owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            parse_github_repo_url("https://github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            parse_github_repo_url("ssh://git@github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn github_mcp_server_config_uses_gh_token_without_storing_secret() {
+        let config = github_mcp_server_config("docker");
+        assert_eq!(config.command.as_deref(), Some("sh"));
+        assert!(config.env.is_empty());
+        assert!(config.args.join(" ").contains("gh auth token"));
+        assert!(
+            config
+                .args
+                .join(" ")
+                .contains("ghcr.io/github/github-mcp-server")
+        );
     }
 }
