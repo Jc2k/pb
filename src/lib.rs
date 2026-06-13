@@ -56,7 +56,7 @@ pub enum Commands {
     /// Submit or attach to a daemon-backed session over the pb unix socket
     Queue(QueueArgs),
     /// Start the web UI server
-    Serve(ServeArgs),
+    Serve,
     /// Manage user-level configuration
     #[command(name = "config")]
     Config {
@@ -69,9 +69,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
-    /// Run the macOS menu bar status item for a pb serve instance
-    #[command(hide = true)]
-    Tray(TrayArgs),
     /// Manage the per-project container environment for sandboxed task execution
     #[command(name = "env")]
     Env {
@@ -91,7 +88,7 @@ pub enum Commands {
 #[derive(Subcommand, Debug)]
 pub enum SelfCommand {
     /// Install pb into ~/.local/bin and register the launchd service
-    Install(ServeArgs),
+    Install,
     /// Stop the launchd service, remove its configuration, and delete the installed binary
     Uninstall(SelfUninstallArgs),
     /// Update pb from the latest GitHub release
@@ -378,84 +375,6 @@ pub struct QueueArgs {
     pub socket_path: Option<PathBuf>,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct ServeArgs {
-    /// Bind host
-    #[arg(long)]
-    pub host: Option<String>,
-
-    /// Bind port
-    #[arg(long)]
-    pub port: Option<u16>,
-
-    /// Unix socket path for local daemon clients
-    #[arg(long)]
-    pub socket_path: Option<PathBuf>,
-
-    /// Default model for API sessions
-    #[arg(long)]
-    pub model: Option<String>,
-
-    /// Directory containing pulled model blobs
-    #[arg(long)]
-    pub model_dir: Option<PathBuf>,
-
-    /// Working directory where tools can read/search/edit
-    #[arg(long)]
-    pub workdir: Option<PathBuf>,
-
-    /// Default max steps per run
-    #[arg(long)]
-    pub max_steps: Option<usize>,
-
-    /// Default max new tokens per model turn
-    #[arg(long)]
-    pub max_tokens: Option<i32>,
-
-    /// Default context size
-    #[arg(long)]
-    pub ctx_size: Option<u32>,
-
-    /// Default number of CPU threads for decoding
-    #[arg(long)]
-    pub threads: Option<i32>,
-
-    /// Default number of CPU threads for prompt processing
-    #[arg(long)]
-    pub threads_batch: Option<i32>,
-
-    /// Default number of transformer layers to offload to GPU
-    #[arg(long)]
-    pub gpu_layers: Option<u32>,
-
-    /// Default temperature
-    #[arg(long)]
-    pub temperature: Option<f32>,
-
-    /// Default agent profile for new sessions
-    #[arg(long, value_enum)]
-    pub profile: Option<AgentProfile>,
-
-    /// Default top-k for sampling
-    #[arg(long)]
-    pub top_k: Option<i32>,
-
-    /// Default RNG seed
-    #[arg(long)]
-    pub seed: Option<u32>,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct TrayArgs {
-    /// Web UI host to open and poll
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-
-    /// Web UI port to open and poll
-    #[arg(long, default_value_t = 8311)]
-    pub port: u16,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestDescriptor {
     digest: String,
@@ -488,18 +407,14 @@ struct HfModelInfo {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::SelfCmd { command } => match command {
-            SelfCommand::Install(args) => run_self_install(&args),
+            SelfCommand::Install => run_self_install(),
             SelfCommand::Uninstall(args) => run_self_uninstall(&args),
             SelfCommand::Update => run_self_update(),
         },
         Commands::Pull(args) => pull_model(&args).await,
         Commands::Queue(args) => run_queue(args).await,
-        Commands::Serve(args) => run_serve(args).await,
+        Commands::Serve => run_serve().await,
         Commands::Config { command } => run_config_command(command),
-        Commands::Tray(args) => tray::run(tray::TrayArgs {
-            host: args.host,
-            port: args.port,
-        }),
         Commands::Projects { command } => run_projects_command(command).await,
         Commands::Env { command } => run_env_command(command),
         Commands::Service { command } => run_service_command(command),
@@ -507,45 +422,41 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn run_serve(args: ServeArgs) -> Result<()> {
+async fn run_serve() -> Result<()> {
     let user_config = UserConfig::load()?;
-    let resolved_host = user_config.effective_web_listen(args.host.clone());
-    let resolved_port = user_config.effective_web_port(args.port);
+    let resolved_host = user_config.effective_web_listen();
+    let resolved_port = user_config.effective_web_port();
     let defaults = agent_core::AgentRequest {
         task: String::new(),
-        model: user_config.effective_model(args.model.clone()),
-        model_dir: user_config.effective_model_dir(args.model_dir.clone()),
-        workdir: user_config.effective_workdir(args.workdir.clone()),
+        model: user_config.effective_model(),
+        model_dir: user_config.effective_model_dir(),
+        workdir: user_config.effective_workdir(),
         branch: None,
-        max_steps: user_config.effective_max_steps(args.max_steps),
-        max_tokens: user_config.effective_max_tokens(args.max_tokens),
-        ctx_size: user_config.effective_ctx_size(args.ctx_size),
-        threads: user_config.effective_threads(args.threads),
-        threads_batch: user_config.effective_threads_batch(args.threads_batch),
-        gpu_layers: user_config.effective_gpu_layers(args.gpu_layers),
-        temperature: user_config.effective_temperature(args.temperature),
-        profile: user_config.effective_profile(args.profile),
+        max_steps: user_config.effective_max_steps(),
+        max_tokens: user_config.effective_max_tokens(),
+        ctx_size: user_config.effective_ctx_size(),
+        threads: user_config.effective_threads(),
+        threads_batch: user_config.effective_threads_batch(),
+        gpu_layers: user_config.effective_gpu_layers(),
+        temperature: user_config.effective_temperature(),
+        profile: user_config.effective_profile(),
         infer_profile: false,
         sub_agent_depth: 0,
-        top_k: user_config.effective_top_k(args.top_k),
-        seed: user_config.effective_seed(args.seed),
+        top_k: user_config.effective_top_k(),
+        seed: user_config.effective_seed(),
         environment: None,
     };
     let server_args = web::ServeArgs {
         host: resolved_host.clone(),
         port: resolved_port,
-        socket_path: args
-            .socket_path
-            .clone()
-            .unwrap_or_else(daemon_client::default_socket_path),
+        socket_path: user_config.effective_socket_path(),
     };
 
-    run_serve_platform(args, server_args, defaults, resolved_host, resolved_port).await
+    run_serve_platform(server_args, defaults, resolved_host, resolved_port).await
 }
 
 #[cfg(not(target_os = "macos"))]
 async fn run_serve_platform(
-    _cli_args: ServeArgs,
     server_args: web::ServeArgs,
     defaults: agent_core::AgentRequest,
     _resolved_host: String,
@@ -556,7 +467,6 @@ async fn run_serve_platform(
 
 #[cfg(target_os = "macos")]
 async fn run_serve_platform(
-    _cli_args: ServeArgs,
     server_args: web::ServeArgs,
     defaults: agent_core::AgentRequest,
     resolved_host: String,
@@ -783,7 +693,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_self_install(args: &ServeArgs) -> Result<()> {
+fn run_self_install() -> Result<()> {
     ensure_macos_launchd()?;
 
     let source = std::env::current_exe().context("cannot determine path to pb binary")?;
@@ -819,7 +729,7 @@ fn run_self_install(args: &ServeArgs) -> Result<()> {
         })?;
     }
 
-    service::install(&destination, args)?;
+    service::install(&destination)?;
     service::start()?;
     println!("pb installed at {}", destination.display());
     Ok(())
@@ -871,6 +781,7 @@ fn run_self_update() -> Result<()> {
         .context("self-update failed")?;
 
     println!("Updated to {}", status.version());
+    service::refresh_plist_if_installed(&installed_binary_path()?)?;
     service::restart_or_start_if_installed()?;
     Ok(())
 }

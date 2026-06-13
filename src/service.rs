@@ -8,8 +8,6 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-use crate::ServeArgs;
-
 pub const LABEL: &str = "com.jc2k.pb";
 pub const LEGACY_TRAY_LABEL: &str = "com.jc2k.pb.tray";
 
@@ -33,83 +31,9 @@ fn launch_agent_plist_path(label: &str) -> Result<PathBuf> {
         .join(format!("{label}.plist")))
 }
 
-/// Render the plist XML for a given `pb serve` invocation.
+/// Render the plist XML for `pb serve`.
 #[cfg(target_os = "macos")]
-fn render_plist(exe: &str, args: &ServeArgs) -> String {
-    let mut program_args = vec![
-        format!("        <string>{exe}</string>"),
-        "        <string>serve</string>".to_string(),
-    ];
-
-    if let Some(ref host) = args.host {
-        program_args.push("        <string>--host</string>".to_string());
-        program_args.push(format!("        <string>{host}</string>"));
-    }
-    if let Some(port) = args.port {
-        program_args.push("        <string>--port</string>".to_string());
-        program_args.push(format!("        <string>{port}</string>"));
-    }
-    if let Some(ref model) = args.model {
-        program_args.push("        <string>--model</string>".to_string());
-        program_args.push(format!("        <string>{model}</string>"));
-    }
-    if let Some(gpu_layers) = args.gpu_layers {
-        program_args.push("        <string>--gpu-layers</string>".to_string());
-        program_args.push(format!("        <string>{gpu_layers}</string>"));
-    }
-    if let Some(max_steps) = args.max_steps {
-        program_args.push("        <string>--max-steps</string>".to_string());
-        program_args.push(format!("        <string>{max_steps}</string>"));
-    }
-    if let Some(max_tokens) = args.max_tokens {
-        program_args.push("        <string>--max-tokens</string>".to_string());
-        program_args.push(format!("        <string>{max_tokens}</string>"));
-    }
-    if let Some(ctx_size) = args.ctx_size {
-        program_args.push("        <string>--ctx-size</string>".to_string());
-        program_args.push(format!("        <string>{ctx_size}</string>"));
-    }
-    if let Some(temperature) = args.temperature {
-        program_args.push("        <string>--temperature</string>".to_string());
-        program_args.push(format!("        <string>{temperature}</string>"));
-    }
-    if let Some(profile) = args.profile {
-        program_args.push("        <string>--profile</string>".to_string());
-        program_args.push(format!("        <string>{profile}</string>"));
-    }
-    if let Some(top_k) = args.top_k {
-        program_args.push("        <string>--top-k</string>".to_string());
-        program_args.push(format!("        <string>{top_k}</string>"));
-    }
-    if let Some(seed) = args.seed {
-        program_args.push("        <string>--seed</string>".to_string());
-        program_args.push(format!("        <string>{seed}</string>"));
-    }
-
-    if let Some(ref model_dir) = args.model_dir {
-        program_args.push("        <string>--model-dir</string>".to_string());
-        program_args.push(format!("        <string>{}</string>", model_dir.display()));
-    }
-    if let Some(ref workdir) = args.workdir {
-        program_args.push("        <string>--workdir</string>".to_string());
-        program_args.push(format!("        <string>{}</string>", workdir.display()));
-    }
-    if let Some(ref socket_path) = args.socket_path {
-        program_args.push("        <string>--socket-path</string>".to_string());
-        program_args.push(format!(
-            "        <string>{}</string>",
-            socket_path.display()
-        ));
-    }
-    if let Some(threads) = args.threads {
-        program_args.push("        <string>--threads</string>".to_string());
-        program_args.push(format!("        <string>{threads}</string>"));
-    }
-    if let Some(threads_batch) = args.threads_batch {
-        program_args.push("        <string>--threads-batch</string>".to_string());
-        program_args.push(format!("        <string>{threads_batch}</string>"));
-    }
-
+fn render_plist(exe: &str) -> String {
     let log_dir = dirs::home_dir()
         .map(|h| h.join("Library/Logs"))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -123,7 +47,8 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-{args_str}
+        <string>{exe}</string>
+        <string>serve</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -137,17 +62,16 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
 </plist>
 "#,
         label = LABEL,
-        args_str = program_args.join("\n"),
         log_out = log_dir.join("pb.stdout.log").display(),
         log_err = log_dir.join("pb.stderr.log").display(),
     )
 }
 
 /// Install the LaunchAgent plist for a specific pb binary path and load it with launchctl.
-pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
+pub fn install(exe: &Path) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (exe, args);
+        let _ = exe;
         bail!("pb service is only supported on macOS");
     }
 
@@ -161,7 +85,7 @@ pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("failed to create {}", plist_dir.display()))?;
 
-        write_plist(&plist, &render_plist(&exe, args))?;
+        write_plist(&plist, &render_plist(&exe))?;
         if legacy_tray_plist.exists() {
             unload_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
             remove_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
@@ -170,6 +94,37 @@ pub fn install(exe: &Path, args: &ServeArgs) -> Result<()> {
         load_plist(&plist)?;
 
         println!("Service {LABEL} loaded. It will start automatically on login.");
+        Ok(())
+    }
+}
+
+/// Rewrite the installed LaunchAgent plist so it points at the given binary path.
+pub fn refresh_plist_if_installed(exe: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist = plist_path()?;
+        let legacy_tray_plist = legacy_tray_plist_path()?;
+        if !plist.exists() && !legacy_tray_plist.exists() {
+            return Ok(());
+        }
+
+        if let Some(plist_dir) = plist.parent() {
+            std::fs::create_dir_all(plist_dir)
+                .with_context(|| format!("failed to create {}", plist_dir.display()))?;
+        }
+
+        let exe = exe.to_string_lossy().into_owned();
+        write_plist(&plist, &render_plist(&exe))?;
+        if legacy_tray_plist.exists() {
+            unload_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
+            remove_plist(LEGACY_TRAY_LABEL, &legacy_tray_plist)?;
+        }
         Ok(())
     }
 }
@@ -369,32 +324,6 @@ pub fn restart_or_start_if_installed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use crate::{
-        DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, default_gpu_layers,
-    };
-
-    #[cfg(target_os = "macos")]
-    fn default_serve_args() -> ServeArgs {
-        ServeArgs {
-            host: Some("127.0.0.1".to_string()),
-            port: Some(8311),
-            model: Some(DEFAULT_MODEL.to_string()),
-            model_dir: None,
-            workdir: None,
-            socket_path: None,
-            max_steps: Some(DEFAULT_AGENT_MAX_STEPS),
-            max_tokens: Some(DEFAULT_AGENT_MAX_TOKENS),
-            ctx_size: Some(8192),
-            threads: None,
-            threads_batch: None,
-            gpu_layers: Some(default_gpu_layers()),
-            temperature: Some(0.2),
-            profile: Some(crate::agent_core::AgentProfile::Build),
-            top_k: Some(40),
-            seed: Some(1337),
-        }
-    }
 
     #[test]
     fn test_plist_path_contains_label() {
@@ -413,36 +342,30 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_render_plist_contains_label() {
-        let args = default_serve_args();
         let exe = "/usr/local/bin/pb";
-        let plist = render_plist(exe, &args);
+        let plist = render_plist(exe);
         assert!(plist.contains(LABEL));
         assert!(plist.contains(exe));
         assert!(plist.contains("serve"));
-        assert!(plist.contains("127.0.0.1"));
-        assert!(plist.contains("8311"));
+        assert!(!plist.contains("--host"));
+        assert!(!plist.contains("--port"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_render_plist_with_optional_args() {
-        let mut args = default_serve_args();
-        args.threads = Some(4);
-        args.threads_batch = Some(8);
-        args.model_dir = Some(PathBuf::from("/models"));
-        args.workdir = Some(PathBuf::from("/workspace"));
-        let plist = render_plist("/usr/local/bin/pb", &args);
-        assert!(plist.contains("--threads"));
-        assert!(plist.contains("--threads-batch"));
-        assert!(plist.contains("--model-dir"));
-        assert!(plist.contains("--workdir"));
+    fn test_render_plist_has_no_pb_configuration_args() {
+        let plist = render_plist("/usr/local/bin/pb");
+        assert!(!plist.contains("--host"));
+        assert!(!plist.contains("--port"));
+        assert!(!plist.contains("--model"));
+        assert!(!plist.contains("--workdir"));
+        assert!(!plist.contains("--socket-path"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn test_render_plist_log_paths() {
-        let args = default_serve_args();
-        let plist = render_plist("/usr/local/bin/pb", &args);
+        let plist = render_plist("/usr/local/bin/pb");
         assert!(plist.contains("pb.stdout.log"));
         assert!(plist.contains("pb.stderr.log"));
     }
@@ -450,8 +373,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_plist_valid_xml_structure() {
-        let args = default_serve_args();
-        let plist = render_plist("/usr/local/bin/pb", &args);
+        let plist = render_plist("/usr/local/bin/pb");
         assert!(plist.starts_with("<?xml"));
         assert!(plist.contains("<plist version=\"1.0\">"));
         assert!(plist.contains("</plist>"));
