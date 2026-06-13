@@ -1624,8 +1624,13 @@ fn run_tool(
             let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = arguments.get("end").and_then(Value::as_u64);
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
-            let text = std::fs::read_to_string(&resolved)
-                .with_context(|| format!("failed to read {}", resolved.display()))?;
+            let text = match std::fs::read_to_string(&resolved) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(format!("file not found: {}", resolved.display()))
+                }
+                Err(e) => return Err(anyhow!(e)).context(format!("failed to read {}", resolved.display())),
+            };
 
             let lines: Vec<_> = text.lines().collect();
             if let Some(end) = end
