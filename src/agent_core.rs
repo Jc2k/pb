@@ -34,6 +34,7 @@ use std::time::Duration;
 use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
+use crate::mcp::{self, McpToolRegistry};
 
 const LLAMA_BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
@@ -592,6 +593,13 @@ pub fn run_agent<S: EventSink>(
         None
     };
 
+    let user_config =
+        crate::config::UserConfig::load().context("failed to load user MCP config")?;
+    let project_mcp_config = mcp::ProjectMcpConfig::load(&workspace_root)
+        .context("failed to load project MCP config")?;
+    let mcp_servers = mcp::effective_servers(&user_config.mcp, project_mcp_config.as_ref());
+    let mcp_registry = mcp::discover_tools(mcp_servers);
+
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
         model: model_path.display().to_string(),
@@ -607,6 +615,7 @@ pub fn run_agent<S: EventSink>(
         env_config.as_ref(),
         args.profile,
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+        &mcp_registry,
     )?;
 
     let todo_memory = RefCell::new(TodoMemory::default());
@@ -631,6 +640,7 @@ pub fn run_agent<S: EventSink>(
         command_backend.as_ref(),
         env_config.as_ref(),
         &todo_memory,
+        &mcp_registry,
         &mut sink,
     )?;
     let reached_final = outcome.reached_final;
@@ -664,6 +674,7 @@ fn build_agent_instructions(
     env_config: Option<&EnvironmentConfig>,
     profile: AgentProfile,
     allow_sub_agents: bool,
+    mcp_registry: &McpToolRegistry,
 ) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
@@ -673,11 +684,20 @@ fn build_agent_instructions(
     );
     instructions.push_str(profile.instructions());
     instructions.push('\n');
-    let available_tools = available_tool_specs(profile, command_backend_kind, allow_sub_agents);
-    let available_tool_signatures =
-        available_tool_signatures(profile, command_backend_kind, allow_sub_agents);
+    let available_tools = available_tool_specs(
+        profile,
+        command_backend_kind,
+        allow_sub_agents,
+        mcp_registry,
+    );
+    let available_tool_signatures = available_tool_signatures(
+        profile,
+        command_backend_kind,
+        allow_sub_agents,
+        mcp_registry,
+    );
     let tool_schema_json = serde_json::to_string_pretty(&available_tools)
-        .context("failed to serialize built-in tool schemas")?;
+        .context("failed to serialize tool schemas")?;
     instructions.push_str(&format!(
         "Available tools: {}.\n",
         available_tool_signatures.join(", ")
@@ -705,6 +725,11 @@ fn build_agent_instructions(
     instructions.push_str(
         "Use web_search for general internet research and web_fetch for reading a specific URL. Only use public http/https URLs.\n",
     );
+    if !mcp_registry.is_empty() {
+        instructions.push_str(
+            "Configured MCP tools are exposed with mcp_<server>_<tool> names. Use them when they are the most direct way to access configured external context or services.\n",
+        );
+    }
     instructions.push_str(
         "Skills are discovered from repo Codex, Claude, OpenCode, and Copilot locations by metadata only. Use skill_search(query,max_results) to find relevant skills without loading full bodies, then skill(name) to load one selected skill when it applies. Build agents can use framework skills to improve implementation; plan agents can plan skill invocations; research agents can use research skills for targeted source gathering.\n",
     );
@@ -768,8 +793,8 @@ fn build_agent_instructions(
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct BuiltInToolSchema {
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
     #[serde(rename = "inputSchema")]
     input_schema: Value,
 }
@@ -778,27 +803,43 @@ fn available_tool_specs(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
+    mcp_registry: &McpToolRegistry,
 ) -> Vec<BuiltInToolSchema> {
-    all_builtin_tool_specs()
+    let mut tools: Vec<_> = all_builtin_tool_specs()
         .into_iter()
-        .filter(|tool| tool_allowed(tool.name, profile, command_backend_kind, allow_sub_agents))
-        .collect()
+        .filter(|tool| tool_allowed(&tool.name, profile, command_backend_kind, allow_sub_agents))
+        .collect();
+    tools.extend(mcp_registry.tools.values().map(|tool| BuiltInToolSchema {
+        name: tool.tool_name.clone(),
+        description: format!(
+            "{} (MCP server: {}, tool: {})",
+            tool.description, tool.server_name, tool.server_tool_name
+        ),
+        input_schema: tool.input_schema.clone(),
+    }));
+    tools
 }
 
 fn available_tool_signatures(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
-) -> Vec<&'static str> {
-    available_tool_specs(profile, command_backend_kind, allow_sub_agents)
-        .into_iter()
-        .map(|tool| tool.signature())
-        .collect()
+    mcp_registry: &McpToolRegistry,
+) -> Vec<String> {
+    available_tool_specs(
+        profile,
+        command_backend_kind,
+        allow_sub_agents,
+        mcp_registry,
+    )
+    .into_iter()
+    .map(|tool| tool.signature())
+    .collect()
 }
 
 impl BuiltInToolSchema {
-    fn signature(&self) -> &'static str {
-        match self.name {
+    fn signature(&self) -> String {
+        let signature = match self.name.as_str() {
             "read_file" => "read_file(path,start,end)",
             "glob" => "glob(pattern,path,max_results)",
             "ripgrep" => "ripgrep(pattern,path,max_results)",
@@ -818,8 +859,9 @@ impl BuiltInToolSchema {
             "git_commit" => "git_commit(message)",
             "git_revert" => "git_revert(commit)",
             "sub_agent" => "sub_agent(profile,task,max_steps)",
-            _ => "unknown()",
-        }
+            _ => return format!("{}(arguments)", self.name),
+        };
+        signature.to_string()
     }
 }
 
@@ -1070,8 +1112,8 @@ fn builtin_tool(
     input_schema: Value,
 ) -> BuiltInToolSchema {
     BuiltInToolSchema {
-        name,
-        description,
+        name: name.to_string(),
+        description: description.to_string(),
         input_schema,
     }
 }
@@ -1158,6 +1200,7 @@ fn run_agent_steps(
     command_backend: Option<&CommandBackend>,
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
+    mcp_registry: &McpToolRegistry,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
     for step in 1..=args.max_steps {
@@ -1203,6 +1246,7 @@ fn run_agent_steps(
                     command_backend,
                     env_config,
                     todo_memory,
+                    mcp_registry,
                 };
                 let tool_result = run_tool(&tool, &arguments, &tool_context, sink)?;
                 sink.emit(AgentEvent::ToolResult {
@@ -1424,6 +1468,7 @@ struct ToolContext<'a> {
     command_backend: Option<&'a CommandBackend>,
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
+    mcp_registry: &'a McpToolRegistry,
 }
 
 fn tool_result_limit(arguments: &Value, tool: &str, default_limit: usize) -> Result<usize> {
@@ -1554,6 +1599,9 @@ fn run_tool(
     context: &ToolContext<'_>,
     sink: &mut dyn EventSink,
 ) -> Result<String> {
+    if context.mcp_registry.tool(tool).is_some() {
+        return mcp::call_tool(context.mcp_registry, tool, arguments);
+    }
     if !tool_allowed(
         tool,
         context.request.profile,
@@ -1897,6 +1945,7 @@ fn run_sub_agent(
         context.env_config,
         profile,
         false,
+        context.mcp_registry,
     )?;
     let mut messages = vec![
         ChatMessage {
@@ -1928,6 +1977,7 @@ fn run_sub_agent(
         context.command_backend,
         context.env_config,
         context.todo_memory,
+        context.mcp_registry,
         &mut sub_sink,
     )?;
     let collector = sub_sink.collector;
@@ -3259,6 +3309,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            &McpToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("run_command(cmd)"));
@@ -3276,6 +3327,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            &McpToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: build"));
@@ -3294,6 +3346,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            &McpToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Tool schemas use the MCP tool shape"));
@@ -3305,13 +3358,22 @@ mod tests {
 
     #[test]
     fn available_tool_specs_filter_by_profile_and_backend() {
-        let review_tools = available_tool_specs(AgentProfile::Review, None, false);
+        let review_tools = available_tool_specs(
+            AgentProfile::Review,
+            None,
+            false,
+            &McpToolRegistry::default(),
+        );
         assert!(review_tools.iter().any(|tool| tool.name == "read_file"));
         assert!(!review_tools.iter().any(|tool| tool.name == "edit_file"));
         assert!(!review_tools.iter().any(|tool| tool.name == "run_command"));
 
-        let build_tools =
-            available_tool_specs(AgentProfile::Build, Some(CommandBackendKind::Local), true);
+        let build_tools = available_tool_specs(
+            AgentProfile::Build,
+            Some(CommandBackendKind::Local),
+            true,
+            &McpToolRegistry::default(),
+        );
         let run_command = build_tools
             .iter()
             .find(|tool| tool.name == "run_command")
@@ -3332,6 +3394,7 @@ mod tests {
             None,
             AgentProfile::Review,
             false,
+            &McpToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: review"));
@@ -3359,6 +3422,7 @@ mod tests {
                 None,
                 profile,
                 true,
+                &McpToolRegistry::default(),
             )
             .unwrap();
             assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
@@ -3378,6 +3442,7 @@ mod tests {
             None,
             AgentProfile::Research,
             true,
+            &McpToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: research"));
