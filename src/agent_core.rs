@@ -14,8 +14,8 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use reqwest::Url;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use similar::TextDiff;
 use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::DefaultHasher};
@@ -674,10 +674,20 @@ fn build_agent_instructions(
     instructions.push_str(profile.instructions());
     instructions.push('\n');
     let available_tools = available_tool_specs(profile, command_backend_kind, allow_sub_agents);
+    let available_tool_signatures =
+        available_tool_signatures(profile, command_backend_kind, allow_sub_agents);
+    let tool_schema_json = serde_json::to_string_pretty(&available_tools)
+        .context("failed to serialize built-in tool schemas")?;
     instructions.push_str(&format!(
         "Available tools: {}.\n",
-        available_tools.join(", ")
+        available_tool_signatures.join(", ")
     ));
+    instructions.push_str(
+        "Tool schemas use the MCP tool shape with name, description, and inputSchema JSON Schema fields. Pass arguments that conform to the selected tool's inputSchema.\n",
+    );
+    instructions.push_str("Tool schemas:\n");
+    instructions.push_str(&tool_schema_json);
+    instructions.push('\n');
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
             "Use sub_agent(profile,task,max_steps) to delegate bounded work into a fresh context. Supported profiles are explore, review, plan, ask, research, scout, and build. Launch a research sub-agent when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The sub-agent result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
@@ -756,41 +766,362 @@ fn build_agent_instructions(
     Ok(instructions)
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct BuiltInToolSchema {
+    name: &'static str,
+    description: &'static str,
+    #[serde(rename = "inputSchema")]
+    input_schema: Value,
+}
+
 fn available_tool_specs(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
+) -> Vec<BuiltInToolSchema> {
+    all_builtin_tool_specs()
+        .into_iter()
+        .filter(|tool| tool_allowed(tool.name, profile, command_backend_kind, allow_sub_agents))
+        .collect()
+}
+
+fn available_tool_signatures(
+    profile: AgentProfile,
+    command_backend_kind: Option<CommandBackendKind>,
+    allow_sub_agents: bool,
 ) -> Vec<&'static str> {
-    let mut tools = vec![
-        "read_file(path,start,end)",
-        "glob(pattern,path,max_results)",
-        "ripgrep(pattern,path,max_results)",
-        "search(pattern,path)",
-        "web_search(query)",
-        "web_fetch(url)",
-        "git_log()",
-        "todo(action,id,title,description,status,parent_id,note)",
-        "skill_search(query,max_results)",
-        "skill(name)",
-    ];
-    if profile == AgentProfile::Plan {
-        tools.push("ask_user(question)");
+    available_tool_specs(profile, command_backend_kind, allow_sub_agents)
+        .into_iter()
+        .map(|tool| tool.signature())
+        .collect()
+}
+
+impl BuiltInToolSchema {
+    fn signature(&self) -> &'static str {
+        match self.name {
+            "read_file" => "read_file(path,start,end)",
+            "glob" => "glob(pattern,path,max_results)",
+            "ripgrep" => "ripgrep(pattern,path,max_results)",
+            "search" => "search(pattern,path)",
+            "web_search" => "web_search(query)",
+            "web_fetch" => "web_fetch(url)",
+            "git_log" => "git_log()",
+            "todo" => "todo(action,id,title,description,status,parent_id,note)",
+            "skill_search" => "skill_search(query,max_results)",
+            "skill" => "skill(name)",
+            "ask_user" => "ask_user(question)",
+            "run_command" => "run_command(cmd)",
+            "edit_file" => "edit_file(path,old_text,new_text)",
+            "apply_patch" => "apply_patch(patch)",
+            "mv" => "mv(source,destination)",
+            "rm" => "rm(path,recursive)",
+            "git_commit" => "git_commit(message)",
+            "git_revert" => "git_revert(commit)",
+            "sub_agent" => "sub_agent(profile,task,max_steps)",
+            _ => "unknown()",
+        }
     }
-    if command_backend_kind.is_some() {
-        tools.push("run_command(cmd)");
+}
+
+fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
+    vec![
+        builtin_tool(
+            "read_file",
+            "Read a UTF-8 text file inside the project root, optionally limiting the returned line range.",
+            object_schema(
+                [
+                    string_property("path", "Project-relative file path to read."),
+                    integer_property("start", "First 1-indexed line to include; defaults to 1."),
+                    integer_property(
+                        "end",
+                        "Last 1-indexed line to include; defaults to the end of the file.",
+                    ),
+                ],
+                ["path"],
+            ),
+        ),
+        builtin_tool(
+            "glob",
+            "List project files matching a glob pattern.",
+            object_schema(
+                [
+                    string_property("pattern", "Glob pattern to match."),
+                    string_property(
+                        "path",
+                        "Optional project-relative directory to search within.",
+                    ),
+                    integer_property("max_results", "Maximum number of matches to return."),
+                ],
+                ["pattern"],
+            ),
+        ),
+        builtin_tool(
+            "ripgrep",
+            "Search project files with ripgrep-compatible regular expressions.",
+            object_schema(
+                [
+                    string_property("pattern", "Regular expression to search for."),
+                    string_property(
+                        "path",
+                        "Optional project-relative file or directory to search within.",
+                    ),
+                    integer_property("max_results", "Maximum number of matches to return."),
+                ],
+                ["pattern"],
+            ),
+        ),
+        builtin_tool(
+            "search",
+            "Alias for ripgrep; search project files with a regular expression.",
+            object_schema(
+                [
+                    string_property("pattern", "Regular expression to search for."),
+                    string_property(
+                        "path",
+                        "Optional project-relative file or directory to search within.",
+                    ),
+                    integer_property("max_results", "Maximum number of matches to return."),
+                ],
+                ["pattern"],
+            ),
+        ),
+        builtin_tool(
+            "web_search",
+            "Search the public web for current or external information.",
+            object_schema([string_property("query", "Search query.")], ["query"]),
+        ),
+        builtin_tool(
+            "web_fetch",
+            "Fetch and extract text from a public http or https URL.",
+            object_schema(
+                [string_property("url", "Public http or https URL to fetch.")],
+                ["url"],
+            ),
+        ),
+        builtin_tool(
+            "git_log",
+            "Show recent commits in the project repository.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "todo",
+            "Manage shared agent todo memory.",
+            object_schema(
+                [
+                    enum_property(
+                        "action",
+                        "Todo operation to perform.",
+                        [
+                            "list", "next", "add", "update", "complete", "block", "start",
+                        ],
+                    ),
+                    integer_property(
+                        "id",
+                        "Todo id for update, complete, block, or start actions.",
+                    ),
+                    string_property("title", "Todo title for add or update actions."),
+                    string_property("description", "Todo description for add or update actions."),
+                    enum_property(
+                        "status",
+                        "Todo status for update actions.",
+                        ["pending", "in_progress", "completed", "blocked"],
+                    ),
+                    integer_property("parent_id", "Optional parent todo id for add actions."),
+                    string_property("note", "Optional note to append while updating a todo."),
+                ],
+                [],
+            ),
+        ),
+        builtin_tool(
+            "skill_search",
+            "Search discovered skill metadata without loading full skill bodies.",
+            object_schema(
+                [
+                    string_property(
+                        "query",
+                        "Skill search query; empty string lists broadly relevant skills.",
+                    ),
+                    integer_property("max_results", "Maximum number of skills to return."),
+                ],
+                [],
+            ),
+        ),
+        builtin_tool(
+            "skill",
+            "Load the body of a selected skill by name.",
+            object_schema(
+                [string_property(
+                    "name",
+                    "Skill name returned by skill_search.",
+                )],
+                ["name"],
+            ),
+        ),
+        builtin_tool(
+            "ask_user",
+            "Ask the human user a blocking clarification question.",
+            object_schema(
+                [string_property(
+                    "question",
+                    "Question to present to the user.",
+                )],
+                ["question"],
+            ),
+        ),
+        builtin_tool(
+            "run_command",
+            "Execute a shell command in the configured project environment.",
+            object_schema(
+                [string_property(
+                    "cmd",
+                    "Shell command to execute from the project root.",
+                )],
+                ["cmd"],
+            ),
+        ),
+        builtin_tool(
+            "edit_file",
+            "Replace an exact text occurrence in a project file.",
+            object_schema(
+                [
+                    string_property("path", "Project-relative file path to edit."),
+                    string_property("old_text", "Exact text to replace."),
+                    string_property("new_text", "Replacement text."),
+                ],
+                ["path", "old_text", "new_text"],
+            ),
+        ),
+        builtin_tool(
+            "apply_patch",
+            "Apply a unified diff patch to project files.",
+            object_schema(
+                [string_property("patch", "Unified diff patch text.")],
+                ["patch"],
+            ),
+        ),
+        builtin_tool(
+            "mv",
+            "Move or rename a file or directory inside the project root.",
+            object_schema(
+                [
+                    string_property("source", "Existing project-relative source path."),
+                    string_property("destination", "New project-relative destination path."),
+                ],
+                ["source", "destination"],
+            ),
+        ),
+        builtin_tool(
+            "rm",
+            "Remove a file or directory inside the project root.",
+            object_schema(
+                [
+                    string_property("path", "Project-relative path to remove."),
+                    boolean_property("recursive", "Whether to recursively remove a directory."),
+                ],
+                ["path"],
+            ),
+        ),
+        builtin_tool(
+            "git_commit",
+            "Commit all current project changes with a semantic commit message.",
+            object_schema(
+                [string_property("message", "Semantic commit message.")],
+                ["message"],
+            ),
+        ),
+        builtin_tool(
+            "git_revert",
+            "Revert a commit by hash or revision.",
+            object_schema(
+                [string_property(
+                    "commit",
+                    "Commit hash or revision to revert.",
+                )],
+                ["commit"],
+            ),
+        ),
+        builtin_tool(
+            "sub_agent",
+            "Delegate bounded work to another agent profile in a fresh context.",
+            object_schema(
+                [
+                    enum_property(
+                        "profile",
+                        "Profile for the delegated agent.",
+                        [
+                            "explore", "review", "plan", "ask", "research", "scout", "build",
+                        ],
+                    ),
+                    string_property("task", "Concrete task for the delegated agent."),
+                    integer_property(
+                        "max_steps",
+                        "Maximum tool/final iterations for the delegated agent.",
+                    ),
+                ],
+                ["profile", "task"],
+            ),
+        ),
+    ]
+}
+
+fn builtin_tool(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+) -> BuiltInToolSchema {
+    BuiltInToolSchema {
+        name,
+        description,
+        input_schema,
     }
-    if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
-        tools.push("edit_file(path,old_text,new_text)");
-        tools.push("apply_patch(patch)");
-        tools.push("mv(source,destination)");
-        tools.push("rm(path,recursive)");
-        tools.push("git_commit(message)");
-        tools.push("git_revert(commit)");
+}
+
+fn object_schema<const P: usize, const R: usize>(
+    properties: [(&'static str, Value); P],
+    required: [&'static str; R],
+) -> Value {
+    let mut property_map = Map::new();
+    for (name, schema) in properties {
+        property_map.insert(name.to_string(), schema);
     }
-    if allow_sub_agents && profile != AgentProfile::Research {
-        tools.push("sub_agent(profile,task,max_steps)");
-    }
-    tools
+    json!({
+        "type": "object",
+        "properties": property_map,
+        "required": required.to_vec(),
+        "additionalProperties": false,
+    })
+}
+
+fn string_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "string", "description": description }),
+    )
+}
+
+fn integer_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "integer", "description": description, "minimum": 1 }),
+    )
+}
+
+fn boolean_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "boolean", "description": description }),
+    )
+}
+
+fn enum_property<const N: usize>(
+    name: &'static str,
+    description: &'static str,
+    values: [&'static str; N],
+) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "string", "description": description, "enum": values.to_vec() }),
+    )
 }
 
 fn tool_allowed(
@@ -2950,6 +3281,44 @@ mod tests {
         assert!(instructions.contains("Profile: build"));
         assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
+    }
+
+    #[test]
+    fn build_profile_instructions_include_mcp_shaped_tool_schemas() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            true,
+        )
+        .unwrap();
+        assert!(instructions.contains("Tool schemas use the MCP tool shape"));
+        assert!(instructions.contains(r#""inputSchema": {"#));
+        assert!(instructions.contains(r#""name": "read_file""#));
+        assert!(instructions.contains(r#""required": ["#));
+        assert!(instructions.contains(r#""additionalProperties": false"#));
+    }
+
+    #[test]
+    fn available_tool_specs_filter_by_profile_and_backend() {
+        let review_tools = available_tool_specs(AgentProfile::Review, None, false);
+        assert!(review_tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(!review_tools.iter().any(|tool| tool.name == "edit_file"));
+        assert!(!review_tools.iter().any(|tool| tool.name == "run_command"));
+
+        let build_tools =
+            available_tool_specs(AgentProfile::Build, Some(CommandBackendKind::Local), true);
+        let run_command = build_tools
+            .iter()
+            .find(|tool| tool.name == "run_command")
+            .expect("run_command should be available with a backend");
+        assert_eq!(run_command.input_schema["type"], "object");
+        assert_eq!(run_command.input_schema["required"], json!(["cmd"]));
+        assert!(build_tools.iter().any(|tool| tool.name == "sub_agent"));
     }
 
     #[test]
