@@ -37,6 +37,7 @@ mod macos {
     type Bool = i8;
 
     const ICON_BYTES: &[u8] = include_bytes!("../public/icon-192.png");
+    const TRAY_ICON_SIZE: c_double = 18.0;
 
     static WEB_URL: OnceLock<String> = OnceLock::new();
     static STATUS_HOST: OnceLock<String> = OnceLock::new();
@@ -238,6 +239,13 @@ mod macos {
         )
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsSize {
+        width: c_double,
+        height: c_double,
+    }
+
     unsafe fn status_icon() -> Id {
         let data = msg_send_id2_ptr_usize(
             class("NSData"),
@@ -247,6 +255,14 @@ mod macos {
         );
         let image_alloc: Id = msg_send_id0(class("NSImage"), sel("alloc"));
         let image: Id = msg_send_id1_id(image_alloc, sel("initWithData:"), data);
+        msg_send_void1_size(
+            image,
+            sel("setSize:"),
+            NsSize {
+                width: TRAY_ICON_SIZE,
+                height: TRAY_ICON_SIZE,
+            },
+        );
         msg_send_void1_bool(image, sel("setTemplate:"), 1_i8);
         image
     }
@@ -342,6 +358,12 @@ mod macos {
 
     unsafe fn msg_send_void1_bool(receiver: Id, selector: Sel, arg: Bool) {
         type FnPtr = unsafe extern "C" fn(Id, Sel, Bool);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
+    }
+
+    unsafe fn msg_send_void1_size(receiver: Id, selector: Sel, arg: NsSize) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, NsSize);
         let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         unsafe { f(receiver, selector, arg) }
     }
