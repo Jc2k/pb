@@ -93,6 +93,9 @@ pub enum SelfCommand {
     Uninstall(SelfUninstallArgs),
     /// Update pb from the latest GitHub release
     Update,
+    /// Refresh launchd service configuration after a self-update
+    #[command(name = "refresh-service", hide = true)]
+    RefreshService,
 }
 
 #[derive(Args, Debug)]
@@ -410,6 +413,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             SelfCommand::Install => run_self_install(),
             SelfCommand::Uninstall(args) => run_self_uninstall(&args),
             SelfCommand::Update => run_self_update(),
+            SelfCommand::RefreshService => run_self_refresh_service(),
         },
         Commands::Pull(args) => pull_model(&args).await,
         Commands::Queue(args) => run_queue(args).await,
@@ -781,8 +785,29 @@ fn run_self_update() -> Result<()> {
         .context("self-update failed")?;
 
     println!("Updated to {}", status.version());
-    service::refresh_plist_if_installed(&installed_binary_path()?)?;
-    service::restart_or_start_if_installed()?;
+    run_updated_binary_service_refresh(&installed_binary_path()?)?;
+    Ok(())
+}
+
+fn run_self_refresh_service() -> Result<()> {
+    service::refresh_plist_and_reload_if_changed(&installed_binary_path()?)
+}
+
+fn run_updated_binary_service_refresh(binary: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let status = Command::new(binary)
+        .args(["self", "refresh-service"])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run updated pb binary at {} to refresh launchd service",
+                binary.display()
+            )
+        })?;
+    if !status.success() {
+        bail!("updated pb binary failed to refresh launchd service (exit {status})");
+    }
     Ok(())
 }
 
