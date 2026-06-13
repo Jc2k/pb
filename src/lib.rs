@@ -21,6 +21,7 @@ pub mod daemon_client;
 pub mod environment;
 pub mod events;
 pub mod init;
+pub mod mcp;
 pub mod projects;
 pub mod service;
 pub mod session_store;
