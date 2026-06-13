@@ -10,10 +10,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, sleep};
 
 use crate::agent_core::AgentProfile;
+use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 
 pub mod agent_core;
 pub mod cli_ui;
+pub mod config;
 pub mod container;
 pub mod daemon_client;
 pub mod environment;
@@ -55,6 +57,12 @@ pub enum Commands {
     Queue(QueueArgs),
     /// Start the web UI server
     Serve(ServeArgs),
+    /// Manage user-level configuration
+    #[command(name = "config")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage named projects in the user-global registry
     #[command(name = "projects", alias = "project")]
     Projects {
@@ -109,6 +117,31 @@ pub enum EnvCommand {
     Start(EnvWorkdirArgs),
     /// Show the current project environment configuration
     Status(EnvWorkdirArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Set a user configuration value, for example: pb config set web.listen 0.0.0.0
+    Set(ConfigSetArgs),
+    /// Get a user configuration value
+    Get(ConfigGetArgs),
+    /// Show the user configuration TOML
+    Show,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ConfigSetArgs {
+    /// Dot-separated config key, such as web.listen or model.temperature
+    pub key: String,
+
+    /// Value to store
+    pub value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ConfigGetArgs {
+    /// Dot-separated config key, such as web.listen or model.temperature
+    pub key: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -348,20 +381,20 @@ pub struct QueueArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
     /// Bind host
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
+    #[arg(long)]
+    pub host: Option<String>,
 
     /// Bind port
-    #[arg(long, default_value_t = 8311)]
-    pub port: u16,
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// Unix socket path for local daemon clients
     #[arg(long)]
     pub socket_path: Option<PathBuf>,
 
     /// Default model for API sessions
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    pub model: String,
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Directory containing pulled model blobs
     #[arg(long)]
@@ -372,16 +405,16 @@ pub struct ServeArgs {
     pub workdir: Option<PathBuf>,
 
     /// Default max steps per run
-    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_STEPS)]
-    pub max_steps: usize,
+    #[arg(long)]
+    pub max_steps: Option<usize>,
 
     /// Default max new tokens per model turn
-    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_TOKENS)]
-    pub max_tokens: i32,
+    #[arg(long)]
+    pub max_tokens: Option<i32>,
 
     /// Default context size
-    #[arg(long, default_value_t = 8192)]
-    pub ctx_size: u32,
+    #[arg(long)]
+    pub ctx_size: Option<u32>,
 
     /// Default number of CPU threads for decoding
     #[arg(long)]
@@ -392,24 +425,24 @@ pub struct ServeArgs {
     pub threads_batch: Option<i32>,
 
     /// Default number of transformer layers to offload to GPU
-    #[arg(long, default_value_t = default_gpu_layers())]
-    pub gpu_layers: u32,
+    #[arg(long)]
+    pub gpu_layers: Option<u32>,
 
     /// Default temperature
-    #[arg(long, default_value_t = 0.2)]
-    pub temperature: f32,
+    #[arg(long)]
+    pub temperature: Option<f32>,
 
     /// Default agent profile for new sessions
-    #[arg(long, value_enum, default_value_t = AgentProfile::Build)]
-    pub profile: AgentProfile,
+    #[arg(long, value_enum)]
+    pub profile: Option<AgentProfile>,
 
     /// Default top-k for sampling
-    #[arg(long, default_value_t = 40)]
-    pub top_k: i32,
+    #[arg(long)]
+    pub top_k: Option<i32>,
 
     /// Default RNG seed
-    #[arg(long, default_value_t = 1337)]
-    pub seed: u32,
+    #[arg(long)]
+    pub seed: Option<u32>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -462,6 +495,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Pull(args) => pull_model(&args).await,
         Commands::Queue(args) => run_queue(args).await,
         Commands::Serve(args) => run_serve(args).await,
+        Commands::Config { command } => run_config_command(command),
         Commands::Tray(args) => tray::run(tray::TrayArgs {
             host: args.host,
             port: args.port,
@@ -474,36 +508,39 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    let user_config = UserConfig::load()?;
+    let resolved_host = user_config.effective_web_listen(args.host.clone());
+    let resolved_port = user_config.effective_web_port(args.port);
     let defaults = agent_core::AgentRequest {
         task: String::new(),
-        model: args.model.clone(),
-        model_dir: args.model_dir.clone(),
-        workdir: args.workdir.clone(),
+        model: user_config.effective_model(args.model.clone()),
+        model_dir: user_config.effective_model_dir(args.model_dir.clone()),
+        workdir: user_config.effective_workdir(args.workdir.clone()),
         branch: None,
-        max_steps: args.max_steps,
-        max_tokens: args.max_tokens,
-        ctx_size: args.ctx_size,
-        threads: args.threads,
-        threads_batch: args.threads_batch,
-        gpu_layers: args.gpu_layers,
-        temperature: args.temperature,
-        profile: args.profile,
+        max_steps: user_config.effective_max_steps(args.max_steps),
+        max_tokens: user_config.effective_max_tokens(args.max_tokens),
+        ctx_size: user_config.effective_ctx_size(args.ctx_size),
+        threads: user_config.effective_threads(args.threads),
+        threads_batch: user_config.effective_threads_batch(args.threads_batch),
+        gpu_layers: user_config.effective_gpu_layers(args.gpu_layers),
+        temperature: user_config.effective_temperature(args.temperature),
+        profile: user_config.effective_profile(args.profile),
         infer_profile: false,
         sub_agent_depth: 0,
-        top_k: args.top_k,
-        seed: args.seed,
+        top_k: user_config.effective_top_k(args.top_k),
+        seed: user_config.effective_seed(args.seed),
         environment: None,
     };
     let server_args = web::ServeArgs {
-        host: args.host.clone(),
-        port: args.port,
+        host: resolved_host.clone(),
+        port: resolved_port,
         socket_path: args
             .socket_path
             .clone()
             .unwrap_or_else(daemon_client::default_socket_path),
     };
 
-    run_serve_platform(args, server_args, defaults).await
+    run_serve_platform(args, server_args, defaults, resolved_host, resolved_port).await
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -511,15 +548,19 @@ async fn run_serve_platform(
     _cli_args: ServeArgs,
     server_args: web::ServeArgs,
     defaults: agent_core::AgentRequest,
+    _resolved_host: String,
+    _resolved_port: u16,
 ) -> Result<()> {
     web::run_server(server_args, defaults).await
 }
 
 #[cfg(target_os = "macos")]
 async fn run_serve_platform(
-    cli_args: ServeArgs,
+    _cli_args: ServeArgs,
     server_args: web::ServeArgs,
     defaults: agent_core::AgentRequest,
+    resolved_host: String,
+    resolved_port: u16,
 ) -> Result<()> {
     use std::sync::mpsc;
 
@@ -543,14 +584,41 @@ async fn run_serve_platform(
         .context("pb web server exited before startup")?
     {
         Ok(_) => tray::run(tray::TrayArgs {
-            host: cli_args.host,
-            port: cli_args.port,
+            host: resolved_host,
+            port: resolved_port,
         }),
         Err(err) => {
             let _ = server_thread.join();
             bail!(err);
         }
     }
+}
+
+fn run_config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Set(args) => {
+            let mut config = UserConfig::load()?;
+            config.set(&args.key, &args.value)?;
+            config.save()?;
+            println!(
+                "{} = {}",
+                args.key,
+                config.get(&args.key)?.unwrap_or_default()
+            );
+        }
+        ConfigCommand::Get(args) => {
+            let config = UserConfig::load()?;
+            match config.get(&args.key)? {
+                Some(value) => println!("{value}"),
+                None => bail!("config key '{}' is not set", args.key),
+            }
+        }
+        ConfigCommand::Show => {
+            let config = UserConfig::load()?;
+            print!("{}", config.to_pretty_toml()?);
+        }
+    }
+    Ok(())
 }
 
 async fn run_projects_command(command: ProjectsCommand) -> Result<()> {

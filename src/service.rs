@@ -39,29 +39,52 @@ fn render_plist(exe: &str, args: &ServeArgs) -> String {
     let mut program_args = vec![
         format!("        <string>{exe}</string>"),
         "        <string>serve</string>".to_string(),
-        "        <string>--host</string>".to_string(),
-        format!("        <string>{}</string>", args.host),
-        "        <string>--port</string>".to_string(),
-        format!("        <string>{}</string>", args.port),
-        "        <string>--model</string>".to_string(),
-        format!("        <string>{}</string>", args.model),
-        "        <string>--gpu-layers</string>".to_string(),
-        format!("        <string>{}</string>", args.gpu_layers),
-        "        <string>--max-steps</string>".to_string(),
-        format!("        <string>{}</string>", args.max_steps),
-        "        <string>--max-tokens</string>".to_string(),
-        format!("        <string>{}</string>", args.max_tokens),
-        "        <string>--ctx-size</string>".to_string(),
-        format!("        <string>{}</string>", args.ctx_size),
-        "        <string>--temperature</string>".to_string(),
-        format!("        <string>{}</string>", args.temperature),
-        "        <string>--profile</string>".to_string(),
-        format!("        <string>{}</string>", args.profile),
-        "        <string>--top-k</string>".to_string(),
-        format!("        <string>{}</string>", args.top_k),
-        "        <string>--seed</string>".to_string(),
-        format!("        <string>{}</string>", args.seed),
     ];
+
+    if let Some(ref host) = args.host {
+        program_args.push("        <string>--host</string>".to_string());
+        program_args.push(format!("        <string>{host}</string>"));
+    }
+    if let Some(port) = args.port {
+        program_args.push("        <string>--port</string>".to_string());
+        program_args.push(format!("        <string>{port}</string>"));
+    }
+    if let Some(ref model) = args.model {
+        program_args.push("        <string>--model</string>".to_string());
+        program_args.push(format!("        <string>{model}</string>"));
+    }
+    if let Some(gpu_layers) = args.gpu_layers {
+        program_args.push("        <string>--gpu-layers</string>".to_string());
+        program_args.push(format!("        <string>{gpu_layers}</string>"));
+    }
+    if let Some(max_steps) = args.max_steps {
+        program_args.push("        <string>--max-steps</string>".to_string());
+        program_args.push(format!("        <string>{max_steps}</string>"));
+    }
+    if let Some(max_tokens) = args.max_tokens {
+        program_args.push("        <string>--max-tokens</string>".to_string());
+        program_args.push(format!("        <string>{max_tokens}</string>"));
+    }
+    if let Some(ctx_size) = args.ctx_size {
+        program_args.push("        <string>--ctx-size</string>".to_string());
+        program_args.push(format!("        <string>{ctx_size}</string>"));
+    }
+    if let Some(temperature) = args.temperature {
+        program_args.push("        <string>--temperature</string>".to_string());
+        program_args.push(format!("        <string>{temperature}</string>"));
+    }
+    if let Some(profile) = args.profile {
+        program_args.push("        <string>--profile</string>".to_string());
+        program_args.push(format!("        <string>{profile}</string>"));
+    }
+    if let Some(top_k) = args.top_k {
+        program_args.push("        <string>--top-k</string>".to_string());
+        program_args.push(format!("        <string>{top_k}</string>"));
+    }
+    if let Some(seed) = args.seed {
+        program_args.push("        <string>--seed</string>".to_string());
+        program_args.push(format!("        <string>{seed}</string>"));
+    }
 
     if let Some(ref model_dir) = args.model_dir {
         program_args.push("        <string>--model-dir</string>".to_string());
@@ -354,22 +377,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn default_serve_args() -> ServeArgs {
         ServeArgs {
-            host: "127.0.0.1".to_string(),
-            port: 8311,
-            model: DEFAULT_MODEL.to_string(),
+            host: Some("127.0.0.1".to_string()),
+            port: Some(8311),
+            model: Some(DEFAULT_MODEL.to_string()),
             model_dir: None,
             workdir: None,
             socket_path: None,
-            max_steps: DEFAULT_AGENT_MAX_STEPS,
-            max_tokens: DEFAULT_AGENT_MAX_TOKENS,
-            ctx_size: 8192,
+            max_steps: Some(DEFAULT_AGENT_MAX_STEPS),
+            max_tokens: Some(DEFAULT_AGENT_MAX_TOKENS),
+            ctx_size: Some(8192),
             threads: None,
             threads_batch: None,
-            gpu_layers: default_gpu_layers(),
-            temperature: 0.2,
-            profile: crate::agent_core::AgentProfile::Build,
-            top_k: 40,
-            seed: 1337,
+            gpu_layers: Some(default_gpu_layers()),
+            temperature: Some(0.2),
+            profile: Some(crate::agent_core::AgentProfile::Build),
+            top_k: Some(40),
+            seed: Some(1337),
         }
     }
 
