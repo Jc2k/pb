@@ -42,6 +42,8 @@ mod macos {
     static STATUS_HOST: OnceLock<String> = OnceLock::new();
     static STATUS_PORT: OnceLock<u16> = OnceLock::new();
     static STATUS_BUTTON: OnceLock<usize> = OnceLock::new();
+    static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
+    static STATUS_DELEGATE: OnceLock<usize> = OnceLock::new();
 
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {}
@@ -56,7 +58,10 @@ mod macos {
         fn objc_registerClassPair(cls: Id);
         fn class_addMethod(cls: Id, name: Sel, imp: *const c_void, types: *const c_char) -> Bool;
         fn sel_registerName(name: *const c_char) -> Sel;
-        fn objc_msgSend(receiver: Id, selector: Sel, ...) -> Id;
+        // objc_msgSend must be cast to the exact Objective-C method signature for
+        // each call site. Calling it through a single C-variadic declaration is
+        // undefined on macOS/arm64, especially for floating-point arguments.
+        fn objc_msgSend();
     }
 
     pub fn run(args: TrayArgs) -> Result<()> {
@@ -72,29 +77,36 @@ mod macos {
             .map_err(|_| anyhow::anyhow!("tray port already initialized"))?;
 
         unsafe {
-            let app: Id = msg_send0(class("NSApplication"), sel("sharedApplication"));
-            let _: Id = msg_send1(app, sel("setActivationPolicy:"), 1_i64);
+            let app: Id = msg_send_id0(class("NSApplication"), sel("sharedApplication"));
+            msg_send_void1_i64(app, sel("setActivationPolicy:"), 1_i64);
 
             let delegate_class = create_delegate_class()?;
-            let delegate: Id = msg_send0(delegate_class, sel("new"));
+            let delegate: Id = msg_send_id0(delegate_class, sel("new"));
+            STATUS_DELEGATE
+                .set(delegate as usize)
+                .map_err(|_| anyhow::anyhow!("tray delegate already initialized"))?;
 
-            let status_bar: Id = msg_send0(class("NSStatusBar"), sel("systemStatusBar"));
-            let status_item: Id = msg_send1(
+            let status_bar: Id = msg_send_id0(class("NSStatusBar"), sel("systemStatusBar"));
+            let status_item: Id = msg_send_id1_f64(
                 status_bar,
                 sel("statusItemWithLength:"),
                 -1.0_f64 as c_double,
             );
-            let button: Id = msg_send0(status_item, sel("button"));
+            msg_send_id0(status_item, sel("retain"));
+            STATUS_ITEM
+                .set(status_item as usize)
+                .map_err(|_| anyhow::anyhow!("tray status item already initialized"))?;
+            let button: Id = msg_send_id0(status_item, sel("button"));
             STATUS_BUTTON
                 .set(button as usize)
                 .map_err(|_| anyhow::anyhow!("tray button already initialized"))?;
-            let _: Id = msg_send1(button, sel("setImage:"), status_icon());
+            msg_send_void1_id(button, sel("setImage:"), status_icon());
             set_button_title("");
-            let _: Id = msg_send1(button, sel("setToolTip:"), ns_string("pb idle"));
-            let _: Id = msg_send1(button, sel("setTarget:"), delegate);
-            let _: Id = msg_send1(button, sel("setAction:"), sel("pbStatusItemClicked:"));
+            msg_send_void1_id(button, sel("setToolTip:"), ns_string("pb idle"));
+            msg_send_void1_id(button, sel("setTarget:"), delegate);
+            msg_send_void1_sel(button, sel("setAction:"), sel("pbStatusItemClicked:"));
 
-            let _: Id = msg_send5(
+            let _timer = msg_send_id5_timer(
                 class("NSTimer"),
                 sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
                 2.0_f64 as c_double,
@@ -105,7 +117,7 @@ mod macos {
             );
 
             update_status_item();
-            let _: Id = msg_send0(app, sel("run"));
+            msg_send_void0(app, sel("run"));
         }
 
         Ok(())
@@ -144,9 +156,9 @@ mod macos {
             let Some(url) = WEB_URL.get() else {
                 return;
             };
-            let workspace: Id = msg_send0(class("NSWorkspace"), sel("sharedWorkspace"));
-            let ns_url: Id = msg_send1(class("NSURL"), sel("URLWithString:"), ns_string(url));
-            let _: Id = msg_send1(workspace, sel("openURL:"), ns_url);
+            let workspace: Id = msg_send_id0(class("NSWorkspace"), sel("sharedWorkspace"));
+            let ns_url: Id = msg_send_id1_id(class("NSURL"), sel("URLWithString:"), ns_string(url));
+            msg_send_void1_id(workspace, sel("openURL:"), ns_url);
         }
     }
 
@@ -160,12 +172,12 @@ mod macos {
             if busy {
                 set_button_title("•");
                 if let Some(button) = STATUS_BUTTON.get() {
-                    let _: Id = msg_send1(*button as Id, sel("setToolTip:"), ns_string("pb busy"));
+                    msg_send_void1_id(*button as Id, sel("setToolTip:"), ns_string("pb busy"));
                 }
             } else {
                 set_button_title("");
                 if let Some(button) = STATUS_BUTTON.get() {
-                    let _: Id = msg_send1(*button as Id, sel("setToolTip:"), ns_string("pb idle"));
+                    msg_send_void1_id(*button as Id, sel("setToolTip:"), ns_string("pb idle"));
                 }
             }
         }
@@ -173,7 +185,7 @@ mod macos {
 
     unsafe fn set_button_title(title: &str) {
         if let Some(button) = STATUS_BUTTON.get() {
-            let _: Id = msg_send1(*button as Id, sel("setTitle:"), ns_string(title));
+            msg_send_void1_id(*button as Id, sel("setTitle:"), ns_string(title));
         }
     }
 
@@ -215,55 +227,122 @@ mod macos {
     }
 
     unsafe fn ns_string(value: &str) -> Id {
-        let ns_string: Id = msg_send0(class("NSString"), sel("alloc"));
+        let ns_string: Id = msg_send_id0(class("NSString"), sel("alloc"));
         let c_string = CString::new(value).unwrap();
-        msg_send3(
+        msg_send_id3_ptr_usize_u64(
             ns_string,
             sel("initWithBytes:length:encoding:"),
-            c_string.as_ptr(),
+            c_string.as_ptr().cast::<c_void>(),
             value.len(),
             4_u64,
         )
     }
 
     unsafe fn status_icon() -> Id {
-        let data = msg_send2(
+        let data = msg_send_id2_ptr_usize(
             class("NSData"),
             sel("dataWithBytes:length:"),
-            ICON_BYTES.as_ptr(),
+            ICON_BYTES.as_ptr().cast::<c_void>(),
             ICON_BYTES.len(),
         );
-        let image_alloc: Id = msg_send0(class("NSImage"), sel("alloc"));
-        let image: Id = msg_send1(image_alloc, sel("initWithData:"), data);
-        let _: Id = msg_send1(image, sel("setTemplate:"), 1_i32);
+        let image_alloc: Id = msg_send_id0(class("NSImage"), sel("alloc"));
+        let image: Id = msg_send_id1_id(image_alloc, sel("initWithData:"), data);
+        msg_send_void1_bool(image, sel("setTemplate:"), 1_i8);
         image
     }
 
-    unsafe fn msg_send0(receiver: Id, selector: Sel) -> Id {
-        unsafe { objc_msgSend(receiver, selector) }
+    unsafe fn msg_send_id0(receiver: Id, selector: Sel) -> Id {
+        type FnPtr = unsafe extern "C" fn(Id, Sel) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector) }
     }
 
-    unsafe fn msg_send1<A>(receiver: Id, selector: Sel, arg: A) -> Id {
-        unsafe { objc_msgSend(receiver, selector, arg) }
+    unsafe fn msg_send_void0(receiver: Id, selector: Sel) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector) }
     }
 
-    unsafe fn msg_send2<A, B>(receiver: Id, selector: Sel, a: A, b: B) -> Id {
-        unsafe { objc_msgSend(receiver, selector, a, b) }
+    unsafe fn msg_send_id1_id(receiver: Id, selector: Sel, arg: Id) -> Id {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, Id) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
     }
 
-    unsafe fn msg_send3<A, B, C>(receiver: Id, selector: Sel, a: A, b: B, c: C) -> Id {
-        unsafe { objc_msgSend(receiver, selector, a, b, c) }
+    unsafe fn msg_send_id1_f64(receiver: Id, selector: Sel, arg: c_double) -> Id {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, c_double) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
     }
 
-    unsafe fn msg_send5<A, B, C, D, E>(
+    unsafe fn msg_send_id2_ptr_usize(
         receiver: Id,
         selector: Sel,
-        a: A,
-        b: B,
-        c: C,
-        d: D,
-        e: E,
+        ptr: *const c_void,
+        len: usize,
     ) -> Id {
-        unsafe { objc_msgSend(receiver, selector, a, b, c, d, e) }
+        type FnPtr = unsafe extern "C" fn(Id, Sel, *const c_void, usize) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, ptr, len) }
+    }
+
+    unsafe fn msg_send_id3_ptr_usize_u64(
+        receiver: Id,
+        selector: Sel,
+        ptr: *const c_void,
+        len: usize,
+        encoding: u64,
+    ) -> Id {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, *const c_void, usize, u64) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, ptr, len, encoding) }
+    }
+
+    unsafe fn msg_send_id5_timer(
+        receiver: Id,
+        selector: Sel,
+        interval: c_double,
+        target: Id,
+        timer_selector: Sel,
+        user_info: Id,
+        repeats: Bool,
+    ) -> Id {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, c_double, Id, Sel, Id, Bool) -> Id;
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe {
+            f(
+                receiver,
+                selector,
+                interval,
+                target,
+                timer_selector,
+                user_info,
+                repeats,
+            )
+        }
+    }
+
+    unsafe fn msg_send_void1_id(receiver: Id, selector: Sel, arg: Id) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, Id);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
+    }
+
+    unsafe fn msg_send_void1_sel(receiver: Id, selector: Sel, arg: Sel) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, Sel);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
+    }
+
+    unsafe fn msg_send_void1_i64(receiver: Id, selector: Sel, arg: i64) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, i64);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
+    }
+
+    unsafe fn msg_send_void1_bool(receiver: Id, selector: Sel, arg: Bool) {
+        type FnPtr = unsafe extern "C" fn(Id, Sel, Bool);
+        let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { f(receiver, selector, arg) }
     }
 }
