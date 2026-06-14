@@ -420,144 +420,154 @@ function HomePage() {
       <div className="app-shell">
         <aside className="sidebar d-none d-lg-flex flex-column">
           <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-            <div className="brand-mark"><i className="bi bi-terminal"></i></div>
-            <div>
-              <strong>LocalAgent</strong>
-              <small className="d-block text-secondary">Private by default</small>
-            </div>
+            <div className="brand-mark">&gt;_</div>
+            <strong>LocalAgent</strong>
           </div>
 
           <nav className="nav nav-pills flex-column gap-1 px-2">
-            <a className="nav-link active" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
+            <a className="nav-link active" href="#"><i className="bi bi-house-door"></i> Home</a>
+            <a className="nav-link" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
             <a className="nav-link" href="#"><i className="bi bi-folder2-open"></i> Projects</a>
-            <a className="nav-link" href="#"><i className="bi bi-files"></i> Files</a>
-            <a className="nav-link" href="#"><i className="bi bi-shield-lock"></i> Privacy</a>
             <a className="nav-link" href="#"><i className="bi bi-gear"></i> Settings</a>
           </nav>
 
-          <div className="mt-auto p-3 user-mini">
-            <div className="avatar-sm">JC</div>
+          <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">
+            <div className="avatar-sm">JD</div>
             <div>
-              <strong>John Carr</strong>
+              <strong>Jane Doe</strong>
               <small className="d-block text-secondary">Local workspace</small>
             </div>
           </div>
         </aside>
 
-        <section className="session-panel" style={{ gridTemplateRows: "auto 1fr", height: "100vh" }}>
-          <header className="session-header">
-            <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-              <img
-                src="/logo.svg"
-                alt="pb"
-                width="32"
-                height="32"
-                style={{ borderRadius: "6px" }}
-              />
-              pb
-            </span>
+        <section className="main-panel">
+          <header className="mobile-topbar d-lg-none d-flex align-items-center justify-content-between px-3 py-2">
+            <div className="brand compact d-flex align-items-center gap-2">
+              <div className="brand-mark">&gt;_</div>
+              <strong>LocalAgent</strong>
+            </div>
+            <button className="btn btn-light btn-icon" aria-label="Open menu">☰</button>
           </header>
 
-          <div className="container-fluid px-3 pb-4" style={{ overflowY: "auto" }}>
-            <div className="row g-3 justify-content-center">
-              <div className="col-lg-6 col-xl-5 d-flex flex-column gap-3">
-                <div className="card">
-                  <div className="card-body d-flex flex-column gap-2">
-                    <textarea
-                      className="form-control"
-                      rows={4}
-                      value={task}
-                      onChange={(e) => setTask(e.target.value)}
-                      placeholder="Describe the task…"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
-                          void startSession();
-                      }}
-                    />
-                    <div>
-                      <select
-                        className="form-select"
-                        value={workdir}
-                        onChange={(e) => setWorkdir(e.target.value)}
-                        disabled={projects.length === 0}
-                      >
-                        {projects.length === 0 ? (
-                          <option value="">No registered projects</option>
-                        ) : (
-                          projects.map((project) => (
-                            <option key={project.name} value={project.path}>
-                              {project.name} — {project.path}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                      <div className="form-text">
-                        Register projects with <code>pb projects add</code>.
-                      </div>
-                    </div>
-                    <input
-                      className="form-control"
+          <div className="content-wrap">
+            <section className="hero-section">
+              <h1>Start a new session</h1>
+              <p className="text-secondary mb-3">Describe what you'd like the agent to work on.</p>
+
+              <form
+                className="start-card card"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void startSession();
+                }}
+              >
+                <div className="task-editor position-relative">
+                  <textarea
+                    className="form-control"
+                    value={task}
+                    onChange={(e) => setTask(e.target.value)}
+                    placeholder="What would you like the agent to do?"
+                    rows={4}
+                  />
+                  <div className="editor-actions position-absolute end-0 bottom-0 p-2">
+                    <button type="button" className="btn btn-sm border rounded-2 text-secondary bg-transparent" aria-label="Attach context">⌕</button>
+                    <button type="button" className="btn btn-sm border rounded-2 text-secondary bg-transparent" aria-label="Improve prompt">✣</button>
+                  </div>
+                </div>
+
+                <div className="session-controls row g-3 align-items-end p-3">
+                  <div className="col-12 col-md-5">
+                    <label className="form-label small fw-semibold">Project</label>
+                    <select
+                      className="form-select"
+                      value={workdir}
+                      onChange={(e) => setWorkdir(e.target.value)}
+                      disabled={projects.length === 0}
+                    >
+                      {projects.length === 0 ? (
+                        <option value="">No registered projects</option>
+                      ) : (
+                        projects.map((project) => (
+                          <option key={project.name} value={project.path}>
+                            {project.name}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
+                  <div className="col-12 col-md-4">
+                    <label className="form-label small fw-semibold">Base branch</label>
+                    <select
+                      className="form-select"
                       value={branch}
                       onChange={(e) => setBranch(e.target.value)}
-                      placeholder="Branch (default: main)"
-                    />
+                    >
+                      <option>main</option>
+                      <option>develop</option>
+                      <option>feature/ui-refresh</option>
+                    </select>
+                  </div>
+                  <div className="col-12 col-md-3 d-grid">
                     <button
-                      className="btn btn-primary"
-                      onClick={() => void startSession()}
+                      className="btn btn-primary start-button"
+                      type="submit"
                       disabled={!task.trim() || !workdir || isSubmitting}
                     >
-                      {isSubmitting ? (
-                        <>
-                          <span className="spinner-border spinner-border-sm me-2" />
-                          Queueing…
-                        </>
-                      ) : (
-                        "Queue task"
-                      )}
+                      ▷ Start session
                     </button>
                   </div>
                 </div>
+              </form>
+            </section>
 
-                <div className="card">
-                  <div className="card-body py-2 small d-flex flex-wrap gap-2 align-items-center">
-                    <span className="fw-semibold me-1">Queue state</span>
-                    <span className="badge bg-info text-dark">
-                      {queuedCount} queued
-                    </span>
-                    <span className="badge bg-primary">{runningCount} running</span>
-                    <span className="badge bg-warning text-dark">
-                      {pausedCount} paused
-                    </span>
-                    <span className="badge bg-secondary">
-                      {completedCount} completed
-                    </span>
-                  </div>
-                </div>
-
-                <div className="list-group">
-                  {sessions.length === 0 ? (
-                    <div className="list-group-item text-body-secondary small">
-                      No sessions yet
-                    </div>
-                  ) : (
-                    sessions.map((s) => (
-                      <SessionCard
-                        key={s.session_id}
-                        session={s}
-                        onClick={() => navigate(`/sessions/${s.session_id}`)}
-                      />
-                    ))
-                  )}
-                </div>
+            <section className="sessions-section">
+              <div className="section-header d-flex align-items-center justify-content-between mb-3">
+                <h2 className="h6 fw-bold m-0">Recent sessions</h2>
+                <a href="#" className="text-decoration-none small fw-medium text-blue">View all sessions</a>
               </div>
-            </div>
-          </div>
 
-          <form className="composer">
-            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
-            <input className="form-control" placeholder="Message the agent…" aria-label="Message the agent" />
-            <button className="btn btn-primary rounded-circle" type="submit"><i className="bi bi-arrow-up"></i></button>
-          </form>
+              <div className="session-list list-group">
+                {sessions.length === 0 ? (
+                  <div className="list-group-item text-secondary small">
+                    No sessions yet
+                  </div>
+                ) : (
+                  sessions.map((s) => {
+                    let statusClass = "";
+                    let statusText = s.status;
+                    if (s.status === "running") {
+                      statusClass = "status-running";
+                      statusText = "Running";
+                    } else if (s.status === "completed") {
+                      statusClass = "status-completed";
+                      statusText = "Completed";
+                    } else if (s.status === "queued") {
+                      statusClass = "status-queued";
+                      statusText = "Queued";
+                    }
+
+                    return (
+                      <button
+                        key={s.session_id}
+                        type="button"
+                        className={`session-row list-group-item list-group-item-action py-3 px-4 ${s.status}`}
+                        onClick={() => navigate(`/sessions/${s.session_id}`)}
+                      >
+                        <div className={`state-dot rounded-circle bg-${s.status === "running" ? "green" : s.status === "completed" ? "blue" : "gray"}`} />
+                        <div className="session-icon">&gt;_</div>
+                        <div className="session-main">
+                          <strong>{s.task}</strong>
+                          <span>{projectName(s.workdir)} · {formatStartTime(s.updated_at_ms)}</span>
+                        </div>
+                        <span className={`status-pill ${statusClass}`}>{statusText}</span>
+                        <span className="chevron">›</span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+          </div>
         </section>
       </div>
     </>
