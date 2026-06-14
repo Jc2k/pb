@@ -14,19 +14,20 @@ type AgentEvent =
       model: string;
       workspace: string;
       branch: string;
+      nesting_depth?: number;
     }
-  | { type: "step_started"; step: number; max_steps: number }
-  | { type: "reasoning"; content: string }
-  | { type: "tool_call"; tool: string; arguments: unknown }
-  | { type: "tool_result"; tool: string; result: string }
-  | { type: "user_question"; question_id: string; question: string }
-  | { type: "user_answer"; question_id: string; answer: string }
-  | { type: "sub_agent_started"; profile: string; task: string }
-  | { type: "sub_agent_finished"; profile: string; result: string }
-  | { type: "diff"; path: string; diff: string }
-  | { type: "final"; content: string }
-  | { type: "session_summary"; branch: string; commits: string }
-  | { type: "error"; message: string }
+  | { type: "step_started"; step: number; max_steps: number; nesting_depth?: number }
+  | { type: "reasoning"; content: string; nesting_depth?: number }
+  | { type: "tool_call"; tool: string; arguments: unknown; nesting_depth?: number }
+  | { type: "tool_result"; tool: string; result: string; nesting_depth?: number }
+  | { type: "user_question"; question_id: string; question: string; nesting_depth?: number }
+  | { type: "user_answer"; question_id: string; answer: string; nesting_depth?: number }
+  | { type: "sub_agent_started"; profile: string; task: string; nesting_depth?: number }
+  | { type: "sub_agent_finished"; profile: string; result: string; nesting_depth?: number }
+  | { type: "diff"; path: string; diff: string; nesting_depth?: number }
+  | { type: "final"; content: string; nesting_depth?: number }
+  | { type: "session_summary"; branch: string; commits: string; nesting_depth?: number }
+  | { type: "error"; message: string; nesting_depth?: number }
   | { type: string; [key: string]: unknown };
 
 interface EventEnvelope {
@@ -145,8 +146,9 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "step_started":
+      const sd = e.nesting_depth || 0;
       return (
-        <div className="step-marker text-body-secondary small mb-1">
+        <div className="step-marker text-body-secondary small mb-1" style={{ paddingLeft: `${sd * 1rem}` }}>
           <hr className="my-1" />
           <span>
             Step {e.step} / {e.max_steps}
@@ -155,10 +157,11 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "reasoning":
+      const rd = e.nesting_depth || 0;
       return (
-        <details className="card border-0 bg-body-secondary mb-2">
+        <details className="card border-0 bg-body-secondary mb-2" style={{ paddingLeft: `${rd * 1rem}` }}>
           <summary className="card-header border-0 bg-body-secondary py-2 small fw-semibold">
-            Reasoning
+            Reasoning {rd > 0 ? `(depth ${rd})` : ""}
           </summary>
           <div className="card-body py-2">
             <pre className="mb-0 small">{e.content}</pre>
@@ -167,11 +170,12 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "tool_call":
+      const td = e.nesting_depth || 0;
       return (
-        <details className="card border-secondary mb-2" open>
+        <details className="card border-secondary mb-2" open style={{ paddingLeft: `${td * 1rem}` }}>
           <summary className="card-header py-2 small d-flex align-items-center gap-2">
             <span className="badge bg-secondary">tool</span>
-            <code>{e.tool}</code>
+            <code>{e.tool}</code> {td > 0 && <span className="badge bg-info text-dark ms-1">depth {td}</span>}
           </summary>
           <div className="card-body py-2">
             <pre className="mb-0 small">
@@ -182,11 +186,12 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "tool_result":
+      const trd = e.nesting_depth || 0;
       return (
-        <details className="card border-0 bg-body-tertiary mb-2">
+        <details className="card border-0 bg-body-tertiary mb-2" style={{ paddingLeft: `${trd * 1rem}` }}>
           <summary className="card-header border-0 bg-body-tertiary py-2 small d-flex align-items-center gap-2">
             <span className="badge bg-light text-dark">result</span>
-            <code>{e.tool}</code>
+            <code>{e.tool}</code> {trd > 0 && <span className="badge bg-info text-dark ms-1">depth {trd}</span>}
           </summary>
           <div className="card-body py-2">
             <pre className="mb-0 small result-pre">{e.result}</pre>
@@ -211,10 +216,11 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "sub_agent_started":
+      const depth = e.nesting_depth || 0;
       return (
-        <div className="alert alert-secondary py-2 mb-2">
+        <div className="alert alert-secondary py-2 mb-2" style={{ marginLeft: `${depth * 1rem}` }}>
           <div className="small text-uppercase text-body-secondary">
-            Sub-agent
+            Sub-agent (depth {depth})
           </div>
           <div>
             <span className="badge bg-primary me-2">{e.profile}</span>
@@ -224,10 +230,11 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "sub_agent_finished":
+      const fd = e.nesting_depth || 0;
       return (
-        <details className="card border-primary mb-2" open>
+        <details className="card border-primary mb-2" open style={{ marginLeft: `${fd * 1rem}` }}>
           <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-primary">sub-agent</span>
+            <span className="badge bg-primary">sub-agent (depth {fd})</span>
             <code>{e.profile}</code>
           </summary>
           <div className="card-body py-2">
@@ -237,11 +244,12 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "diff":
+      const dd = e.nesting_depth || 0;
       return (
-        <details className="card border-info mb-2">
+        <details className="card border-info mb-2" style={{ paddingLeft: `${dd * 1rem}` }}>
           <summary className="card-header py-2 small d-flex align-items-center gap-2">
             <span className="badge bg-info text-dark">diff</span>
-            <code>{e.path}</code>
+            <code>{e.path}</code> {dd > 0 && <span className="badge bg-primary ms-1">depth {dd}</span>}
           </summary>
           <div className="card-body p-0 overflow-auto">
             <DiffView diff={e.diff} />
@@ -250,18 +258,20 @@ function EventItem({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "final":
+      const ffd = e.nesting_depth || 0;
       return (
-        <div className="alert alert-success py-2 mb-2">
-          <div className="fw-semibold mb-1">Final response</div>
+        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ffd * 1rem}` }}>
+          <div className="fw-semibold mb-1">Final response {ffd > 0 ? `(depth ${ffd})` : ""}</div>
           <pre className="mb-0 small">{e.content}</pre>
         </div>
       );
 
     case "session_summary":
+      const ssd = e.nesting_depth || 0;
       return (
-        <div className="alert alert-success py-2 mb-2">
+        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ssd * 1rem}` }}>
           <div className="fw-semibold mb-1">
-            Session complete &middot; <code>{e.branch}</code>
+            Session complete {ssd > 0 ? `(depth ${ssd})` : ""} &middot; <code>{e.branch}</code>
           </div>
           <pre className="mb-0 small">{e.commits}</pre>
         </div>

@@ -38,6 +38,7 @@ pub enum AgentEvent {
     SubAgentStarted {
         profile: String,
         task: String,
+        nesting_depth: usize,
     },
     SubAgentFinished {
         profile: String,

@@ -641,6 +641,7 @@ pub fn run_agent<S: EventSink>(
         env_config.as_ref(),
         &todo_memory,
         &mcp_registry,
+        0,
         &mut sink,
     )?;
     let reached_final = outcome.reached_final;
@@ -655,6 +656,7 @@ pub fn run_agent<S: EventSink>(
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
+        nesting_depth: 0,
     });
 
     // `command_backend` is dropped here, which removes task containers when used.
@@ -1201,6 +1203,7 @@ fn run_agent_steps(
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
     mcp_registry: &McpToolRegistry,
+    nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
     for step in 1..=args.max_steps {
@@ -1627,9 +1630,12 @@ fn run_tool(
             let text = match std::fs::read_to_string(&resolved) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(format!("file not found: {}", resolved.display()))
+                    return Ok(format!("file not found: {}", resolved.display()));
                 }
-                Err(e) => return Err(anyhow!(e)).context(format!("failed to read {}", resolved.display())),
+                Err(e) => {
+                    return Err(anyhow!(e))
+                        .context(format!("failed to read {}", resolved.display()));
+                }
             };
 
             let lines: Vec<_> = text.lines().collect();
@@ -1701,6 +1707,7 @@ fn run_tool(
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff,
+                nesting_depth: context.nesting_depth,
             });
             Ok(format!("updated {}", resolved.display()))
         }
@@ -1716,6 +1723,7 @@ fn run_tool(
                 sink.emit(AgentEvent::Diff {
                     path: "apply_patch".to_string(),
                     diff,
+                    nesting_depth: context.nesting_depth,
                 });
             }
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
@@ -1940,6 +1948,7 @@ fn run_sub_agent(
     sink.emit(AgentEvent::SubAgentStarted {
         profile: profile.as_str().to_string(),
         task: task.to_string(),
+        nesting_depth: context.request.sub_agent_depth + 1,
     });
 
     let instructions = build_agent_instructions(
@@ -1969,10 +1978,6 @@ fn run_sub_agent(
     sub_request.max_steps = max_steps;
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
 
-    let mut sub_sink = SubAgentSink {
-        parent: sink,
-        collector: SubAgentEventCollector::default(),
-    };
     let outcome = run_agent_steps(
         context.backend,
         context.model,
@@ -1983,46 +1988,20 @@ fn run_sub_agent(
         context.env_config,
         context.todo_memory,
         context.mcp_registry,
-        &mut sub_sink,
+        context.request.sub_agent_depth + 1,
+        sink,
     )?;
-    let collector = sub_sink.collector;
 
-    let mut result = String::new();
-    if outcome.reached_final {
-        result.push_str(
-            collector
-                .final_content
-                .as_deref()
-                .or(outcome.final_content.as_deref())
-                .unwrap_or("sub-agent finished without a final message"),
-        );
+    let result = if outcome.reached_final {
+        "sub-agent completed successfully".to_string()
     } else {
-        result.push_str("sub-agent reached its step limit before finalizing");
-    }
-    if collector.diffs > 0 {
-        result.push_str(&format!(
-            "
-
-Workspace edits emitted: {} diff(s).",
-            collector.diffs
-        ));
-    }
-    if !collector.errors.is_empty() {
-        result.push_str(
-            "
-
-Errors:
-",
-        );
-        result.push_str(&collector.errors.join(
-            "
-",
-        ));
-    }
+        "sub-agent reached its step limit before finalizing".to_string()
+    };
 
     sink.emit(AgentEvent::SubAgentFinished {
         profile: profile.as_str().to_string(),
-        result: result.clone(),
+        result,
+        nesting_depth: context.request.sub_agent_depth + 1,
     });
     Ok(result)
 }
