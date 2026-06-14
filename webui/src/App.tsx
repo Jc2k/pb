@@ -755,10 +755,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       <aside className="sidebar d-none d-lg-flex flex-column">
         <div className="brand d-flex align-items-center gap-2 px-3 py-3">
           <div className="brand-mark"><i className="bi bi-terminal"></i></div>
-          <div>
-            <strong>LocalAgent</strong>
-            <small className="d-block text-secondary">Private by default</small>
-          </div>
+          <strong>LocalAgent</strong>
         </div>
 
         <nav className="nav nav-pills flex-column gap-1 px-2">
