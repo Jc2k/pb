@@ -99,6 +99,23 @@ function relativeTime(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
+function formatStartTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now.getTime() - timestamp;
+  const diffMin = Math.floor(diffMs / 60000);
+  
+  if (diffMin < 1) return "Started just now";
+  if (diffMin < 60) return `Started ${diffMin} min ago`;
+  const hours = Math.floor(diffMin / 60);
+  const minutes = diffMin % 60;
+  if (hours < 24) {
+    const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return `Started ${timeStr}`;
+  }
+  return date.toLocaleDateString();
+}
+
 /* ─── diff view ──────────────────────────────────────────────── */
 
 function DiffView({ diff }: { diff: string }) {
@@ -117,6 +134,433 @@ function DiffView({ diff }: { diff: string }) {
         );
       })}
     </pre>
+  );
+}
+
+/* ─── tool strip component for assistant messages ────────────── */
+
+function ToolStrip({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; toolResults: AgentEvent[] }) {
+  const [isOpen, setIsOpen] = useState(true);
+
+  if (toolCalls.length === 0) return null;
+
+  const allTools = [...toolCalls];
+  
+  return (
+    <button
+      className="tool-strip"
+      onClick={() => setIsOpen(!isOpen)}
+      aria-expanded={isOpen}
+      type="button"
+    >
+      <span><i className="bi bi-tools"></i> {allTools.length} tools used</span>
+      <span className="tool-names">
+        {allTools.map((t, i) => {
+          if (t.type === "tool_call") return t.tool;
+          return "";
+        }).join(" · ")}
+      </span>
+      <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
+    </button>
+  );
+}
+
+/* ─── message bubble component ──────────────────────────────── */
+
+function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
+  const e = envelope.event;
+  
+  switch (e.type) {
+    case "reasoning":
+      const rd = e.nesting_depth || 0;
+      return (
+        <article className="message-row assistant-message" style={{ paddingLeft: `${rd}rem` }}>
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>{e.content}</p>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "tool_call":
+      const tcDepth = e.nesting_depth || 0;
+      return (
+        <details 
+          className="message-row assistant-message" 
+          open 
+          style={{ marginLeft: `${tcDepth}rem` }}
+        >
+          <summary style={{ display: "none" }} />
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>Called {e.tool}</p>
+            <details open className="card border-secondary mb-0">
+              <summary className="card-header py-1 small d-flex align-items-center gap-2">
+                <span className="badge bg-secondary">arguments</span>
+              </summary>
+              <div className="card-body py-1">
+                <pre className="mb-0 small">{JSON.stringify(e.arguments, null, 2)}</pre>
+              </div>
+            </details>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </details>
+      );
+
+    case "tool_result":
+      const trDepth = e.nesting_depth || 0;
+      return (
+        <details 
+          className="message-row assistant-message compact"
+          open
+          style={{ marginLeft: `${trDepth}rem` }}
+        >
+          <summary style={{ display: "none" }} />
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>Result from {e.tool}</p>
+            <pre className="mb-0 small result-pre">{e.result}</pre>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </details>
+      );
+
+    case "user_question":
+      return (
+        <article className="message-row user-message">
+          <div className="bubble user-bubble">
+            <p>{e.question}</p>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "user_answer":
+      return (
+        <article className="message-row assistant-message compact">
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>Your answer:</p>
+            <pre className="mb-0 small">{e.answer}</pre>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "sub_agent_started":
+      const saDepth = e.nesting_depth || 0;
+      return (
+        <article className="message-row assistant-message compact" style={{ marginLeft: `${saDepth}rem` }}>
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>
+              <span className="badge bg-primary me-2">{e.profile}</span>
+              {e.task}
+            </p>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "sub_agent_finished":
+      const sfDepth = e.nesting_depth || 0;
+      return (
+        <details 
+          className="message-row assistant-message compact"
+          open
+          style={{ marginLeft: `${sfDepth}rem` }}
+        >
+          <summary style={{ display: "none" }} />
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>Sub-agent {e.profile} completed</p>
+            <pre className="mb-0 small result-pre">{e.result}</pre>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </details>
+      );
+
+    case "diff":
+      const dd = e.nesting_depth || 0;
+      return (
+        <details 
+          className="message-row assistant-message" 
+          open
+          style={{ marginLeft: `${dd}rem` }}
+        >
+          <summary style={{ display: "none" }} />
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p><code>{e.path}</code> changed</p>
+            <details open className="card border-info mb-0">
+              <summary className="card-header py-1 small d-flex align-items-center gap-2">
+                <span className="badge bg-info text-dark">diff view</span>
+              </summary>
+              <div className="card-body p-0 overflow-auto">
+                <DiffView diff={e.diff} />
+              </div>
+            </details>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </details>
+      );
+
+    case "final":
+      const ffd = e.nesting_depth || 0;
+      return (
+        <article className="message-row assistant-message" style={{ marginLeft: `${ffd}rem` }}>
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>{e.content}</p>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "session_summary":
+      const ssd = e.nesting_depth || 0;
+      return (
+        <article className="message-row assistant-message compact" style={{ marginLeft: `${ssd}rem` }}>
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble">
+            <p>
+              Session complete <code>{e.branch}</code>
+            </p>
+            <pre className="mb-0 small result-pre">{e.commits}</pre>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    case "error":
+      return (
+        <article className="message-row assistant-message compact">
+          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bubble thought-bubble" style={{ border: "1px solid #fda4af", background: "#fef2f2" }}>
+            <p>Error</p>
+            <pre className="mb-0 small result-pre">{String(e.message)}</pre>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+        </article>
+      );
+
+    default:
+      return null;
+  }
+}
+
+/* ─── home page (/) ──────────────────────────────────────────── */
+
+function HomePage() {
+  const [task, setTask] = useState("");
+  const [workdir, setWorkdir] = useState("");
+  const [branch, setBranch] = useState("main");
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const queuedCount = sessions.filter(
+    (session) => session.status === "queued",
+  ).length;
+  const runningCount = sessions.filter(
+    (session) => session.status === "running",
+  ).length;
+  const pausedCount = sessions.filter(
+    (session) => session.status === "paused",
+  ).length;
+  const completedCount = sessions.filter(
+    (session) => session.status === "completed",
+  ).length;
+
+  const fetchSessions = async () => {
+    const res = await fetch("/api/sessions");
+    if (!res.ok) return;
+    setSessions((await res.json()) as SessionItem[]);
+  };
+
+  const fetchProjects = async () => {
+    const res = await fetch(`/api/projects`);
+    if (!res.ok) return;
+    const entries = (await res.json()) as ProjectEntry[];
+    setProjects(entries);
+    setWorkdir((current) => current || entries[0]?.path || "");
+  };
+
+  const startSession = async () => {
+    if (!task.trim() || !workdir) return;
+    setIsSubmitting(true);
+    try {
+      const res = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task: task.trim(),
+          workdir: workdir.trim() || undefined,
+          branch: branch.trim() || "main",
+        }),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { session_id: string };
+      navigate(`/sessions/${data.session_id}`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchSessions();
+    void fetchProjects();
+    const timer = window.setInterval(() => void fetchSessions(), 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <>
+      <div className="app-shell">
+        <aside className="sidebar d-none d-lg-flex flex-column">
+          <div className="brand d-flex align-items-center gap-2 px-3 py-3">
+            <div className="brand-mark"><i className="bi bi-terminal"></i></div>
+            <div>
+              <strong>LocalAgent</strong>
+              <small className="d-block text-secondary">Private by default</small>
+            </div>
+          </div>
+
+          <nav className="nav nav-pills flex-column gap-1 px-2">
+            <a className="nav-link active" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
+            <a className="nav-link" href="#"><i className="bi bi-folder2-open"></i> Projects</a>
+            <a className="nav-link" href="#"><i className="bi bi-files"></i> Files</a>
+            <a className="nav-link" href="#"><i className="bi bi-shield-lock"></i> Privacy</a>
+            <a className="nav-link" href="#"><i className="bi bi-gear"></i> Settings</a>
+          </nav>
+
+          <div className="mt-auto p-3 user-mini">
+            <div className="avatar-sm">JC</div>
+            <div>
+              <strong>John Carr</strong>
+              <small className="d-block text-secondary">Local workspace</small>
+            </div>
+          </div>
+        </aside>
+
+        <section className="session-panel" style={{ gridTemplateRows: "auto 1fr", height: "100vh" }}>
+          <header className="session-header">
+            <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
+              <img
+                src="/logo.svg"
+                alt="pb"
+                width="32"
+                height="32"
+                style={{ borderRadius: "6px" }}
+              />
+              pb
+            </span>
+          </header>
+
+          <div className="container-fluid px-3 pb-4" style={{ overflowY: "auto" }}>
+            <div className="row g-3 justify-content-center">
+              <div className="col-lg-6 col-xl-5 d-flex flex-column gap-3">
+                <div className="card">
+                  <div className="card-body d-flex flex-column gap-2">
+                    <textarea
+                      className="form-control"
+                      rows={4}
+                      value={task}
+                      onChange={(e) => setTask(e.target.value)}
+                      placeholder="Describe the task…"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
+                          void startSession();
+                      }}
+                    />
+                    <div>
+                      <select
+                        className="form-select"
+                        value={workdir}
+                        onChange={(e) => setWorkdir(e.target.value)}
+                        disabled={projects.length === 0}
+                      >
+                        {projects.length === 0 ? (
+                          <option value="">No registered projects</option>
+                        ) : (
+                          projects.map((project) => (
+                            <option key={project.name} value={project.path}>
+                              {project.name} — {project.path}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <div className="form-text">
+                        Register projects with <code>pb projects add</code>.
+                      </div>
+                    </div>
+                    <input
+                      className="form-control"
+                      value={branch}
+                      onChange={(e) => setBranch(e.target.value)}
+                      placeholder="Branch (default: main)"
+                    />
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => void startSession()}
+                      disabled={!task.trim() || !workdir || isSubmitting}
+                    >
+                      {isSubmitting ? (
+                        <>
+                          <span className="spinner-border spinner-border-sm me-2" />
+                          Queueing…
+                        </>
+                      ) : (
+                        "Queue task"
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <div className="card-body py-2 small d-flex flex-wrap gap-2 align-items-center">
+                    <span className="fw-semibold me-1">Queue state</span>
+                    <span className="badge bg-info text-dark">
+                      {queuedCount} queued
+                    </span>
+                    <span className="badge bg-primary">{runningCount} running</span>
+                    <span className="badge bg-warning text-dark">
+                      {pausedCount} paused
+                    </span>
+                    <span className="badge bg-secondary">
+                      {completedCount} completed
+                    </span>
+                  </div>
+                </div>
+
+                <div className="list-group">
+                  {sessions.length === 0 ? (
+                    <div className="list-group-item text-body-secondary small">
+                      No sessions yet
+                    </div>
+                  ) : (
+                    sessions.map((s) => (
+                      <SessionCard
+                        key={s.session_id}
+                        session={s}
+                        onClick={() => navigate(`/sessions/${s.session_id}`)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <form className="composer">
+            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
+            <input className="form-control" placeholder="Message the agent…" aria-label="Message the agent" />
+            <button className="btn btn-primary rounded-circle" type="submit"><i className="bi bi-arrow-up"></i></button>
+          </form>
+        </section>
+      </div>
+    </>
   );
 }
 
@@ -174,393 +618,10 @@ function SessionCard({
   );
 }
 
-/* ─── home page (/) ──────────────────────────────────────────── */
-
-function HomePage() {
-  const [task, setTask] = useState("");
-  const [workdir, setWorkdir] = useState("");
-  const [branch, setBranch] = useState("main");
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
-  const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const queuedCount = sessions.filter(
-    (session) => session.status === "queued",
-  ).length;
-  const runningCount = sessions.filter(
-    (session) => session.status === "running",
-  ).length;
-  const pausedCount = sessions.filter(
-    (session) => session.status === "paused",
-  ).length;
-  const completedCount = sessions.filter(
-    (session) => session.status === "completed",
-  ).length;
-
-  const fetchSessions = async () => {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) return;
-    setSessions((await res.json()) as SessionItem[]);
-  };
-
-  const fetchProjects = async () => {
-    const res = await fetch("/api/projects");
-    if (!res.ok) return;
-    const entries = (await res.json()) as ProjectEntry[];
-    setProjects(entries);
-    setWorkdir((current) => current || entries[0]?.path || "");
-  };
-
-  const startSession = async () => {
-    if (!task.trim() || !workdir) return;
-    setIsSubmitting(true);
-    try {
-      const res = await fetch("/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          task: task.trim(),
-          workdir: workdir.trim() || undefined,
-          branch: branch.trim() || "main",
-        }),
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as { session_id: string };
-      navigate(`/sessions/${data.session_id}`);
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  useEffect(() => {
-    void fetchSessions();
-    void fetchProjects();
-    const timer = window.setInterval(() => void fetchSessions(), 5000);
-    return () => window.clearInterval(timer);
-    // fetchSessions and fetchProjects are stable async closures defined in
-    // this component; we intentionally run them only once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  return (
-    <>
-      <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
-        <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-          <img
-            src="/logo.svg"
-            alt="pb"
-            width="32"
-            height="32"
-            style={{ borderRadius: "6px" }}
-          />
-          pb
-        </span>
-      </nav>
-
-      <div className="container-fluid px-3 pb-4">
-        <div className="row g-3 justify-content-center">
-          <div className="col-lg-6 col-xl-5 d-flex flex-column gap-3">
-            <div className="card">
-              <div className="card-body d-flex flex-column gap-2">
-                <textarea
-                  className="form-control"
-                  rows={4}
-                  value={task}
-                  onChange={(e) => setTask(e.target.value)}
-                  placeholder="Describe the task…"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
-                      void startSession();
-                  }}
-                />
-                <div>
-                  <select
-                    className="form-select"
-                    value={workdir}
-                    onChange={(e) => setWorkdir(e.target.value)}
-                    disabled={projects.length === 0}
-                  >
-                    {projects.length === 0 ? (
-                      <option value="">No registered projects</option>
-                    ) : (
-                      projects.map((project) => (
-                        <option key={project.name} value={project.path}>
-                          {project.name} — {project.path}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <div className="form-text">
-                    Register projects with <code>pb projects add</code>.
-                  </div>
-                </div>
-                <input
-                  className="form-control"
-                  value={branch}
-                  onChange={(e) => setBranch(e.target.value)}
-                  placeholder="Branch (default: main)"
-                />
-                <button
-                  className="btn btn-primary"
-                  onClick={() => void startSession()}
-                  disabled={!task.trim() || !workdir || isSubmitting}
-                >
-                  {isSubmitting ? (
-                    <>
-                      <span className="spinner-border spinner-border-sm me-2" />
-                      Queueing…
-                    </>
-                  ) : (
-                    "Queue task"
-                  )}
-                </button>
-              </div>
-            </div>
-
-            <div className="card">
-              <div className="card-body py-2 small d-flex flex-wrap gap-2 align-items-center">
-                <span className="fw-semibold me-1">Queue state</span>
-                <span className="badge bg-info text-dark">
-                  {queuedCount} queued
-                </span>
-                <span className="badge bg-primary">{runningCount} running</span>
-                <span className="badge bg-warning text-dark">
-                  {pausedCount} paused
-                </span>
-                <span className="badge bg-secondary">
-                  {completedCount} completed
-                </span>
-              </div>
-            </div>
-
-            <div className="list-group">
-              {sessions.length === 0 ? (
-                <div className="list-group-item text-body-secondary small">
-                  No sessions yet
-                </div>
-              ) : (
-                sessions.map((s) => (
-                  <SessionCard
-                    key={s.session_id}
-                    session={s}
-                    onClick={() => navigate(`/sessions/${s.session_id}`)}
-                  />
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    </>
-  );
-}
-
-/* ─── nav bar ────────────────────────────────────────────────── */
-
-function Navbar({ onHome }: { onHome?: () => void }) {
-  return (
-    <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
-      <button
-        type="button"
-        className="btn btn-sm btn-outline-light me-3"
-        onClick={onHome}
-      >
-        ← Back
-      </button>
-      <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-        <img
-          src="/logo.svg"
-          alt="pb"
-          width="32"
-          height="32"
-          style={{ borderRadius: "6px" }}
-        />
-        pb
-      </span>
-    </nav>
-  );
-}
-
-/* ─── status line ────────────────────────────────────────────── */
-
-function StatusLine({ session }: { session: SessionItem }) {
-  const [statusText, setStatusText] = useState("unknown");
-
-  useEffect(() => {
-    let text = "unknown";
-    if (session.status === "running") {
-      text = "running";
-    } else if (session.status === "queued") {
-      text = "queued";
-    } else if (session.status === "paused") {
-      text = session.pending_question
-        ? "waiting for answer"
-        : "paused after restart";
-    } else if (session.branch) {
-      text = <code>{session.branch}</code>;
-    } else {
-      text = "completed";
-    }
-    setStatusText(text);
-  }, [session]);
-
-  const isRunning = session.status === "running";
-
-  return (
-    <div className="status-line">
-      {isRunning && <span className="live-dot" />}
-      <span>{statusText}</span>
-    </div>
-  );
-}
-
-/* ─── message stream item ────────────────────────────────────── */
-
-function StreamItem({ envelope }: { envelope: EventEnvelope }) {
-  const e = envelope.event;
-  
-  switch (e.type) {
-    case "reasoning":
-      const rd = e.nesting_depth || 0;
-      return (
-        <details 
-          className="thought-bubble card border-0 mb-2" 
-          style={{ paddingLeft: `${rd}rem` }}
-        >
-          <summary className="card-header border-0 bg-body-secondary py-2 small fw-semibold">
-            Reasoning {rd > 0 ? `(depth ${rd})` : ""}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small">{e.content}</pre>
-          </div>
-        </details>
-      );
-
-    case "tool_call":
-      const td = e.nesting_depth || 0;
-      return (
-        <details className="card border-secondary mb-2" open style={{ paddingLeft: `${td}rem` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-secondary">tool</span>
-            <code>{e.tool}</code> {td > 0 && <span className="badge bg-info text-dark ms-1">depth {td}</span>}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small">
-              {JSON.stringify(e.arguments, null, 2)}
-            </pre>
-          </div>
-        </details>
-      );
-
-    case "tool_result":
-      const trd = e.nesting_depth || 0;
-      return (
-        <details className="card border-0 bg-body-tertiary mb-2" style={{ paddingLeft: `${trd}rem` }}>
-          <summary className="card-header border-0 bg-body-tertiary py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-light text-dark">result</span>
-            <code>{e.tool}</code> {trd > 0 && <span className="badge bg-info text-dark ms-1">depth {trd}</span>}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small result-pre">{e.result}</pre>
-          </div>
-        </details>
-      );
-
-    case "user_question":
-      return (
-        <div className="alert alert-warning py-2 mb-2">
-          <div className="fw-semibold mb-1">Question for you</div>
-          <div>{e.question}</div>
-        </div>
-      );
-
-    case "user_answer":
-      return (
-        <div className="alert alert-light border py-2 mb-2">
-          <div className="fw-semibold mb-1">Your answer</div>
-          <pre className="mb-0 small">{e.answer}</pre>
-        </div>
-      );
-
-    case "sub_agent_started":
-      const depth = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-secondary py-2 mb-2" style={{ marginLeft: `${depth}rem` }}>
-          <div className="small text-uppercase text-body-secondary">
-            Sub-agent (depth {depth})
-          </div>
-          <div>
-            <span className="badge bg-primary me-2">{e.profile}</span>
-            {e.task}
-          </div>
-        </div>
-      );
-
-    case "sub_agent_finished":
-      const fd = e.nesting_depth || 0;
-      return (
-        <details className="card border-primary mb-2" open style={{ marginLeft: `${fd}rem` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-primary">sub-agent (depth {fd})</span>
-            <code>{e.profile}</code>
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small result-pre">{e.result}</pre>
-          </div>
-        </details>
-      );
-
-    case "diff":
-      const dd = e.nesting_depth || 0;
-      return (
-        <details className="card border-info mb-2" style={{ paddingLeft: `${dd}rem` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-info text-dark">diff</span>
-            <code>{e.path}</code> {dd > 0 && <span className="badge bg-primary ms-1">depth {dd}</span>}
-          </summary>
-          <div className="card-body p-0 overflow-auto">
-            <DiffView diff={e.diff} />
-          </div>
-        </details>
-      );
-
-    case "final":
-      const ffd = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ffd}rem` }}>
-          <div className="fw-semibold mb-1">Final response {ffd > 0 ? `(depth ${ffd})` : ""}</div>
-          <pre className="mb-0 small">{e.content}</pre>
-        </div>
-      );
-
-    case "session_summary":
-      const ssd = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ssd}rem` }}>
-          <div className="fw-semibold mb-1">
-            Session complete {ssd > 0 ? `(depth ${ssd})` : ""} &middot; <code>{e.branch}</code>
-          </div>
-          <pre className="mb-0 small">{e.commits}</pre>
-        </div>
-      );
-
-    case "error":
-      return (
-        <div className="alert alert-danger py-2 mb-2">
-          <div className="fw-semibold mb-1">Error</div>
-          {String(e.message)}
-        </div>
-      );
-
-    default:
-      return null;
-  }
-}
-
 /* ─── session page (/sessions/:id) ──────────────────────────── */
 
 function SessionPage({ sessionId }: { sessionId: string }) {
-  const [session, setSession] = useState<SessionItem | null>(null);
+  const [session, setSession] = useState<SessionDetails | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
@@ -578,43 +639,13 @@ function SessionPage({ sessionId }: { sessionId: string }) {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((prev) => [...prev, parsed]);
         if (parsed.event.type === "user_question") {
-          setSession((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  running: false,
-                  paused: true,
-                  status: "paused",
-                  pending_question: {
-                    question_id: parsed.event.question_id,
-                    question: parsed.event.question,
-                  },
-                }
-              : prev,
-          );
           setSessionRunning(false);
         } else if (parsed.event.type === "user_answer") {
-          setSession((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  running: true,
-                  paused: false,
-                  status: "running",
-                  pending_question: undefined,
-                }
-              : prev,
-          );
           setSessionRunning(true);
         } else if (
           parsed.event.type === "final" ||
           parsed.event.type === "session_summary"
         ) {
-          setSession((prev) =>
-            prev
-              ? { ...prev, running: false, paused: false, status: "completed" }
-              : prev,
-          );
           setSessionRunning(false);
         }
       } catch (err) {
@@ -628,17 +659,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     const res = await fetch(`/api/sessions/${sessionId}`);
     if (!res.ok) return;
     const details = (await res.json()) as SessionDetails;
-    setSession({
-      session_id: details.session_id,
-      task: details.task,
-      running: details.running,
-      paused: details.paused,
-      status: details.status,
-      branch: details.branch,
-      workdir: undefined,
-      pending_question: details.pending_question,
-      updated_at_ms: 0,
-    });
+    setSession(details);
     setEvents(details.events);
     setSessionRunning(details.running);
     setAnswer("");
@@ -652,21 +673,11 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       body: JSON.stringify({ task: followUp.trim() }),
     });
     setFollowUp("");
-    setSession((prev) =>
-      prev
-        ? { ...prev, status: "queued", running: false, paused: false }
-        : prev,
-    );
     setSessionRunning(false);
   };
 
   const resumeSession = async () => {
     await fetch(`/api/sessions/${sessionId}/resume`, { method: "POST" });
-    setSession((prev) =>
-      prev
-        ? { ...prev, status: "queued", running: false, paused: false }
-        : prev,
-    );
     setSessionRunning(false);
   };
 
@@ -681,11 +692,6 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       }),
     });
     setAnswer("");
-    setSession((prev) =>
-      prev
-        ? { ...prev, paused: false, running: true, status: "running" }
-        : prev,
-    );
     setSessionRunning(true);
   };
 
@@ -708,101 +714,176 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     return () => sourceRef.current?.close();
   }, [sessionId]);
 
-  const statusText = (() => {
-    if (!session) return null;
-    if (session.status === "running") return <span className="text-primary">running</span>;
-    if (session.status === "queued") return <span className="text-info">queued</span>;
-    if (session.status === "paused")
-      return session.pending_question ? (
-        <span className="text-warning">waiting for answer</span>
-      ) : (
-        <span className="text-warning">paused after restart</span>
-      );
-    if (session.branch) return <code>{session.branch}</code>;
-    return "completed";
-  })();
-
   const isRunning = session?.status === "running" || false;
-  const hasPendingQuestion = session?.pending_question !== undefined;
+
+  if (!session) {
+    return (
+      <div className="app-shell">
+        <aside className="sidebar d-none d-lg-flex flex-column">
+          <div className="brand d-flex align-items-center gap-2 px-3 py-3">
+            <div className="brand-mark"><i className="bi bi-terminal"></i></div>
+            <div>
+              <strong>LocalAgent</strong>
+              <small className="d-block text-secondary">Private by default</small>
+            </div>
+          </div>
+        </aside>
+        <section className="session-panel">
+          <header className="session-header">
+            <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
+              <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+              pb
+            </span>
+          </header>
+        </section>
+      </div>
+    );
+  }
 
   return (
-    <>
-      <Navbar onHome={() => navigate("/")} />
-      
-      <div className="container-fluid px-3 pb-4">
-        <div className="session-panel">
-          <header className="session-header">
-            <div className="brand-mark" style={{ flex: "0 0 42px", width: "42px", height: "42px" }}>
-              <i className="bi bi-bot" />
-            </div>
-            <div>
-              <h1>{session?.task ?? sessionId}</h1>
-              {session && <StatusLine session={session} />}
-            </div>
-          </header>
-
-          <div className="session-layout">
-            <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
-              {events.length === 0 ? (
-                <div className="text-body-secondary small">
-                  Waiting for queue events…
-                </div>
-              ) : (
-                events.map((env, i) => <StreamItem key={i} envelope={env} />)
-              )}
-            </main>
-
-            {session?.status === "paused" && hasPendingQuestion ? (
-              <footer className="composer">
-                <textarea
-                  className="form-control"
-                  rows={2}
-                  value={answer}
-                  onChange={(e) => setAnswer(e.target.value)}
-                  placeholder="Answer the planning question…"
-                />
-                <button
-                  className="btn btn-warning"
-                  onClick={() => void answerQuestion()}
-                  disabled={!answer.trim()}
-                >
-                  Answer
-                </button>
-              </footer>
-            ) : session?.status === "paused" ? (
-              <footer className="composer">
-                <div className="flex-grow-1 small text-body-secondary">
-                  This session was restored after a daemon restart and is paused until you resume it.
-                </div>
-                <button
-                  className="btn btn-warning"
-                  onClick={() => void resumeSession()}
-                >
-                  Resume
-                </button>
-              </footer>
-            ) : !isRunning && session?.status === "completed" ? (
-              <footer className="composer">
-                <input
-                  type="text"
-                  className="form-control"
-                  value={followUp}
-                  onChange={(e) => setFollowUp(e.target.value)}
-                  placeholder="Follow-up task…"
-                />
-                <button
-                  className="btn btn-primary"
-                  onClick={() => void continueSession()}
-                  disabled={!followUp.trim()}
-                >
-                  <i className="bi bi-send" />
-                </button>
-              </footer>
-            ) : null}
+    <div className="app-shell">
+      <aside className="sidebar d-none d-lg-flex flex-column">
+        <div className="brand d-flex align-items-center gap-2 px-3 py-3">
+          <div className="brand-mark"><i className="bi bi-terminal"></i></div>
+          <div>
+            <strong>LocalAgent</strong>
+            <small className="d-block text-secondary">Private by default</small>
           </div>
         </div>
-      </div>
-    </>
+
+        <nav className="nav nav-pills flex-column gap-1 px-2">
+          <a className="nav-link active" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
+          <a className="nav-link" href="#"><i className="bi bi-folder2-open"></i> Projects</a>
+          <a className="nav-link" href="#"><i className="bi bi-files"></i> Files</a>
+          <a className="nav-link" href="#"><i className="bi bi-shield-lock"></i> Privacy</a>
+          <a className="nav-link" href="#"><i className="bi bi-gear"></i> Settings</a>
+        </nav>
+
+        <div className="mt-auto p-3 user-mini">
+          <div className="avatar-sm">JC</div>
+          <div>
+            <strong>John Carr</strong>
+            <small className="d-block text-secondary">Local workspace</small>
+          </div>
+        </div>
+      </aside>
+
+      <section className="session-panel">
+        <header className="session-header">
+          <button
+            type="button"
+            className="btn btn-link d-lg-none p-0 text-body"
+            onClick={() => navigate("/")}
+          >
+            <i className="bi bi-chevron-left fs-4"></i>
+          </button>
+          <div className="session-icon d-none d-sm-grid"><i className="bi bi-terminal"></i></div>
+          <div className="min-w-0 flex-grow-1">
+            <h1>{session.task}</h1>
+            <div className="status-line">
+              {isRunning && <span className="live-dot" />}
+              <span>{session.status === "running" ? "Running" : session.status === "queued" ? "Queued" :
+                session.status === "paused" ? (session.pending_question ? "Waiting for answer" : "Paused") : "Completed"}
+              </span>
+              {session.updated_at_ms && (
+                <>
+                  <span className="dot-sep"></span>
+                  <span>{formatStartTime(session.updated_at_ms)}</span>
+                </>
+              )}
+              <span className="dot-sep d-none d-sm-inline"></span>
+              <span className="d-none d-sm-inline">Model: {session.branch}</span>
+            </div>
+          </div>
+          <button className="btn btn-light rounded-pill d-none d-sm-inline-flex">
+            <i className="bi bi-box-arrow-up me-2"></i>Share
+          </button>
+          <button 
+            className="btn btn-danger rounded-pill"
+            onClick={() => window.location.reload()}
+          >
+            <i className="bi bi-stop-fill me-1"></i>Stop
+          </button>
+        </header>
+
+        <div className="session-layout">
+          <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
+            {events.length === 0 ? (
+              <div className="text-body-secondary small">Waiting for queue events…</div>
+            ) : (
+              events.map((env, i) => <MessageBubble key={i} envelope={env} />)
+            )}
+          </main>
+
+          <aside className="tool-drawer d-none d-xl-block">
+            <div className="drawer-header">
+              <h2>Tools</h2>
+              <span className="badge rounded-pill text-bg-light">{events.filter(e => e.event.type === "tool_call" || e.event.type === "tool_result").length}</span>
+            </div>
+            {events.filter(e => e.event.type === "tool_call" || e.event.type === "tool_result").map((e, i) => (
+              <button key={i} className="drawer-item">
+                <span><i className="bi bi-file-earmark-text"></i>{e.event.type === "tool_call" ? ` ${e.event.tool}` : ""}</span>
+              </button>
+            ))}
+
+            <div className="empty-detail">
+              <i className="bi bi-file-earmark-code"></i>
+              <h3>Select a tool</h3>
+              <p>Inspect files, commands, and outputs without cluttering the main session.</p>
+            </div>
+          </aside>
+        </div>
+
+        {session.status === "paused" && session.pending_question ? (
+          <form className="composer" onSubmit={(e) => { e.preventDefault(); void answerQuestion(); }}>
+            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
+            <input
+              className="form-control"
+              rows={2}
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value)}
+              placeholder="Answer the planning question…"
+            />
+            <button
+              className="btn btn-warning rounded-circle"
+              type="submit"
+              disabled={!answer.trim()}
+            >
+              <i className="bi bi-check-lg"></i>
+            </button>
+          </form>
+        ) : session.status === "paused" ? (
+          <footer className="composer">
+            <div className="flex-grow-1 small text-body-secondary">
+              This session was restored after a daemon restart and is paused until you resume it.
+            </div>
+            <button
+              className="btn btn-warning"
+              onClick={() => void resumeSession()}
+            >
+              Resume
+            </button>
+          </footer>
+        ) : !isRunning && session.status === "completed" ? (
+          <form className="composer" onSubmit={(e) => { e.preventDefault(); void continueSession(); }}>
+            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
+            <input
+              className="form-control"
+              value={followUp}
+              onChange={(e) => setFollowUp(e.target.value)}
+              placeholder="Follow-up task…"
+            />
+            <button
+              className="btn btn-primary rounded-circle"
+              type="submit"
+              disabled={!followUp.trim()}
+            >
+              <i className="bi bi-arrow-up"></i>
+            </button>
+          </form>
+        ) : null}
+      </section>
+    </div>
   );
 }
 
