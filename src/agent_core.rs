@@ -656,7 +656,6 @@ pub fn run_agent<S: EventSink>(
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
-        nesting_depth: 0,
     });
 
     // `command_backend` is dropped here, which removes task containers when used.
@@ -1707,7 +1706,6 @@ fn run_tool(
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff,
-                nesting_depth: context.nesting_depth,
             });
             Ok(format!("updated {}", resolved.display()))
         }
@@ -1723,7 +1721,6 @@ fn run_tool(
                 sink.emit(AgentEvent::Diff {
                     path: "apply_patch".to_string(),
                     diff,
-                    nesting_depth: context.nesting_depth,
                 });
             }
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
@@ -2000,8 +1997,7 @@ fn run_sub_agent(
 
     sink.emit(AgentEvent::SubAgentFinished {
         profile: profile.as_str().to_string(),
-        result,
-        nesting_depth: context.request.sub_agent_depth + 1,
+        result: result.clone(),
     });
     Ok(result)
 }

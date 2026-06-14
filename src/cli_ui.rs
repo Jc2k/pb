@@ -27,7 +27,7 @@ pub fn render_event(event: &AgentEvent) {
             question_id,
             answer,
         } => print_block(&format!("answer {question_id}"), answer),
-        AgentEvent::SubAgentStarted { profile, task } => {
+        AgentEvent::SubAgentStarted { profile, task, nesting_depth: _ } => {
             print_header("sub-agent", &format!("{profile}: {task}"));
         }
         AgentEvent::SubAgentFinished { profile, result } => {

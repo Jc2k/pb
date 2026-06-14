@@ -1,5 +1,6 @@
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
+import "./session.css";
 
 /* ─── constants ──────────────────────────────────────────────── */
 
@@ -117,181 +118,6 @@ function DiffView({ diff }: { diff: string }) {
       })}
     </pre>
   );
-}
-
-/* ─── event item ─────────────────────────────────────────────── */
-
-function EventItem({ envelope }: { envelope: EventEnvelope }) {
-  const e = envelope.event;
-  switch (e.type) {
-    case "started":
-      return (
-        <div className="alert alert-info py-2 mb-2">
-          <div className="fw-semibold">Session started</div>
-          <div className="small mt-1 d-flex flex-wrap gap-3">
-            <span>
-              <span className="text-body-secondary">model </span>
-              <code>{e.model}</code>
-            </span>
-            <span>
-              <span className="text-body-secondary">branch </span>
-              <code>{e.branch}</code>
-            </span>
-            <span>
-              <span className="text-body-secondary">workspace </span>
-              <code>{e.workspace}</code>
-            </span>
-          </div>
-        </div>
-      );
-
-    case "step_started":
-      const sd = e.nesting_depth || 0;
-      return (
-        <div className="step-marker text-body-secondary small mb-1" style={{ paddingLeft: `${sd * 1rem}` }}>
-          <hr className="my-1" />
-          <span>
-            Step {e.step} / {e.max_steps}
-          </span>
-        </div>
-      );
-
-    case "reasoning":
-      const rd = e.nesting_depth || 0;
-      return (
-        <details className="card border-0 bg-body-secondary mb-2" style={{ paddingLeft: `${rd * 1rem}` }}>
-          <summary className="card-header border-0 bg-body-secondary py-2 small fw-semibold">
-            Reasoning {rd > 0 ? `(depth ${rd})` : ""}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small">{e.content}</pre>
-          </div>
-        </details>
-      );
-
-    case "tool_call":
-      const td = e.nesting_depth || 0;
-      return (
-        <details className="card border-secondary mb-2" open style={{ paddingLeft: `${td * 1rem}` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-secondary">tool</span>
-            <code>{e.tool}</code> {td > 0 && <span className="badge bg-info text-dark ms-1">depth {td}</span>}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small">
-              {JSON.stringify(e.arguments, null, 2)}
-            </pre>
-          </div>
-        </details>
-      );
-
-    case "tool_result":
-      const trd = e.nesting_depth || 0;
-      return (
-        <details className="card border-0 bg-body-tertiary mb-2" style={{ paddingLeft: `${trd * 1rem}` }}>
-          <summary className="card-header border-0 bg-body-tertiary py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-light text-dark">result</span>
-            <code>{e.tool}</code> {trd > 0 && <span className="badge bg-info text-dark ms-1">depth {trd}</span>}
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small result-pre">{e.result}</pre>
-          </div>
-        </details>
-      );
-
-    case "user_question":
-      return (
-        <div className="alert alert-warning py-2 mb-2">
-          <div className="fw-semibold mb-1">Question for you</div>
-          <div>{e.question}</div>
-        </div>
-      );
-
-    case "user_answer":
-      return (
-        <div className="alert alert-light border py-2 mb-2">
-          <div className="fw-semibold mb-1">Your answer</div>
-          <pre className="mb-0 small">{e.answer}</pre>
-        </div>
-      );
-
-    case "sub_agent_started":
-      const depth = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-secondary py-2 mb-2" style={{ marginLeft: `${depth * 1rem}` }}>
-          <div className="small text-uppercase text-body-secondary">
-            Sub-agent (depth {depth})
-          </div>
-          <div>
-            <span className="badge bg-primary me-2">{e.profile}</span>
-            {e.task}
-          </div>
-        </div>
-      );
-
-    case "sub_agent_finished":
-      const fd = e.nesting_depth || 0;
-      return (
-        <details className="card border-primary mb-2" open style={{ marginLeft: `${fd * 1rem}` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-primary">sub-agent (depth {fd})</span>
-            <code>{e.profile}</code>
-          </summary>
-          <div className="card-body py-2">
-            <pre className="mb-0 small result-pre">{e.result}</pre>
-          </div>
-        </details>
-      );
-
-    case "diff":
-      const dd = e.nesting_depth || 0;
-      return (
-        <details className="card border-info mb-2" style={{ paddingLeft: `${dd * 1rem}` }}>
-          <summary className="card-header py-2 small d-flex align-items-center gap-2">
-            <span className="badge bg-info text-dark">diff</span>
-            <code>{e.path}</code> {dd > 0 && <span className="badge bg-primary ms-1">depth {dd}</span>}
-          </summary>
-          <div className="card-body p-0 overflow-auto">
-            <DiffView diff={e.diff} />
-          </div>
-        </details>
-      );
-
-    case "final":
-      const ffd = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ffd * 1rem}` }}>
-          <div className="fw-semibold mb-1">Final response {ffd > 0 ? `(depth ${ffd})` : ""}</div>
-          <pre className="mb-0 small">{e.content}</pre>
-        </div>
-      );
-
-    case "session_summary":
-      const ssd = e.nesting_depth || 0;
-      return (
-        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ssd * 1rem}` }}>
-          <div className="fw-semibold mb-1">
-            Session complete {ssd > 0 ? `(depth ${ssd})` : ""} &middot; <code>{e.branch}</code>
-          </div>
-          <pre className="mb-0 small">{e.commits}</pre>
-        </div>
-      );
-
-    case "error":
-      return (
-        <div className="alert alert-danger py-2 mb-2">
-          <div className="fw-semibold mb-1">Error</div>
-          {String(e.message)}
-        </div>
-      );
-
-    default:
-      return (
-        <div className="text-body-secondary small mb-1">
-          <code>{e.type}</code>
-        </div>
-      );
-  }
 }
 
 /* ─── session card ───────────────────────────────────────────── */
@@ -529,6 +355,208 @@ function HomePage() {
   );
 }
 
+/* ─── nav bar ────────────────────────────────────────────────── */
+
+function Navbar({ onHome }: { onHome?: () => void }) {
+  return (
+    <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
+      <button
+        type="button"
+        className="btn btn-sm btn-outline-light me-3"
+        onClick={onHome}
+      >
+        ← Back
+      </button>
+      <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
+        <img
+          src="/logo.svg"
+          alt="pb"
+          width="32"
+          height="32"
+          style={{ borderRadius: "6px" }}
+        />
+        pb
+      </span>
+    </nav>
+  );
+}
+
+/* ─── status line ────────────────────────────────────────────── */
+
+function StatusLine({ session }: { session: SessionItem }) {
+  const [statusText, setStatusText] = useState("unknown");
+
+  useEffect(() => {
+    let text = "unknown";
+    if (session.status === "running") {
+      text = "running";
+    } else if (session.status === "queued") {
+      text = "queued";
+    } else if (session.status === "paused") {
+      text = session.pending_question
+        ? "waiting for answer"
+        : "paused after restart";
+    } else if (session.branch) {
+      text = <code>{session.branch}</code>;
+    } else {
+      text = "completed";
+    }
+    setStatusText(text);
+  }, [session]);
+
+  const isRunning = session.status === "running";
+
+  return (
+    <div className="status-line">
+      {isRunning && <span className="live-dot" />}
+      <span>{statusText}</span>
+    </div>
+  );
+}
+
+/* ─── message stream item ────────────────────────────────────── */
+
+function StreamItem({ envelope }: { envelope: EventEnvelope }) {
+  const e = envelope.event;
+  
+  switch (e.type) {
+    case "reasoning":
+      const rd = e.nesting_depth || 0;
+      return (
+        <details 
+          className="thought-bubble card border-0 mb-2" 
+          style={{ paddingLeft: `${rd}rem` }}
+        >
+          <summary className="card-header border-0 bg-body-secondary py-2 small fw-semibold">
+            Reasoning {rd > 0 ? `(depth ${rd})` : ""}
+          </summary>
+          <div className="card-body py-2">
+            <pre className="mb-0 small">{e.content}</pre>
+          </div>
+        </details>
+      );
+
+    case "tool_call":
+      const td = e.nesting_depth || 0;
+      return (
+        <details className="card border-secondary mb-2" open style={{ paddingLeft: `${td}rem` }}>
+          <summary className="card-header py-2 small d-flex align-items-center gap-2">
+            <span className="badge bg-secondary">tool</span>
+            <code>{e.tool}</code> {td > 0 && <span className="badge bg-info text-dark ms-1">depth {td}</span>}
+          </summary>
+          <div className="card-body py-2">
+            <pre className="mb-0 small">
+              {JSON.stringify(e.arguments, null, 2)}
+            </pre>
+          </div>
+        </details>
+      );
+
+    case "tool_result":
+      const trd = e.nesting_depth || 0;
+      return (
+        <details className="card border-0 bg-body-tertiary mb-2" style={{ paddingLeft: `${trd}rem` }}>
+          <summary className="card-header border-0 bg-body-tertiary py-2 small d-flex align-items-center gap-2">
+            <span className="badge bg-light text-dark">result</span>
+            <code>{e.tool}</code> {trd > 0 && <span className="badge bg-info text-dark ms-1">depth {trd}</span>}
+          </summary>
+          <div className="card-body py-2">
+            <pre className="mb-0 small result-pre">{e.result}</pre>
+          </div>
+        </details>
+      );
+
+    case "user_question":
+      return (
+        <div className="alert alert-warning py-2 mb-2">
+          <div className="fw-semibold mb-1">Question for you</div>
+          <div>{e.question}</div>
+        </div>
+      );
+
+    case "user_answer":
+      return (
+        <div className="alert alert-light border py-2 mb-2">
+          <div className="fw-semibold mb-1">Your answer</div>
+          <pre className="mb-0 small">{e.answer}</pre>
+        </div>
+      );
+
+    case "sub_agent_started":
+      const depth = e.nesting_depth || 0;
+      return (
+        <div className="alert alert-secondary py-2 mb-2" style={{ marginLeft: `${depth}rem` }}>
+          <div className="small text-uppercase text-body-secondary">
+            Sub-agent (depth {depth})
+          </div>
+          <div>
+            <span className="badge bg-primary me-2">{e.profile}</span>
+            {e.task}
+          </div>
+        </div>
+      );
+
+    case "sub_agent_finished":
+      const fd = e.nesting_depth || 0;
+      return (
+        <details className="card border-primary mb-2" open style={{ marginLeft: `${fd}rem` }}>
+          <summary className="card-header py-2 small d-flex align-items-center gap-2">
+            <span className="badge bg-primary">sub-agent (depth {fd})</span>
+            <code>{e.profile}</code>
+          </summary>
+          <div className="card-body py-2">
+            <pre className="mb-0 small result-pre">{e.result}</pre>
+          </div>
+        </details>
+      );
+
+    case "diff":
+      const dd = e.nesting_depth || 0;
+      return (
+        <details className="card border-info mb-2" style={{ paddingLeft: `${dd}rem` }}>
+          <summary className="card-header py-2 small d-flex align-items-center gap-2">
+            <span className="badge bg-info text-dark">diff</span>
+            <code>{e.path}</code> {dd > 0 && <span className="badge bg-primary ms-1">depth {dd}</span>}
+          </summary>
+          <div className="card-body p-0 overflow-auto">
+            <DiffView diff={e.diff} />
+          </div>
+        </details>
+      );
+
+    case "final":
+      const ffd = e.nesting_depth || 0;
+      return (
+        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ffd}rem` }}>
+          <div className="fw-semibold mb-1">Final response {ffd > 0 ? `(depth ${ffd})` : ""}</div>
+          <pre className="mb-0 small">{e.content}</pre>
+        </div>
+      );
+
+    case "session_summary":
+      const ssd = e.nesting_depth || 0;
+      return (
+        <div className="alert alert-success py-2 mb-2" style={{ marginLeft: `${ssd}rem` }}>
+          <div className="fw-semibold mb-1">
+            Session complete {ssd > 0 ? `(depth ${ssd})` : ""} &middot; <code>{e.branch}</code>
+          </div>
+          <pre className="mb-0 small">{e.commits}</pre>
+        </div>
+      );
+
+    case "error":
+      return (
+        <div className="alert alert-danger py-2 mb-2">
+          <div className="fw-semibold mb-1">Error</div>
+          {String(e.message)}
+        </div>
+      );
+
+    default:
+      return null;
+  }
+}
+
 /* ─── session page (/sessions/:id) ──────────────────────────── */
 
 function SessionPage({ sessionId }: { sessionId: string }) {
@@ -538,7 +566,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
   const [followUp, setFollowUp] = useState("");
   const [answer, setAnswer] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
-  const feedRef = useRef<HTMLDivElement>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
 
   const openEvents = (id: string) => {
@@ -661,16 +689,16 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     setSessionRunning(true);
   };
 
-  const onFeedScroll = () => {
-    const el = feedRef.current;
+  const onChatScroll = () => {
+    const el = chatRef.current;
     if (!el) return;
     atBottomRef.current =
       el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD;
   };
 
   useEffect(() => {
-    if (atBottomRef.current && feedRef.current) {
-      feedRef.current.scrollTop = feedRef.current.scrollHeight;
+    if (atBottomRef.current && chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }
   }, [events]);
 
@@ -678,77 +706,54 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     atBottomRef.current = true;
     void fetchSession().then(() => openEvents(sessionId));
     return () => sourceRef.current?.close();
-    // sessionId is stable for the lifetime of this component instance.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  const statusText = (() => {
+    if (!session) return null;
+    if (session.status === "running") return <span className="text-primary">running</span>;
+    if (session.status === "queued") return <span className="text-info">queued</span>;
+    if (session.status === "paused")
+      return session.pending_question ? (
+        <span className="text-warning">waiting for answer</span>
+      ) : (
+        <span className="text-warning">paused after restart</span>
+      );
+    if (session.branch) return <code>{session.branch}</code>;
+    return "completed";
+  })();
+
+  const isRunning = session?.status === "running" || false;
+  const hasPendingQuestion = session?.pending_question !== undefined;
 
   return (
     <>
-      <nav className="navbar navbar-dark bg-dark border-bottom px-3 py-2 mb-3">
-        <button
-          type="button"
-          className="btn btn-sm btn-outline-light me-3"
-          onClick={() => navigate("/")}
-        >
-          ← Back
-        </button>
-        <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-          <img
-            src="/logo.svg"
-            alt="pb"
-            width="32"
-            height="32"
-            style={{ borderRadius: "6px" }}
-          />
-          pb
-        </span>
-        {session && (
-          <span className="navbar-text small text-body-secondary ms-auto">
-            {session.status === "running" ? (
-              <span className="text-primary">running</span>
-            ) : session.status === "queued" ? (
-              <span className="text-info">queued</span>
-            ) : session.status === "paused" ? (
-              <span className="text-warning">
-                {session.pending_question
-                  ? "waiting for answer"
-                  : "paused after restart"}
-              </span>
-            ) : session.branch ? (
-              <code>{session.branch}</code>
-            ) : (
-              "completed"
-            )}
-          </span>
-        )}
-      </nav>
-
+      <Navbar onHome={() => navigate("/")} />
+      
       <div className="container-fluid px-3 pb-4">
-        <div className="card">
-          <div className="card-header d-flex justify-content-between align-items-center gap-2">
-            <div className="fw-semibold text-truncate flex-grow-1">
-              {session?.task ?? sessionId}
+        <div className="session-panel">
+          <header className="session-header">
+            <div className="brand-mark" style={{ flex: "0 0 42px", width: "42px", height: "42px" }}>
+              <i className="bi bi-bot" />
             </div>
-          </div>
-          <div
-            className="card-body event-feed overflow-auto"
-            ref={feedRef}
-            onScroll={onFeedScroll}
-          >
-            {events.length === 0 ? (
-              <div className="text-body-secondary small">
-                Waiting for queue events…
-              </div>
-            ) : (
-              events.map((env, i) => <EventItem key={i} envelope={env} />)
-            )}
-          </div>
-          {session?.status === "paused" && session.pending_question ? (
-            <div className="card-footer bg-warning-subtle">
-              <div className="small fw-semibold mb-2">
-                {session.pending_question.question}
-              </div>
-              <div className="input-group">
+            <div>
+              <h1>{session?.task ?? sessionId}</h1>
+              {session && <StatusLine session={session} />}
+            </div>
+          </header>
+
+          <div className="session-layout">
+            <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
+              {events.length === 0 ? (
+                <div className="text-body-secondary small">
+                  Waiting for queue events…
+                </div>
+              ) : (
+                events.map((env, i) => <StreamItem key={i} envelope={env} />)
+              )}
+            </main>
+
+            {session?.status === "paused" && hasPendingQuestion ? (
+              <footer className="composer">
                 <textarea
                   className="form-control"
                   rows={2}
@@ -763,44 +768,38 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                 >
                   Answer
                 </button>
-              </div>
-            </div>
-          ) : session?.status === "paused" ? (
-            <div className="card-footer bg-warning-subtle d-flex justify-content-between align-items-center gap-2">
-              <div className="small">
-                This session was restored after a daemon restart and is paused
-                until you resume it.
-              </div>
-              <button
-                className="btn btn-warning"
-                onClick={() => void resumeSession()}
-              >
-                Resume queued task
-              </button>
-            </div>
-          ) : (
-            !sessionRunning &&
-            session?.status === "completed" && (
-              <div className="card-footer">
-                <div className="input-group">
-                  <textarea
-                    className="form-control"
-                    rows={2}
-                    value={followUp}
-                    onChange={(e) => setFollowUp(e.target.value)}
-                    placeholder="Follow-up task…"
-                  />
-                  <button
-                    className="btn btn-outline-primary"
-                    onClick={() => void continueSession()}
-                    disabled={!followUp.trim()}
-                  >
-                    Continue
-                  </button>
+              </footer>
+            ) : session?.status === "paused" ? (
+              <footer className="composer">
+                <div className="flex-grow-1 small text-body-secondary">
+                  This session was restored after a daemon restart and is paused until you resume it.
                 </div>
-              </div>
-            )
-          )}
+                <button
+                  className="btn btn-warning"
+                  onClick={() => void resumeSession()}
+                >
+                  Resume
+                </button>
+              </footer>
+            ) : !isRunning && session?.status === "completed" ? (
+              <footer className="composer">
+                <input
+                  type="text"
+                  className="form-control"
+                  value={followUp}
+                  onChange={(e) => setFollowUp(e.target.value)}
+                  placeholder="Follow-up task…"
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void continueSession()}
+                  disabled={!followUp.trim()}
+                >
+                  <i className="bi bi-send" />
+                </button>
+              </footer>
+            ) : null}
+          </div>
         </div>
       </div>
     </>

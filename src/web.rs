@@ -1256,10 +1256,14 @@ async fn static_asset(Path(path): Path<String>) -> impl IntoResponse {
 fn serve_asset(path: &str) -> Response {
     let file = WebAssets::get(path).or_else(|| WebAssets::get("index.html"));
     if let Some(content) = file {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let mime = if path.ends_with(".html") || !path.contains('.') {
+            mime_guess::Mime::from(mime_guess::mime::TEXT_HTML)
+        } else {
+            mime_guess::from_path(path).first_or_octet_stream()
+        };
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, mime.as_ref())],
+            [(header::CONTENT_TYPE, mime.to_string().as_str())],
             content.data,
         )
             .into_response()
