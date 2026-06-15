@@ -25,7 +25,7 @@ const TOOL_FRIENDLY_NAMES: Record<string, string> = {
   rm: "Remove",
   git_commit: "Commit changes",
   git_revert: "Revert commit",
-  sub_agent: "Sub-agent"
+  sub_agent: "Sub-agent",
 };
 
 const TOOL_ICONS: Record<string, string> = {
@@ -47,7 +47,7 @@ const TOOL_ICONS: Record<string, string> = {
   rm: "bi bi-trash",
   git_commit: "bi bi-git",
   git_revert: "bi bi-x-octagon",
-  sub_agent: "bi bi-people"
+  sub_agent: "bi bi-people",
 };
 
 /* ─── types ──────────────────────────────────────────────────── */
@@ -61,17 +61,57 @@ type AgentEvent =
       branch: string;
       nesting_depth?: number;
     }
-  | { type: "step_started"; step: number; max_steps: number; nesting_depth?: number }
+  | {
+      type: "step_started";
+      step: number;
+      max_steps: number;
+      nesting_depth?: number;
+    }
   | { type: "reasoning"; content: string; nesting_depth?: number }
-  | { type: "tool_call"; tool: string; arguments: unknown; nesting_depth?: number }
-  | { type: "tool_result"; tool: string; result: string; nesting_depth?: number }
-  | { type: "user_question"; question_id: string; question: string; nesting_depth?: number }
-  | { type: "user_answer"; question_id: string; answer: string; nesting_depth?: number }
-  | { type: "sub_agent_started"; profile: string; task: string; nesting_depth?: number }
-  | { type: "sub_agent_finished"; profile: string; result: string; nesting_depth?: number }
+  | {
+      type: "tool_call";
+      tool: string;
+      arguments: unknown;
+      nesting_depth?: number;
+    }
+  | {
+      type: "tool_result";
+      tool: string;
+      result: string;
+      nesting_depth?: number;
+    }
+  | {
+      type: "user_question";
+      question_id: string;
+      question: string;
+      nesting_depth?: number;
+    }
+  | {
+      type: "user_answer";
+      question_id: string;
+      answer: string;
+      nesting_depth?: number;
+    }
+  | {
+      type: "sub_agent_started";
+      profile: string;
+      task: string;
+      nesting_depth?: number;
+    }
+  | {
+      type: "sub_agent_finished";
+      profile: string;
+      result: string;
+      nesting_depth?: number;
+    }
   | { type: "diff"; path: string; diff: string; nesting_depth?: number }
   | { type: "final"; content: string; nesting_depth?: number }
-  | { type: "session_summary"; branch: string; commits: string; nesting_depth?: number }
+  | {
+      type: "session_summary";
+      branch: string;
+      commits: string;
+      nesting_depth?: number;
+    }
   | { type: "error"; message: string; nesting_depth?: number }
   | { type: string; [key: string]: unknown };
 
@@ -129,33 +169,52 @@ function navigate(to: string) {
 
 /* ─── helpers ────────────────────────────────────────────────── */
 
-function groupToolEvents(events: EventEnvelope[]): (EventEnvelope | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] })[] {
-  const grouped: (EventEnvelope | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] })[] = [];
-  
+function groupToolEvents(
+  events: EventEnvelope[],
+): (
+  | EventEnvelope
+  | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] }
+)[] {
+  const grouped: (
+    | EventEnvelope
+    | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] }
+  )[] = [];
+
   let currentToolCalls: AgentEvent[] = [];
   let currentToolResults: AgentEvent[] = [];
-  
+
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
-    
+
     if (event.event.type === "tool_call") {
       currentToolCalls.push(event);
-    } else if (event.event.type === "tool_result" && currentToolCalls.length > currentToolResults.length) {
+    } else if (
+      event.event.type === "tool_result" &&
+      currentToolCalls.length > currentToolResults.length
+    ) {
       currentToolResults.push(event);
     } else {
       if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
-        grouped.push({ type: "tool_group", toolCalls: [...currentToolCalls], toolResults: [...currentToolResults] });
+        grouped.push({
+          type: "tool_group",
+          toolCalls: [...currentToolCalls],
+          toolResults: [...currentToolResults],
+        });
         currentToolCalls = [];
         currentToolResults = [];
       }
       grouped.push(event);
     }
   }
-  
+
   if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
-    grouped.push({ type: "tool_group", toolCalls: [...currentToolCalls], toolResults: [...currentToolResults] });
+    grouped.push({
+      type: "tool_group",
+      toolCalls: [...currentToolCalls],
+      toolResults: [...currentToolResults],
+    });
   }
-  
+
   return grouped;
 }
 
@@ -178,13 +237,16 @@ function formatStartTime(timestamp: number): string {
   const now = new Date();
   const diffMs = now.getTime() - timestamp;
   const diffMin = Math.floor(diffMs / 60000);
-  
+
   if (diffMin < 1) return "Started just now";
   if (diffMin < 60) return `Started ${diffMin} min ago`;
   const hours = Math.floor(diffMin / 60);
   const minutes = diffMin % 60;
   if (hours < 24) {
-    const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const timeStr = date.toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
     return `Started ${timeStr}`;
   }
   return date.toLocaleDateString();
@@ -211,22 +273,31 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
-
 /* ─── tool detail helper ─────────────────────────────────────── */
 
-function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | null {
+function getToolDetail(
+  toolCall: AgentEvent,
+  toolResult?: AgentEvent,
+): string | null {
   if (toolCall.event.type !== "tool_call") return null;
-  
+
   const args = toolCall.event.arguments as Record<string, unknown>;
-  
+
   switch (toolCall.event.tool) {
     case "read_file":
-      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+      const filePath = args ? (args.path as string) : undefined;
+      return filePath || "(no path)";
     case "glob":
-      return (args.pattern as string) || "(no pattern)" + (args.relative_path ? ` in ${args.relative_path}` : "");
+      return (
+        (args.pattern as string) ||
+        "(no pattern)" + (args.relative_path ? ` in ${args.relative_path}` : "")
+      );
     case "ripgrep":
     case "search":
-      return (args.pattern as string) || "(no pattern)" + (args.path ? ` in ${args.path}` : "");
+      return (
+        (args.pattern as string) ||
+        "(no pattern)" + (args.path ? ` in ${args.path}` : "")
+      );
     case "web_search":
       return (args.query as string) || "(no query)";
     case "web_fetch":
@@ -237,7 +308,10 @@ function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | 
       const query = args.query as string;
       if (!query) return "";
       if (!toolResult) return `${query} (pending)`;
-      const skillMatches = toolResult.event.type === "tool_result" ? (toolResult.event.result.match(/name: /g)?.length || 0) : 0;
+      const skillMatches =
+        toolResult.event.type === "tool_result"
+          ? toolResult.event.result.match(/name: /g)?.length || 0
+          : 0;
       return `${query} (${skillMatches} skills)`;
     }
     case "skill": {
@@ -249,14 +323,16 @@ function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | 
     case "mv":
       return `from ${(args.source as string) || ""} to ${(args.destination as string) || ""}`;
     case "rm":
-      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+      const filePath = args ? (args.path as string) : undefined;
+      return filePath || "(no path)";
     case "edit_file": {
       const path = args.path as string;
       if (!path) return "(no path)";
       return path + (args.diff ? " (patch)" : "");
     }
     case "apply_patch":
-      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+      const filePath = args ? (args.path as string) : undefined;
+      return filePath || "(no path)";
     case "git_commit":
       return (args.message as string) || "(no message)";
     case "git_revert":
@@ -286,7 +362,13 @@ function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | 
 
 /* ─── message bubble component for grouping ────────────────── */
 
-function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; toolResults: AgentEvent[] }) {
+function ToolGroupBubble({
+  toolCalls,
+  toolResults,
+}: {
+  toolCalls: AgentEvent[];
+  toolResults: AgentEvent[];
+}) {
   const [isOpen, setIsOpen] = useState(false);
 
   if (toolCalls.length === 0) return null;
@@ -296,17 +378,17 @@ function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; 
   const toolItems = toolCalls
     .map((e, i) => {
       if (e.event.type !== "tool_call") return null;
-      
+
       const toolName = e.event.tool;
       const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
       const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
-      
+
       let statusClass = "success";
       let detailText: string | null = null;
-      
+
       const result = i < toolResults.length ? toolResults[i] : undefined;
       detailText = getToolDetail(e, result);
-      
+
       return (
         <div key={i} className={`tool-item ${statusClass}`}>
           <i className={iconClass}></i>
@@ -316,30 +398,36 @@ function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; 
       );
     })
     .filter(Boolean);
-  
-  const toolNames = toolCalls.map((e, i) => {
-    if (e.event.type === "tool_call") return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
-    return "";
-  }).filter(Boolean).join(" · ");
+
+  const toolNames = toolCalls
+    .map((e, i) => {
+      if (e.event.type === "tool_call")
+        return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
+      return "";
+    })
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <article className="message-row assistant-message compact">
-      <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+      <div className="bot-avatar">
+        <i className="bi bi-stars"></i>
+      </div>
       <div className="bubble thought-bubble">
-        <button 
+        <button
           className={`tool-strip${isOpen ? "" : " collapsed"}`}
           onClick={() => setIsOpen(!isOpen)}
           aria-expanded={isOpen}
           type="button"
         >
-          <span><i className="bi bi-tools"></i> {toolCalls.length} tools used</span>
+          <span>
+            <i className="bi bi-tools"></i> {toolCalls.length} tools used
+          </span>
           <span className="tool-names">{toolNames}</span>
           <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
-          <div className="tool-list">
-            {toolItems}
-          </div>
+          <div className="tool-list">{toolItems}</div>
         </div>
         <time>{relativeTime(Date.now())}</time>
       </div>
@@ -347,16 +435,20 @@ function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; 
   );
 }
 
-
 function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
-  
+
   switch (e.type) {
     case "reasoning":
       const rd = e.nesting_depth || 0;
       return (
-        <article className="message-row assistant-message" style={{ paddingLeft: `${rd}rem` }}>
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+        <article
+          className="message-row assistant-message"
+          style={{ paddingLeft: `${rd}rem` }}
+        >
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <div className="bubble thought-bubble">
             <p>{e.content}</p>
             <time>{relativeTime(Date.now())}</time>
@@ -371,14 +463,18 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <p>{e.question}</p>
             <time>{relativeTime(Date.now())}</time>
           </div>
-          <div className="user-avatar"><i className="bi bi-person"></i></div>
+          <div className="user-avatar">
+            <i className="bi bi-person"></i>
+          </div>
         </article>
       );
 
     case "user_answer":
       return (
         <article className="message-row assistant-message compact">
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <div className="bubble thought-bubble">
             <p>Your answer:</p>
             <pre className="mb-0 small">{e.answer}</pre>
@@ -390,8 +486,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "sub_agent_started":
       const saDepth = e.nesting_depth || 0;
       return (
-        <article className="message-row assistant-message compact" style={{ marginLeft: `${saDepth}rem` }}>
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+        <article
+          className="message-row assistant-message compact"
+          style={{ marginLeft: `${saDepth}rem` }}
+        >
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <div className="bubble thought-bubble">
             <p>
               <span className="badge bg-primary me-2">{e.profile}</span>
@@ -405,11 +506,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "sub_agent_finished":
       const sfDepth = e.nesting_depth || 0;
       return (
-        <article 
+        <article
           className="message-row assistant-message compact"
           style={{ marginLeft: `${sfDepth}rem` }}
         >
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <details open className="bubble thought-bubble">
             <summary style={{ display: "none" }} />
             <p>Sub-agent {e.profile} completed</p>
@@ -422,14 +525,18 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "diff":
       const dd = e.nesting_depth || 0;
       return (
-        <article 
-          className="message-row assistant-message" 
+        <article
+          className="message-row assistant-message"
           style={{ marginLeft: `${dd}rem` }}
         >
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <details open className="bubble thought-bubble">
             <summary style={{ display: "none" }} />
-            <p><code>{e.path}</code> changed</p>
+            <p>
+              <code>{e.path}</code> changed
+            </p>
             <details open className="card border-info mb-0">
               <summary className="card-header py-1 small d-flex align-items-center gap-2">
                 <span className="badge bg-info text-dark">diff view</span>
@@ -446,8 +553,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "final":
       const ffd = e.nesting_depth || 0;
       return (
-        <article className="message-row assistant-message" style={{ marginLeft: `${ffd}rem` }}>
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+        <article
+          className="message-row assistant-message"
+          style={{ marginLeft: `${ffd}rem` }}
+        >
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <div className="bubble thought-bubble">
             <p>{e.content}</p>
             <time>{relativeTime(Date.now())}</time>
@@ -458,8 +570,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "session_summary":
       const ssd = e.nesting_depth || 0;
       return (
-        <article className="message-row assistant-message compact" style={{ marginLeft: `${ssd}rem` }}>
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+        <article
+          className="message-row assistant-message compact"
+          style={{ marginLeft: `${ssd}rem` }}
+        >
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
           <div className="bubble thought-bubble">
             <p>
               Session complete <code>{e.branch}</code>
@@ -473,8 +590,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "error":
       return (
         <article className="message-row assistant-message compact">
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <div className="bubble thought-bubble" style={{ border: "1px solid #fda4af", background: "#fef2f2" }}>
+          <div className="bot-avatar">
+            <i className="bi bi-stars"></i>
+          </div>
+          <div
+            className="bubble thought-bubble"
+            style={{ border: "1px solid #fda4af", background: "#fef2f2" }}
+          >
             <p>Error</p>
             <pre className="mb-0 small result-pre">{String(e.message)}</pre>
             <time>{relativeTime(Date.now())}</time>
@@ -562,10 +684,18 @@ function HomePage() {
           </div>
 
           <nav className="nav nav-pills flex-column gap-1 px-2">
-            <a className="nav-link active" href="#"><i className="bi bi-house-door"></i> Home</a>
-            <a className="nav-link" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
-            <a className="nav-link" href="#"><i className="bi bi-folder2-open"></i> Projects</a>
-            <a className="nav-link" href="#"><i className="bi bi-gear"></i> Settings</a>
+            <a className="nav-link active" href="#">
+              <i className="bi bi-house-door"></i> Home
+            </a>
+            <a className="nav-link" href="#">
+              <i className="bi bi-chat-square-text"></i> Sessions
+            </a>
+            <a className="nav-link" href="#">
+              <i className="bi bi-folder2-open"></i> Projects
+            </a>
+            <a className="nav-link" href="#">
+              <i className="bi bi-gear"></i> Settings
+            </a>
           </nav>
 
           <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">
@@ -583,13 +713,17 @@ function HomePage() {
               <div className="brand-mark">&gt;_</div>
               <strong>LocalAgent</strong>
             </div>
-            <button className="btn btn-light btn-icon" aria-label="Open menu">☰</button>
+            <button className="btn btn-light btn-icon" aria-label="Open menu">
+              ☰
+            </button>
           </header>
 
           <div className="content-wrap">
             <section className="hero-section">
               <h1>Start a new session</h1>
-              <p className="text-secondary mb-3">Describe what you'd like the agent to work on.</p>
+              <p className="text-secondary mb-3">
+                Describe what you'd like the agent to work on.
+              </p>
 
               <form
                 className="start-card card"
@@ -607,14 +741,28 @@ function HomePage() {
                     rows={4}
                   />
                   <div className="editor-actions position-absolute end-0 bottom-0 p-2">
-                    <button type="button" className="btn btn-sm border rounded-2 text-secondary bg-transparent" aria-label="Attach context">⌕</button>
-                    <button type="button" className="btn btn-sm border rounded-2 text-secondary bg-transparent" aria-label="Improve prompt">✣</button>
+                    <button
+                      type="button"
+                      className="btn btn-sm border rounded-2 text-secondary bg-transparent"
+                      aria-label="Attach context"
+                    >
+                      ⌕
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm border rounded-2 text-secondary bg-transparent"
+                      aria-label="Improve prompt"
+                    >
+                      ✣
+                    </button>
                   </div>
                 </div>
 
                 <div className="session-controls row g-3 align-items-end p-3">
                   <div className="col-12 col-md-5">
-                    <label className="form-label small fw-semibold">Project</label>
+                    <label className="form-label small fw-semibold">
+                      Project
+                    </label>
                     <select
                       className="form-select"
                       value={workdir}
@@ -633,7 +781,9 @@ function HomePage() {
                     </select>
                   </div>
                   <div className="col-12 col-md-4">
-                    <label className="form-label small fw-semibold">Base branch</label>
+                    <label className="form-label small fw-semibold">
+                      Base branch
+                    </label>
                     <select
                       className="form-select"
                       value={branch}
@@ -660,7 +810,12 @@ function HomePage() {
             <section className="sessions-section">
               <div className="section-header d-flex align-items-center justify-content-between mb-3">
                 <h2 className="h6 fw-bold m-0">Recent sessions</h2>
-                <a href="#" className="text-decoration-none small fw-medium text-blue">View all sessions</a>
+                <a
+                  href="#"
+                  className="text-decoration-none small fw-medium text-blue"
+                >
+                  View all sessions
+                </a>
               </div>
 
               <div className="session-list list-group">
@@ -690,13 +845,20 @@ function HomePage() {
                         className={`session-row list-group-item list-group-item-action py-3 px-4 ${s.status}`}
                         onClick={() => navigate(`/sessions/${s.session_id}`)}
                       >
-                        <div className={`state-dot rounded-circle bg-${s.status === "running" ? "green" : s.status === "completed" ? "blue" : "gray"}`} />
+                        <div
+                          className={`state-dot rounded-circle bg-${s.status === "running" ? "green" : s.status === "completed" ? "blue" : "gray"}`}
+                        />
                         <div className="session-icon">&gt;_</div>
                         <div className="session-main">
                           <strong>{s.task}</strong>
-                          <span>{projectName(s.workdir)} · {formatStartTime(s.updated_at_ms)}</span>
+                          <span>
+                            {projectName(s.workdir)} ·{" "}
+                            {formatStartTime(s.updated_at_ms)}
+                          </span>
                         </div>
-                        <span className={`status-pill ${statusClass}`}>{statusText}</span>
+                        <span className={`status-pill ${statusClass}`}>
+                          {statusText}
+                        </span>
                         <span className="chevron">›</span>
                       </button>
                     );
@@ -868,17 +1030,27 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       <div className="app-shell">
         <aside className="sidebar d-none d-lg-flex flex-column">
           <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-            <div className="brand-mark"><i className="bi bi-terminal"></i></div>
+            <div className="brand-mark">
+              <i className="bi bi-terminal"></i>
+            </div>
             <div>
               <strong>LocalAgent</strong>
-              <small className="d-block text-secondary">Private by default</small>
+              <small className="d-block text-secondary">
+                Private by default
+              </small>
             </div>
           </div>
         </aside>
         <section className="session-panel">
           <header className="session-header">
             <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
-              <img src="/logo.svg" alt="pb" width="32" height="32" style={{ borderRadius: "6px" }} />
+              <img
+                src="/logo.svg"
+                alt="pb"
+                width="32"
+                height="32"
+                style={{ borderRadius: "6px" }}
+              />
               pb
             </span>
           </header>
@@ -891,16 +1063,28 @@ function SessionPage({ sessionId }: { sessionId: string }) {
     <div className="app-shell">
       <aside className="sidebar d-none d-lg-flex flex-column">
         <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-          <div className="brand-mark"><i className="bi bi-terminal"></i></div>
+          <div className="brand-mark">
+            <i className="bi bi-terminal"></i>
+          </div>
           <strong>LocalAgent</strong>
         </div>
 
         <nav className="nav nav-pills flex-column gap-1 px-2">
-          <a className="nav-link active" href="#"><i className="bi bi-chat-square-text"></i> Sessions</a>
-          <a className="nav-link" href="#"><i className="bi bi-folder2-open"></i> Projects</a>
-          <a className="nav-link" href="#"><i className="bi bi-files"></i> Files</a>
-          <a className="nav-link" href="#"><i className="bi bi-shield-lock"></i> Privacy</a>
-          <a className="nav-link" href="#"><i className="bi bi-gear"></i> Settings</a>
+          <a className="nav-link active" href="#">
+            <i className="bi bi-chat-square-text"></i> Sessions
+          </a>
+          <a className="nav-link" href="#">
+            <i className="bi bi-folder2-open"></i> Projects
+          </a>
+          <a className="nav-link" href="#">
+            <i className="bi bi-files"></i> Files
+          </a>
+          <a className="nav-link" href="#">
+            <i className="bi bi-shield-lock"></i> Privacy
+          </a>
+          <a className="nav-link" href="#">
+            <i className="bi bi-gear"></i> Settings
+          </a>
         </nav>
 
         <div className="mt-auto p-3 user-mini">
@@ -921,13 +1105,23 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           >
             <i className="bi bi-chevron-left fs-4"></i>
           </button>
-          <div className="session-icon d-none d-sm-grid"><i className="bi bi-terminal"></i></div>
+          <div className="session-icon d-none d-sm-grid">
+            <i className="bi bi-terminal"></i>
+          </div>
           <div className="min-w-0 flex-grow-1">
             <h1>{session.task}</h1>
             <div className="status-line">
               {isRunning && <span className="live-dot" />}
-              <span>{session.status === "running" ? "Running" : session.status === "queued" ? "Queued" :
-                session.status === "paused" ? (session.pending_question ? "Waiting for answer" : "Paused") : "Completed"}
+              <span>
+                {session.status === "running"
+                  ? "Running"
+                  : session.status === "queued"
+                    ? "Queued"
+                    : session.status === "paused"
+                      ? session.pending_question
+                        ? "Waiting for answer"
+                        : "Paused"
+                      : "Completed"}
               </span>
               {session.updated_at_ms && (
                 <>
@@ -936,13 +1130,15 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                 </>
               )}
               <span className="dot-sep d-none d-sm-inline"></span>
-              <span className="d-none d-sm-inline">Model: {session.branch}</span>
+              <span className="d-none d-sm-inline">
+                Model: {session.branch}
+              </span>
             </div>
           </div>
           <button className="btn btn-light rounded-pill d-none d-sm-inline-flex">
             <i className="bi bi-box-arrow-up me-2"></i>Share
           </button>
-          <button 
+          <button
             className="btn btn-danger rounded-pill"
             onClick={() => window.location.reload()}
           >
@@ -950,43 +1146,90 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           </button>
         </header>
 
-         <div className="session-layout">
-           <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
-             {events.length === 0 ? (
-               <div className="text-body-secondary small">Waiting for queue events…</div>
-             ) : (
-               groupToolEvents(events.filter(e => e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished")).map((grouped, i) => {
-                 if ((grouped as any).type === "tool_group") {
-                   const tc = (grouped as any).toolCalls;
-                   return <ToolGroupBubble key={i} toolCalls={tc} toolResults={(grouped as any).toolResults} />;
-                 }
-                 return <MessageBubble key={i} envelope={grouped as EventEnvelope} />;
-               })
-             )}
-           </main>
+        <div className="session-layout">
+          <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
+            {events.length === 0 ? (
+              <div className="text-body-secondary small">
+                Waiting for queue events…
+              </div>
+            ) : (
+              groupToolEvents(
+                events.filter(
+                  (e) =>
+                    e.event.tool !== "sub_agent" &&
+                    e.event.type !== "sub_agent_started" &&
+                    e.event.type !== "sub_agent_finished",
+                ),
+              ).map((grouped, i) => {
+                if ((grouped as any).type === "tool_group") {
+                  const tc = (grouped as any).toolCalls;
+                  return (
+                    <ToolGroupBubble
+                      key={i}
+                      toolCalls={tc}
+                      toolResults={(grouped as any).toolResults}
+                    />
+                  );
+                }
+                return (
+                  <MessageBubble key={i} envelope={grouped as EventEnvelope} />
+                );
+              })
+            )}
+          </main>
 
           <aside className="tool-drawer d-none d-xl-block">
             <div className="drawer-header">
               <h2>Tools</h2>
-              <span className="badge rounded-pill text-bg-light">{events.filter(e => (e.event.type === "tool_call" || e.event.type === "tool_result") && e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished").length}</span>
+              <span className="badge rounded-pill text-bg-light">
+                {
+                  events.filter(
+                    (e) =>
+                      (e.event.type === "tool_call" ||
+                        e.event.type === "tool_result") &&
+                      e.event.type !== "sub_agent_started" &&
+                      e.event.type !== "sub_agent_finished",
+                  ).length
+                }
+              </span>
             </div>
-            {events.filter(e => e.event.type === "tool_call" || e.event.type === "tool_result").map((e, i) => (
-              <button key={i} className="drawer-item">
-                <span><i className="bi bi-file-earmark-text"></i>{e.event.type === "tool_call" ? ` ${e.event.tool}` : ""}</span>
-              </button>
-            ))}
+            {events
+              .filter(
+                (e) =>
+                  e.event.type === "tool_call" ||
+                  e.event.type === "tool_result",
+              )
+              .map((e, i) => (
+                <button key={i} className="drawer-item">
+                  <span>
+                    <i className="bi bi-file-earmark-text"></i>
+                    {e.event.type === "tool_call" ? ` ${e.event.tool}` : ""}
+                  </span>
+                </button>
+              ))}
 
             <div className="empty-detail">
               <i className="bi bi-file-earmark-code"></i>
               <h3>Select a tool</h3>
-              <p>Inspect files, commands, and outputs without cluttering the main session.</p>
+              <p>
+                Inspect files, commands, and outputs without cluttering the main
+                session.
+              </p>
             </div>
           </aside>
         </div>
 
         {session.status === "paused" && session.pending_question ? (
-          <form className="composer" onSubmit={(e) => { e.preventDefault(); void answerQuestion(); }}>
-            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
+          <form
+            className="composer"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void answerQuestion();
+            }}
+          >
+            <button className="btn btn-light rounded-circle" type="button">
+              <i className="bi bi-plus-lg"></i>
+            </button>
             <input
               className="form-control"
               rows={2}
@@ -1005,7 +1248,8 @@ function SessionPage({ sessionId }: { sessionId: string }) {
         ) : session.status === "paused" ? (
           <footer className="composer">
             <div className="flex-grow-1 small text-body-secondary">
-              This session was restored after a daemon restart and is paused until you resume it.
+              This session was restored after a daemon restart and is paused
+              until you resume it.
             </div>
             <button
               className="btn btn-warning"
@@ -1015,8 +1259,16 @@ function SessionPage({ sessionId }: { sessionId: string }) {
             </button>
           </footer>
         ) : !isRunning && session.status === "completed" ? (
-          <form className="composer" onSubmit={(e) => { e.preventDefault(); void continueSession(); }}>
-            <button className="btn btn-light rounded-circle" type="button"><i className="bi bi-plus-lg"></i></button>
+          <form
+            className="composer"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void continueSession();
+            }}
+          >
+            <button className="btn btn-light rounded-circle" type="button">
+              <i className="bi bi-plus-lg"></i>
+            </button>
             <input
               className="form-control"
               value={followUp}
