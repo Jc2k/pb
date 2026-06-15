@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_core::AgentProfile;
+
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +20,7 @@ pub enum AgentEvent {
     },
     Reasoning {
         content: String,
+        profile: AgentProfile,
     },
     ToolCall {
         tool: String,
@@ -50,6 +53,7 @@ pub enum AgentEvent {
     },
     Final {
         content: String,
+        profile: AgentProfile,
     },
     SessionSummary {
         branch: String,

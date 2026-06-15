@@ -67,7 +67,7 @@ type AgentEvent =
       max_steps: number;
       nesting_depth?: number;
     }
-  | { type: "reasoning"; content: string; nesting_depth?: number }
+  | { type: "reasoning"; content: string; profile: string }
   | {
       type: "tool_call";
       tool: string;
@@ -165,6 +165,24 @@ function useRoute(): string {
 function navigate(to: string) {
   window.history.pushState(null, "", to);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+/* ─── avatar helpers ─────────────────────────────────────────── */
+
+function getAvatarForProfile(profile: string): string {
+  const validProfiles = [
+    "build",
+    "scout",
+    "review",
+    "explore",
+    "plan",
+    "ask",
+    "research",
+  ];
+  if (validProfiles.includes(profile)) {
+    return `/avatar-${profile}.png`;
+  }
+  return "/avatar.png";
 }
 
 /* ─── helpers ────────────────────────────────────────────────── */
@@ -447,7 +465,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           style={{ paddingLeft: `${rd}rem` }}
         >
           <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
+            <img src={`avatar-${e.profile}.png`} />
           </div>
           <div className="bubble thought-bubble">
             <p>{e.content}</p>
@@ -491,7 +509,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           style={{ marginLeft: `${saDepth}rem` }}
         >
           <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
+            <img src={getAvatarForProfile(e.profile)} alt={e.profile} />
           </div>
           <div className="bubble thought-bubble">
             <p>

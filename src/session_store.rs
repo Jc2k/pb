@@ -276,6 +276,7 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_core::AgentProfile;
     use crate::environment::EnvironmentConfig;
     use crate::events::AgentEvent;
     use tempfile::TempDir;
@@ -328,6 +329,7 @@ mod tests {
             SessionStatus::Running,
             vec![EventEnvelope::new(AgentEvent::Final {
                 content: "done".to_string(),
+                profile: AgentProfile::Build,
             })],
         );
 

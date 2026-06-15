@@ -16,7 +16,10 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::StepStarted { step, max_steps } => {
             print_header("step", &format!("{step}/{max_steps}"));
         }
-        AgentEvent::Reasoning { content } => print_header("reasoning", content),
+        AgentEvent::Reasoning {
+            content,
+            profile: _,
+        } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
         AgentEvent::ToolResult { result, .. } => print_block("tool result", result),
         AgentEvent::UserQuestion {
@@ -27,14 +30,21 @@ pub fn render_event(event: &AgentEvent) {
             question_id,
             answer,
         } => print_block(&format!("answer {question_id}"), answer),
-        AgentEvent::SubAgentStarted { profile, task, nesting_depth: _ } => {
+        AgentEvent::SubAgentStarted {
+            profile,
+            task,
+            nesting_depth: _,
+        } => {
             print_header("sub-agent", &format!("{profile}: {task}"));
         }
         AgentEvent::SubAgentFinished { profile, result } => {
             print_block(&format!("sub-agent {profile}"), result);
         }
         AgentEvent::Diff { diff, .. } => print_block("diff", diff),
-        AgentEvent::Final { content } => print_header("final", content),
+        AgentEvent::Final {
+            content,
+            profile: _,
+        } => print_header("final", content),
         AgentEvent::SessionSummary { branch, commits } => {
             print_header("session", &format!("branch: {branch}"));
             if !commits.trim().is_empty() {

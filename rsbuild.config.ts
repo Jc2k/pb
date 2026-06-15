@@ -13,5 +13,12 @@ export default defineConfig({
     distPath: {
       root: "webui/dist",
     },
+    assetPrefixes: {
+      js: "/",
+      css: "/",
+      image: "/",
+      font: "/",
+      other: "/",
+    },
   },
 });

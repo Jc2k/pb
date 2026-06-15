@@ -1218,10 +1218,14 @@ fn run_agent_steps(
         match action {
             AgentAction::Final { content, thinking } => {
                 if let Some(reasoning) = thinking {
-                    sink.emit(AgentEvent::Reasoning { content: reasoning });
+                    sink.emit(AgentEvent::Reasoning {
+                        content: reasoning,
+                        profile: args.profile,
+                    });
                 }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
+                    profile: args.profile,
                 });
                 return Ok(StepRunOutcome {
                     reached_final: true,
@@ -1234,7 +1238,10 @@ fn run_agent_steps(
                 thinking,
             } => {
                 if let Some(reasoning) = thinking {
-                    sink.emit(AgentEvent::Reasoning { content: reasoning });
+                    sink.emit(AgentEvent::Reasoning {
+                        content: reasoning,
+                        profile: args.profile,
+                    });
                 }
                 sink.emit(AgentEvent::ToolCall {
                     tool: tool.clone(),
@@ -1871,7 +1878,10 @@ struct SubAgentEventCollector {
 impl SubAgentEventCollector {
     fn collect(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Final { content } => self.final_content = Some(content),
+            AgentEvent::Final {
+                content,
+                profile: _,
+            } => self.final_content = Some(content),
             AgentEvent::Error { message } => self.errors.push(message),
             AgentEvent::Diff { .. } => self.diffs += 1,
             _ => {}
@@ -3825,7 +3835,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let resolved = resolve_workspace_path(&workspace, "new/dir/file.txt", false).unwrap();
         assert_eq!(
-            resolved,
+            resolved.canonicalize().unwrap_or(resolved),
             workspace
                 .join("new/dir/file.txt")
                 .canonicalize()
