@@ -7,23 +7,47 @@ import "./session.css";
 const SCROLL_THRESHOLD = 80;
 
 const TOOL_FRIENDLY_NAMES: Record<string, string> = {
-  "Reading files": "Reading files",
-  "Searching code": "Searching code", 
-  "Listing folders": "Listing folders",
-  "Writing files": "Writing files",
-  "Running command": "Running command",
-  "Running tests": "Running tests",
-  "Reading output": "Reading output"
+  read_file: "Read file",
+  glob: "List files",
+  ripgrep: "Search code",
+  search: "Search",
+  web_search: "Web search",
+  web_fetch: "Fetch URL",
+  git_log: "Git log",
+  todo: "Manage todos",
+  skill_search: "Search skills",
+  skill: "Load skill",
+  ask_user: "Ask user",
+  run_command: "Run command",
+  edit_file: "Edit file",
+  apply_patch: "Apply patch",
+  mv: "Move/rename",
+  rm: "Remove",
+  git_commit: "Commit changes",
+  git_revert: "Revert commit",
+  sub_agent: "Sub-agent"
 };
 
 const TOOL_ICONS: Record<string, string> = {
-  "Reading files": "bi bi-file-earmark-text",
-  "Searching code": "bi bi-search", 
-  "Listing folders": "bi bi-folder2",
-  "Writing files": "bi bi-pencil-square",
-  "Running command": "bi bi-play-circle",
-  "Running tests": "bi bi-play-circle",
-  "Reading output": "bi bi-card-text"
+  read_file: "bi bi-file-earmark-text",
+  glob: "bi bi-files",
+  ripgrep: "bi bi-search",
+  search: "bi bi-search",
+  web_search: "bi bi-globe",
+  web_fetch: "bi bi-link",
+  git_log: "bi bi-clock-history",
+  todo: "bi bi-check2-square",
+  skill_search: "bi bi-bookmark-star",
+  skill: "bi bi-file-earmark-code",
+  ask_user: "bi bi-person-circle",
+  run_command: "bi bi-play-circle",
+  edit_file: "bi bi-pencil-square",
+  apply_patch: "bi bi-diff",
+  mv: "bi bi-graph-up-arrow",
+  rm: "bi bi-trash",
+  git_commit: "bi bi-git",
+  git_revert: "bi bi-x-octagon",
+  sub_agent: "bi bi-people"
 };
 
 /* ─── types ──────────────────────────────────────────────────── */
