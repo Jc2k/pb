@@ -236,7 +236,8 @@ function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | 
     case "skill_search": {
       const query = args.query as string;
       if (!query) return "";
-      const skillMatches = toolResult?.event.type === "tool_result" ? (toolResult.event.result.match(/name: /g)?.length || 0) : 0;
+      if (!toolResult) return `${query} (pending)`;
+      const skillMatches = toolResult.event.type === "tool_result" ? (toolResult.event.result.match(/name: /g)?.length || 0) : 0;
       return `${query} (${skillMatches} skills)`;
     }
     case "skill": {
@@ -278,6 +279,7 @@ function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | 
           }
         }
       }
+      if (!toolResult) return "(pending)";
       return null;
   }
 }
@@ -302,9 +304,8 @@ function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; 
       let statusClass = "success";
       let detailText: string | null = null;
       
-      if (i < toolResults.length && toolResults[i].event.type === "tool_result") {
-        detailText = getToolDetail(e, toolResults[i]);
-      }
+      const result = i < toolResults.length ? toolResults[i] : undefined;
+      detailText = getToolDetail(e, result);
       
       return (
         <div key={i} className={`tool-item ${statusClass}`}>
