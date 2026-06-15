@@ -186,44 +186,42 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "tool_call":
       const tcDepth = e.nesting_depth || 0;
       return (
-        <details 
+        <article 
           className="message-row assistant-message" 
-          open 
           style={{ marginLeft: `${tcDepth}rem` }}
         >
-          <summary style={{ display: "none" }} />
           <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <div className="bubble thought-bubble">
+          <details open className="bubble thought-bubble">
+            <summary style={{ display: "none" }} />
             <p>Called {e.tool}</p>
-            <details open className="card border-secondary mb-0">
-              <summary className="card-header py-1 small d-flex align-items-center gap-2">
-                <span className="badge bg-secondary">arguments</span>
-              </summary>
-              <div className="card-body py-1">
-                <pre className="mb-0 small">{JSON.stringify(e.arguments, null, 2)}</pre>
-              </div>
-            </details>
+              <details open className="card border-secondary mb-0">
+                <summary className="card-header py-1 small d-flex align-items-center gap-2">
+                  <span className="badge bg-secondary">arguments</span>
+                </summary>
+                <div className="card-body py-1">
+                  <pre className="mb-0 small">{JSON.stringify(e.arguments, null, 2)}</pre>
+                </div>
+              </details>
             <time>{relativeTime(Date.now())}</time>
-          </div>
-        </details>
+          </details>
+        </article>
       );
 
     case "tool_result":
       const trDepth = e.nesting_depth || 0;
       return (
-        <details 
+        <article 
           className="message-row assistant-message compact"
-          open
           style={{ marginLeft: `${trDepth}rem` }}
         >
-          <summary style={{ display: "none" }} />
           <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <div className="bubble thought-bubble">
+          <details open className="bubble thought-bubble">
+            <summary style={{ display: "none" }} />
             <p>Result from {e.tool}</p>
             <pre className="mb-0 small result-pre">{e.result}</pre>
             <time>{relativeTime(Date.now())}</time>
-          </div>
-        </details>
+          </details>
+        </article>
       );
 
     case "user_question":
@@ -233,6 +231,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <p>{e.question}</p>
             <time>{relativeTime(Date.now())}</time>
           </div>
+          <div className="user-avatar"><i className="bi bi-person"></i></div>
         </article>
       );
 
@@ -266,32 +265,30 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
     case "sub_agent_finished":
       const sfDepth = e.nesting_depth || 0;
       return (
-        <details 
+        <article 
           className="message-row assistant-message compact"
-          open
           style={{ marginLeft: `${sfDepth}rem` }}
         >
-          <summary style={{ display: "none" }} />
           <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <div className="bubble thought-bubble">
+          <details open className="bubble thought-bubble">
+            <summary style={{ display: "none" }} />
             <p>Sub-agent {e.profile} completed</p>
             <pre className="mb-0 small result-pre">{e.result}</pre>
             <time>{relativeTime(Date.now())}</time>
-          </div>
-        </details>
+          </details>
+        </article>
       );
 
     case "diff":
       const dd = e.nesting_depth || 0;
       return (
-        <details 
+        <article 
           className="message-row assistant-message" 
-          open
           style={{ marginLeft: `${dd}rem` }}
         >
-          <summary style={{ display: "none" }} />
           <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <div className="bubble thought-bubble">
+          <details open className="bubble thought-bubble">
+            <summary style={{ display: "none" }} />
             <p><code>{e.path}</code> changed</p>
             <details open className="card border-info mb-0">
               <summary className="card-header py-1 small d-flex align-items-center gap-2">
@@ -302,8 +299,8 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
               </div>
             </details>
             <time>{relativeTime(Date.now())}</time>
-          </div>
-        </details>
+          </details>
+        </article>
       );
 
     case "final":

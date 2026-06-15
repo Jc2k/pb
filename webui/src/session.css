@@ -126,6 +126,9 @@ body {
 .bot-avatar {
   width: 34px; height: 34px; flex: 0 0 34px; margin-top: .15rem;
 }
+.user-avatar {
+  width: 34px; height: 34px; flex: 0 0 34px; margin-top: .15rem;
+}
 
 .bubble {
   max-width: min(620px, 84%);
