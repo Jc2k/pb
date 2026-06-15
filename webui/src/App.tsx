@@ -427,10 +427,7 @@ function ToolGroupBubble({
     .join(" · ");
 
   return (
-    <article className="message-row assistant-message compact">
-      <div className="bot-avatar">
-        <i className="bi bi-stars"></i>
-      </div>
+    <article className="message-row compact tool-message">
       <div className="bubble thought-bubble">
         <button
           className={`tool-strip${isOpen ? "" : " collapsed"}`}
