@@ -6,6 +6,26 @@ import "./session.css";
 
 const SCROLL_THRESHOLD = 80;
 
+const TOOL_FRIENDLY_NAMES: Record<string, string> = {
+  "Reading files": "Reading files",
+  "Searching code": "Searching code", 
+  "Listing folders": "Listing folders",
+  "Writing files": "Writing files",
+  "Running command": "Running command",
+  "Running tests": "Running tests",
+  "Reading output": "Reading output"
+};
+
+const TOOL_ICONS: Record<string, string> = {
+  "Reading files": "bi bi-file-earmark-text",
+  "Searching code": "bi bi-search", 
+  "Listing folders": "bi bi-folder2",
+  "Writing files": "bi bi-pencil-square",
+  "Running command": "bi bi-play-circle",
+  "Running tests": "bi bi-play-circle",
+  "Reading output": "bi bi-card-text"
+};
+
 /* ─── types ──────────────────────────────────────────────────── */
 
 type AgentEvent =
@@ -85,6 +105,36 @@ function navigate(to: string) {
 
 /* ─── helpers ────────────────────────────────────────────────── */
 
+function groupToolEvents(events: EventEnvelope[]): (EventEnvelope | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] })[] {
+  const grouped: (EventEnvelope | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] })[] = [];
+  
+  let currentToolCalls: AgentEvent[] = [];
+  let currentToolResults: AgentEvent[] = [];
+  
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    
+    if (event.event.type === "tool_call") {
+      currentToolCalls.push(event);
+    } else if (event.event.type === "tool_result" && currentToolCalls.length > currentToolResults.length) {
+      currentToolResults.push(event);
+    } else {
+      if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
+        grouped.push({ type: "tool_group", toolCalls: [...currentToolCalls], toolResults: [...currentToolResults] });
+        currentToolCalls = [];
+        currentToolResults = [];
+      }
+      grouped.push(event);
+    }
+  }
+  
+  if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
+    grouped.push({ type: "tool_group", toolCalls: [...currentToolCalls], toolResults: [...currentToolResults] });
+  }
+  
+  return grouped;
+}
+
 function projectName(workdir?: string): string {
   if (!workdir) return "Unknown project";
   const parts = workdir.replace(/\\/g, "/").split("/").filter(Boolean);
@@ -137,35 +187,83 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
-/* ─── tool strip component for assistant messages ────────────── */
+/* ─── message bubble component for grouping ────────────────── */
 
-function ToolStrip({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; toolResults: AgentEvent[] }) {
-  const [isOpen, setIsOpen] = useState(true);
+function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; toolResults: AgentEvent[] }) {
+  const [isOpen, setIsOpen] = useState(false);
 
   if (toolCalls.length === 0) return null;
 
-  const allTools = [...toolCalls];
+  const collapseId = `tools-${Math.random().toString(36).substr(2, 9)}`;
+
+  const toolItems = toolCalls
+    .map((e, i) => {
+      if (e.event.type !== "tool_call") return null;
+      
+      const toolName = e.event.tool;
+      const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
+      const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
+      
+      let statusClass = "success";
+      let detailText = "";
+      
+      if (i < toolResults.length && toolResults[i].event.type === "tool_result") {
+        try {
+          const parsedResult = JSON.parse(toolResults[i].event.result);
+          if (Array.isArray(parsedResult)) {
+            detailText = `${parsedResult.length} items`;
+          } else if (typeof parsedResult === "object" && parsedResult !== null) {
+            detailText = Object.keys(parsedResult).length > 0 ? "result" : "";
+          }
+        } catch {
+          if (toolResults[i].event.result.length < 50) {
+            detailText = toolResults[i].event.result;
+          } else {
+            detailText = "result";
+          }
+        }
+      }
+      
+      return (
+        <div key={i} className={`tool-item ${statusClass}`}>
+          <i className={iconClass}></i>
+          <span>{friendlyName}</span>
+          {detailText && <small>{detailText}</small>}
+        </div>
+      );
+    })
+    .filter(Boolean);
   
+  const toolNames = toolCalls.map((e, i) => {
+    if (e.event.type === "tool_call") return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
+    return "";
+  }).filter(Boolean).join(" · ");
+
   return (
-    <button
-      className="tool-strip"
-      onClick={() => setIsOpen(!isOpen)}
-      aria-expanded={isOpen}
-      type="button"
-    >
-      <span><i className="bi bi-tools"></i> {allTools.length} tools used</span>
-      <span className="tool-names">
-        {allTools.map((t, i) => {
-          if (t.type === "tool_call") return t.tool;
-          return "";
-        }).join(" · ")}
-      </span>
-      <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
-    </button>
+    <article className="message-row assistant-message compact">
+      <div className="bot-avatar"><i className="bi bi-stars"></i></div>
+      <div className="bubble thought-bubble">
+        <button 
+          className={`tool-strip${isOpen ? "" : " collapsed"}`}
+          onClick={() => setIsOpen(!isOpen)}
+          aria-expanded={isOpen}
+          type="button"
+        >
+          <span><i className="bi bi-tools"></i> {toolCalls.length} tools used</span>
+          <span className="tool-names">{toolNames}</span>
+          <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
+        </button>
+        <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
+          <div className="tool-list">
+            {toolItems}
+          </div>
+        </div>
+        <time>{relativeTime(Date.now())}</time>
+      </div>
+    </article>
   );
 }
 
-/* ─── message bubble component ──────────────────────────────── */
 
 function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
@@ -180,47 +278,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <p>{e.content}</p>
             <time>{relativeTime(Date.now())}</time>
           </div>
-        </article>
-      );
-
-    case "tool_call":
-      const tcDepth = e.nesting_depth || 0;
-      return (
-        <article 
-          className="message-row assistant-message" 
-          style={{ marginLeft: `${tcDepth}rem` }}
-        >
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <details open className="bubble thought-bubble">
-            <summary style={{ display: "none" }} />
-            <p>Called {e.tool}</p>
-              <details open className="card border-secondary mb-0">
-                <summary className="card-header py-1 small d-flex align-items-center gap-2">
-                  <span className="badge bg-secondary">arguments</span>
-                </summary>
-                <div className="card-body py-1">
-                  <pre className="mb-0 small">{JSON.stringify(e.arguments, null, 2)}</pre>
-                </div>
-              </details>
-            <time>{relativeTime(Date.now())}</time>
-          </details>
-        </article>
-      );
-
-    case "tool_result":
-      const trDepth = e.nesting_depth || 0;
-      return (
-        <article 
-          className="message-row assistant-message compact"
-          style={{ marginLeft: `${trDepth}rem` }}
-        >
-          <div className="bot-avatar"><i className="bi bi-stars"></i></div>
-          <details open className="bubble thought-bubble">
-            <summary style={{ display: "none" }} />
-            <p>Result from {e.tool}</p>
-            <pre className="mb-0 small result-pre">{e.result}</pre>
-            <time>{relativeTime(Date.now())}</time>
-          </details>
         </article>
       );
 
@@ -810,14 +867,20 @@ function SessionPage({ sessionId }: { sessionId: string }) {
           </button>
         </header>
 
-        <div className="session-layout">
-          <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
-            {events.length === 0 ? (
-              <div className="text-body-secondary small">Waiting for queue events…</div>
-            ) : (
-              events.filter(e => e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished").map((env, i) => <MessageBubble key={i} envelope={env} />)
-            )}
-          </main>
+         <div className="session-layout">
+           <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
+             {events.length === 0 ? (
+               <div className="text-body-secondary small">Waiting for queue events…</div>
+             ) : (
+               groupToolEvents(events.filter(e => e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished")).map((grouped, i) => {
+                 if ((grouped as any).type === "tool_group") {
+                   const tc = (grouped as any).toolCalls;
+                   return <ToolGroupBubble key={i} toolCalls={tc} toolResults={(grouped as any).toolResults} />;
+                 }
+                 return <MessageBubble key={i} envelope={grouped as EventEnvelope} />;
+               })
+             )}
+           </main>
 
           <aside className="tool-drawer d-none d-xl-block">
             <div className="drawer-header">
