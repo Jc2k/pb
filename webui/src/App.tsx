@@ -815,14 +815,14 @@ function SessionPage({ sessionId }: { sessionId: string }) {
             {events.length === 0 ? (
               <div className="text-body-secondary small">Waiting for queue events…</div>
             ) : (
-              events.map((env, i) => <MessageBubble key={i} envelope={env} />)
+              events.filter(e => e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished").map((env, i) => <MessageBubble key={i} envelope={env} />)
             )}
           </main>
 
           <aside className="tool-drawer d-none d-xl-block">
             <div className="drawer-header">
               <h2>Tools</h2>
-              <span className="badge rounded-pill text-bg-light">{events.filter(e => e.event.type === "tool_call" || e.event.type === "tool_result").length}</span>
+              <span className="badge rounded-pill text-bg-light">{events.filter(e => (e.event.type === "tool_call" || e.event.type === "tool_result") && e.event.type !== "sub_agent_started" && e.event.type !== "sub_agent_finished").length}</span>
             </div>
             {events.filter(e => e.event.type === "tool_call" || e.event.type === "tool_result").map((e, i) => (
               <button key={i} className="drawer-item">
