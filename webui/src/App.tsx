@@ -211,6 +211,77 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
+
+/* ─── tool detail helper ─────────────────────────────────────── */
+
+function getToolDetail(toolCall: AgentEvent, toolResult?: AgentEvent): string | null {
+  if (toolCall.event.type !== "tool_call") return null;
+  
+  const args = toolCall.event.arguments as Record<string, unknown>;
+  
+  switch (toolCall.event.tool) {
+    case "read_file":
+      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+    case "glob":
+      return (args.pattern as string) || "(no pattern)" + (args.relative_path ? ` in ${args.relative_path}` : "");
+    case "ripgrep":
+    case "search":
+      return (args.pattern as string) || "(no pattern)" + (args.path ? ` in ${args.path}` : "");
+    case "web_search":
+      return (args.query as string) || "(no query)";
+    case "web_fetch":
+      return (args.url as string) || "(no url)";
+    case "run_command":
+      return (args.cmd as string) || "(no cmd)";
+    case "skill_search": {
+      const query = args.query as string;
+      if (!query) return "";
+      const skillMatches = toolResult?.event.type === "tool_result" ? (toolResult.event.result.match(/name: /g)?.length || 0) : 0;
+      return `${query} (${skillMatches} skills)`;
+    }
+    case "skill": {
+      const name = args.name as string;
+      if (!name) return "(no name)";
+      if (name === "list") return "loaded skills list";
+      return name;
+    }
+    case "mv":
+      return `from ${(args.source as string) || ""} to ${(args.destination as string) || ""}`;
+    case "rm":
+      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+    case "edit_file": {
+      const path = args.path as string;
+      if (!path) return "(no path)";
+      return path + (args.diff ? " (patch)" : "");
+    }
+    case "apply_patch":
+      const filePath = args ? (args.path as string) : undefined; return filePath || "(no path)";
+    case "git_commit":
+      return (args.message as string) || "(no message)";
+    case "git_revert":
+      return (args.commit as string) || "(no commit)";
+    default:
+      if (toolResult && toolResult.event.type === "tool_result") {
+        try {
+          const parsed = JSON.parse(toolResult.event.result);
+          if (Array.isArray(parsed)) {
+            return `${parsed.length} items`;
+          }
+          if (typeof parsed === "object" && parsed !== null) {
+            const keys = Object.keys(parsed);
+            return `result (${keys.length} fields)`;
+          }
+        } catch {
+          const result = toolResult.event.result;
+          if (result.length < 80) {
+            return result.replace(/\n/g, " ");
+          }
+        }
+      }
+      return null;
+  }
+}
+
 /* ─── message bubble component for grouping ────────────────── */
 
 function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; toolResults: AgentEvent[] }) {
@@ -229,23 +300,10 @@ function ToolGroupBubble({ toolCalls, toolResults }: { toolCalls: AgentEvent[]; 
       const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
       
       let statusClass = "success";
-      let detailText = "";
+      let detailText: string | null = null;
       
       if (i < toolResults.length && toolResults[i].event.type === "tool_result") {
-        try {
-          const parsedResult = JSON.parse(toolResults[i].event.result);
-          if (Array.isArray(parsedResult)) {
-            detailText = `${parsedResult.length} items`;
-          } else if (typeof parsedResult === "object" && parsedResult !== null) {
-            detailText = Object.keys(parsedResult).length > 0 ? "result" : "";
-          }
-        } catch {
-          if (toolResults[i].event.result.length < 50) {
-            detailText = toolResults[i].event.result;
-          } else {
-            detailText = "result";
-          }
-        }
+        detailText = getToolDetail(e, toolResults[i]);
       }
       
       return (
