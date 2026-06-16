@@ -1142,40 +1142,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar d-none d-lg-flex flex-column">
-        <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-          <div className="brand-mark">
-            <i className="bi bi-terminal"></i>
-          </div>
-          <strong>LocalAgent</strong>
-        </div>
-
-        <nav className="nav nav-pills flex-column gap-1 px-2">
-          <a className="nav-link active" href="#">
-            <i className="bi bi-chat-square-text"></i> Sessions
-          </a>
-          <a className="nav-link" href="#">
-            <i className="bi bi-folder2-open"></i> Projects
-          </a>
-          <a className="nav-link" href="#">
-            <i className="bi bi-files"></i> Files
-          </a>
-          <a className="nav-link" href="#">
-            <i className="bi bi-shield-lock"></i> Privacy
-          </a>
-          <a className="nav-link" href="#">
-            <i className="bi bi-gear"></i> Settings
-          </a>
-        </nav>
-
-        <div className="mt-auto p-3 user-mini">
-          <div className="avatar-sm">JC</div>
-          <div>
-            <strong>John Carr</strong>
-            <small className="d-block text-secondary">Local workspace</small>
-          </div>
-        </div>
-      </aside>
+      <Aside />
 
       <section className="session-panel">
         <header className="session-header">
