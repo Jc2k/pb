@@ -1,6 +1,7 @@
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
 import "./session.css";
+import { Aside } from "./Aside";
 
 /* ─── constants ──────────────────────────────────────────────── */
 
@@ -387,14 +388,10 @@ function getToolDetailSimple(toolEvent: AgentEvent): string | null {
     case "read_file":
       return args ? (args.path as string) : "(no path)";
     case "glob":
-      return (
-        (args.pattern as string) || "(no pattern)"
-      );
+      return (args.pattern as string) || "(no pattern)";
     case "ripgrep":
     case "search":
-      return (
-        (args.pattern as string) || "(no pattern)"
-      );
+      return (args.pattern as string) || "(no pattern)";
     case "web_search":
       return (args.query as string) || "(no query)";
     case "web_fetch":
@@ -801,35 +798,7 @@ function HomePage() {
   return (
     <>
       <div className="app-shell">
-        <aside className="sidebar d-none d-lg-flex flex-column">
-          <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-            <div className="brand-mark">&gt;_</div>
-            <strong>LocalAgent</strong>
-          </div>
-
-          <nav className="nav nav-pills flex-column gap-1 px-2">
-            <a className="nav-link active" href="#">
-              <i className="bi bi-house-door"></i> Home
-            </a>
-            <a className="nav-link" href="#">
-              <i className="bi bi-chat-square-text"></i> Sessions
-            </a>
-            <a className="nav-link" href="#">
-              <i className="bi bi-folder2-open"></i> Projects
-            </a>
-            <a className="nav-link" href="#">
-              <i className="bi bi-gear"></i> Settings
-            </a>
-          </nav>
-
-          <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">
-            <div className="avatar-sm">JD</div>
-            <div>
-              <strong>Jane Doe</strong>
-              <small className="d-block text-secondary">Local workspace</small>
-            </div>
-          </div>
-        </aside>
+        <Aside />
 
         <section className="main-panel">
           <header className="mobile-topbar d-lg-none d-flex align-items-center justify-content-between px-3 py-2">
@@ -1152,19 +1121,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
   if (!session) {
     return (
       <div className="app-shell">
-        <aside className="sidebar d-none d-lg-flex flex-column">
-          <div className="brand d-flex align-items-center gap-2 px-3 py-3">
-            <div className="brand-mark">
-              <i className="bi bi-terminal"></i>
-            </div>
-            <div>
-              <strong>LocalAgent</strong>
-              <small className="d-block text-secondary">
-                Private by default
-              </small>
-            </div>
-          </div>
-        </aside>
+        <Aside />
         <section className="session-panel">
           <header className="session-header">
             <span className="navbar-brand fw-bold mb-0 d-flex align-items-center gap-2">
@@ -1323,35 +1280,46 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                   e.event.type === "tool_call" ||
                   e.event.type === "tool_result",
               );
-              
+
               if (toolEvents.length === 0) {
                 return (
                   <div className="empty-detail">
                     <i className="bi bi-file-earmark-code"></i>
                     <h3>Select a tool</h3>
                     <p>
-                      Inspect files, commands, and outputs without cluttering the main
-                      session.
+                      Inspect files, commands, and outputs without cluttering
+                      the main session.
                     </p>
                   </div>
                 );
               }
-              
+
               const groupedTools: Record<
                 string,
-                { count: number; details: string[]; icon: string; callEvents: AgentEvent[] }
+                {
+                  count: number;
+                  details: string[];
+                  icon: string;
+                  callEvents: AgentEvent[];
+                }
               > = {};
-              
+
               toolEvents.forEach((e) => {
                 if (e.event.type !== "tool_call") return;
-                
+
                 const toolName = e.event.tool;
                 const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
-                const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
+                const iconClass =
+                  TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
                 const detail = getToolDetailSimple(e);
-                
+
                 if (!groupedTools[toolName]) {
-                  groupedTools[toolName] = { count: 0, details: [], icon: iconClass, callEvents: [] };
+                  groupedTools[toolName] = {
+                    count: 0,
+                    details: [],
+                    icon: iconClass,
+                    callEvents: [],
+                  };
                 }
                 groupedTools[toolName].count++;
                 groupedTools[toolName].callEvents.push(e);
@@ -1359,7 +1327,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                   groupedTools[toolName].details.push(detail);
                 }
               });
-              
+
               return Object.entries(groupedTools).map(([toolName, data], i) => (
                 <button key={i} className="drawer-item">
                   <span>

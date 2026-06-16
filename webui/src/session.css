@@ -37,6 +37,7 @@ body {
     min-height: 100vh;
     display: grid;
     grid-template-columns: 18rem minmax(0, 1fr);
+    display: flex;
 }
 
 .sidebar {
@@ -150,12 +151,6 @@ body {
 .dot-sep::before {
     content: "•";
     color: #c4c9d1;
-}
-
-.content-wrap {
-    width: min(100%, 100%);
-    margin: 0;
-    padding: 0;
 }
 
 .session-layout {

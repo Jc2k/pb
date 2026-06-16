@@ -1,6 +1,449 @@
 @import "bootstrap/dist/css/bootstrap.min.css";
 @import "bootstrap-icons/font/bootstrap-icons.css";
 
+:root {
+    --app-bg: #f6f8fb;
+    --panel-bg: #ffffff;
+    --line: #e6ebf1;
+    --line-soft: #eef2f6;
+    --text-soft: #667085;
+    --blue: #0d6efd;
+    --shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    min-height: 100vh;
+    margin: 0;
+    background: radial-gradient(
+        circle at top right,
+        #ffffff 0,
+        var(--app-bg) 45%,
+        #f2f5f9 100%
+    );
+    color: #111827;
+}
+
+.app-shell {
+    min-height: 100vh;
+    display: flex;
+}
+
+.sidebar {
+    width: 270px;
+    padding: 26px 18px;
+    background: rgba(255, 255, 255, 0.78);
+    border-right: 1px solid var(--line);
+    backdrop-filter: blur(18px);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 1.05rem;
+}
+
+.brand.compact {
+    font-size: 1rem;
+}
+
+.brand-mark {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    background: #050505;
+    color: white;
+    font-weight: 700;
+    letter-spacing: -0.08em;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+}
+
+.nav-link {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: #243044;
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-weight: 500;
+}
+
+.nav-link:hover,
+.nav-link.active {
+    color: var(--blue);
+    background: #eef5ff;
+}
+
+.nav-icon {
+    width: 20px;
+    text-align: center;
+}
+
+.user-menu {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 8px;
+}
+
+.avatar {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #e5e7eb;
+    color: #111827;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.user-copy {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.15;
+}
+
+.user-copy span {
+    color: var(--text-soft);
+    font-size: 0.78rem;
+}
+
+.main-panel {
+    flex: 1;
+    min-width: 0;
+}
+
+.mobile-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    background: rgba(255, 255, 255, 0.86);
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(16px);
+}
+
+.btn-icon {
+    width: 38px;
+    height: 38px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+}
+
+.content-wrap {
+    width: min(100%, 1040px);
+    margin: 0 auto;
+    padding: 72px 38px;
+}
+
+.hero-section h1 {
+    font-size: clamp(1.7rem, 3vw, 2.25rem);
+    font-weight: 750;
+    letter-spacing: -0.04em;
+}
+
+.start-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+}
+
+.task-editor {
+    position: relative;
+}
+
+.task-editor textarea {
+    min-height: 210px;
+    padding: 22px;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    resize: vertical;
+    box-shadow: none !important;
+    font-size: 1.05rem;
+}
+
+.editor-actions {
+    position: absolute;
+    right: 18px;
+    bottom: 16px;
+    display: flex;
+    gap: 8px;
+}
+
+.ghost-button {
+    border: 0;
+    background: transparent;
+    color: #64748b;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+}
+
+.ghost-button:hover {
+    background: #f1f5f9;
+}
+
+.session-controls {
+    padding: 18px 22px 22px;
+}
+
+.form-label {
+    margin-bottom: 7px;
+    color: #344054;
+    font-size: 0.88rem;
+    font-weight: 600;
+}
+
+.form-select,
+.form-control {
+    border-color: #dbe2ea;
+    border-radius: 12px;
+}
+
+.form-select {
+    min-height: 48px;
+}
+
+.start-button {
+    min-height: 48px;
+    border-radius: 12px;
+    font-weight: 650;
+    box-shadow: 0 10px 22px rgba(13, 110, 253, 0.22);
+}
+
+.sessions-section {
+    margin-top: 54px;
+}
+
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 16px;
+}
+
+.section-header h2 {
+    margin: 0;
+    font-size: 1.12rem;
+    font-weight: 750;
+    letter-spacing: -0.02em;
+}
+
+.section-header a {
+    color: var(--blue);
+    text-decoration: none;
+    font-weight: 500;
+    font-size: 0.92rem;
+}
+
+.session-list {
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 8px 28px rgba(15, 23, 42, 0.04);
+}
+
+.session-row {
+    display: grid;
+    grid-template-columns: 12px 44px 1fr auto 18px;
+    align-items: center;
+    gap: 16px;
+    padding: 18px 20px;
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px solid var(--line-soft);
+    transition:
+        background 0.15s ease,
+        transform 0.15s ease;
+}
+
+.session-row:last-child {
+    border-bottom: 0;
+}
+.session-row:hover {
+    background: #f8fbff;
+}
+
+.state-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #94a3b8;
+}
+
+.running .state-dot {
+    background: #22c55e;
+}
+.completed .state-dot {
+    background: #0d6efd;
+}
+.failed .state-dot {
+    background: #ef4444;
+}
+.stopped .state-dot {
+    background: #94a3b8;
+}
+
+.session-icon {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    border-radius: 12px;
+    font-weight: 800;
+    color: #0f172a;
+    background: #eef4ff;
+    letter-spacing: -0.08em;
+}
+
+.running .session-icon {
+    background: #dcfce7;
+    color: #15803d;
+}
+.failed .session-icon {
+    background: #fee2e2;
+    color: #dc2626;
+}
+.stopped .session-icon {
+    background: #f1f5f9;
+    color: #475569;
+}
+
+.session-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.session-main strong {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 720;
+}
+
+.session-main span {
+    color: var(--text-soft);
+    font-size: 0.9rem;
+}
+
+.status-pill {
+    justify-self: end;
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.status-running {
+    color: #15803d;
+    background: #dcfce7;
+}
+.status-completed {
+    color: #0d6efd;
+    background: #e8f1ff;
+}
+.status-failed {
+    color: #dc2626;
+    background: #fee2e2;
+}
+.status-stopped {
+    color: #475569;
+    background: #f1f5f9;
+}
+
+.chevron {
+    color: #64748b;
+    font-size: 1.5rem;
+    line-height: 1;
+}
+
+@media (max-width: 991.98px) {
+    .app-shell {
+        display: block;
+    }
+
+    .content-wrap {
+        padding: 28px 18px 42px;
+    }
+
+    .hero-section h1 {
+        font-size: 1.55rem;
+    }
+
+    .task-editor textarea {
+        min-height: 150px;
+        padding: 18px;
+        font-size: 1rem;
+    }
+
+    .session-controls {
+        padding: 14px;
+    }
+
+    .sessions-section {
+        margin-top: 26px;
+    }
+
+    .section-header a {
+        font-size: 0.86rem;
+        white-space: nowrap;
+    }
+
+    .session-row {
+        grid-template-columns: 10px 34px 1fr auto 12px;
+        gap: 10px;
+        padding: 13px 12px;
+    }
+
+    .session-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        font-size: 0.78rem;
+    }
+
+    .session-main strong {
+        font-size: 0.88rem;
+    }
+    .session-main span {
+        font-size: 0.75rem;
+    }
+
+    .status-pill {
+        padding: 4px 8px;
+        font-size: 0.68rem;
+    }
+}
+
+@media (max-width: 420px) {
+    .status-pill {
+        display: none;
+    }
+    .session-row {
+        grid-template-columns: 10px 34px 1fr 12px;
+    }
+}
+
+
 #root {
   height: 100%;
 }
@@ -17,7 +460,7 @@ body {
   min-height: 300px;
 }
 
-/* diff viewer */
+/* diff viewer */ /*
 .diff-block {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.8125rem;
@@ -39,13 +482,13 @@ body {
   color: var(--bs-info);
 }
 
-/* tool result scroll cap */
+/* tool result scroll cap */ /*
 .result-pre {
   max-height: 300px;
   overflow-y: auto;
 }
 
-/* collapsible details/summary */
+/* collapsible details/summary */ /*
 details > summary {
   cursor: pointer;
   list-style: none;
