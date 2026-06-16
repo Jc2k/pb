@@ -378,6 +378,43 @@ function getToolDetail(
   }
 }
 
+function getToolDetailSimple(toolEvent: AgentEvent): string | null {
+  if (toolEvent.event.type !== "tool_call") return null;
+
+  const args = toolEvent.event.arguments as Record<string, unknown>;
+
+  switch (toolEvent.event.tool) {
+    case "read_file":
+      return args ? (args.path as string) : "(no path)";
+    case "glob":
+      return (
+        (args.pattern as string) || "(no pattern)"
+      );
+    case "ripgrep":
+    case "search":
+      return (
+        (args.pattern as string) || "(no pattern)"
+      );
+    case "web_search":
+      return (args.query as string) || "(no query)";
+    case "web_fetch":
+      return (args.url as string) || "(no url)";
+    case "run_command":
+      return (args.cmd as string) || "(no cmd)";
+    case "mv":
+      return `from ${(args.source as string) || ""} to ${(args.destination as string) || ""}`;
+    case "rm":
+      return args ? (args.path as string) : "(no path)";
+    case "edit_file": {
+      const path = args.path as string;
+      if (!path) return "(no path)";
+      return path + (args.diff ? " (patch)" : "");
+    }
+    default:
+      return null;
+  }
+}
+
 /* ─── message bubble component for grouping ────────────────── */
 
 function ToolGroupBubble({
@@ -1280,29 +1317,59 @@ function SessionPage({ sessionId }: { sessionId: string }) {
                 }
               </span>
             </div>
-            {events
-              .filter(
+            {(() => {
+              const toolEvents = events.filter(
                 (e) =>
                   e.event.type === "tool_call" ||
                   e.event.type === "tool_result",
-              )
-              .map((e, i) => (
+              );
+              
+              if (toolEvents.length === 0) {
+                return (
+                  <div className="empty-detail">
+                    <i className="bi bi-file-earmark-code"></i>
+                    <h3>Select a tool</h3>
+                    <p>
+                      Inspect files, commands, and outputs without cluttering the main
+                      session.
+                    </p>
+                  </div>
+                );
+              }
+              
+              const groupedTools: Record<
+                string,
+                { count: number; details: string[]; icon: string; callEvents: AgentEvent[] }
+              > = {};
+              
+              toolEvents.forEach((e) => {
+                if (e.event.type !== "tool_call") return;
+                
+                const toolName = e.event.tool;
+                const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
+                const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
+                const detail = getToolDetailSimple(e);
+                
+                if (!groupedTools[toolName]) {
+                  groupedTools[toolName] = { count: 0, details: [], icon: iconClass, callEvents: [] };
+                }
+                groupedTools[toolName].count++;
+                groupedTools[toolName].callEvents.push(e);
+                if (detail) {
+                  groupedTools[toolName].details.push(detail);
+                }
+              });
+              
+              return Object.entries(groupedTools).map(([toolName, data], i) => (
                 <button key={i} className="drawer-item">
                   <span>
-                    <i className="bi bi-file-earmark-text"></i>
-                    {e.event.type === "tool_call" ? ` ${e.event.tool}` : ""}
+                    <i className={data.icon}></i>
+                    {TOOL_FRIENDLY_NAMES[toolName] || toolName}
                   </span>
+                  <strong>{data.count}</strong>
                 </button>
-              ))}
-
-            <div className="empty-detail">
-              <i className="bi bi-file-earmark-code"></i>
-              <h3>Select a tool</h3>
-              <p>
-                Inspect files, commands, and outputs without cluttering the main
-                session.
-              </p>
-            </div>
+              ));
+            })()}
           </aside>
         </div>
 
