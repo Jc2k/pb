@@ -180,17 +180,18 @@ body {
     margin-top: 0.15rem;
 }
 
-.bot-avatar {
-    width: 34px;
-    height: 34px;
-    flex: 0 0 34px;
-    margin-top: 0.15rem;
-}
+.bot-avatar,
 .user-avatar {
-    width: 34px;
-    height: 34px;
-    flex: 0 0 34px;
+    width: 64px;
+    height: 64px;
+    flex: 0 0 64px;
     margin-top: 0.15rem;
+
+    img {
+        width: 64px;
+        height: 64px;
+        border-radius: 14px;
+    }
 }
 
 .bubble {
@@ -241,8 +242,8 @@ body {
 }
 
 .tool-message {
-    /* 32px image + 14px margin*/
-    padding-left: 48px;
+    /* 64px image + 14px margin*/
+    padding-left: 78px;
 }
 
 .tool-message .bubble {

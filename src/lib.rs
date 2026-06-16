@@ -27,6 +27,7 @@ pub mod projects;
 pub mod service;
 pub mod session_store;
 pub mod tray;
+pub mod user;
 pub mod web;
 
 pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";

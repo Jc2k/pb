@@ -454,6 +454,19 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
 
   switch (e.type) {
+    case "started":
+      return (
+        <article className="message-row user-message">
+          <div className="bubble user-bubble">
+            <p>{e.task}</p>
+            <time>{relativeTime(Date.now())}</time>
+          </div>
+          <div className="user-avatar">
+            <img src={`/api/current-user.png`} />
+          </div>
+        </article>
+      );
+
     case "reasoning":
       const rd = e.nesting_depth || 0;
       return (
@@ -462,7 +475,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           style={{ paddingLeft: `${rd}rem` }}
         >
           <div className="bot-avatar">
-            <img src={`avatar-${e.profile}.png`} />
+            <img src={`/static/images/avatar-${e.profile}.png`} />
           </div>
           <div className="bubble thought-bubble">
             <p>{e.content}</p>

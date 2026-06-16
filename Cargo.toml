@@ -14,9 +14,26 @@ globset = "0.4.18"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.26"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 indicatif = "0.17.11"
+libc = "0.2.186"
 llama-cpp-2 = "0.1.146"
 mime_guess = "2.0.5"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSData",
+    "NSError",
+    "NSEnumerator",
+    "NSString",
+] }
+objc2-open-directory = { version = "0.3", features = [
+    "CFOpenDirectory",
+    "CFOpenDirectoryConstants",
+    "ODNode",
+    "ODRecord",
+    "ODSession",
+] }
 regex = "1.12.4"
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust-embed = "8.9.0"
@@ -24,9 +41,12 @@ self_update = { version = "0.41.0", default-features = false, features = ["archi
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.150"
 similar = "2.7.0"
+thiserror = "2.0.18"
 tokio = { version = "1.38.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 toml = "0.8"
+tracing = "0.1.44"
+url = "2.5.8"
 walkdir = "2.5.0"
 
 [dev-dependencies]

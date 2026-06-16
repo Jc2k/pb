@@ -223,6 +223,8 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
         .route("/api/status", get(status))
+        .route("/api/current-user.png", get(crate::user::avatar_png))
+        .route("/api/current-user", get(crate::user::user_info))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state((state.clone(), defaults.clone()));
