@@ -450,6 +450,48 @@ function ToolGroupBubble({
   );
 }
 
+function profileName(profile: string): string {
+  switch (profile) {
+    case "plan":
+      return "Dade Murphy";
+    case "build":
+      return "Kate Libby";
+    case "review":
+      return "Eugene Belford";
+    case "scout":
+      return "Ramon Sanchez";
+    case "explore":
+      return "Paul Cook";
+    case "research":
+      return "Emmanuel Goldstein";
+    case "ask":
+      return "Joey Pardella";
+    default:
+      return "Jon Appleseed";
+  }
+}
+
+function profileJobTitle(profile: string): string {
+  switch (profile) {
+    case "plan":
+      return "Ticket Goblin";
+    case "build":
+      return "Patch Crafter";
+    case "review":
+      return "Review Gremlin";
+    case "scout":
+      return "Env Scout";
+    case "explore":
+      return "Repo Mapper";
+    case "research":
+      return "Web Sleuth";
+    case "ask":
+      return "Question Wrangler";
+    default:
+      return "Unknown";
+  }
+}
+
 function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
 
@@ -477,9 +519,16 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           <div className="bot-avatar">
             <img src={`/static/images/avatar-${e.profile}.png`} />
           </div>
-          <div className="bubble thought-bubble">
-            <p>{e.content}</p>
-            <time>{relativeTime(Date.now())}</time>
+          <div>
+            <div class="author-line">
+              <strong>{profileName(e.profile)}</strong>
+              <span>{profileJobTitle(e.profile)}</span>
+              <time>10:42 AM</time>
+            </div>
+            <div className="bubble thought-bubble">
+              <p>{e.content}</p>
+              <time>{relativeTime(Date.now())}</time>
+            </div>
           </div>
         </article>
       );
@@ -588,9 +637,16 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           <div className="bot-avatar">
             <i className="bi bi-stars"></i>
           </div>
-          <div className="bubble thought-bubble">
-            <p>{e.content}</p>
-            <time>{relativeTime(Date.now())}</time>
+          <div>
+            <div class="author-line">
+              <strong>{profileName(e.profile)}</strong>
+              <span>{profileJobTitle(e.profile)}</span>
+              <time>10:42 AM</time>
+            </div>
+            <div className="bubble thought-bubble">
+              <p>{e.content}</p>
+              <time>{relativeTime(Date.now())}</time>
+            </div>
           </div>
         </article>
       );

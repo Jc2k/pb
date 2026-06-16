@@ -180,6 +180,18 @@ body {
     margin-top: 0.15rem;
 }
 
+.author-line {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+.author-line span,
+.author-line time {
+    color: var(--muted);
+    font-size: 0.92rem;
+}
+
 .bot-avatar,
 .user-avatar {
     width: 64px;
