@@ -213,7 +213,7 @@ article.user div.message-container {
 }
 
 .bubble {
-    max-width: min(620px, 84%);
+    max-width: min(620px, 100%);
     border-radius: 21px;
     padding: 0.85rem 0.95rem 0.4rem;
     position: relative;
@@ -424,7 +424,7 @@ article.user div.message-container {
         gap: 0.75rem;
     }
     .bubble {
-        max-width: calc(100% - 46px);
+        max-width: 100%;
     }
 }
 
@@ -450,9 +450,6 @@ article.user div.message-container {
         padding-inline: 0.75rem;
     }
     .bot-avatar {
-        width: 30px;
-        height: 30px;
-        flex-basis: 30px;
         border-radius: 10px;
     }
     .bubble {
