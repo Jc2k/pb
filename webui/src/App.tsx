@@ -444,7 +444,6 @@ function ToolGroupBubble({
         <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
           <div className="tool-list">{toolItems}</div>
         </div>
-        <time>{relativeTime(Date.now())}</time>
       </div>
     </article>
   );
@@ -498,10 +497,16 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   switch (e.type) {
     case "started":
       return (
-        <article className="message-row user-message">
-          <div className="bubble user-bubble">
-            <p>{e.task}</p>
-            <time>{relativeTime(Date.now())}</time>
+        <article className="user message-row user-message">
+          <div className="message-container">
+            <div className="author-line">
+              <strong>{profileName(e.profile)}</strong>
+              <span>{profileJobTitle(e.profile)}</span>
+              <time>10:42 AM</time>
+            </div>
+            <div className="bubble user-bubble">
+              <p>{e.task}</p>
+            </div>
           </div>
           <div className="user-avatar">
             <img src={`/api/current-user.png`} />
@@ -513,13 +518,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
       const rd = e.nesting_depth || 0;
       return (
         <article
-          className="message-row assistant-message"
+          className="bot message-row assistant-message"
           style={{ paddingLeft: `${rd}rem` }}
         >
           <div className="bot-avatar">
             <img src={`/static/images/avatar-${e.profile}.png`} />
           </div>
-          <div>
+          <div class="message-container">
             <div class="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
@@ -527,7 +532,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             </div>
             <div className="bubble thought-bubble">
               <p>{e.content}</p>
-              <time>{relativeTime(Date.now())}</time>
             </div>
           </div>
         </article>
@@ -535,10 +539,16 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
 
     case "user_question":
       return (
-        <article className="message-row user-message">
-          <div className="bubble user-bubble">
-            <p>{e.question}</p>
-            <time>{relativeTime(Date.now())}</time>
+        <article className="user message-row user-message">
+          <div className="message-container">
+            <div className="author-line">
+              <strong>{profileName(e.profile)}</strong>
+              <span>{profileJobTitle(e.profile)}</span>
+              <time>{relativeTime(Date.now())}</time>
+            </div>
+            <div className="bubble user-bubble">
+              <p>{e.question}</p>
+            </div>
           </div>
           <div className="user-avatar">
             <i className="bi bi-person"></i>
@@ -548,14 +558,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
 
     case "user_answer":
       return (
-        <article className="message-row assistant-message compact">
+        <article className="bot message-row assistant-message compact">
           <div className="bot-avatar">
             <i className="bi bi-stars"></i>
           </div>
           <div className="bubble thought-bubble">
             <p>Your answer:</p>
             <pre className="mb-0 small">{e.answer}</pre>
-            <time>{relativeTime(Date.now())}</time>
           </div>
         </article>
       );
@@ -575,7 +584,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
               <span className="badge bg-primary me-2">{e.profile}</span>
               {e.task}
             </p>
-            <time>{relativeTime(Date.now())}</time>
           </div>
         </article>
       );
@@ -594,7 +602,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <summary style={{ display: "none" }} />
             <p>Sub-agent {e.profile} completed</p>
             <pre className="mb-0 small result-pre">{e.result}</pre>
-            <time>{relativeTime(Date.now())}</time>
           </details>
         </article>
       );
@@ -622,7 +629,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
                 <DiffView diff={e.diff} />
               </div>
             </details>
-            <time>{relativeTime(Date.now())}</time>
           </details>
         </article>
       );
@@ -631,21 +637,20 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
       const ffd = e.nesting_depth || 0;
       return (
         <article
-          className="message-row assistant-message"
+          className="bot message-row assistant-message"
           style={{ marginLeft: `${ffd}rem` }}
         >
           <div className="bot-avatar">
             <i className="bi bi-stars"></i>
           </div>
-          <div>
-            <div class="author-line">
+          <div className="message-container">
+            <div className="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
               <time>10:42 AM</time>
             </div>
             <div className="bubble thought-bubble">
               <p>{e.content}</p>
-              <time>{relativeTime(Date.now())}</time>
             </div>
           </div>
         </article>
@@ -666,7 +671,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
               Session complete <code>{e.branch}</code>
             </p>
             <pre className="mb-0 small result-pre">{e.commits}</pre>
-            <time>{relativeTime(Date.now())}</time>
           </div>
         </article>
       );
@@ -683,7 +687,6 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           >
             <p>Error</p>
             <pre className="mb-0 small result-pre">{String(e.message)}</pre>
-            <time>{relativeTime(Date.now())}</time>
           </div>
         </article>
       );
