@@ -68,59 +68,68 @@ type AgentEvent =
       workspace: string;
       branch: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "step_started";
       step: number;
       max_steps: number;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
-  | { type: "reasoning"; content: string; profile: string }
+  | { type: "reasoning"; content: string; profile: string; timestamp_ms?: number }
   | {
       type: "tool_call";
       tool: string;
       arguments: unknown;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "tool_result";
       tool: string;
       result: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "user_question";
       question_id: string;
       question: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "user_answer";
       question_id: string;
       answer: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "sub_agent_started";
       profile: string;
       task: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
   | {
       type: "sub_agent_finished";
       profile: string;
       result: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
-  | { type: "diff"; path: string; diff: string; nesting_depth?: number }
-  | { type: "final"; content: string; nesting_depth?: number }
+  | { type: "diff"; path: string; diff: string; nesting_depth?: number; timestamp_ms?: number }
+  | { type: "final"; content: string; nesting_depth?: number; timestamp_ms?: number }
   | {
       type: "session_summary";
       branch: string;
       commits: string;
       nesting_depth?: number;
+      timestamp_ms?: number;
     }
-  | { type: "error"; message: string; nesting_depth?: number }
+  | { type: "error"; message: string; nesting_depth?: number; timestamp_ms?: number }
   | { type: string; [key: string]: unknown };
 
 interface EventEnvelope {
@@ -241,6 +250,24 @@ function relativeTime(ms: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
   return new Date(ms).toLocaleDateString();
+}
+
+function formatEventTime(timestamp_ms?: number): string {
+  if (!timestamp_ms) return "";
+  const date = new Date(timestamp_ms);
+  const now = new Date();
+  const diffMs = now.getTime() - timestamp_ms;
+  const diffMin = Math.floor(diffMs / 60000);
+
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const hours = Math.floor(diffMin / 60);
+  const minutes = diffMin % 60;
+  if (hours < 24) {
+    const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return `at ${timeStr}`;
+  }
+  return date.toLocaleDateString();
 }
 
 function formatStartTime(timestamp: number): string {
@@ -528,7 +555,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <div className="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
-              <time>10:42 AM</time>
+              <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble user-bubble">
               <p>{e.task}</p>
@@ -554,7 +581,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <div class="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
-              <time>10:42 AM</time>
+              <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble thought-bubble">
               <p>{e.content}</p>
@@ -570,7 +597,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <div className="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
-              <time>{relativeTime(Date.now())}</time>
+              <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble user-bubble">
               <p>{e.question}</p>
@@ -673,7 +700,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <div className="author-line">
               <strong>{profileName(e.profile)}</strong>
               <span>{profileJobTitle(e.profile)}</span>
-              <time>10:42 AM</time>
+              <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble thought-bubble">
               <p>{e.content}</p>

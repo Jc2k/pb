@@ -266,7 +266,7 @@ fn command_output(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn now_millis() -> u128 {
+pub fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -331,6 +331,7 @@ mod tests {
             vec![EventEnvelope::new(AgentEvent::Final {
                 content: "done".to_string(),
                 profile: AgentProfile::Build,
+                timestamp_ms: None,
             })],
         );
 

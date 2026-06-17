@@ -511,6 +511,7 @@ async fn answer_question_inner(
         AgentEvent::UserAnswer {
             question_id,
             answer,
+            timestamp_ms: Some(now_millis()),
         },
     );
     persist_session_snapshot(
@@ -685,6 +686,7 @@ impl EventSink for WebEventSink {
         let event = AgentEvent::UserQuestion {
             question_id: question_id.clone(),
             question: question.to_string(),
+            timestamp_ms: Some(now_millis()),
         };
 
         tokio::runtime::Handle::current().block_on(async {
@@ -817,6 +819,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             message: err.to_string(),
+                            timestamp_ms: Some(now_millis()),
                         },
                     );
                 }
@@ -826,6 +829,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             message: err.to_string(),
+                            timestamp_ms: Some(now_millis()),
                         },
                     );
                 }
@@ -1292,7 +1296,7 @@ fn publish_event(
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
 ) {
-    let envelope = EventEnvelope::new(event);
+    let envelope = EventEnvelope::with_timestamp(event);
     let _ = sender.send(envelope.clone());
     if let Ok(mut entries) = history.lock() {
         entries.push(envelope);

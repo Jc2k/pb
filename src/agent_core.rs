@@ -35,6 +35,7 @@ use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
 use crate::mcp::{self, McpToolRegistry};
+use crate::session_store::now_millis;
 
 const LLAMA_BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
@@ -632,6 +633,7 @@ pub fn run_agent<S: EventSink>(
         model: model_path.display().to_string(),
         workspace: workspace_root.display().to_string(),
         branch: branch.clone(),
+        timestamp_ms: Some(now_millis()),
     });
 
     let instructions = build_agent_instructions(
@@ -683,6 +685,7 @@ pub fn run_agent<S: EventSink>(
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
+        timestamp_ms: Some(now_millis()),
     });
 
     // `command_backend` is dropped here, which removes task containers when used.
@@ -1236,6 +1239,7 @@ fn run_agent_steps(
         sink.emit(AgentEvent::StepStarted {
             step,
             max_steps: args.max_steps,
+            timestamp_ms: Some(now_millis()),
         });
 
         let prompt = render_prompt(messages);
@@ -1248,11 +1252,13 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Reasoning {
                         content: reasoning,
                         profile: args.profile,
+                        timestamp_ms: Some(now_millis()),
                     });
                 }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
+                    timestamp_ms: Some(now_millis()),
                 });
                 return Ok(StepRunOutcome {
                     reached_final: true,
@@ -1268,11 +1274,13 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Reasoning {
                         content: reasoning,
                         profile: args.profile,
+                        timestamp_ms: Some(now_millis()),
                     });
                 }
                 sink.emit(AgentEvent::ToolCall {
                     tool: tool.clone(),
                     arguments: arguments.clone(),
+                    timestamp_ms: Some(now_millis()),
                 });
                 let tool_context = ToolContext {
                     backend,
@@ -1288,6 +1296,7 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
+                    timestamp_ms: Some(now_millis()),
                 });
 
                 messages.push(ChatMessage {
@@ -1740,6 +1749,7 @@ fn run_tool(
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff,
+                timestamp_ms: Some(now_millis()),
             });
             Ok(format!("updated {}", resolved.display()))
         }
@@ -1755,6 +1765,7 @@ fn run_tool(
                 sink.emit(AgentEvent::Diff {
                     path: "apply_patch".to_string(),
                     diff,
+                    timestamp_ms: Some(now_millis()),
                 });
             }
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
@@ -1908,8 +1919,12 @@ impl SubAgentEventCollector {
             AgentEvent::Final {
                 content,
                 profile: _,
+                ..
             } => self.final_content = Some(content),
-            AgentEvent::Error { message } => self.errors.push(message),
+            AgentEvent::Error {
+                message,
+                timestamp_ms: _,
+            } => self.errors.push(message),
             AgentEvent::Diff { .. } => self.diffs += 1,
             _ => {}
         }
@@ -1983,6 +1998,7 @@ fn run_sub_agent(
         profile: profile.as_str().to_string(),
         task: task.to_string(),
         nesting_depth: context.request.sub_agent_depth + 1,
+        timestamp_ms: Some(now_millis()),
     });
 
     let instructions = build_agent_instructions(
@@ -2035,6 +2051,7 @@ fn run_sub_agent(
     sink.emit(AgentEvent::SubAgentFinished {
         profile: profile.as_str().to_string(),
         result: result.clone(),
+        timestamp_ms: Some(now_millis()),
     });
     Ok(result)
 }
