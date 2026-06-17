@@ -174,7 +174,7 @@ impl UserConfig {
     }
 
     pub fn effective_ctx_size(&self) -> u32 {
-        self.model.ctx_size.unwrap_or(8192)
+        self.model.ctx_size.unwrap_or(131_072)
     }
 
     pub fn effective_threads(&self) -> Option<i32> {
@@ -276,5 +276,21 @@ mod tests {
             UserConfig::default().effective_max_steps(),
             DEFAULT_AGENT_MAX_STEPS
         );
+    }
+
+    #[test]
+    fn effective_ctx_size_auto_detect() {
+        let config = UserConfig::default();
+        // When ctx_size not set, returns default of 131072 (128k)
+        assert_eq!(config.effective_ctx_size(), 131_072);
+    }
+
+    #[test]
+    fn effective_ctx_size_uses_config_when_set() {
+        let mut config = UserConfig::default();
+        config.set("model.ctx_size", "8192").unwrap();
+
+        // When ctx_size is explicitly set in config, use that value
+        assert_eq!(config.effective_ctx_size(), 8192);
     }
 }

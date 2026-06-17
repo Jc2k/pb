@@ -1666,9 +1666,11 @@ fn run_ripgrep(
         match result {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            // Other gets raised when its not grepable utf-8, like a png
+            Err(error) if error.kind() == std::io::ErrorKind::Other => continue,
             Err(error) => {
-                return Err(anyhow!(error))
-                    .with_context(|| format!("failed to search {}", path.display()));
+                let message = format!("failed to search {:?}: {error:?}", path.display());
+                return Err(anyhow!(error)).context(message);
             }
         }
         if hits.len() >= limit {
