@@ -40,12 +40,6 @@ body {
     display: flex;
 }
 
-.sidebar {
-    background: rgba(255, 255, 255, 0.72);
-    backdrop-filter: blur(18px);
-    border-right: 1px solid var(--line);
-}
-
 .brand {
     display: flex;
     align-items: center;
