@@ -1709,21 +1709,25 @@ fn run_tool(
     let command_backend = context.command_backend;
     match tool {
         "read_file" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .context("read_file requires string argument: path")?;
+            let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+                return Ok("read_file requires string argument: path".to_string());
+            };
             let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = arguments.get("end").and_then(Value::as_u64);
-            let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            let resolved = match resolve_workspace_path(workspace_root, path, true) {
+                Ok(resolved) => resolved,
+                Err(err) => return Ok(format!("failed to resolve path: {err:?}")),
+            };
             let text = match std::fs::read_to_string(&resolved) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(format!("file not found: {}", resolved.display()));
                 }
                 Err(e) => {
-                    return Err(anyhow!(e))
-                        .context(format!("failed to read {}", resolved.display()));
+                    return Ok(format!(
+                        "failed to read file: {}: {e:?}",
+                        resolved.display()
+                    ));
                 }
             };
 
