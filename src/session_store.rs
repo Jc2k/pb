@@ -301,6 +301,7 @@ mod tests {
             top_k: 1,
             seed: 0,
             environment: None::<EnvironmentConfig>,
+            session_id: String::new(),
         }
     }
 

@@ -497,6 +497,7 @@ async fn run_serve() -> Result<()> {
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
         environment: None,
+        session_id: String::new(),
     };
     let server_args = web::ServeArgs {
         host: resolved_host.clone(),

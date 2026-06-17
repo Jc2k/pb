@@ -348,6 +348,8 @@ pub struct AgentRequest {
     pub seed: u32,
     /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
     pub environment: Option<EnvironmentConfig>,
+    #[serde(default)]
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +538,34 @@ fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn determine_branch_for_request(args: &AgentRequest, workspace_root: &Path) -> String {
+    if let Some(b) = &args.branch {
+        return b.clone();
+    }
+
+    // Defensive: first check if a branch exists for this task (possibly without session_id from older runs)
+    let base_branch = branch_name_from_task(&args.task);
+    if git_branch_exists(&base_branch, workspace_root) {
+        return base_branch;
+    }
+
+    let mut branch = base_branch.clone();
+    if !args.session_id.is_empty() {
+        branch.push_str(&format!("-{}", args.session_id));
+
+        // If suffix version exists, use that
+        if git_branch_exists(&branch, workspace_root) {
+            return branch;
+        }
+    }
+
+    branch
+}
+
+fn git_branch_exists(name: &str, workdir: &Path) -> bool {
+    git_run(&["rev-parse", "--verify", name], workdir).is_ok()
+}
+
 pub fn run_agent<S: EventSink>(
     mut args: AgentRequest,
     models_root: &Path,
@@ -552,16 +582,13 @@ pub fn run_agent<S: EventSink>(
     // Anchor to the git project root so tools cannot escape the repository boundary.
     let workspace_root = find_git_root(&workdir_canonical).unwrap_or(workdir_canonical);
 
-    let (branch, is_continuation) = if let Some(b) = &args.branch {
-        git_checkout_branch(b, &workspace_root)
-            .with_context(|| format!("failed to checkout branch '{b}'"))?;
-        (b.clone(), true)
-    } else {
-        let b = branch_name_from_task(&args.task);
-        git_create_branch(&b, &workspace_root)
-            .with_context(|| format!("failed to create branch '{b}'"))?;
-        (b, false)
-    };
+    let branch = determine_branch_for_request(&args, &workspace_root);
+
+    let is_continuation = git_checkout_branch(&branch, &workspace_root).is_ok();
+    if !is_continuation {
+        git_create_branch(&branch, &workspace_root)
+            .with_context(|| format!("failed to create branch '{branch}'"))?;
+    }
 
     suppress_llama_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
@@ -3576,6 +3603,94 @@ mod tests {
         let name = branch_name_from_task(&long_task);
         assert!(name.len() <= "pb/".len() + 50);
         assert!(name.starts_with("pb/"));
+    }
+
+    #[test]
+    fn branch_includes_session_id() {
+        let args = AgentRequest {
+            task: "Fix login bug".to_string(),
+            model: "model.gguf".to_string(),
+            model_dir: None,
+            workdir: None,
+            branch: None,
+            max_steps: 10,
+            max_tokens: 2048,
+            ctx_size: 4096,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            temperature: 0.7,
+            profile: AgentProfile::Build,
+            infer_profile: false,
+            sub_agent_depth: 0,
+            top_k: 40,
+            seed: 42,
+            environment: None,
+            session_id: "session-123".to_string(),
+        };
+
+        let workdir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(workdir.path())
+            .output()
+            .unwrap();
+
+        let branch = determine_branch_for_request(&args, workdir.path());
+        assert_eq!(branch, "pb/fix-login-bug-session-123");
+    }
+
+    #[test]
+    fn branch_defensive_checkout_existing_with_session_id() {
+        let workdir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(workdir.path())
+            .output()
+            .unwrap();
+
+        // First create a commit (required for branch)
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(workdir.path())
+            .output()
+            .unwrap();
+
+        // Create a branch WITH session_id suffix (as would be created by new code)
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "pb/another-task-session-456"])
+            .current_dir(workdir.path())
+            .output()
+            .unwrap();
+
+        let args = AgentRequest {
+            task: "Another task".to_string(),
+            model: "model.gguf".to_string(),
+            model_dir: None,
+            workdir: Some(workdir.path().to_path_buf()),
+            branch: None,
+            max_steps: 10,
+            max_tokens: 2048,
+            ctx_size: 4096,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            temperature: 0.7,
+            profile: AgentProfile::Build,
+            infer_profile: false,
+            sub_agent_depth: 0,
+            top_k: 40,
+            seed: 42,
+            environment: None,
+            session_id: "session-456".to_string(),
+        };
+
+        // Should find and use existing branch with same session_id
+        let branch = determine_branch_for_request(&args, workdir.path());
+        assert_eq!(
+            branch, "pb/another-task-session-456",
+            "Should find existing branch with matching session_id"
+        );
     }
 
     #[test]

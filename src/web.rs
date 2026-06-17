@@ -293,6 +293,7 @@ async fn start_session_inner(
         request.workdir = Some(PathBuf::from(workdir));
     }
     request.branch = req.branch.clone();
+    request.session_id = session_id.clone();
     request.max_steps = req.max_steps.unwrap_or(request.max_steps);
     request.max_tokens = req.max_tokens.unwrap_or(request.max_tokens);
     request.ctx_size = req.ctx_size.unwrap_or(request.ctx_size);
