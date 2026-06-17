@@ -1,3 +1,5 @@
+import { Link } from "react-router-dom";
+
 export function Aside() {
   return (
     <aside className="sidebar d-none d-lg-flex flex-column">
@@ -7,18 +9,18 @@ export function Aside() {
       </div>
 
       <nav className="nav nav-pills flex-column gap-1 px-2">
-        <a className="nav-link active" href="#">
+        <Link className="nav-link active" to="/">
           <i className="bi bi-house-door"></i> Home
-        </a>
-        <a className="nav-link" href="#">
+        </Link>
+        <Link className="nav-link" to="/sessions">
           <i className="bi bi-chat-square-text"></i> Sessions
-        </a>
-        <a className="nav-link" href="#">
+        </Link>
+        <Link className="nav-link" to="/projects">
           <i className="bi bi-folder2-open"></i> Projects
-        </a>
-        <a className="nav-link" href="#">
+        </Link>
+        <Link className="nav-link" to="/settings">
           <i className="bi bi-gear"></i> Settings
-        </a>
+        </Link>
       </nav>
 
       <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">

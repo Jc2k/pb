@@ -1,5 +1,12 @@
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
+import {
+  BrowserRouter,
+  Routes,
+  Route,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import "./session.css";
 import { Aside } from "./Aside";
 
@@ -151,22 +158,7 @@ interface ProjectEntry {
   path: string;
 }
 
-/* ─── simple router ──────────────────────────────────────────── */
-
-function useRoute(): string {
-  const [path, setPath] = useState(() => window.location.pathname);
-  useEffect(() => {
-    const handler = () => setPath(window.location.pathname);
-    window.addEventListener("popstate", handler);
-    return () => window.removeEventListener("popstate", handler);
-  }, []);
-  return path;
-}
-
-function navigate(to: string) {
-  window.history.pushState(null, "", to);
-  window.dispatchEvent(new PopStateEvent("popstate"));
-}
+/* ─── custom router removed - using react-router-dom instead ─ */
 
 /* ─── avatar helpers ─────────────────────────────────────────── */
 
@@ -732,6 +724,11 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
 
 /* ─── home page (/) ──────────────────────────────────────────── */
 
+export function Asidenav(to: string) {
+  const navigate = useNavigate();
+  return () => navigate(to);
+}
+
 function HomePage() {
   const [task, setTask] = useState("");
   const [workdir, setWorkdir] = useState("");
@@ -739,6 +736,7 @@ function HomePage() {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const navigate = useNavigate();
 
   const queuedCount = sessions.filter(
     (session) => session.status === "queued",
@@ -1022,7 +1020,8 @@ function SessionCard({
 
 /* ─── session page (/sessions/:id) ──────────────────────────── */
 
-function SessionPage({ sessionId }: { sessionId: string }) {
+function SessionPage() {
+  const { sessionId } = useParams<{ sessionId: string }>();
   const [session, setSession] = useState<SessionDetails | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
@@ -1381,12 +1380,12 @@ function SessionPage({ sessionId }: { sessionId: string }) {
 /* ─── main app ───────────────────────────────────────────────── */
 
 export default function App() {
-  const path = useRoute();
-
-  const sessionMatch = path.match(/^\/sessions\/([^/]+)$/);
-  if (sessionMatch) {
-    return <SessionPage sessionId={sessionMatch[1]} />;
-  }
-
-  return <HomePage />;
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<HomePage />} />
+        <Route path="/sessions/:sessionId" element={<SessionPage />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
