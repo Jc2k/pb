@@ -1262,7 +1262,29 @@ fn run_agent_steps(
 
         let prompt = render_prompt(messages);
         let output = generate_completion(backend, model, args, &prompt)?;
-        let action = parse_action(&output)?;
+
+        let action = match parse_action(&output) {
+            Ok(action) => action,
+            Err(e) => {
+                // We could push a chat bubble to the user here?
+                // But the LLM might want to speak for itself, so lets try without.
+
+                messages.push(ChatMessage {
+                    role: "assistant",
+                    content: output,
+                });
+
+                let error_msg = format!(
+                    "JSON parsing error: {e}\n\nPlease fix the JSON structure and try again."
+                );
+                messages.push(ChatMessage {
+                    role: "tool",
+                    content: error_msg,
+                });
+
+                continue;
+            }
+        };
 
         match action {
             AgentAction::Final { content, thinking } => {
