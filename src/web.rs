@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
@@ -227,6 +227,7 @@ pub async fn run_server_with_ready(
         .route("/api/status", get(status))
         .route("/api/current-user.png", get(crate::user::avatar_png))
         .route("/api/current-user", get(crate::user::user_info))
+        .route("/auth/github/callback", get(github_oauth_callback))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state((state.clone(), defaults.clone()));
@@ -1265,6 +1266,10 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
     })
+}
+
+async fn github_oauth_callback(Query(query): Query<HashMap<String, String>>) -> Response {
+    crate::github_oauth::persist_callback_from_query(&query).into_response()
 }
 
 async fn index() -> impl IntoResponse {
