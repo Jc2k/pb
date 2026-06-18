@@ -210,7 +210,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. Orchestrate implementation work for requests that make, change, or fix something. First call a plan sub-agent to break the request into concrete build tasks. Then call one or more build sub-agents to implement those tasks, requiring each build sub-agent to git_commit after its logical change. Automatically call a scout sub-agent when you need to establish or refresh a working development environment. After implementation, call a review sub-agent to inspect the committed work before finalizing. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes, but prefer delegating planned implementation to build sub-agents."
+                "Profile: build. Orchestrate implementation work for requests that make, change, or fix something. First call a plan sub-agent to break the request into concrete build tasks. Then call one or more build sub-agents to implement those tasks. Automatically call a scout sub-agent when you need to establish or refresh a working development environment. After implementation, call a review sub-agent to inspect the work before finalizing. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes when the task calls for a repository commit, but prefer delegating planned implementation to build sub-agents."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -675,29 +675,6 @@ pub fn run_agent<S: EventSink>(
     )?;
     let reached_final = outcome.reached_final;
 
-    if git_has_changes(&workspace_root).unwrap_or(false) {
-        let summary: String = args.task.chars().take(60).collect();
-        let commit_msg = format!("refactor(agent): {summary}");
-        let arguments = json!({ "message": commit_msg });
-        sink.emit(AgentEvent::ToolCall {
-            tool: "git_commit".to_string(),
-            arguments,
-            nesting_depth: None,
-            timestamp_ms: Some(now_millis()),
-        });
-        let result = match git_commit_all(&commit_msg, &workspace_root) {
-            Ok(true) => format!("committed: {commit_msg}"),
-            Ok(false) => "nothing to commit".to_string(),
-            Err(err) => format!("auto-commit failed: {err}"),
-        };
-        sink.emit(AgentEvent::ToolResult {
-            tool: "git_commit".to_string(),
-            result,
-            nesting_depth: None,
-            timestamp_ms: Some(now_millis()),
-        });
-    }
-
     let commits = git_log_recent(&workspace_root, 5).unwrap_or_default();
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
@@ -763,7 +740,7 @@ fn build_agent_instructions(
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         instructions.push_str(
-            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. Use git_commit with a semantic commit message after each logical change.\n",
+            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. Use git_commit with a semantic commit message only when the task requires or clearly benefits from a repository commit; otherwise leave changes uncommitted for the caller or external MCP workflow to handle.\n",
         );
     } else {
         instructions.push_str(
@@ -3426,6 +3403,9 @@ mod tests {
         assert!(instructions.contains("Profile: build"));
         assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
+        assert!(instructions.contains("only when the task requires or clearly benefits"));
+        assert!(instructions.contains("otherwise leave changes uncommitted"));
+        assert!(!instructions.contains("requiring each build sub-agent to git_commit"));
     }
 
     #[test]
