@@ -1336,7 +1336,10 @@ fn run_agent_steps(
                     todo_memory,
                     mcp_registry,
                 };
-                let tool_result = run_tool(&tool, &arguments, &tool_context, sink)?;
+                let tool_result = match run_tool(&tool, &arguments, &tool_context, sink) {
+                    Ok(result) => result,
+                    Err(error) => format_tool_error(&tool, &error),
+                };
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
@@ -1710,24 +1713,20 @@ fn run_tool(
     match tool {
         "read_file" => {
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-                return Ok("read_file requires string argument: path".to_string());
+                bail!("read_file requires string argument: path");
             };
             let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = arguments.get("end").and_then(Value::as_u64);
-            let resolved = match resolve_workspace_path(workspace_root, path, true) {
-                Ok(resolved) => resolved,
-                Err(err) => return Ok(format!("failed to resolve path: {err:?}")),
-            };
+            let resolved = resolve_workspace_path(workspace_root, path, true)
+                .with_context(|| format!("failed to resolve path: {path}"))?;
             let text = match std::fs::read_to_string(&resolved) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(format!("file not found: {}", resolved.display()));
+                    bail!("file not found: {}", resolved.display());
                 }
                 Err(e) => {
-                    return Ok(format!(
-                        "failed to read file: {}: {e:?}",
-                        resolved.display()
-                    ));
+                    return Err(e)
+                        .with_context(|| format!("failed to read file: {}", resolved.display()));
                 }
             };
 
@@ -1959,6 +1958,10 @@ fn run_tool(
         }
         _ => bail!("unknown tool: {tool}"),
     }
+}
+
+fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
+    format!("tool '{tool}' failed: {error:#}")
 }
 
 #[derive(Default)]
@@ -3595,6 +3598,16 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("parent todo id 99 was not found"));
+    }
+
+    #[test]
+    fn format_tool_error_includes_tool_name_and_error_chain() {
+        let err = anyhow!("missing thing").context("failed to run");
+        let formatted = format_tool_error("read_file", &err);
+
+        assert!(formatted.contains("tool 'read_file' failed"));
+        assert!(formatted.contains("failed to run"));
+        assert!(formatted.contains("missing thing"));
     }
 
     #[test]
