@@ -502,6 +502,23 @@ function ToolGroupBubble({
   );
 }
 
+function isHiddenChatEvent(event: EventEnvelope): boolean {
+  return (
+    event.event.type === "sub_agent_started" ||
+    event.event.type === "sub_agent_finished"
+  );
+}
+
+function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnvelope[] {
+  const chatEvents = events.filter((event) => !isHiddenChatEvent(event));
+  const lastVisibleIndex = chatEvents.length - 1;
+
+  return chatEvents.filter(
+    (event, index) =>
+      event.event.type !== "step_started" || index === lastVisibleIndex,
+  );
+}
+
 function profileName(profile: string): string {
   switch (profile) {
     case "plan":
@@ -563,6 +580,22 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           </div>
           <div className="user-avatar">
             <img src={`/api/current-user.png`} />
+          </div>
+        </article>
+      );
+
+    case "step_started":
+      const sd = e.nesting_depth || 0;
+      return (
+        <article
+          className="message-row assistant-message compact typing-row"
+          style={{ marginLeft: `${sd}rem` }}
+          aria-label={`Working step ${e.step} of ${e.max_steps}`}
+        >
+          <div className="typing-indicator" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
           </div>
         </article>
       );
@@ -1227,28 +1260,26 @@ function SessionPage() {
                 Waiting for queue events…
               </div>
             ) : (
-              groupToolEvents(
-                events.filter(
-                  (e) =>
-                    e.event.tool !== "sub_agent" &&
-                    e.event.type !== "sub_agent_started" &&
-                    e.event.type !== "sub_agent_finished",
-                ),
-              ).map((grouped, i) => {
-                if ((grouped as any).type === "tool_group") {
-                  const tc = (grouped as any).toolCalls;
+              groupToolEvents(chatEventsWithOnlyLatestStep(events)).map(
+                (grouped, i) => {
+                  if ((grouped as any).type === "tool_group") {
+                    const tc = (grouped as any).toolCalls;
+                    return (
+                      <ToolGroupBubble
+                        key={i}
+                        toolCalls={tc}
+                        toolResults={(grouped as any).toolResults}
+                      />
+                    );
+                  }
                   return (
-                    <ToolGroupBubble
+                    <MessageBubble
                       key={i}
-                      toolCalls={tc}
-                      toolResults={(grouped as any).toolResults}
+                      envelope={grouped as EventEnvelope}
                     />
                   );
-                }
-                return (
-                  <MessageBubble key={i} envelope={grouped as EventEnvelope} />
-                );
-              })
+                },
+              )
             )}
           </main>
 
@@ -1259,10 +1290,8 @@ function SessionPage() {
                 {
                   events.filter(
                     (e) =>
-                      (e.event.type === "tool_call" ||
-                        e.event.type === "tool_result") &&
-                      e.event.type !== "sub_agent_started" &&
-                      e.event.type !== "sub_agent_finished",
+                      e.event.type === "tool_call" ||
+                      e.event.type === "tool_result",
                   ).length
                 }
               </span>

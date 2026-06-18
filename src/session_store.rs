@@ -331,6 +331,7 @@ mod tests {
             vec![EventEnvelope::new(AgentEvent::Final {
                 content: "done".to_string(),
                 profile: AgentProfile::Build,
+                nesting_depth: None,
                 timestamp_ms: None,
             })],
         );
