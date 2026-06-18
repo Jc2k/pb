@@ -109,6 +109,7 @@ pub enum AgentProfile {
     Plan,
     Ask,
     Research,
+    Monitor,
 }
 
 impl Default for AgentProfile {
@@ -157,7 +158,8 @@ Profiles:\n\
 - plan: produce an implementation plan or roadmap without editing.\n\
 - ask: answer a focused question that does not require codebase investigation or edits.\n\
 - research: deep dive into external information, documentation, errors, ecosystem behavior, or public sources to inform a plan, answer, review, or fix without editing.\n\
-Choose one of: build, scout, review, explore, plan, ask, research.\n\n\
+- monitor: audit an in-progress or stalled agent session for loops, off-track work, missing next steps, or whether the work simply needs more time.\n\
+Choose one of: build, scout, review, explore, plan, ask, research, monitor.\n\n\
 [user]\n\
 Task:\n{task}\n\n\
 [assistant]\n"
@@ -207,6 +209,7 @@ impl AgentProfile {
             Self::Plan => "plan",
             Self::Ask => "ask",
             Self::Research => "research",
+            Self::Monitor => "monitor",
         }
     }
 
@@ -219,8 +222,9 @@ impl AgentProfile {
             "plan" => Ok(Self::Plan),
             "ask" => Ok(Self::Ask),
             "research" => Ok(Self::Research),
+            "monitor" => Ok(Self::Monitor),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research"
+                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor"
             ),
         }
     }
@@ -234,6 +238,7 @@ impl AgentProfile {
             Self::Plan => "Dade Murphy",
             Self::Ask => "Joey Pardella",
             Self::Research => "Emmanuel Goldstein",
+            Self::Monitor => "Trinity Walker",
         }
     }
 
@@ -265,6 +270,9 @@ impl AgentProfile {
             }
             Self::Research => {
                 "Profile: research. You are Emmanuel. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or call teammates. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
+            }
+            Self::Monitor => {
+                "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
             }
         }
     }
@@ -773,7 +781,7 @@ fn build_agent_instructions(
     instructions.push_str(profile.instructions());
     instructions.push('\n');
     instructions.push_str(&format!(
-        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), and Joey (ask). Use I when talking about what you have done and We when talking about what needs to happen next. ",
+        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), and Trinity (monitor). Use I when talking about what you have done and We when talking about what needs to happen next. ",
         current = profile.teammate_first_name()
     ));
     if allow_sub_agents && profile != AgentProfile::Research {
@@ -813,7 +821,7 @@ fn build_agent_instructions(
     instructions.push('\n');
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
@@ -1215,7 +1223,8 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                         "profile",
                         "Profile for the delegated agent.",
                         [
-                            "explore", "review", "plan", "ask", "research", "scout", "build",
+                            "explore", "review", "plan", "ask", "research", "monitor", "scout",
+                            "build",
                         ],
                     ),
                     string_property("task", "Concrete task for the delegated agent."),
@@ -1314,7 +1323,10 @@ fn tool_allowed(
                 || (allow_sub_agents
                     && matches!(
                         profile,
-                        AgentProfile::Ask | AgentProfile::Build | AgentProfile::Plan
+                        AgentProfile::Ask
+                            | AgentProfile::Build
+                            | AgentProfile::Plan
+                            | AgentProfile::Monitor
                     )));
     }
     match tool {
@@ -2148,53 +2160,6 @@ fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
     format!("tool '{tool}' failed: {error:#}")
 }
 
-#[derive(Default)]
-struct SubAgentEventCollector {
-    final_content: Option<String>,
-    errors: Vec<String>,
-    diffs: usize,
-}
-
-impl SubAgentEventCollector {
-    fn collect(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::Final {
-                content,
-                profile: _,
-                ..
-            } => self.final_content = Some(content),
-            AgentEvent::Error { message, .. } => self.errors.push(message),
-            AgentEvent::Diff { .. } => self.diffs += 1,
-            _ => {}
-        }
-    }
-}
-
-impl EventSink for SubAgentEventCollector {
-    fn emit(&mut self, event: AgentEvent) {
-        self.collect(event);
-    }
-}
-
-struct SubAgentSink<'a> {
-    parent: &'a mut dyn EventSink,
-    collector: SubAgentEventCollector,
-}
-
-impl EventSink for SubAgentSink<'_> {
-    fn emit(&mut self, event: AgentEvent) {
-        self.collector.collect(event);
-    }
-
-    fn ask_user(&mut self, question: &str) -> Result<String> {
-        self.parent.ask_user(question)
-    }
-
-    fn ask_multiple_choice(&mut self, question: &str, choices: &[String]) -> Result<String> {
-        self.parent.ask_multiple_choice(question, choices)
-    }
-}
-
 fn run_guard_commands(
     config: &EnvironmentConfig,
     command_backend: Option<&CommandBackend>,
@@ -2289,9 +2254,14 @@ fn run_sub_agent(
     )?;
 
     let result = if outcome.reached_final {
-        "sub-agent completed successfully".to_string()
+        match outcome.final_content {
+            Some(content) if !content.trim().is_empty() => {
+                format!("sub-agent completed successfully:\n{}", content.trim())
+            }
+            _ => "sub-agent completed successfully".to_string(),
+        }
     } else {
-        "sub-agent reached its step limit before finalizing".to_string()
+        "sub-agent reached its step limit before finalizing. Ask Trinity (monitor) to audit progress for loops, blockers, and whether to re-delegate with more max_steps before deciding how to continue.".to_string()
     };
 
     sink.emit(AgentEvent::SubAgentFinished {
@@ -3547,6 +3517,7 @@ mod tests {
         assert!(prompt.contains("plan"));
         assert!(prompt.contains("ask"));
         assert!(prompt.contains("research"));
+        assert!(prompt.contains("monitor"));
         assert!(prompt.contains("Fix the login bug"));
     }
 
@@ -3567,6 +3538,10 @@ mod tests {
         assert_eq!(
             parse_inferred_agent_profile(r#"{"profile":"research"}"#).unwrap(),
             AgentProfile::Research
+        );
+        assert_eq!(
+            parse_inferred_agent_profile(r#"{"profile":"monitor"}"#).unwrap(),
+            AgentProfile::Monitor
         );
     }
 
@@ -3619,6 +3594,7 @@ mod tests {
         );
         assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
         assert!(instructions.contains("Dade=plan"));
+        assert!(instructions.contains("Trinity=monitor"));
         assert!(instructions.contains("Use I when talking about what you have done and We when talking about what needs to happen next"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
         assert!(instructions.contains("call Eugene to review the result before finalizing"));
@@ -3752,6 +3728,7 @@ mod tests {
             AgentProfile::Explore,
             AgentProfile::Plan,
             AgentProfile::Ask,
+            AgentProfile::Monitor,
         ] {
             let instructions = build_agent_instructions(
                 tmp.path(),
