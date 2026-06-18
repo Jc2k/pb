@@ -64,6 +64,13 @@ cargo build --release
 
 GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
 
+
+## GitHub MCP OAuth setup
+
+`pb mcp setup github` uses a baked GitHub OAuth client ID and a localhost callback; it does not require a GitHub client secret or the `gh` CLI. Configure the release repository with the GitHub Actions secret `PB_GITHUB_CLIENT_ID` so the workflow can compile the client ID into release binaries.
+
+Create a GitHub OAuth App with an authorization callback URL on the configured web port, for example `http://127.0.0.1:8311/auth/github/callback` for the default `web.port`. During setup, `pb` opens GitHub in the browser, waits for the callback on the existing `pb serve` port when it is already running (or starts a temporary listener on that port), exchanges the PKCE authorization code, and stores the resulting token in the user config directory for the GitHub MCP server.
+
 ## Tool policy configuration
 
 Projects can define `.pb/policy.toml` to allow, deny, or ask before tool calls, including MCP tools. Rules are evaluated in order; the first matching rule wins, and calls that do not match a rule are allowed.

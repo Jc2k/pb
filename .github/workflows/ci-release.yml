@@ -39,6 +39,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+        env:
+          PB_GITHUB_CLIENT_ID: ${{ secrets.PB_GITHUB_CLIENT_ID }}
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -102,6 +104,8 @@ jobs:
 
       - name: Build optimized macOS arm64 binary
         run: cargo build --release --target aarch64-apple-darwin
+        env:
+          PB_GITHUB_CLIENT_ID: ${{ secrets.PB_GITHUB_CLIENT_ID }}
 
       - name: Prepare release asset
         run: |
