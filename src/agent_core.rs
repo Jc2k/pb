@@ -381,6 +381,8 @@ pub struct AgentRequest {
     pub infer_profile: bool,
     #[serde(default)]
     pub sub_agent_depth: usize,
+    #[serde(default)]
+    pub repository_less: bool,
     pub top_k: i32,
     pub seed: u32,
     /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
@@ -619,13 +621,17 @@ pub fn run_agent<S: EventSink>(
     // Anchor to the git project root so tools cannot escape the repository boundary.
     let workspace_root = find_git_root(&workdir_canonical).unwrap_or(workdir_canonical);
 
-    let branch = determine_branch_for_request(&args, &workspace_root);
-
-    let is_continuation = git_checkout_branch(&branch, &workspace_root).is_ok();
-    if !is_continuation {
-        git_create_branch(&branch, &workspace_root)
-            .with_context(|| format!("failed to create branch '{branch}'"))?;
-    }
+    let (branch, is_continuation) = if args.repository_less {
+        ("repository-less".to_string(), false)
+    } else {
+        let branch = determine_branch_for_request(&args, &workspace_root);
+        let is_continuation = git_checkout_branch(&branch, &workspace_root).is_ok();
+        if !is_continuation {
+            git_create_branch(&branch, &workspace_root)
+                .with_context(|| format!("failed to create branch '{branch}'"))?;
+        }
+        (branch, is_continuation)
+    };
 
     suppress_llama_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
@@ -641,7 +647,9 @@ pub fn run_agent<S: EventSink>(
 
     // Load environment config (explicit arg takes precedence over file on disk).
     let env_config = args.environment.clone().or_else(|| {
-        if args.profile == AgentProfile::Scout {
+        if args.repository_less {
+            None
+        } else if args.profile == AgentProfile::Scout {
             crate::init::scout_environment(&workspace_root)
                 .ok()
                 .flatten()
@@ -659,11 +667,22 @@ pub fn run_agent<S: EventSink>(
 
     let user_config =
         crate::config::UserConfig::load().context("failed to load user MCP config")?;
-    let project_mcp_config = mcp::ProjectMcpConfig::load(&workspace_root)
-        .context("failed to load project MCP config")?;
+    let project_mcp_config = if args.repository_less {
+        None
+    } else {
+        mcp::ProjectMcpConfig::load(&workspace_root).context("failed to load project MCP config")?
+    };
     let mcp_servers = mcp::effective_servers(&user_config.mcp, project_mcp_config.as_ref());
-    let mcp_registry = mcp::discover_tools(mcp_servers);
-    let policy_config = PolicyConfig::load(&workspace_root)?.unwrap_or_default();
+    let mcp_registry = if args.repository_less {
+        McpToolRegistry::default()
+    } else {
+        mcp::discover_tools(mcp_servers)
+    };
+    let policy_config = if args.repository_less {
+        PolicyConfig::default()
+    } else {
+        PolicyConfig::load(&workspace_root)?.unwrap_or_default()
+    };
 
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
@@ -681,6 +700,7 @@ pub fn run_agent<S: EventSink>(
         env_config.as_ref(),
         args.profile,
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+        args.repository_less,
         &mcp_registry,
     )?;
 
@@ -713,7 +733,11 @@ pub fn run_agent<S: EventSink>(
     )?;
     let reached_final = outcome.reached_final;
 
-    let commits = git_log_recent(&workspace_root, 5).unwrap_or_default();
+    let commits = if args.repository_less {
+        String::new()
+    } else {
+        git_log_recent(&workspace_root, 5).unwrap_or_default()
+    };
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
@@ -737,6 +761,7 @@ fn build_agent_instructions(
     env_config: Option<&EnvironmentConfig>,
     profile: AgentProfile,
     allow_sub_agents: bool,
+    repository_less: bool,
     mcp_registry: &McpToolRegistry,
 ) -> Result<String> {
     let mut instructions = String::from(
@@ -764,12 +789,14 @@ fn build_agent_instructions(
         profile,
         command_backend_kind,
         allow_sub_agents,
+        repository_less,
         mcp_registry,
     );
     let available_tool_signatures = available_tool_signatures(
         profile,
         command_backend_kind,
         allow_sub_agents,
+        repository_less,
         mcp_registry,
     );
     let tool_schema_json = serde_json::to_string_pretty(&available_tools)
@@ -809,10 +836,14 @@ fn build_agent_instructions(
     instructions.push_str(
         "Skills are discovered from repo Codex, Claude, OpenCode, and Copilot locations by metadata only. Use skill_search(query,max_results) to find relevant skills without loading full bodies, then skill(name) to load one selected skill when it applies. Build agents can use framework skills to improve implementation; plan agents can plan skill invocations; research agents can use research skills for targeted source gathering.\n",
     );
-    instructions.push_str(&format!(
-        "Reading and writing is only permitted within the project root: {}.\n",
-        workspace_root.display()
-    ));
+    if repository_less {
+        instructions.push_str("This session has no associated repository. Answer pure questions ephemerally using only your own knowledge, web_search, web_fetch, and research delegation. If the user asks to build a new project, explain that they should start a project-specific session after creating/registering a repository. Do not inspect or edit local files.\n");
+    } else {
+        instructions.push_str(&format!(
+            "Reading and writing is only permitted within the project root: {}.\n",
+            workspace_root.display()
+        ));
+    }
     match command_backend_kind {
         Some(CommandBackendKind::Container) => instructions.push_str(
             "Use run_command(cmd) to execute shell commands inside the sandboxed container environment. The project root is mounted at /workspace inside the container.\n",
@@ -840,15 +871,18 @@ fn build_agent_instructions(
         }
     }
 
-    if let Ok(copilot_instructions) =
-        std::fs::read_to_string(workspace_root.join(".github/copilot-instructions.md"))
+    if !repository_less
+        && let Ok(copilot_instructions) =
+            std::fs::read_to_string(workspace_root.join(".github/copilot-instructions.md"))
     {
         instructions.push_str("Repository instructions:\n");
         instructions.push_str(&copilot_instructions);
         instructions.push('\n');
     }
 
-    if continuing {
+    if repository_less {
+        instructions.push_str("You are not working on a git branch.\n");
+    } else if continuing {
         instructions.push_str(&format!(
             "You are continuing work on branch '{branch}'. Review the recent commits below before proceeding.\n"
         ));
@@ -879,11 +913,20 @@ fn available_tool_specs(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
+    repository_less: bool,
     mcp_registry: &McpToolRegistry,
 ) -> Vec<BuiltInToolSchema> {
     let mut tools: Vec<_> = all_builtin_tool_specs()
         .into_iter()
-        .filter(|tool| tool_allowed(&tool.name, profile, command_backend_kind, allow_sub_agents))
+        .filter(|tool| {
+            tool_allowed(
+                &tool.name,
+                profile,
+                command_backend_kind,
+                allow_sub_agents,
+                repository_less,
+            )
+        })
         .collect();
     tools.extend(mcp_registry.tools.values().map(|tool| BuiltInToolSchema {
         name: tool.tool_name.clone(),
@@ -900,12 +943,14 @@ fn available_tool_signatures(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
+    repository_less: bool,
     mcp_registry: &McpToolRegistry,
 ) -> Vec<String> {
     available_tool_specs(
         profile,
         command_backend_kind,
         allow_sub_agents,
+        repository_less,
         mcp_registry,
     )
     .into_iter()
@@ -1261,7 +1306,17 @@ fn tool_allowed(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
+    repository_less: bool,
 ) -> bool {
+    if repository_less {
+        return matches!(tool, "web_search" | "web_fetch" | "sub_agent")
+            && (tool != "sub_agent"
+                || (allow_sub_agents
+                    && matches!(
+                        profile,
+                        AgentProfile::Ask | AgentProfile::Build | AgentProfile::Plan
+                    )));
+    }
     match tool {
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
         | "todo" | "skill_search" | "skill" => true,
@@ -1801,6 +1856,7 @@ fn run_tool(
         context.request.profile,
         context.command_backend.map(CommandBackend::kind),
         context.request.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+        context.request.repository_less,
     ) {
         bail!(
             "tool '{tool}' is not available for the {} profile",
@@ -2196,6 +2252,7 @@ fn run_sub_agent(
         context.env_config,
         profile,
         false,
+        context.request.repository_less,
         context.mcp_registry,
     )?;
     let mut messages = vec![
@@ -2214,6 +2271,7 @@ fn run_sub_agent(
     sub_request.profile = profile;
     sub_request.max_steps = max_steps;
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
+    sub_request.repository_less = context.request.repository_less;
 
     let outcome = run_agent_steps(
         context.backend,
@@ -3532,6 +3590,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            false,
             &McpToolRegistry::default(),
         )
         .unwrap();
@@ -3550,6 +3609,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            false,
             &McpToolRegistry::default(),
         )
         .unwrap();
@@ -3577,6 +3637,7 @@ mod tests {
             None,
             AgentProfile::Build,
             true,
+            false,
             &McpToolRegistry::default(),
         )
         .unwrap();
@@ -3589,8 +3650,13 @@ mod tests {
 
     #[test]
     fn ask_user_tool_schema_accepts_optional_choices() {
-        let specs =
-            available_tool_specs(AgentProfile::Plan, None, true, &McpToolRegistry::default());
+        let specs = available_tool_specs(
+            AgentProfile::Plan,
+            None,
+            true,
+            false,
+            &McpToolRegistry::default(),
+        );
         let ask_user = specs
             .iter()
             .find(|tool| tool.name == "ask_user")
@@ -3628,6 +3694,7 @@ mod tests {
             AgentProfile::Review,
             None,
             false,
+            false,
             &McpToolRegistry::default(),
         );
         assert!(review_tools.iter().any(|tool| tool.name == "read_file"));
@@ -3638,6 +3705,7 @@ mod tests {
             AgentProfile::Build,
             Some(CommandBackendKind::Local),
             true,
+            false,
             &McpToolRegistry::default(),
         );
         let run_command = build_tools
@@ -3659,6 +3727,7 @@ mod tests {
             Some(CommandBackendKind::Local),
             None,
             AgentProfile::Review,
+            false,
             false,
             &McpToolRegistry::default(),
         )
@@ -3690,12 +3759,13 @@ mod tests {
                 None,
                 profile,
                 true,
+                false,
                 &McpToolRegistry::default(),
             )
             .unwrap();
             assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
             assert!(instructions.contains("research"));
-            assert!(tool_allowed("sub_agent", profile, None, true));
+            assert!(tool_allowed("sub_agent", profile, None, true, false));
         }
     }
 
@@ -3710,6 +3780,7 @@ mod tests {
             None,
             AgentProfile::Research,
             true,
+            false,
             &McpToolRegistry::default(),
         )
         .unwrap();
@@ -3721,7 +3792,8 @@ mod tests {
             "sub_agent",
             AgentProfile::Research,
             None,
-            true
+            true,
+            false
         ));
     }
 
@@ -3884,6 +3956,7 @@ mod tests {
             profile: AgentProfile::Build,
             infer_profile: false,
             sub_agent_depth: 0,
+            repository_less: false,
             top_k: 40,
             seed: 42,
             environment: None,
@@ -3940,6 +4013,7 @@ mod tests {
             profile: AgentProfile::Build,
             infer_profile: false,
             sub_agent_depth: 0,
+            repository_less: false,
             top_k: 40,
             seed: 42,
             environment: None,
@@ -4244,11 +4318,29 @@ mod tests {
     #[test]
     fn write_tools_are_only_available_for_write_profiles() {
         for tool in ["apply_patch", "mv", "rm"] {
-            assert!(tool_allowed(tool, AgentProfile::Build, None, false));
-            assert!(tool_allowed(tool, AgentProfile::Scout, None, false));
-            assert!(!tool_allowed(tool, AgentProfile::Review, None, false));
-            assert!(!tool_allowed(tool, AgentProfile::Explore, None, false));
-            assert!(!tool_allowed(tool, AgentProfile::Research, None, false));
+            assert!(tool_allowed(tool, AgentProfile::Build, None, false, false));
+            assert!(tool_allowed(tool, AgentProfile::Scout, None, false, false));
+            assert!(!tool_allowed(
+                tool,
+                AgentProfile::Review,
+                None,
+                false,
+                false
+            ));
+            assert!(!tool_allowed(
+                tool,
+                AgentProfile::Explore,
+                None,
+                false,
+                false
+            ));
+            assert!(!tool_allowed(
+                tool,
+                AgentProfile::Research,
+                None,
+                false,
+                false
+            ));
         }
     }
 

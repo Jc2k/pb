@@ -496,6 +496,7 @@ async fn run_serve() -> Result<()> {
         profile: user_config.effective_profile(),
         infer_profile: false,
         sub_agent_depth: 0,
+        repository_less: false,
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
         environment: None,

@@ -300,6 +300,7 @@ mod tests {
             profile: crate::agent_core::AgentProfile::Build,
             infer_profile: false,
             sub_agent_depth: 0,
+            repository_less: false,
             top_k: 1,
             seed: 0,
             environment: None::<EnvironmentConfig>,

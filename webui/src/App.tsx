@@ -1030,8 +1030,6 @@ export function Asidenav(to: string) {
 
 function HomePage() {
   const [task, setTask] = useState("");
-  const [workdir, setWorkdir] = useState("");
-  const [branch, setBranch] = useState("main");
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -1061,11 +1059,10 @@ function HomePage() {
     if (!res.ok) return;
     const entries = (await res.json()) as ProjectEntry[];
     setProjects(entries);
-    setWorkdir((current) => current || entries[0]?.path || "");
   };
 
   const startSession = async () => {
-    if (!task.trim() || !workdir) return;
+    if (!task.trim()) return;
     setIsSubmitting(true);
     try {
       const res = await fetch("/api/sessions", {
@@ -1073,8 +1070,6 @@ function HomePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           task: task.trim(),
-          workdir: workdir.trim() || undefined,
-          branch: branch.trim() || "main",
         }),
       });
       if (!res.ok) return;
@@ -1148,51 +1143,19 @@ function HomePage() {
                   </div>
                 </div>
 
-                <div className="session-controls row g-3 align-items-end p-3">
-                  <div className="col-12 col-md-5">
-                    <label className="form-label small fw-semibold">
-                      Project
-                    </label>
-                    <select
-                      className="form-select"
-                      value={workdir}
-                      onChange={(e) => setWorkdir(e.target.value)}
-                      disabled={projects.length === 0}
-                    >
-                      {projects.length === 0 ? (
-                        <option value="">No registered projects</option>
-                      ) : (
-                        projects.map((project) => (
-                          <option key={project.name} value={project.path}>
-                            {project.name}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </div>
-                  <div className="col-12 col-md-4">
-                    <label className="form-label small fw-semibold">
-                      Base branch
-                    </label>
-                    <select
-                      className="form-select"
-                      value={branch}
-                      onChange={(e) => setBranch(e.target.value)}
-                    >
-                      <option>main</option>
-                      <option>develop</option>
-                      <option>feature/ui-refresh</option>
-                    </select>
-                  </div>
-                  <div className="col-12 col-md-3 d-grid">
-                    <button
-                      className="btn btn-primary start-button"
-                      type="submit"
-                      disabled={!task.trim() || !workdir || isSubmitting}
-                    >
-                      ▷ Start session
-                    </button>
-                  </div>
+                <div className="session-controls d-flex flex-column flex-md-row gap-3 align-items-md-center justify-content-between p-3">
+                  <p className="text-secondary small m-0">
+                    Home sessions start without a repository. Ask a research question, or say
+                    <code> Create a new repo called my-app…</code> to bootstrap a project.
+                    Project-specific work lives under Projects.
+                  </p>
+                  <button
+                    className="btn btn-primary start-button"
+                    type="submit"
+                    disabled={!task.trim() || isSubmitting}
+                  >
+                    ▷ Start session
+                  </button>
                 </div>
               </form>
             </section>
