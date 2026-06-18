@@ -246,7 +246,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. First call Dade to break the request into concrete build tasks. Then call Kate for one or more implementation tasks. Automatically call Ramon when you need to establish or refresh a working development environment. After implementation, call Eugene to inspect the work before finalizing. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes when the task calls for a repository commit, but prefer giving planned implementation to Kate."
+                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. First call Dade to break the request into concrete build tasks. Then call Kate for one or more implementation tasks. Automatically call Ramon when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene to review the result before finalizing. If Eugene passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If Eugene does not pass the work, address the review output and request another review. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes, but prefer giving planned implementation to Kate."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -818,7 +818,7 @@ fn build_agent_instructions(
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         instructions.push_str(
-            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. Use git_commit with a semantic commit message only when the task requires or clearly benefits from a repository commit; otherwise leave changes uncommitted for the caller or external MCP workflow to handle.\n",
+            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. For build work, when you believe the implementation is complete, request a review before finalizing; if review passes, run applicable guard commands and try to git_commit with a semantic commit message that follows project guidelines; if review does not pass, address the review output before requesting another review.\n",
         );
     } else {
         instructions.push_str(
@@ -3621,8 +3621,10 @@ mod tests {
         assert!(instructions.contains("Dade=plan"));
         assert!(instructions.contains("Use I when talking about what you have done and We when talking about what needs to happen next"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
-        assert!(instructions.contains("only when the task requires or clearly benefits"));
-        assert!(instructions.contains("otherwise leave changes uncommitted"));
+        assert!(instructions.contains("call Eugene to review the result before finalizing"));
+        assert!(instructions.contains("If Eugene passes the work"));
+        assert!(instructions.contains("try to git_commit with a semantic commit message"));
+        assert!(instructions.contains("If Eugene does not pass the work"));
         assert!(!instructions.contains("requiring each build sub-agent to git_commit"));
     }
 
