@@ -496,6 +496,84 @@ interface ToolSummary {
   items: ToolSummaryItem[];
 }
 
+type TodoStatus = "pending" | "in_progress" | "completed" | "blocked";
+
+interface TodoTask {
+  id: number;
+  title: string;
+  description: string;
+  status: TodoStatus;
+  parent_id?: number | null;
+  notes?: string[];
+  timestampMs?: number;
+}
+
+function isTodoTask(value: unknown): value is TodoTask {
+  if (!value || typeof value !== "object") return false;
+  const task = value as Record<string, unknown>;
+  return typeof task.id === "number" && typeof task.title === "string";
+}
+
+function parseTodoTasks(result: string): TodoTask[] | null {
+  if (result === "no todos" || result === "no pending todos") return [];
+  try {
+    const parsed = JSON.parse(result) as unknown;
+    if (Array.isArray(parsed) && parsed.every(isTodoTask)) return parsed;
+    if (parsed && typeof parsed === "object") {
+      const payload = parsed as Record<string, unknown>;
+      if (isTodoTask(payload.added)) return [payload.added];
+      if (isTodoTask(payload.updated)) return [payload.updated];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function buildTodoTasks(events: EventEnvelope[]): TodoTask[] {
+  const tasks = new Map<number, TodoTask>();
+  const pendingCalls: EventEnvelope[] = [];
+
+  events.forEach((event) => {
+    if (event.event.type === "tool_call") {
+      pendingCalls.push(event);
+      return;
+    }
+
+    if (event.event.type !== "tool_result") return;
+
+    const callIndex = pendingCalls.findIndex(
+      (call) => call.event.type === "tool_call" && call.event.tool === event.event.tool,
+    );
+    const call = callIndex >= 0 ? pendingCalls.splice(callIndex, 1)[0] : undefined;
+
+    if (event.event.tool !== "todo") return;
+
+    const parsedTasks = parseTodoTasks(event.event.result);
+    if (!parsedTasks) return;
+
+    const action =
+      call?.event.type === "tool_call"
+        ? ((call.event.arguments as Record<string, unknown> | undefined)?.action as string | undefined)
+        : undefined;
+
+    if (action === "list") tasks.clear();
+
+    parsedTasks.forEach((task) => {
+      tasks.set(task.id, { ...tasks.get(task.id), ...task, timestampMs: event.event.timestamp_ms });
+    });
+  });
+
+  return Array.from(tasks.values()).sort((a, b) => a.id - b.id);
+}
+
+const TODO_STATUS_LABELS: Record<TodoStatus, string> = {
+  pending: "Pending",
+  in_progress: "In progress",
+  completed: "Completed",
+  blocked: "Blocked",
+};
+
 function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
   const summaries: Record<string, ToolSummary> = {};
   const pendingCalls: EventEnvelope[] = [];
@@ -541,6 +619,79 @@ function addToolSummaryItem(
     detail: getToolDetail(call, result) || "(no details)",
     timestampMs: call.event.timestamp_ms,
   });
+}
+
+function DrawerPanel({
+  title,
+  icon,
+  count,
+  children,
+  defaultOpen = true,
+}: {
+  title: string;
+  icon: string;
+  count: number;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+
+  return (
+    <section className="drawer-panel">
+      <button
+        className="drawer-panel-header"
+        onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
+        type="button"
+      >
+        <span>
+          <i className={icon}></i>
+          <h2>{title}</h2>
+        </span>
+        <span className="drawer-count">
+          <strong>{count}</strong>
+          <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
+        </span>
+      </button>
+      {isOpen && <div className="drawer-panel-body">{children}</div>}
+    </section>
+  );
+}
+
+function TodoDrawer({ tasks }: { tasks: TodoTask[] }) {
+  if (tasks.length === 0) {
+    return (
+      <div className="empty-detail compact">
+        <i className="bi bi-check2-square"></i>
+        <h3>No managed tasks</h3>
+        <p>Todo tool activity will appear here as the agent plans and updates work.</p>
+      </div>
+    );
+  }
+
+  return (
+    <ol className="todo-list">
+      {tasks.map((task) => (
+        <li key={task.id} className={`todo-item ${task.status}`}>
+          <div className="todo-title-row">
+            <span className="todo-id">#{task.id}</span>
+            <span className="todo-status">{TODO_STATUS_LABELS[task.status] || task.status}</span>
+          </div>
+          <strong>{task.title}</strong>
+          {task.description && <p>{task.description}</p>}
+          {task.parent_id ? <small>Parent #{task.parent_id}</small> : null}
+          {task.notes?.length ? (
+            <ul className="todo-notes">
+              {task.notes.map((note, index) => (
+                <li key={index}>{note}</li>
+              ))}
+            </ul>
+          ) : null}
+          {task.timestampMs && <time>{formatEventTime(task.timestampMs)}</time>}
+        </li>
+      ))}
+    </ol>
+  );
 }
 
 function ToolDrawerSummary({ summary }: { summary: ToolSummary }) {
@@ -1168,6 +1319,7 @@ function SessionCard({
 
 function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
+  const navigate = useNavigate();
   const [session, setSession] = useState<SessionDetails | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
@@ -1371,38 +1523,47 @@ function SessionPage() {
           </main>
 
           <aside className="tool-drawer d-none d-xl-block">
-            <div className="drawer-header">
-              <h2>Tools</h2>
-              <span className="badge rounded-pill text-bg-light">
-                {events.filter((e) => e.event.type === "tool_call").length}
-              </span>
-            </div>
-            {(() => {
-              const toolEvents = events.filter(
-                (e) =>
-                  e.event.type === "tool_call" ||
-                  e.event.type === "tool_result",
-              );
-
-              if (toolEvents.length === 0) {
-                return (
-                  <div className="empty-detail">
-                    <i className="bi bi-file-earmark-code"></i>
-                    <h3>Select a tool</h3>
-                    <p>
-                      Inspect files, commands, and outputs without cluttering
-                      the main session.
-                    </p>
-                  </div>
+            <DrawerPanel
+              title="Tools"
+              icon="bi bi-tools"
+              count={events.filter((e) => e.event.type === "tool_call").length}
+            >
+              {(() => {
+                const toolEvents = events.filter(
+                  (e) =>
+                    e.event.type === "tool_call" ||
+                    e.event.type === "tool_result",
                 );
-              }
 
-              const summaries = buildToolSummaries(events);
+                if (toolEvents.length === 0) {
+                  return (
+                    <div className="empty-detail compact">
+                      <i className="bi bi-file-earmark-code"></i>
+                      <h3>No tools yet</h3>
+                      <p>
+                        Inspect files, commands, and outputs without cluttering
+                        the main session.
+                      </p>
+                    </div>
+                  );
+                }
 
-              return summaries.map((summary) => (
-                <ToolDrawerSummary key={summary.toolName} summary={summary} />
-              ));
-            })()}
+                const summaries = buildToolSummaries(events);
+
+                return summaries.map((summary) => (
+                  <ToolDrawerSummary key={summary.toolName} summary={summary} />
+                ));
+              })()}
+            </DrawerPanel>
+
+            <DrawerPanel
+              title="Tasks"
+              icon="bi bi-check2-square"
+              count={buildTodoTasks(events).length}
+              defaultOpen={false}
+            >
+              <TodoDrawer tasks={buildTodoTasks(events)} />
+            </DrawerPanel>
           </aside>
         </div>
 

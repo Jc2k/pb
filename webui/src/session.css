@@ -559,3 +559,146 @@ article.user div.message-container {
         padding-inline: 0.7rem;
     }
 }
+
+.drawer-panel {
+    margin-bottom: 1rem;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.48);
+    overflow: hidden;
+}
+
+.drawer-panel-header {
+    width: 100%;
+    border: 0;
+    background: rgba(255, 255, 255, 0.66);
+    padding: 0.85rem 0.95rem;
+    color: #1f2937;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    text-align: left;
+}
+
+.drawer-panel-header:hover {
+    background: rgba(255, 255, 255, 0.9);
+}
+
+.drawer-panel-header > span:first-child {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+}
+
+.drawer-panel-header h2 {
+    font-size: 0.95rem;
+    margin: 0;
+}
+
+.drawer-panel-body {
+    padding: 0.8rem;
+}
+
+.empty-detail.compact {
+    margin: 1rem 0;
+}
+
+.empty-detail.compact i {
+    font-size: 2rem;
+}
+
+.empty-detail.compact h3 {
+    font-size: 0.9rem;
+}
+
+.empty-detail.compact p {
+    font-size: 0.82rem;
+    margin-bottom: 0;
+}
+
+.todo-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.7rem;
+}
+
+.todo-item {
+    border: 1px solid var(--line);
+    border-left: 4px solid #9ca3af;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.74);
+    padding: 0.75rem;
+    color: #374151;
+}
+
+.todo-item.pending {
+    border-left-color: #f59e0b;
+}
+
+.todo-item.in_progress {
+    border-left-color: #0d6efd;
+}
+
+.todo-item.completed {
+    border-left-color: #16a34a;
+}
+
+.todo-item.blocked {
+    border-left-color: #dc2626;
+}
+
+.todo-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+}
+
+.todo-id,
+.todo-status {
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.todo-status {
+    border: 1px solid var(--soft-line);
+    border-radius: 999px;
+    padding: 0.12rem 0.45rem;
+    background: rgba(255, 255, 255, 0.7);
+}
+
+.todo-item strong {
+    display: block;
+    font-size: 0.88rem;
+    line-height: 1.35;
+}
+
+.todo-item p {
+    margin: 0.35rem 0 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
+.todo-item small,
+.todo-item time {
+    display: block;
+    color: var(--muted);
+    font-size: 0.72rem;
+    margin-top: 0.35rem;
+}
+
+.todo-notes {
+    margin: 0.45rem 0 0;
+    padding-left: 1rem;
+    color: var(--muted);
+    font-size: 0.76rem;
+}
