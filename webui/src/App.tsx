@@ -127,6 +127,9 @@ type AgentEvent =
       type: "session_summary";
       branch: string;
       commits: string;
+      summary?: string;
+      diff_stat?: string;
+      diff?: string;
       nesting_depth?: number;
       timestamp_ms?: number;
     }
@@ -999,7 +1002,34 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             <p>
               Session complete <code>{e.branch}</code>
             </p>
-            <pre className="mb-0 small result-pre">{e.commits}</pre>
+            {e.summary?.trim() ? (
+              <>
+                <strong>Summary</strong>
+                <pre className="small result-pre">{e.summary}</pre>
+              </>
+            ) : null}
+            {e.commits?.trim() ? (
+              <>
+                <strong>Commits</strong>
+                <pre className="small result-pre">{e.commits}</pre>
+              </>
+            ) : null}
+            {e.diff_stat?.trim() ? (
+              <>
+                <strong>Diff stat from main</strong>
+                <pre className="small result-pre">{e.diff_stat}</pre>
+              </>
+            ) : null}
+            {e.diff?.trim() ? (
+              <details className="card border-info mb-0">
+                <summary className="card-header py-1 small d-flex align-items-center gap-2">
+                  <span className="badge bg-info text-dark">diff from main</span>
+                </summary>
+                <div className="card-body p-0 overflow-auto">
+                  <DiffView diff={e.diff} />
+                </div>
+              </details>
+            ) : null}
           </div>
         </article>
       );

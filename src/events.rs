@@ -97,6 +97,12 @@ pub enum AgentEvent {
     SessionSummary {
         branch: String,
         commits: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        diff_stat: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        diff: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -281,12 +287,20 @@ impl EventEnvelope {
                 },
             },
             AgentEvent::SessionSummary {
-                branch, commits, ..
+                branch,
+                commits,
+                summary,
+                diff_stat,
+                diff,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::SessionSummary {
                     branch,
                     commits,
+                    summary,
+                    diff_stat,
+                    diff,
                     timestamp_ms: Some(now),
                 },
             },
