@@ -811,7 +811,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             </div>
           </div>
           <div className="user-avatar">
-            <img src={`/api/current-user.png`} />
+            <img src="/api/current-user.png" alt="Current user" />
           </div>
         </article>
       );
@@ -876,7 +876,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             </div>
           </div>
           <div className="user-avatar">
-            <i className="bi bi-person"></i>
+            <img src="/api/current-user.png" alt="Current user" />
           </div>
         </article>
       );

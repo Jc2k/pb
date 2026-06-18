@@ -1,6 +1,59 @@
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+interface CurrentUser {
+  username: string;
+  real_name?: string | null;
+}
+
+function initialsForName(name: string): string {
+  const parts = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    return "?";
+  }
+
+  return parts
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? "")
+    .join("");
+}
+
 export function Aside() {
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [avatarFailed, setAvatarFailed] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    fetch("/api/current-user", { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`current user request failed: ${response.status}`);
+        }
+        return response.json() as Promise<CurrentUser>;
+      })
+      .then(setCurrentUser)
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        console.debug("Could not load current user info", error);
+      });
+
+    return () => controller.abort();
+  }, []);
+
+  const displayName =
+    currentUser?.real_name || currentUser?.username || "Local user";
+  const userSubtitle = currentUser?.username
+    ? `@${currentUser.username}`
+    : "Local workspace";
+  const initials = useMemo(() => initialsForName(displayName), [displayName]);
+
   return (
     <aside className="sidebar d-none d-lg-flex flex-column">
       <div className="brand d-flex align-items-center gap-2 px-3 py-3">
@@ -24,10 +77,20 @@ export function Aside() {
       </nav>
 
       <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">
-        <div className="avatar-sm">JD</div>
+        <div className="avatar-sm" aria-hidden="true">
+          {avatarFailed ? (
+            <span>{initials}</span>
+          ) : (
+            <img
+              src="/api/current-user.png"
+              alt=""
+              onError={() => setAvatarFailed(true)}
+            />
+          )}
+        </div>
         <div>
-          <strong>Jane Doe</strong>
-          <small className="d-block text-secondary">Local workspace</small>
+          <strong>{displayName}</strong>
+          <small className="d-block text-secondary">{userSubtitle}</small>
         </div>
       </div>
     </aside>
