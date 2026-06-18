@@ -194,15 +194,23 @@ function groupToolEvents(
   events: EventEnvelope[],
 ): (
   | EventEnvelope
-  | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] }
+  | {
+      type: "tool_group";
+      toolCalls: EventEnvelope[];
+      toolResults: EventEnvelope[];
+    }
 )[] {
   const grouped: (
     | EventEnvelope
-    | { type: "tool_group"; toolCalls: AgentEvent[]; toolResults: AgentEvent[] }
+    | {
+      type: "tool_group";
+      toolCalls: EventEnvelope[];
+      toolResults: EventEnvelope[];
+    }
   )[] = [];
 
-  let currentToolCalls: AgentEvent[] = [];
-  let currentToolResults: AgentEvent[] = [];
+  let currentToolCalls: EventEnvelope[] = [];
+  let currentToolResults: EventEnvelope[] = [];
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
@@ -265,7 +273,10 @@ function formatEventTime(timestamp_ms?: number): string {
   const hours = Math.floor(diffMin / 60);
   const minutes = diffMin % 60;
   if (hours < 24) {
-    const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const timeStr = date.toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
     return `at ${timeStr}`;
   }
   return date.toLocaleDateString();
@@ -315,8 +326,8 @@ function DiffView({ diff }: { diff: string }) {
 /* ─── tool detail helper ─────────────────────────────────────── */
 
 function getToolDetail(
-  toolCall: AgentEvent,
-  toolResult?: AgentEvent,
+  toolCall: EventEnvelope,
+  toolResult?: EventEnvelope,
 ): string | null {
   if (toolCall.event.type !== "tool_call") return null;
 
@@ -399,47 +410,14 @@ function getToolDetail(
   }
 }
 
-function getToolDetailSimple(toolEvent: AgentEvent): string | null {
-  if (toolEvent.event.type !== "tool_call") return null;
-
-  const args = toolEvent.event.arguments as Record<string, unknown>;
-
-  switch (toolEvent.event.tool) {
-    case "read_file":
-      return args ? (args.path as string) : "(no path)";
-    case "glob":
-      return (args.pattern as string) || "(no pattern)";
-    case "ripgrep":
-    case "search":
-      return (args.pattern as string) || "(no pattern)";
-    case "web_search":
-      return (args.query as string) || "(no query)";
-    case "web_fetch":
-      return (args.url as string) || "(no url)";
-    case "run_command":
-      return (args.cmd as string) || "(no cmd)";
-    case "mv":
-      return `from ${(args.source as string) || ""} to ${(args.destination as string) || ""}`;
-    case "rm":
-      return args ? (args.path as string) : "(no path)";
-    case "edit_file": {
-      const path = args.path as string;
-      if (!path) return "(no path)";
-      return path + (args.diff ? " (patch)" : "");
-    }
-    default:
-      return null;
-  }
-}
-
 /* ─── message bubble component for grouping ────────────────── */
 
 function ToolGroupBubble({
   toolCalls,
   toolResults,
 }: {
-  toolCalls: AgentEvent[];
-  toolResults: AgentEvent[];
+  toolCalls: EventEnvelope[];
+  toolResults: EventEnvelope[];
 }) {
   const [isOpen, setIsOpen] = useState(false);
 
@@ -493,13 +471,113 @@ function ToolGroupBubble({
             <i className="bi bi-tools"></i> {toolCalls.length} tools used
           </span>
           <span className="tool-names">{toolNames}</span>
-          <i className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}></i>
+          <i
+            className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
+          ></i>
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
           <div className="tool-list">{toolItems}</div>
         </div>
       </div>
     </article>
+  );
+}
+
+interface ToolSummaryItem {
+  detail: string;
+  timestampMs?: number;
+}
+
+interface ToolSummary {
+  toolName: string;
+  friendlyName: string;
+  icon: string;
+  count: number;
+  items: ToolSummaryItem[];
+}
+
+function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
+  const summaries: Record<string, ToolSummary> = {};
+  const pendingCalls: EventEnvelope[] = [];
+
+  events.forEach((event) => {
+    if (event.event.type === "tool_call") {
+      pendingCalls.push(event);
+      return;
+    }
+
+    if (event.event.type === "tool_result" && pendingCalls.length > 0) {
+      const call = pendingCalls.shift();
+      if (!call || call.event.type !== "tool_call") return;
+      addToolSummaryItem(summaries, call, event);
+    }
+  });
+
+  pendingCalls.forEach((call) => addToolSummaryItem(summaries, call));
+
+  return Object.values(summaries);
+}
+
+function addToolSummaryItem(
+  summaries: Record<string, ToolSummary>,
+  call: EventEnvelope,
+  result?: EventEnvelope,
+) {
+  if (call.event.type !== "tool_call") return;
+
+  const toolName = call.event.tool;
+  if (!summaries[toolName]) {
+    summaries[toolName] = {
+      toolName,
+      friendlyName: TOOL_FRIENDLY_NAMES[toolName] || toolName,
+      icon: TOOL_ICONS[toolName] || "bi bi-file-earmark-text",
+      count: 0,
+      items: [],
+    };
+  }
+
+  summaries[toolName].count++;
+  summaries[toolName].items.push({
+    detail: getToolDetail(call, result) || "(no details)",
+    timestampMs: call.event.timestamp_ms,
+  });
+}
+
+function ToolDrawerSummary({ summary }: { summary: ToolSummary }) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className="drawer-tool-group">
+      <button
+        className="drawer-item"
+        onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
+        type="button"
+      >
+        <span>
+          <i className={summary.icon}></i>
+          {summary.friendlyName}
+        </span>
+        <span className="drawer-count">
+          <strong>{summary.count}</strong>
+          <i
+            className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
+          ></i>
+        </span>
+      </button>
+      {isOpen && (
+        <ol className="drawer-tool-details">
+          {summary.items.map((item, index) => (
+            <li key={`${summary.toolName}-${index}`}>
+              <span className="drawer-detail-text">{item.detail}</span>
+              {item.timestampMs && (
+                <time>{formatEventTime(item.timestampMs)}</time>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
   );
 }
 
@@ -1296,13 +1374,7 @@ function SessionPage() {
             <div className="drawer-header">
               <h2>Tools</h2>
               <span className="badge rounded-pill text-bg-light">
-                {
-                  events.filter(
-                    (e) =>
-                      e.event.type === "tool_call" ||
-                      e.event.type === "tool_result",
-                  ).length
-                }
+                {events.filter((e) => e.event.type === "tool_call").length}
               </span>
             </div>
             {(() => {
@@ -1325,48 +1397,10 @@ function SessionPage() {
                 );
               }
 
-              const groupedTools: Record<
-                string,
-                {
-                  count: number;
-                  details: string[];
-                  icon: string;
-                  callEvents: AgentEvent[];
-                }
-              > = {};
+              const summaries = buildToolSummaries(events);
 
-              toolEvents.forEach((e) => {
-                if (e.event.type !== "tool_call") return;
-
-                const toolName = e.event.tool;
-                const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
-                const iconClass =
-                  TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
-                const detail = getToolDetailSimple(e);
-
-                if (!groupedTools[toolName]) {
-                  groupedTools[toolName] = {
-                    count: 0,
-                    details: [],
-                    icon: iconClass,
-                    callEvents: [],
-                  };
-                }
-                groupedTools[toolName].count++;
-                groupedTools[toolName].callEvents.push(e);
-                if (detail) {
-                  groupedTools[toolName].details.push(detail);
-                }
-              });
-
-              return Object.entries(groupedTools).map(([toolName, data], i) => (
-                <button key={i} className="drawer-item">
-                  <span>
-                    <i className={data.icon}></i>
-                    {TOOL_FRIENDLY_NAMES[toolName] || toolName}
-                  </span>
-                  <strong>{data.count}</strong>
-                </button>
+              return summaries.map((summary) => (
+                <ToolDrawerSummary key={summary.toolName} summary={summary} />
               ));
             })()}
           </aside>
