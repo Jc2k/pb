@@ -1956,10 +1956,7 @@ impl SubAgentEventCollector {
                 profile: _,
                 ..
             } => self.final_content = Some(content),
-            AgentEvent::Error {
-                message,
-                timestamp_ms: _,
-            } => self.errors.push(message),
+            AgentEvent::Error { message, .. } => self.errors.push(message),
             AgentEvent::Diff { .. } => self.diffs += 1,
             _ => {}
         }

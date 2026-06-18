@@ -3,14 +3,19 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+#[cfg(target_os = "macos")]
 use image::{ImageFormat, ImageReader};
+#[cfg(target_os = "macos")]
 use objc2::rc::{Retained, autoreleasepool};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSData, NSError, NSString};
+#[cfg(target_os = "macos")]
 use objc2_open_directory::{
     ODAttributeType, ODNode, ODRecord, ODRecordType, kODAttributeTypeFullName,
     kODAttributeTypeJPEGPhoto, kODAttributeTypePicture, kODNodeTypeLocalNodes, kODRecordTypeUsers,
 };
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::{ffi::CStr, io::Cursor, path::PathBuf};
 use thiserror::Error;
 use tokio::task;
@@ -59,6 +64,17 @@ pub struct UserInfo {
     pub real_name: Option<String>,
 }
 
+#[cfg(not(target_os = "macos"))]
+fn load_current_process_user_avatar_png() -> Result<Vec<u8>, MacOsUserError> {
+    Err(MacOsUserError::UnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_current_process_user_info() -> Result<UserInfo, MacOsUserError> {
+    Err(MacOsUserError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "macos")]
 fn load_current_process_user_avatar_png() -> Result<Vec<u8>, MacOsUserError> {
     let username = current_effective_username()?;
 
@@ -69,6 +85,7 @@ fn load_current_process_user_avatar_png() -> Result<Vec<u8>, MacOsUserError> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn load_current_process_user_info() -> Result<UserInfo, MacOsUserError> {
     let username = current_effective_username()?;
 
@@ -86,6 +103,7 @@ fn load_current_process_user_info() -> Result<UserInfo, MacOsUserError> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn current_effective_username() -> Result<String, MacOsUserError> {
     unsafe {
         let pw = libc::getpwuid(libc::geteuid());
@@ -104,6 +122,7 @@ fn current_effective_username() -> Result<String, MacOsUserError> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn open_directory_user_record(username: &str) -> Result<Retained<ODRecord>, MacOsUserError> {
     unsafe {
         let mut err: Option<Retained<NSError>> = None;
@@ -125,6 +144,7 @@ fn open_directory_user_record(username: &str) -> Result<Retained<ODRecord>, MacO
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_avatar_source_bytes(record: &ODRecord) -> Result<Vec<u8>, MacOsUserError> {
     // Prefer embedded binary JPEG avatar data.
     if let Some(bytes) = od_first_data_attr(record, od_attr_jpeg_photo()?)? {
@@ -140,6 +160,7 @@ fn read_avatar_source_bytes(record: &ODRecord) -> Result<Vec<u8>, MacOsUserError
     Err(MacOsUserError::NoAvatar)
 }
 
+#[cfg(target_os = "macos")]
 fn od_first_data_attr(
     record: &ODRecord,
     attr: &ODAttributeType,
@@ -165,6 +186,7 @@ fn od_first_data_attr(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn od_first_string_attr(
     record: &ODRecord,
     attr: &ODAttributeType,
@@ -190,12 +212,14 @@ fn od_first_string_attr(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn data_as_vec(data: &NSData) -> Vec<u8> {
     // `NSData` values from OpenDirectory are immutable for the lifetime of `data`,
     // so copying the exposed byte slice into Rust-owned memory is safe here.
     data.to_vec()
 }
 
+#[cfg(target_os = "macos")]
 fn encode_png(source: &[u8]) -> Result<Vec<u8>, MacOsUserError> {
     let image = ImageReader::new(Cursor::new(source))
         .with_guessed_format()?
@@ -207,6 +231,7 @@ fn encode_png(source: &[u8]) -> Result<Vec<u8>, MacOsUserError> {
     Ok(png)
 }
 
+#[cfg(target_os = "macos")]
 fn path_or_file_url_to_pathbuf(s: &str) -> Result<PathBuf, MacOsUserError> {
     if let Ok(url) = url::Url::parse(s) {
         if url.scheme() == "file" {
@@ -219,6 +244,7 @@ fn path_or_file_url_to_pathbuf(s: &str) -> Result<PathBuf, MacOsUserError> {
     Ok(PathBuf::from(s))
 }
 
+#[cfg(target_os = "macos")]
 fn od_attr_jpeg_photo() -> Result<&'static ODAttributeType, MacOsUserError> {
     unsafe {
         kODAttributeTypeJPEGPhoto.ok_or_else(|| {
@@ -227,6 +253,7 @@ fn od_attr_jpeg_photo() -> Result<&'static ODAttributeType, MacOsUserError> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn od_attr_picture() -> Result<&'static ODAttributeType, MacOsUserError> {
     unsafe {
         kODAttributeTypePicture.ok_or_else(|| {
@@ -235,6 +262,7 @@ fn od_attr_picture() -> Result<&'static ODAttributeType, MacOsUserError> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn od_attr_full_name() -> Result<&'static ODAttributeType, MacOsUserError> {
     unsafe {
         kODAttributeTypeFullName.ok_or_else(|| {
@@ -243,6 +271,7 @@ fn od_attr_full_name() -> Result<&'static ODAttributeType, MacOsUserError> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn od_record_type_users() -> Result<&'static ODRecordType, MacOsUserError> {
     unsafe {
         kODRecordTypeUsers.ok_or_else(|| {
@@ -251,6 +280,7 @@ fn od_record_type_users() -> Result<&'static ODRecordType, MacOsUserError> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ns_error_string(err: Option<Retained<NSError>>) -> String {
     err.map(|e| format!("{e:?}"))
         .unwrap_or_else(|| "unknown OpenDirectory error".to_owned())
@@ -258,21 +288,31 @@ fn ns_error_string(err: Option<Retained<NSError>>) -> String {
 
 #[derive(Debug, Error)]
 enum MacOsUserError {
+    #[cfg(not(target_os = "macos"))]
+    #[error("macOS user details are only supported on macOS")]
+    UnsupportedPlatform,
+
+    #[cfg(target_os = "macos")]
     #[error("could not determine current user")]
     NoCurrentUser,
 
+    #[cfg(target_os = "macos")]
     #[error("user has no JPEGPhoto or Picture avatar")]
     NoAvatar,
 
+    #[cfg(target_os = "macos")]
     #[error("OpenDirectory error: {0}")]
     OpenDirectory(String),
 
+    #[cfg(target_os = "macos")]
     #[error("bad Picture path: {0}")]
     BadPicturePath(String),
 
+    #[cfg(target_os = "macos")]
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[cfg(target_os = "macos")]
     #[error(transparent)]
     Image(#[from] image::ImageError),
 }
