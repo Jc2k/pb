@@ -765,6 +765,8 @@ function profileName(profile: string): string {
       return "Paul Cook";
     case "research":
       return "Emmanuel Goldstein";
+    case "monitor":
+      return "Trinity Walker";
     case "ask":
       return "Joey Pardella";
     default:
@@ -786,6 +788,8 @@ function profileJobTitle(profile: string): string {
       return "Repo Mapper";
     case "research":
       return "Web Sleuth";
+    case "monitor":
+      return "Progress Monitor";
     case "ask":
       return "Question Wrangler";
     default:
