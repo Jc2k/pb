@@ -72,11 +72,25 @@ pub fn render_event(event: &AgentEvent) {
             ..
         } => print_header("final", content),
         AgentEvent::SessionSummary {
-            branch, commits, ..
+            branch,
+            commits,
+            summary,
+            diff_stat,
+            diff,
+            ..
         } => {
             print_header("session", &format!("branch: {branch}"));
+            if !summary.trim().is_empty() {
+                print_block("session summary", summary);
+            }
             if !commits.trim().is_empty() {
                 print_block("session commits", commits);
+            }
+            if !diff_stat.trim().is_empty() {
+                print_block("diff stat from main", diff_stat);
+            }
+            if !diff.trim().is_empty() {
+                print_block("diff from main", diff);
             }
         }
         AgentEvent::Error { message, .. } => eprintln!("error: {message}"),

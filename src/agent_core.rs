@@ -740,15 +740,23 @@ pub fn run_agent<S: EventSink>(
         &mut sink,
     )?;
     let reached_final = outcome.reached_final;
+    let summary = outcome.final_content.unwrap_or_default();
 
-    let commits = if args.repository_less {
-        String::new()
+    let (commits, diff_stat, diff) = if args.repository_less {
+        (String::new(), String::new(), String::new())
     } else {
-        git_log_recent(&workspace_root, 5).unwrap_or_default()
+        (
+            git_log_recent(&workspace_root, 5).unwrap_or_default(),
+            git_diff_stat_from_main(&workspace_root).unwrap_or_default(),
+            git_diff_from_main(&workspace_root).unwrap_or_default(),
+        )
     };
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
+        summary,
+        diff_stat,
+        diff,
         timestamp_ms: Some(now_millis()),
     });
 
@@ -777,6 +785,9 @@ fn build_agent_instructions(
     );
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
+    );
+    instructions.push_str(
+        "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it.\n",
     );
     instructions.push_str(profile.instructions());
     instructions.push('\n');
@@ -3397,6 +3408,14 @@ fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
 
 fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
     git_run(&["log", "--oneline", &format!("-{n}")], workdir)
+}
+
+fn git_diff_stat_from_main(workdir: &Path) -> Result<String> {
+    git_run(&["diff", "--stat", "main...HEAD"], workdir)
+}
+
+fn git_diff_from_main(workdir: &Path) -> Result<String> {
+    git_run(&["diff", "--find-renames", "main...HEAD"], workdir)
 }
 
 fn git_revert(commit: &str, workdir: &Path) -> Result<String> {
