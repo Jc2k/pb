@@ -95,8 +95,10 @@ pub struct SessionDetails {
     pub paused: bool,
     pub status: SessionStatus,
     pub branch: Option<String>,
+    pub workdir: Option<String>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,8 +580,13 @@ async fn get_session(
         paused: session.paused,
         status: session.status,
         branch: session.branch.clone(),
+        workdir: session
+            .workdir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
+        updated_at_ms: session.updated_at_ms,
     }))
 }
 
@@ -1263,8 +1270,13 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         paused: session.paused,
         status: session.status,
         branch: session.branch.clone(),
+        workdir: session
+            .workdir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
+        updated_at_ms: session.updated_at_ms,
     })
 }
 

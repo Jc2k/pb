@@ -159,8 +159,10 @@ interface SessionDetails {
   paused: boolean;
   status: SessionStatus;
   branch?: string;
+  workdir?: string;
   pending_question?: { question_id: string; question: string; choices?: string[] };
   events: EventEnvelope[];
+  updated_at_ms: number;
 }
 
 interface ProjectEntry {
@@ -1261,6 +1263,180 @@ function HomePage() {
   );
 }
 
+/* ─── projects pages ─────────────────────────────────────────── */
+
+function PageShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="app-shell">
+      <Aside />
+      <section className="main-panel">
+        <header className="mobile-topbar d-lg-none d-flex align-items-center justify-content-between px-3 py-2">
+          <div className="brand compact d-flex align-items-center gap-2">
+            <div className="brand-mark">&gt;_</div>
+            <strong>LocalAgent</strong>
+          </div>
+        </header>
+        <div className="content-wrap">{children}</div>
+      </section>
+    </div>
+  );
+}
+
+function ProjectsPage() {
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+
+  useEffect(() => {
+    void fetch("/api/projects")
+      .then((res) => (res.ok ? res.json() : []))
+      .then((entries: ProjectEntry[]) => setProjects(entries));
+    void fetch("/api/sessions")
+      .then((res) => (res.ok ? res.json() : []))
+      .then((entries: SessionItem[]) => setSessions(entries));
+  }, []);
+
+  return (
+    <PageShell>
+      <section className="hero-section">
+        <h1>Projects</h1>
+        <p className="text-secondary mb-3">
+          Choose a registered project to view its sessions and start focused project work.
+        </p>
+      </section>
+
+      <section className="sessions-section">
+        <div className="session-list list-group">
+          {projects.length === 0 ? (
+            <div className="list-group-item text-secondary small">
+              No registered projects. Add one with <code>pb projects add</code>.
+            </div>
+          ) : (
+            projects.map((project) => {
+              const projectSessions = sessions.filter((session) => session.workdir === project.path);
+              const running = projectSessions.filter((session) => session.status === "running").length;
+              return (
+                <Link
+                  key={project.name}
+                  className="session-row list-group-item list-group-item-action py-3 px-4 text-decoration-none"
+                  to={`/projects/${encodeURIComponent(project.name)}`}
+                >
+                  <div className="session-icon"><i className="bi bi-folder2-open"></i></div>
+                  <div className="session-main">
+                    <strong>{project.name}</strong>
+                    <span>{project.path}</span>
+                  </div>
+                  <span className={`status-pill ${running ? "status-running" : "status-completed"}`}>
+                    {projectSessions.length} session{projectSessions.length === 1 ? "" : "s"}
+                  </span>
+                  <span className="chevron">›</span>
+                </Link>
+              );
+            })
+          )}
+        </div>
+      </section>
+    </PageShell>
+  );
+}
+
+function ProjectPage() {
+  const { projectName: encodedProjectName } = useParams<{ projectName: string }>();
+  const navigate = useNavigate();
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [task, setTask] = useState("");
+  const [branch, setBranch] = useState("main");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
+  const project = projects.find((entry) => entry.name === name);
+  const projectSessions = project ? sessions.filter((session) => session.workdir === project.path) : [];
+
+  useEffect(() => {
+    void fetch("/api/projects")
+      .then((res) => (res.ok ? res.json() : []))
+      .then((entries: ProjectEntry[]) => setProjects(entries));
+  }, []);
+
+  useEffect(() => {
+    const fetchSessions = () =>
+      fetch("/api/sessions")
+        .then((res) => (res.ok ? res.json() : []))
+        .then((entries: SessionItem[]) => setSessions(entries));
+    void fetchSessions();
+    const timer = window.setInterval(() => void fetchSessions(), 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const startProjectSession = async () => {
+    if (!project || !task.trim()) return;
+    setIsSubmitting(true);
+    try {
+      const res = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: task.trim(), workdir: project.path, branch: branch.trim() || "main" }),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { session_id: string };
+      navigate(`/sessions/${data.session_id}`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <PageShell>
+      <section className="hero-section">
+        <Link to="/projects" className="text-decoration-none small fw-medium text-blue">← All projects</Link>
+        <h1>{project?.name || name || "Project"}</h1>
+        <p className="text-secondary mb-3">{project?.path || "Project not found"}</p>
+
+        {project && (
+          <form className="start-card card" onSubmit={(e) => { e.preventDefault(); void startProjectSession(); }}>
+            <div className="task-editor position-relative">
+              <textarea
+                className="form-control"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                placeholder={`Ask the agent to work in ${project.name}…`}
+                rows={4}
+              />
+            </div>
+            <div className="session-controls row g-3 align-items-end p-3">
+              <div className="col-12 col-md-8">
+                <label className="form-label small fw-semibold">Base branch</label>
+                <select className="form-select" value={branch} onChange={(e) => setBranch(e.target.value)}>
+                  <option>main</option>
+                  <option>develop</option>
+                  <option>feature/ui-refresh</option>
+                </select>
+              </div>
+              <div className="col-12 col-md-4 d-grid">
+                <button className="btn btn-primary start-button" type="submit" disabled={!task.trim() || isSubmitting}>▷ Start project chat</button>
+              </div>
+            </div>
+          </form>
+        )}
+      </section>
+
+      <section className="sessions-section">
+        <div className="section-header d-flex align-items-center justify-content-between mb-3">
+          <h2 className="h6 fw-bold m-0">Project sessions</h2>
+        </div>
+        <div className="session-list list-group">
+          {projectSessions.length === 0 ? (
+            <div className="list-group-item text-secondary small">No sessions for this project yet</div>
+          ) : (
+            projectSessions.map((session) => (
+              <SessionCard key={session.session_id} session={session} onClick={() => navigate(`/sessions/${session.session_id}`)} />
+            ))
+          )}
+        </div>
+      </section>
+    </PageShell>
+  );
+}
+
 /* ─── session card ───────────────────────────────────────────── */
 
 function SessionCard({
@@ -1662,6 +1838,8 @@ export default function App() {
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/sessions/:sessionId" element={<SessionPage />} />
+        <Route path="/projects" element={<ProjectsPage />} />
+        <Route path="/projects/:projectName" element={<ProjectPage />} />
       </Routes>
     </BrowserRouter>
   );
