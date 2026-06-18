@@ -819,6 +819,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             message: err.to_string(),
+                            nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
                         },
                     );
@@ -829,6 +830,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             message: err.to_string(),
+                            nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
                         },
                     );

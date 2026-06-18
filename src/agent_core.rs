@@ -678,7 +678,24 @@ pub fn run_agent<S: EventSink>(
     if git_has_changes(&workspace_root).unwrap_or(false) {
         let summary: String = args.task.chars().take(60).collect();
         let commit_msg = format!("refactor(agent): {summary}");
-        let _ = git_commit_all(&commit_msg, &workspace_root);
+        let arguments = json!({ "message": commit_msg });
+        sink.emit(AgentEvent::ToolCall {
+            tool: "git_commit".to_string(),
+            arguments,
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        let result = match git_commit_all(&commit_msg, &workspace_root) {
+            Ok(true) => format!("committed: {commit_msg}"),
+            Ok(false) => "nothing to commit".to_string(),
+            Err(err) => format!("auto-commit failed: {err}"),
+        };
+        sink.emit(AgentEvent::ToolResult {
+            tool: "git_commit".to_string(),
+            result,
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
     }
 
     let commits = git_log_recent(&workspace_root, 5).unwrap_or_default();
@@ -1239,6 +1256,7 @@ fn run_agent_steps(
         sink.emit(AgentEvent::StepStarted {
             step,
             max_steps: args.max_steps,
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
 
@@ -1252,12 +1270,14 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Reasoning {
                         content: reasoning,
                         profile: args.profile,
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
                 }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
                 return Ok(StepRunOutcome {
@@ -1274,12 +1294,14 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Reasoning {
                         content: reasoning,
                         profile: args.profile,
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
                 }
                 sink.emit(AgentEvent::ToolCall {
                     tool: tool.clone(),
                     arguments: arguments.clone(),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
                 let tool_context = ToolContext {
@@ -1296,6 +1318,7 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::ToolResult {
                     tool: tool.clone(),
                     result: tool_result.clone(),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
 
@@ -1749,6 +1772,8 @@ fn run_tool(
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff,
+                nesting_depth: (context.request.sub_agent_depth > 0)
+                    .then_some(context.request.sub_agent_depth),
                 timestamp_ms: Some(now_millis()),
             });
             Ok(format!("updated {}", resolved.display()))
@@ -1765,6 +1790,8 @@ fn run_tool(
                 sink.emit(AgentEvent::Diff {
                     path: "apply_patch".to_string(),
                     diff,
+                    nesting_depth: (context.request.sub_agent_depth > 0)
+                        .then_some(context.request.sub_agent_depth),
                     timestamp_ms: Some(now_millis()),
                 });
             }
@@ -2051,6 +2078,7 @@ fn run_sub_agent(
     sink.emit(AgentEvent::SubAgentFinished {
         profile: profile.as_str().to_string(),
         result: result.clone(),
+        nesting_depth: Some(context.request.sub_agent_depth + 1),
         timestamp_ms: Some(now_millis()),
     });
     Ok(result)

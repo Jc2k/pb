@@ -174,6 +174,50 @@ body {
     margin-top: 0.15rem;
 }
 
+.typing-row {
+    min-height: 1.4rem;
+    padding-left: calc(64px + 0.75rem);
+}
+
+.typing-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    width: fit-content;
+    border: 1px solid var(--assistant-border);
+    border-radius: 999px;
+    background: var(--assistant);
+    padding: 0.48rem 0.7rem;
+    box-shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+}
+
+.typing-indicator span {
+    width: 0.42rem;
+    height: 0.42rem;
+    border-radius: 999px;
+    background: #9ca3af;
+    animation: typing-pulse 1.2s ease-in-out infinite;
+}
+
+.typing-indicator span:nth-child(2) {
+    animation-delay: 0.16s;
+}
+
+.typing-indicator span:nth-child(3) {
+    animation-delay: 0.32s;
+}
+
+@keyframes typing-pulse {
+    0%, 80%, 100% {
+        opacity: 0.35;
+        transform: translateY(0);
+    }
+    40% {
+        opacity: 1;
+        transform: translateY(-0.16rem);
+    }
+}
+
 article.user div.message-container {
     display: flex;
     flex-direction: column;

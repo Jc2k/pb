@@ -21,11 +21,15 @@ pub enum AgentEvent {
         step: usize,
         max_steps: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
     Reasoning {
         content: String,
         profile: AgentProfile,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
@@ -33,11 +37,15 @@ pub enum AgentEvent {
         tool: String,
         arguments: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
     ToolResult {
         tool: String,
         result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
@@ -64,17 +72,23 @@ pub enum AgentEvent {
         profile: String,
         result: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
     Diff {
         path: String,
         diff: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
     Final {
         content: String,
         profile: AgentProfile,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
@@ -86,6 +100,8 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u128>,
     },
@@ -125,40 +141,58 @@ impl EventEnvelope {
                 },
             },
             AgentEvent::StepStarted {
-                step, max_steps, ..
+                step,
+                max_steps,
+                nesting_depth,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::StepStarted {
                     step,
                     max_steps,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
             AgentEvent::Reasoning {
-                content, profile, ..
+                content,
+                profile,
+                nesting_depth,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::Reasoning {
                     content,
                     profile,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
             AgentEvent::ToolCall {
-                tool, arguments, ..
+                tool,
+                arguments,
+                nesting_depth,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::ToolCall {
                     tool,
                     arguments,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
-            AgentEvent::ToolResult { tool, result, .. } => Self {
+            AgentEvent::ToolResult {
+                tool,
+                result,
+                nesting_depth,
+                ..
+            } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
@@ -201,30 +235,44 @@ impl EventEnvelope {
                 },
             },
             AgentEvent::SubAgentFinished {
-                profile, result, ..
+                profile,
+                result,
+                nesting_depth,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::SubAgentFinished {
                     profile,
                     result,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
-            AgentEvent::Diff { path, diff, .. } => Self {
+            AgentEvent::Diff {
+                path,
+                diff,
+                nesting_depth,
+                ..
+            } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::Diff {
                     path,
                     diff,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
             AgentEvent::Final {
-                content, profile, ..
+                content,
+                profile,
+                nesting_depth,
+                ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::Final {
                     content,
                     profile,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
@@ -238,10 +286,15 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
-            AgentEvent::Error { message, .. } => Self {
+            AgentEvent::Error {
+                message,
+                nesting_depth,
+                ..
+            } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::Error {
                     message,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
