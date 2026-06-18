@@ -492,21 +492,26 @@ async fn answer_question_inner(
         anyhow::bail!(AnswerQuestionError::Conflict);
     }
 
-    session.paused = false;
-    session.running = true;
-    session.status = SessionStatus::Running;
-    session.updated_at_ms = now_millis();
+    let answer = req.answer.trim().to_string();
+    if answer.is_empty() || (!pending.choices.is_empty() && !pending.choices.contains(&answer)) {
+        session.pending_question = Some(pending);
+        anyhow::bail!(AnswerQuestionError::Conflict);
+    }
+
     let sender = session.sender.clone();
     let history = Arc::clone(&session.history);
     let request_template = session.request_template.clone();
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
-    let answer = req.answer.trim().to_string();
     let question_id = req.question_id.clone();
     pending
         .responder
         .send(answer.clone())
         .map_err(|_| AnswerQuestionError::Gone)?;
+    session.paused = false;
+    session.running = true;
+    session.status = SessionStatus::Running;
+    session.updated_at_ms = now_millis();
     publish_event(
         &sender,
         &history,
