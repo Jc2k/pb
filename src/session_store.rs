@@ -32,7 +32,7 @@ pub struct PersistedSession {
     pub running: bool,
     #[serde(default)]
     pub status: Option<SessionStatus>,
-    pub updated_at_ms: u128,
+    pub updated_at_ms: u64,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -266,11 +266,13 @@ fn command_output(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub fn now_millis() -> u128 {
+pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

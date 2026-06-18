@@ -15,7 +15,7 @@ pub enum AgentEvent {
         workspace: String,
         branch: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     StepStarted {
         step: usize,
@@ -23,7 +23,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     Reasoning {
         content: String,
@@ -31,7 +31,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     ToolCall {
         tool: String,
@@ -39,7 +39,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     ToolResult {
         tool: String,
@@ -47,26 +47,26 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     UserQuestion {
         question_id: String,
         question: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     UserAnswer {
         question_id: String,
         answer: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     SubAgentStarted {
         profile: String,
         task: String,
         nesting_depth: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     SubAgentFinished {
         profile: String,
@@ -74,7 +74,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     Diff {
         path: String,
@@ -82,7 +82,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     Final {
         content: String,
@@ -90,20 +90,20 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     SessionSummary {
         branch: String,
         commits: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
     Error {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp_ms: Option<u128>,
+        timestamp_ms: Option<u64>,
     },
 }
 

@@ -84,7 +84,7 @@ pub struct SessionListItem {
     pub status: SessionStatus,
     pub branch: Option<String>,
     pub workdir: Option<String>,
-    pub updated_at_ms: u128,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +175,7 @@ struct SessionState {
     pending_question: Option<PendingQuestionState>,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
-    updated_at_ms: u128,
+    updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1286,11 +1286,13 @@ fn new_session_id() -> String {
     format!("session-{now}")
 }
 
-fn now_millis() -> u128 {
+fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn publish_event(
