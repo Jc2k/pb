@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -294,10 +295,29 @@ async fn start_session_inner(
     if let Some(model_dir) = req.model_dir {
         request.model_dir = Some(PathBuf::from(model_dir));
     }
-    if let Some(workdir) = req.workdir {
+    let explicit_workdir = req
+        .workdir
+        .as_deref()
+        .filter(|workdir| !workdir.trim().is_empty());
+    if let Some(workdir) = explicit_workdir {
         request.workdir = Some(PathBuf::from(workdir));
+        request.repository_less = false;
+    } else if let Some(bootstrap) = maybe_bootstrap_project(&req.task)? {
+        request.workdir = Some(bootstrap);
+        request.repository_less = false;
+    } else {
+        request.workdir = None;
+        request.repository_less = true;
+        if !matches!(req.profile, Some(AgentProfile::Build | AgentProfile::Scout)) {
+            request.profile = req.profile.unwrap_or(AgentProfile::Ask);
+            request.infer_profile = req.profile.is_none();
+        }
     }
-    request.branch = req.branch.clone();
+    request.branch = if request.repository_less {
+        None
+    } else {
+        req.branch.clone()
+    };
     request.session_id = session_id.clone();
     request.max_steps = req.max_steps.unwrap_or(request.max_steps);
     request.max_tokens = req.max_tokens.unwrap_or(request.max_tokens);
@@ -306,8 +326,12 @@ async fn start_session_inner(
     request.threads_batch = req.threads_batch.or(request.threads_batch);
     request.gpu_layers = req.gpu_layers.unwrap_or(request.gpu_layers);
     request.temperature = req.temperature.unwrap_or(request.temperature);
-    request.profile = req.profile.unwrap_or(request.profile);
-    request.infer_profile = req.profile.is_none();
+    if !request.repository_less
+        || matches!(req.profile, Some(AgentProfile::Build | AgentProfile::Scout))
+    {
+        request.profile = req.profile.unwrap_or(request.profile);
+        request.infer_profile = req.profile.is_none();
+    }
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
 
@@ -344,6 +368,67 @@ async fn start_session_inner(
     dispatch_next_session(state.clone());
 
     Ok(SessionResponse { session_id })
+}
+
+fn maybe_bootstrap_project(task: &str) -> Result<Option<PathBuf>> {
+    let Some(name) = parse_bootstrap_project_name(task) else {
+        return Ok(None);
+    };
+    let home = dirs::home_dir().context("cannot determine home directory for project bootstrap")?;
+    let projects_dir = home.join("Projects");
+    std::fs::create_dir_all(&projects_dir)
+        .with_context(|| format!("failed to create {}", projects_dir.display()))?;
+    let project_dir = projects_dir.join(&name);
+    if project_dir.exists() {
+        bail!(
+            "bootstrap project already exists: {}",
+            project_dir.display()
+        );
+    }
+    std::fs::create_dir(&project_dir)
+        .with_context(|| format!("failed to create {}", project_dir.display()))?;
+    let output = Command::new("git")
+        .arg("init")
+        .current_dir(&project_dir)
+        .output()
+        .context("failed to run git init for bootstrap project")?;
+    if !output.status.success() {
+        bail!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    projects::add_project(AddProjectRequest {
+        name: Some(name),
+        path: project_dir.to_string_lossy().to_string(),
+    })?;
+    Ok(Some(project_dir))
+}
+
+fn parse_bootstrap_project_name(task: &str) -> Option<String> {
+    let lower = task.to_ascii_lowercase();
+    for marker in [
+        "new repo called ",
+        "new repository called ",
+        "repo called ",
+        "repository called ",
+    ] {
+        if let Some(index) = lower.find(marker) {
+            let start = index + marker.len();
+            let raw = task[start..]
+                .split_whitespace()
+                .next()?
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+            let name = raw
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect::<String>();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 async fn continue_session(
