@@ -1046,12 +1046,15 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "ask_user",
-            "Ask the human user a blocking clarification question.",
+            "Ask the human user a blocking clarification question. Provide choices for a multiple-choice question, or omit choices for a free-text answer.",
             object_schema(
-                [string_property(
-                    "question",
-                    "Question to present to the user.",
-                )],
+                [
+                    string_property("question", "Question to present to the user."),
+                    string_array_property(
+                        "choices",
+                        "Optional multiple-choice answers to present. Omit or pass an empty array for free-text answers.",
+                    ),
+                ],
                 ["question"],
             ),
         ),
@@ -1183,6 +1186,17 @@ fn string_property(name: &'static str, description: &'static str) -> (&'static s
     (
         name,
         json!({ "type": "string", "description": description }),
+    )
+}
+
+fn string_array_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
+    (
+        name,
+        json!({
+            "type": "array",
+            "description": description,
+            "items": { "type": "string" },
+        }),
     )
 }
 
@@ -1998,7 +2012,12 @@ fn run_tool(
                 .get("question")
                 .and_then(Value::as_str)
                 .context("ask_user requires string argument: question")?;
-            sink.ask_user(question)
+            let choices = question_choices(arguments)?;
+            if choices.is_empty() {
+                sink.ask_user(question)
+            } else {
+                sink.ask_multiple_choice(question, &choices)
+            }
         }
         "sub_agent" => run_sub_agent(arguments, context, sink),
         "run_command" => {
@@ -2012,6 +2031,30 @@ fn run_tool(
         }
         _ => bail!("unknown tool: {tool}"),
     }
+}
+
+fn question_choices(arguments: &Value) -> Result<Vec<String>> {
+    let Some(raw_choices) = arguments.get("choices") else {
+        return Ok(Vec::new());
+    };
+    let choices = raw_choices
+        .as_array()
+        .context("ask_user choices must be an array of strings")?;
+    choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let choice = choice
+                .as_str()
+                .with_context(|| format!("ask_user choices[{index}] must be a string"))?
+                .trim()
+                .to_string();
+            if choice.is_empty() {
+                anyhow::bail!("ask_user choices[{index}] must not be empty");
+            }
+            Ok(choice)
+        })
+        .collect()
 }
 
 fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
@@ -3506,6 +3549,41 @@ mod tests {
         assert!(instructions.contains(r#""name": "read_file""#));
         assert!(instructions.contains(r#""required": ["#));
         assert!(instructions.contains(r#""additionalProperties": false"#));
+    }
+
+    #[test]
+    fn ask_user_tool_schema_accepts_optional_choices() {
+        let specs =
+            available_tool_specs(AgentProfile::Plan, None, true, &McpToolRegistry::default());
+        let ask_user = specs
+            .iter()
+            .find(|tool| tool.name == "ask_user")
+            .expect("ask_user tool should be available");
+
+        assert_eq!(
+            ask_user.input_schema["properties"]["choices"]["type"],
+            "array"
+        );
+        assert_eq!(
+            ask_user.input_schema["properties"]["choices"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(ask_user.input_schema["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn question_choices_validate_multiple_choice_arguments() {
+        assert_eq!(
+            question_choices(&json!({"question":"Pick","choices":["red","blue"]})).unwrap(),
+            vec!["red".to_string(), "blue".to_string()]
+        );
+        assert!(
+            question_choices(&json!({"question":"Pick"}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(question_choices(&json!({"choices":[""]})).is_err());
+        assert!(question_choices(&json!({"choices":"allow"})).is_err());
     }
 
     #[test]
