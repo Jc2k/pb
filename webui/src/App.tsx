@@ -96,6 +96,7 @@ type AgentEvent =
       type: "user_question";
       question_id: string;
       question: string;
+      choices?: string[];
       nesting_depth?: number;
       timestamp_ms?: number;
     }
@@ -147,7 +148,7 @@ interface SessionItem {
   status: SessionStatus;
   branch?: string;
   workdir?: string;
-  pending_question?: { question_id: string; question: string };
+  pending_question?: { question_id: string; question: string; choices?: string[] };
   updated_at_ms: number;
 }
 
@@ -158,7 +159,7 @@ interface SessionDetails {
   paused: boolean;
   status: SessionStatus;
   branch?: string;
-  pending_question?: { question_id: string; question: string };
+  pending_question?: { question_id: string; question: string; choices?: string[] };
   events: EventEnvelope[];
 }
 
@@ -634,6 +635,13 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
             </div>
             <div className="bubble user-bubble">
               <p>{e.question}</p>
+              {e.choices?.length ? (
+                <div className="d-flex gap-2 flex-wrap mt-2">
+                  {e.choices.map((choice) => (
+                    <span className="badge text-bg-warning" key={choice}>{choice}</span>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </div>
           <div className="user-avatar">
@@ -1142,14 +1150,15 @@ function SessionPage() {
     setSessionRunning(false);
   };
 
-  const answerQuestion = async () => {
-    if (!answer.trim() || !session?.pending_question) return;
+  const answerQuestion = async (choice?: string) => {
+    const selectedAnswer = choice ?? answer.trim();
+    if (!selectedAnswer || !session?.pending_question) return;
     await fetch(`/api/sessions/${sessionId}/answer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         question_id: session.pending_question.question_id,
-        answer: answer.trim(),
+        answer: selectedAnswer,
       }),
     });
     setAnswer("");
@@ -1374,20 +1383,37 @@ function SessionPage() {
             <button className="btn btn-light rounded-circle" type="button">
               <i className="bi bi-plus-lg"></i>
             </button>
-            <input
-              className="form-control"
-              rows={2}
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              placeholder="Answer the planning question…"
-            />
-            <button
-              className="btn btn-warning rounded-circle"
-              type="submit"
-              disabled={!answer.trim()}
-            >
-              <i className="bi bi-check-lg"></i>
-            </button>
+            {session.pending_question.choices?.length ? (
+              <div className="d-flex gap-2 flex-grow-1 flex-wrap">
+                {session.pending_question.choices.map((choice) => (
+                  <button
+                    key={choice}
+                    className="btn btn-warning"
+                    type="button"
+                    onClick={() => void answerQuestion(choice)}
+                  >
+                    {choice}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <>
+                <input
+                  className="form-control"
+                  rows={2}
+                  value={answer}
+                  onChange={(e) => setAnswer(e.target.value)}
+                  placeholder="Answer the planning question…"
+                />
+                <button
+                  className="btn btn-warning rounded-circle"
+                  type="submit"
+                  disabled={!answer.trim()}
+                >
+                  <i className="bi bi-check-lg"></i>
+                </button>
+              </>
+            )}
           </form>
         ) : session.status === "paused" ? (
           <footer className="composer">

@@ -63,3 +63,30 @@ cargo build --release
 ## CI
 
 GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
+
+## Tool policy configuration
+
+Projects can define `.pb/policy.toml` to allow, deny, or ask before tool calls, including MCP tools. Rules are evaluated in order; the first matching rule wins, and calls that do not match a rule are allowed.
+
+```toml
+[[rules]]
+name = "ask before shell in planning"
+outcome = "ask" # allow | deny | ask
+profiles = ["plan", "explore"]
+tools = ["run_command", "mcp_github_*"]
+question = "Allow this tool call?"
+
+[rules.params]
+command = { contains = "npm install" }
+
+[[rules]]
+name = "block recursive deletes in build"
+outcome = "deny"
+profiles = ["build"]
+tools = ["run_command"]
+
+[rules.params]
+command = { regex = "rm\\s+-rf" }
+```
+
+Parameter filters use dot paths over the full tool argument JSON, including nested objects and array indexes, and support literal values or `{ equals, contains, glob, regex, exists }` matchers.

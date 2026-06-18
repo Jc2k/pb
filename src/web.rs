@@ -103,6 +103,7 @@ pub struct SessionDetails {
 pub struct PendingQuestionView {
     pub question_id: String,
     pub question: String,
+    pub choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +161,7 @@ pub struct SessionFinished {
 struct PendingQuestionState {
     question_id: String,
     question: String,
+    choices: Vec<String>,
     responder: std::sync::mpsc::Sender<String>,
 }
 
@@ -677,6 +679,10 @@ impl EventSink for WebEventSink {
     }
 
     fn ask_user(&mut self, question: &str) -> Result<String> {
+        self.ask_multiple_choice(question, &[])
+    }
+
+    fn ask_multiple_choice(&mut self, question: &str, choices: &[String]) -> Result<String> {
         let question = question.trim();
         if question.is_empty() {
             anyhow::bail!("ask_user question must not be empty");
@@ -686,6 +692,7 @@ impl EventSink for WebEventSink {
         let event = AgentEvent::UserQuestion {
             question_id: question_id.clone(),
             question: question.to_string(),
+            choices: choices.to_vec(),
             timestamp_ms: Some(now_millis()),
         };
 
@@ -700,6 +707,7 @@ impl EventSink for WebEventSink {
             session.pending_question = Some(PendingQuestionState {
                 question_id: question_id.clone(),
                 question: question.to_string(),
+                choices: choices.to_vec(),
                 responder: tx,
             });
             session.updated_at_ms = now_millis();
@@ -1168,6 +1176,7 @@ fn pending_question_view(pending: &PendingQuestionState) -> PendingQuestionView 
     PendingQuestionView {
         question_id: pending.question_id.clone(),
         question: pending.question.clone(),
+        choices: pending.choices.clone(),
     }
 }
 

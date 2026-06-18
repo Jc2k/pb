@@ -52,6 +52,8 @@ pub enum AgentEvent {
     UserQuestion {
         question_id: String,
         question: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -199,12 +201,14 @@ impl EventEnvelope {
             AgentEvent::UserQuestion {
                 question_id,
                 question,
+                choices,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::UserQuestion {
                     question_id,
                     question,
+                    choices,
                     timestamp_ms: Some(now),
                 },
             },

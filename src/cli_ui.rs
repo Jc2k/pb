@@ -29,8 +29,24 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::UserQuestion {
             question_id,
             question,
+            choices,
             ..
-        } => print_block(&format!("question {question_id}"), question),
+        } => {
+            let body = if choices.is_empty() {
+                question.clone()
+            } else {
+                format!(
+                    "{}\n{}",
+                    question,
+                    choices
+                        .iter()
+                        .map(|choice| format!("- {choice}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            print_block(&format!("question {question_id}"), &body);
+        }
         AgentEvent::UserAnswer {
             question_id,
             answer,

@@ -35,6 +35,7 @@ use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
 use crate::mcp::{self, McpToolRegistry};
+use crate::policy::{PolicyConfig, PolicyOutcome};
 use crate::session_store::now_millis;
 
 const LLAMA_BATCH_SIZE: usize = 512;
@@ -69,6 +70,23 @@ pub trait EventSink {
 
     fn ask_user(&mut self, _question: &str) -> Result<String> {
         bail!("ask_user is not available in this execution context")
+    }
+
+    fn ask_multiple_choice(&mut self, question: &str, choices: &[String]) -> Result<String> {
+        let prompt = if choices.is_empty() {
+            question.to_string()
+        } else {
+            format!(
+                "{}\n{}",
+                question,
+                choices
+                    .iter()
+                    .map(|choice| format!("- {choice}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        self.ask_user(&prompt)
     }
 }
 
@@ -627,6 +645,7 @@ pub fn run_agent<S: EventSink>(
         .context("failed to load project MCP config")?;
     let mcp_servers = mcp::effective_servers(&user_config.mcp, project_mcp_config.as_ref());
     let mcp_registry = mcp::discover_tools(mcp_servers);
+    let policy_config = PolicyConfig::load(&workspace_root)?.unwrap_or_default();
 
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
@@ -670,6 +689,7 @@ pub fn run_agent<S: EventSink>(
         env_config.as_ref(),
         &todo_memory,
         &mcp_registry,
+        &policy_config,
         0,
         &mut sink,
     )?;
@@ -1226,6 +1246,7 @@ fn run_agent_steps(
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
     mcp_registry: &McpToolRegistry,
+    policy_config: &PolicyConfig,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
@@ -1312,7 +1333,62 @@ fn run_agent_steps(
                     env_config,
                     todo_memory,
                     mcp_registry,
+                    policy_config,
                 };
+                let decision = policy_config.decide(args.profile, &tool, &arguments);
+                match decision.outcome {
+                    PolicyOutcome::Allow => {}
+                    PolicyOutcome::Deny => {
+                        let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
+                        let tool_result = format!("tool '{tool}' denied by policy rule '{rule}'");
+                        sink.emit(AgentEvent::ToolResult {
+                            tool: tool.clone(),
+                            result: tool_result.clone(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        messages.push(ChatMessage {
+                            role: "assistant",
+                            content: output,
+                        });
+                        messages.push(ChatMessage {
+                            role: "tool",
+                            content: format!("tool={tool}\nargs={arguments}\nresult={tool_result}"),
+                        });
+                        continue;
+                    }
+                    PolicyOutcome::Ask => {
+                        let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
+                        let question = decision.question.unwrap_or_else(|| format!("Policy rule '{rule}' requires approval before running {tool} with arguments {arguments}."));
+                        let choices = vec!["allow".to_string(), "deny".to_string()];
+                        let answer = sink
+                            .ask_multiple_choice(&question, &choices)?
+                            .trim()
+                            .to_ascii_lowercase();
+                        if answer != "allow" {
+                            let tool_result = format!(
+                                "tool '{tool}' was not approved by the user for policy rule '{rule}'"
+                            );
+                            sink.emit(AgentEvent::ToolResult {
+                                tool: tool.clone(),
+                                result: tool_result.clone(),
+                                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                timestamp_ms: Some(now_millis()),
+                            });
+                            messages.push(ChatMessage {
+                                role: "assistant",
+                                content: output,
+                            });
+                            messages.push(ChatMessage {
+                                role: "tool",
+                                content: format!(
+                                    "tool={tool}\nargs={arguments}\nresult={tool_result}"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
                 let tool_result = match run_tool(&tool, &arguments, &tool_context, sink) {
                     Ok(result) => result,
                     Err(error) => format_tool_error(&tool, &error),
@@ -1539,6 +1615,7 @@ struct ToolContext<'a> {
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
     mcp_registry: &'a McpToolRegistry,
+    policy_config: &'a PolicyConfig,
 }
 
 fn tool_result_limit(arguments: &Value, tool: &str, default_limit: usize) -> Result<usize> {
@@ -1982,6 +2059,10 @@ impl EventSink for SubAgentSink<'_> {
     fn ask_user(&mut self, question: &str) -> Result<String> {
         self.parent.ask_user(question)
     }
+
+    fn ask_multiple_choice(&mut self, question: &str, choices: &[String]) -> Result<String> {
+        self.parent.ask_multiple_choice(question, choices)
+    }
 }
 
 fn run_guard_commands(
@@ -2070,6 +2151,7 @@ fn run_sub_agent(
         context.env_config,
         context.todo_memory,
         context.mcp_registry,
+        context.policy_config,
         context.request.sub_agent_depth + 1,
         sink,
     )?;
