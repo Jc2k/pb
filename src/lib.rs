@@ -860,6 +860,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
                     }
                 }
                 session_store::SessionStatus::Completed => "completed",
+                session_store::SessionStatus::Failed => "failed",
             };
             let workdir = session.workdir.unwrap_or_else(|| "-".to_string());
             println!(

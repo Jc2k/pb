@@ -1387,9 +1387,15 @@ fn run_agent_steps(
         let action = match parse_action(&output) {
             Ok(action) => action,
             Err(e) => {
-                // We could push a chat bubble to the user here?
-                // But the LLM might want to speak for itself, so lets try without.
-
+                let parse_message = format!(
+                    "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {e}",
+                    max_steps = args.max_steps
+                );
+                sink.emit(AgentEvent::Error {
+                    message: parse_message,
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
                 messages.push(ChatMessage {
                     role: "assistant",
                     content: output,
@@ -1534,6 +1540,16 @@ fn run_agent_steps(
             }
         }
     }
+
+    let message = format!(
+        "The agent reached the step limit ({}) before producing a final response.",
+        args.max_steps
+    );
+    sink.emit(AgentEvent::Error {
+        message,
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
 
     Ok(StepRunOutcome {
         reached_final: false,

@@ -141,7 +141,7 @@ interface EventEnvelope {
   event: AgentEvent;
 }
 
-type SessionStatus = "queued" | "running" | "paused" | "completed";
+type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
 
 interface SessionItem {
   session_id: string;
@@ -1640,7 +1640,9 @@ function SessionPage() {
                       ? session.pending_question
                         ? "Waiting for answer"
                         : "Paused"
-                      : "Completed"}
+                      : session.status === "failed"
+                        ? "Failed"
+                        : "Completed"}
               </span>
               {session.updated_at_ms && (
                 <>
