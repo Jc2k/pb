@@ -73,7 +73,7 @@ jobs:
 
   release-macos-arm64:
     needs: semantic-release
-    if: needs.semantic-release.outputs.new_release_published == 'true'
+    if: needs['semantic-release'].outputs.new_release_published == 'true'
     runs-on: macos-14
     steps:
       - name: Checkout
@@ -100,7 +100,7 @@ jobs:
 
       - name: Update version in Cargo.toml
         run: |
-          sed -i '' "s/^version = \".*\"/version = \"${{ needs.semantic-release.outputs.new_release_version }}\"/" Cargo.toml
+          sed -i '' "s/^version = \".*\"/version = \"${{ needs['semantic-release'].outputs.new_release_version }}\"/" Cargo.toml
 
       - name: Build optimized macOS arm64 binary
         run: cargo build --release --target aarch64-apple-darwin
@@ -115,7 +115,7 @@ jobs:
       - name: Upload binary to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.semantic-release.outputs.new_release_version }}
+          tag_name: v${{ needs['semantic-release'].outputs.new_release_version }}
           files: dist/pb-aarch64-apple-darwin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
