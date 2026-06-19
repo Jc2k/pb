@@ -415,6 +415,13 @@ struct ChatMessage {
     content: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AgentToolCall {
+    tool: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentAction {
@@ -422,6 +429,11 @@ enum AgentAction {
         tool: String,
         #[serde(default)]
         arguments: Value,
+        #[serde(default)]
+        thinking: Option<String>,
+    },
+    ToolCalls {
+        calls: Vec<AgentToolCall>,
         #[serde(default)]
         thinking: Option<String>,
     },
@@ -788,6 +800,9 @@ fn build_agent_instructions(
     );
     instructions.push_str(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
+    );
+    instructions.push_str(
+        "When one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass.\n",
     );
     instructions.push_str(
         "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it.\n",
@@ -1362,6 +1377,19 @@ struct StepRunOutcome {
     final_content: Option<String>,
 }
 
+struct ToolExecutionEnv<'a> {
+    backend: &'a LlamaBackend,
+    model: &'a LlamaModel,
+    args: &'a AgentRequest,
+    workspace_root: &'a Path,
+    command_backend: Option<&'a CommandBackend>,
+    env_config: Option<&'a EnvironmentConfig>,
+    todo_memory: &'a RefCell<TodoMemory>,
+    mcp_registry: &'a McpToolRegistry,
+    policy_config: &'a PolicyConfig,
+    nesting_depth: usize,
+}
+
 fn run_agent_steps(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -1442,104 +1470,46 @@ fn run_agent_steps(
                 arguments,
                 thinking,
             } => {
-                if let Some(reasoning) = thinking {
-                    sink.emit(AgentEvent::Reasoning {
-                        content: reasoning,
-                        profile: args.profile,
-                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
-                }
-                sink.emit(AgentEvent::ToolCall {
-                    tool: tool.clone(),
-                    arguments: arguments.clone(),
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-                let tool_context = ToolContext {
-                    backend,
-                    model,
-                    request: args,
-                    workspace_root,
-                    command_backend,
-                    env_config,
-                    todo_memory,
-                    mcp_registry,
-                    policy_config,
-                };
-                let decision = policy_config.decide(args.profile, &tool, &arguments);
-                match decision.outcome {
-                    PolicyOutcome::Allow => {}
-                    PolicyOutcome::Deny => {
-                        let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
-                        let tool_result = format!("tool '{tool}' denied by policy rule '{rule}'");
-                        sink.emit(AgentEvent::ToolResult {
-                            tool: tool.clone(),
-                            result: tool_result.clone(),
-                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                            timestamp_ms: Some(now_millis()),
-                        });
-                        messages.push(ChatMessage {
-                            role: "assistant",
-                            content: output,
-                        });
-                        messages.push(ChatMessage {
-                            role: "tool",
-                            content: format!("tool={tool}\nargs={arguments}\nresult={tool_result}"),
-                        });
-                        continue;
-                    }
-                    PolicyOutcome::Ask => {
-                        let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
-                        let question = decision.question.unwrap_or_else(|| format!("Policy rule '{rule}' requires approval before running {tool} with arguments {arguments}."));
-                        let choices = vec!["allow".to_string(), "deny".to_string()];
-                        let answer = sink
-                            .ask_multiple_choice(&question, &choices)?
-                            .trim()
-                            .to_ascii_lowercase();
-                        if answer != "allow" {
-                            let tool_result = format!(
-                                "tool '{tool}' was not approved by the user for policy rule '{rule}'"
-                            );
-                            sink.emit(AgentEvent::ToolResult {
-                                tool: tool.clone(),
-                                result: tool_result.clone(),
-                                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                                timestamp_ms: Some(now_millis()),
-                            });
-                            messages.push(ChatMessage {
-                                role: "assistant",
-                                content: output,
-                            });
-                            messages.push(ChatMessage {
-                                role: "tool",
-                                content: format!(
-                                    "tool={tool}\nargs={arguments}\nresult={tool_result}"
-                                ),
-                            });
-                            continue;
-                        }
-                    }
-                }
-                let tool_result = match run_tool(&tool, &arguments, &tool_context, sink) {
-                    Ok(result) => result,
-                    Err(error) => format_tool_error(&tool, &error),
-                };
-                sink.emit(AgentEvent::ToolResult {
-                    tool: tool.clone(),
-                    result: tool_result.clone(),
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-
-                messages.push(ChatMessage {
-                    role: "assistant",
-                    content: output,
-                });
-                messages.push(ChatMessage {
-                    role: "tool",
-                    content: format!("tool={tool}\nargs={arguments}\nresult={tool_result}"),
-                });
+                execute_tool_calls(
+                    vec![AgentToolCall { tool, arguments }],
+                    thinking,
+                    &output,
+                    ToolExecutionEnv {
+                        backend,
+                        model,
+                        args,
+                        workspace_root,
+                        command_backend,
+                        env_config,
+                        todo_memory,
+                        mcp_registry,
+                        policy_config,
+                        nesting_depth,
+                    },
+                    messages,
+                    sink,
+                )?;
+            }
+            AgentAction::ToolCalls { calls, thinking } => {
+                execute_tool_calls(
+                    calls,
+                    thinking,
+                    &output,
+                    ToolExecutionEnv {
+                        backend,
+                        model,
+                        args,
+                        workspace_root,
+                        command_backend,
+                        env_config,
+                        todo_memory,
+                        mcp_registry,
+                        policy_config,
+                        nesting_depth,
+                    },
+                    messages,
+                    sink,
+                )?;
             }
         }
     }
@@ -1558,6 +1528,141 @@ fn run_agent_steps(
         reached_final: false,
         final_content: None,
     })
+}
+
+fn execute_tool_calls(
+    calls: Vec<AgentToolCall>,
+    thinking: Option<String>,
+    assistant_output: &str,
+    env: ToolExecutionEnv<'_>,
+    messages: &mut Vec<ChatMessage>,
+    sink: &mut dyn EventSink,
+) -> Result<()> {
+    if let Some(reasoning) = thinking {
+        sink.emit(AgentEvent::Reasoning {
+            content: reasoning,
+            profile: env.args.profile,
+            nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+
+    let mut runnable = Vec::new();
+    let mut results = Vec::new();
+    for call in calls {
+        sink.emit(AgentEvent::ToolCall {
+            tool: call.tool.clone(),
+            arguments: call.arguments.clone(),
+            nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+
+        let decision = env
+            .policy_config
+            .decide(env.args.profile, &call.tool, &call.arguments);
+        match decision.outcome {
+            PolicyOutcome::Allow => runnable.push(call),
+            PolicyOutcome::Deny => {
+                let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
+                results.push((
+                    call.tool,
+                    call.arguments,
+                    format!("tool denied by policy rule '{rule}'"),
+                ));
+            }
+            PolicyOutcome::Ask => {
+                let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
+                let question = decision.question.unwrap_or_else(|| {
+                    format!(
+                        "Policy rule '{rule}' requires approval before running {} with arguments {}.",
+                        call.tool, call.arguments
+                    )
+                });
+                let choices = vec!["allow".to_string(), "deny".to_string()];
+                let answer = sink
+                    .ask_multiple_choice(&question, &choices)?
+                    .trim()
+                    .to_ascii_lowercase();
+                if answer == "allow" {
+                    runnable.push(call);
+                } else {
+                    results.push((
+                        call.tool,
+                        call.arguments,
+                        format!("tool was not approved by the user for policy rule '{rule}'"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let tool_context = ToolContext {
+        backend: env.backend,
+        model: env.model,
+        request: env.args,
+        workspace_root: env.workspace_root,
+        command_backend: env.command_backend,
+        env_config: env.env_config,
+        todo_memory: env.todo_memory,
+        mcp_registry: env.mcp_registry,
+        policy_config: env.policy_config,
+    };
+
+    let all_mcp = !runnable.is_empty()
+        && runnable
+            .iter()
+            .all(|call| env.mcp_registry.tool(&call.tool).is_some());
+    if all_mcp && runnable.len() > 1 {
+        let registry = env.mcp_registry.clone();
+        let handles = runnable
+            .into_iter()
+            .map(|call| {
+                let registry = registry.clone();
+                std::thread::spawn(move || {
+                    let result = mcp::call_tool(&registry, &call.tool, &call.arguments)
+                        .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
+                    (call.tool, call.arguments, result)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            results.push(handle.join().unwrap_or_else(|_| {
+                (
+                    "unknown".to_string(),
+                    Value::Null,
+                    "tool thread panicked".to_string(),
+                )
+            }));
+        }
+    } else {
+        for call in runnable {
+            let result = run_tool(&call.tool, &call.arguments, &tool_context, sink)
+                .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
+            results.push((call.tool, call.arguments, result));
+        }
+    }
+
+    messages.push(ChatMessage {
+        role: "assistant",
+        content: assistant_output.to_string(),
+    });
+    let mut tool_message = String::new();
+    for (tool, arguments, result) in results {
+        sink.emit(AgentEvent::ToolResult {
+            tool: tool.clone(),
+            result: result.clone(),
+            nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        tool_message.push_str(&format!(
+            "tool={tool}\nargs={arguments}\nresult={result}\n\n"
+        ));
+    }
+    messages.push(ChatMessage {
+        role: "tool",
+        content: tool_message.trim_end().to_string(),
+    });
+    Ok(())
 }
 
 fn render_prompt(messages: &[ChatMessage]) -> String {
@@ -3618,6 +3723,22 @@ mod tests {
         };
         assert_eq!(tool, "git_revert");
         assert_eq!(arguments["commit"], "a707c16");
+    }
+
+    #[test]
+    fn parse_action_accepts_multiple_tool_calls() {
+        let output = r#"{"type":"tool_calls","calls":[{"tool":"read_file","arguments":{"path":"Cargo.toml"}},{"tool":"mcp_github_search","arguments":{"query":"pb"}}],"thinking":"I can gather both inputs now."}"#;
+        let action = parse_action(output).expect("tool_calls JSON action should parse");
+
+        let AgentAction::ToolCalls { calls, thinking } = action else {
+            panic!("expected tool_calls action");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+        assert_eq!(calls[1].tool, "mcp_github_search");
+        assert_eq!(calls[1].arguments["query"], "pb");
+        assert_eq!(thinking.as_deref(), Some("I can gather both inputs now."));
     }
 
     #[test]
