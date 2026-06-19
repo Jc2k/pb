@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::agent_core::AgentProfile;
+use crate::lsp::LspConfig;
 use crate::mcp::McpConfig;
 use crate::{
     DEFAULT_AGENT_MAX_STEPS, DEFAULT_AGENT_MAX_TOKENS, DEFAULT_MODEL, daemon_client,
@@ -17,6 +18,7 @@ pub struct UserConfig {
     pub web: WebConfig,
     pub model: ModelConfig,
     pub mcp: McpConfig,
+    pub lsp: LspConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -227,7 +229,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, and disabled fields. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, and disabled fields"
     )
 }
 

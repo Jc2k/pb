@@ -23,6 +23,7 @@ pub mod environment;
 pub mod events;
 mod github_oauth;
 pub mod init;
+pub mod lsp;
 pub mod mcp;
 pub mod policy;
 pub mod projects;
