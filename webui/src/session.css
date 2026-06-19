@@ -343,6 +343,38 @@ article.user div.message-container {
     transform: rotate(180deg);
 }
 
+.error-message {
+    padding-left: 78px;
+}
+
+.error-tool-bubble {
+    background: #fef2f2;
+    border-color: #fca5a5;
+}
+
+.error-strip {
+    color: #991b1b;
+}
+
+.error-strip .tool-names {
+    color: #b91c1c;
+}
+
+.error-strip .bi-exclamation-triangle-fill {
+    color: var(--bs-danger);
+}
+
+.error-detail {
+    padding: 0.75rem 0 0.25rem;
+    color: #7f1d1d;
+}
+
+.error-detail strong {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-size: 0.82rem;
+}
+
 .tool-list {
     padding: 0.65rem 0 0.15rem;
     display: grid;

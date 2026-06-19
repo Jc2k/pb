@@ -122,6 +122,7 @@ pub struct StatusResponse {
     pub queued_sessions: usize,
     pub paused_sessions: usize,
     pub completed_sessions: usize,
+    pub failed_sessions: usize,
     pub total_sessions: usize,
 }
 
@@ -695,12 +696,17 @@ async fn status(
         .values()
         .filter(|session| session.status == SessionStatus::Completed)
         .count();
+    let failed_sessions = sessions
+        .values()
+        .filter(|session| session.status == SessionStatus::Failed)
+        .count();
     Json(StatusResponse {
         busy: running_sessions > 0,
         running_sessions,
         queued_sessions,
         paused_sessions,
         completed_sessions,
+        failed_sessions,
         total_sessions: sessions.len(),
     })
 }
@@ -911,15 +917,19 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         if let Some(session) = sessions.get_mut(&session_id) {
             session.running = false;
             session.paused = false;
-            session.status = SessionStatus::Completed;
             session.pending_question = None;
             session.updated_at_ms = now_millis();
+            let mut final_status = SessionStatus::Completed;
             match result {
                 Ok(Ok(run_result)) => {
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.workspace_root);
+                    if !run_result.reached_final {
+                        final_status = SessionStatus::Failed;
+                    }
                 }
                 Ok(Err(err)) => {
+                    final_status = SessionStatus::Failed;
                     publish_event(
                         &session.sender,
                         &session.history,
@@ -931,6 +941,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     );
                 }
                 Err(err) => {
+                    final_status = SessionStatus::Failed;
                     publish_event(
                         &session.sender,
                         &session.history,
@@ -942,12 +953,13 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     );
                 }
             }
+            session.status = final_status;
             persist_session_snapshot(
                 &session_id,
                 &session.request_template,
                 session.branch.clone(),
                 session.workdir.clone(),
-                SessionStatus::Completed,
+                final_status,
                 &session.history,
             );
         }

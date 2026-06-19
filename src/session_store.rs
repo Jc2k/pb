@@ -20,6 +20,7 @@ pub enum SessionStatus {
     Running,
     Paused,
     Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +135,7 @@ fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSessio
                             SessionStatus::Paused
                         }
                         SessionStatus::Completed => SessionStatus::Completed,
+                        SessionStatus::Failed => SessionStatus::Failed,
                     },
                 );
                 session.running = false;

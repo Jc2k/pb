@@ -133,7 +133,13 @@ type AgentEvent =
       nesting_depth?: number;
       timestamp_ms?: number;
     }
-  | { type: "error"; message: string; nesting_depth?: number; timestamp_ms?: number }
+  | {
+      type: "error";
+      message: string;
+      summary?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
   | { type: string; [key: string]: unknown };
 
 interface EventEnvelope {
@@ -141,7 +147,7 @@ interface EventEnvelope {
   event: AgentEvent;
 }
 
-type SessionStatus = "queued" | "running" | "paused" | "completed";
+type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
 
 interface SessionItem {
   session_id: string;
@@ -800,6 +806,55 @@ function profileJobTitle(profile: string): string {
   }
 }
 
+function errorSummary(event: Extract<AgentEvent, { type: "error" }>): string {
+  const summary = event.summary?.trim();
+  if (summary) return summary;
+
+  const message = String(event.message || "").trim();
+  const firstLine = message.split("\n").find((line) => line.trim())?.trim();
+  if (!firstLine) return "Agent error";
+  return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
+}
+
+function ErrorEventBubble({
+  event,
+}: {
+  event: Extract<AgentEvent, { type: "error" }>;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const summary = errorSummary(event);
+  const detail = String(event.message || "").trim() || "No error details provided.";
+  const hasDetail = detail !== summary;
+
+  return (
+    <article className="message-row compact tool-message error-message">
+      <div className="bubble thought-bubble error-tool-bubble">
+        <button
+          className={`tool-strip error-strip${isOpen ? "" : " collapsed"}`}
+          onClick={() => setIsOpen(!isOpen)}
+          aria-expanded={isOpen}
+          type="button"
+        >
+          <span>
+            <i className="bi bi-exclamation-triangle-fill"></i> Error
+          </span>
+          <span className="tool-names">{summary}</span>
+          <i
+            className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
+            aria-hidden="true"
+          ></i>
+        </button>
+        <div className={`collapse${isOpen ? " show" : ""}`}>
+          <div className="error-detail">
+            {hasDetail ? <strong>{summary}</strong> : null}
+            <pre className="mb-0 small result-pre">{detail}</pre>
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
 
@@ -1035,20 +1090,7 @@ function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
       );
 
     case "error":
-      return (
-        <article className="message-row assistant-message compact">
-          <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
-          </div>
-          <div
-            className="bubble thought-bubble"
-            style={{ border: "1px solid #fda4af", background: "#fef2f2" }}
-          >
-            <p>Error</p>
-            <pre className="mb-0 small result-pre">{String(e.message)}</pre>
-          </div>
-        </article>
-      );
+      return <ErrorEventBubble event={e} />;
 
     default:
       return null;
@@ -1640,7 +1682,9 @@ function SessionPage() {
                       ? session.pending_question
                         ? "Waiting for answer"
                         : "Paused"
-                      : "Completed"}
+                      : session.status === "failed"
+                        ? "Failed"
+                        : "Completed"}
               </span>
               {session.updated_at_ms && (
                 <>
