@@ -4077,6 +4077,7 @@ mod tests {
                 true,
                 false,
                 &McpToolRegistry::default(),
+                &LspToolRegistry::default(),
             )
             .unwrap();
             assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
