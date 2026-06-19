@@ -1,4 +1,4 @@
-//! MCP server configuration and stdio client support.
+//! MCP server configuration and stdio/http client support.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -23,6 +24,9 @@ pub struct McpConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {
     pub command: Option<String>,
+    pub url: Option<String>,
+    pub container_image: Option<String>,
+    pub container_runtime: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub working_directory: Option<PathBuf>,
@@ -44,10 +48,11 @@ pub struct McpToolSpec {
     pub input_schema: Value,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct McpToolRegistry {
     pub servers: BTreeMap<String, McpServerConfig>,
     pub tools: BTreeMap<String, McpToolSpec>,
+    sessions: BTreeMap<String, Arc<Mutex<McpClient>>>,
 }
 
 impl McpToolRegistry {
@@ -105,10 +110,15 @@ pub fn effective_servers(
         .into_iter()
         .filter(|(_, config)| {
             !config.disabled
-                && config
+                && (config
                     .command
                     .as_deref()
                     .is_some_and(|c| !c.trim().is_empty())
+                    || config.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+                    || config
+                        .container_image
+                        .as_deref()
+                        .is_some_and(|i| !i.trim().is_empty()))
         })
         .collect()
 }
@@ -117,12 +127,17 @@ pub fn discover_tools(servers: BTreeMap<String, McpServerConfig>) -> McpToolRegi
     let mut registry = McpToolRegistry {
         servers: servers.clone(),
         tools: BTreeMap::new(),
+        sessions: BTreeMap::new(),
     };
     for (server_name, server_config) in servers {
-        match McpClient::connect(&server_name, &server_config)
-            .and_then(|mut client| client.list_tools())
-        {
-            Ok(server_tools) => {
+        match McpClient::connect(&server_name, &server_config).and_then(|mut client| {
+            let tools = client.list_tools()?;
+            Ok((client, tools))
+        }) {
+            Ok((client, server_tools)) => {
+                registry
+                    .sessions
+                    .insert(server_name.clone(), Arc::new(Mutex::new(client)));
                 for tool in server_tools {
                     let unique_name = unique_tool_name(&server_name, &tool.name);
                     registry.tools.insert(
@@ -174,6 +189,12 @@ pub fn call_tool(registry: &McpToolRegistry, tool_name: &str, arguments: &Value)
     if spec.server_tool_name == "status" {
         bail!(spec.description.clone());
     }
+    if let Some(session) = registry.sessions.get(&spec.server_name) {
+        let mut client = session
+            .lock()
+            .map_err(|_| anyhow!("MCP session for {} is poisoned", spec.server_name))?;
+        return client.call_tool(&spec.server_tool_name, arguments);
+    }
     let mut client = McpClient::connect(&spec.server_name, server)?;
     client.call_tool(&spec.server_tool_name, arguments)
 }
@@ -222,46 +243,20 @@ struct ServerTool {
     input_schema: Option<Value>,
 }
 
-struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
+enum McpClient {
+    Stdio(StdioMcpClient),
+    Http(HttpMcpClient),
 }
 
 impl McpClient {
     fn connect(server_name: &str, config: &McpServerConfig) -> Result<Self> {
-        let command = config
-            .command
-            .as_deref()
-            .with_context(|| format!("MCP server {server_name} has no command"))?;
-        let mut command_builder = Command::new(command);
-        command_builder.args(&config.args);
-        if let Some(cwd) = &config.working_directory {
-            command_builder.current_dir(cwd);
+        if let Some(url) = config.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            let mut client = Self::Http(HttpMcpClient::new(url.trim().to_string())?);
+            client.initialize(server_name)?;
+            return Ok(client);
         }
-        command_builder.envs(&config.env);
-        command_builder
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command_builder
-            .spawn()
-            .with_context(|| format!("failed to start MCP server {server_name}: {command}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("failed to open MCP server stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("failed to open MCP server stdout")?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 1,
-        };
+
+        let mut client = Self::Stdio(StdioMcpClient::spawn(server_name, config)?);
         client.initialize(server_name)?;
         Ok(client)
     }
@@ -298,6 +293,60 @@ impl McpClient {
             }),
         )?;
         Ok(format_tool_result(&result))
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Self::Stdio(client) => client.request(method, params),
+            Self::Http(client) => client.request(method, params),
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        match self {
+            Self::Stdio(client) => client.notify(method, params),
+            Self::Http(client) => client.notify(method, params),
+        }
+    }
+}
+
+struct StdioMcpClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl StdioMcpClient {
+    fn spawn(server_name: &str, config: &McpServerConfig) -> Result<Self> {
+        let (command, args) = stdio_command(server_name, config)?;
+        let mut command_builder = Command::new(&command);
+        command_builder.args(&args);
+        if let Some(cwd) = &config.working_directory {
+            command_builder.current_dir(cwd);
+        }
+        command_builder.envs(&config.env);
+        command_builder
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command_builder
+            .spawn()
+            .with_context(|| format!("failed to start MCP server {server_name}: {command}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("failed to open MCP server stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to open MCP server stdout")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+        })
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -376,11 +425,111 @@ impl McpClient {
     }
 }
 
-impl Drop for McpClient {
+impl Drop for StdioMcpClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+struct HttpMcpClient {
+    url: String,
+    client: reqwest::blocking::Client,
+    next_id: u64,
+}
+
+impl HttpMcpClient {
+    fn new(url: String) -> Result<Self> {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            bail!("MCP http url must start with http:// or https://");
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(MCP_READ_TIMEOUT)
+            .build()
+            .context("failed to build MCP HTTP client")?;
+        Ok(Self {
+            url,
+            client,
+            next_id: 1,
+        })
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self
+            .post(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))?
+            .context("MCP HTTP request did not return a JSON-RPC response")?;
+        if response.get("id").and_then(Value::as_u64) != Some(id) {
+            bail!("MCP HTTP response id did not match request id for {method}");
+        }
+        if let Some(error) = response.get("error") {
+            bail!("MCP request {method} failed: {error}");
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        let _ = self.post(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))?;
+        Ok(())
+    }
+
+    fn post(&self, message: Value) -> Result<Option<Value>> {
+        let response = self
+            .client
+            .post(&self.url)
+            .header("accept", "application/json, text/event-stream")
+            .json(&message)
+            .send()
+            .with_context(|| format!("failed to send MCP HTTP request to {}", self.url))?
+            .error_for_status()
+            .with_context(|| format!("MCP HTTP request to {} failed", self.url))?;
+        if response.status() == reqwest::StatusCode::ACCEPTED
+            || response.content_length() == Some(0)
+        {
+            return Ok(None);
+        }
+        response
+            .json()
+            .map(Some)
+            .context("failed to parse MCP HTTP JSON response")
+    }
+}
+
+fn stdio_command(server_name: &str, config: &McpServerConfig) -> Result<(String, Vec<String>)> {
+    if let Some(image) = config
+        .container_image
+        .as_deref()
+        .filter(|i| !i.trim().is_empty())
+    {
+        let runtime = config
+            .container_runtime
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or("docker");
+        let mut args = vec!["run".to_string(), "-i".to_string(), "--rm".to_string()];
+        for key in config.env.keys() {
+            args.push("-e".to_string());
+            args.push(key.clone());
+        }
+        args.push(image.trim().to_string());
+        args.extend(config.args.clone());
+        return Ok((runtime.to_string(), args));
+    }
+
+    let command = config.command.as_deref().with_context(|| {
+        format!("MCP server {server_name} has no command, url, or container_image")
+    })?;
+    Ok((command.to_string(), config.args.clone()))
 }
 
 fn format_tool_result(result: &Value) -> String {
@@ -419,6 +568,7 @@ mod tests {
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 working_directory: Some(PathBuf::from("tools")),
                 disabled: false,
+                ..Default::default()
             },
         );
         config.save(dir.path()).unwrap();
@@ -474,6 +624,67 @@ mod tests {
             Some("project-docs")
         );
         assert!(!effective.contains_key("github"));
+    }
+
+    #[test]
+    fn effective_servers_keeps_http_and_container_transports() {
+        let global = McpConfig {
+            servers: BTreeMap::from([
+                (
+                    "remote".to_string(),
+                    McpServerConfig {
+                        url: Some("https://mcp.example.test".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "boxed".to_string(),
+                    McpServerConfig {
+                        container_image: Some("ghcr.io/example/mcp:latest".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        };
+        let effective = effective_servers(&global, None);
+        assert_eq!(effective.len(), 2);
+        assert_eq!(
+            effective
+                .get("remote")
+                .and_then(|server| server.url.as_deref()),
+            Some("https://mcp.example.test")
+        );
+        assert_eq!(
+            effective
+                .get("boxed")
+                .and_then(|server| server.container_image.as_deref()),
+            Some("ghcr.io/example/mcp:latest")
+        );
+    }
+
+    #[test]
+    fn container_stdio_command_uses_runtime_run_i_rm() {
+        let config = McpServerConfig {
+            container_image: Some("ghcr.io/example/mcp:latest".to_string()),
+            container_runtime: Some("podman".to_string()),
+            args: vec!["--flag".to_string()],
+            env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            ..Default::default()
+        };
+        let (command, args) = stdio_command("boxed", &config).unwrap();
+        assert_eq!(command, "podman");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "-e",
+                "TOKEN",
+                "ghcr.io/example/mcp:latest",
+                "--flag"
+            ]
+        );
     }
 
     #[test]
