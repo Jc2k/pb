@@ -51,6 +51,9 @@ const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
+const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
+const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
+const MAX_TOKEN_RETRY_CAP: i32 = 8192;
 
 fn suppress_llama_logs() {
     static LLAMA_LOGS_SUPPRESSED: OnceLock<()> = OnceLock::new();
@@ -140,7 +143,7 @@ pub fn infer_agent_profile(
     inference_args.top_k = 1;
 
     let prompt = profile_inference_prompt(task);
-    let output = generate_completion(backend, model, &inference_args, &prompt)?;
+    let output = generate_completion(backend, model, &inference_args, &prompt)?.content;
     parse_inferred_agent_profile(&output)
         .with_context(|| format!("failed to infer an agent profile from model output: {output}"))
 }
@@ -1382,13 +1385,13 @@ fn run_agent_steps(
         });
 
         let prompt = render_prompt(messages);
-        let output = generate_completion(backend, model, args, &prompt)?;
-
-        let action = match parse_action(&output) {
-            Ok(action) => action,
-            Err(e) => {
+        let (output, action) = match generate_and_parse_action_with_retries(
+            backend, model, args, &prompt, step,
+        )? {
+            Ok(parsed) => parsed,
+            Err(ParseFailure { output, error }) => {
                 let parse_message = format!(
-                    "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {e}",
+                    "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {error}",
                     max_steps = args.max_steps
                 );
                 sink.emit(AgentEvent::Error {
@@ -1402,7 +1405,7 @@ fn run_agent_steps(
                 });
 
                 let error_msg = format!(
-                    "JSON parsing error: {e}\n\nPlease fix the JSON structure and try again."
+                    "JSON parsing error: {error}\n\nPlease fix the JSON structure and try again."
                 );
                 messages.push(ChatMessage {
                     role: "tool",
@@ -1571,12 +1574,82 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+struct ParseFailure {
+    output: String,
+    error: anyhow::Error,
+}
+
+struct CompletionOutput {
+    content: String,
+    finish_reason: CompletionFinishReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionFinishReason {
+    EndOfGeneration,
+    MaxTokens,
+}
+
+fn generate_and_parse_action_with_retries(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    args: &AgentRequest,
+    prompt: &str,
+    step: usize,
+) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
+    let mut max_tokens = boosted_max_tokens(args);
+
+    loop {
+        let mut request = args.clone();
+        request.max_tokens = max_tokens;
+        let completion = generate_completion(backend, model, &request, prompt)?;
+        match parse_action(&completion.content) {
+            Ok(action) => return Ok(Ok((completion.content, action))),
+            Err(error) => {
+                let ran_out_of_tokens =
+                    completion.finish_reason == CompletionFinishReason::MaxTokens;
+                let failure = ParseFailure {
+                    output: completion.content,
+                    error,
+                };
+                if !ran_out_of_tokens {
+                    return Ok(Err(failure));
+                }
+
+                let next_max_tokens = next_retry_max_tokens(max_tokens);
+                if next_max_tokens <= max_tokens {
+                    return Ok(Err(failure));
+                }
+                tracing::warn!(
+                    step,
+                    max_tokens,
+                    next_max_tokens,
+                    "retrying model turn with a larger max token cap after truncated unparsable output"
+                );
+                max_tokens = next_max_tokens;
+            }
+        }
+    }
+}
+
+fn boosted_max_tokens(args: &AgentRequest) -> i32 {
+    let profile_floor = match args.profile {
+        AgentProfile::Research => RESEARCH_TURN_MAX_TOKENS,
+        _ => DEFAULT_TURN_MAX_TOKENS,
+    };
+    args.max_tokens.max(profile_floor)
+}
+
+fn next_retry_max_tokens(current: i32) -> i32 {
+    current.saturating_mul(2).min(MAX_TOKEN_RETRY_CAP)
+}
+
 fn generate_completion(
     backend: &LlamaBackend,
     model: &LlamaModel,
     args: &AgentRequest,
     prompt: &str,
-) -> Result<String> {
+) -> Result<CompletionOutput> {
     let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
     let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
     if let Some(threads) = args.threads {
@@ -1631,11 +1704,13 @@ fn generate_completion(
     let mut n_cur = i32::try_from(tokens.len()).context("prompt token count exceeds i32::MAX")?;
     let mut generated_tokens = 0;
 
+    let mut finish_reason = CompletionFinishReason::MaxTokens;
     while generated_tokens < args.max_tokens {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
         if model.is_eog_token(token) {
+            finish_reason = CompletionFinishReason::EndOfGeneration;
             break;
         }
 
@@ -1654,7 +1729,10 @@ fn generate_completion(
         generated_tokens += 1;
     }
 
-    Ok(output)
+    Ok(CompletionOutput {
+        content: output,
+        finish_reason,
+    })
 }
 
 fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {
@@ -3495,6 +3573,31 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
 mod tests {
     use super::*;
 
+    fn test_agent_request(profile: AgentProfile, max_tokens: i32) -> AgentRequest {
+        AgentRequest {
+            task: "test".to_string(),
+            model: "model.gguf".to_string(),
+            model_dir: None,
+            workdir: None,
+            branch: None,
+            max_steps: 10,
+            max_tokens,
+            ctx_size: 4096,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            temperature: 0.7,
+            profile,
+            infer_profile: false,
+            sub_agent_depth: 0,
+            repository_less: false,
+            top_k: 40,
+            seed: 42,
+            environment: None,
+            session_id: "session-123".to_string(),
+        }
+    }
+
     #[test]
     fn extract_json_object_handles_noise() {
         let output = "hello {\"type\":\"final\",\"content\":\"ok\"} trailing";
@@ -3538,6 +3641,31 @@ mod tests {
 
         assert!(err.contains("prompt is too long"), "error was: {err}");
         assert!(err.contains("--ctx-size"), "error was: {err}");
+    }
+
+    #[test]
+    fn boosted_max_tokens_applies_general_floor() {
+        let mut args = test_agent_request(AgentProfile::Ask, 384);
+        assert_eq!(boosted_max_tokens(&args), DEFAULT_TURN_MAX_TOKENS);
+
+        args.max_tokens = 3_000;
+        assert_eq!(boosted_max_tokens(&args), 3_000);
+    }
+
+    #[test]
+    fn boosted_max_tokens_applies_research_floor() {
+        let args = test_agent_request(AgentProfile::Research, 384);
+        assert_eq!(boosted_max_tokens(&args), RESEARCH_TURN_MAX_TOKENS);
+    }
+
+    #[test]
+    fn next_retry_max_tokens_doubles_until_hard_cap() {
+        assert_eq!(next_retry_max_tokens(2_048), 4_096);
+        assert_eq!(next_retry_max_tokens(4_096), MAX_TOKEN_RETRY_CAP);
+        assert_eq!(
+            next_retry_max_tokens(MAX_TOKEN_RETRY_CAP),
+            MAX_TOKEN_RETRY_CAP
+        );
     }
 
     #[test]

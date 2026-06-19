@@ -38,7 +38,7 @@ const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
 const PROGRESS_TICK_MS: u64 = 120;
 pub const DEFAULT_AGENT_MAX_STEPS: usize = 12;
-pub const DEFAULT_AGENT_MAX_TOKENS: i32 = 384;
+pub const DEFAULT_AGENT_MAX_TOKENS: i32 = 2048;
 const GPU_FULL_OFFLOAD: u32 = 999;
 
 #[derive(Parser, Debug)]
