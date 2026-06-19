@@ -34,6 +34,7 @@ use std::time::Duration;
 use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
+use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::policy::{PolicyConfig, PolicyOutcome};
 use crate::session_store::now_millis;
@@ -701,6 +702,17 @@ pub fn run_agent<S: EventSink>(
     } else {
         mcp::discover_tools(mcp_servers)
     };
+    let project_lsp_config = if args.repository_less {
+        None
+    } else {
+        lsp::ProjectLspConfig::load(&workspace_root).context("failed to load project LSP config")?
+    };
+    let lsp_servers = lsp::effective_servers(&user_config.lsp, project_lsp_config.as_ref());
+    let lsp_registry = if args.repository_less {
+        LspToolRegistry::default()
+    } else {
+        lsp::discover_tools(lsp_servers, &workspace_root)
+    };
     let policy_config = if args.repository_less {
         PolicyConfig::default()
     } else {
@@ -725,6 +737,7 @@ pub fn run_agent<S: EventSink>(
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
         &mcp_registry,
+        &lsp_registry,
     )?;
 
     let todo_memory = RefCell::new(TodoMemory::default());
@@ -750,6 +763,7 @@ pub fn run_agent<S: EventSink>(
         env_config.as_ref(),
         &todo_memory,
         &mcp_registry,
+        &lsp_registry,
         &policy_config,
         0,
         &mut sink,
@@ -794,6 +808,7 @@ fn build_agent_instructions(
     allow_sub_agents: bool,
     repository_less: bool,
     mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
 ) -> Result<String> {
     let mut instructions = String::from(
         "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
@@ -828,6 +843,7 @@ fn build_agent_instructions(
         allow_sub_agents,
         repository_less,
         mcp_registry,
+        lsp_registry,
     );
     let available_tool_signatures = available_tool_signatures(
         profile,
@@ -835,6 +851,7 @@ fn build_agent_instructions(
         allow_sub_agents,
         repository_less,
         mcp_registry,
+        lsp_registry,
     );
     let tool_schema_json = serde_json::to_string_pretty(&available_tools)
         .context("failed to serialize tool schemas")?;
@@ -868,6 +885,11 @@ fn build_agent_instructions(
     if !mcp_registry.is_empty() {
         instructions.push_str(
             "Configured MCP tools are exposed with mcp_<server>_<tool> names. Use them when they are the most direct way to access configured external context or services.\n",
+        );
+    }
+    if !lsp_registry.is_empty() {
+        instructions.push_str(
+            "Configured LSP tools are exposed with lsp_<server>_<operation> names for hover, definition, references, document symbols, workspace symbols, and diagnostics. Use them for code intelligence when they are more precise than text search. Containerized LSPs see the project at the same absolute path as the coding agent.\n",
         );
     }
     instructions.push_str(
@@ -952,6 +974,7 @@ fn available_tool_specs(
     allow_sub_agents: bool,
     repository_less: bool,
     mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
 ) -> Vec<BuiltInToolSchema> {
     let mut tools: Vec<_> = all_builtin_tool_specs()
         .into_iter()
@@ -973,6 +996,11 @@ fn available_tool_specs(
         ),
         input_schema: tool.input_schema.clone(),
     }));
+    tools.extend(lsp_registry.tools.values().map(|tool| BuiltInToolSchema {
+        name: tool.tool_name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+    }));
     tools
 }
 
@@ -982,6 +1010,7 @@ fn available_tool_signatures(
     allow_sub_agents: bool,
     repository_less: bool,
     mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
 ) -> Vec<String> {
     available_tool_specs(
         profile,
@@ -989,6 +1018,7 @@ fn available_tool_signatures(
         allow_sub_agents,
         repository_less,
         mcp_registry,
+        lsp_registry,
     )
     .into_iter()
     .map(|tool| tool.signature())
@@ -1386,6 +1416,7 @@ struct ToolExecutionEnv<'a> {
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
     mcp_registry: &'a McpToolRegistry,
+    lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
     nesting_depth: usize,
 }
@@ -1400,6 +1431,7 @@ fn run_agent_steps(
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
     mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
     policy_config: &PolicyConfig,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
@@ -1483,6 +1515,7 @@ fn run_agent_steps(
                         env_config,
                         todo_memory,
                         mcp_registry,
+                        lsp_registry,
                         policy_config,
                         nesting_depth,
                     },
@@ -1504,6 +1537,7 @@ fn run_agent_steps(
                         env_config,
                         todo_memory,
                         mcp_registry,
+                        lsp_registry,
                         policy_config,
                         nesting_depth,
                     },
@@ -1605,6 +1639,7 @@ fn execute_tool_calls(
         env_config: env.env_config,
         todo_memory: env.todo_memory,
         mcp_registry: env.mcp_registry,
+        lsp_registry: env.lsp_registry,
         policy_config: env.policy_config,
     };
 
@@ -1937,6 +1972,7 @@ struct ToolContext<'a> {
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
     mcp_registry: &'a McpToolRegistry,
+    lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
 }
 
@@ -2072,6 +2108,14 @@ fn run_tool(
 ) -> Result<String> {
     if context.mcp_registry.tool(tool).is_some() {
         return mcp::call_tool(context.mcp_registry, tool, arguments);
+    }
+    if context.lsp_registry.tool(tool).is_some() {
+        return lsp::call_tool(
+            context.lsp_registry,
+            context.workspace_root,
+            tool,
+            arguments,
+        );
     }
     if !tool_allowed(
         tool,
@@ -2429,6 +2473,7 @@ fn run_sub_agent(
         false,
         context.request.repository_less,
         context.mcp_registry,
+        context.lsp_registry,
     )?;
     let mut messages = vec![
         ChatMessage {
@@ -2458,6 +2503,7 @@ fn run_sub_agent(
         context.env_config,
         context.todo_memory,
         context.mcp_registry,
+        context.lsp_registry,
         context.policy_config,
         context.request.sub_agent_depth + 1,
         sink,
@@ -3851,6 +3897,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("run_command(cmd)"));
@@ -3870,6 +3917,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: build"));
@@ -3901,6 +3949,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Tool schemas use the MCP tool shape"));
@@ -3918,6 +3967,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         );
         let ask_user = specs
             .iter()
@@ -3958,6 +4008,7 @@ mod tests {
             false,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         );
         assert!(review_tools.iter().any(|tool| tool.name == "read_file"));
         assert!(!review_tools.iter().any(|tool| tool.name == "edit_file"));
@@ -3969,6 +4020,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         );
         let run_command = build_tools
             .iter()
@@ -3992,6 +4044,7 @@ mod tests {
             false,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: review"));
@@ -4045,6 +4098,7 @@ mod tests {
             true,
             false,
             &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
         )
         .unwrap();
         assert!(instructions.contains("Profile: research"));
