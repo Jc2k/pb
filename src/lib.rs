@@ -692,6 +692,7 @@ fn github_mcp_server_config(runtime: &str, token_path: &Path) -> McpServerConfig
         env: Default::default(),
         working_directory: None,
         disabled: false,
+        ..Default::default()
     }
 }
 
