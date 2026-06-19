@@ -50,6 +50,7 @@ const MAX_SKILL_TEXT_CHARS: usize = 40_000;
 const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
+const MAX_PARSE_REPAIR_ATTEMPTS: usize = 2;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
 
 fn suppress_llama_logs() {
@@ -1381,35 +1382,42 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        let prompt = render_prompt(messages);
-        let output = generate_completion(backend, model, args, &prompt)?;
+        let (action, output) = {
+            let mut repair_attempt = 0usize;
+            loop {
+                let prompt = render_prompt(messages);
+                let output = generate_completion(backend, model, args, &prompt)?;
 
-        let action = match parse_action(&output) {
-            Ok(action) => action,
-            Err(e) => {
-                let parse_message = format!(
-                    "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {e}",
-                    max_steps = args.max_steps
-                );
-                sink.emit(AgentEvent::Error {
-                    message: parse_message,
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-                messages.push(ChatMessage {
-                    role: "assistant",
-                    content: output,
-                });
+                match parse_action(&output) {
+                    Ok(action) => break (action, output),
+                    Err(e) => {
+                        repair_attempt += 1;
+                        let parse_message = format!(
+                            "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps} (repair attempt {repair_attempt}/{max_attempts}): {e}",
+                            max_steps = args.max_steps,
+                            max_attempts = MAX_PARSE_REPAIR_ATTEMPTS
+                        );
+                        sink.emit(AgentEvent::Error {
+                            message: parse_message,
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
 
-                let error_msg = format!(
-                    "JSON parsing error: {e}\n\nPlease fix the JSON structure and try again."
-                );
-                messages.push(ChatMessage {
-                    role: "tool",
-                    content: error_msg,
-                });
+                        if repair_attempt >= MAX_PARSE_REPAIR_ATTEMPTS {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "model returned unparsable pb JSON action after {repair_attempt} repair attempts on step {step}/{}",
+                                    args.max_steps
+                                )
+                            });
+                        }
 
-                continue;
+                        messages.push(ChatMessage {
+                            role: "user",
+                            content: parse_repair_message(&output, &e),
+                        });
+                    }
+                }
             }
         };
 
@@ -1555,6 +1563,12 @@ fn run_agent_steps(
         reached_final: false,
         final_content: None,
     })
+}
+
+fn parse_repair_message(output: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Your previous response was not a valid pb JSON action and was not executed. Error: {error:#}\n\nRespond now with exactly one JSON object and nothing else. Use either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{}},\"thinking\":\"...\"}} or {{\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"}}. Do not repeat the malformed response.\n\nMalformed response:\n```\n{output}\n```"
+    )
 }
 
 fn render_prompt(messages: &[ChatMessage]) -> String {
@@ -3515,6 +3529,17 @@ mod tests {
         };
         assert_eq!(tool, "git_revert");
         assert_eq!(arguments["commit"], "a707c16");
+    }
+
+    #[test]
+    fn parse_repair_message_is_user_actionable() {
+        let err = parse_action("not json").expect_err("output should fail to parse");
+        let message = parse_repair_message("not json", &err);
+
+        assert!(message.contains("was not executed"));
+        assert!(message.contains("Respond now with exactly one JSON object"));
+        assert!(message.contains("Do not repeat the malformed response"));
+        assert!(message.contains("not json"));
     }
 
     #[test]
