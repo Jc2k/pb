@@ -1035,6 +1035,7 @@ impl BuiltInToolSchema {
             "web_search" => "web_search(query)",
             "web_fetch" => "web_fetch(url)",
             "git_log" => "git_log()",
+            "session_changes" => "session_changes(path,commits,max_results)",
             "todo" => "todo(action,id,title,description,status,parent_id,note)",
             "skill_search" => "skill_search(query,max_results)",
             "skill" => "skill(name)",
@@ -1132,6 +1133,27 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
             "git_log",
             "Show recent commits in the project repository.",
             object_schema([], []),
+        ),
+        builtin_tool(
+            "session_changes",
+            "Investigate recent LLM sessions and their git changes. Use this when the user refers to the last session, recent changes, or a feature/file that recently broke. Returns compact session summaries, touched files, commits, diff stats, and optional file git history without dumping full diffs by default.",
+            object_schema(
+                [
+                    string_property(
+                        "path",
+                        "Optional project-relative file path to focus on. Includes recent git log entries for the file and prioritizes sessions whose summaries/diffs mention it.",
+                    ),
+                    string_property(
+                        "commits",
+                        "Optional git revision range (for example main..HEAD or abc123..def456) to correlate against session summaries.",
+                    ),
+                    integer_property(
+                        "max_results",
+                        "Maximum number of sessions and commits to return.",
+                    ),
+                ],
+                [],
+            ),
         ),
         builtin_tool(
             "todo",
@@ -1390,7 +1412,7 @@ fn tool_allowed(
     }
     match tool {
         "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
-        | "todo" | "skill_search" | "skill" => true,
+        | "session_changes" | "todo" | "skill_search" | "skill" => true,
         "ask_user" => profile == AgentProfile::Plan,
         "run_command" => command_backend_kind.is_some(),
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
@@ -2340,6 +2362,7 @@ fn run_tool(
                 Ok(log)
             }
         }
+        "session_changes" => run_session_changes(arguments, workspace_root),
         "todo" => run_todo_tool(arguments, context.todo_memory),
         "git_revert" => {
             let commit = arguments
@@ -3653,6 +3676,184 @@ fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
 
 fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
     git_run(&["log", "--oneline", &format!("-{n}")], workdir)
+}
+
+fn run_session_changes(arguments: &Value, workspace_root: &Path) -> Result<String> {
+    let path = arguments.get("path").and_then(Value::as_str);
+    let commits = arguments.get("commits").and_then(Value::as_str);
+    let limit = tool_result_limit(arguments, "session_changes", 8)?;
+    let sessions = crate::session_store::restore_project_sessions(workspace_root)?;
+
+    let mut out = String::new();
+    if let Some(path) = path {
+        let file_log = git_log_for_path(workspace_root, path, limit)
+            .unwrap_or_else(|err| format!("unable to read git log for {path}: {err:#}"));
+        out.push_str(&format!("Recent git commits for {path}:\n"));
+        out.push_str(if file_log.trim().is_empty() {
+            "none\n"
+        } else {
+            file_log.trim()
+        });
+        out.push_str("\n\n");
+    }
+    if let Some(range) = commits {
+        let range_log = git_log_range(workspace_root, range, limit)
+            .unwrap_or_else(|err| format!("unable to read git log for {range}: {err:#}"));
+        out.push_str(&format!("Commits in {range}:\n"));
+        out.push_str(if range_log.trim().is_empty() {
+            "none\n"
+        } else {
+            range_log.trim()
+        });
+        out.push_str("\n\n");
+    }
+
+    out.push_str("Recent LLM session summaries:\n");
+    let mut matches = sessions
+        .iter()
+        .filter_map(|session| summarize_session_change(session, path, commits))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|item| std::cmp::Reverse(item.updated_at_ms));
+    if matches.is_empty() {
+        out.push_str("none found");
+    } else {
+        for item in matches.into_iter().take(limit) {
+            out.push_str(&item.text);
+            out.push('\n');
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+struct SessionChangeSummary {
+    updated_at_ms: u64,
+    text: String,
+}
+
+fn summarize_session_change(
+    session: &crate::session_store::PersistedSession,
+    path_filter: Option<&str>,
+    commit_filter: Option<&str>,
+) -> Option<SessionChangeSummary> {
+    let mut task = session.task.as_str();
+    let mut summary = "";
+    let mut commits = "";
+    let mut diff_stat = "";
+    let mut touched_paths = Vec::new();
+    for envelope in &session.events {
+        match &envelope.event {
+            AgentEvent::Started { task: started, .. } => task = started,
+            AgentEvent::SessionSummary {
+                summary: event_summary,
+                commits: event_commits,
+                diff_stat: event_diff_stat,
+                diff,
+                ..
+            } => {
+                summary = event_summary;
+                commits = event_commits;
+                diff_stat = event_diff_stat;
+                touched_paths = extract_diff_paths(event_diff_stat, diff);
+            }
+            _ => {}
+        }
+    }
+    let haystack = format!(
+        "{task}\n{summary}\n{commits}\n{diff_stat}\n{}",
+        touched_paths.join("\n")
+    );
+    if let Some(path) = path_filter
+        && !haystack.contains(path)
+    {
+        return None;
+    }
+    if let Some(range) = commit_filter {
+        let hashes = range
+            .split(|ch: char| !ch.is_ascii_hexdigit())
+            .filter(|part| part.len() >= 7)
+            .collect::<Vec<_>>();
+        if !hashes.is_empty() && !hashes.iter().any(|hash| commits.contains(hash)) {
+            return None;
+        }
+    }
+
+    let mut text = format!(
+        "- session_id: {}\n  updated_at_ms: {}\n  task: {}\n",
+        session.session_id,
+        session.updated_at_ms,
+        one_line(task, 220)
+    );
+    if !summary.trim().is_empty() {
+        text.push_str(&format!("  summary: {}\n", one_line(summary, 360)));
+    }
+    if !commits.trim().is_empty() {
+        text.push_str("  commits:\n");
+        for line in commits.lines().take(5) {
+            text.push_str(&format!("    {line}\n"));
+        }
+    }
+    if !diff_stat.trim().is_empty() {
+        text.push_str("  diff_stat:\n");
+        for line in diff_stat.lines().take(12) {
+            text.push_str(&format!("    {line}\n"));
+        }
+    }
+    if !touched_paths.is_empty() {
+        text.push_str(&format!(
+            "  touched_paths: {}\n",
+            touched_paths
+                .into_iter()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Some(SessionChangeSummary {
+        updated_at_ms: session.updated_at_ms,
+        text,
+    })
+}
+
+fn extract_diff_paths(diff_stat: &str, diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff_stat.lines() {
+        if let Some((path, _)) = line.split_once('|') {
+            let path = path.trim();
+            if !path.is_empty() && !path.contains(" file changed") {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    for line in diff.lines() {
+        if let Some(path) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+        {
+            if path != "/dev/null" {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn one_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    if compact.chars().count() > max_chars {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn git_log_for_path(workdir: &Path, path: &str, n: usize) -> Result<String> {
+    git_run(&["log", "--oneline", &format!("-{n}"), "--", path], workdir)
+}
+
+fn git_log_range(workdir: &Path, range: &str, n: usize) -> Result<String> {
+    git_run(&["log", "--oneline", &format!("-{n}"), range], workdir)
 }
 
 fn git_diff_stat_from_main(workdir: &Path) -> Result<String> {
