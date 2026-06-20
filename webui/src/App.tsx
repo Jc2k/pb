@@ -177,6 +177,7 @@ interface SessionDetails {
 interface ProjectEntry {
   name: string;
   path: string;
+  notify_on_finish: boolean;
 }
 
 /* ─── custom router removed - using react-router-dom instead ─ */
@@ -256,6 +257,62 @@ function groupToolEvents(
   }
 
   return grouped;
+}
+
+
+function notificationSupport(): boolean {
+  return typeof window !== "undefined" && "Notification" in window;
+}
+
+async function ensureNotificationPermission(): Promise<boolean> {
+  if (!notificationSupport()) return false;
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission !== "default") return false;
+  return (await Notification.requestPermission()) === "granted";
+}
+
+async function notifySessionFinished(session: SessionItem, projects: ProjectEntry[]) {
+  if (session.status !== "completed" && session.status !== "failed") return;
+  const project = projects.find((entry) => entry.path === session.workdir);
+  if (!project?.notify_on_finish) return;
+  if (!(await ensureNotificationPermission())) return;
+  const title = session.status === "completed" ? "pb session completed" : "pb session failed";
+  const body = `${project.name}: ${session.task}`;
+  const url = `/sessions/${session.session_id}`;
+  const registration = await navigator.serviceWorker?.getRegistration?.();
+  if (registration?.showNotification) {
+    await registration.showNotification(title, {
+      body,
+      icon: "/apple-touch-icon.png",
+      badge: "/apple-touch-icon.png",
+      data: { url },
+      tag: `pb-${session.session_id}-${session.status}`,
+    });
+    return;
+  }
+  const notification = new Notification(title, { body, icon: "/apple-touch-icon.png" });
+  notification.onclick = () => {
+    window.focus();
+    window.location.href = url;
+  };
+}
+
+function useProjectFinishNotifications(sessions: SessionItem[], projects: ProjectEntry[]) {
+  const seenRef = useRef<Record<string, SessionStatus>>({});
+
+  useEffect(() => {
+    for (const session of sessions) {
+      const previous = seenRef.current[session.session_id];
+      seenRef.current[session.session_id] = session.status;
+      if (
+        previous &&
+        previous !== session.status &&
+        (session.status === "completed" || session.status === "failed")
+      ) {
+        void notifySessionFinished(session, projects);
+      }
+    }
+  }, [sessions, projects]);
 }
 
 function projectName(workdir?: string): string {
@@ -1124,6 +1181,8 @@ function HomePage() {
     (session) => session.status === "completed",
   ).length;
 
+  useProjectFinishNotifications(sessions, projects);
+
   const fetchSessions = async () => {
     const res = await fetch("/api/sessions");
     if (!res.ok) return;
@@ -1325,14 +1384,29 @@ function ProjectsPage() {
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [sessions, setSessions] = useState<SessionItem[]>([]);
 
-  useEffect(() => {
-    void fetch("/api/projects")
+  const fetchProjects = () =>
+    fetch("/api/projects")
       .then((res) => (res.ok ? res.json() : []))
       .then((entries: ProjectEntry[]) => setProjects(entries));
+
+  useEffect(() => {
+    void fetchProjects();
     void fetch("/api/sessions")
       .then((res) => (res.ok ? res.json() : []))
       .then((entries: SessionItem[]) => setSessions(entries));
   }, []);
+
+  useProjectFinishNotifications(sessions, projects);
+
+  const toggleProjectNotifications = async (project: ProjectEntry) => {
+    if (!project.notify_on_finish && !(await ensureNotificationPermission())) return;
+    const res = await fetch(`/api/projects/${encodeURIComponent(project.name)}/notifications`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ notify_on_finish: !project.notify_on_finish }),
+    });
+    if (res.ok) void fetchProjects();
+  };
 
   return (
     <PageShell>
@@ -1354,21 +1428,35 @@ function ProjectsPage() {
               const projectSessions = sessions.filter((session) => session.workdir === project.path);
               const running = projectSessions.filter((session) => session.status === "running").length;
               return (
-                <Link
+                <div
                   key={project.name}
-                  className="session-row list-group-item list-group-item-action py-3 px-4 text-decoration-none"
-                  to={`/projects/${encodeURIComponent(project.name)}`}
+                  className="session-row list-group-item py-3 px-4"
                 >
                   <div className="session-icon"><i className="bi bi-folder2-open"></i></div>
-                  <div className="session-main">
+                  <Link
+                    className="session-main text-decoration-none text-reset"
+                    to={`/projects/${encodeURIComponent(project.name)}`}
+                  >
                     <strong>{project.name}</strong>
                     <span>{project.path}</span>
-                  </div>
+                  </Link>
                   <span className={`status-pill ${running ? "status-running" : "status-completed"}`}>
                     {projectSessions.length} session{projectSessions.length === 1 ? "" : "s"}
                   </span>
-                  <span className="chevron">›</span>
-                </Link>
+                  <button
+                    type="button"
+                    className={`btn btn-sm btn-icon ${project.notify_on_finish ? "btn-primary" : "btn-outline-secondary"}`}
+                    title={project.notify_on_finish ? "Disable finish notifications" : "Notify me when sessions complete or fail"}
+                    aria-label={project.notify_on_finish ? "Disable finish notifications" : "Enable finish notifications"}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      void toggleProjectNotifications(project);
+                    }}
+                  >
+                    <i className={`bi ${project.notify_on_finish ? "bi-alarm-fill" : "bi-alarm"}`}></i>
+                  </button>
+                  <Link className="chevron text-decoration-none" to={`/projects/${encodeURIComponent(project.name)}`}>›</Link>
+                </div>
               );
             })
           )}
@@ -1389,6 +1477,8 @@ function ProjectPage() {
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = project ? sessions.filter((session) => session.workdir === project.path) : [];
+
+  useProjectFinishNotifications(sessions, projects);
 
   useEffect(() => {
     void fetch("/api/projects")
