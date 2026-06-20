@@ -19,6 +19,14 @@ pub struct UserConfig {
     pub model: ModelConfig,
     pub mcp: McpConfig,
     pub lsp: LspConfig,
+    pub memory: MemoryConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Optional separate personal memory repository for cross-project preferences.
+    pub personal_repo: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -97,6 +105,7 @@ impl UserConfig {
             "model.profile" => self.model.profile.map(|value| value.to_string()),
             "model.top_k" => self.model.top_k.map(|value| value.to_string()),
             "model.seed" => self.model.seed.map(|value| value.to_string()),
+            "memory.personal_repo" => self.memory.personal_repo.as_ref().map(display_path),
             _ => bail_unknown_key(key)?,
         })
     }
@@ -125,6 +134,7 @@ impl UserConfig {
             }
             "model.top_k" => self.model.top_k = Some(parse_value(key, value)?),
             "model.seed" => self.model.seed = Some(parse_value(key, value)?),
+            "memory.personal_repo" => self.memory.personal_repo = Some(PathBuf::from(value)),
             _ => return bail_unknown_key(key),
         }
         Ok(())
@@ -205,6 +215,10 @@ impl UserConfig {
 
     pub fn effective_seed(&self) -> u32 {
         self.model.seed.unwrap_or(1337)
+    }
+
+    pub fn effective_personal_memory_repo(&self) -> Option<PathBuf> {
+        self.memory.personal_repo.clone()
     }
 }
 
