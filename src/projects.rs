@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct ProjectEntry {
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub notify_on_finish: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +25,11 @@ pub struct AddProjectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveProjectRequest {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProjectNotificationsRequest {
+    pub notify_on_finish: bool,
 }
 
 pub fn registry_path() -> Result<PathBuf> {
@@ -66,9 +73,17 @@ pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
     };
     validate_project_name(&name)?;
 
+    let path_string = path.to_string_lossy().into_owned();
+    let existing_notify = load_projects()?
+        .into_iter()
+        .find(|project| project.name == name || project.path == path_string)
+        .map(|project| project.notify_on_finish)
+        .unwrap_or(false);
+
     let entry = ProjectEntry {
         name: name.clone(),
-        path: path.to_string_lossy().into_owned(),
+        path: path_string,
+        notify_on_finish: existing_notify,
     };
 
     let mut projects = load_projects()?;
@@ -88,6 +103,18 @@ pub fn remove_project(name: &str) -> Result<ProjectEntry> {
     let removed = projects.remove(index);
     save_projects(&projects)?;
     Ok(removed)
+}
+
+pub fn set_project_notifications(name: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
+    validate_project_name(name)?;
+    let mut projects = load_projects()?;
+    let Some(project) = projects.iter_mut().find(|project| project.name == name) else {
+        bail!("project not found: {name}");
+    };
+    project.notify_on_finish = notify_on_finish;
+    let updated = project.clone();
+    save_projects(&projects)?;
+    Ok(updated)
 }
 
 fn save_projects(projects: &[ProjectEntry]) -> Result<()> {
@@ -126,5 +153,28 @@ mod tests {
             default_project_name(Path::new("/tmp/example-project")).unwrap(),
             "example-project"
         );
+    }
+
+    #[test]
+    fn notification_toggle_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let project_dir = dir.path().join("example");
+        std::fs::create_dir(&project_dir).unwrap();
+
+        add_project(AddProjectRequest {
+            name: Some("example".to_string()),
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap();
+        let updated = set_project_notifications("example", true).unwrap();
+        assert!(updated.notify_on_finish);
+        assert!(load_projects().unwrap()[0].notify_on_finish);
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 }

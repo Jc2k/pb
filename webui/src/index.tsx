@@ -4,3 +4,10 @@ import App from "./App";
 
 const root = document.getElementById("root")!;
 createRoot(root).render(<App />);
+
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register("/pb-sw.js");
+  });
+}

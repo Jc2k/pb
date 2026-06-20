@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use rust_embed::RustEmbed;
@@ -21,11 +21,30 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
-use crate::projects::{self, AddProjectRequest, ProjectEntry, RemoveProjectRequest};
+use crate::projects::{
+    self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
+};
 use crate::session_store::{self, PersistedSession, SessionStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
+
+const SERVICE_WORKER_JS: &str = r#"self.addEventListener("install",(event)=>{self.skipWaiting();});
+self.addEventListener("activate",(event)=>{event.waitUntil(self.clients.claim());});
+self.addEventListener("notificationclick",(event)=>{
+  event.notification.close();
+  const url=(event.notification.data&&event.notification.data.url)||"/";
+  event.waitUntil(self.clients.matchAll({type:"window",includeUncontrolled:true}).then((clients)=>{
+    for (const client of clients) {
+      if ("focus" in client) {
+        client.navigate(url);
+        return client.focus();
+      }
+    }
+    if (self.clients.openWindow) return self.clients.openWindow(url);
+  }));
+});
+"#;
 
 #[derive(Debug, Clone)]
 pub struct ServeArgs {
@@ -228,10 +247,15 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
+        .route(
+            "/api/projects/{name}/notifications",
+            patch(update_project_notifications),
+        )
         .route("/api/status", get(status))
         .route("/api/current-user.png", get(crate::user::avatar_png))
         .route("/api/current-user", get(crate::user::user_info))
         .route("/auth/github/callback", get(github_oauth_callback))
+        .route("/pb-sw.js", get(service_worker))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state((state.clone(), defaults.clone()));
@@ -752,6 +776,19 @@ async fn list_projects(
     Json(project_list_snapshot(&state).await)
 }
 
+async fn update_project_notifications(
+    Path(name): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<UpdateProjectNotificationsRequest>,
+) -> Result<Json<ProjectEntry>, StatusCode> {
+    let updated = projects::set_project_notifications(&name, req.notify_on_finish)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    reload_projects(&state)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(updated))
+}
+
 struct WebEventSink {
     state: AppState,
     session_id: String,
@@ -1063,6 +1100,20 @@ async fn handle_rpc_connection(
         "pb.projects.rm" => {
             let params: RemoveProjectRequest = serde_json::from_value(request.params)?;
             let result = projects::remove_project(&params.name)?;
+            reload_projects(&state).await?;
+            write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.projects.notifications" => {
+            let params: serde_json::Value = request.params;
+            let name = params
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing project name"))?;
+            let notify_on_finish = params
+                .get("notify_on_finish")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("missing notify_on_finish"))?;
+            let result = projects::set_project_notifications(name, notify_on_finish)?;
             reload_projects(&state).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
@@ -1379,6 +1430,16 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
 
 async fn github_oauth_callback(Query(query): Query<HashMap<String, String>>) -> Response {
     crate::github_oauth::persist_callback_from_query(&query).into_response()
+}
+
+async fn service_worker() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        SERVICE_WORKER_JS,
+    )
 }
 
 async fn index() -> impl IntoResponse {
