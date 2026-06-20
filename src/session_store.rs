@@ -113,7 +113,7 @@ pub fn restore_registered_sessions(projects: &[ProjectEntry]) -> Vec<PersistedSe
     sessions
 }
 
-fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSession>> {
+pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSession>> {
     ensure_git_repository(workspace_root)?;
     let refs = run_git(
         workspace_root,
