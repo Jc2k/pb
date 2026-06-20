@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::browser_tools;
 use crate::container;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
@@ -1060,6 +1061,24 @@ impl BuiltInToolSchema {
             "memory_read" => "memory_read(id)",
             "memory_propose" => "memory_propose(kind,title,body,evidence)",
             "memory_supersede" => "memory_supersede(id,replacement_id,reason)",
+            "browser_open" => "browser_open(url)",
+            "browser_snapshot" => "browser_snapshot()",
+            "browser_interact" => "browser_interact(action,target,value)",
+            "browser_dom" => "browser_dom(target)",
+            "browser_console" => "browser_console()",
+            "browser_network" => "browser_network()",
+            "browser_evaluate" => "browser_evaluate(script)",
+            "browser_storage" => "browser_storage(clear)",
+            "browser_wait" => "browser_wait(condition,target,timeout_ms)",
+            "browser_reload" => "browser_reload(clear_storage)",
+            "browser_screenshot" => "browser_screenshot(target)",
+            "react_tree" => "react_tree()",
+            "react_component" => "react_component(target)",
+            "react_find" => "react_find(name)",
+            "react_renders" => "react_renders()",
+            "react_errors" => "react_errors()",
+            "browser_debug_report" => "browser_debug_report()",
+            "browser_close" => "browser_close()",
             _ => return format!("{}(arguments)", self.name),
         };
         signature.to_string()
@@ -1377,6 +1396,163 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
             ),
         ),
         builtin_tool(
+            "browser_open",
+            "Open a URL in an isolated local Safari WebDriver session, launching /usr/bin/safaridriver on macOS when needed.",
+            object_schema(
+                [string_property("url", "HTTP(S) or local URL to open.")],
+                ["url"],
+            ),
+        ),
+        builtin_tool(
+            "browser_snapshot",
+            "Return a structured DOM/accessibility snapshot with stable element references.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "browser_interact",
+            "Interact with an element selected by CSS selector or browser_snapshot reference: click, type, select, focus, hover, or submit.",
+            object_schema(
+                [
+                    enum_property(
+                        "action",
+                        "Interaction action.",
+                        ["click", "type", "select", "focus", "hover", "submit"],
+                    ),
+                    string_property("target", "CSS selector or stable snapshot reference."),
+                    string_property("value", "Optional typed text or selected value."),
+                ],
+                ["action", "target"],
+            ),
+        ),
+        builtin_tool(
+            "browser_dom",
+            "Return an element's HTML, attributes, text, computed styles, bounds, and visibility.",
+            object_schema(
+                [string_property(
+                    "target",
+                    "CSS selector or stable snapshot reference.",
+                )],
+                ["target"],
+            ),
+        ),
+        builtin_tool(
+            "browser_console",
+            "Return captured console messages, warnings, exceptions, and unhandled promise rejections.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "browser_network",
+            "Return captured fetch/XHR requests, responses, failures, status codes, and timings.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "browser_evaluate",
+            "Execute diagnostic JavaScript in the current page and return the serialized result.",
+            object_schema(
+                [string_property(
+                    "script",
+                    "JavaScript body to execute. Use return to return a value.",
+                )],
+                ["script"],
+            ),
+        ),
+        builtin_tool(
+            "browser_storage",
+            "Inspect or clear cookies-visible document.cookie plus local and session storage.",
+            object_schema(
+                [boolean_property(
+                    "clear",
+                    "Clear local and session storage before reading.",
+                )],
+                [],
+            ),
+        ),
+        builtin_tool(
+            "browser_wait",
+            "Wait for an element, text, URL fragment, or JavaScript condition.",
+            object_schema(
+                [
+                    enum_property(
+                        "condition",
+                        "Wait condition type.",
+                        ["element", "text", "url", "javascript"],
+                    ),
+                    string_property(
+                        "target",
+                        "CSS selector, text, URL fragment, or JavaScript condition body.",
+                    ),
+                    integer_property("timeout_ms", "Timeout in milliseconds."),
+                ],
+                ["condition", "target"],
+            ),
+        ),
+        builtin_tool(
+            "browser_reload",
+            "Reload the page, optionally clearing browser storage first.",
+            object_schema(
+                [boolean_property(
+                    "clear_storage",
+                    "Clear local and session storage before reloading.",
+                )],
+                [],
+            ),
+        ),
+        builtin_tool(
+            "browser_screenshot",
+            "Capture the viewport or selected element as a PNG artifact encoded as base64.",
+            object_schema(
+                [string_property(
+                    "target",
+                    "Optional CSS selector or snapshot reference for an element screenshot.",
+                )],
+                [],
+            ),
+        ),
+        builtin_tool(
+            "browser_debug_report",
+            "Collect URL, screenshot, DOM snapshot, console errors, failed requests, and relevant storage in one report. Native Web Inspector breakpoints, source-map debugging, and complete performance tracing are out of scope.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "react_tree",
+            "Return the mounted React component tree when the React DevTools global hook is available; otherwise report unsupported.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "react_component",
+            "Return component details for a target when React diagnostics are available; otherwise report unsupported.",
+            object_schema(
+                [string_property(
+                    "target",
+                    "Component name or browser snapshot reference.",
+                )],
+                ["target"],
+            ),
+        ),
+        builtin_tool(
+            "react_find",
+            "Find mounted React components by display name when React diagnostics are available; otherwise report unsupported.",
+            object_schema(
+                [string_property("name", "React display name to find.")],
+                ["name"],
+            ),
+        ),
+        builtin_tool(
+            "react_renders",
+            "Identify component commits and frequent rerenders when React diagnostics are available; otherwise report unsupported.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "react_errors",
+            "Collect React warnings, hydration errors, and error-boundary failures when React diagnostics are available; otherwise report unsupported.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "browser_close",
+            "Close the Safari WebDriver session, Safari window, and safaridriver process.",
+            object_schema([], []),
+        ),
+        builtin_tool(
             "sub_agent",
             "Delegate bounded work to another agent profile in a fresh context.",
             object_schema(
@@ -1492,9 +1668,37 @@ fn tool_allowed(
                     )));
     }
     match tool {
-        "read_file" | "glob" | "ripgrep" | "search" | "web_search" | "web_fetch" | "git_log"
-        | "session_changes" | "todo" | "skill_search" | "skill" | "memory_search"
-        | "memory_read" => true,
+        "read_file"
+        | "glob"
+        | "ripgrep"
+        | "search"
+        | "web_search"
+        | "web_fetch"
+        | "git_log"
+        | "session_changes"
+        | "todo"
+        | "skill_search"
+        | "skill"
+        | "memory_search"
+        | "memory_read"
+        | "browser_open"
+        | "browser_snapshot"
+        | "browser_interact"
+        | "browser_dom"
+        | "browser_console"
+        | "browser_network"
+        | "browser_evaluate"
+        | "browser_storage"
+        | "browser_wait"
+        | "browser_reload"
+        | "browser_screenshot"
+        | "browser_debug_report"
+        | "browser_close"
+        | "react_tree"
+        | "react_component"
+        | "react_find"
+        | "react_renders"
+        | "react_errors" => true,
         "ask_user" => profile == AgentProfile::Plan,
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
@@ -2491,6 +2695,24 @@ fn run_tool(
                 sink.ask_multiple_choice(question, &choices)
             }
         }
+        "browser_open"
+        | "browser_snapshot"
+        | "browser_interact"
+        | "browser_dom"
+        | "browser_console"
+        | "browser_network"
+        | "browser_evaluate"
+        | "browser_storage"
+        | "browser_wait"
+        | "browser_reload"
+        | "browser_screenshot"
+        | "browser_debug_report"
+        | "browser_close"
+        | "react_tree"
+        | "react_component"
+        | "react_find"
+        | "react_renders"
+        | "react_errors" => browser_tools::call_tool(tool, arguments),
         "sub_agent" => run_sub_agent(arguments, context, sink),
         "run_command" => {
             let cmd = arguments

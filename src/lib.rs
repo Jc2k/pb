@@ -15,6 +15,7 @@ use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode}
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 pub mod agent_core;
+pub mod browser_tools;
 pub mod cli_ui;
 pub mod config;
 pub mod container;
