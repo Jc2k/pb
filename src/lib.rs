@@ -25,6 +25,7 @@ mod github_oauth;
 pub mod init;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod policy;
 pub mod projects;
 pub mod service;
