@@ -107,6 +107,40 @@ jobs:
         env:
           PB_GITHUB_CLIENT_ID: ${{ secrets.PB_GITHUB_CLIENT_ID }}
 
+      - name: Configure macOS code signing identity
+        env:
+          MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
+          MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+          MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [[ -n "${MACOS_CODESIGN_CERT_P12_BASE64}" ]]; then
+            echo "Importing configured macOS code signing certificate."
+            security create-keychain -p "${MACOS_CODESIGN_KEYCHAIN_PASSWORD}" build-signing.keychain-db
+            security set-keychain-settings -lut 21600 build-signing.keychain-db
+            security unlock-keychain -p "${MACOS_CODESIGN_KEYCHAIN_PASSWORD}" build-signing.keychain-db
+            base64 -D <<< "${MACOS_CODESIGN_CERT_P12_BASE64}" > signing-certificate.p12
+            security import signing-certificate.p12 -k build-signing.keychain-db -P "${MACOS_CODESIGN_CERT_PASSWORD}" -T /usr/bin/codesign
+            security list-keychains -d user -s build-signing.keychain-db
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${MACOS_CODESIGN_KEYCHAIN_PASSWORD}" build-signing.keychain-db
+            identity=$(security find-identity -v -p codesigning build-signing.keychain-db | awk -F '"' '/"/ { print $2; exit }')
+            if [[ -z "${identity}" ]]; then
+              echo "No code signing identity was found in the imported certificate." >&2
+              exit 1
+            fi
+            echo "MACOS_CODESIGN_IDENTITY=${identity}" >> "${GITHUB_ENV}"
+          else
+            echo "No signing certificate configured; falling back to ad-hoc signing."
+            echo "MACOS_CODESIGN_IDENTITY=-" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Sign macOS binary
+        run: |
+          # A self-signed identity does not require an Apple Developer account.
+          # It still does not notarize the binary or remove Gatekeeper warnings
+          # for downloaded release assets.
+          codesign --force --sign "${MACOS_CODESIGN_IDENTITY}" --timestamp=none target/aarch64-apple-darwin/release/pb
+          codesign --verify --verbose=4 target/aarch64-apple-darwin/release/pb
+
       - name: Prepare release asset
         run: |
           mkdir -p dist
