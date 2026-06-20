@@ -64,6 +64,31 @@ cargo build --release
 
 GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
 
+### macOS code signing without a paid Apple Developer account
+
+The release workflow supports an optional self-signed macOS code signing identity. This gives the release binary a Mach-O code signature without requiring Xcode or a paid Apple Developer account. It does not notarize the binary, and macOS Gatekeeper can still warn users when they download the release asset from the internet.
+
+To create and export a self-signed identity using built-in macOS tools:
+
+1. Open **Keychain Access**.
+2. Choose **Keychain Access → Certificate Assistant → Create a Certificate...**.
+3. Set **Name** to something recognizable, such as `pb self-signed release`.
+4. Set **Identity Type** to **Self Signed Root**.
+5. Set **Certificate Type** to **Code Signing**.
+6. Create the certificate in the **login** keychain.
+7. In Keychain Access, select the certificate and its private key, then choose **File → Export Items...**.
+8. Save the export as `pb-codesign.p12` and protect it with a strong password.
+9. Convert it to base64 for GitHub Actions:
+
+   ```bash
+   base64 -i pb-codesign.p12 | pbcopy
+   ```
+
+10. Add these repository secrets in GitHub:
+    - `MACOS_CODESIGN_CERT_P12_BASE64`: the base64 text copied in the previous step
+    - `MACOS_CODESIGN_CERT_PASSWORD`: the `.p12` export password
+
+If `MACOS_CODESIGN_CERT_P12_BASE64` is not configured, the workflow falls back to ad-hoc signing with `codesign --sign -`, which also requires no Apple Developer account.
 
 ## GitHub MCP OAuth setup
 
