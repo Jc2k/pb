@@ -124,10 +124,13 @@ jobs:
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${MACOS_CODESIGN_KEYCHAIN_PASSWORD}" build-signing.keychain-db
             identity=$(security find-identity -v -p codesigning build-signing.keychain-db | awk -F '"' '/"/ { print $2; exit }')
             if [[ -z "${identity}" ]]; then
-              echo "No code signing identity was found in the imported certificate." >&2
-              exit 1
+              echo "::warning::The configured certificate was imported, but it is not a valid code signing identity. Falling back to ad-hoc signing."
+              echo "Imported identities:"
+              security find-identity -v build-signing.keychain-db || true
+              echo "MACOS_CODESIGN_IDENTITY=-" >> "${GITHUB_ENV}"
+            else
+              echo "MACOS_CODESIGN_IDENTITY=${identity}" >> "${GITHUB_ENV}"
             fi
-            echo "MACOS_CODESIGN_IDENTITY=${identity}" >> "${GITHUB_ENV}"
           else
             echo "No signing certificate configured; falling back to ad-hoc signing."
             echo "MACOS_CODESIGN_IDENTITY=-" >> "${GITHUB_ENV}"
