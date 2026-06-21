@@ -88,7 +88,14 @@ To create and export a self-signed identity using built-in macOS tools:
     - `MACOS_CODESIGN_CERT_P12_BASE64`: the base64 text copied in the previous step
     - `MACOS_CODESIGN_CERT_PASSWORD`: the `.p12` export password
 
-If `MACOS_CODESIGN_CERT_P12_BASE64` is not configured, the workflow falls back to ad-hoc signing with `codesign --sign -`, which also requires no Apple Developer account.
+If `MACOS_CODESIGN_CERT_P12_BASE64` is not configured, the workflow falls back to ad-hoc signing with `codesign --sign -`, which also requires no Apple Developer account. The workflow also falls back to ad-hoc signing when an imported `.p12` is not usable for code signing.
+
+If GitHub Actions reports that no code signing identity was found after importing the certificate, recreate the `.p12` and verify these details before updating the secret:
+
+- The certificate was created with **Certificate Type** set to **Code Signing**. A generic SSL, S/MIME, or website certificate can import successfully but will not appear in `security find-identity -p codesigning`.
+- The export includes both the certificate and its private key. In Keychain Access, expand the certificate row and select the certificate together with the nested private key before choosing **File → Export Items...**.
+- The base64 secret is generated from the exported `.p12`, not from a `.cer`, `.pem`, or certificate-only export.
+- Locally, the exported file should produce a code signing identity after import, for example `security find-identity -v -p codesigning <keychain>` should list the certificate name.
 
 ## GitHub MCP OAuth setup
 
