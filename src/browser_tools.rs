@@ -9,6 +9,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use fantoccini::{Client, ClientBuilder, Locator};
+use futures::future::LocalBoxFuture;
 use serde_json::{Value, json};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -41,10 +42,12 @@ pub fn call_tool(tool: &str, arguments: &Value) -> Result<String> {
             "browser_open" => open(arguments).await,
             "browser_snapshot" => with_client(|c| Box::pin(async move { snapshot(c).await })).await,
             "browser_interact" => {
-                with_client(|c| Box::pin(async move { interact(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { interact(c, &arguments).await })).await
             }
             "browser_dom" => {
-                with_client(|c| Box::pin(async move { dom(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { dom(c, &arguments).await })).await
             }
             "browser_console" => {
                 with_client(|c| {
@@ -63,19 +66,24 @@ pub fn call_tool(tool: &str, arguments: &Value) -> Result<String> {
                 .await
             }
             "browser_evaluate" => {
-                with_client(|c| Box::pin(async move { evaluate(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { evaluate(c, &arguments).await })).await
             }
             "browser_storage" => {
-                with_client(|c| Box::pin(async move { storage(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { storage(c, &arguments).await })).await
             }
             "browser_wait" => {
-                with_client(|c| Box::pin(async move { wait_for(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { wait_for(c, &arguments).await })).await
             }
             "browser_reload" => {
-                with_client(|c| Box::pin(async move { reload(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { reload(c, &arguments).await })).await
             }
             "browser_screenshot" => {
-                with_client(|c| Box::pin(async move { screenshot(c, arguments).await })).await
+                let arguments = arguments.clone();
+                with_client(|c| Box::pin(async move { screenshot(c, &arguments).await })).await
             }
             "browser_debug_report" => {
                 with_client(|c| Box::pin(async move { debug_report(c).await })).await
@@ -98,10 +106,9 @@ fn block_on<F: std::future::Future<Output = Result<String>>>(future: F) -> Resul
         .context("browser tool timed out")?
 }
 
-async fn with_client<F>(f: impl FnOnce(&mut Client) -> F) -> Result<String>
-where
-    F: std::future::Future<Output = Result<String>>,
-{
+async fn with_client(
+    f: impl for<'a> FnOnce(&'a mut Client) -> LocalBoxFuture<'a, Result<String>>,
+) -> Result<String> {
     let mut session = SESSION
         .get_or_init(|| Mutex::new(None))
         .lock()
