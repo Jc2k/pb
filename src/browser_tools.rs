@@ -6,29 +6,47 @@
 //! Native debugger breakpoints, source-map debugging, and complete performance tracing are
 //! outside this initial WebDriver-based scope.
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(any())]
+use anyhow::{Context, anyhow};
+use anyhow::{Result, bail};
+#[cfg(any())]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+#[cfg(any())]
 use fantoccini::{Client, ClientBuilder, Locator};
+#[cfg(any())]
 use futures::future::LocalBoxFuture;
 use serde_json::{Value, json};
+#[cfg(any())]
 use std::process::{Child, Command, Stdio};
+#[cfg(any())]
 use std::sync::{Mutex, OnceLock};
+#[cfg(any())]
 use std::time::Duration;
+#[cfg(any())]
 use tokio::net::TcpListener;
-use tokio::time::{Instant, sleep, timeout};
+#[cfg(any())]
+use tokio::time::timeout;
+#[cfg(any())]
+use tokio::time::{Instant, sleep};
 
+#[cfg(any())]
 const SAFARIDRIVER: &str = "/usr/bin/safaridriver";
+#[cfg(any())]
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any())]
 const WAIT_POLL: Duration = Duration::from_millis(200);
 
+#[cfg(any())]
 static SESSION: OnceLock<Mutex<Option<BrowserSession>>> = OnceLock::new();
 
+#[cfg(any())]
 struct BrowserSession {
     client: Client,
     driver: Child,
     port: u16,
 }
 
+#[cfg(any())]
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         let _ = self.driver.kill();
@@ -36,6 +54,7 @@ impl Drop for BrowserSession {
     }
 }
 
+#[cfg(any())]
 pub fn call_tool(tool: &str, arguments: &Value) -> Result<String> {
     block_on(async move {
         match tool {
@@ -97,6 +116,32 @@ pub fn call_tool(tool: &str, arguments: &Value) -> Result<String> {
     })
 }
 
+#[cfg(not(any()))]
+pub fn call_tool(tool: &str, _arguments: &Value) -> Result<String> {
+    match tool {
+        "react_tree" | "react_component" | "react_find" | "react_renders" | "react_errors" => {
+            react_unsupported(tool)
+        }
+        "browser_open"
+        | "browser_snapshot"
+        | "browser_interact"
+        | "browser_dom"
+        | "browser_console"
+        | "browser_network"
+        | "browser_evaluate"
+        | "browser_storage"
+        | "browser_wait"
+        | "browser_reload"
+        | "browser_screenshot"
+        | "browser_debug_report"
+        | "browser_close" => bail!(
+            "Safari automation is only available on macOS. On macOS, enable it once with: safaridriver --enable"
+        ),
+        _ => bail!("unknown browser tool: {tool}"),
+    }
+}
+
+#[cfg(any())]
 fn block_on<F: std::future::Future<Output = Result<String>>>(future: F) -> Result<String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -106,6 +151,7 @@ fn block_on<F: std::future::Future<Output = Result<String>>>(future: F) -> Resul
         .context("browser tool timed out")?
 }
 
+#[cfg(any())]
 async fn with_client(
     f: impl for<'a> FnOnce(&'a mut Client) -> LocalBoxFuture<'a, Result<String>>,
 ) -> Result<String> {
@@ -124,6 +170,7 @@ async fn with_client(
     f(&mut session.client).await
 }
 
+#[cfg(any())]
 async fn open(arguments: &Value) -> Result<String> {
     let url = arguments
         .get("url")
@@ -163,12 +210,13 @@ async fn open(arguments: &Value) -> Result<String> {
     )
 }
 
+#[cfg(any())]
 async fn start_session() -> Result<BrowserSession> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any()))]
     bail!(
         "Safari automation is only available on macOS. On macOS, enable it once with: safaridriver --enable"
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(any())]
     {
         if !std::path::Path::new(SAFARIDRIVER).exists() {
             bail!(
@@ -208,12 +256,14 @@ async fn start_session() -> Result<BrowserSession> {
     }
 }
 
+#[cfg(any())]
 async fn inject_instrumentation(client: &mut Client) -> Result<()> {
     let script = include_str!("browser_instrumentation.js");
     let _ = client.execute(script, vec![]).await;
     Ok(())
 }
 
+#[cfg(any())]
 async fn js_json(client: &mut Client, script: &str) -> Result<String> {
     inject_instrumentation(client).await?;
     Ok(client
@@ -223,10 +273,12 @@ async fn js_json(client: &mut Client, script: &str) -> Result<String> {
         .to_string())
 }
 
+#[cfg(any())]
 async fn snapshot(client: &mut Client) -> Result<String> {
     js_json(client, r#"return Array.from(document.querySelectorAll('body *')).slice(0,500).map((el,i)=>{ if(!el.dataset.pbRef) el.dataset.pbRef='pb-'+i+'-'+Math.random().toString(36).slice(2); const r=el.getBoundingClientRect(); return {ref:el.dataset.pbRef, tag:el.tagName.toLowerCase(), id:el.id||null, classes:Array.from(el.classList), role:el.getAttribute('role'), name:el.getAttribute('aria-label')||el.innerText?.trim().slice(0,120)||el.getAttribute('title')||'', visible:!!(r.width||r.height), bounds:{x:r.x,y:r.y,width:r.width,height:r.height}};});"#).await
 }
 
+#[cfg(any())]
 async fn resolve_element(
     client: &mut Client,
     target: &str,
@@ -242,6 +294,7 @@ async fn resolve_element(
         .with_context(|| format!("failed to find element: {target}"))
 }
 
+#[cfg(any())]
 async fn interact(client: &mut Client, arguments: &Value) -> Result<String> {
     let action = arguments
         .get("action")
@@ -280,6 +333,7 @@ async fn interact(client: &mut Client, arguments: &Value) -> Result<String> {
     Ok(json!({"ok": true, "action": action, "target": target}).to_string())
 }
 
+#[cfg(any())]
 async fn dom(client: &mut Client, arguments: &Value) -> Result<String> {
     let target = arguments
         .get("target")
@@ -289,6 +343,7 @@ async fn dom(client: &mut Client, arguments: &Value) -> Result<String> {
     Ok(client.execute(r#"const el=arguments[0], r=el.getBoundingClientRect(), cs=getComputedStyle(el); return {html:el.outerHTML, text:el.innerText||el.textContent||'', attributes:Object.fromEntries(Array.from(el.attributes).map(a=>[a.name,a.value])), styles:{display:cs.display, visibility:cs.visibility, opacity:cs.opacity, position:cs.position}, bounds:{x:r.x,y:r.y,width:r.width,height:r.height}, visible:!!(r.width||r.height)&&cs.visibility!=='hidden'&&cs.display!=='none'};"#, vec![el.to_json()?]).await?.to_string())
 }
 
+#[cfg(any())]
 async fn evaluate(client: &mut Client, arguments: &Value) -> Result<String> {
     let script = arguments
         .get("script")
@@ -297,6 +352,7 @@ async fn evaluate(client: &mut Client, arguments: &Value) -> Result<String> {
     js_json(client, &format!("return (async()=>{{ {script} }})()")).await
 }
 
+#[cfg(any())]
 async fn storage(client: &mut Client, arguments: &Value) -> Result<String> {
     inject_instrumentation(client).await?;
     if let Some(clear) = arguments.get("clear").and_then(Value::as_bool)
@@ -309,6 +365,7 @@ async fn storage(client: &mut Client, arguments: &Value) -> Result<String> {
     Ok(client.execute("return {localStorage:{...localStorage}, sessionStorage:{...sessionStorage}, cookies:document.cookie};", vec![]).await?.to_string())
 }
 
+#[cfg(any())]
 async fn wait_for(client: &mut Client, arguments: &Value) -> Result<String> {
     let condition = arguments
         .get("condition")
@@ -356,6 +413,7 @@ async fn wait_for(client: &mut Client, arguments: &Value) -> Result<String> {
     }
 }
 
+#[cfg(any())]
 async fn reload(client: &mut Client, arguments: &Value) -> Result<String> {
     if arguments
         .get("clear_storage")
@@ -375,6 +433,7 @@ fn react_unsupported(tool: &str) -> Result<String> {
     Ok(json!({"ok": false, "tool": tool, "unsupported": true, "reason": "React diagnostics require the React DevTools global hook to be available in the page; this first WebDriver implementation reports unsupported when the hook is absent or inaccessible."}).to_string())
 }
 
+#[cfg(any())]
 async fn screenshot(client: &mut Client, arguments: &Value) -> Result<String> {
     let bytes = if let Some(target) = arguments.get("target").and_then(Value::as_str) {
         resolve_element(client, target).await?.screenshot().await?
@@ -384,6 +443,7 @@ async fn screenshot(client: &mut Client, arguments: &Value) -> Result<String> {
     Ok(json!({"mime":"image/png", "base64": BASE64.encode(bytes)}).to_string())
 }
 
+#[cfg(any())]
 async fn debug_report(client: &mut Client) -> Result<String> {
     inject_instrumentation(client).await?;
     let url = client.current_url().await.ok().map(|u| u.to_string());
@@ -404,6 +464,7 @@ async fn debug_report(client: &mut Client) -> Result<String> {
     Ok(json!({"url":url,"screenshot":{"mime":"image/png","base64":shot},"dom":dom,"console":console,"failed_requests":network,"storage":storage,"scope_note":"Full Safari Web Inspector features such as native debugger breakpoints, source-map debugging, and complete performance tracing are outside this WebDriver-based scope."}).to_string())
 }
 
+#[cfg(any())]
 async fn close() -> Result<String> {
     let session = SESSION
         .get_or_init(|| Mutex::new(None))
@@ -423,7 +484,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any()))]
     fn browser_open_explains_safaridriver_enable_when_unavailable() {
         let err = call_tool("browser_open", &json!({"url":"http://127.0.0.1/"})).unwrap_err();
         let text = format!("{err:#}");
