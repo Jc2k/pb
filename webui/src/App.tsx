@@ -912,6 +912,27 @@ function ErrorEventBubble({
   );
 }
 
+
+function InitialUserMessage({ task, timestampMs }: { task: string; timestampMs?: number }) {
+  return (
+    <article className="user message-row user-message">
+      <div className="message-container">
+        <div className="author-line">
+          <strong>You</strong>
+          <span>Session request</span>
+          {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
+        </div>
+        <div className="bubble user-bubble">
+          <p>{task}</p>
+        </div>
+      </div>
+      <div className="user-avatar">
+        <img src="/api/current-user.png" alt="Current user" />
+      </div>
+    </article>
+  );
+}
+
 function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
   const e = envelope.event;
 
@@ -1846,9 +1867,10 @@ function SessionPage() {
         <div className="session-layout">
           <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
             {events.length === 0 ? (
-              <div className="text-body-secondary small">
-                Waiting for queue events…
-              </div>
+              <InitialUserMessage
+                task={session.task}
+                timestampMs={session.updated_at_ms}
+              />
             ) : (
               groupToolEvents(chatEventsWithOnlyLatestStep(events)).map(
                 (grouped, i) => {
