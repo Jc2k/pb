@@ -1630,6 +1630,7 @@ function SessionPage() {
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
   const [answer, setAnswer] = useState("");
+  const [shareMessage, setShareMessage] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -1685,6 +1686,30 @@ function SessionPage() {
     setSessionRunning(false);
   };
 
+  const shareSession = async () => {
+    if (!session) return;
+    const shareUrl = new URL(`/sessions/${session.session_id}`, window.location.origin).toString();
+    const shareData: ShareData = {
+      title: `pb session: ${session.task}`,
+      text: `View this pb session: ${session.task}`,
+      url: shareUrl,
+    };
+
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+        setShareMessage("Shared");
+      } else {
+        await navigator.clipboard.writeText(shareUrl);
+        setShareMessage("Link copied");
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      console.error(err);
+      setShareMessage("Unable to share");
+    }
+  };
+
   const answerQuestion = async (choice?: string) => {
     const selectedAnswer = choice ?? answer.trim();
     if (!selectedAnswer || !session?.pending_question) return;
@@ -1718,6 +1743,12 @@ function SessionPage() {
     void fetchSession().then(() => openEvents(sessionId));
     return () => sourceRef.current?.close();
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!shareMessage) return;
+    const timer = window.setTimeout(() => setShareMessage(""), 2400);
+    return () => window.clearTimeout(timer);
+  }, [shareMessage]);
 
   const isRunning = session?.status === "running" || false;
 
@@ -1788,9 +1819,22 @@ function SessionPage() {
               </span>
             </div>
           </div>
-          <button className="btn btn-light rounded-pill d-none d-sm-inline-flex">
-            <i className="bi bi-box-arrow-up me-2"></i>Share
-          </button>
+          <div className="share-action">
+            <button
+              type="button"
+              className="btn btn-light rounded-pill d-inline-flex align-items-center"
+              onClick={shareSession}
+              aria-label="Share this session"
+            >
+              <i className="bi bi-box-arrow-up me-sm-2"></i>
+              <span className="d-none d-sm-inline">Share</span>
+            </button>
+            {shareMessage && (
+              <span className="share-status small text-body-secondary" role="status">
+                {shareMessage}
+              </span>
+            )}
+          </div>
           <button
             className="btn btn-danger rounded-pill"
             onClick={() => window.location.reload()}
