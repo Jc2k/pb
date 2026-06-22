@@ -71,6 +71,7 @@ pub fn render_event(event: &AgentEvent) {
             profile: _,
             ..
         } => print_header("final", content),
+        AgentEvent::SessionTitle { title, .. } => print_header("session title", title),
         AgentEvent::SessionSummary {
             branch,
             commits,

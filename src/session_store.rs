@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent_core::{AgentRequest, find_git_root};
-use crate::events::EventEnvelope;
+use crate::events::{AgentEvent, EventEnvelope};
 use crate::projects::ProjectEntry;
 
 const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
@@ -27,6 +27,8 @@ pub enum SessionStatus {
 pub struct PersistedSession {
     pub session_id: String,
     pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub branch: Option<String>,
     pub workdir: Option<PathBuf>,
     pub request_template: AgentRequest,
@@ -50,6 +52,7 @@ impl PersistedSession {
         Self {
             session_id,
             task: request_template.task.clone(),
+            title: latest_session_title(&events),
             branch,
             workdir,
             request_template,
@@ -165,6 +168,18 @@ fn read_note(workspace_root: &Path, note_ref: &str) -> Result<String> {
 
 fn parse_session(payload: &str) -> Result<PersistedSession> {
     serde_json::from_str(payload).context("failed to parse session note")
+}
+
+fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|envelope| match &envelope.event {
+            AgentEvent::SessionTitle { title, .. } if !title.trim().is_empty() => {
+                Some(title.trim().to_string())
+            }
+            _ => None,
+        })
 }
 
 fn trim_events(mut events: Vec<EventEnvelope>) -> Vec<EventEnvelope> {

@@ -94,6 +94,11 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    SessionTitle {
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     SessionSummary {
         branch: String,
         commits: String,
@@ -283,6 +288,13 @@ impl EventEnvelope {
                     content,
                     profile,
                     nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::SessionTitle { title, .. } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::SessionTitle {
+                    title,
                     timestamp_ms: Some(now),
                 },
             },

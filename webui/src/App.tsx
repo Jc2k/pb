@@ -23,6 +23,7 @@ const TOOL_FRIENDLY_NAMES: Record<string, string> = {
   web_search: "Web search",
   web_fetch: "Fetch URL",
   git_log: "Git log",
+  session_title: "Set title",
   todo: "Manage todos",
   skill_search: "Search skills",
   skill: "Load skill",
@@ -45,6 +46,7 @@ const TOOL_ICONS: Record<string, string> = {
   web_search: "bi bi-globe",
   web_fetch: "bi bi-link",
   git_log: "bi bi-clock-history",
+  session_title: "bi bi-type",
   todo: "bi bi-check2-square",
   skill_search: "bi bi-bookmark-star",
   skill: "bi bi-file-earmark-code",
@@ -125,6 +127,11 @@ type AgentEvent =
   | { type: "diff"; path: string; diff: string; nesting_depth?: number; timestamp_ms?: number }
   | { type: "final"; content: string; nesting_depth?: number; timestamp_ms?: number }
   | {
+      type: "session_title";
+      title: string;
+      timestamp_ms?: number;
+    }
+  | {
       type: "session_summary";
       branch: string;
       commits: string;
@@ -153,6 +160,7 @@ type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
 interface SessionItem {
   session_id: string;
   task: string;
+  title?: string | null;
   running: boolean;
   paused: boolean;
   status: SessionStatus;
@@ -165,6 +173,7 @@ interface SessionItem {
 interface SessionDetails {
   session_id: string;
   task: string;
+  title?: string | null;
   running: boolean;
   paused: boolean;
   status: SessionStatus;
@@ -202,6 +211,10 @@ function getAvatarForProfile(profile: string): string {
 }
 
 /* ─── helpers ────────────────────────────────────────────────── */
+
+function sessionTitle(session: Pick<SessionItem, "task" | "title">): string {
+  return session.title?.trim() || session.task;
+}
 
 function groupToolEvents(
   events: EventEnvelope[],
@@ -278,7 +291,7 @@ async function notifySessionFinished(session: SessionItem, projects: ProjectEntr
   if (!project?.notify_on_finish) return;
   if (!(await ensureNotificationPermission())) return;
   const title = session.status === "completed" ? "pb session completed" : "pb session failed";
-  const body = `${project.name}: ${session.task}`;
+  const body = `${project.name}: ${sessionTitle(session)}`;
   const url = `/sessions/${session.session_id}`;
   const registration = await navigator.serviceWorker?.getRegistration?.();
   if (registration?.showNotification) {
@@ -1360,7 +1373,7 @@ function HomePage() {
                         />
                         <div className="session-icon">&gt;_</div>
                         <div className="session-main">
-                          <strong>{s.task}</strong>
+                          <strong>{sessionTitle(s)}</strong>
                           <span>
                             {projectName(s.workdir)} ·{" "}
                             {formatStartTime(s.updated_at_ms)}
@@ -1630,7 +1643,7 @@ function SessionCard({
     >
       <div className="d-flex justify-content-between align-items-start gap-2">
         <div className="fw-semibold text-truncate flex-grow-1 small">
-          {session.task}
+          {sessionTitle(session)}
         </div>
         {badge}
       </div>
@@ -1665,6 +1678,9 @@ function SessionPage() {
       try {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((prev) => [...prev, parsed]);
+        if (parsed.event.type === "session_title") {
+          setSession((current) => current ? { ...current, title: parsed.event.title } : current);
+        }
         if (parsed.event.type === "user_question") {
           setSessionRunning(false);
         } else if (parsed.event.type === "user_answer") {
@@ -1712,8 +1728,8 @@ function SessionPage() {
     if (!session) return;
     const shareUrl = new URL(`/sessions/${session.session_id}`, window.location.origin).toString();
     const shareData: ShareData = {
-      title: `pb session: ${session.task}`,
-      text: `View this pb session: ${session.task}`,
+      title: `pb session: ${sessionTitle(session)}`,
+      text: `View this pb session: ${sessionTitle(session)}`,
       url: shareUrl,
     };
 
@@ -1813,7 +1829,7 @@ function SessionPage() {
             <i className="bi bi-terminal"></i>
           </div>
           <div className="min-w-0 flex-grow-1">
-            <h1>{session.task}</h1>
+            <h1>{sessionTitle(session)}</h1>
             <div className="status-line">
               {isRunning && <span className="live-dot" />}
               <span>
