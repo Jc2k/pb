@@ -21,6 +21,9 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
+use crate::integrations::{
+    self, InstalledIntegration, IntegrationInstallRequest, MarketplaceIntegration,
+};
 use crate::projects::{
     self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
 };
@@ -251,6 +254,14 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
         .route(
+            "/api/integrations/marketplace",
+            get(list_marketplace_integrations),
+        )
+        .route(
+            "/api/projects/{name}/integrations",
+            get(list_project_integrations).post(install_project_integration),
+        )
+        .route(
             "/api/projects/{name}/notifications",
             patch(update_project_notifications),
         )
@@ -295,6 +306,42 @@ fn notify_ready(
     if let Some(sender) = ready.take() {
         let _ = sender.send(result);
     }
+}
+
+async fn list_marketplace_integrations() -> Result<Json<Vec<MarketplaceIntegration>>, StatusCode> {
+    integrations::list_marketplace()
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+async fn list_project_integrations(
+    Path(name): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<Vec<InstalledIntegration>>, StatusCode> {
+    let projects = state.projects.lock().await;
+    let project = projects
+        .iter()
+        .find(|project| project.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    integrations::list_installed(&PathBuf::from(&project.path))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn install_project_integration(
+    Path(name): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<IntegrationInstallRequest>,
+) -> Result<Json<InstalledIntegration>, StatusCode> {
+    let projects = state.projects.lock().await;
+    let project = projects
+        .iter()
+        .find(|project| project.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    integrations::install(&PathBuf::from(&project.path), req)
+        .map(|response| Json(response.installed))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn start_session(

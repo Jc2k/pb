@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep};
 use crate::agent_core::AgentProfile;
 use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
+use crate::integrations::{IntegrationInstallRequest, IntegrationKind};
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 pub mod agent_core;
@@ -24,6 +25,7 @@ pub mod environment;
 pub mod events;
 mod github_oauth;
 pub mod init;
+pub mod integrations;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
@@ -89,6 +91,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// List and install project-scoped MCP/LSP integrations
+    #[command(name = "integrations", alias = "integration")]
+    Integrations {
+        #[command(subcommand)]
+        command: IntegrationsCommand,
+    },
     /// Manage the pb serve launchd service (macOS)
     #[command(name = "service")]
     Service {
@@ -150,6 +158,54 @@ pub enum McpCommand {
         #[command(subcommand)]
         command: McpSetupCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IntegrationsCommand {
+    /// List marketplace and installed integrations for this project
+    List(IntegrationsListArgs),
+    /// Add a project-scoped MCP or LSP integration by container image
+    Add(IntegrationsAddArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct IntegrationsListArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Only show integrations of this kind: mcp or lsp
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Include marketplace entries from the crunchy-pb GitHub org
+    #[arg(long)]
+    pub marketplace: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct IntegrationsAddArgs {
+    /// Integration kind: mcp or lsp
+    pub kind: String,
+
+    /// Container image to configure, for example ghcr.io/crunchy-pb/sentry-mcp:latest
+    pub container_image: String,
+
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Server name to write in the per-project config; defaults to the image name
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Container runtime command used to run the integration
+    #[arg(long, default_value = "docker")]
+    pub runtime: String,
+
+    /// Do not overwrite an existing integration with the same name
+    #[arg(long)]
+    pub no_overwrite: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -474,6 +530,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Projects { command } => run_projects_command(command).await,
         Commands::Env { command } => run_env_command(command),
         Commands::Mcp { command } => run_mcp_command(command).await,
+        Commands::Integrations { command } => run_integrations_command(command).await,
         Commands::Service { command } => run_service_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
@@ -585,6 +642,71 @@ fn run_config_command(command: ConfigCommand) -> Result<()> {
         ConfigCommand::Show => {
             let config = UserConfig::load()?;
             print!("{}", config.to_pretty_toml()?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
+    match command {
+        IntegrationsCommand::List(args) => {
+            let root = resolve_env_root(args.workdir)?;
+            let filter = args
+                .kind
+                .as_deref()
+                .map(IntegrationKind::parse)
+                .transpose()?;
+            let installed = integrations::list_installed(&root)?;
+            if installed.is_empty() {
+                println!("no project integrations installed");
+            } else {
+                for item in installed
+                    .iter()
+                    .filter(|item| filter.is_none_or(|kind| item.kind == kind))
+                {
+                    println!(
+                        "installed	{}	{}	{}",
+                        item.kind.as_str(),
+                        item.name,
+                        item.container_image
+                    );
+                }
+            }
+            if args.marketplace {
+                for item in integrations::list_marketplace()
+                    .await?
+                    .into_iter()
+                    .filter(|item| filter.is_none_or(|kind| item.kind == kind))
+                {
+                    println!(
+                        "marketplace	{}	{}	{}	{}",
+                        item.kind.as_str(),
+                        item.name,
+                        item.container_image,
+                        item.description
+                    );
+                }
+            }
+        }
+        IntegrationsCommand::Add(args) => {
+            let root = resolve_env_root(args.workdir)?;
+            let response = integrations::install(
+                &root,
+                IntegrationInstallRequest {
+                    kind: IntegrationKind::parse(&args.kind)?,
+                    container_image: args.container_image,
+                    name: args.name,
+                    runtime: Some(args.runtime),
+                    no_overwrite: args.no_overwrite,
+                },
+            )?;
+            println!(
+                "installed {} integration '{}' from {} in {}",
+                response.installed.kind.as_str(),
+                response.installed.name,
+                response.installed.container_image,
+                response.config_path
+            );
         }
     }
     Ok(())
