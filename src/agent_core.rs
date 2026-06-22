@@ -820,6 +820,9 @@ fn build_agent_instructions(
         "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
     );
     instructions.push_str(
+        "Near the start of each new task, call session_title with a concise 3-8 word summary suitable as a heading or session table row.\n",
+    );
+    instructions.push_str(
         "When one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass.\n",
     );
     instructions.push_str(
@@ -1045,6 +1048,7 @@ impl BuiltInToolSchema {
             "web_fetch" => "web_fetch(url)",
             "git_log" => "git_log()",
             "session_changes" => "session_changes(path,commits,max_results)",
+            "session_title" => "session_title(title)",
             "todo" => "todo(action,id,title,description,status,parent_id,note)",
             "skill_search" => "skill_search(query,max_results)",
             "skill" => "skill(name)",
@@ -1184,6 +1188,17 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                     ),
                 ],
                 [],
+            ),
+        ),
+        builtin_tool(
+            "session_title",
+            "Set a short human-readable title for this session. Use this near the start of a new task after understanding the user request, and update it if the scope changes. The title should work as a table row label or page heading.",
+            object_schema(
+                [string_property(
+                    "title",
+                    "Concise session title, usually 3-8 words.",
+                )],
+                ["title"],
             ),
         ),
         builtin_tool(
@@ -2657,6 +2672,22 @@ fn run_tool(
             }
         }
         "session_changes" => run_session_changes(arguments, workspace_root),
+        "session_title" => {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .context("session_title requires string argument: title")?
+                .trim();
+            if title.is_empty() {
+                bail!("session_title title must not be empty");
+            }
+            let title = title.chars().take(80).collect::<String>();
+            sink.emit(AgentEvent::SessionTitle {
+                title: title.clone(),
+                timestamp_ms: Some(now_millis()),
+            });
+            Ok(format!("session title set: {title}"))
+        }
         "todo" => run_todo_tool(arguments, context.todo_memory),
         "memory_search" => {
             memory::search_tool(arguments, workspace_root, context.personal_memory_repo)

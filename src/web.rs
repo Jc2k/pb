@@ -99,6 +99,7 @@ pub struct SessionResponse {
 pub struct SessionListItem {
     pub session_id: String,
     pub task: String,
+    pub title: Option<String>,
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
@@ -111,6 +112,7 @@ pub struct SessionListItem {
 pub struct SessionDetails {
     pub session_id: String,
     pub task: String,
+    pub title: Option<String>,
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
@@ -191,6 +193,7 @@ struct PendingQuestionState {
 #[derive(Debug)]
 struct SessionState {
     task: String,
+    title: Option<String>,
     branch: Option<String>,
     workdir: Option<PathBuf>,
     request_template: AgentRequest,
@@ -363,6 +366,7 @@ async fn start_session_inner(
     let now = now_millis();
     let session = SessionState {
         task: request.task.clone(),
+        title: None,
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
         request_template: request.clone(),
@@ -473,6 +477,7 @@ async fn continue_session(
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
     session.task = request.task.clone();
+    session.title = None;
     session.request_template = request.clone();
     session.running = false;
     session.paused = false;
@@ -654,6 +659,7 @@ async fn list_sessions(
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
+            title: session.title.clone(),
             running: session.running,
             paused: session.paused,
             status: session.status,
@@ -686,6 +692,7 @@ async fn get_session(
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
+        title: session.title.clone(),
         running: session.running,
         paused: session.paused,
         status: session.status,
@@ -807,6 +814,18 @@ impl EventSink for WebEventSink {
         {
             self.persisted_workdir = Some(PathBuf::from(workspace));
             self.persisted_branch = Some(branch.clone());
+        }
+        if let AgentEvent::SessionTitle { title, .. } = &event {
+            let title = title.trim().to_string();
+            if !title.is_empty() {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut sessions = self.state.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&self.session_id) {
+                        session.title = Some(title);
+                        session.updated_at_ms = now_millis();
+                    }
+                });
+            }
         }
         publish_event(&self.sender, &self.history, event);
         persist_session_snapshot(
@@ -1319,6 +1338,7 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
         session_id,
         SessionState {
             task: persisted.task,
+            title: persisted.title,
             branch: persisted.branch,
             workdir: persisted.workdir,
             request_template: persisted.request_template,
@@ -1374,6 +1394,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
+            title: session.title.clone(),
             running: session.running,
             paused: session.paused,
             status: session.status,
@@ -1414,6 +1435,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
+        title: session.title.clone(),
         running: session.running,
         paused: session.paused,
         status: session.status,
