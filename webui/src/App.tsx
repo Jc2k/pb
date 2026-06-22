@@ -1440,7 +1440,7 @@ function ProjectsPage() {
       </section>
 
       <section className="sessions-section">
-        <div className="session-list list-group">
+        <div className="project-list session-list list-group">
           {projects.length === 0 ? (
             <div className="list-group-item text-secondary small">
               No registered projects. Add one with <code>pb projects add</code>.
@@ -1452,11 +1452,11 @@ function ProjectsPage() {
               return (
                 <div
                   key={project.name}
-                  className="session-row list-group-item py-3 px-4"
+                  className="project-row session-row list-group-item py-3 px-4"
                 >
                   <div className="session-icon"><i className="bi bi-folder2-open"></i></div>
                   <Link
-                    className="session-main text-decoration-none text-reset"
+                    className="project-main session-main text-decoration-none text-reset"
                     to={`/projects/${encodeURIComponent(project.name)}`}
                   >
                     <strong>{project.name}</strong>
