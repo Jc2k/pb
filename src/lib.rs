@@ -690,17 +690,19 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
         }
         IntegrationsCommand::Add(args) => {
             let root = resolve_env_root(args.workdir)?;
-            let response = integrations::install(
-                &root,
-                IntegrationInstallRequest {
-                    kind: IntegrationKind::parse(&args.kind)?,
-                    container_image: args.container_image,
-                    name: args.name,
-                    runtime: Some(args.runtime),
-                    env: Default::default(),
-                    no_overwrite: args.no_overwrite,
-                },
-            )?;
+            let kind = IntegrationKind::parse(&args.kind)?;
+            let request = IntegrationInstallRequest {
+                kind,
+                container_image: args.container_image,
+                name: args.name,
+                runtime: Some(args.runtime),
+                env: Default::default(),
+                no_overwrite: args.no_overwrite,
+            };
+            let response = match kind {
+                IntegrationKind::Mcp => integrations::install_project(&root, request),
+                IntegrationKind::Lsp => integrations::install_global_lsp(request),
+            }?;
             println!(
                 "installed {} integration '{}' from {} in {}",
                 response.installed.kind.as_str(),
