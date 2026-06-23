@@ -71,7 +71,7 @@ export function Aside() {
         <Link className="nav-link" to="/projects">
           <i className="bi bi-folder2-open"></i> Projects
         </Link>
-        <Link className="nav-link" to="/projects">
+        <Link className="nav-link" to="/integrations">
           <i className="bi bi-plug"></i> Integrations
         </Link>
         <Link className="nav-link" to="/settings">

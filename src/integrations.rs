@@ -1,4 +1,4 @@
-//! Marketplace discovery and per-project integration installation.
+//! Marketplace discovery and integration installation.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use crate::lsp::{LspServerConfig, ProjectLspConfig};
+use crate::config::{self, UserConfig};
+use crate::lsp::LspServerConfig;
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 const MARKETPLACE_ORG: &str = "crunchy-pb";
@@ -185,7 +186,7 @@ fn find_annotation<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     }
 }
 
-pub fn list_installed(workspace_root: &Path) -> Result<Vec<InstalledIntegration>> {
+pub fn list_project_installed(workspace_root: &Path) -> Result<Vec<InstalledIntegration>> {
     let mut installed = Vec::new();
     if let Some(config) = ProjectMcpConfig::load(workspace_root)? {
         installed.extend(config.servers.into_iter().filter_map(|(name, server)| {
@@ -194,18 +195,6 @@ pub fn list_installed(workspace_root: &Path) -> Result<Vec<InstalledIntegration>
                 .map(|container_image| InstalledIntegration {
                     name,
                     kind: IntegrationKind::Mcp,
-                    container_image,
-                    disabled: server.disabled,
-                })
-        }));
-    }
-    if let Some(config) = ProjectLspConfig::load(workspace_root)? {
-        installed.extend(config.servers.into_iter().filter_map(|(name, server)| {
-            server
-                .container_image
-                .map(|container_image| InstalledIntegration {
-                    name,
-                    kind: IntegrationKind::Lsp,
                     container_image,
                     disabled: server.disabled,
                 })
@@ -220,7 +209,7 @@ pub fn list_installed(workspace_root: &Path) -> Result<Vec<InstalledIntegration>
     Ok(installed)
 }
 
-pub fn install(
+pub fn install_project(
     workspace_root: &Path,
     request: IntegrationInstallRequest,
 ) -> Result<IntegrationInstallResponse> {
@@ -259,34 +248,67 @@ pub fn install(
                     .to_string(),
             })
         }
-        IntegrationKind::Lsp => {
-            let mut config = ProjectLspConfig::load(workspace_root)?.unwrap_or_default();
-            if request.no_overwrite && config.servers.contains_key(&name) {
-                bail!("LSP integration '{name}' is already installed");
-            }
-            config.servers.insert(
-                name.clone(),
-                LspServerConfig {
-                    container_image: Some(request.container_image.clone()),
-                    container_runtime: Some(runtime),
-                    env: request.env.clone(),
-                    ..Default::default()
-                },
-            );
-            config.save(workspace_root)?;
-            Ok(IntegrationInstallResponse {
-                installed: InstalledIntegration {
+        IntegrationKind::Lsp => bail!("LSP integrations are configured globally"),
+    }
+}
+
+pub fn list_global_lsp_installed() -> Result<Vec<InstalledIntegration>> {
+    let config = UserConfig::load()?;
+    let mut installed: Vec<_> = config
+        .lsp
+        .servers
+        .into_iter()
+        .filter_map(|(name, server)| {
+            server
+                .container_image
+                .map(|container_image| InstalledIntegration {
                     name,
                     kind: IntegrationKind::Lsp,
-                    container_image: request.container_image,
-                    disabled: false,
-                },
-                config_path: crate::lsp::project_lsp_config_path(workspace_root)
-                    .display()
-                    .to_string(),
-            })
-        }
+                    container_image,
+                    disabled: server.disabled,
+                })
+        })
+        .collect();
+    installed.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(installed)
+}
+
+pub fn install_global_lsp(
+    request: IntegrationInstallRequest,
+) -> Result<IntegrationInstallResponse> {
+    if request.kind != IntegrationKind::Lsp {
+        bail!("only LSP integrations can be installed globally");
     }
+    let name = request
+        .name
+        .unwrap_or_else(|| name_from_image(&request.container_image));
+    if name.trim().is_empty() || name.contains(['\n', '\r']) {
+        bail!("integration name cannot be empty or contain newlines");
+    }
+    let runtime = request.runtime.unwrap_or_else(|| "docker".to_string());
+    let mut user_config = UserConfig::load()?;
+    if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
+        bail!("LSP integration '{name}' is already installed");
+    }
+    user_config.lsp.servers.insert(
+        name.clone(),
+        LspServerConfig {
+            container_image: Some(request.container_image.clone()),
+            container_runtime: Some(runtime),
+            env: request.env.clone(),
+            ..Default::default()
+        },
+    );
+    user_config.save()?;
+    Ok(IntegrationInstallResponse {
+        installed: InstalledIntegration {
+            name,
+            kind: IntegrationKind::Lsp,
+            container_image: request.container_image,
+            disabled: false,
+        },
+        config_path: config::config_path()?.display().to_string(),
+    })
 }
 
 fn name_from_image(image: &str) -> String {
@@ -315,7 +337,7 @@ mod tests {
     #[test]
     fn install_writes_project_scoped_mcp_config() {
         let dir = tempfile::tempdir().unwrap();
-        let response = install(
+        let response = install_project(
             dir.path(),
             IntegrationInstallRequest {
                 kind: IntegrationKind::Mcp,
