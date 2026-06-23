@@ -697,6 +697,7 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                     container_image: args.container_image,
                     name: args.name,
                     runtime: Some(args.runtime),
+                    env: Default::default(),
                     no_overwrite: args.no_overwrite,
                 },
             )?;
