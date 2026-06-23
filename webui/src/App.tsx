@@ -1222,7 +1222,6 @@ function HomePage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [customImage, setCustomImage] = useState("");
-  const [customKind, setCustomKind] = useState<IntegrationKind>("mcp");
   const navigate = useNavigate();
 
   const queuedCount = sessions.filter(
@@ -1534,7 +1533,6 @@ function ProjectPage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [customImage, setCustomImage] = useState("");
-  const [customKind, setCustomKind] = useState<IntegrationKind>("mcp");
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = project ? sessions.filter((session) => session.workdir === project.path) : [];
@@ -1569,6 +1567,17 @@ function ProjectPage() {
   useEffect(() => {
     void fetchInstalledIntegrations();
   }, [name]);
+
+  const integrationRepoNameFromImage = (image: string) => {
+    const repoWithTag = image.trim().split("/").pop() || "";
+    return repoWithTag.split(":")[0];
+  };
+
+  const customMarketplaceIntegration = marketplace.find((item) => {
+    const image = customImage.trim();
+    if (!image) return false;
+    return item.container_image === image || item.name === integrationRepoNameFromImage(image);
+  });
 
   const installIntegration = async (kind: IntegrationKind, containerImage: string, integrationName?: string) => {
     if (!project || !containerImage.trim()) return;
@@ -1657,21 +1666,42 @@ function ProjectPage() {
               </div>
             ))}
           </div>
-          <form className="card start-card p-3 mb-3" onSubmit={(e) => { e.preventDefault(); void installIntegration(customKind, customImage); }}>
-            <div className="row g-2">
-              <div className="col-12 col-md-2">
-                <select className="form-select" value={customKind} onChange={(e) => setCustomKind(e.target.value as IntegrationKind)}>
-                  <option value="mcp">MCP</option>
-                  <option value="lsp">LSP</option>
-                </select>
-              </div>
+          <form
+            className="card start-card p-3 mb-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (customMarketplaceIntegration) {
+                void installIntegration(customMarketplaceIntegration.kind, customImage, customMarketplaceIntegration.name);
+              }
+            }}
+          >
+            <div className="row g-2 align-items-center">
               <div className="col-12 col-md-8">
-                <input className="form-control" value={customImage} onChange={(e) => setCustomImage(e.target.value)} placeholder="ghcr.io/crunchy-pb/sentry-mcp:latest" />
+                <input
+                  className="form-control"
+                  value={customImage}
+                  onChange={(e) => setCustomImage(e.target.value)}
+                  placeholder="ghcr.io/crunchy-pb/sentry-mcp:latest"
+                />
+              </div>
+              <div className="col-12 col-md-2">
+                {customImage.trim() ? (
+                  <span className="badge text-bg-light text-uppercase">
+                    {customMarketplaceIntegration?.kind || "unknown"}
+                  </span>
+                ) : (
+                  <span className="text-secondary small">Kind comes from repo tag</span>
+                )}
               </div>
               <div className="col-12 col-md-2 d-grid">
-                <button className="btn btn-outline-primary" disabled={!customImage.trim()}>Add</button>
+                <button className="btn btn-outline-primary" disabled={!customMarketplaceIntegration}>Add</button>
               </div>
             </div>
+            {customImage.trim() && !customMarketplaceIntegration && (
+              <p className="text-secondary small mb-0 mt-2">
+                Add the GitHub repo to the marketplace with an <code>mcp</code> or <code>lsp</code> topic so pb can infer its kind.
+              </p>
+            )}
           </form>
           <div className="project-list session-list list-group mb-4">
             {marketplace.length === 0 ? (
