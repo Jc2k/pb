@@ -267,6 +267,10 @@ pub async fn run_server_with_ready(
             get(list_project_integrations).post(install_project_integration),
         )
         .route(
+            "/api/integrations/lsp",
+            get(list_global_lsp_integrations).post(install_global_lsp_integration),
+        )
+        .route(
             "/api/projects/{name}/notifications",
             patch(update_project_notifications),
         )
@@ -344,7 +348,7 @@ async fn list_project_integrations(
         .iter()
         .find(|project| project.name == name)
         .ok_or(StatusCode::NOT_FOUND)?;
-    integrations::list_installed(&PathBuf::from(&project.path))
+    integrations::list_project_installed(&PathBuf::from(&project.path))
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -359,7 +363,21 @@ async fn install_project_integration(
         .iter()
         .find(|project| project.name == name)
         .ok_or(StatusCode::NOT_FOUND)?;
-    integrations::install(&PathBuf::from(&project.path), req)
+    integrations::install_project(&PathBuf::from(&project.path), req)
+        .map(|response| Json(response.installed))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn list_global_lsp_integrations() -> Result<Json<Vec<InstalledIntegration>>, StatusCode> {
+    integrations::list_global_lsp_installed()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn install_global_lsp_integration(
+    Json(req): Json<IntegrationInstallRequest>,
+) -> Result<Json<InstalledIntegration>, StatusCode> {
+    integrations::install_global_lsp(req)
         .map(|response| Json(response.installed))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }

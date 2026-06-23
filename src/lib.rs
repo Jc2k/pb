@@ -656,7 +656,7 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 .as_deref()
                 .map(IntegrationKind::parse)
                 .transpose()?;
-            let installed = integrations::list_installed(&root)?;
+            let installed = integrations::list_project_installed(&root)?;
             if installed.is_empty() {
                 println!("no project integrations installed");
             } else {
