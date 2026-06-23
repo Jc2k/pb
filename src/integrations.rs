@@ -12,7 +12,7 @@ use crate::lsp::LspServerConfig;
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 const MARKETPLACE_ORG: &str = "crunchy-pb";
-pub const CONFIG_SCHEMA_ANNOTATION: &str = "io.github.crunchy-pb.integration.config-schema";
+pub const CONFIG_SCHEMA_ANNOTATION: &str = "uk.unrtd.pb.integration.config-schema";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
