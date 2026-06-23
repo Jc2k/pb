@@ -208,6 +208,147 @@ interface InstalledIntegration {
   disabled: boolean;
 }
 
+type JsonSchemaProperty = {
+  type?: string | string[];
+  title?: string;
+  description?: string;
+  default?: string | number | boolean;
+  enum?: Array<string | number | boolean>;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+};
+
+type IntegrationJsonSchema = {
+  title?: string;
+  description?: string;
+  type?: string;
+  required?: string[];
+  properties?: Record<string, JsonSchemaProperty>;
+};
+
+interface IntegrationConfigSchemaResponse {
+  container_image: string;
+  annotation: string;
+  schema?: IntegrationJsonSchema | null;
+}
+
+interface PendingIntegrationInstall {
+  kind: IntegrationKind;
+  containerImage: string;
+  name?: string;
+}
+
+
+function schemaPropertyType(property: JsonSchemaProperty): string {
+  return Array.isArray(property.type) ? property.type.find((item) => item !== "null") || "string" : property.type || "string";
+}
+
+function validateIntegrationConfig(schema: IntegrationJsonSchema | null | undefined, values: Record<string, string>) {
+  const errors: Record<string, string> = {};
+  if (!schema?.properties) return errors;
+  const required = new Set(schema.required || []);
+  for (const [key, property] of Object.entries(schema.properties)) {
+    const value = values[key] || "";
+    if (required.has(key) && !value.trim()) {
+      errors[key] = "This field is required.";
+      continue;
+    }
+    if (!value) continue;
+    if (property.enum?.length && !property.enum.map(String).includes(value)) errors[key] = "Choose one of the allowed values.";
+    if (property.minLength !== undefined && value.length < property.minLength) errors[key] = `Use at least ${property.minLength} characters.`;
+    if (property.maxLength !== undefined && value.length > property.maxLength) errors[key] = `Use ${property.maxLength} characters or fewer.`;
+    if (property.pattern) {
+      try {
+        if (!new RegExp(property.pattern).test(value)) errors[key] = "Use the expected format.";
+      } catch {
+        // Ignore invalid schema patterns from third-party images.
+      }
+    }
+  }
+  return errors;
+}
+
+function IntegrationConfigForm({
+  pending,
+  schemaResponse,
+  loading,
+  error,
+  onCancel,
+  onInstall,
+}: {
+  pending: PendingIntegrationInstall;
+  schemaResponse?: IntegrationConfigSchemaResponse | null;
+  loading: boolean;
+  error?: string;
+  onCancel: () => void;
+  onInstall: (env: Record<string, string>) => void;
+}) {
+  const schema = schemaResponse?.schema || null;
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [touched, setTouched] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    const next: Record<string, string> = {};
+    for (const [key, property] of Object.entries(schema?.properties || {})) {
+      if (property.default !== undefined) next[key] = String(property.default);
+    }
+    setValues(next);
+    setTouched({});
+  }, [schemaResponse?.container_image]);
+
+  const validationErrors = validateIntegrationConfig(schema, values);
+  const fields = Object.entries(schema?.properties || {});
+  const canSubmit = !loading && Object.keys(validationErrors).length === 0;
+
+  return (
+    <form className="card start-card p-3 mb-3 border-primary-subtle" onSubmit={(event) => {
+      event.preventDefault();
+      const allTouched = Object.fromEntries(fields.map(([key]) => [key, true]));
+      setTouched(allTouched);
+      if (canSubmit) onInstall(Object.fromEntries(Object.entries(values).filter(([, value]) => value.trim() !== "")));
+    }}>
+      <div className="d-flex align-items-start justify-content-between gap-3 mb-3">
+        <div>
+          <h3 className="h6 fw-bold mb-1">Configure {pending.name || pending.containerImage}</h3>
+          <p className="text-secondary small mb-0">Values are stored as key/value config and passed as environment variables when the container starts.</p>
+        </div>
+        <span className="badge text-bg-light text-uppercase">{pending.kind}</span>
+      </div>
+      {loading && <div className="alert alert-info py-2 small"><span className="spinner-border spinner-border-sm me-2" />Fetching container schema annotation…</div>}
+      {error && <div className="alert alert-warning py-2 small">Could not fetch the schema annotation, so this integration can be installed without extra fields. {error}</div>}
+      {!loading && !error && fields.length === 0 && <div className="alert alert-secondary py-2 small">This container does not publish a configuration schema annotation, so it will be installed without extra environment values.</div>}
+      {schema?.description && <p className="small text-secondary">{schema.description}</p>}
+      <div className="row g-3">
+        {fields.map(([key, property]) => {
+          const label = property.title || key;
+          const type = schemaPropertyType(property);
+          const isInvalid = Boolean(touched[key] && validationErrors[key]);
+          return (
+            <div className="col-12 col-md-6" key={key}>
+              <label className="form-label small fw-semibold" htmlFor={`integration-config-${key}`}>{label}{schema?.required?.includes(key) && <span className="text-danger ms-1">*</span>}</label>
+              {property.enum?.length ? (
+                <select id={`integration-config-${key}`} className={`form-select ${isInvalid ? "is-invalid" : ""}`} value={values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))}>
+                  <option value="">Choose…</option>
+                  {property.enum.map((option) => <option key={String(option)} value={String(option)}>{String(option)}</option>)}
+                </select>
+              ) : (
+                <input id={`integration-config-${key}`} className={`form-control ${isInvalid ? "is-invalid" : ""}`} type={type === "integer" || type === "number" ? "number" : type === "boolean" ? "checkbox" : "text"} checked={type === "boolean" ? values[key] === "true" : undefined} value={type === "boolean" ? undefined : values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: type === "boolean" ? String(event.target.checked) : event.target.value }))} />
+              )}
+              {property.description && <div className="form-text">{property.description}</div>}
+              {isInvalid && <div className="invalid-feedback d-block">{validationErrors[key]}</div>}
+            </div>
+          );
+        })}
+      </div>
+      <div className="d-flex justify-content-end gap-2 mt-3">
+        <button type="button" className="btn btn-outline-secondary" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" disabled={!canSubmit}>{fields.length ? "Install with config" : "Install"}</button>
+      </div>
+    </form>
+  );
+}
+
 /* ─── custom router removed - using react-router-dom instead ─ */
 
 /* ─── avatar helpers ─────────────────────────────────────────── */
@@ -1222,6 +1363,10 @@ function HomePage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [customImage, setCustomImage] = useState("");
+  const [pendingInstall, setPendingInstall] = useState<PendingIntegrationInstall | null>(null);
+  const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [schemaError, setSchemaError] = useState("");
   const navigate = useNavigate();
 
   const queuedCount = sessions.filter(
@@ -1533,6 +1678,10 @@ function ProjectPage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [customImage, setCustomImage] = useState("");
+  const [pendingInstall, setPendingInstall] = useState<PendingIntegrationInstall | null>(null);
+  const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [schemaError, setSchemaError] = useState("");
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = project ? sessions.filter((session) => session.workdir === project.path) : [];
@@ -1579,15 +1728,42 @@ function ProjectPage() {
     return item.container_image === image || item.name === integrationRepoNameFromImage(image);
   });
 
-  const installIntegration = async (kind: IntegrationKind, containerImage: string, integrationName?: string) => {
+  const prepareIntegrationInstall = async (kind: IntegrationKind, containerImage: string, integrationName?: string) => {
     if (!project || !containerImage.trim()) return;
+    const pending = { kind, containerImage: containerImage.trim(), name: integrationName };
+    setPendingInstall(pending);
+    setConfigSchema(null);
+    setSchemaError("");
+    setSchemaLoading(true);
+    try {
+      const res = await fetch(`/api/integrations/config-schema?image=${encodeURIComponent(pending.containerImage)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setConfigSchema((await res.json()) as IntegrationConfigSchemaResponse);
+    } catch (err) {
+      setSchemaError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setSchemaLoading(false);
+    }
+  };
+
+  const installIntegration = async (env: Record<string, string> = {}) => {
+    if (!project || !pendingInstall) return;
     const res = await fetch(`/api/projects/${encodeURIComponent(project.name)}/integrations`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind, container_image: containerImage.trim(), name: integrationName, runtime: "docker" }),
+      body: JSON.stringify({
+        kind: pendingInstall.kind,
+        container_image: pendingInstall.containerImage,
+        name: pendingInstall.name,
+        runtime: "docker",
+        env,
+      }),
     });
     if (res.ok) {
       setCustomImage("");
+      setPendingInstall(null);
+      setConfigSchema(null);
+      setSchemaError("");
       void fetchInstalledIntegrations();
     }
   };
@@ -1671,7 +1847,7 @@ function ProjectPage() {
             onSubmit={(e) => {
               e.preventDefault();
               if (customMarketplaceIntegration) {
-                void installIntegration(customMarketplaceIntegration.kind, customImage, customMarketplaceIntegration.name);
+                void prepareIntegrationInstall(customMarketplaceIntegration.kind, customImage, customMarketplaceIntegration.name);
               }
             }}
           >
@@ -1703,6 +1879,16 @@ function ProjectPage() {
               </p>
             )}
           </form>
+          {pendingInstall && (
+            <IntegrationConfigForm
+              pending={pendingInstall}
+              schemaResponse={configSchema}
+              loading={schemaLoading}
+              error={schemaError}
+              onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }}
+              onInstall={(env) => void installIntegration(env)}
+            />
+          )}
           <div className="project-list session-list list-group mb-4">
             {marketplace.length === 0 ? (
               <div className="list-group-item text-secondary small">No marketplace integrations found.</div>
@@ -1715,7 +1901,7 @@ function ProjectPage() {
                     <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
                     <span>{item.description || item.container_image}</span>
                   </div>
-                  <button className="btn btn-sm btn-primary" disabled={isInstalled} onClick={() => void installIntegration(item.kind, item.container_image, item.name)}>
+                  <button className="btn btn-sm btn-primary" disabled={isInstalled} onClick={() => void prepareIntegrationInstall(item.kind, item.container_image, item.name)}>
                     {isInstalled ? "Installed" : "Install"}
                   </button>
                 </div>

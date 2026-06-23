@@ -22,7 +22,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::integrations::{
-    self, InstalledIntegration, IntegrationInstallRequest, MarketplaceIntegration,
+    self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
+    MarketplaceIntegration,
 };
 use crate::projects::{
     self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
@@ -258,6 +259,10 @@ pub async fn run_server_with_ready(
             get(list_marketplace_integrations),
         )
         .route(
+            "/api/integrations/config-schema",
+            get(get_integration_config_schema),
+        )
+        .route(
             "/api/projects/{name}/integrations",
             get(list_project_integrations).post(install_project_integration),
         )
@@ -311,6 +316,21 @@ fn notify_ready(
 async fn list_marketplace_integrations() -> Result<Json<Vec<MarketplaceIntegration>>, StatusCode> {
     integrations::list_marketplace()
         .await
+        .map(Json)
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+#[derive(Debug, Deserialize)]
+struct IntegrationSchemaQuery {
+    image: String,
+}
+
+async fn get_integration_config_schema(
+    Query(query): Query<IntegrationSchemaQuery>,
+) -> Result<Json<IntegrationConfigSchema>, StatusCode> {
+    tokio::task::spawn_blocking(move || integrations::fetch_config_schema(&query.image))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }

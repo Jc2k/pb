@@ -2,12 +2,16 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 
 use crate::lsp::{LspServerConfig, ProjectLspConfig};
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 const MARKETPLACE_ORG: &str = "crunchy-pb";
+pub const CONFIG_SCHEMA_ANNOTATION: &str = "io.github.crunchy-pb.integration.config-schema";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +62,8 @@ pub struct IntegrationInstallRequest {
     pub name: Option<String>,
     pub runtime: Option<String>,
     #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
     pub no_overwrite: bool,
 }
 
@@ -65,6 +71,13 @@ pub struct IntegrationInstallRequest {
 pub struct IntegrationInstallResponse {
     pub installed: InstalledIntegration,
     pub config_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntegrationConfigSchema {
+    pub container_image: String,
+    pub annotation: String,
+    pub schema: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +141,50 @@ pub fn marketplace_container_image(repo_name: &str) -> String {
     format!("ghcr.io/{MARKETPLACE_ORG}/{repo_name}:latest")
 }
 
+pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSchema> {
+    if container_image.trim().is_empty() {
+        bail!("container image cannot be empty");
+    }
+    let output = Command::new("docker")
+        .args(["manifest", "inspect", container_image])
+        .output()
+        .with_context(|| format!("failed to inspect container image {container_image}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to inspect container image {container_image}: {stderr}");
+    }
+    let manifest: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to decode manifest for {container_image}"))?;
+    let schema_text = find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION);
+    let schema = schema_text
+        .map(|text| {
+            serde_json::from_str(text)
+                .context("failed to parse integration config schema annotation")
+        })
+        .transpose()?;
+    Ok(IntegrationConfigSchema {
+        container_image: container_image.to_string(),
+        annotation: CONFIG_SCHEMA_ANNOTATION.to_string(),
+        schema,
+    })
+}
+
+fn find_annotation<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    if let Some(text) = value
+        .get("annotations")
+        .and_then(Value::as_object)
+        .and_then(|annotations| annotations.get(key))
+        .and_then(Value::as_str)
+    {
+        return Some(text);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(|item| find_annotation(item, key)),
+        Value::Object(map) => map.values().find_map(|item| find_annotation(item, key)),
+        _ => None,
+    }
+}
+
 pub fn list_installed(workspace_root: &Path) -> Result<Vec<InstalledIntegration>> {
     let mut installed = Vec::new();
     if let Some(config) = ProjectMcpConfig::load(workspace_root)? {
@@ -185,6 +242,7 @@ pub fn install(
                 McpServerConfig {
                     container_image: Some(request.container_image.clone()),
                     container_runtime: Some(runtime),
+                    env: request.env.clone(),
                     ..Default::default()
                 },
             );
@@ -211,6 +269,7 @@ pub fn install(
                 LspServerConfig {
                     container_image: Some(request.container_image.clone()),
                     container_runtime: Some(runtime),
+                    env: request.env.clone(),
                     ..Default::default()
                 },
             );
@@ -263,6 +322,7 @@ mod tests {
                 container_image: "ghcr.io/crunchy-pb/sentry-mcp:latest".to_string(),
                 name: None,
                 runtime: Some("docker".to_string()),
+                env: BTreeMap::from([("SENTRY_DSN".to_string(), "https://example".to_string())]),
                 no_overwrite: false,
             },
         )
@@ -272,6 +332,13 @@ mod tests {
         assert_eq!(
             config.servers["sentry-mcp"].container_image.as_deref(),
             Some("ghcr.io/crunchy-pb/sentry-mcp:latest")
+        );
+        assert_eq!(
+            config.servers["sentry-mcp"]
+                .env
+                .get("SENTRY_DSN")
+                .map(String::as_str),
+            Some("https://example")
         );
     }
 }
