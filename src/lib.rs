@@ -166,6 +166,8 @@ pub enum IntegrationsCommand {
     List(IntegrationsListArgs),
     /// Add a project-scoped MCP or LSP integration by container image
     Add(IntegrationsAddArgs),
+    /// Remove a configured project MCP or global LSP integration
+    Remove(IntegrationsRemoveArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -206,6 +208,19 @@ pub struct IntegrationsAddArgs {
     /// Do not overwrite an existing integration with the same name
     #[arg(long)]
     pub no_overwrite: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct IntegrationsRemoveArgs {
+    /// Integration kind: mcp or lsp
+    pub kind: String,
+
+    /// Configured integration/server name to remove
+    pub name: String,
+
+    /// Project root for MCP integrations; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -708,6 +723,22 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 response.installed.kind.as_str(),
                 response.installed.name,
                 response.installed.container_image,
+                response.config_path
+            );
+        }
+        IntegrationsCommand::Remove(args) => {
+            let kind = IntegrationKind::parse(&args.kind)?;
+            let response = match kind {
+                IntegrationKind::Mcp => {
+                    let root = resolve_env_root(args.workdir)?;
+                    integrations::remove_project(&root, kind, &args.name)
+                }
+                IntegrationKind::Lsp => integrations::remove_global_lsp(&args.name),
+            }?;
+            println!(
+                "removed {} integration '{}' from {}",
+                response.removed.kind.as_str(),
+                response.removed.name,
                 response.config_path
             );
         }

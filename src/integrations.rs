@@ -74,6 +74,12 @@ pub struct IntegrationInstallResponse {
     pub config_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationRemoveResponse {
+    pub removed: InstalledIntegration,
+    pub config_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntegrationConfigSchema {
     pub container_image: String,
@@ -252,6 +258,39 @@ pub fn install_project(
     }
 }
 
+pub fn remove_project(
+    workspace_root: &Path,
+    kind: IntegrationKind,
+    name: &str,
+) -> Result<IntegrationRemoveResponse> {
+    if kind != IntegrationKind::Mcp {
+        bail!("LSP integrations are configured globally");
+    }
+    if name.trim().is_empty() || name.contains(['\n', '\r']) {
+        bail!("integration name cannot be empty or contain newlines");
+    }
+    let mut config = ProjectMcpConfig::load(workspace_root)?.unwrap_or_default();
+    let server = config
+        .servers
+        .remove(name)
+        .with_context(|| format!("MCP integration '{name}' is not installed"))?;
+    let container_image = server
+        .container_image
+        .context("configured MCP server is not a container integration")?;
+    config.save(workspace_root)?;
+    Ok(IntegrationRemoveResponse {
+        removed: InstalledIntegration {
+            name: name.to_string(),
+            kind,
+            container_image,
+            disabled: server.disabled,
+        },
+        config_path: crate::mcp::project_mcp_config_path(workspace_root)
+            .display()
+            .to_string(),
+    })
+}
+
 pub fn list_global_lsp_installed() -> Result<Vec<InstalledIntegration>> {
     let config = UserConfig::load()?;
     let mut installed: Vec<_> = config
@@ -311,6 +350,31 @@ pub fn install_global_lsp(
     })
 }
 
+pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
+    if name.trim().is_empty() || name.contains(['\n', '\r']) {
+        bail!("integration name cannot be empty or contain newlines");
+    }
+    let mut user_config = UserConfig::load()?;
+    let server = user_config
+        .lsp
+        .servers
+        .remove(name)
+        .with_context(|| format!("LSP integration '{name}' is not installed"))?;
+    let container_image = server
+        .container_image
+        .context("configured LSP server is not a container integration")?;
+    user_config.save()?;
+    Ok(IntegrationRemoveResponse {
+        removed: InstalledIntegration {
+            name: name.to_string(),
+            kind: IntegrationKind::Lsp,
+            container_image,
+            disabled: server.disabled,
+        },
+        config_path: config::config_path()?.display().to_string(),
+    })
+}
+
 fn name_from_image(image: &str) -> String {
     image
         .rsplit('/')
@@ -332,6 +396,29 @@ mod tests {
             marketplace_container_image("sentry-mcp"),
             "ghcr.io/crunchy-pb/sentry-mcp:latest"
         );
+    }
+
+    #[test]
+    fn remove_deletes_project_scoped_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        install_project(
+            dir.path(),
+            IntegrationInstallRequest {
+                kind: IntegrationKind::Mcp,
+                container_image: "ghcr.io/crunchy-pb/sentry-mcp:latest".to_string(),
+                name: None,
+                runtime: Some("docker".to_string()),
+                env: BTreeMap::new(),
+                no_overwrite: false,
+            },
+        )
+        .unwrap();
+
+        let response = remove_project(dir.path(), IntegrationKind::Mcp, "sentry-mcp").unwrap();
+
+        assert_eq!(response.removed.name, "sentry-mcp");
+        let config = ProjectMcpConfig::load(dir.path()).unwrap().unwrap();
+        assert!(!config.servers.contains_key("sentry-mcp"));
     }
 
     #[test]

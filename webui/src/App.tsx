@@ -273,12 +273,14 @@ function IntegrationList({
   installedIcon,
   emptyText,
   onInstall,
+  onRemove,
 }: {
   marketplace: MarketplaceIntegration[];
   installed: InstalledIntegration[];
   installedIcon: string;
   emptyText: string;
   onInstall: (item: MarketplaceIntegration) => void;
+  onRemove?: (item: InstalledIntegration) => void;
 }) {
   const available = marketplace.filter((item) => !isIntegrationInstalled(item, installed));
   const hasItems = installed.length > 0 || available.length > 0;
@@ -296,7 +298,10 @@ function IntegrationList({
                 <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
                 <span>{item.container_image}</span>
               </div>
-              <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
+              <div className="d-flex align-items-center gap-2">
+                <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
+                {onRemove && <button className="btn btn-sm btn-outline-danger" onClick={() => onRemove(item)}>Remove</button>}
+              </div>
             </div>
           ))}
           {available.map((item) => (
@@ -1802,6 +1807,14 @@ function ProjectPage() {
     }
   };
 
+  const removeIntegration = async (item: InstalledIntegration) => {
+    if (!project || !window.confirm(`Remove ${item.name} from this project?`)) return;
+    const res = await fetch(`/api/projects/${encodeURIComponent(project.name)}/integrations/${encodeURIComponent(item.name)}`, {
+      method: "DELETE",
+    });
+    if (res.ok) void fetchInstalledIntegrations();
+  };
+
   const installIntegration = async (env: Record<string, string> = {}) => {
     if (!project || !pendingInstall) return;
     const res = await fetch(`/api/projects/${encodeURIComponent(project.name)}/integrations`, {
@@ -1889,6 +1902,7 @@ function ProjectPage() {
             installedIcon="bi bi-plug"
             emptyText="No marketplace integrations available to install."
             onInstall={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name)}
+            onRemove={(item) => void removeIntegration(item)}
           />
           {pendingInstall && (
             <IntegrationConfigForm
@@ -1960,6 +1974,14 @@ function IntegrationsPage() {
     }
   };
 
+  const removeIntegration = async (item: InstalledIntegration) => {
+    if (!window.confirm(`Remove ${item.name} from global configuration?`)) return;
+    const res = await fetch(`/api/integrations/lsp/${encodeURIComponent(item.name)}`, {
+      method: "DELETE",
+    });
+    if (res.ok) void fetchInstalledIntegrations();
+  };
+
   const installIntegration = async (env: Record<string, string> = {}) => {
     if (!pendingInstall) return;
     const res = await fetch("/api/integrations/lsp", {
@@ -2003,6 +2025,7 @@ function IntegrationsPage() {
           installedIcon="bi bi-code-slash"
           emptyText="No marketplace language servers available to install."
           onInstall={(item) => void prepareIntegrationInstall(item.container_image, item.name)}
+          onRemove={(item) => void removeIntegration(item)}
         />
         {pendingInstall && <IntegrationConfigForm pending={pendingInstall} schemaResponse={configSchema} loading={schemaLoading} error={schemaError} onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }} onInstall={(env) => void installIntegration(env)} />}
       </section>
