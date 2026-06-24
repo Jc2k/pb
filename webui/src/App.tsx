@@ -205,6 +205,7 @@ interface InstalledIntegration {
   name: string;
   kind: IntegrationKind;
   container_image: string;
+  env?: Record<string, string>;
   disabled: boolean;
 }
 
@@ -237,6 +238,8 @@ interface PendingIntegrationInstall {
   kind: IntegrationKind;
   containerImage: string;
   name?: string;
+  installed?: boolean;
+  env?: Record<string, string>;
 }
 
 function uniqueIntegrations<
@@ -274,6 +277,7 @@ function IntegrationList({
   emptyText,
   onInstall,
   onRemove,
+  onConfigure,
 }: {
   marketplace: MarketplaceIntegration[];
   installed: InstalledIntegration[];
@@ -281,6 +285,7 @@ function IntegrationList({
   emptyText: string;
   onInstall: (item: MarketplaceIntegration) => void;
   onRemove?: (item: InstalledIntegration) => void;
+  onConfigure: (item: MarketplaceIntegration | InstalledIntegration) => void;
 }) {
   const available = marketplace.filter((item) => !isIntegrationInstalled(item, installed));
   const hasItems = installed.length > 0 || available.length > 0;
@@ -300,6 +305,9 @@ function IntegrationList({
               </div>
               <div className="d-flex align-items-center gap-2">
                 <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
+                <button className="btn btn-sm btn-outline-secondary" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
+                  <i className="bi bi-gear"></i>
+                </button>
                 {onRemove && <button className="btn btn-sm btn-outline-danger" onClick={() => onRemove(item)}>Remove</button>}
               </div>
             </div>
@@ -311,7 +319,12 @@ function IntegrationList({
                 <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
                 <span>{item.description || item.container_image}</span>
               </div>
-              <button className="btn btn-sm btn-primary" onClick={() => onInstall(item)}>Install</button>
+              <div className="d-flex align-items-center gap-2">
+                <button className="btn btn-sm btn-outline-secondary" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
+                  <i className="bi bi-gear"></i>
+                </button>
+                <button className="btn btn-sm btn-primary" onClick={() => onInstall(item)}>Install</button>
+              </div>
             </div>
           ))}
         </>
@@ -371,11 +384,12 @@ function IntegrationConfigForm({
   useEffect(() => {
     const next: Record<string, string> = {};
     for (const [key, property] of Object.entries(schema?.properties || {})) {
-      if (property.default !== undefined) next[key] = String(property.default);
+      if (pending.env?.[key] !== undefined) next[key] = pending.env[key];
+      else if (property.default !== undefined) next[key] = String(property.default);
     }
     setValues(next);
     setTouched({});
-  }, [schemaResponse?.container_image]);
+  }, [schemaResponse?.container_image, pending.env]);
 
   const validationErrors = validateIntegrationConfig(schema, values);
   const fields = Object.entries(schema?.properties || {});
@@ -423,7 +437,9 @@ function IntegrationConfigForm({
       </div>
       <div className="d-flex justify-content-end gap-2 mt-3">
         <button type="button" className="btn btn-outline-secondary" onClick={onCancel}>Cancel</button>
-        <button className="btn btn-primary" disabled={!canSubmit}>{fields.length ? "Install with config" : "Install"}</button>
+        <button className="btn btn-primary" disabled={!canSubmit}>
+          {pending.installed ? "Save configuration" : fields.length ? "Install with config" : "Install"}
+        </button>
       </div>
     </form>
   );
@@ -1789,9 +1805,9 @@ function ProjectPage() {
     void fetchInstalledIntegrations();
   }, [name]);
 
-  const prepareIntegrationInstall = async (kind: IntegrationKind, containerImage: string, integrationName?: string) => {
+  const prepareIntegrationInstall = async (kind: IntegrationKind, containerImage: string, integrationName?: string, installed = false, env?: Record<string, string>) => {
     if (!project || !containerImage.trim()) return;
-    const pending = { kind, containerImage: containerImage.trim(), name: integrationName };
+    const pending = { kind, containerImage: containerImage.trim(), name: integrationName, installed, env };
     setPendingInstall(pending);
     setConfigSchema(null);
     setSchemaError("");
@@ -1902,6 +1918,7 @@ function ProjectPage() {
             installedIcon="bi bi-plug"
             emptyText="No marketplace integrations available to install."
             onInstall={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name)}
+            onConfigure={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name, "disabled" in item, "disabled" in item ? item.env : undefined)}
             onRemove={(item) => void removeIntegration(item)}
           />
           {pendingInstall && (
@@ -1956,9 +1973,9 @@ function IntegrationsPage() {
     if (res.ok) setInstalled(uniqueInstalledIntegrations((await res.json()) as InstalledIntegration[]));
   };
 
-  const prepareIntegrationInstall = async (containerImage: string, integrationName?: string) => {
+  const prepareIntegrationInstall = async (containerImage: string, integrationName?: string, installed = false, env?: Record<string, string>) => {
     if (!containerImage.trim()) return;
-    const pending = { kind: "lsp" as IntegrationKind, containerImage: containerImage.trim(), name: integrationName };
+    const pending = { kind: "lsp" as IntegrationKind, containerImage: containerImage.trim(), name: integrationName, installed, env };
     setPendingInstall(pending);
     setConfigSchema(null);
     setSchemaError("");
@@ -2025,6 +2042,7 @@ function IntegrationsPage() {
           installedIcon="bi bi-code-slash"
           emptyText="No marketplace language servers available to install."
           onInstall={(item) => void prepareIntegrationInstall(item.container_image, item.name)}
+          onConfigure={(item) => void prepareIntegrationInstall(item.container_image, item.name, "disabled" in item, "disabled" in item ? item.env : undefined)}
           onRemove={(item) => void removeIntegration(item)}
         />
         {pendingInstall && <IntegrationConfigForm pending={pendingInstall} schemaResponse={configSchema} loading={schemaLoading} error={schemaError} onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }} onInstall={(env) => void installIntegration(env)} />}
