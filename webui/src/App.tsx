@@ -239,6 +239,81 @@ interface PendingIntegrationInstall {
   name?: string;
 }
 
+function uniqueIntegrations<
+  T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
+>(entries: T[]): T[] {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = `${entry.kind}:${entry.name}:${entry.container_image}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueInstalledIntegrations(entries: InstalledIntegration[]): InstalledIntegration[] {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = `${entry.kind}:${entry.name}:${entry.container_image}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function isIntegrationInstalled(item: MarketplaceIntegration, installed: InstalledIntegration[]): boolean {
+  return installed.some((entry) =>
+    entry.kind === item.kind && (entry.container_image === item.container_image || entry.name === item.name)
+  );
+}
+
+function IntegrationList({
+  marketplace,
+  installed,
+  installedIcon,
+  emptyText,
+  onInstall,
+}: {
+  marketplace: MarketplaceIntegration[];
+  installed: InstalledIntegration[];
+  installedIcon: string;
+  emptyText: string;
+  onInstall: (item: MarketplaceIntegration) => void;
+}) {
+  const available = marketplace.filter((item) => !isIntegrationInstalled(item, installed));
+  const hasItems = installed.length > 0 || available.length > 0;
+
+  return (
+    <div className="project-list session-list list-group mb-4">
+      {!hasItems ? (
+        <div className="list-group-item text-secondary small">{emptyText}</div>
+      ) : (
+        <>
+          {installed.map((item) => (
+            <div key={`installed:${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4">
+              <div className="session-icon"><i className={installedIcon}></i></div>
+              <div className="project-main session-main">
+                <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
+                <span>{item.container_image}</span>
+              </div>
+              <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
+            </div>
+          ))}
+          {available.map((item) => (
+            <div key={`${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4">
+              <div className="session-icon"><img src={item.icon_url} alt="" width="24" height="24" style={{ borderRadius: "6px" }} /></div>
+              <div className="project-main session-main">
+                <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
+                <span>{item.description || item.container_image}</span>
+              </div>
+              <button className="btn btn-sm btn-primary" onClick={() => onInstall(item)}>Install</button>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
 
 function schemaPropertyType(property: JsonSchemaProperty): string {
   return Array.isArray(property.type) ? property.type.find((item) => item !== "null") || "string" : property.type || "string";
@@ -1360,13 +1435,6 @@ function HomePage() {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
-  const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
-  const [customImage, setCustomImage] = useState("");
-  const [pendingInstall, setPendingInstall] = useState<PendingIntegrationInstall | null>(null);
-  const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
-  const [schemaLoading, setSchemaLoading] = useState(false);
-  const [schemaError, setSchemaError] = useState("");
   const navigate = useNavigate();
 
   const queuedCount = sessions.filter(
@@ -1677,7 +1745,6 @@ function ProjectPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
-  const [customImage, setCustomImage] = useState("");
   const [pendingInstall, setPendingInstall] = useState<PendingIntegrationInstall | null>(null);
   const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
@@ -1694,7 +1761,7 @@ function ProjectPage() {
       .then((entries: ProjectEntry[]) => setProjects(entries));
     void fetch("/api/integrations/marketplace")
       .then((res) => (res.ok ? res.json() : []))
-      .then((entries: MarketplaceIntegration[]) => setMarketplace(entries.filter((entry) => entry.kind === "mcp")));
+      .then((entries: MarketplaceIntegration[]) => setMarketplace(uniqueIntegrations(entries.filter((entry) => entry.kind === "mcp"))));
   }, []);
 
   useEffect(() => {
@@ -1710,23 +1777,12 @@ function ProjectPage() {
   const fetchInstalledIntegrations = async () => {
     if (!name) return;
     const res = await fetch(`/api/projects/${encodeURIComponent(name)}/integrations`);
-    if (res.ok) setInstalled(((await res.json()) as InstalledIntegration[]).filter((entry) => entry.kind === "mcp"));
+    if (res.ok) setInstalled(uniqueInstalledIntegrations(((await res.json()) as InstalledIntegration[]).filter((entry) => entry.kind === "mcp")));
   };
 
   useEffect(() => {
     void fetchInstalledIntegrations();
   }, [name]);
-
-  const integrationRepoNameFromImage = (image: string) => {
-    const repoWithTag = image.trim().split("/").pop() || "";
-    return repoWithTag.split(":")[0];
-  };
-
-  const customMarketplaceIntegration = marketplace.find((item) => {
-    const image = customImage.trim();
-    if (!image) return false;
-    return item.container_image === image || item.name === integrationRepoNameFromImage(image);
-  });
 
   const prepareIntegrationInstall = async (kind: IntegrationKind, containerImage: string, integrationName?: string) => {
     if (!project || !containerImage.trim()) return;
@@ -1760,7 +1816,6 @@ function ProjectPage() {
       }),
     });
     if (res.ok) {
-      setCustomImage("");
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
@@ -1828,57 +1883,13 @@ function ProjectPage() {
               <p className="text-secondary small m-0">Install project-scoped MCP containers for new sessions.</p>
             </div>
           </div>
-          <div className="project-list session-list list-group mb-3">
-            {installed.length === 0 ? (
-              <div className="list-group-item text-secondary small">No integrations installed for this project yet.</div>
-            ) : installed.map((item) => (
-              <div key={`installed:${item.kind}:${item.name}`} className="project-row session-row list-group-item py-2 px-4">
-                <div className="session-icon"><i className="bi bi-plug"></i></div>
-                <div className="project-main session-main">
-                  <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
-                  <span>{item.container_image}</span>
-                </div>
-                <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
-              </div>
-            ))}
-          </div>
-          <form
-            className="card start-card p-3 mb-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (customMarketplaceIntegration) {
-                void prepareIntegrationInstall(customMarketplaceIntegration.kind, customImage, customMarketplaceIntegration.name);
-              }
-            }}
-          >
-            <div className="row g-2 align-items-center">
-              <div className="col-12 col-md-8">
-                <input
-                  className="form-control"
-                  value={customImage}
-                  onChange={(e) => setCustomImage(e.target.value)}
-                  placeholder="ghcr.io/crunchy-pb/sentry-mcp:latest"
-                />
-              </div>
-              <div className="col-12 col-md-2">
-                {customImage.trim() ? (
-                  <span className="badge text-bg-light text-uppercase">
-                    {customMarketplaceIntegration?.kind || "unknown"}
-                  </span>
-                ) : (
-                  <span className="text-secondary small">Kind comes from repo tag</span>
-                )}
-              </div>
-              <div className="col-12 col-md-2 d-grid">
-                <button className="btn btn-outline-primary" disabled={!customMarketplaceIntegration}>Add</button>
-              </div>
-            </div>
-            {customImage.trim() && !customMarketplaceIntegration && (
-              <p className="text-secondary small mb-0 mt-2">
-                Add the GitHub repo to the marketplace with an <code>mcp</code> topic so pb can infer its kind.
-              </p>
-            )}
-          </form>
+          <IntegrationList
+            marketplace={marketplace}
+            installed={installed}
+            installedIcon="bi bi-plug"
+            emptyText="No marketplace integrations available to install."
+            onInstall={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name)}
+          />
           {pendingInstall && (
             <IntegrationConfigForm
               pending={pendingInstall}
@@ -1889,25 +1900,6 @@ function ProjectPage() {
               onInstall={(env) => void installIntegration(env)}
             />
           )}
-          <div className="project-list session-list list-group mb-4">
-            {marketplace.length === 0 ? (
-              <div className="list-group-item text-secondary small">No marketplace integrations found.</div>
-            ) : marketplace.map((item) => {
-              const isInstalled = installed.some((entry) => entry.kind === item.kind && entry.container_image === item.container_image);
-              return (
-                <div key={`${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4">
-                  <div className="session-icon"><img src={item.icon_url} alt="" width="24" height="24" style={{ borderRadius: "6px" }} /></div>
-                  <div className="project-main session-main">
-                    <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
-                    <span>{item.description || item.container_image}</span>
-                  </div>
-                  <button className="btn btn-sm btn-primary" disabled={isInstalled} onClick={() => void prepareIntegrationInstall(item.kind, item.container_image, item.name)}>
-                    {isInstalled ? "Installed" : "Install"}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
         </section>
       )}
 
@@ -1933,7 +1925,6 @@ function ProjectPage() {
 function IntegrationsPage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
-  const [customImage, setCustomImage] = useState("");
   const [pendingInstall, setPendingInstall] = useState<PendingIntegrationInstall | null>(null);
   const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
@@ -1942,25 +1933,14 @@ function IntegrationsPage() {
   useEffect(() => {
     void fetch("/api/integrations/marketplace")
       .then((res) => (res.ok ? res.json() : []))
-      .then((entries: MarketplaceIntegration[]) => setMarketplace(entries.filter((entry) => entry.kind === "lsp")));
+      .then((entries: MarketplaceIntegration[]) => setMarketplace(uniqueIntegrations(entries.filter((entry) => entry.kind === "lsp"))));
     void fetchInstalledIntegrations();
   }, []);
 
   const fetchInstalledIntegrations = async () => {
     const res = await fetch("/api/integrations/lsp");
-    if (res.ok) setInstalled((await res.json()) as InstalledIntegration[]);
+    if (res.ok) setInstalled(uniqueInstalledIntegrations((await res.json()) as InstalledIntegration[]));
   };
-
-  const integrationRepoNameFromImage = (image: string) => {
-    const repoWithTag = image.trim().split("/").pop() || "";
-    return repoWithTag.split(":")[0];
-  };
-
-  const customMarketplaceIntegration = marketplace.find((item) => {
-    const image = customImage.trim();
-    if (!image) return false;
-    return item.container_image === image || item.name === integrationRepoNameFromImage(image);
-  });
 
   const prepareIntegrationInstall = async (containerImage: string, integrationName?: string) => {
     if (!containerImage.trim()) return;
@@ -1994,7 +1974,6 @@ function IntegrationsPage() {
       }),
     });
     if (res.ok) {
-      setCustomImage("");
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
@@ -2018,35 +1997,14 @@ function IntegrationsPage() {
             <p className="text-secondary small m-0">Install global LSP containers for code intelligence in new sessions.</p>
           </div>
         </div>
-        <div className="project-list session-list list-group mb-3">
-          {installed.length === 0 ? (
-            <div className="list-group-item text-secondary small">No language servers installed yet.</div>
-          ) : installed.map((item) => (
-            <div key={`installed:${item.kind}:${item.name}`} className="project-row session-row list-group-item py-2 px-4">
-              <div className="session-icon"><i className="bi bi-code-slash"></i></div>
-              <div className="project-main session-main">
-                <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
-                <span>{item.container_image}</span>
-              </div>
-              <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
-            </div>
-          ))}
-        </div>
-        <form className="card start-card p-3 mb-3" onSubmit={(e) => { e.preventDefault(); if (customMarketplaceIntegration) void prepareIntegrationInstall(customImage, customMarketplaceIntegration.name); }}>
-          <div className="row g-2 align-items-center">
-            <div className="col-12 col-md-8"><input className="form-control" value={customImage} onChange={(e) => setCustomImage(e.target.value)} placeholder="ghcr.io/crunchy-pb/rust-analyzer-lsp:latest" /></div>
-            <div className="col-12 col-md-2"><span className="badge text-bg-light text-uppercase">{customImage.trim() ? customMarketplaceIntegration?.kind || "unknown" : "lsp"}</span></div>
-            <div className="col-12 col-md-2 d-grid"><button className="btn btn-outline-primary" disabled={!customMarketplaceIntegration}>Add</button></div>
-          </div>
-          {customImage.trim() && !customMarketplaceIntegration && <p className="text-secondary small mb-0 mt-2">Add the GitHub repo to the marketplace with an <code>lsp</code> topic so pb can infer its kind.</p>}
-        </form>
+        <IntegrationList
+          marketplace={marketplace}
+          installed={installed}
+          installedIcon="bi bi-code-slash"
+          emptyText="No marketplace language servers available to install."
+          onInstall={(item) => void prepareIntegrationInstall(item.container_image, item.name)}
+        />
         {pendingInstall && <IntegrationConfigForm pending={pendingInstall} schemaResponse={configSchema} loading={schemaLoading} error={schemaError} onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }} onInstall={(env) => void installIntegration(env)} />}
-        <div className="project-list session-list list-group mb-4">
-          {marketplace.length === 0 ? <div className="list-group-item text-secondary small">No marketplace language servers found.</div> : marketplace.map((item) => {
-            const isInstalled = installed.some((entry) => entry.kind === item.kind && entry.container_image === item.container_image);
-            return <div key={`${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4"><div className="session-icon"><img src={item.icon_url} alt="" width="24" height="24" style={{ borderRadius: "6px" }} /></div><div className="project-main session-main"><strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong><span>{item.description || item.container_image}</span></div><button className="btn btn-sm btn-primary" disabled={isInstalled} onClick={() => void prepareIntegrationInstall(item.container_image, item.name)}>{isInstalled ? "Installed" : "Install"}</button></div>;
-          })}
-        </div>
       </section>
     </PageShell>
   );
