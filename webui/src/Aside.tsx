@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { NavLink } from "react-router-dom";
 import { initialsForName } from "./lib/user";
 
 interface CurrentUser {
@@ -47,21 +47,21 @@ export function Aside() {
       </div>
 
       <nav className="nav nav-pills flex-column gap-1 px-2">
-        <Link className="nav-link active" to="/">
+        <NavLink className="nav-link" to="/" end>
           <i className="bi bi-house-door"></i> Home
-        </Link>
-        <Link className="nav-link" to="/sessions">
+        </NavLink>
+        <NavLink className="nav-link" to="/sessions">
           <i className="bi bi-chat-square-text"></i> Sessions
-        </Link>
-        <Link className="nav-link" to="/projects">
+        </NavLink>
+        <NavLink className="nav-link" to="/projects">
           <i className="bi bi-folder2-open"></i> Projects
-        </Link>
-        <Link className="nav-link" to="/integrations">
+        </NavLink>
+        <NavLink className="nav-link" to="/integrations">
           <i className="bi bi-plug"></i> Integrations
-        </Link>
-        <Link className="nav-link" to="/settings">
+        </NavLink>
+        <NavLink className="nav-link" to="/settings">
           <i className="bi bi-gear"></i> Settings
-        </Link>
+        </NavLink>
       </nav>
 
       <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">

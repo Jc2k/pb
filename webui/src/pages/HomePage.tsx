@@ -88,6 +88,12 @@ export function HomePage() {
               <p className="text-secondary mb-3">
                 Describe what you'd like the agent to work on.
               </p>
+              <div className="hero-stats" aria-label="Session status summary">
+                <span><strong>{runningCount}</strong> running</span>
+                <span><strong>{queuedCount}</strong> queued</span>
+                <span><strong>{pausedCount}</strong> paused</span>
+                <span><strong>{completedCount}</strong> completed</span>
+              </div>
 
               <form
                 className="start-card card"
@@ -110,14 +116,14 @@ export function HomePage() {
                       className="btn btn-sm border rounded-2 text-secondary bg-transparent"
                       aria-label="Attach context"
                     >
-                      ⌕
+                      <i className="bi bi-paperclip" aria-hidden="true"></i>
                     </button>
                     <button
                       type="button"
                       className="btn btn-sm border rounded-2 text-secondary bg-transparent"
                       aria-label="Improve prompt"
                     >
-                      ✣
+                      <i className="bi bi-stars" aria-hidden="true"></i>
                     </button>
                   </div>
                 </div>
@@ -133,7 +139,7 @@ export function HomePage() {
                     type="submit"
                     disabled={!task.trim() || isSubmitting}
                   >
-                    ▷ Start session
+                    <i className="bi bi-play-fill me-1"></i> Start session
                   </button>
                 </div>
               </form>
