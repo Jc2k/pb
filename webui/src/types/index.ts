@@ -1,0 +1,181 @@
+export type AgentEvent =
+  | {
+      type: "started";
+      task: string;
+      model: string;
+      workspace: string;
+      branch: string;
+      profile: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "step_started";
+      step: number;
+      max_steps: number;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | { type: "reasoning"; content: string; profile: string; timestamp_ms?: number }
+  | {
+      type: "tool_call";
+      tool: string;
+      arguments: unknown;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "tool_result";
+      tool: string;
+      result: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "user_question";
+      question_id: string;
+      question: string;
+      choices?: string[];
+      profile: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "user_answer";
+      question_id: string;
+      answer: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "sub_agent_started";
+      profile: string;
+      task: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "sub_agent_finished";
+      profile: string;
+      result: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | { type: "diff"; path: string; diff: string; nesting_depth?: number; timestamp_ms?: number }
+  | { type: "final"; content: string; profile: string; nesting_depth?: number; timestamp_ms?: number }
+  | {
+      type: "session_title";
+      title: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "session_summary";
+      branch: string;
+      commits: string;
+      summary?: string;
+      diff_stat?: string;
+      diff?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "error";
+      message: string;
+      summary?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | { type: string; [key: string]: unknown };
+
+
+export interface EventEnvelope {
+  version: string;
+  event: AgentEvent;
+}
+
+export type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
+
+export interface SessionItem {
+  session_id: string;
+  task: string;
+  title?: string | null;
+  running: boolean;
+  paused: boolean;
+  status: SessionStatus;
+  branch?: string;
+  workdir?: string;
+  pending_question?: { question_id: string; question: string; choices?: string[] };
+  updated_at_ms: number;
+}
+
+export interface SessionDetails {
+  session_id: string;
+  task: string;
+  title?: string | null;
+  running: boolean;
+  paused: boolean;
+  status: SessionStatus;
+  branch?: string;
+  workdir?: string;
+  pending_question?: { question_id: string; question: string; choices?: string[] };
+  events: EventEnvelope[];
+  updated_at_ms: number;
+}
+
+export interface ProjectEntry {
+  name: string;
+  path: string;
+  notify_on_finish: boolean;
+}
+
+export type IntegrationKind = "mcp" | "lsp";
+
+export interface MarketplaceIntegration {
+  name: string;
+  kind: IntegrationKind;
+  description: string;
+  icon_url: string;
+  repo_url: string;
+  container_image: string;
+}
+
+export interface InstalledIntegration {
+  name: string;
+  kind: IntegrationKind;
+  container_image: string;
+  env?: Record<string, string>;
+  disabled: boolean;
+}
+
+export type JsonSchemaProperty = {
+  type?: string | string[];
+  title?: string;
+  description?: string;
+  default?: string | number | boolean;
+  enum?: Array<string | number | boolean>;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+};
+
+export type IntegrationJsonSchema = {
+  title?: string;
+  description?: string;
+  type?: string;
+  required?: string[];
+  properties?: Record<string, JsonSchemaProperty>;
+};
+
+export interface IntegrationConfigSchemaResponse {
+  container_image: string;
+  annotation: string;
+  schema?: IntegrationJsonSchema | null;
+}
+
+export interface PendingIntegrationInstall {
+  kind: IntegrationKind;
+  containerImage: string;
+  name?: string;
+  installed?: boolean;
+  env?: Record<string, string>;
+}
