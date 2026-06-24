@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use rust_embed::RustEmbed;
@@ -267,8 +267,16 @@ pub async fn run_server_with_ready(
             get(list_project_integrations).post(install_project_integration),
         )
         .route(
+            "/api/projects/{name}/integrations/{integration_name}",
+            delete(remove_project_integration),
+        )
+        .route(
             "/api/integrations/lsp",
             get(list_global_lsp_integrations).post(install_global_lsp_integration),
+        )
+        .route(
+            "/api/integrations/lsp/{integration_name}",
+            delete(remove_global_lsp_integration),
         )
         .route(
             "/api/projects/{name}/notifications",
@@ -368,6 +376,24 @@ async fn install_project_integration(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn remove_project_integration(
+    Path((name, integration_name)): Path<(String, String)>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<InstalledIntegration>, StatusCode> {
+    let projects = state.projects.lock().await;
+    let project = projects
+        .iter()
+        .find(|project| project.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    integrations::remove_project(
+        &PathBuf::from(&project.path),
+        crate::integrations::IntegrationKind::Mcp,
+        &integration_name,
+    )
+    .map(|response| Json(response.removed))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn list_global_lsp_integrations() -> Result<Json<Vec<InstalledIntegration>>, StatusCode> {
     integrations::list_global_lsp_installed()
         .map(Json)
@@ -379,6 +405,14 @@ async fn install_global_lsp_integration(
 ) -> Result<Json<InstalledIntegration>, StatusCode> {
     integrations::install_global_lsp(req)
         .map(|response| Json(response.installed))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn remove_global_lsp_integration(
+    Path(integration_name): Path<String>,
+) -> Result<Json<InstalledIntegration>, StatusCode> {
+    integrations::remove_global_lsp(&integration_name)
+        .map(|response| Json(response.removed))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
