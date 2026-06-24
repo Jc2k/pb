@@ -4,6 +4,7 @@ import {
   getAvatarForProfile,
   groupToolEvents,
   projectName,
+  projectSettingsPath,
   sessionTitle,
 } from "./helpers.ts";
 
@@ -38,4 +39,9 @@ Deno.test("groupToolEvents groups contiguous tool calls with their results", () 
   equal((grouped[1] as { type: string }).type, "tool_group");
   equal((grouped[1] as { toolCalls: EventEnvelope[] }).toolCalls.length, 1);
   equal((grouped[1] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
+});
+
+Deno.test("projectSettingsPath encodes project names under the project URL", () => {
+  equal(projectSettingsPath("my project"), "/projects/my%20project/settings");
+  equal(projectSettingsPath("owner/repo"), "/projects/owner%2Frepo/settings");
 });

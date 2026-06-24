@@ -109,6 +109,10 @@ export function groupToolEvents(
 }
 
 
+export function projectSettingsPath(projectName: string): string {
+  return `/projects/${encodeURIComponent(projectName)}/settings`;
+}
+
 export function notificationSupport(): boolean {
   return typeof window !== "undefined" && "Notification" in window;
 }
