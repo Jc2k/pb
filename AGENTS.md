@@ -3,7 +3,8 @@
 ## Commands
 
 - `deno task build:web` - Build web UI assets (required before `cargo build`)
-- `cargo test --all-targets` - Run tests
+- `cargo test --all-targets` - Run Rust tests
+- `deno task test:web` - Run web UI tests
 - `cargo build --release --target aarch64-apple-darwin` - Build release binary for macOS arm64
 
 ## Architecture
@@ -23,6 +24,7 @@
 1. **Semantic commits only**: `feat:`, `fix:`, `chore:`, etc.
 2. **Update `src/init.rs`** when adding new per-project configuration fields
 3. **Web UI requirements**: Must include `viewport-fit=cover`, `env(safe-area-inset-*)` CSS, and PWA meta tags
+4. **Web UI tests**: Add or update `webui/src/**/*.test.ts` tests for web UI behavior changes, and run `deno task test:web` before committing
 
 ## Release process
 
