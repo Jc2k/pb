@@ -1,5 +1,4 @@
-import { useEffect, useRef } from "react";
-import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, SessionItem, SessionStatus } from "../types";
+import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, SessionItem } from "../types";
 
 export function uniqueIntegrations<
   T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
@@ -145,24 +144,6 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
     window.focus();
     window.location.href = url;
   };
-}
-
-export function useProjectFinishNotifications(sessions: SessionItem[], projects: ProjectEntry[]) {
-  const seenRef = useRef<Record<string, SessionStatus>>({});
-
-  useEffect(() => {
-    for (const session of sessions) {
-      const previous = seenRef.current[session.session_id];
-      seenRef.current[session.session_id] = session.status;
-      if (
-        previous &&
-        previous !== session.status &&
-        (session.status === "completed" || session.status === "failed")
-      ) {
-        void notifySessionFinished(session, projects);
-      }
-    }
-  }, [sessions, projects]);
 }
 
 export function projectName(workdir?: string): string {
