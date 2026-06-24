@@ -4,7 +4,8 @@ import type { InstalledIntegration, IntegrationConfigSchemaResponse, Integration
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { SessionCard } from "../components/Session";
-import { ensureNotificationPermission, uniqueInstalledIntegrations, uniqueIntegrations, useProjectFinishNotifications } from "../lib/helpers";
+import { ensureNotificationPermission, uniqueInstalledIntegrations, uniqueIntegrations } from "../lib/helpers";
+import { useProjectFinishNotifications } from "../lib/hooks";
 
 export function ProjectsPage() {
   const [projects, setProjects] = useState<ProjectEntry[]>([]);

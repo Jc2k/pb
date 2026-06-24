@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Aside } from "../Aside";
 import type { ProjectEntry, SessionItem } from "../types";
-import { formatStartTime, projectName, sessionTitle, useProjectFinishNotifications } from "../lib/helpers";
+import { formatStartTime, projectName, sessionTitle } from "../lib/helpers";
+import { useProjectFinishNotifications } from "../lib/hooks";
 
 export function HomePage() {
   const [task, setTask] = useState("");
