@@ -53,6 +53,8 @@ pub struct InstalledIntegration {
     pub name: String,
     pub kind: IntegrationKind,
     pub container_image: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub disabled: bool,
 }
 
@@ -202,6 +204,7 @@ pub fn list_project_installed(workspace_root: &Path) -> Result<Vec<InstalledInte
                     name,
                     kind: IntegrationKind::Mcp,
                     container_image,
+                    env: server.env,
                     disabled: server.disabled,
                 })
         }));
@@ -247,6 +250,7 @@ pub fn install_project(
                     name,
                     kind: IntegrationKind::Mcp,
                     container_image: request.container_image,
+                    env: request.env,
                     disabled: false,
                 },
                 config_path: crate::mcp::project_mcp_config_path(workspace_root)
@@ -283,6 +287,7 @@ pub fn remove_project(
             name: name.to_string(),
             kind,
             container_image,
+            env: server.env,
             disabled: server.disabled,
         },
         config_path: crate::mcp::project_mcp_config_path(workspace_root)
@@ -304,6 +309,7 @@ pub fn list_global_lsp_installed() -> Result<Vec<InstalledIntegration>> {
                     name,
                     kind: IntegrationKind::Lsp,
                     container_image,
+                    env: server.env,
                     disabled: server.disabled,
                 })
         })
@@ -344,6 +350,7 @@ pub fn install_global_lsp(
             name,
             kind: IntegrationKind::Lsp,
             container_image: request.container_image,
+            env: request.env,
             disabled: false,
         },
         config_path: config::config_path()?.display().to_string(),
@@ -369,6 +376,7 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
             name: name.to_string(),
             kind: IntegrationKind::Lsp,
             container_image,
+            env: server.env,
             disabled: server.disabled,
         },
         config_path: config::config_path()?.display().to_string(),
