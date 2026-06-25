@@ -1,11 +1,12 @@
 //! Marketplace discovery and integration installation.
 
 use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 use crate::config::{self, UserConfig};
 use crate::lsp::LspServerConfig;
@@ -154,16 +155,13 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
     if container_image.trim().is_empty() {
         bail!("container image cannot be empty");
     }
-    let output = Command::new("docker")
-        .args(["manifest", "inspect", container_image])
-        .output()
+    let image = RegistryImage::parse(container_image)?;
+    let client = Client::builder()
+        .user_agent("pb-integration-config-schema")
+        .build()
+        .context("failed to build registry client")?;
+    let manifest = fetch_registry_manifest(&client, &image)
         .with_context(|| format!("failed to inspect container image {container_image}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to inspect container image {container_image}: {stderr}");
-    }
-    let manifest: Value = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to decode manifest for {container_image}"))?;
     let schema_text = find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION);
     let schema = schema_text
         .map(|text| {
@@ -176,6 +174,126 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
         annotation: CONFIG_SCHEMA_ANNOTATION.to_string(),
         schema,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryImage {
+    registry: String,
+    repository: String,
+    reference: String,
+}
+
+impl RegistryImage {
+    fn parse(image: &str) -> Result<Self> {
+        let image = image.trim();
+        if image.is_empty() {
+            bail!("container image cannot be empty");
+        }
+        let (name, reference) = split_image_reference(image);
+        let mut parts = name.splitn(2, '/');
+        let registry = parts.next().unwrap_or_default();
+        let repository = parts.next().unwrap_or_default();
+        if registry.is_empty() || repository.is_empty() {
+            bail!("container image must include a registry and repository");
+        }
+        Ok(Self {
+            registry: registry.to_string(),
+            repository: repository.to_string(),
+            reference: reference.to_string(),
+        })
+    }
+
+    fn manifest_url(&self) -> String {
+        format!(
+            "https://{}/v2/{}/manifests/{}",
+            self.registry, self.repository, self.reference
+        )
+    }
+}
+
+fn split_image_reference(image: &str) -> (&str, &str) {
+    let last_slash = image.rfind('/');
+    let last_colon = image.rfind(':');
+    if let Some(colon) = last_colon
+        && last_slash.is_none_or(|slash| colon > slash)
+    {
+        return (&image[..colon], &image[colon + 1..]);
+    }
+    (image, "latest")
+}
+
+fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Value> {
+    let accept = [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+    .join(", ");
+    let url = image.manifest_url();
+    let mut response = client.get(&url).header(ACCEPT, &accept).send()?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if let Some(challenge) = challenge {
+            if let Some(token) = fetch_bearer_token(client, &challenge, image)? {
+                response = client
+                    .get(&url)
+                    .header(ACCEPT, &accept)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .send()?;
+            }
+        }
+    }
+    let response = response.error_for_status()?;
+    response
+        .json::<Value>()
+        .context("failed to decode image manifest")
+}
+
+fn fetch_bearer_token(
+    client: &Client,
+    challenge: &str,
+    image: &RegistryImage,
+) -> Result<Option<String>> {
+    let Some(params) = challenge.strip_prefix("Bearer ") else {
+        return Ok(None);
+    };
+    let mut realm = None;
+    let mut service = None;
+    for part in params.split(',') {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches('"');
+        match key {
+            "realm" => realm = Some(value.to_string()),
+            "service" => service = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let Some(realm) = realm else {
+        return Ok(None);
+    };
+    let mut request = client
+        .get(realm)
+        .query(&[("scope", format!("repository:{}:pull", image.repository))]);
+    if let Some(service) = service {
+        request = request.query(&[("service", service)]);
+    }
+    let token: Value = request
+        .send()?
+        .error_for_status()?
+        .json()
+        .context("failed to decode registry auth token")?;
+    Ok(token
+        .get("token")
+        .or_else(|| token.get("access_token"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 fn find_annotation<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -403,6 +521,40 @@ mod tests {
         assert_eq!(
             marketplace_container_image("sentry-mcp"),
             "ghcr.io/crunchy-pb/sentry-mcp:latest"
+        );
+    }
+
+    #[test]
+    fn registry_image_parse_splits_registry_repository_and_tag() {
+        let image = RegistryImage::parse("ghcr.io/crunchy-pb/mcp-sentry:latest").unwrap();
+        assert_eq!(image.registry, "ghcr.io");
+        assert_eq!(image.repository, "crunchy-pb/mcp-sentry");
+        assert_eq!(image.reference, "latest");
+        assert_eq!(
+            image.manifest_url(),
+            "https://ghcr.io/v2/crunchy-pb/mcp-sentry/manifests/latest"
+        );
+    }
+
+    #[test]
+    fn registry_image_parse_defaults_missing_tag_to_latest() {
+        let image = RegistryImage::parse("ghcr.io/crunchy-pb/mcp-sentry").unwrap();
+        assert_eq!(image.reference, "latest");
+    }
+
+    #[test]
+    fn find_annotation_reads_nested_manifest_annotations() {
+        let manifest = serde_json::json!({
+            "manifests": [{
+                "annotations": {
+                    CONFIG_SCHEMA_ANNOTATION: r#"{"type":"object"}"#
+                }
+            }]
+        });
+
+        assert_eq!(
+            find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION),
+            Some(r#"{"type":"object"}"#)
         );
     }
 
