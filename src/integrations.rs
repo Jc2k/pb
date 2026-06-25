@@ -162,7 +162,10 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
         .context("failed to build registry client")?;
     let manifest = fetch_registry_manifest(&client, &image)
         .with_context(|| format!("failed to inspect container image {container_image}"))?;
-    let schema_text = find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION);
+    let config = fetch_registry_config(&client, &image, &manifest)
+        .with_context(|| format!("failed to fetch image config for {container_image}"))?;
+    let schema_text = find_annotation(&config, CONFIG_SCHEMA_ANNOTATION)
+        .or_else(|| find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION));
     let schema = schema_text
         .map(|text| {
             serde_json::from_str(text)
@@ -209,6 +212,20 @@ impl RegistryImage {
             self.registry, self.repository, self.reference
         )
     }
+
+    fn blob_url(&self, digest: &str) -> String {
+        format!(
+            "https://{}/v2/{}/blobs/{}",
+            self.registry, self.repository, digest
+        )
+    }
+
+    fn manifest_digest_url(&self, digest: &str) -> String {
+        format!(
+            "https://{}/v2/{}/manifests/{}",
+            self.registry, self.repository, digest
+        )
+    }
 }
 
 fn split_image_reference(image: &str) -> (&str, &str) {
@@ -230,8 +247,69 @@ fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Val
         "application/vnd.docker.distribution.manifest.v2+json",
     ]
     .join(", ");
-    let url = image.manifest_url();
-    let mut response = client.get(&url).header(ACCEPT, &accept).send()?;
+    fetch_registry_json(
+        client,
+        image,
+        &image.manifest_url(),
+        &accept,
+        "image manifest",
+    )
+}
+
+fn fetch_registry_config(
+    client: &Client,
+    image: &RegistryImage,
+    manifest: &Value,
+) -> Result<Value> {
+    let image_manifest = if manifest.get("config").is_some() {
+        manifest.clone()
+    } else {
+        let digest = manifest
+            .get("manifests")
+            .and_then(Value::as_array)
+            .and_then(|manifests| manifests.first())
+            .and_then(|manifest| manifest.get("digest"))
+            .and_then(Value::as_str)
+            .context("image index does not contain a manifest digest")?;
+        fetch_registry_json(
+            client,
+            image,
+            &image.manifest_digest_url(digest),
+            &[
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ]
+            .join(", "),
+            "platform image manifest",
+        )?
+    };
+    let digest = image_manifest
+        .get("config")
+        .and_then(|config| config.get("digest"))
+        .and_then(Value::as_str)
+        .context("image manifest does not contain a config digest")?;
+    fetch_registry_json(
+        client,
+        image,
+        &image.blob_url(digest),
+        &[
+            "application/vnd.oci.image.config.v1+json",
+            "application/vnd.docker.container.image.v1+json",
+            "application/octet-stream",
+        ]
+        .join(", "),
+        "image config",
+    )
+}
+
+fn fetch_registry_json(
+    client: &Client,
+    image: &RegistryImage,
+    url: &str,
+    accept: &str,
+    context: &str,
+) -> Result<Value> {
+    let mut response = client.get(url).header(ACCEPT, accept).send()?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let challenge = response
             .headers()
@@ -241,8 +319,8 @@ fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Val
         if let Some(challenge) = challenge {
             if let Some(token) = fetch_bearer_token(client, &challenge, image)? {
                 response = client
-                    .get(&url)
-                    .header(ACCEPT, &accept)
+                    .get(url)
+                    .header(ACCEPT, accept)
                     .header(AUTHORIZATION, format!("Bearer {token}"))
                     .send()?;
             }
@@ -251,7 +329,7 @@ fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Val
     let response = response.error_for_status()?;
     response
         .json::<Value>()
-        .context("failed to decode image manifest")
+        .with_context(|| format!("failed to decode {context}"))
 }
 
 fn fetch_bearer_token(
@@ -301,6 +379,16 @@ fn find_annotation<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .get("annotations")
         .and_then(Value::as_object)
         .and_then(|annotations| annotations.get(key))
+        .and_then(Value::as_str)
+    {
+        return Some(text);
+    }
+    if let Some(text) = value
+        .get("config")
+        .and_then(|config| config.get("Labels"))
+        .or_else(|| value.get("Labels"))
+        .and_then(Value::as_object)
+        .and_then(|labels| labels.get(key))
         .and_then(Value::as_str)
     {
         return Some(text);
@@ -555,6 +643,22 @@ mod tests {
         assert_eq!(
             find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION),
             Some(r#"{"type":"object"}"#)
+        );
+    }
+
+    #[test]
+    fn find_annotation_reads_image_config_labels() {
+        let config = serde_json::json!({
+            "config": {
+                "Labels": {
+                    CONFIG_SCHEMA_ANNOTATION: r#"{"type":"object","required":["token"]}"#
+                }
+            }
+        });
+
+        assert_eq!(
+            find_annotation(&config, CONFIG_SCHEMA_ANNOTATION),
+            Some(r#"{"type":"object","required":["token"]}"#)
         );
     }
 
