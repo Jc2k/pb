@@ -1,5 +1,5 @@
 import { equal } from "node:assert/strict";
-import type { EventEnvelope } from "../types";
+import type { EventEnvelope } from "../types/index";
 import {
   getAvatarForProfile,
   groupToolEvents,

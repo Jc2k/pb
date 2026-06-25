@@ -1,5 +1,5 @@
 import { deepEqual, equal } from "node:assert/strict";
-import type { IntegrationJsonSchema } from "../types";
+import type { IntegrationJsonSchema } from "../types/index";
 import { schemaPropertyType, validateIntegrationConfig } from "./integrationConfig.ts";
 
 Deno.test("schemaPropertyType chooses a non-null type from nullable schemas", () => {

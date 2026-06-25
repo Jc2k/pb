@@ -1,4 +1,4 @@
-import type { IntegrationJsonSchema, JsonSchemaProperty } from "../types";
+import type { IntegrationJsonSchema, JsonSchemaProperty } from "../types/index";
 
 export function schemaPropertyType(property: JsonSchemaProperty): string {
   return Array.isArray(property.type) ? property.type.find((item) => item !== "null") || "string" : property.type || "string";
