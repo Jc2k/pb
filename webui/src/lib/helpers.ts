@@ -1,4 +1,4 @@
-import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, SessionItem } from "../types";
+import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, SessionItem } from "../types/index";
 
 export function uniqueIntegrations<
   T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
