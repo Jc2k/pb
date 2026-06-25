@@ -30,9 +30,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::browser_tools;
 use crate::container;
+use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
 use crate::lsp::{self, LspToolRegistry};
@@ -410,6 +412,20 @@ pub struct AgentRunResult {
     pub branch: String,
     pub workspace_root: PathBuf,
     pub reached_final: bool,
+}
+
+#[derive(Debug, Default)]
+struct RunMetrics {
+    llm_invocations: usize,
+    llm_runtime_ms: u64,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    tool_calls: usize,
+    tool_runtime_ms: u64,
+    llm_energy_joules: f64,
+    llm_energy_kwh: f64,
+    tool_energy_joules: f64,
+    tool_energy_kwh: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1763,6 +1779,8 @@ fn run_agent_steps(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
+    let mut metrics = RunMetrics::default();
+
     for step in 1..=args.max_steps {
         sink.emit(AgentEvent::StepStarted {
             step,
@@ -1773,7 +1791,14 @@ fn run_agent_steps(
 
         let prompt = render_prompt(messages);
         let (output, action) = match generate_and_parse_action_with_retries(
-            backend, model, args, &prompt, step,
+            backend,
+            model,
+            args,
+            &prompt,
+            step,
+            &mut metrics,
+            sink,
+            nesting_depth,
         )? {
             Ok(parsed) => parsed,
             Err(ParseFailure { output, error }) => {
@@ -1813,6 +1838,20 @@ fn run_agent_steps(
                         timestamp_ms: Some(now_millis()),
                     });
                 }
+                sink.emit(AgentEvent::SessionMetrics {
+                    llm_invocations: metrics.llm_invocations,
+                    llm_runtime_ms: metrics.llm_runtime_ms,
+                    prompt_tokens: metrics.prompt_tokens,
+                    generated_tokens: metrics.generated_tokens,
+                    tool_calls: metrics.tool_calls,
+                    tool_runtime_ms: metrics.tool_runtime_ms,
+                    llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
+                    llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
+                    tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
+                    tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
@@ -1849,6 +1888,7 @@ fn run_agent_steps(
                     },
                     messages,
                     sink,
+                    &mut metrics,
                 )?;
             }
             AgentAction::ToolCalls { calls, thinking } => {
@@ -1872,6 +1912,7 @@ fn run_agent_steps(
                     },
                     messages,
                     sink,
+                    &mut metrics,
                 )?;
             }
         }
@@ -1881,6 +1922,20 @@ fn run_agent_steps(
         "The agent reached the step limit ({}) before producing a final response.",
         args.max_steps
     );
+    sink.emit(AgentEvent::SessionMetrics {
+        llm_invocations: metrics.llm_invocations,
+        llm_runtime_ms: metrics.llm_runtime_ms,
+        prompt_tokens: metrics.prompt_tokens,
+        generated_tokens: metrics.generated_tokens,
+        tool_calls: metrics.tool_calls,
+        tool_runtime_ms: metrics.tool_runtime_ms,
+        llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
+        llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
+        tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
+        tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
     sink.emit(AgentEvent::Error {
         message,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
@@ -1900,6 +1955,7 @@ fn execute_tool_calls(
     env: ToolExecutionEnv<'_>,
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
+    metrics: &mut RunMetrics,
 ) -> Result<()> {
     if let Some(reasoning) = thinking {
         sink.emit(AgentEvent::Reasoning {
@@ -1931,6 +1987,8 @@ fn execute_tool_calls(
                     call.tool,
                     call.arguments,
                     format!("tool denied by policy rule '{rule}'"),
+                    0,
+                    None,
                 ));
             }
             PolicyOutcome::Ask => {
@@ -1953,6 +2011,8 @@ fn execute_tool_calls(
                         call.tool,
                         call.arguments,
                         format!("tool was not approved by the user for policy rule '{rule}'"),
+                        0,
+                        None,
                     ));
                 }
             }
@@ -1984,9 +2044,14 @@ fn execute_tool_calls(
             .map(|call| {
                 let registry = registry.clone();
                 std::thread::spawn(move || {
+                    let energy_start = energy::sample();
+                    let started = Instant::now();
                     let result = mcp::call_tool(&registry, &call.tool, &call.arguments)
                         .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
-                    (call.tool, call.arguments, result)
+                    let energy = energy_start
+                        .and_then(|sample| sample.estimate_since(energy::sample(), started));
+                    let duration_ms = duration_millis(started);
+                    (call.tool, call.arguments, result, duration_ms, energy)
                 })
             })
             .collect::<Vec<_>>();
@@ -1996,14 +2061,21 @@ fn execute_tool_calls(
                     "unknown".to_string(),
                     Value::Null,
                     "tool thread panicked".to_string(),
+                    0,
+                    None,
                 )
             }));
         }
     } else {
         for call in runnable {
+            let energy_start = energy::sample();
+            let started = Instant::now();
             let result = run_tool(&call.tool, &call.arguments, &tool_context, sink)
                 .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
-            results.push((call.tool, call.arguments, result));
+            let energy =
+                energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+            let duration_ms = duration_millis(started);
+            results.push((call.tool, call.arguments, result, duration_ms, energy));
         }
     }
 
@@ -2012,10 +2084,21 @@ fn execute_tool_calls(
         content: assistant_output.to_string(),
     });
     let mut tool_message = String::new();
-    for (tool, arguments, result) in results {
+    for (tool, arguments, result, duration_ms, energy) in results {
+        metrics.tool_calls += 1;
+        metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
+        add_energy(
+            &mut metrics.tool_energy_joules,
+            &mut metrics.tool_energy_kwh,
+            energy,
+        );
         sink.emit(AgentEvent::ToolResult {
             tool: tool.clone(),
             result: result.clone(),
+            duration_ms: Some(duration_ms),
+            energy_joules: energy.map(|estimate| estimate.joules),
+            energy_kwh: energy.map(|estimate| estimate.kwh),
+            average_power_watts: energy.map(|estimate| estimate.average_watts),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -2052,6 +2135,10 @@ struct ParseFailure {
 struct CompletionOutput {
     content: String,
     finish_reason: CompletionFinishReason,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    duration_ms: u64,
+    energy: Option<EnergyEstimate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,6 +2153,9 @@ fn generate_and_parse_action_with_retries(
     args: &AgentRequest,
     prompt: &str,
     step: usize,
+    metrics: &mut RunMetrics,
+    sink: &mut dyn EventSink,
+    nesting_depth: usize,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
 
@@ -2073,6 +2163,32 @@ fn generate_and_parse_action_with_retries(
         let mut request = args.clone();
         request.max_tokens = max_tokens;
         let completion = generate_completion(backend, model, &request, prompt)?;
+        metrics.llm_invocations += 1;
+        metrics.llm_runtime_ms = metrics
+            .llm_runtime_ms
+            .saturating_add(completion.duration_ms);
+        metrics.prompt_tokens = metrics
+            .prompt_tokens
+            .saturating_add(completion.prompt_tokens);
+        metrics.generated_tokens = metrics
+            .generated_tokens
+            .saturating_add(completion.generated_tokens);
+        add_energy(
+            &mut metrics.llm_energy_joules,
+            &mut metrics.llm_energy_kwh,
+            completion.energy,
+        );
+        sink.emit(AgentEvent::LlmInvocation {
+            step,
+            duration_ms: completion.duration_ms,
+            prompt_tokens: completion.prompt_tokens,
+            generated_tokens: completion.generated_tokens,
+            energy_joules: completion.energy.map(|estimate| estimate.joules),
+            energy_kwh: completion.energy.map(|estimate| estimate.kwh),
+            average_power_watts: completion.energy.map(|estimate| estimate.average_watts),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
         match parse_action(&completion.content) {
             Ok(action) => return Ok(Ok((completion.content, action))),
             Err(error) => {
@@ -2120,6 +2236,8 @@ fn generate_completion(
     args: &AgentRequest,
     prompt: &str,
 ) -> Result<CompletionOutput> {
+    let energy_start = energy::sample();
+    let started = Instant::now();
     let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
     let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
     if let Some(threads) = args.threads {
@@ -2172,10 +2290,10 @@ fn generate_completion(
     let mut decoder = UTF_8.new_decoder();
     let mut output = String::new();
     let mut n_cur = i32::try_from(tokens.len()).context("prompt token count exceeds i32::MAX")?;
-    let mut generated_tokens = 0;
+    let mut generated_tokens: usize = 0;
 
     let mut finish_reason = CompletionFinishReason::MaxTokens;
-    while generated_tokens < args.max_tokens {
+    while generated_tokens < usize::try_from(args.max_tokens).unwrap_or(0) {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
@@ -2199,10 +2317,30 @@ fn generate_completion(
         generated_tokens += 1;
     }
 
+    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     Ok(CompletionOutput {
         content: output,
         finish_reason,
+        prompt_tokens: tokens.len(),
+        generated_tokens,
+        duration_ms: duration_millis(started),
+        energy,
     })
+}
+
+fn duration_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn add_energy(total_joules: &mut f64, total_kwh: &mut f64, energy: Option<EnergyEstimate>) {
+    if let Some(estimate) = energy {
+        *total_joules += estimate.joules;
+        *total_kwh += estimate.kwh;
+    }
+}
+
+fn nonzero_f64(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {

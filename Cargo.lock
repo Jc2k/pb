@@ -1291,6 +1291,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "macpow"
+version = "0.1.19"
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1489,6 +1493,7 @@ dependencies = [
  "indicatif",
  "libc",
  "llama-cpp-2",
+ "macpow",
  "mime_guess",
  "objc2",
  "objc2-foundation",

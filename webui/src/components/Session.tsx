@@ -6,6 +6,18 @@ import { formatEventTime, getAvatarForProfile, projectName, relativeTime, sessio
 import { TODO_STATUS_LABELS, errorSummary, getToolDetail, profileJobTitle, profileName } from "../lib/sessionUtils";
 import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
 
+function formatDurationMs(ms?: number): string {
+  if (ms === undefined) return "unknown runtime";
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+function formatEnergy(kwh?: number, joules?: number): string {
+  if (kwh !== undefined) return `${kwh.toExponential(3)} kWh`;
+  if (joules !== undefined) return `${joules.toFixed(2)} J`;
+  return "not available";
+}
+
 export function DiffView({ diff }: { diff: string }) {
   return (
     <pre className="diff-block mb-0">
@@ -456,6 +468,31 @@ export function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           </div>
         </article>
       );
+
+    case "llm_invocation":
+      return null;
+
+    case "session_metrics": {
+      const md = e.nesting_depth || 0;
+      return (
+        <article
+          className="message-row assistant-message compact"
+          style={{ marginLeft: `${md}rem` }}
+        >
+          <div className="bot-avatar">
+            <i className="bi bi-speedometer2"></i>
+          </div>
+          <div className="bubble thought-bubble">
+            <p>Session metrics</p>
+            <ul className="mb-0 small">
+              <li>LLM: {e.llm_invocations} calls, {formatDurationMs(e.llm_runtime_ms)}, {e.prompt_tokens} prompt tokens, {e.generated_tokens} generated tokens</li>
+              <li>Tools: {e.tool_calls} calls, {formatDurationMs(e.tool_runtime_ms)}</li>
+              <li>Energy: LLM {formatEnergy(e.llm_energy_kwh, e.llm_energy_joules)}, tools {formatEnergy(e.tool_energy_kwh, e.tool_energy_joules)}</li>
+            </ul>
+          </div>
+        </article>
+      );
+    }
 
     case "session_summary":
       const ssd = e.nesting_depth || 0;
