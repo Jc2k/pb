@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent_core::{AgentRequest, find_git_root};
-use crate::events::{AgentEvent, EventEnvelope};
+use crate::events::{AgentEvent, EventEnvelope, SessionMetricsSnapshot};
 use crate::projects::ProjectEntry;
 
 const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
@@ -36,6 +36,8 @@ pub struct PersistedSession {
     #[serde(default)]
     pub status: Option<SessionStatus>,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<SessionMetricsSnapshot>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -59,6 +61,7 @@ impl PersistedSession {
             running,
             status: Some(status),
             updated_at_ms: now_millis(),
+            metrics: latest_session_metrics(&events),
             events: trim_events(events),
         }
     }
@@ -168,6 +171,13 @@ fn read_note(workspace_root: &Path, note_ref: &str) -> Result<String> {
 
 fn parse_session(payload: &str) -> Result<PersistedSession> {
     serde_json::from_str(payload).context("failed to parse session note")
+}
+
+fn latest_session_metrics(events: &[EventEnvelope]) -> Option<SessionMetricsSnapshot> {
+    events
+        .iter()
+        .rev()
+        .find_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
 }
 
 fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {

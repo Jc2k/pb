@@ -39,6 +39,7 @@ export function getToolDetail(
 ): string | null {
   if (toolCall.event.type !== "tool_call") return null;
 
+
   const args = toolCall.event.arguments as Record<string, unknown>;
 
   switch (toolCall.event.tool) {
@@ -198,8 +199,17 @@ function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventE
     };
   }
   summaries[toolName].count++;
+  const detail = getToolDetail(call, result) || "(no details)";
+  const durationMs = result?.event.type === "tool_result" ? result.event.duration_ms : undefined;
+  const duration = durationMs === undefined
+    ? ""
+    : durationMs < 1000
+      ? ` · ${durationMs} ms`
+      : ` · ${(durationMs / 1000).toFixed(1)} s`;
+  const energyKwh = result?.event.type === "tool_result" ? result.event.energy_kwh : undefined;
+  const energy = energyKwh === undefined ? "" : ` · ${energyKwh.toExponential(3)} kWh`;
   summaries[toolName].items.push({
-    detail: getToolDetail(call, result) || "(no details)",
+    detail: `${detail}${duration}${energy}`,
     timestampMs: call.event.timestamp_ms,
   });
 }

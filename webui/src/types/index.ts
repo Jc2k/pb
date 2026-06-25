@@ -28,6 +28,10 @@ export type AgentEvent =
       type: "tool_result";
       tool: string;
       result: string;
+      duration_ms?: number;
+      energy_joules?: number;
+      energy_kwh?: number;
+      average_power_watts?: number;
       nesting_depth?: number;
       timestamp_ms?: number;
     }
@@ -64,6 +68,33 @@ export type AgentEvent =
   | { type: "diff"; path: string; diff: string; nesting_depth?: number; timestamp_ms?: number }
   | { type: "final"; content: string; profile: string; nesting_depth?: number; timestamp_ms?: number }
   | {
+      type: "llm_invocation";
+      step: number;
+      duration_ms: number;
+      prompt_tokens: number;
+      generated_tokens: number;
+      energy_joules?: number;
+      energy_kwh?: number;
+      average_power_watts?: number;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "session_metrics";
+      llm_invocations: number;
+      llm_runtime_ms: number;
+      prompt_tokens: number;
+      generated_tokens: number;
+      tool_calls: number;
+      tool_runtime_ms: number;
+      llm_energy_joules?: number;
+      llm_energy_kwh?: number;
+      tool_energy_joules?: number;
+      tool_energy_kwh?: number;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
       type: "session_title";
       title: string;
       timestamp_ms?: number;
@@ -87,6 +118,19 @@ export type AgentEvent =
     };
 
 
+export interface SessionMetricsSnapshot {
+  llm_invocations: number;
+  llm_runtime_ms: number;
+  prompt_tokens: number;
+  generated_tokens: number;
+  tool_calls: number;
+  tool_runtime_ms: number;
+  llm_energy_joules?: number;
+  llm_energy_kwh?: number;
+  tool_energy_joules?: number;
+  tool_energy_kwh?: number;
+}
+
 export interface EventEnvelope {
   version: string;
   event: AgentEvent;
@@ -105,6 +149,7 @@ export interface SessionItem {
   workdir?: string;
   pending_question?: { question_id: string; question: string; choices?: string[] };
   updated_at_ms: number;
+  metrics?: SessionMetricsSnapshot | null;
 }
 
 export interface SessionDetails {
@@ -119,6 +164,7 @@ export interface SessionDetails {
   pending_question?: { question_id: string; question: string; choices?: string[] };
   events: EventEnvelope[];
   updated_at_ms: number;
+  metrics?: SessionMetricsSnapshot | null;
 }
 
 export interface ProjectEntry {

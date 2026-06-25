@@ -21,6 +21,7 @@ pub mod cli_ui;
 pub mod config;
 pub mod container;
 pub mod daemon_client;
+pub mod energy;
 pub mod environment;
 pub mod events;
 mod github_oauth;

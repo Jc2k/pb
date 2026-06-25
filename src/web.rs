@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
-use crate::events::{AgentEvent, EventEnvelope};
+use crate::events::{AgentEvent, EventEnvelope, SessionMetricsSnapshot};
 use crate::integrations::{
     self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
     MarketplaceIntegration,
@@ -110,6 +110,7 @@ pub struct SessionListItem {
     pub branch: Option<String>,
     pub workdir: Option<String>,
     pub updated_at_ms: u64,
+    pub metrics: Option<SessionMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,7 @@ pub struct SessionDetails {
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
     pub updated_at_ms: u64,
+    pub metrics: Option<SessionMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +209,7 @@ struct SessionState {
     pending_question: Option<PendingQuestionState>,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
+    metrics: Option<SessionMetricsSnapshot>,
     updated_at_ms: u64,
 }
 
@@ -495,6 +498,7 @@ async fn start_session_inner(
         pending_question: None,
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
+        metrics: None,
         updated_at_ms: now,
     };
 
@@ -788,6 +792,7 @@ async fn list_sessions(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             updated_at_ms: session.updated_at_ms,
+            metrics: session.metrics.clone(),
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
@@ -823,6 +828,7 @@ async fn get_session(
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
         updated_at_ms: session.updated_at_ms,
+        metrics: session.metrics.clone(),
     }))
 }
 
@@ -933,6 +939,15 @@ impl EventSink for WebEventSink {
         {
             self.persisted_workdir = Some(PathBuf::from(workspace));
             self.persisted_branch = Some(branch.clone());
+        }
+        if let Some(metrics) = SessionMetricsSnapshot::from_event(&event) {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut sessions = self.state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&self.session_id) {
+                    session.metrics = Some(metrics);
+                    session.updated_at_ms = now_millis();
+                }
+            });
         }
         if let AgentEvent::SessionTitle { title, .. } = &event {
             let title = title.trim().to_string();
@@ -1467,6 +1482,7 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             pending_question: None,
             sender,
             history,
+            metrics: persisted.metrics,
             updated_at_ms: persisted.updated_at_ms,
         },
     )
@@ -1523,6 +1539,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             updated_at_ms: session.updated_at_ms,
+            metrics: session.metrics.clone(),
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
@@ -1566,6 +1583,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
         updated_at_ms: session.updated_at_ms,
+        metrics: session.metrics.clone(),
     })
 }
 

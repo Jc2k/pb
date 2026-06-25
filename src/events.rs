@@ -6,6 +6,58 @@ use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMetricsSnapshot {
+    pub llm_invocations: usize,
+    pub llm_runtime_ms: u64,
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub tool_calls: usize,
+    pub tool_runtime_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_energy_kwh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_energy_kwh: Option<f64>,
+}
+
+impl SessionMetricsSnapshot {
+    pub fn from_event(event: &AgentEvent) -> Option<Self> {
+        if let AgentEvent::SessionMetrics {
+            llm_invocations,
+            llm_runtime_ms,
+            prompt_tokens,
+            generated_tokens,
+            tool_calls,
+            tool_runtime_ms,
+            llm_energy_joules,
+            llm_energy_kwh,
+            tool_energy_joules,
+            tool_energy_kwh,
+            ..
+        } = event
+        {
+            Some(Self {
+                llm_invocations: *llm_invocations,
+                llm_runtime_ms: *llm_runtime_ms,
+                prompt_tokens: *prompt_tokens,
+                generated_tokens: *generated_tokens,
+                tool_calls: *tool_calls,
+                tool_runtime_ms: *tool_runtime_ms,
+                llm_energy_joules: *llm_energy_joules,
+                llm_energy_kwh: *llm_energy_kwh,
+                tool_energy_joules: *tool_energy_joules,
+                tool_energy_kwh: *tool_energy_kwh,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -44,6 +96,14 @@ pub enum AgentEvent {
     ToolResult {
         tool: String,
         result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        energy_joules: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        energy_kwh: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        average_power_watts: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +156,42 @@ pub enum AgentEvent {
     },
     SessionTitle {
         title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    LlmInvocation {
+        step: usize,
+        duration_ms: u64,
+        prompt_tokens: usize,
+        generated_tokens: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        energy_joules: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        energy_kwh: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        average_power_watts: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    SessionMetrics {
+        llm_invocations: usize,
+        llm_runtime_ms: u64,
+        prompt_tokens: usize,
+        generated_tokens: usize,
+        tool_calls: usize,
+        tool_runtime_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        llm_energy_joules: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        llm_energy_kwh: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_energy_joules: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_energy_kwh: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -198,6 +294,10 @@ impl EventEnvelope {
             AgentEvent::ToolResult {
                 tool,
                 result,
+                duration_ms,
+                energy_joules,
+                energy_kwh,
+                average_power_watts,
                 nesting_depth,
                 ..
             } => Self {
@@ -205,6 +305,10 @@ impl EventEnvelope {
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
+                    duration_ms,
+                    energy_joules,
+                    energy_kwh,
+                    average_power_watts,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -287,6 +391,60 @@ impl EventEnvelope {
                 event: AgentEvent::Final {
                     content,
                     profile,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::LlmInvocation {
+                step,
+                duration_ms,
+                prompt_tokens,
+                generated_tokens,
+                energy_joules,
+                energy_kwh,
+                average_power_watts,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::LlmInvocation {
+                    step,
+                    duration_ms,
+                    prompt_tokens,
+                    generated_tokens,
+                    energy_joules,
+                    energy_kwh,
+                    average_power_watts,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::SessionMetrics {
+                llm_invocations,
+                llm_runtime_ms,
+                prompt_tokens,
+                generated_tokens,
+                tool_calls,
+                tool_runtime_ms,
+                llm_energy_joules,
+                llm_energy_kwh,
+                tool_energy_joules,
+                tool_energy_kwh,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::SessionMetrics {
+                    llm_invocations,
+                    llm_runtime_ms,
+                    prompt_tokens,
+                    generated_tokens,
+                    tool_calls,
+                    tool_runtime_ms,
+                    llm_energy_joules,
+                    llm_energy_kwh,
+                    tool_energy_joules,
+                    tool_energy_kwh,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
