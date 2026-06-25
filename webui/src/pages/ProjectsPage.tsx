@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import type { InstalledIntegration, IntegrationConfigSchemaResponse, IntegrationKind, MarketplaceIntegration, PendingIntegrationInstall, ProjectEntry, SessionItem } from "../types";
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { SessionCard } from "../components/Session";
-import { ensureNotificationPermission, projectSettingsPath, uniqueInstalledIntegrations, uniqueIntegrations } from "../lib/helpers";
+import { ensureNotificationPermission, projectName, projectSettingsPath, relativeTime, sessionTitle, uniqueInstalledIntegrations, uniqueIntegrations } from "../lib/helpers";
 import { useProjectFinishNotifications } from "../lib/hooks";
 
 export function ProjectsPage() {
@@ -79,6 +79,45 @@ export function ProjectsPage() {
   );
 }
 
+type ProjectDetailsTab = "usage" | "overview" | "snapshot";
+type SessionFilter = "all" | SessionItem["status"];
+
+function formatUsageValue(value: number, suffix = ""): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m${suffix}`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k${suffix}`;
+  return `${Math.round(value)}${suffix}`;
+}
+
+function formatRuntime(ms: number): string {
+  const hours = Math.floor(ms / 3_600_000);
+  const minutes = Math.round((ms % 3_600_000) / 60_000);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${Math.round(ms / 1000)}s`;
+}
+
+function statusIcon(status: SessionItem["status"]): string {
+  if (status === "running") return "bi bi-record-circle";
+  if (status === "queued") return "bi bi-clock";
+  if (status === "paused") return "bi bi-pause-fill";
+  if (status === "failed") return "bi bi-x-circle";
+  return "bi bi-check-lg";
+}
+
+function statusLabel(session: SessionItem): string {
+  if (session.status === "paused" && session.pending_question) return "Needs answer";
+  if (session.status === "paused") return "Paused";
+  return session.status.charAt(0).toUpperCase() + session.status.slice(1);
+}
+
+function iconTone(status: SessionItem["status"], index: number): string {
+  if (status === "running") return "green";
+  if (status === "queued") return "blue";
+  if (status === "paused") return "amber";
+  if (status === "failed") return "red";
+  return ["black", "green", "purple"][index % 3];
+}
+
 export function ProjectPage() {
   const { projectName: encodedProjectName } = useParams<{ projectName: string }>();
   const navigate = useNavigate();
@@ -87,9 +126,35 @@ export function ProjectPage() {
   const [task, setTask] = useState("");
   const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [filter, setFilter] = useState<SessionFilter>("all");
+  const [activeDetailsTab, setActiveDetailsTab] = useState<ProjectDetailsTab>("usage");
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
-  const projectSessions = project ? sessions.filter((session) => session.workdir === project.path) : [];
+  const projectSessions = useMemo(
+    () => project ? sessions.filter((session) => session.workdir === project.path) : [],
+    [project, sessions],
+  );
+  const visibleSessions = filter === "all" ? projectSessions : projectSessions.filter((session) => session.status === filter);
+  const sessionCounts = useMemo(() => ({
+    all: projectSessions.length,
+    running: projectSessions.filter((session) => session.status === "running").length,
+    queued: projectSessions.filter((session) => session.status === "queued").length,
+    paused: projectSessions.filter((session) => session.status === "paused").length,
+    completed: projectSessions.filter((session) => session.status === "completed").length,
+    failed: projectSessions.filter((session) => session.status === "failed").length,
+  }), [projectSessions]);
+  const usage = useMemo(() => projectSessions.reduce((totals, session) => {
+    const metrics = session.metrics;
+    if (!metrics) return totals;
+    totals.tokens += metrics.prompt_tokens + metrics.generated_tokens;
+    totals.runtimeMs += metrics.llm_runtime_ms + metrics.tool_runtime_ms;
+    totals.toolCalls += metrics.tool_calls;
+    totals.energyKwh += metrics.llm_energy_kwh ?? 0;
+    totals.energyKwh += metrics.tool_energy_kwh ?? 0;
+    return totals;
+  }, { tokens: 0, runtimeMs: 0, toolCalls: 0, energyKwh: 0 }), [projectSessions]);
+  const lastActive = projectSessions[0]?.updated_at_ms ? relativeTime(projectSessions[0].updated_at_ms) : "No activity yet";
+  const defaultBranch = branch.trim() || "main";
 
   useProjectFinishNotifications(sessions, projects);
 
@@ -116,7 +181,7 @@ export function ProjectPage() {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: task.trim(), workdir: project.path, branch: branch.trim() || "main" }),
+        body: JSON.stringify({ task: task.trim(), workdir: project.path, branch: defaultBranch }),
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
@@ -126,63 +191,89 @@ export function ProjectPage() {
     }
   };
 
+  const usageList = (
+    <>
+      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energyKwh ? `~${usage.energyKwh.toFixed(3)} kWh` : "Not available"}</strong><em>Local model telemetry</em></span></div>
+      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime</small><strong>{formatRuntime(usage.runtimeMs)}</strong><em>LLM and tool runtime</em></span></div>
+      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-tools"></i></span><span><small>Tool calls</small><strong>{usage.toolCalls}</strong><em>Across project sessions</em></span></div>
+    </>
+  );
+
   return (
-    <PageShell>
-      <section className="hero-section">
-        <Link to="/projects" className="text-decoration-none small fw-medium text-blue">← All projects</Link>
-        <h1>{project?.name || name || "Project"}</h1>
-        <p className="text-secondary mb-3">{project?.path || "Project not found"}</p>
-        {project && (
-          <Link className="btn btn-outline-secondary btn-sm mb-3" to={projectSettingsPath(project.name)}>
-            <i className="bi bi-gear me-1"></i> Project settings
-          </Link>
-        )}
-
-        {project && (
-          <form className="start-card card" onSubmit={(e) => { e.preventDefault(); void startProjectSession(); }}>
-            <div className="task-editor position-relative">
-              <textarea
-                className="form-control"
-                value={task}
-                onChange={(e) => setTask(e.target.value)}
-                placeholder={`Ask the agent to work in ${project.name}…`}
-                rows={4}
-              />
+    <PageShell pageClassName="project-detail-shell" contentClassName="project-detail-wrap">
+      <div className="project-layout">
+        <section className="project-content">
+          <Link to="/projects" className="back-link"><i className="bi bi-arrow-left"></i> All projects</Link>
+          <div className="project-heading">
+            <div className="title-row">
+              <h1>{project?.name || name || "Project"}</h1>
+              {project && <label className="branch-picker"><i className="bi bi-git"></i><select value={branch} onChange={(e) => setBranch(e.target.value)} aria-label="Base branch"><option>main</option><option>develop</option><option>feature/ui-refresh</option></select><i className="bi bi-chevron-down"></i></label>}
             </div>
-            <div className="session-controls row g-3 align-items-end p-3">
-              <div className="col-12 col-md-8">
-                <label className="form-label small fw-semibold">Base branch</label>
-                <select className="form-select" value={branch} onChange={(e) => setBranch(e.target.value)}>
-                  <option>main</option>
-                  <option>develop</option>
-                  <option>feature/ui-refresh</option>
-                </select>
+            {project && <Link className="btn btn-light icon-btn settings-btn" to={projectSettingsPath(project.name)} aria-label="Project settings"><i className="bi bi-gear"></i></Link>}
+          </div>
+
+          {project ? (
+            <form className="card soft-card composer-card" onSubmit={(e) => { e.preventDefault(); void startProjectSession(); }}>
+              <div className="card-body">
+                <h2>Ask the agent</h2>
+                <p>What would you like the agent to work on in this project?</p>
+                <textarea className="form-control composer-input" value={task} onChange={(e) => setTask(e.target.value)} rows={3} placeholder="Describe your task or ask a question..." />
+                <div className="composer-actions">
+                  <div className="quick-actions">
+                    {["Fix bug", "Refactor code", "Add feature", "Write tests"].map((label) => <button key={label} className={`btn btn-light ${label === "Refactor code" || label === "Write tests" ? "optional-action" : ""}`.trim()} type="button" onClick={() => setTask(label.toLowerCase())}><i className="bi bi-plus-lg"></i> {label}</button>)}
+                  </div>
+                  <button className="btn btn-primary send-btn" type="submit" disabled={!task.trim() || isSubmitting} aria-label="Start project chat"><i className="bi bi-arrow-up"></i></button>
+                </div>
               </div>
-              <div className="col-12 col-md-4 d-grid">
-                <button className="btn btn-primary start-button" type="submit" disabled={!task.trim() || isSubmitting}>▷ Start project chat</button>
-              </div>
+            </form>
+          ) : <div className="card soft-card"><div className="card-body text-secondary">Project not found.</div></div>}
+
+          <section className="sessions-section project-sessions-panel">
+            <h2>Project sessions</h2>
+            <div className="status-filter" role="group" aria-label="Filter sessions by state">
+              {(["all", "running", "queued", "paused", "completed", "failed"] as SessionFilter[]).map((item) => <button key={item} type="button" className={`filter-chip${filter === item ? " active" : ""}`} onClick={() => setFilter(item)}>{item !== "all" && <i className={`${statusIcon(item as SessionItem["status"])} status-${item}`}></i>} {item.charAt(0).toUpperCase() + item.slice(1)} <span>{sessionCounts[item]}</span></button>)}
             </div>
-          </form>
-        )}
-      </section>
+            <div className="session-list card soft-card">
+              {visibleSessions.length === 0 ? <div className="empty-session-row">No sessions match this filter.</div> : visibleSessions.map((session, index) => (
+                <button key={session.session_id} className="session-row project-session-row" type="button" onClick={() => navigate(`/sessions/${session.session_id}`)}>
+                  <span className={`session-icon ${iconTone(session.status, index)}`}><i className={statusIcon(session.status)}></i></span>
+                  <span className="session-main"><strong>{sessionTitle(session)}</strong><small>{projectName(session.workdir)} <i className="bi bi-git"></i> {session.branch || defaultBranch}</small></span>
+                  <span className={`state-pill ${session.status}`}><i className={statusIcon(session.status)}></i> {statusLabel(session)}</span>
+                  <time>{relativeTime(session.updated_at_ms)}</time>
+                  <i className="bi bi-chevron-right row-chevron"></i>
+                </button>
+              ))}
+            </div>
+          </section>
+        </section>
 
-
-      <section className="sessions-section">
-        <div className="section-header d-flex align-items-center justify-content-between mb-3">
-          <h2 className="h6 fw-bold m-0">Project sessions</h2>
-        </div>
-        <div className="session-list list-group">
-          {projectSessions.length === 0 ? (
-            <div className="list-group-item text-secondary small">No sessions for this project yet</div>
-          ) : (
-            projectSessions.map((session) => (
-              <SessionCard key={session.session_id} session={session} onClick={() => navigate(`/sessions/${session.session_id}`)} />
-            ))
-          )}
-        </div>
-      </section>
+        <aside className="project-aside">
+          <div className="details-tabs card soft-card">
+            <div className="card-body">
+              <div className="details-heading"><h2>Project details</h2><i className="bi bi-lock"></i></div>
+              <div className="tab-nav" role="tablist" aria-label="Project details tabs">{(["usage", "overview", "snapshot"] as ProjectDetailsTab[]).map((tab) => <button key={tab} type="button" role="tab" className={`nav-link${activeDetailsTab === tab ? " active" : ""}`} onClick={() => setActiveDetailsTab(tab)}>{tab.charAt(0).toUpperCase() + tab.slice(1)}</button>)}</div>
+              {activeDetailsTab === "usage" && <div className="info-list usage-list">{usageList}<p className="privacy-note"><i className="bi bi-lock"></i> All usage is local and private.</p></div>}
+              {activeDetailsTab === "overview" && <ProjectOverview currentStatus={projectSessions[0]?.status || "queued"} defaultBranch={defaultBranch} lastActive={lastActive} sessionCount={projectSessions.length} />}
+              {activeDetailsTab === "snapshot" && <ProjectSnapshot project={project} lastSession={projectSessions[0]} />}
+            </div>
+          </div>
+          <section className="card soft-card aside-card desktop-card"><div className="card-body"><div className="card-title-row"><h2>Local usage</h2><i className="bi bi-info-circle"></i></div><div className="info-list usage-list">{usageList}</div><p className="privacy-note"><i className="bi bi-lock"></i> All usage is local and private.</p></div></section>
+          <section className="card soft-card aside-card desktop-card"><div className="card-body"><h2>Project overview</h2><ProjectOverview currentStatus={projectSessions[0]?.status || "queued"} defaultBranch={defaultBranch} lastActive={lastActive} sessionCount={projectSessions.length} /></div></section>
+          <section className="card soft-card aside-card desktop-card"><div className="card-body"><h2>Project snapshot</h2><ProjectSnapshot project={project} lastSession={projectSessions[0]} /></div></section>
+          <p className="device-note"><i className="bi bi-lock"></i> All data stays on your device.</p>
+        </aside>
+      </div>
     </PageShell>
   );
+}
+
+function ProjectOverview({ currentStatus, defaultBranch, lastActive, sessionCount }: { currentStatus: SessionItem["status"]; defaultBranch: string; lastActive: string; sessionCount: number }) {
+  return <div className="info-list key-value-list"><div><span>Current session</span><strong><span className={`state-pill ${currentStatus}`}>{currentStatus}</span></strong></div><div><span>Default branch</span><strong><i className="bi bi-git"></i> {defaultBranch}</strong></div><div><span>Last active</span><strong>{lastActive}</strong></div><div><span>Sessions</span><strong>{sessionCount}</strong></div></div>;
+}
+
+function ProjectSnapshot({ project, lastSession }: { project?: ProjectEntry; lastSession?: SessionItem }) {
+  return <div className="info-list snapshot-list"><div className="metric-row"><span className="metric-icon blue"><i className="bi bi-code-square"></i></span><span><small>Project path</small><strong>{project?.path || "Unknown"}</strong></span></div><div className="metric-row"><span className="metric-icon purple"><i className="bi bi-box-seam"></i></span><span><small>Workspace</small><strong>{project?.name || "Project"}</strong></span></div><div className="metric-row"><span className="metric-icon green"><i className="bi bi-git"></i></span><span><small>Last session</small><strong>{lastSession ? sessionTitle(lastSession) : "No sessions yet"}</strong>{lastSession && <em>{relativeTime(lastSession.updated_at_ms)}</em>}</span></div></div>;
 }
 
 export function ProjectSettingsPage() {
