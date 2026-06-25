@@ -1,3 +1,4 @@
+/// <reference lib="deno.ns" />
 import { equal } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
 import {
