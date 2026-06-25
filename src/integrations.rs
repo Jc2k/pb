@@ -264,13 +264,8 @@ fn fetch_registry_config(
     let image_manifest = if manifest.get("config").is_some() {
         manifest.clone()
     } else {
-        let digest = manifest
-            .get("manifests")
-            .and_then(Value::as_array)
-            .and_then(|manifests| manifests.first())
-            .and_then(|manifest| manifest.get("digest"))
-            .and_then(Value::as_str)
-            .context("image index does not contain a manifest digest")?;
+        let digest = select_runnable_manifest_digest(manifest)
+            .context("image index does not contain a runnable manifest digest")?;
         fetch_registry_json(
             client,
             image,
@@ -300,6 +295,49 @@ fn fetch_registry_config(
         .join(", "),
         "image config",
     )
+}
+
+fn select_runnable_manifest_digest(manifest: &Value) -> Option<&str> {
+    let manifests = manifest.get("manifests")?.as_array()?;
+    manifests
+        .iter()
+        .filter(|item| is_runnable_manifest(item))
+        .max_by_key(|item| manifest_platform_priority(item))
+        .and_then(|item| item.get("digest"))
+        .and_then(Value::as_str)
+}
+
+fn is_runnable_manifest(manifest: &Value) -> bool {
+    let platform = manifest.get("platform");
+    let os = platform
+        .and_then(|platform| platform.get("os"))
+        .and_then(Value::as_str);
+    if matches!(os, Some("unknown")) {
+        return false;
+    }
+
+    let media_type = manifest
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    media_type.contains("manifest.v1") || media_type.contains("manifest.v2")
+}
+
+fn manifest_platform_priority(manifest: &Value) -> u8 {
+    let platform = manifest.get("platform");
+    let os = platform
+        .and_then(|platform| platform.get("os"))
+        .and_then(Value::as_str);
+    let architecture = platform
+        .and_then(|platform| platform.get("architecture"))
+        .and_then(Value::as_str);
+
+    match (os, architecture) {
+        (Some("linux"), Some("amd64")) => 3,
+        (Some("linux"), Some("arm64")) => 2,
+        (Some("linux"), _) => 1,
+        _ => 0,
+    }
 }
 
 fn fetch_registry_json(
@@ -659,6 +697,34 @@ mod tests {
         assert_eq!(
             find_annotation(&config, CONFIG_SCHEMA_ANNOTATION),
             Some(r#"{"type":"object","required":["token"]}"#)
+        );
+    }
+
+    #[test]
+    fn select_runnable_manifest_digest_skips_attestation_manifests() {
+        let manifest = serde_json::json!({
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:attestation",
+                    "platform": { "os": "unknown", "architecture": "unknown" }
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:arm64",
+                    "platform": { "os": "linux", "architecture": "arm64" }
+                },
+                {
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": "sha256:amd64",
+                    "platform": { "os": "linux", "architecture": "amd64" }
+                }
+            ]
+        });
+
+        assert_eq!(
+            select_runnable_manifest_digest(&manifest),
+            Some("sha256:amd64")
         );
     }
 
