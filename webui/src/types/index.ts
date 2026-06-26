@@ -173,6 +173,13 @@ export interface ProjectEntry {
   notify_on_finish: boolean;
 }
 
+export interface ProjectUsageStats {
+  tokens: number;
+  runtime_ms: number;
+  tool_calls: number;
+  energy_kwh?: number | null;
+}
+
 export type IntegrationKind = "mcp" | "lsp";
 
 export interface MarketplaceIntegration {

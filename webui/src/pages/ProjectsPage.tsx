@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import type { InstalledIntegration, IntegrationConfigSchemaResponse, IntegrationKind, MarketplaceIntegration, PendingIntegrationInstall, ProjectEntry, SessionItem } from "../types";
+import type { InstalledIntegration, IntegrationConfigSchemaResponse, IntegrationKind, MarketplaceIntegration, PendingIntegrationInstall, ProjectEntry, ProjectUsageStats, SessionItem } from "../types";
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { SessionCard } from "../components/Session";
@@ -128,6 +128,7 @@ export function ProjectPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [filter, setFilter] = useState<SessionFilter>("all");
   const [activeDetailsTab, setActiveDetailsTab] = useState<ProjectDetailsTab>("usage");
+  const [usage, setUsage] = useState<ProjectUsageStats>({ tokens: 0, runtime_ms: 0, tool_calls: 0 });
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = useMemo(
@@ -143,16 +144,6 @@ export function ProjectPage() {
     completed: projectSessions.filter((session) => session.status === "completed").length,
     failed: projectSessions.filter((session) => session.status === "failed").length,
   }), [projectSessions]);
-  const usage = useMemo(() => projectSessions.reduce((totals, session) => {
-    const metrics = session.metrics;
-    if (!metrics) return totals;
-    totals.tokens += metrics.prompt_tokens + metrics.generated_tokens;
-    totals.runtimeMs += metrics.llm_runtime_ms + metrics.tool_runtime_ms;
-    totals.toolCalls += metrics.tool_calls;
-    totals.energyKwh += metrics.llm_energy_kwh ?? 0;
-    totals.energyKwh += metrics.tool_energy_kwh ?? 0;
-    return totals;
-  }, { tokens: 0, runtimeMs: 0, toolCalls: 0, energyKwh: 0 }), [projectSessions]);
   const lastActive = projectSessions[0]?.updated_at_ms ? relativeTime(projectSessions[0].updated_at_ms) : "No activity yet";
   const defaultBranch = branch.trim() || "main";
 
@@ -174,6 +165,17 @@ export function ProjectPage() {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (!name) return;
+    const fetchUsage = () =>
+      fetch(`/api/projects/${encodeURIComponent(name)}/usage`)
+        .then((res) => (res.ok ? res.json() : { tokens: 0, runtime_ms: 0, tool_calls: 0 }))
+        .then((stats: ProjectUsageStats) => setUsage(stats));
+    void fetchUsage();
+    const timer = window.setInterval(() => void fetchUsage(), 5000);
+    return () => window.clearInterval(timer);
+  }, [name]);
+
   const startProjectSession = async () => {
     if (!project || !task.trim()) return;
     setIsSubmitting(true);
@@ -193,10 +195,10 @@ export function ProjectPage() {
 
   const usageList = (
     <>
-      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens (today)</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
-      <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energyKwh ? `~${usage.energyKwh.toFixed(3)} kWh` : "Not available"}</strong><em>Local model telemetry</em></span></div>
-      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime (today)</small><strong>{formatRuntime(usage.runtimeMs)}</strong><em>LLM and tool runtime</em></span></div>
-      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-bezier2"></i></span><span><small>Tool calls (today)</small><strong>{usage.toolCalls}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energy_kwh ? `~${usage.energy_kwh.toFixed(3)} kWh` : "Not available"}</strong><em>Local model telemetry</em></span></div>
+      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime</small><strong>{formatRuntime(usage.runtime_ms)}</strong><em>LLM and tool runtime</em></span></div>
+      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-bezier2"></i></span><span><small>Tool calls</small><strong>{usage.tool_calls}</strong><em>Across project sessions</em></span></div>
     </>
   );
 
