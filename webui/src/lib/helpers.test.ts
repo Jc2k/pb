@@ -7,6 +7,7 @@ import {
   projectName,
   projectSettingsPath,
   sessionTitle,
+  usageStatsForToday,
 } from "./helpers.ts";
 
 Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () => {
@@ -45,4 +46,51 @@ Deno.test("groupToolEvents groups contiguous tool calls with their results", () 
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {
   equal(projectSettingsPath("my project"), "/projects/my%20project/settings");
   equal(projectSettingsPath("owner/repo"), "/projects/owner%2Frepo/settings");
+});
+
+Deno.test("usageStatsForToday sums metrics for sessions updated today", () => {
+  const today = new Date("2026-06-26T12:00:00");
+  const sessions = [
+    {
+      session_id: "today",
+      task: "Current work",
+      running: false,
+      paused: false,
+      status: "completed" as const,
+      updated_at_ms: new Date("2026-06-26T08:30:00").getTime(),
+      metrics: {
+        llm_invocations: 1,
+        llm_runtime_ms: 1000,
+        prompt_tokens: 120,
+        generated_tokens: 30,
+        tool_calls: 2,
+        tool_runtime_ms: 500,
+        llm_energy_kwh: 0.001,
+        tool_energy_kwh: 0.002,
+      },
+    },
+    {
+      session_id: "yesterday",
+      task: "Old work",
+      running: false,
+      paused: false,
+      status: "completed" as const,
+      updated_at_ms: new Date("2026-06-25T23:59:59").getTime(),
+      metrics: {
+        llm_invocations: 1,
+        llm_runtime_ms: 2000,
+        prompt_tokens: 400,
+        generated_tokens: 100,
+        tool_calls: 5,
+        tool_runtime_ms: 1000,
+      },
+    },
+  ];
+
+  const stats = usageStatsForToday(sessions, today);
+
+  equal(stats.tokens, 150);
+  equal(stats.runtime_ms, 1500);
+  equal(stats.tool_calls, 2);
+  equal(stats.energy_kwh, 0.003);
 });

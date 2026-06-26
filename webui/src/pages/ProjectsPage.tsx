@@ -4,7 +4,7 @@ import type { InstalledIntegration, IntegrationConfigSchemaResponse, Integration
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { SessionCard } from "../components/Session";
-import { ensureNotificationPermission, projectName, projectSettingsPath, relativeTime, sessionTitle, uniqueInstalledIntegrations, uniqueIntegrations } from "../lib/helpers";
+import { ensureNotificationPermission, projectName, projectSettingsPath, relativeTime, sessionTitle, uniqueInstalledIntegrations, uniqueIntegrations, usageStatsForToday } from "../lib/helpers";
 import { useProjectFinishNotifications } from "../lib/hooks";
 
 export function ProjectsPage() {
@@ -145,6 +145,7 @@ export function ProjectPage() {
     failed: projectSessions.filter((session) => session.status === "failed").length,
   }), [projectSessions]);
   const lastActive = projectSessions[0]?.updated_at_ms ? relativeTime(projectSessions[0].updated_at_ms) : "No activity yet";
+  const todaysUsage = useMemo(() => usageStatsForToday(projectSessions), [projectSessions]);
   const defaultBranch = branch.trim() || "main";
 
   useProjectFinishNotifications(sessions, projects);
@@ -195,10 +196,10 @@ export function ProjectPage() {
 
   const usageList = (
     <>
-      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
-      <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energy_kwh ? `~${usage.energy_kwh.toFixed(3)} kWh` : "Not available"}</strong><em>Local model telemetry</em></span></div>
-      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime</small><strong>{formatRuntime(usage.runtime_ms)}</strong><em>LLM and tool runtime</em></span></div>
-      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-bezier2"></i></span><span><small>Tool calls</small><strong>{usage.tool_calls}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens</small><strong>{formatUsageValue(usage.tokens)}</strong><em className="today-usage">Today: {formatUsageValue(todaysUsage.tokens)}</em><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energy_kwh ? `~${usage.energy_kwh.toFixed(3)} kWh` : "Not available"}</strong><em className="today-usage">Today: {todaysUsage.energy_kwh ? `~${todaysUsage.energy_kwh.toFixed(3)} kWh` : "Not available"}</em><em>Local model telemetry</em></span></div>
+      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime</small><strong>{formatRuntime(usage.runtime_ms)}</strong><em className="today-usage">Today: {formatRuntime(todaysUsage.runtime_ms)}</em><em>LLM and tool runtime</em></span></div>
+      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-bezier2"></i></span><span><small>Tool calls</small><strong>{usage.tool_calls}</strong><em className="today-usage">Today: {todaysUsage.tool_calls}</em><em>Across project sessions</em></span></div>
     </>
   );
 
