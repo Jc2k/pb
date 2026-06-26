@@ -1078,7 +1078,7 @@ body {
 .project-session-row time,
 .session-main small {
   color: #44516a;
-  font-weight: 560;
+  font-weight: 450;
 }
 
 .project-session-row .session-main {
@@ -1307,7 +1307,7 @@ body {
 .back-link {
   margin-bottom: 0.8rem;
   font-size: 0.92rem;
-  font-weight: 750;
+  font-weight: 600;
 }
 
 .project-heading {
@@ -1320,8 +1320,9 @@ body {
 }
 
 .title-row h1 {
-  font-size: clamp(2.6rem, 5vw, 3.75rem);
-  letter-spacing: -0.075em;
+  font-size: clamp(2.25rem, 4.4vw, 3.25rem);
+  font-weight: 640;
+  letter-spacing: -0.055em;
 }
 
 .branch-picker {
@@ -1331,6 +1332,7 @@ body {
   border-radius: 10px;
   background: #fff;
   font-size: 0.92rem;
+  font-weight: 600;
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
 }
 
@@ -1365,6 +1367,7 @@ body {
 .aside-card h2,
 .details-tabs h2 {
   font-size: 1.03rem;
+  font-weight: 620;
   letter-spacing: -0.02em;
 }
 
@@ -1401,7 +1404,7 @@ body {
   background: #fff;
   color: #111827;
   font-size: 0.88rem;
-  font-weight: 750;
+  font-weight: 600;
   box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
 }
 
@@ -1427,7 +1430,7 @@ body {
   border-radius: 9px;
   background: #fff;
   font-size: 0.83rem;
-  font-weight: 750;
+  font-weight: 600;
   box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
 }
 
@@ -1456,14 +1459,14 @@ body {
 
 .project-session-row .session-main strong {
   font-size: 0.92rem;
-  font-weight: 780;
+  font-weight: 520;
 }
 
 .project-session-row .session-main small,
 .project-session-row time {
   color: #33415c;
   font-size: 0.8rem;
-  font-weight: 560;
+  font-weight: 450;
 }
 
 .state-pill {
@@ -1471,7 +1474,7 @@ body {
   padding: 0.18rem 0.5rem;
   border-radius: 6px;
   font-size: 0.72rem;
-  font-weight: 760;
+  font-weight: 600;
 }
 
 .card-title-row,
@@ -1497,12 +1500,12 @@ body {
 
 .metric-row small {
   font-size: 0.82rem;
-  font-weight: 620;
+  font-weight: 520;
 }
 
 .metric-row strong {
   font-size: 0.98rem;
-  font-weight: 820;
+  font-weight: 640;
 }
 
 .metric-row em {
@@ -1532,7 +1535,7 @@ body {
   }
 
   .title-row h1 {
-    font-size: clamp(2.55rem, 12vw, 3.35rem);
+    font-size: clamp(2.2rem, 10.5vw, 3rem);
   }
 
   .project-aside {
