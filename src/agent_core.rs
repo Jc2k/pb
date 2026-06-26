@@ -119,6 +119,7 @@ pub enum AgentProfile {
     Ask,
     Research,
     Monitor,
+    Vision,
 }
 
 impl Default for AgentProfile {
@@ -219,6 +220,7 @@ impl AgentProfile {
             Self::Ask => "ask",
             Self::Research => "research",
             Self::Monitor => "monitor",
+            Self::Vision => "vision",
         }
     }
 
@@ -232,8 +234,9 @@ impl AgentProfile {
             "ask" => Ok(Self::Ask),
             "research" => Ok(Self::Research),
             "monitor" => Ok(Self::Monitor),
+            "vision" => Ok(Self::Vision),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor"
+                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor, vision"
             ),
         }
     }
@@ -248,6 +251,7 @@ impl AgentProfile {
             Self::Ask => "Joey Pardella",
             Self::Research => "Emmanuel Goldstein",
             Self::Monitor => "Trinity Walker",
+            Self::Vision => "Lisa Snapshot",
         }
     }
 
@@ -279,6 +283,9 @@ impl AgentProfile {
             }
             Self::Research => {
                 "Profile: research. You are Emmanuel. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or call teammates. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
+            }
+            Self::Vision => {
+                "Profile: vision. You are Lisa. Analyze attached images, screenshots, mockups, UI comparisons, diagrams, and visual artifacts. Use vision_describe for image understanding and return structured findings that build and review agents can act on. Do not edit files or create commits."
             }
             Self::Monitor => {
                 "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
@@ -378,6 +385,15 @@ impl TodoMemory {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SessionAttachment {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub path: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRequest {
     pub task: String,
@@ -406,6 +422,8 @@ pub struct AgentRequest {
     pub environment: Option<EnvironmentConfig>,
     #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
+    pub attachments: Vec<SessionAttachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -743,6 +761,7 @@ pub fn run_agent<S: EventSink>(
         model: model_path.display().to_string(),
         workspace: workspace_root.display().to_string(),
         branch: branch.clone(),
+        attachments: args.attachments.clone(),
         timestamp_ms: Some(now_millis()),
     });
 
@@ -768,7 +787,7 @@ pub fn run_agent<S: EventSink>(
         },
         ChatMessage {
             role: "user",
-            content: args.task.clone(),
+            content: task_with_attachments(&args),
         },
     ];
 
@@ -848,7 +867,7 @@ fn build_agent_instructions(
     instructions.push_str(profile.instructions());
     instructions.push('\n');
     instructions.push_str(&format!(
-        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), and Trinity (monitor). Use I when talking about what you have done and We when talking about what needs to happen next. ",
+        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), Trinity (monitor), and Lisa (vision). Use I when talking about what you have done and We when talking about what needs to happen next. ",
         current = profile.teammate_first_name()
     ));
     if allow_sub_agents && profile != AgentProfile::Research {
@@ -890,7 +909,7 @@ fn build_agent_instructions(
     instructions.push('\n');
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor, Lisa=vision. Ask Lisa when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
@@ -1078,6 +1097,8 @@ impl BuiltInToolSchema {
             "git_commit" => "git_commit(message)",
             "git_revert" => "git_revert(commit)",
             "sub_agent" => "sub_agent(profile,task,max_steps)",
+            "attachments" => "attachments()",
+            "vision_describe" => "vision_describe(attachment_id,path,prompt)",
             "memory_search" => "memory_search(query,paths,kinds,limit)",
             "memory_read" => "memory_read(id)",
             "memory_propose" => "memory_propose(kind,title,body,evidence)",
@@ -1108,6 +1129,32 @@ impl BuiltInToolSchema {
 
 fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
     vec![
+        builtin_tool(
+            "attachments",
+            "List images attached to this session. Attachments are stored with session data and may be referenced by id or path.",
+            object_schema([], []),
+        ),
+        builtin_tool(
+            "vision_describe",
+            "Analyze an attached image or project image using a local vision model when available. On Apple Silicon with 64GB RAM, prefer Qwen3-VL 8B/30B-A3B quantized over the larger MoE unless explicitly configured.",
+            object_schema(
+                [
+                    string_property(
+                        "attachment_id",
+                        "Attachment id from attachments(); optional when path is set.",
+                    ),
+                    string_property(
+                        "path",
+                        "Project-relative image path or stored attachment path; optional when attachment_id is set.",
+                    ),
+                    string_property(
+                        "prompt",
+                        "What visual information to extract, e.g. layout structure, UI differences, accessibility concerns.",
+                    ),
+                ],
+                [],
+            ),
+        ),
         builtin_tool(
             "read_file",
             "Read a UTF-8 text file inside the project root, optionally limiting the returned line range.",
@@ -1688,16 +1735,19 @@ fn tool_allowed(
     repository_less: bool,
 ) -> bool {
     if repository_less {
-        return matches!(tool, "web_search" | "web_fetch" | "sub_agent")
-            && (tool != "sub_agent"
-                || (allow_sub_agents
-                    && matches!(
-                        profile,
-                        AgentProfile::Ask
-                            | AgentProfile::Build
-                            | AgentProfile::Plan
-                            | AgentProfile::Monitor
-                    )));
+        return matches!(
+            tool,
+            "web_search" | "web_fetch" | "sub_agent" | "attachments" | "vision_describe"
+        ) && (tool != "sub_agent"
+            || (allow_sub_agents
+                && matches!(
+                    profile,
+                    AgentProfile::Ask
+                        | AgentProfile::Build
+                        | AgentProfile::Plan
+                        | AgentProfile::Monitor
+                        | AgentProfile::Vision
+                )));
     }
     match tool {
         "read_file"
@@ -1738,7 +1788,10 @@ fn tool_allowed(
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
-        "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
+        "sub_agent" => {
+            allow_sub_agents && profile != AgentProfile::Research && profile != AgentProfile::Vision
+        }
+        "attachments" | "vision_describe" => true,
         _ => false,
     }
 }
@@ -3019,6 +3072,8 @@ fn run_tool(
         | "react_renders"
         | "react_errors" => browser_tools::call_tool(tool, arguments),
         "sub_agent" => run_sub_agent(arguments, context, sink),
+        "attachments" => Ok(serde_json::to_string_pretty(&context.request.attachments)?),
+        "vision_describe" => run_vision_describe(arguments, context),
         "run_command" => {
             let cmd = arguments
                 .get("cmd")
@@ -3079,6 +3134,88 @@ fn run_guard_commands(
         }
     }
     Ok(())
+}
+
+fn task_with_attachments(args: &AgentRequest) -> String {
+    if args.attachments.is_empty() {
+        return args.task.clone();
+    }
+    let list = args
+        .attachments
+        .iter()
+        .map(|a| {
+            format!(
+                "- {} (id: {}, mime: {}, size: {} bytes, path: {})",
+                a.name, a.id, a.mime, a.size, a.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\nAttached images available to this task:\n{}\nUse attachments() and vision_describe(...) when visual details matter.",
+        args.task, list
+    )
+}
+
+fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<String> {
+    let attachment_id = arguments
+        .get("attachment_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let path_arg = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("Describe this image as structured implementation guidance.");
+    let attachment = if !attachment_id.is_empty() {
+        context
+            .request
+            .attachments
+            .iter()
+            .find(|a| a.id == attachment_id)
+    } else {
+        None
+    };
+    let path = attachment
+        .map(|a| PathBuf::from(&a.path))
+        .or_else(|| (!path_arg.is_empty()).then(|| PathBuf::from(path_arg)))
+        .context("vision_describe requires attachment_id or path")?;
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        context.workspace_root.join(path)
+    };
+    if !absolute.exists() {
+        bail!("image not found: {}", absolute.display());
+    }
+    let output = Command::new("ollama")
+        .args([
+            "run",
+            "qwen3-vl:8b",
+            prompt,
+            absolute.to_string_lossy().as_ref(),
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Ok(format!(
+            "vision model invocation failed ({}). Image is available at {}. Install/run a local Qwen3-VL model (recommended on Mac M4 Max 64GB: qwen3-vl:8b or a quantized 30B-A3B; avoid large MoE unless memory permits) and retry. stderr: {}",
+            out.status,
+            absolute.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(err) => Ok(format!(
+            "vision model is not available ({err}). Image is available at {}. Install Ollama or configure a Qwen3-VL runner; recommended Mac M4 Max 64GB starting point: quantized Qwen3-VL 8B/30B-A3B rather than the larger MoE.",
+            absolute.display()
+        )),
+    }
 }
 
 fn run_sub_agent(
@@ -4571,6 +4708,7 @@ mod tests {
             seed: 42,
             environment: None,
             session_id: "session-123".to_string(),
+            attachments: Vec::new(),
         }
     }
 
@@ -5147,6 +5285,7 @@ mod tests {
             seed: 42,
             environment: None,
             session_id: "session-123".to_string(),
+            attachments: Vec::new(),
         };
 
         let workdir = tempfile::tempdir().unwrap();
@@ -5204,6 +5343,7 @@ mod tests {
             seed: 42,
             environment: None,
             session_id: "session-456".to_string(),
+            attachments: Vec::new(),
         };
 
         // Should find and use existing branch with same session_id

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent_core::AgentProfile;
+use crate::agent_core::{AgentProfile, SessionAttachment};
 use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
@@ -66,6 +66,8 @@ pub enum AgentEvent {
         model: String,
         workspace: String,
         branch: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<SessionAttachment>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -238,6 +240,7 @@ impl EventEnvelope {
                 model,
                 workspace,
                 branch,
+                attachments,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
@@ -246,6 +249,7 @@ impl EventEnvelope {
                     model,
                     workspace,
                     branch,
+                    attachments,
                     timestamp_ms: Some(now),
                 },
             },

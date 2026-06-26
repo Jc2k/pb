@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import type { InstalledIntegration, IntegrationConfigSchemaResponse, IntegrationKind, MarketplaceIntegration, PendingIntegrationInstall, ProjectEntry, ProjectUsageStats, SessionItem } from "../types";
+import type { InstalledIntegration, IntegrationConfigSchemaResponse, IntegrationKind, MarketplaceIntegration, PendingIntegrationInstall, ProjectEntry, ProjectUsageStats, SessionAttachment, SessionItem } from "../types";
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { SessionCard } from "../components/Session";
@@ -126,6 +126,7 @@ export function ProjectPage() {
   const [task, setTask] = useState("");
   const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
   const [activeDetailsTab, setActiveDetailsTab] = useState<ProjectDetailsTab>("usage");
   const [usage, setUsage] = useState<ProjectUsageStats>({ tokens: 0, runtime_ms: 0, tool_calls: 0 });
@@ -184,7 +185,7 @@ export function ProjectPage() {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: task.trim(), workdir: project.path, branch: defaultBranch }),
+        body: JSON.stringify({ task: task.trim(), workdir: project.path, branch: defaultBranch, attachments: images }),
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
@@ -222,6 +223,7 @@ export function ProjectPage() {
                 <h2>Ask the agent</h2>
                 <p>What would you like the agent to work on in this project?</p>
                 <textarea className="form-control composer-input" value={task} onChange={(e) => setTask(e.target.value)} rows={3} placeholder="Describe your task or ask a question..." />
+                <ImageAttachments images={images} setImages={setImages} />
                 <div className="composer-actions">
                   <div className="quick-actions">
                     <button className="btn btn-light" type="button" onClick={() => setTask("fix bug")}><i className="bi bi-bug"></i> Fix bug</button>
@@ -417,4 +419,29 @@ export function ProjectSettingsPage() {
       )}
     </PageShell>
   );
+}
+
+function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
+  const onFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const loaded = await Promise.all(Array.from(files).filter((file) => file.type.startsWith("image/")).map(async (file) => ({
+      name: file.name,
+      mime: file.type || "application/octet-stream",
+      base64: await fileToBase64(file),
+    })));
+    setImages([...images, ...loaded]);
+  };
+  return <div className="attachment-row small text-secondary mt-2">
+    <label className="btn btn-sm btn-light"><i className="bi bi-paperclip"></i> Attach images<input className="visually-hidden" type="file" accept="image/*" multiple onChange={(e) => void onFiles(e.target.files)} /></label>
+    {images.map((image, index) => <span key={`${image.name}-${index}`} className="badge text-bg-light ms-2">{image.name}<button type="button" className="btn-close btn-close-sm ms-2" aria-label={`Remove ${image.name}`} onClick={() => setImages(images.filter((_, i) => i !== index))}></button></span>)}
+  </div>;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
