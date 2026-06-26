@@ -193,10 +193,10 @@ export function ProjectPage() {
 
   const usageList = (
     <>
-      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon purple"><i className="bi bi-file-earmark-text"></i></span><span><small>Tokens (today)</small><strong>{formatUsageValue(usage.tokens)}</strong><em>Across project sessions</em></span></div>
       <div className="metric-row"><span className="metric-icon green"><i className="bi bi-lightning-charge"></i></span><span><small>Energy (estimated)</small><strong>{usage.energyKwh ? `~${usage.energyKwh.toFixed(3)} kWh` : "Not available"}</strong><em>Local model telemetry</em></span></div>
-      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime</small><strong>{formatRuntime(usage.runtimeMs)}</strong><em>LLM and tool runtime</em></span></div>
-      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-tools"></i></span><span><small>Tool calls</small><strong>{usage.toolCalls}</strong><em>Across project sessions</em></span></div>
+      <div className="metric-row"><span className="metric-icon blue"><i className="bi bi-clock"></i></span><span><small>Runtime (today)</small><strong>{formatRuntime(usage.runtimeMs)}</strong><em>LLM and tool runtime</em></span></div>
+      <div className="metric-row"><span className="metric-icon orange"><i className="bi bi-bezier2"></i></span><span><small>Tool calls (today)</small><strong>{usage.toolCalls}</strong><em>Across project sessions</em></span></div>
     </>
   );
 
@@ -221,7 +221,9 @@ export function ProjectPage() {
                 <textarea className="form-control composer-input" value={task} onChange={(e) => setTask(e.target.value)} rows={3} placeholder="Describe your task or ask a question..." />
                 <div className="composer-actions">
                   <div className="quick-actions">
-                    {["Fix bug", "Refactor code", "Add feature", "Write tests"].map((label) => <button key={label} className={`btn btn-light ${label === "Refactor code" || label === "Write tests" ? "optional-action" : ""}`.trim()} type="button" onClick={() => setTask(label.toLowerCase())}><i className="bi bi-plus-lg"></i> {label}</button>)}
+                    <button className="btn btn-light" type="button" onClick={() => setTask("fix bug")}><i className="bi bi-bug"></i> Fix bug</button>
+                    <button className="btn btn-light" type="button" onClick={() => setTask("add feature")}><i className="bi bi-plus-lg"></i> Add feature</button>
+                    <button className="btn btn-light" type="button" onClick={() => setTask("more options")}><span>More</span><i className="bi bi-chevron-down"></i></button>
                   </div>
                   <button className="btn btn-primary send-btn" type="submit" disabled={!task.trim() || isSubmitting} aria-label="Start project chat"><i className="bi bi-arrow-up"></i></button>
                 </div>

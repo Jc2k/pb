@@ -1282,3 +1282,319 @@ body {
   .metric-row strong { font-size: 1.02rem; }
   .metric-row em { font-size: 0.76rem; }
 }
+
+/* Calmer project page matching the supplied mockups */
+.project-detail-shell.main-panel,
+.project-detail-shell .mobile-topbar {
+  background: #f8fafc;
+}
+
+.project-detail-wrap {
+  width: min(1360px, 100%);
+  padding: 1.65rem 2rem 2.5rem;
+}
+
+.project-layout {
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 1.6rem;
+}
+
+.project-aside {
+  gap: 0.85rem;
+  padding-top: 3.35rem;
+}
+
+.back-link {
+  margin-bottom: 0.8rem;
+  font-size: 0.92rem;
+  font-weight: 750;
+}
+
+.project-heading {
+  align-items: center;
+  margin-bottom: 1.15rem;
+}
+
+.title-row {
+  gap: 0.85rem;
+}
+
+.title-row h1 {
+  font-size: clamp(2.6rem, 5vw, 3.75rem);
+  letter-spacing: -0.075em;
+}
+
+.branch-picker {
+  min-height: 44px;
+  padding: 0.58rem 0.9rem;
+  border-color: #d9e0ea;
+  border-radius: 10px;
+  background: #fff;
+  font-size: 0.92rem;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
+}
+
+.icon-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
+}
+
+.soft-card {
+  border-color: #dfe5ed;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 4px 18px rgba(15, 23, 42, 0.035);
+  backdrop-filter: none;
+}
+
+.composer-card {
+  margin-bottom: 1.55rem;
+}
+
+.composer-card .card-body,
+.aside-card .card-body,
+.details-tabs .card-body {
+  padding: 1.15rem 1.25rem;
+}
+
+.composer-card h2,
+.project-sessions-panel h2,
+.aside-card h2,
+.details-tabs h2 {
+  font-size: 1.03rem;
+  letter-spacing: -0.02em;
+}
+
+.composer-card p {
+  margin: 0.38rem 0 0.9rem;
+  color: #344563;
+  font-size: 0.9rem;
+}
+
+.composer-input {
+  min-height: 84px;
+  padding: 0.9rem 1rem;
+  border-color: #d8e0ea;
+  border-radius: 10px;
+  font-size: 0.95rem;
+}
+
+.composer-actions {
+  margin-top: 0.85rem;
+}
+
+.quick-actions {
+  gap: 0.5rem;
+}
+
+.quick-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 42px;
+  padding: 0.5rem 0.85rem;
+  border-color: #dbe3ee;
+  border-radius: 10px;
+  background: #fff;
+  color: #111827;
+  font-size: 0.88rem;
+  font-weight: 750;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
+}
+
+.send-btn {
+  width: 46px;
+  height: 46px;
+  border-radius: 11px;
+}
+
+.project-sessions-panel h2 {
+  margin-bottom: 0.7rem;
+}
+
+.status-filter {
+  gap: 0.45rem;
+  padding-bottom: 0.65rem;
+}
+
+.filter-chip {
+  min-height: 36px;
+  padding: 0.42rem 0.72rem;
+  border-color: #dbe3ee;
+  border-radius: 9px;
+  background: #fff;
+  font-size: 0.83rem;
+  font-weight: 750;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
+}
+
+.filter-chip span {
+  min-width: 19px;
+  height: 19px;
+  font-size: 0.72rem;
+}
+
+.project-session-row {
+  grid-template-columns: 40px minmax(0, 1fr) auto minmax(88px, auto) 14px;
+  min-height: 62px;
+  padding: 0.72rem 0.95rem;
+}
+
+.project-session-row .session-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  font-size: 0.86rem;
+}
+
+.project-session-row .session-main {
+  gap: 0.1rem;
+}
+
+.project-session-row .session-main strong {
+  font-size: 0.92rem;
+  font-weight: 780;
+}
+
+.project-session-row .session-main small,
+.project-session-row time {
+  color: #33415c;
+  font-size: 0.8rem;
+  font-weight: 560;
+}
+
+.state-pill {
+  min-height: 22px;
+  padding: 0.18rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 760;
+}
+
+.card-title-row,
+.details-heading {
+  margin-bottom: 0.9rem;
+}
+
+.info-list {
+  gap: 0.85rem;
+}
+
+.metric-row {
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 0.8rem;
+}
+
+.metric-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  font-size: 1.08rem;
+}
+
+.metric-row small {
+  font-size: 0.82rem;
+  font-weight: 620;
+}
+
+.metric-row strong {
+  font-size: 0.98rem;
+  font-weight: 820;
+}
+
+.metric-row em {
+  color: #536179;
+  font-size: 0.74rem;
+}
+
+.key-value-list > div {
+  min-height: 36px;
+}
+
+.key-value-list span,
+.key-value-list strong {
+  font-size: 0.9rem;
+}
+
+.privacy-note,
+.device-note {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  font-size: 0.84rem;
+}
+
+@media (max-width: 991.98px) {
+  .project-detail-wrap {
+    padding: 1rem 0.75rem 6rem;
+  }
+
+  .title-row h1 {
+    font-size: clamp(2.55rem, 12vw, 3.35rem);
+  }
+
+  .project-aside {
+    padding-top: 0.9rem;
+  }
+
+  .composer-card .card-body,
+  .aside-card .card-body,
+  .details-tabs .card-body {
+    padding: 0.95rem;
+  }
+
+  .composer-input {
+    min-height: 72px;
+  }
+
+  .quick-actions .btn {
+    min-height: 38px;
+    padding: 0.46rem 0.7rem;
+    font-size: 0.78rem;
+  }
+
+  .send-btn {
+    width: 42px;
+    height: 42px;
+  }
+
+  .status-filter {
+    margin-inline: -0.75rem;
+    padding-inline: 0.75rem;
+  }
+
+  .filter-chip {
+    min-height: 32px;
+    padding: 0.36rem 0.58rem;
+    font-size: 0.74rem;
+  }
+
+  .project-session-row {
+    grid-template-columns: 34px minmax(0, 1fr) auto 12px;
+    min-height: 54px;
+    gap: 0.55rem;
+    padding: 0.62rem 0.75rem;
+  }
+
+  .project-session-row .session-icon {
+    width: 30px;
+    height: 30px;
+    border-radius: 7px;
+    font-size: 0.78rem;
+  }
+
+  .project-session-row .session-main strong {
+    font-size: 0.78rem;
+  }
+
+  .project-session-row .session-main small,
+  .project-session-row time {
+    font-size: 0.68rem;
+  }
+
+  .state-pill {
+    font-size: 0.62rem;
+  }
+}
