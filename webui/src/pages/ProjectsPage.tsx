@@ -290,8 +290,16 @@ export function ProjectSettingsPage() {
   const [configSchema, setConfigSchema] = useState<IntegrationConfigSchemaResponse | null>(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
   const [schemaError, setSchemaError] = useState("");
+  const [integrationSearch, setIntegrationSearch] = useState("");
+  const [integrationCategory, setIntegrationCategory] = useState<IntegrationKind | "all">("all");
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
+  const filteredMarketplace = marketplace.filter((item) => {
+    const query = integrationSearch.trim().toLowerCase();
+    const matchesCategory = integrationCategory === "all" || item.kind === integrationCategory;
+    const matchesSearch = !query || [item.name, item.description, item.container_image].some((value) => value.toLowerCase().includes(query));
+    return matchesCategory && matchesSearch;
+  });
 
   const fetchProjects = () =>
     fetch("/api/projects")
@@ -367,38 +375,45 @@ export function ProjectSettingsPage() {
 
   return (
     <PageShell>
-      <section className="hero-section">
-        <Link to={`/projects/${encodeURIComponent(name)}`} className="text-decoration-none small fw-medium text-blue">← Project</Link>
+      <section className="hero-section project-settings-hero">
+        <Link to={`/projects/${encodeURIComponent(name)}`} className="back-link">← Project</Link>
         <h1>{project?.name || name || "Project"} settings</h1>
-        <p className="text-secondary mb-3">{project?.path || "Project not found"}</p>
       </section>
 
       {project && (
-        <>
-          <section className="sessions-section">
-            <div className="section-header d-flex align-items-center justify-content-between mb-3">
-              <div>
-                <h2 className="h6 fw-bold m-0">Notifications</h2>
-                <p className="text-secondary small m-0">Choose whether this project sends browser notifications when sessions complete or fail.</p>
-              </div>
-              <button type="button" className={`btn btn-sm ${project.notify_on_finish ? "btn-primary" : "btn-outline-secondary"}`} onClick={() => void toggleProjectNotifications()}>
-                <i className={`bi me-1 ${project.notify_on_finish ? "bi-alarm-fill" : "bi-alarm"}`}></i>
-                {project.notify_on_finish ? "Notifications on" : "Enable notifications"}
-              </button>
+        <div className="project-settings-stack">
+          <section className="settings-card notification-card" aria-labelledby="project-notifications-title">
+            <div>
+              <h2 id="project-notifications-title">Notifications</h2>
+              <p>Choose whether this project sends browser notifications when sessions complete or fail.</p>
             </div>
+            <button type="button" className={`notification-switch ${project.notify_on_finish ? "is-on" : ""}`} role="switch" aria-checked={project.notify_on_finish} onClick={() => void toggleProjectNotifications()}>
+              <span>{project.notify_on_finish ? "On" : "Off"}</span>
+              <i></i>
+            </button>
           </section>
 
-          <section className="sessions-section">
-            <div className="section-header d-flex align-items-center justify-content-between mb-3">
+          <section className="settings-card mcp-store-card" aria-labelledby="mcp-store-title">
+            <div className="mcp-store-header">
               <div>
-                <h2 className="h6 fw-bold m-0">Integrations</h2>
-                <p className="text-secondary small m-0">Install project-scoped MCP containers for new sessions.</p>
+                <h2 id="mcp-store-title">MCP store</h2>
+                <p>Install and configure MCP servers scoped to this project.</p>
               </div>
             </div>
-            <IntegrationList marketplace={marketplace} installed={installed} installedIcon="bi bi-plug" emptyText="No marketplace integrations available to install." onInstall={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name)} onConfigure={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name, "disabled" in item, "disabled" in item ? item.env : undefined)} onRemove={(item) => void removeIntegration(item)} />
-            {pendingInstall && <IntegrationConfigForm pending={pendingInstall} schemaResponse={configSchema} loading={schemaLoading} error={schemaError} onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }} onInstall={(env) => void installIntegration(env)} />}
+            <div className="mcp-store-toolbar">
+              <label className="mcp-search-field">
+                <i className="bi bi-search"></i>
+                <input value={integrationSearch} onChange={(event) => setIntegrationSearch(event.target.value)} placeholder="Search MCP servers..." aria-label="Search MCP servers" />
+              </label>
+              <select className="mcp-category-select" value={integrationCategory} onChange={(event) => setIntegrationCategory(event.target.value as IntegrationKind | "all")} aria-label="Filter MCP servers by category">
+                <option value="all">All categories</option>
+                <option value="mcp">MCP</option>
+              </select>
+            </div>
+            <IntegrationList marketplace={filteredMarketplace} installed={integrationCategory === "all" || integrationCategory === "mcp" ? installed : []} installedIcon="bi bi-plug" emptyText="No MCP servers match your filters." onInstall={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name)} onConfigure={(item) => void prepareIntegrationInstall(item.kind, item.container_image, item.name, "disabled" in item, "disabled" in item ? item.env : undefined)} onRemove={(item) => void removeIntegration(item)} />
           </section>
-        </>
+          {pendingInstall && <div className="integration-modal-backdrop"><IntegrationConfigForm pending={pendingInstall} schemaResponse={configSchema} loading={schemaLoading} error={schemaError} onCancel={() => { setPendingInstall(null); setConfigSchema(null); setSchemaError(""); }} onInstall={(env) => void installIntegration(env)} /></div>}
+        </div>
       )}
     </PageShell>
   );
