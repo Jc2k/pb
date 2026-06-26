@@ -5,6 +5,7 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use futures::StreamExt;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent_core::{AgentProfile, AgentRequest, EventSink, run_agent};
+use crate::agent_core::{AgentProfile, AgentRequest, EventSink, SessionAttachment, run_agent};
 use crate::events::{AgentEvent, EventEnvelope, SessionMetricsSnapshot};
 use crate::integrations::{
     self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
@@ -58,6 +59,13 @@ pub struct ServeArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineAttachment {
+    pub name: String,
+    pub mime: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionRequest {
     pub task: String,
     pub model: Option<String>,
@@ -74,6 +82,8 @@ pub struct StartSessionRequest {
     pub profile: Option<AgentProfile>,
     pub top_k: Option<i32>,
     pub seed: Option<u32>,
+    #[serde(default)]
+    pub attachments: Vec<InlineAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +545,8 @@ async fn start_session_inner(
     }
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
+    request.attachments =
+        materialize_attachments(&session_id, request.workdir.as_deref(), req.attachments)?;
 
     let now = now_millis();
     let session = SessionState {
@@ -571,6 +583,69 @@ async fn start_session_inner(
     dispatch_next_session(state.clone());
 
     Ok(SessionResponse { session_id })
+}
+
+fn materialize_attachments(
+    session_id: &str,
+    workdir: Option<&std::path::Path>,
+    attachments: Vec<InlineAttachment>,
+) -> Result<Vec<SessionAttachment>> {
+    if attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = workdir
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = root
+        .join(".pb")
+        .join("sessions")
+        .join(session_id)
+        .join("attachments");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    attachments
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let id = format!("img{}", index + 1);
+            let safe_name = item
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let filename = if safe_name.is_empty() {
+                format!("{id}.img")
+            } else {
+                format!("{id}-{safe_name}")
+            };
+            let path = dir.join(filename);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(item.base64.trim())
+                .context("invalid base64 attachment")?;
+            std::fs::write(&path, &bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            let stored_path = if let Some(workdir) = workdir {
+                path.strip_prefix(workdir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                path.to_string_lossy().into_owned()
+            };
+            Ok(SessionAttachment {
+                id,
+                name: item.name,
+                mime: item.mime,
+                path: stored_path,
+                size: bytes.len() as u64,
+            })
+        })
+        .collect()
 }
 
 fn maybe_bootstrap_project(task: &str) -> Result<Option<PathBuf>> {

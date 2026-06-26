@@ -332,6 +332,7 @@ mod tests {
             seed: 0,
             environment: None::<EnvironmentConfig>,
             session_id: String::new(),
+            attachments: Vec::new(),
         }
     }
 

@@ -14,6 +14,7 @@ use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 use crate::integrations::{IntegrationInstallRequest, IntegrationKind};
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
+use base64::Engine as _;
 
 pub mod agent_core;
 pub mod browser_tools;
@@ -461,6 +462,10 @@ pub struct QueueArgs {
     #[arg(long, value_enum)]
     pub profile: Option<AgentProfile>,
 
+    /// Attach an image file to the task (may be repeated)
+    #[arg(long = "image", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
+
     /// Top-k for sampling
     #[arg(long)]
     pub top_k: Option<i32>,
@@ -577,6 +582,7 @@ async fn run_serve() -> Result<()> {
         seed: user_config.effective_seed(),
         environment: None,
         session_id: String::new(),
+        attachments: Vec::new(),
     };
     let server_args = web::ServeArgs {
         host: resolved_host.clone(),
@@ -1062,6 +1068,11 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
                 profile: args.profile,
                 top_k: args.top_k,
                 seed: args.seed,
+                attachments: args
+                    .images
+                    .iter()
+                    .map(|path| cli_attachment(path))
+                    .collect::<Result<Vec<_>>>()?,
             },
         )
         .await?;
@@ -2434,4 +2445,22 @@ mod tests {
     fn shell_single_quote_escapes_embedded_single_quotes() {
         assert_eq!(shell_single_quote("abc'def"), "'abc'\\''def'");
     }
+}
+
+fn cli_attachment(path: &Path) -> Result<web::InlineAttachment> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read image {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image")
+        .to_string();
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    Ok(web::InlineAttachment {
+        name,
+        mime,
+        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }

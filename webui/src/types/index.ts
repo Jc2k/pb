@@ -5,6 +5,7 @@ export type AgentEvent =
       model: string;
       workspace: string;
       branch: string;
+      attachments?: SessionAttachment[];
       profile: string;
       nesting_depth?: number;
       timestamp_ms?: number;
@@ -117,6 +118,15 @@ export type AgentEvent =
       timestamp_ms?: number;
     };
 
+
+export interface SessionAttachment {
+  name: string;
+  mime: string;
+  base64?: string;
+  id?: string;
+  path?: string;
+  size?: number;
+}
 
 export interface SessionMetricsSnapshot {
   llm_invocations: number;

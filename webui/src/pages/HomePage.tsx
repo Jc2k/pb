@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Aside } from "../Aside";
-import type { ProjectEntry, SessionItem } from "../types";
+import type { ProjectEntry, SessionAttachment, SessionItem } from "../types";
 import { formatStartTime, projectName, sessionTitle } from "../lib/helpers";
 import { useProjectFinishNotifications } from "../lib/hooks";
 
@@ -10,6 +10,7 @@ export function HomePage() {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [images, setImages] = useState<SessionAttachment[]>([]);
   const navigate = useNavigate();
 
   const queuedCount = sessions.filter(
@@ -49,6 +50,7 @@ export function HomePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           task: task.trim(),
+          attachments: images,
         }),
       });
       if (!res.ok) return;
@@ -127,6 +129,7 @@ export function HomePage() {
                     </button>
                   </div>
                 </div>
+                <ImageAttachments images={images} setImages={setImages} />
 
                 <div className="session-controls d-flex flex-column flex-md-row gap-3 align-items-md-center justify-content-between p-3">
                   <p className="text-secondary small m-0">
@@ -209,4 +212,29 @@ export function HomePage() {
       </div>
     </>
   );
+}
+
+function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
+  const onFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const loaded = await Promise.all(Array.from(files).filter((file) => file.type.startsWith("image/")).map(async (file) => ({
+      name: file.name,
+      mime: file.type || "application/octet-stream",
+      base64: await fileToBase64(file),
+    })));
+    setImages([...images, ...loaded]);
+  };
+  return <div className="attachment-row small text-secondary mt-2">
+    <label className="btn btn-sm btn-light"><i className="bi bi-paperclip"></i> Attach images<input className="visually-hidden" type="file" accept="image/*" multiple onChange={(e) => void onFiles(e.target.files)} /></label>
+    {images.map((image, index) => <span key={`${image.name}-${index}`} className="badge text-bg-light ms-2">{image.name}<button type="button" className="btn-close btn-close-sm ms-2" aria-label={`Remove ${image.name}`} onClick={() => setImages(images.filter((_, i) => i !== index))}></button></span>)}
+  </div>;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
