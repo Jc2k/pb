@@ -1172,6 +1172,11 @@ body {
   text-align: right;
 }
 
+.metric-row .today-usage {
+  color: #8993a6;
+  font-size: 0.78rem;
+}
+
 .snapshot-list .metric-row > span:last-child {
   grid-template-columns: 1fr;
 }
@@ -1511,6 +1516,11 @@ body {
 .metric-row em {
   color: #536179;
   font-size: 0.74rem;
+}
+
+.metric-row .today-usage {
+  color: #8a94a6;
+  font-size: 0.72rem;
 }
 
 .key-value-list > div {

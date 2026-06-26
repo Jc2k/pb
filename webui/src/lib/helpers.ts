@@ -1,4 +1,4 @@
-import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, SessionItem } from "../types/index";
+import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, ProjectUsageStats, SessionItem } from "../types/index";
 
 export function uniqueIntegrations<
   T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
@@ -154,6 +154,31 @@ export function projectName(workdir?: string): string {
   if (!workdir) return "Unknown project";
   const parts = workdir.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts[parts.length - 1] || workdir;
+}
+
+
+export function usageStatsForToday(sessions: SessionItem[], now = new Date()): ProjectUsageStats {
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const startMs = startOfToday.getTime();
+  const endMs = startMs + 86_400_000;
+
+  return sessions.reduce<ProjectUsageStats>((totals, session) => {
+    if (session.updated_at_ms < startMs || session.updated_at_ms >= endMs || !session.metrics) {
+      return totals;
+    }
+
+    totals.tokens += session.metrics.prompt_tokens + session.metrics.generated_tokens;
+    totals.runtime_ms += session.metrics.llm_runtime_ms + session.metrics.tool_runtime_ms;
+    totals.tool_calls += session.metrics.tool_calls;
+
+    const energy = (session.metrics.llm_energy_kwh ?? 0) + (session.metrics.tool_energy_kwh ?? 0);
+    if (energy > 0) {
+      totals.energy_kwh = (totals.energy_kwh ?? 0) + energy;
+    }
+
+    return totals;
+  }, { tokens: 0, runtime_ms: 0, tool_calls: 0 });
 }
 
 export function relativeTime(ms: number): string {
