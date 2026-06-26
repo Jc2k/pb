@@ -24,39 +24,40 @@ export function IntegrationList({
   const hasItems = installed.length > 0 || available.length > 0;
 
   return (
-    <div className="project-list session-list list-group mb-4">
+    <div className="mcp-store-list" data-testid="mcp-store-list">
       {!hasItems ? (
-        <div className="list-group-item text-secondary small">{emptyText}</div>
+        <div className="mcp-store-empty text-secondary small">{emptyText}</div>
       ) : (
         <>
           {installed.map((item) => (
-            <div key={`installed:${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4">
-              <div className="session-icon"><i className={installedIcon}></i></div>
-              <div className="project-main session-main">
-                <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
+            <div key={`installed:${item.kind}:${item.name}`} className="mcp-store-row is-installed">
+              <div className="mcp-store-icon"><i className={installedIcon}></i></div>
+              <div className="mcp-store-copy">
+                <strong>{item.name}</strong>
                 <span>{item.container_image}</span>
+                <small>{item.disabled ? "Disabled for new sessions" : "Ready for new sessions"}</small>
               </div>
-              <div className="d-flex align-items-center gap-2">
-                <span className={`status-pill ${item.disabled ? "status-failed" : "status-completed"}`}>{item.disabled ? "Disabled" : "Configured"}</span>
-                <button className="btn btn-sm btn-outline-secondary" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
+              <div className="mcp-store-actions">
+                <button className="mcp-icon-btn" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
                   <i className="bi bi-gear"></i>
                 </button>
-                {onRemove && <button className="btn btn-sm btn-outline-danger" onClick={() => onRemove(item)}>Remove</button>}
+                {onRemove && <button className="mcp-icon-btn danger" title={`Remove ${item.name}`} aria-label={`Remove ${item.name}`} onClick={() => onRemove(item)}><i className="bi bi-trash"></i></button>}
               </div>
             </div>
           ))}
           {available.map((item) => (
-            <div key={`${item.kind}:${item.name}`} className="project-row session-row list-group-item py-3 px-4">
-              <div className="session-icon"><img src={item.icon_url} alt="" width="24" height="24" style={{ borderRadius: "6px" }} /></div>
-              <div className="project-main session-main">
-                <strong>{item.name} <span className="badge text-bg-light text-uppercase">{item.kind}</span></strong>
-                <span>{item.description || item.container_image}</span>
+            <div key={`${item.kind}:${item.name}`} className="mcp-store-row">
+              <div className="mcp-store-icon image-icon"><img src={item.icon_url} alt="" /></div>
+              <div className="mcp-store-copy">
+                <strong>{item.name}</strong>
+                <span>{item.container_image}</span>
+                <small>{item.description || item.container_image}</small>
               </div>
-              <div className="d-flex align-items-center gap-2">
-                <button className="btn btn-sm btn-outline-secondary" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
+              <div className="mcp-store-actions">
+                <button className="mcp-icon-btn" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>
                   <i className="bi bi-gear"></i>
                 </button>
-                <button className="btn btn-sm btn-primary" onClick={() => onInstall(item)}>Install</button>
+                <button className="mcp-icon-btn add" title={`Install ${item.name}`} aria-label={`Install ${item.name}`} onClick={() => onInstall(item)}><i className="bi bi-plus-lg"></i></button>
               </div>
             </div>
           ))}
@@ -100,30 +101,27 @@ export function IntegrationConfigForm({
   const canSubmit = !loading && Object.keys(validationErrors).length === 0;
 
   return (
-    <form className="card start-card p-3 mb-3 border-primary-subtle" onSubmit={(event) => {
+    <form className="integration-config-sheet" onSubmit={(event) => {
       event.preventDefault();
       const allTouched = Object.fromEntries(fields.map(([key]) => [key, true]));
       setTouched(allTouched);
       if (canSubmit) onInstall(Object.fromEntries(Object.entries(values).filter(([, value]) => value.trim() !== "")));
     }}>
-      <div className="d-flex align-items-start justify-content-between gap-3 mb-3">
-        <div>
-          <h3 className="h6 fw-bold mb-1">Configure {pending.name || pending.containerImage}</h3>
-          <p className="text-secondary small mb-0">Values are stored as key/value config and passed as environment variables when the container starts.</p>
-        </div>
-        <span className="badge text-bg-light text-uppercase">{pending.kind}</span>
+      <div className="integration-config-head">
+        <h3>Configure {pending.name || pending.containerImage}</h3>
+        <button type="button" className="mcp-modal-close" aria-label="Close configuration" onClick={onCancel}><i className="bi bi-x-lg"></i></button>
       </div>
       {loading && <div className="alert alert-info py-2 small"><span className="spinner-border spinner-border-sm me-2" />Fetching container schema annotation…</div>}
       {error && <div className="alert alert-warning py-2 small">Could not fetch the schema annotation, so this integration can be installed without extra fields. {error}</div>}
       {!loading && !error && fields.length === 0 && <div className="alert alert-secondary py-2 small">This container does not publish a configuration schema annotation, so it will be installed without extra environment values.</div>}
       {schema?.description && <p className="small text-secondary">{schema.description}</p>}
-      <div className="row g-3">
+      <div className="integration-config-grid">
         {fields.map(([key, property]) => {
           const label = property.title || key;
           const type = schemaPropertyType(property);
           const isInvalid = Boolean(touched[key] && validationErrors[key]);
           return (
-            <div className="col-12 col-md-6" key={key}>
+            <div className="integration-config-field" key={key}>
               <label className="form-label small fw-semibold" htmlFor={`integration-config-${key}`}>{label}{schema?.required?.includes(key) && <span className="text-danger ms-1">*</span>}</label>
               {property.enum?.length ? (
                 <select id={`integration-config-${key}`} className={`form-select ${isInvalid ? "is-invalid" : ""}`} value={values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))}>
@@ -139,8 +137,8 @@ export function IntegrationConfigForm({
           );
         })}
       </div>
-      <div className="d-flex justify-content-end gap-2 mt-3">
-        <button type="button" className="btn btn-outline-secondary" onClick={onCancel}>Cancel</button>
+      <p className="credentials-note"><i className="bi bi-lock"></i> Credentials are stored locally on your machine.</p>
+      <div className="integration-config-actions">
         <button className="btn btn-primary" disabled={!canSubmit}>
           {pending.installed ? "Save configuration" : fields.length ? "Install with config" : "Install"}
         </button>
