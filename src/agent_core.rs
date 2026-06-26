@@ -56,6 +56,7 @@ const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
+const MONITOR_STEP_BUDGET: usize = 3;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
@@ -259,7 +260,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. First call Dade to break the request into concrete build tasks. Then call Kate for one or more implementation tasks. Automatically call Ramon when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene to review the result before finalizing. If Eugene passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If Eugene does not pass the work, address the review output and request another review. Use todo(action=list) or todo(action=next) to inspect shared task memory, todo(action=complete,...) when a task is finished, and todo(action=add,...) when implementation reveals follow-up work. You may edit files and commit logical changes, but prefer giving planned implementation to Kate."
+                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade to break the request into concrete build tasks; for a single clear change, proceed directly. Automatically call Ramon when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene to review the result before finalizing. If Eugene passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If Eugene does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -271,7 +272,7 @@ impl AgentProfile {
                 "Profile: explore. Investigate the codebase as it pertains to the task. Prefer search/read_file and targeted commands. Do not edit files or create commits. Return a compact map of relevant files, behaviors, and recommendations."
             }
             Self::Plan => {
-                "Profile: plan. Produce an actionable implementation plan from the available context and use todo(action=add,...) to create concrete build tasks for each actionable step. Use ask_user(question) only when a human decision or missing requirement blocks a safe plan; the session pauses until the human answers, and you must incorporate the answer before finalizing. Use skill_search to find relevant reusable workflows or framework guidance; either incorporate invoked skills into the plan or plan explicit skill invocations for build/research agents. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
+                "Profile: plan. Produce an actionable implementation plan from the available context. Use todo(action=add,...) only when there are multiple concrete tasks worth tracking across agents; do not create todos for a single-step plan. Use ask_user(question) only when a human decision or missing requirement blocks a safe plan; the session pauses until the human answers, and you must incorporate the answer before finalizing. Use skill_search to find relevant reusable workflows or framework guidance; either incorporate invoked skills into the plan or plan explicit skill invocations for build/research agents. Do not edit files or create commits. Keep the plan concise and call out assumptions or risks."
             }
             Self::Ask => {
                 "Profile: ask. You are Joey. Answer the focused question using repository context and, when necessary, public web research. Call Emmanuel when the answer depends on deeper external knowledge, current documentation, ecosystem behavior, or non-trivial source synthesis. Do not edit files or create commits. Return a direct answer with supporting evidence."
@@ -839,7 +840,7 @@ fn build_agent_instructions(
         "Near the start of each new task, call session_title with a concise 3-8 word summary suitable as a heading or session table row.\n",
     );
     instructions.push_str(
-        "When one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass.\n",
+        "Prefer batching independent work: when one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass. Batch obvious discovery reads/searches, multiple independent file reads, and independent web/MCP lookups instead of spending separate steps. Do not batch dependent actions where a later call needs an earlier result.\n",
     );
     instructions.push_str(
         "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it.\n",
@@ -1780,11 +1781,15 @@ fn run_agent_steps(
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
     let mut metrics = RunMetrics::default();
+    let original_max_steps = args.max_steps;
+    let mut effective_max_steps = args.max_steps;
+    let mut monitor_used = false;
+    let mut step = 1;
 
-    for step in 1..=args.max_steps {
+    while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
             step,
-            max_steps: args.max_steps,
+            max_steps: effective_max_steps,
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -1804,7 +1809,7 @@ fn run_agent_steps(
             Err(ParseFailure { output, error }) => {
                 let parse_message = format!(
                     "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {error}",
-                    max_steps = args.max_steps
+                    max_steps = effective_max_steps
                 );
                 sink.emit(AgentEvent::Error {
                     message: parse_message,
@@ -1916,11 +1921,46 @@ fn run_agent_steps(
                 )?;
             }
         }
+
+        if step == original_max_steps
+            && !monitor_used
+            && args.profile != AgentProfile::Monitor
+            && args.sub_agent_depth < MAX_SUB_AGENT_DEPTH
+        {
+            monitor_used = true;
+            if let Some(audit) = run_step_limit_monitor(
+                backend,
+                model,
+                args,
+                messages,
+                workspace_root,
+                command_backend,
+                env_config,
+                todo_memory,
+                mcp_registry,
+                lsp_registry,
+                policy_config,
+                personal_memory_repo,
+                nesting_depth,
+                sink,
+            )? {
+                messages.push(ChatMessage {
+                    role: "tool",
+                    content: format!(
+                        "Trinity monitor checkpoint at step {step}/{original_max_steps}:\n{audit}"
+                    ),
+                });
+                if monitor_recommends_more_steps(&audit) {
+                    effective_max_steps =
+                        effective_max_steps.saturating_add(MONITOR_STEP_BUDGET.max(1));
+                }
+            }
+        }
+        step += 1;
     }
 
     let message = format!(
-        "The agent reached the step limit ({}) before producing a final response.",
-        args.max_steps
+        "The agent reached the step limit ({effective_max_steps}) before producing a final response."
     );
     sink.emit(AgentEvent::SessionMetrics {
         llm_invocations: metrics.llm_invocations,
@@ -1946,6 +1986,102 @@ fn run_agent_steps(
         reached_final: false,
         final_content: None,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_step_limit_monitor(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    workspace_root: &Path,
+    command_backend: Option<&CommandBackend>,
+    env_config: Option<&EnvironmentConfig>,
+    todo_memory: &RefCell<TodoMemory>,
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+    policy_config: &PolicyConfig,
+    personal_memory_repo: Option<&Path>,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<Option<String>> {
+    let monitor_task = format!(
+        "The primary {} agent has just used its configured step budget ({}) without a final response. Audit the current transcript for loops, off-track behavior, blockers, and whether it should receive a small extra step grant. Return status, evidence, immediate next action, whether to grant more steps, and stop conditions.",
+        args.profile.as_str(),
+        args.max_steps
+    );
+    sink.emit(AgentEvent::SubAgentStarted {
+        profile: AgentProfile::Monitor.as_str().to_string(),
+        task: monitor_task.clone(),
+        nesting_depth: nesting_depth + 1,
+        timestamp_ms: Some(now_millis()),
+    });
+
+    let instructions = build_agent_instructions(
+        workspace_root,
+        args.branch.as_deref().unwrap_or("monitor"),
+        true,
+        command_backend.map(CommandBackend::kind),
+        env_config,
+        AgentProfile::Monitor,
+        false,
+        args.repository_less,
+        mcp_registry,
+        lsp_registry,
+    )?;
+    let transcript = render_prompt(messages);
+    let mut monitor_messages = vec![
+        ChatMessage {
+            role: "system",
+            content: instructions,
+        },
+        ChatMessage {
+            role: "user",
+            content: format!("{monitor_task}\n\nTranscript so far:\n{transcript}"),
+        },
+    ];
+    let mut monitor_request = args.clone();
+    monitor_request.task = monitor_task;
+    monitor_request.profile = AgentProfile::Monitor;
+    monitor_request.max_steps = MONITOR_STEP_BUDGET;
+    monitor_request.sub_agent_depth = args.sub_agent_depth + 1;
+
+    let outcome = run_agent_steps(
+        backend,
+        model,
+        &monitor_request,
+        &mut monitor_messages,
+        workspace_root,
+        command_backend,
+        env_config,
+        todo_memory,
+        mcp_registry,
+        lsp_registry,
+        policy_config,
+        personal_memory_repo,
+        nesting_depth + 1,
+        sink,
+    )?;
+    let result = outcome
+        .final_content
+        .unwrap_or_else(|| "monitor reached its own step limit before finalizing".to_string());
+    sink.emit(AgentEvent::SubAgentFinished {
+        profile: AgentProfile::Monitor.as_str().to_string(),
+        result: result.clone(),
+        nesting_depth: Some(nesting_depth + 1),
+        timestamp_ms: Some(now_millis()),
+    });
+    Ok(Some(result))
+}
+
+fn monitor_recommends_more_steps(audit: &str) -> bool {
+    let normalized = audit.to_ascii_lowercase();
+    (normalized.contains("needs_more_steps")
+        || normalized.contains("grant more")
+        || normalized.contains("more steps")
+        || normalized.contains("on_track"))
+        && !normalized.contains("off_track")
+        && !normalized.contains("blocked")
 }
 
 fn execute_tool_calls(
@@ -4477,6 +4613,19 @@ mod tests {
     }
 
     #[test]
+    fn monitor_recommendation_parser_grants_only_healthy_extra_steps() {
+        assert!(monitor_recommends_more_steps(
+            "status: needs_more_steps\nevidence: on_track\ngrant more steps: yes"
+        ));
+        assert!(!monitor_recommends_more_steps(
+            "status: off_track\nevidence: loop detected\ngrant more steps: no"
+        ));
+        assert!(!monitor_recommends_more_steps(
+            "status: blocked\nevidence: waiting on user"
+        ));
+    }
+
+    #[test]
     fn prompt_batch_ranges_splits_prompts_larger_than_batch_capacity() {
         assert_eq!(
             prompt_batch_ranges(1_025, 512),
@@ -4622,6 +4771,9 @@ mod tests {
         assert!(instructions.contains("If Eugene passes the work"));
         assert!(instructions.contains("try to git_commit with a semantic commit message"));
         assert!(instructions.contains("If Eugene does not pass the work"));
+        assert!(instructions.contains("Batch obvious discovery reads/searches"));
+        assert!(instructions.contains("Use todos only to track multiple meaningful tasks"));
+        assert!(instructions.contains("do not create a todo list for one straightforward task"));
         assert!(!instructions.contains("requiring each build sub-agent to git_commit"));
     }
 
