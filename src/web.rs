@@ -113,6 +113,53 @@ pub struct SessionListItem {
     pub metrics: Option<SessionMetricsSnapshot>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectUsageStats {
+    pub tokens: usize,
+    pub runtime_ms: u64,
+    pub tool_calls: usize,
+    pub energy_kwh: Option<f64>,
+}
+
+impl ProjectUsageStats {
+    fn add_metrics(&mut self, metrics: &SessionMetricsSnapshot) {
+        self.tokens = self.tokens.saturating_add(
+            metrics
+                .prompt_tokens
+                .saturating_add(metrics.generated_tokens),
+        );
+        self.runtime_ms = self.runtime_ms.saturating_add(
+            metrics
+                .llm_runtime_ms
+                .saturating_add(metrics.tool_runtime_ms),
+        );
+        self.tool_calls = self.tool_calls.saturating_add(metrics.tool_calls);
+        let energy = metrics.llm_energy_kwh.unwrap_or(0.0) + metrics.tool_energy_kwh.unwrap_or(0.0);
+        if energy > 0.0 {
+            self.energy_kwh = Some(self.energy_kwh.unwrap_or(0.0) + energy);
+        }
+    }
+
+    fn subtract_metrics(&mut self, metrics: &SessionMetricsSnapshot) {
+        self.tokens = self.tokens.saturating_sub(
+            metrics
+                .prompt_tokens
+                .saturating_add(metrics.generated_tokens),
+        );
+        self.runtime_ms = self.runtime_ms.saturating_sub(
+            metrics
+                .llm_runtime_ms
+                .saturating_add(metrics.tool_runtime_ms),
+        );
+        self.tool_calls = self.tool_calls.saturating_sub(metrics.tool_calls);
+        let energy = metrics.llm_energy_kwh.unwrap_or(0.0) + metrics.tool_energy_kwh.unwrap_or(0.0);
+        if energy > 0.0 {
+            let remaining = self.energy_kwh.unwrap_or(0.0) - energy;
+            self.energy_kwh = (remaining > 0.0).then_some(remaining);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDetails {
     pub session_id: String,
@@ -217,6 +264,7 @@ struct SessionState {
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
+    project_usage: Arc<Mutex<HashMap<String, ProjectUsageStats>>>,
 }
 
 #[derive(RustEmbed)]
@@ -241,9 +289,11 @@ pub async fn run_server_with_ready(
         }
     };
     let restored_sessions = restore_sessions(&project_entries);
+    let project_usage = build_project_usage_cache(&restored_sessions);
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
+        project_usage: Arc::new(Mutex::new(project_usage)),
     };
 
     let app = Router::new()
@@ -257,6 +307,7 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
+        .route("/api/projects/{name}/usage", get(get_project_usage))
         .route(
             "/api/integrations/marketplace",
             get(list_marketplace_integrations),
@@ -893,6 +944,12 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
     };
 
     if let Some(workdir) = session.workdir.or(session.request_template.workdir) {
+        if let Some(metrics) = &session.metrics {
+            let mut usage = state.project_usage.lock().await;
+            if let Some(stats) = usage.get_mut(&workdir.to_string_lossy().into_owned()) {
+                stats.subtract_metrics(metrics);
+            }
+        }
         session_store::delete_session(&workdir, id)?;
     }
 
@@ -906,6 +963,28 @@ async fn list_projects(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<ProjectEntry>> {
     Json(project_list_snapshot(&state).await)
+}
+
+async fn get_project_usage(
+    Path(name): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<ProjectUsageStats>, StatusCode> {
+    let path = {
+        let projects = state.projects.lock().await;
+        projects
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.path.clone())
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+    let usage = state
+        .project_usage
+        .lock()
+        .await
+        .get(&path)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Json(usage))
 }
 
 async fn update_project_notifications(
@@ -942,10 +1021,27 @@ impl EventSink for WebEventSink {
         }
         if let Some(metrics) = SessionMetricsSnapshot::from_event(&event) {
             tokio::runtime::Handle::current().block_on(async {
-                let mut sessions = self.state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&self.session_id) {
-                    session.metrics = Some(metrics);
+                let (workdir, previous_metrics) = {
+                    let mut sessions = self.state.sessions.lock().await;
+                    let Some(session) = sessions.get_mut(&self.session_id) else {
+                        return;
+                    };
+                    let workdir = session
+                        .workdir
+                        .as_ref()
+                        .or(self.persisted_workdir.as_ref())
+                        .map(|path| path.to_string_lossy().into_owned());
+                    let previous_metrics = session.metrics.replace(metrics.clone());
                     session.updated_at_ms = now_millis();
+                    (workdir, previous_metrics)
+                };
+                if let Some(workdir) = workdir {
+                    let mut usage = self.state.project_usage.lock().await;
+                    let stats = usage.entry(workdir).or_default();
+                    if let Some(previous_metrics) = previous_metrics {
+                        stats.subtract_metrics(&previous_metrics);
+                    }
+                    stats.add_metrics(&metrics);
                 }
             });
         }
@@ -1462,6 +1558,25 @@ fn restore_sessions(project_entries: &[ProjectEntry]) -> HashMap<String, Session
         .map(session_from_persisted)
         .map(|session| (session.0, session.1))
         .collect()
+}
+
+fn build_project_usage_cache(
+    sessions: &HashMap<String, SessionState>,
+) -> HashMap<String, ProjectUsageStats> {
+    let mut cache: HashMap<String, ProjectUsageStats> = HashMap::new();
+    for session in sessions.values() {
+        let Some(workdir) = &session.workdir else {
+            continue;
+        };
+        let Some(metrics) = &session.metrics else {
+            continue;
+        };
+        cache
+            .entry(workdir.to_string_lossy().into_owned())
+            .or_default()
+            .add_metrics(metrics);
+    }
+    cache
 }
 
 fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
