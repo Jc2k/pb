@@ -127,12 +127,12 @@ export function IntegrationConfigForm({
             <div className="integration-config-field" key={key}>
               <label className="form-label small fw-semibold" htmlFor={`integration-config-${key}`}>{label}{schema?.required?.includes(key) && <span className="text-danger ms-1">*</span>}</label>
               {property.enum?.length ? (
-                <select id={`integration-config-${key}`} className={`form-select ${isInvalid ? "is-invalid" : ""}`} value={values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))}>
+                <select id={`integration-config-${key}`} className={`form-select ${isInvalid ? "is-invalid" : ""}`} value={values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: (event.target as { value: string }).value }))}>
                   <option value="">Choose…</option>
                   {property.enum.map((option) => <option key={String(option)} value={String(option)}>{String(option)}</option>)}
                 </select>
               ) : (
-                <input id={`integration-config-${key}`} className={`form-control ${isInvalid ? "is-invalid" : ""}`} type={type === "integer" || type === "number" ? "number" : type === "boolean" ? "checkbox" : "text"} checked={type === "boolean" ? values[key] === "true" : undefined} value={type === "boolean" ? undefined : values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: type === "boolean" ? String(event.target.checked) : event.target.value }))} />
+                <input id={`integration-config-${key}`} className={`form-control ${isInvalid ? "is-invalid" : ""}`} type={type === "integer" || type === "number" ? "number" : type === "boolean" ? "checkbox" : "text"} checked={type === "boolean" ? values[key] === "true" : undefined} value={type === "boolean" ? undefined : values[key] || ""} onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))} onChange={(event) => setValues((prev) => ({ ...prev, [key]: type === "boolean" ? String((event.target as { checked: boolean }).checked) : (event.target as { value: string }).value }))} />
               )}
               {property.description && <div className="form-text">{property.description}</div>}
               {isInvalid && <div className="invalid-feedback d-block">{validationErrors[key]}</div>}

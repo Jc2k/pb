@@ -113,12 +113,32 @@ export function projectSettingsPath(projectName: string): string {
   return `/projects/${encodeURIComponent(projectName)}/settings`;
 }
 
+type NotificationPermissionState = "default" | "denied" | "granted";
+type BrowserNotificationOptions = { body?: string; icon?: string };
+type BrowserNotificationInstance = { onclick: (() => void) | null };
+type ServiceWorkerNotificationOptions = BrowserNotificationOptions & {
+  badge?: string;
+  data?: { url: string };
+  tag?: string;
+};
+
+type BrowserNotification = {
+  permission: NotificationPermissionState;
+  requestPermission: () => Promise<NotificationPermissionState>;
+  new (title: string, options?: BrowserNotificationOptions): BrowserNotificationInstance;
+};
+
+function notificationApi(): BrowserNotification | undefined {
+  return (globalThis as { Notification?: BrowserNotification }).Notification;
+}
+
 export function notificationSupport(): boolean {
-  return typeof window !== "undefined" && "Notification" in window;
+  return notificationApi() !== undefined;
 }
 
 export async function ensureNotificationPermission(): Promise<boolean> {
-  if (!notificationSupport()) return false;
+  const Notification = notificationApi();
+  if (!Notification) return false;
   if (Notification.permission === "granted") return true;
   if (Notification.permission !== "default") return false;
   return (await Notification.requestPermission()) === "granted";
@@ -132,7 +152,13 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
   const title = session.status === "completed" ? "pb session completed" : "pb session failed";
   const body = `${project.name}: ${sessionTitle(session)}`;
   const url = `/sessions/${session.session_id}`;
-  const registration = await navigator.serviceWorker?.getRegistration?.();
+  const registration = await (navigator as {
+    serviceWorker?: {
+      getRegistration?: () => Promise<{
+        showNotification?: (title: string, options?: ServiceWorkerNotificationOptions) => Promise<void>;
+      }>;
+    };
+  }).serviceWorker?.getRegistration?.();
   if (registration?.showNotification) {
     await registration.showNotification(title, {
       body,
@@ -143,9 +169,11 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
     });
     return;
   }
+  const Notification = notificationApi();
+  if (!Notification) return;
   const notification = new Notification(title, { body, icon: "/apple-touch-icon.png" });
   notification.onclick = () => {
-    window.focus();
+    (window as { focus?: () => void }).focus?.();
     window.location.href = url;
   };
 }
