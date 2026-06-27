@@ -88,7 +88,7 @@ export function IntegrationConfigForm({
 
   useEffect(() => {
     const next: Record<string, string> = {};
-    for (const [key, property] of Object.entries(schema?.properties || {})) {
+    for (const [key, property] of Object.entries(schema?.properties ?? {})) {
       if (pending.env?.[key] !== undefined) next[key] = pending.env[key];
       else if (property.default !== undefined) next[key] = String(property.default);
     }
@@ -97,7 +97,7 @@ export function IntegrationConfigForm({
   }, [schemaResponse?.container_image, pending.env]);
 
   const validationErrors = validateIntegrationConfig(schema, values);
-  const fields = Object.entries(schema?.properties || {});
+  const fields = Object.entries(schema?.properties ?? {});
   const canSubmit = !loading && Object.keys(validationErrors).length === 0;
 
   return (
@@ -105,7 +105,10 @@ export function IntegrationConfigForm({
       event.preventDefault();
       const allTouched = Object.fromEntries(fields.map(([key]) => [key, true]));
       setTouched(allTouched);
-      if (canSubmit) onInstall(Object.fromEntries(Object.entries(values).filter(([, value]) => value.trim() !== "")));
+      const nonEmptyValues: Record<string, string> = Object.fromEntries(
+        Object.entries(values).filter(([, value]) => value.trim() !== ""),
+      );
+      if (canSubmit) onInstall(nonEmptyValues);
     }}>
       <div className="integration-config-head">
         <h3>Configure {pending.name || pending.containerImage}</h3>
