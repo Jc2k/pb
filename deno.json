@@ -21,6 +21,11 @@
     "types": [
       "npm:@types/react@^19.2.7",
       "npm:@types/react-dom@^19.2.3"
+    ],
+    "lib": [
+      "deno.window",
+      "dom",
+      "dom.iterable"
     ]
   }
 }
