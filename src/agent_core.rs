@@ -11,6 +11,9 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::mtmd::{
+    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
+};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use reqwest::Url;
@@ -119,7 +122,6 @@ pub enum AgentProfile {
     Ask,
     Research,
     Monitor,
-    Vision,
 }
 
 impl Default for AgentProfile {
@@ -220,7 +222,6 @@ impl AgentProfile {
             Self::Ask => "ask",
             Self::Research => "research",
             Self::Monitor => "monitor",
-            Self::Vision => "vision",
         }
     }
 
@@ -234,9 +235,8 @@ impl AgentProfile {
             "ask" => Ok(Self::Ask),
             "research" => Ok(Self::Research),
             "monitor" => Ok(Self::Monitor),
-            "vision" => Ok(Self::Vision),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor, vision"
+                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor"
             ),
         }
     }
@@ -251,7 +251,6 @@ impl AgentProfile {
             Self::Ask => "Joey Pardella",
             Self::Research => "Emmanuel Goldstein",
             Self::Monitor => "Trinity Walker",
-            Self::Vision => "Lisa Snapshot",
         }
     }
 
@@ -283,9 +282,6 @@ impl AgentProfile {
             }
             Self::Research => {
                 "Profile: research. You are Emmanuel. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or call teammates. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
-            }
-            Self::Vision => {
-                "Profile: vision. You are Lisa. Analyze attached images, screenshots, mockups, UI comparisons, diagrams, and visual artifacts. Use vision_describe for image understanding and return structured findings that build and review agents can act on. Do not edit files or create commits."
             }
             Self::Monitor => {
                 "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
@@ -794,6 +790,7 @@ pub fn run_agent<S: EventSink>(
     let outcome = run_agent_steps(
         &backend,
         &model,
+        &model_path,
         &args,
         &mut messages,
         &workspace_root,
@@ -867,7 +864,7 @@ fn build_agent_instructions(
     instructions.push_str(profile.instructions());
     instructions.push('\n');
     instructions.push_str(&format!(
-        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), Trinity (monitor), and Lisa (vision). Use I when talking about what you have done and We when talking about what needs to happen next. ",
+        "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), Trinity (monitor). Use I when talking about what you have done and We when talking about what needs to happen next. ",
         current = profile.teammate_first_name()
     ));
     if allow_sub_agents && profile != AgentProfile::Research {
@@ -909,7 +906,7 @@ fn build_agent_instructions(
     instructions.push('\n');
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor, Lisa=vision. Ask Lisa when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Use vision_describe directly when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
@@ -1136,7 +1133,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "vision_describe",
-            "Analyze an attached image or project image using a local vision model when available. On Apple Silicon with 64GB RAM, prefer Qwen3-VL 8B/30B-A3B quantized over the larger MoE unless explicitly configured.",
+            "Use a local Qwen vision model to describe an attached screenshot/mockup or a project image file as structured UI data for tasks like \"update the ui to look like this\".",
             object_schema(
                 [
                     string_property(
@@ -1149,7 +1146,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                     ),
                     string_property(
                         "prompt",
-                        "What visual information to extract, e.g. layout structure, UI differences, accessibility concerns.",
+                        "Optional focus for the UI analysis, e.g. layout structure, visual differences, style tokens, accessibility concerns, or app-specific details.",
                     ),
                 ],
                 [],
@@ -1746,7 +1743,6 @@ fn tool_allowed(
                         | AgentProfile::Build
                         | AgentProfile::Plan
                         | AgentProfile::Monitor
-                        | AgentProfile::Vision
                 )));
     }
     match tool {
@@ -1788,9 +1784,7 @@ fn tool_allowed(
         "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
-        "sub_agent" => {
-            allow_sub_agents && profile != AgentProfile::Research && profile != AgentProfile::Vision
-        }
+        "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
         "attachments" | "vision_describe" => true,
         _ => false,
     }
@@ -1805,6 +1799,7 @@ struct StepRunOutcome {
 struct ToolExecutionEnv<'a> {
     backend: &'a LlamaBackend,
     model: &'a LlamaModel,
+    model_path: &'a Path,
     args: &'a AgentRequest,
     workspace_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
@@ -1820,6 +1815,7 @@ struct ToolExecutionEnv<'a> {
 fn run_agent_steps(
     backend: &LlamaBackend,
     model: &LlamaModel,
+    model_path: &Path,
     args: &AgentRequest,
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
@@ -1933,6 +1929,7 @@ fn run_agent_steps(
                     ToolExecutionEnv {
                         backend,
                         model,
+                        model_path,
                         args,
                         workspace_root,
                         command_backend,
@@ -1957,6 +1954,7 @@ fn run_agent_steps(
                     ToolExecutionEnv {
                         backend,
                         model,
+                        model_path,
                         args,
                         workspace_root,
                         command_backend,
@@ -1984,6 +1982,7 @@ fn run_agent_steps(
             if let Some(audit) = run_step_limit_monitor(
                 backend,
                 model,
+                model_path,
                 args,
                 messages,
                 workspace_root,
@@ -2045,6 +2044,7 @@ fn run_agent_steps(
 fn run_step_limit_monitor(
     backend: &LlamaBackend,
     model: &LlamaModel,
+    model_path: &Path,
     args: &AgentRequest,
     messages: &[ChatMessage],
     workspace_root: &Path,
@@ -2102,6 +2102,7 @@ fn run_step_limit_monitor(
     let outcome = run_agent_steps(
         backend,
         model,
+        model_path,
         &monitor_request,
         &mut monitor_messages,
         workspace_root,
@@ -2211,6 +2212,7 @@ fn execute_tool_calls(
     let tool_context = ToolContext {
         backend: env.backend,
         model: env.model,
+        model_path: env.model_path,
         request: env.args,
         workspace_root: env.workspace_root,
         command_backend: env.command_backend,
@@ -2623,6 +2625,7 @@ fn extract_json_object(input: &str) -> Option<String> {
 struct ToolContext<'a> {
     backend: &'a LlamaBackend,
     model: &'a LlamaModel,
+    model_path: &'a Path,
     request: &'a AgentRequest,
     workspace_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
@@ -3171,7 +3174,7 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     let prompt = arguments
         .get("prompt")
         .and_then(Value::as_str)
-        .unwrap_or("Describe this image as structured implementation guidance.");
+        .unwrap_or("Describe this UI for implementation.");
     let attachment = if !attachment_id.is_empty() {
         context
             .request
@@ -3193,29 +3196,191 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     if !absolute.exists() {
         bail!("image not found: {}", absolute.display());
     }
-    let output = Command::new("ollama")
-        .args([
-            "run",
-            "qwen3-vl:8b",
-            prompt,
-            absolute.to_string_lossy().as_ref(),
-        ])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        }
-        Ok(out) => Ok(format!(
-            "vision model invocation failed ({}). Image is available at {}. Install/run a local Qwen3-VL model (recommended on Mac M4 Max 64GB: qwen3-vl:8b or a quantized 30B-A3B; avoid large MoE unless memory permits) and retry. stderr: {}",
-            out.status,
-            absolute.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Err(err) => Ok(format!(
-            "vision model is not available ({err}). Image is available at {}. Install Ollama or configure a Qwen3-VL runner; recommended Mac M4 Max 64GB starting point: quantized Qwen3-VL 8B/30B-A3B rather than the larger MoE.",
-            absolute.display()
-        )),
+    let structured_prompt = vision_describe_prompt(prompt, &absolute)?;
+    let mut request = context.request.clone();
+    request.max_tokens = boosted_max_tokens(&request).max(2048);
+    request.temperature = 0.0;
+    request.top_k = 1;
+    let output = generate_vision_completion(
+        context.backend,
+        context.model,
+        context.model_path,
+        &request,
+        &structured_prompt,
+        &absolute,
+    )
+    .context("vision_describe model invocation failed")?;
+    Ok(output.content.trim().to_string())
+}
+
+fn generate_vision_completion(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    model_path: &Path,
+    args: &AgentRequest,
+    prompt: &str,
+    image_path: &Path,
+) -> Result<CompletionOutput> {
+    let mmproj_path = find_multimodal_projector(model_path)?;
+    let energy_start = energy::sample();
+    let started = Instant::now();
+    let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
+    let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+    if let Some(threads) = args.threads {
+        ctx_params = ctx_params.with_n_threads(threads);
     }
+    if let Some(threads_batch) = args.threads_batch.or(args.threads) {
+        ctx_params = ctx_params.with_n_threads_batch(threads_batch);
+    }
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .context("failed to create llama context for vision tool")?;
+
+    let mtmd_params = MtmdContextParams {
+        use_gpu: args.gpu_layers > 0,
+        print_timings: false,
+        n_threads: args.threads_batch.or(args.threads).unwrap_or(0),
+        media_marker: std::ffi::CString::new(mtmd_default_marker())?,
+    };
+    let mtmd = MtmdContext::init_from_file(&mmproj_path.to_string_lossy(), model, &mtmd_params)
+        .with_context(|| {
+            format!(
+                "failed to initialize multimodal projector {}",
+                mmproj_path.display()
+            )
+        })?;
+    if !mtmd.support_vision() {
+        bail!(
+            "multimodal projector {} does not report vision support",
+            mmproj_path.display()
+        );
+    }
+    let bitmap = MtmdBitmap::from_file(&mtmd, &image_path.to_string_lossy())
+        .with_context(|| format!("failed to load vision image {}", image_path.display()))?;
+    let prompt_with_image = format!("{prompt}\n\nImage: {}", mtmd_default_marker());
+    let chunks = mtmd
+        .tokenize(
+            MtmdInputText {
+                text: prompt_with_image,
+                add_special: true,
+                parse_special: true,
+            },
+            &[&bitmap],
+        )
+        .context("failed to tokenize multimodal vision prompt")?;
+
+    ensure_prompt_fits_context(
+        chunks.total_positions() as usize,
+        args.max_tokens,
+        ctx.n_ctx(),
+    )?;
+    let mut n_cur = chunks
+        .eval_chunks(&mtmd, &ctx, 0, 0, LLAMA_BATCH_SIZE as i32, true)
+        .context("failed to evaluate multimodal vision prompt")?;
+
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::top_k(args.top_k),
+        LlamaSampler::temp(args.temperature),
+        LlamaSampler::dist(args.seed),
+    ]);
+    let mut decoder = UTF_8.new_decoder();
+    let mut output = String::new();
+    let mut generated_tokens: usize = 0;
+    let mut finish_reason = CompletionFinishReason::MaxTokens;
+    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
+    let mut sample_index = -1;
+    while generated_tokens < usize::try_from(args.max_tokens).unwrap_or(0) {
+        let token = sampler.sample(&ctx, sample_index);
+        sampler.accept(token);
+        if model.is_eog_token(token) {
+            finish_reason = CompletionFinishReason::EndOfGeneration;
+            break;
+        }
+        let piece = model
+            .token_to_piece(token, &mut decoder, true, None)
+            .context("failed to decode vision output token")?;
+        output.push_str(&piece);
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .context("failed to queue generated vision token")?;
+        ctx.decode(&mut batch)
+            .context("failed to decode generated vision token")?;
+        n_cur += 1;
+        generated_tokens += 1;
+        sample_index = batch.n_tokens() - 1;
+    }
+
+    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+    Ok(CompletionOutput {
+        content: output,
+        finish_reason,
+        prompt_tokens: chunks.total_tokens(),
+        generated_tokens,
+        duration_ms: duration_millis(started),
+        energy,
+    })
+}
+
+fn find_multimodal_projector(model_path: &Path) -> Result<PathBuf> {
+    let model_dir = model_path
+        .parent()
+        .context("model path has no parent directory")?;
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(model_dir)
+        .with_context(|| format!("failed to read model directory {}", model_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path != model_path)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| {
+                    let name = name.to_ascii_lowercase();
+                    name.contains("mmproj") && name.ends_with(".gguf")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().with_context(|| {
+        format!(
+            "no multimodal projector (mmproj*.gguf) found next to model {}; pull a Qwen vision GGUF with its mmproj file",
+            model_path.display()
+        )
+    })
+}
+
+fn vision_describe_prompt(focus: &str, image_path: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(image_path)
+        .with_context(|| format!("failed to read image metadata {}", image_path.display()))?;
+    let dimensions = image::ImageReader::open(image_path)
+        .with_context(|| format!("failed to open image {}", image_path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to detect image format {}", image_path.display()))?
+        .into_dimensions()
+        .ok();
+    let dimensions = dimensions
+        .map(|(width, height)| format!("{width}x{height}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "You are a UI vision tool for software agents. Analyze the supplied HTML/app UI image and return only valid JSON with this shape:\n\
+{{\n\
+  \"summary\": \"one sentence\",\n\
+  \"screen_type\": \"html|mobile_app|desktop_app|unknown\",\n\
+  \"layout\": {{\"structure\": [\"top-to-bottom regions\"], \"density\": \"sparse|balanced|dense\", \"responsive_notes\": [\"notes\"]}},\n\
+  \"elements\": [{{\"role\": \"button|input|card|nav|text|image|icon|other\", \"label\": \"visible label or empty\", \"position\": \"top-left|top|top-right|left|center|right|bottom-left|bottom|bottom-right\", \"visual_details\": [\"implementation-relevant details\"]}}],\n\
+  \"style\": {{\"colors\": [\"hex or named colors if visible\"], \"typography\": [\"font/weight/size impressions\"], \"spacing\": [\"spacing/radius/shadow notes\"], \"imagery\": [\"image/icon notes\"]}},\n\
+  \"accessibility\": [\"contrast, hierarchy, touch-target, alt-text, or state concerns\"],\n\
+  \"implementation_hints\": [\"concrete changes an agent can apply in code\"],\n\
+  \"uncertainties\": [\"details that are hard to infer\"]\n\
+}}\n\
+Image file: {}\n\
+Image dimensions: {dimensions}\n\
+Image size_bytes: {}\n\
+Focus: {focus}",
+        image_path.display(),
+        metadata.len()
+    ))
 }
 
 fn run_sub_agent(
@@ -3279,6 +3444,7 @@ fn run_sub_agent(
     let outcome = run_agent_steps(
         context.backend,
         context.model,
+        context.model_path,
         &sub_request,
         &mut messages,
         context.workspace_root,
@@ -5035,6 +5201,57 @@ mod tests {
         assert_eq!(run_command.input_schema["type"], "object");
         assert_eq!(run_command.input_schema["required"], json!(["cmd"]));
         assert!(build_tools.iter().any(|tool| tool.name == "sub_agent"));
+    }
+
+    #[test]
+    fn vision_is_a_tool_not_an_agent_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            true,
+            false,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(AgentProfile::parse("vision").is_err());
+        assert!(instructions.contains("vision_describe(attachment_id,path,prompt)"));
+        assert!(instructions.contains("Use vision_describe directly"));
+        assert!(!instructions.contains("Lisa"));
+        assert!(!instructions.contains("vision. Ask"));
+    }
+
+    #[test]
+    fn vision_describe_prompt_requests_structured_ui_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let image_path = tmp.path().join("mockup.png");
+        let image = image::RgbImage::new(1, 1);
+        image.save(&image_path).expect("save image");
+        let prompt = vision_describe_prompt("match this mockup", &image_path).unwrap();
+
+        assert!(prompt.contains("return only valid JSON"));
+        assert!(prompt.contains("\"screen_type\""));
+        assert!(prompt.contains("\"layout\""));
+        assert!(prompt.contains("\"elements\""));
+        assert!(prompt.contains("\"implementation_hints\""));
+        assert!(prompt.contains("Focus: match this mockup"));
+    }
+
+    #[test]
+    fn vision_projector_is_resolved_from_model_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = tmp.path().join("qwen-vision.gguf");
+        let projector = tmp.path().join("mmproj-qwen-vision.gguf");
+        std::fs::write(&model, b"GGUF model").unwrap();
+        std::fs::write(&projector, b"GGUF projector").unwrap();
+
+        assert_eq!(find_multimodal_projector(&model).unwrap(), projector);
     }
 
     #[test]
