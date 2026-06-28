@@ -116,13 +116,6 @@ export function HomePage() {
                     <button
                       type="button"
                       className="btn btn-sm border rounded-2 text-secondary bg-transparent"
-                      aria-label="Attach context"
-                    >
-                      <i className="bi bi-paperclip" aria-hidden="true"></i>
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-sm border rounded-2 text-secondary bg-transparent"
                       aria-label="Improve prompt"
                     >
                       <i className="bi bi-stars" aria-hidden="true"></i>
@@ -137,13 +130,16 @@ export function HomePage() {
                     <code> Create a new repo called my-app…</code> to bootstrap a project.
                     Project-specific work lives under Projects.
                   </p>
-                  <button
-                    className="btn btn-primary start-button"
-                    type="submit"
-                    disabled={!task.trim() || isSubmitting}
-                  >
-                    <i className="bi bi-play-fill me-1"></i> Start session
-                  </button>
+                  <div className="chat-submit-actions">
+                    <AttachmentButton setImages={setImages} images={images} />
+                    <button
+                      className="btn btn-primary start-button"
+                      type="submit"
+                      disabled={!task.trim() || isSubmitting}
+                    >
+                      <i className="bi bi-play-fill me-1"></i> Start session
+                    </button>
+                  </div>
                 </div>
               </form>
             </section>
@@ -214,7 +210,7 @@ export function HomePage() {
   );
 }
 
-function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
+function AttachmentButton({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
   const onFiles = async (files: FileList | null) => {
     if (!files) return;
     const loaded = await Promise.all(Array.from(files).filter((file) => file.type.startsWith("image/")).map(async (file) => ({
@@ -224,8 +220,15 @@ function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; 
     })));
     setImages([...images, ...loaded]);
   };
+  return <label className="btn btn-light attach-btn" aria-label="Attach images" title="Attach images">
+    <i className="bi bi-paperclip" aria-hidden="true"></i>
+    <input className="visually-hidden" type="file" accept="image/*" multiple onChange={(e) => void onFiles(e.target.files)} />
+  </label>;
+}
+
+function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
+  if (images.length === 0) return null;
   return <div className="attachment-row small text-secondary mt-2">
-    <label className="btn btn-sm btn-light"><i className="bi bi-paperclip"></i> Attach images<input className="visually-hidden" type="file" accept="image/*" multiple onChange={(e) => void onFiles(e.target.files)} /></label>
     {images.map((image, index) => <span key={`${image.name}-${index}`} className="badge text-bg-light ms-2">{image.name}<button type="button" className="btn-close btn-close-sm ms-2" aria-label={`Remove ${image.name}`} onClick={() => setImages(images.filter((_, i) => i !== index))}></button></span>)}
   </div>;
 }
