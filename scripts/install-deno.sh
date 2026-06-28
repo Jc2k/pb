@@ -40,7 +40,18 @@ install_project_dependencies() {
   if [[ -f "$repo_root/Cargo.toml" ]]; then
     if command -v cargo >/dev/null 2>&1; then
       echo "Installing Rust dependencies"
-      (cd "$repo_root" && cargo fetch --locked)
+      # Limit prefetching to the current Rust host target. An unrestricted
+      # `cargo fetch` resolves every target-specific dependency in Cargo.lock,
+      # including macOS-only crates such as objc2 on Linux CI runners. The
+      # install script only needs dependencies for the local verification
+      # commands it prints below, so fetching the host target keeps dependency
+      # installation aligned with `cargo test --all-targets`.
+      rust_host="$(rustc -vV | awk '/^host:/ { print $2 }')"
+      if [[ -n "$rust_host" ]]; then
+        (cd "$repo_root" && cargo fetch --locked --target "$rust_host")
+      else
+        (cd "$repo_root" && cargo fetch --locked)
+      fi
     else
       echo "warning: cargo is not installed; skipping Rust dependency installation" >&2
     fi
