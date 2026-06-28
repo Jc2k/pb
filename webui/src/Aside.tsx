@@ -50,9 +50,6 @@ export function Aside() {
         <NavLink className="nav-link" to="/" end>
           <i className="bi bi-house-door"></i> Home
         </NavLink>
-        <NavLink className="nav-link" to="/sessions">
-          <i className="bi bi-chat-square-text"></i> Sessions
-        </NavLink>
         <NavLink className="nav-link" to="/projects">
           <i className="bi bi-folder2-open"></i> Projects
         </NavLink>
