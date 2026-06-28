@@ -46,7 +46,10 @@ install_project_dependencies() {
       # install script only needs dependencies for the local verification
       # commands it prints below, so fetching the host target keeps dependency
       # installation aligned with `cargo test --all-targets`.
-      rust_host="$(rustc -vV | awk '/^host:/ { print $2 }')"
+      rust_host=""
+      if command -v rustc >/dev/null 2>&1; then
+        rust_host="$(rustc -vV | awk '/^host:/ { print $2 }')"
+      fi
       if [[ -n "$rust_host" ]]; then
         (cd "$repo_root" && cargo fetch --locked --target "$rust_host")
       else
@@ -99,7 +102,7 @@ deno_urls=()
 if [[ "$DENO_VERSION" == "latest" ]]; then
   resolved_deno_version=""
   if command -v curl >/dev/null 2>&1; then
-    resolved_deno_version="$(curl --fail --location --show-error --silent \
+    resolved_deno_version="$(curl --fail --location --silent \
       --connect-timeout 20 \
       --max-time "$DENO_DOWNLOAD_TIMEOUT" \
       https://dl.deno.land/release/latest.txt || true)"
@@ -117,6 +120,7 @@ if [[ "$DENO_VERSION" == "latest" ]]; then
   if [[ "$resolved_deno_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     deno_urls+=("https://dl.deno.land/release/${resolved_deno_version}/deno-${deno_target}.zip")
   fi
+  deno_urls+=("https://dl.deno.land/release/latest/download/deno-${deno_target}.zip")
   deno_urls+=("https://github.com/denoland/deno/releases/latest/download/deno-${deno_target}.zip")
 else
   resolved_deno_version="v${DENO_VERSION}"
