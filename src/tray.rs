@@ -8,6 +8,24 @@ pub struct TrayArgs {
     pub port: u16,
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn browser_host(host: &str) -> &str {
+    match host {
+        "" | "0.0.0.0" | "::" => "localhost",
+        _ => host,
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn browser_url(host: &str, port: u16) -> String {
+    let host = browser_host(host);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}/")
+    } else {
+        format!("http://{host}:{port}/")
+    }
+}
+
 pub fn run(args: TrayArgs) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -66,7 +84,7 @@ mod macos {
     }
 
     pub fn run(args: TrayArgs) -> Result<()> {
-        let web_url = format!("http://{}:{}/", args.host, args.port);
+        let web_url = super::browser_url(&args.host, args.port);
         WEB_URL
             .set(web_url)
             .map_err(|_| anyhow::anyhow!("tray URL already initialized"))?;
@@ -366,5 +384,26 @@ mod macos {
         type FnPtr = unsafe extern "C" fn(Id, Sel, NsSize);
         let f: FnPtr = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         unsafe { f(receiver, selector, arg) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_url;
+
+    #[test]
+    fn browser_url_uses_localhost_for_wildcard_ipv4() {
+        assert_eq!(browser_url("0.0.0.0", 8311), "http://localhost:8311/");
+    }
+
+    #[test]
+    fn browser_url_uses_localhost_for_wildcard_ipv6() {
+        assert_eq!(browser_url("::", 8311), "http://localhost:8311/");
+    }
+
+    #[test]
+    fn browser_url_preserves_specific_hosts() {
+        assert_eq!(browser_url("127.0.0.1", 8311), "http://127.0.0.1:8311/");
+        assert_eq!(browser_url("::1", 8311), "http://[::1]:8311/");
     }
 }
