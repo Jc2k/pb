@@ -2,7 +2,7 @@
   "nodeModulesDir": "auto",
   "tasks": {
     "build:web": "deno run --allow-all npm:@rsbuild/core/rsbuild build",
-    "test:web": "deno test --allow-read --unstable-sloppy-imports webui/src"
+    "test:web": "deno test --allow-read --allow-env --unstable-sloppy-imports webui/src"
   },
   "imports": {
     "@rsbuild/core": "npm:@rsbuild/core@^2.0.11",

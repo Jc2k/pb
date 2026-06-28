@@ -4,6 +4,8 @@
     "npm:@rsbuild/core@*": "2.0.14",
     "npm:@rsbuild/core@^2.0.11": "2.0.14",
     "npm:@rsbuild/plugin-react@^2.0.1": "2.0.1_@rsbuild+core@2.0.14",
+    "npm:@types/react-dom@^19.2.3": "19.2.3_@types+react@19.2.17",
+    "npm:@types/react@^19.2.7": "19.2.17",
     "npm:bootstrap-icons@^1.11.3": "1.13.1",
     "npm:bootstrap@^5.3.8": "5.3.8_@popperjs+core@2.11.8",
     "npm:react-dom@^19.2.7": "19.2.7_react@19.2.7",
@@ -157,6 +159,18 @@
         "tslib"
       ]
     },
+    "@types/react-dom@19.2.3_@types+react@19.2.17": {
+      "integrity": "sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==",
+      "dependencies": [
+        "@types/react"
+      ]
+    },
+    "@types/react@19.2.17": {
+      "integrity": "sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==",
+      "dependencies": [
+        "csstype"
+      ]
+    },
     "bootstrap-icons@1.13.1": {
       "integrity": "sha512-ijombt4v6bv5CLeXvRWKy7CuM3TRTuPEuGaGKvTV5cz65rQSY8RQ2JcHt6b90cBBAC7s8fsf2EkQDldzCoXUjw=="
     },
@@ -168,6 +182,9 @@
     },
     "cookie@1.1.1": {
       "integrity": "sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ=="
+    },
+    "csstype@3.2.3": {
+      "integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="
     },
     "react-dom@19.2.7_react@19.2.7": {
       "integrity": "sha512-t0BRVXvbiE/o20Hfw669rLbMCDWtYZLvmJigy2f0MxsXF+71pxhR3xOkspmsO8h3ZlNzyibAmtCa3l4lYKk6gQ==",
@@ -216,8 +233,12 @@
     "dependencies": [
       "npm:@rsbuild/core@^2.0.11",
       "npm:@rsbuild/plugin-react@^2.0.1",
+      "npm:@types/react-dom@^19.2.3",
+      "npm:@types/react@^19.2.7",
+      "npm:bootstrap-icons@^1.11.3",
       "npm:bootstrap@^5.3.8",
       "npm:react-dom@^19.2.7",
+      "npm:react-router-dom@^7.18.0",
       "npm:react@^19.2.7"
     ],
     "packageJson": {

@@ -1,4 +1,4 @@
-import { assertStringIncludes } from "jsr:@std/assert";
+import { ok } from "node:assert/strict";
 import { renderToString } from "react-dom/server";
 import { IntegrationList } from "./Integration.tsx";
 import type { InstalledIntegration, MarketplaceIntegration } from "../types/index.ts";
@@ -31,9 +31,9 @@ Deno.test("IntegrationList renders mockup-style MCP store actions", () => {
     />,
   );
 
-  assertStringIncludes(html, "mcp-store-list");
-  assertStringIncludes(html, "mcp-sentry");
-  assertStringIncludes(html, "aria-label=\"Configure mcp-sentry\"");
-  assertStringIncludes(html, "aria-label=\"Remove mcp-sentry\"");
-  assertStringIncludes(html, "aria-label=\"Install figma-assets\"");
+  ok(html.includes("mcp-store-list"));
+  ok(html.includes("mcp-sentry"));
+  ok(html.includes("aria-label=\"Configure mcp-sentry\""));
+  ok(html.includes("aria-label=\"Remove mcp-sentry\""));
+  ok(html.includes("aria-label=\"Install figma-assets\""));
 });
