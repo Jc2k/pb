@@ -80,6 +80,10 @@ export function ProjectsPage() {
 }
 
 type ProjectDetailsTab = "usage" | "overview" | "snapshot";
+
+export function nextProjectNotificationPreference(project: Pick<ProjectEntry, "notify_on_finish">): boolean {
+  return !project.notify_on_finish;
+}
 type SessionFilter = "all" | SessionItem["status"];
 
 function formatUsageValue(value: number, suffix = ""): string {
@@ -330,11 +334,12 @@ export function ProjectSettingsPage() {
 
   const toggleProjectNotifications = async () => {
     if (!project) return;
-    if (!project.notify_on_finish && !(await ensureNotificationPermission())) return;
+    const notifyOnFinish = nextProjectNotificationPreference(project);
+    if (notifyOnFinish) void ensureNotificationPermission();
     const res = await fetch(`/api/projects/${encodeURIComponent(project.name)}/notifications`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ notify_on_finish: !project.notify_on_finish }),
+      body: JSON.stringify({ notify_on_finish: notifyOnFinish }),
     });
     if (res.ok) void fetchProjects();
   };
