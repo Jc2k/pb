@@ -2004,3 +2004,43 @@ body {
     padding: 0.75rem;
   }
 }
+
+.chat-submit-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex: 0 0 auto;
+}
+
+.attach-btn {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid #dfe5ee;
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #536173;
+  cursor: pointer;
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.08);
+}
+
+.attach-btn:hover,
+.attach-btn:focus-within {
+  border-color: #cbd5e1;
+  background: #fff;
+  color: #1f2937;
+}
+
+.attach-btn .bi {
+  font-size: 1.1rem;
+}
+
+@media (max-width: 575.98px) {
+  .attach-btn {
+    width: 46px;
+    height: 46px;
+    border-radius: 11px;
+  }
+}
