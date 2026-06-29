@@ -11,7 +11,7 @@ const orderedPattern = /^\s*\d+[.)]\s+(.+)$/;
 
 function flushParagraph(blocks: RichTextBlock[], paragraph: string[]) {
   if (paragraph.length === 0) return;
-  blocks.push({ type: "paragraph", lines: paragraph });
+  blocks.push({ type: "paragraph", lines: [...paragraph] });
   paragraph.length = 0;
 }
 
