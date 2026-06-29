@@ -29,7 +29,7 @@ use crate::integrations::{
 use crate::projects::{
     self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
 };
-use crate::session_store::{self, PersistedSession, SessionStatus};
+use crate::session_store::{self, PersistedSession, SessionStatus, latest_session_title};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -1657,12 +1657,15 @@ fn build_project_usage_cache(
 fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
+    let title = persisted
+        .title
+        .or_else(|| latest_session_title(&persisted.events));
     let history = Arc::new(StdMutex::new(persisted.events));
     (
         session_id,
         SessionState {
             task: persisted.task,
-            title: persisted.title,
+            title,
             branch: persisted.branch,
             workdir: persisted.workdir,
             request_template: persisted.request_template,

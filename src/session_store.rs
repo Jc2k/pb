@@ -180,7 +180,7 @@ fn latest_session_metrics(events: &[EventEnvelope]) -> Option<SessionMetricsSnap
         .find_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
 }
 
-fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {
+pub fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {
     events
         .iter()
         .rev()
@@ -346,6 +346,51 @@ mod tests {
     fn session_note_ref_rejects_path_separators() {
         assert!(session_note_ref("session-123").is_ok());
         assert!(session_note_ref("../bad").is_err());
+    }
+
+    #[test]
+    fn latest_session_title_uses_last_non_empty_title() {
+        let events = vec![
+            EventEnvelope::new(AgentEvent::SessionTitle {
+                title: " First title ".to_string(),
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::Final {
+                content: "done".to_string(),
+                profile: AgentProfile::Build,
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::SessionTitle {
+                title: " Updated title ".to_string(),
+                timestamp_ms: None,
+            }),
+        ];
+
+        assert_eq!(
+            latest_session_title(&events).as_deref(),
+            Some("Updated title")
+        );
+    }
+
+    #[test]
+    fn persisted_session_title_tracks_session_title_events() {
+        let dir = init_repo();
+        let request = request(dir.path());
+        let session = PersistedSession::from_parts(
+            "session-title".to_string(),
+            request,
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            true,
+            SessionStatus::Running,
+            vec![EventEnvelope::new(AgentEvent::SessionTitle {
+                title: " Tool supplied title ".to_string(),
+                timestamp_ms: None,
+            })],
+        );
+
+        assert_eq!(session.title.as_deref(), Some("Tool supplied title"));
     }
 
     #[test]
