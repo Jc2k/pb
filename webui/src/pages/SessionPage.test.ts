@@ -24,3 +24,16 @@ Deno.test("session corrections render as centered plain notices", async () => {
   ok(css.includes("align-self: center;"));
   ok(!css.includes(".session-correction .bubble"));
 });
+
+Deno.test("final assistant messages use profile avatars", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+
+  ok(component.includes("function AssistantMessageRow"));
+  ok(
+    component.includes(
+      "<img src={getAvatarForProfile(profile)} alt={profileName(profile)} />",
+    ),
+  );
+  ok(component.includes('case "final"'));
+  ok(!component.includes('case "final":\n      const ffd'));
+});
