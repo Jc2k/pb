@@ -763,3 +763,19 @@ article.user div.message-container {
     color: var(--muted);
     font-size: 0.76rem;
 }
+
+.paused-composer {
+    flex-wrap: wrap;
+}
+
+.paused-composer-copy {
+    flex: 1 1 18rem;
+    min-width: 0;
+}
+
+.composer .btn.composer-action {
+    width: auto;
+    min-width: 0;
+    padding-inline: 1rem;
+    white-space: nowrap;
+}
