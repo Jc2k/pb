@@ -34,6 +34,7 @@ pub mod memory;
 pub mod policy;
 pub mod projects;
 pub mod service;
+pub mod session_power;
 pub mod session_store;
 pub mod tray;
 pub mod user;

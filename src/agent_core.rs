@@ -44,6 +44,7 @@ use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
 use crate::policy::{PolicyConfig, PolicyOutcome};
+use crate::session_power::session_power_summary;
 use crate::session_store::now_millis;
 
 const LLAMA_BATCH_SIZE: usize = 512;
@@ -838,10 +839,18 @@ pub fn run_agent<S: EventSink>(
             git_diff_from_main(&workspace_root).unwrap_or_default(),
         )
     };
+    let total_tokens = outcome
+        .metrics
+        .prompt_tokens
+        .saturating_add(outcome.metrics.generated_tokens);
+    let total_energy_kwh = outcome.metrics.llm_energy_kwh + outcome.metrics.tool_energy_kwh;
+    let power_summary = session_power_summary(total_tokens, total_energy_kwh);
+
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
         summary,
+        power_summary,
         diff_stat,
         diff,
         timestamp_ms: Some(now_millis()),

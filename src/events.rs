@@ -219,6 +219,8 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
+        power_summary: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         diff_stat: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         diff: String,
@@ -508,6 +510,7 @@ impl EventEnvelope {
                 branch,
                 commits,
                 summary,
+                power_summary,
                 diff_stat,
                 diff,
                 ..
@@ -517,6 +520,7 @@ impl EventEnvelope {
                     branch,
                     commits,
                     summary,
+                    power_summary,
                     diff_stat,
                     diff,
                     timestamp_ms: Some(now),
