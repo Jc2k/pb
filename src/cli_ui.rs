@@ -146,6 +146,7 @@ pub fn render_event(event: &AgentEvent) {
             branch,
             commits,
             summary,
+            power_summary,
             diff_stat,
             diff,
             ..
@@ -153,6 +154,9 @@ pub fn render_event(event: &AgentEvent) {
             print_header("session", &format!("branch: {branch}"));
             if !summary.trim().is_empty() {
                 print_block("session summary", summary);
+            }
+            if !power_summary.trim().is_empty() {
+                print_block("session power", power_summary);
             }
             if !commits.trim().is_empty() {
                 print_block("session commits", commits);
