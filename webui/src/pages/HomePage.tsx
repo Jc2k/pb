@@ -1,45 +1,54 @@
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Aside } from "../Aside";
-import type { ProjectEntry, SessionAttachment, SessionItem } from "../types";
-import { formatStartTime, projectName, sessionTitle } from "../lib/helpers";
-import { useProjectFinishNotifications } from "../lib/hooks";
+import { PageShell } from "../components/PageShell";
+import {
+  AttachmentButton,
+  ImageAttachments,
+  sessionCounts,
+  type SessionFilter,
+  SessionFilters,
+  SessionRows,
+  UsageMetrics,
+} from "../components/SessionDashboard";
+import type { ProjectUsageStats, SessionAttachment } from "../types";
+import { relativeTime, usageStatsForToday } from "../lib/helpers";
+import { useProjectSessionData } from "../lib/hooks";
 
 export function HomePage() {
   const [task, setTask] = useState("");
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
-  const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
+  const [filter, setFilter] = useState<SessionFilter>("all");
+  const { sessions } = useProjectSessionData();
   const navigate = useNavigate();
 
-  const queuedCount = sessions.filter(
-    (session) => session.status === "queued",
-  ).length;
-  const runningCount = sessions.filter(
-    (session) => session.status === "running",
-  ).length;
-  const pausedCount = sessions.filter(
-    (session) => session.status === "paused",
-  ).length;
-  const completedCount = sessions.filter(
-    (session) => session.status === "completed",
-  ).length;
-
-  useProjectFinishNotifications(sessions, projects);
-
-  const fetchSessions = async () => {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) return;
-    setSessions((await res.json()) as SessionItem[]);
-  };
-
-  const fetchProjects = async () => {
-    const res = await fetch(`/api/projects`);
-    if (!res.ok) return;
-    const entries = (await res.json()) as ProjectEntry[];
-    setProjects(entries);
-  };
+  const counts = useMemo(() => sessionCounts(sessions), [sessions]);
+  const visibleSessions = filter === "all"
+    ? sessions
+    : sessions.filter((session) => session.status === filter);
+  const usage = useMemo<ProjectUsageStats>(
+    () =>
+      sessions.reduce<ProjectUsageStats>((totals, session) => {
+        if (!session.metrics) return totals;
+        totals.tokens += session.metrics.prompt_tokens +
+          session.metrics.generated_tokens;
+        totals.runtime_ms += session.metrics.llm_runtime_ms +
+          session.metrics.tool_runtime_ms;
+        totals.tool_calls += session.metrics.tool_calls;
+        const energy = (session.metrics.llm_energy_kwh ?? 0) +
+          (session.metrics.tool_energy_kwh ?? 0);
+        if (energy > 0) totals.energy_kwh = (totals.energy_kwh ?? 0) + energy;
+        return totals;
+      }, { tokens: 0, runtime_ms: 0, tool_calls: 0 }),
+    [sessions],
+  );
+  const todaysUsage = useMemo(() => usageStatsForToday(sessions), [sessions]);
+  const runningSession = sessions.find((session) =>
+    session.status === "running"
+  );
+  const lastActive = sessions[0]?.updated_at_ms
+    ? relativeTime(sessions[0].updated_at_ms)
+    : "No activity yet";
 
   const startSession = async () => {
     if (!task.trim()) return;
@@ -48,10 +57,7 @@ export function HomePage() {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          task: task.trim(),
-          attachments: images,
-        }),
+        body: JSON.stringify({ task: task.trim(), attachments: images }),
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
@@ -61,183 +67,133 @@ export function HomePage() {
     }
   };
 
-  useEffect(() => {
-    void fetchSessions();
-    void fetchProjects();
-    const timer = window.setInterval(() => void fetchSessions(), 5000);
-    return () => window.clearInterval(timer);
-  }, []);
-
   return (
-    <>
-      <div className="app-shell">
-        <Aside />
+    <PageShell
+      pageClassName="project-detail-shell home-detail-shell"
+      contentClassName="project-detail-wrap home-detail-wrap"
+    >
+      <div className="project-layout home-layout">
+        <section className="project-content">
+          <section className="home-hero">
+            <h1>New home session</h1>
+            <p>
+              Use this for research, planning, or bootstrapping before a project
+              exists.
+            </p>
+          </section>
 
-        <section className="main-panel">
-          <header className="mobile-topbar d-lg-none d-flex align-items-center justify-content-between px-3 py-2">
-            <div className="brand compact d-flex align-items-center gap-2">
-              <div className="brand-mark">&gt;_</div>
-              <strong>LocalAgent</strong>
+          <form
+            className="card soft-card composer-card home-composer-card"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void startSession();
+            }}
+          >
+            <div className="card-body">
+              <textarea
+                className="form-control composer-input"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                rows={4}
+                placeholder="Describe the work..."
+              />
+              <ImageAttachments images={images} setImages={setImages} />
+              <div className="composer-actions">
+                <div className="quick-actions">
+                  <button
+                    className="btn btn-light"
+                    type="button"
+                    onClick={() => setTask("Research ")}
+                  >
+                    <i className="bi bi-search"></i> Research
+                  </button>
+                  <button
+                    className="btn btn-light"
+                    type="button"
+                    onClick={() => setTask("Create a new repo called ")}
+                  >
+                    <i className="bi bi-chat-square-plus"></i> Create repo
+                  </button>
+                  <button
+                    className="btn btn-light"
+                    type="button"
+                    onClick={() => setTask("Fix error ")}
+                  >
+                    <i className="bi bi-tools"></i> Fix error
+                  </button>
+                  <button className="btn btn-light" type="button">
+                    <span>More</span>
+                    <i className="bi bi-chevron-down"></i>
+                  </button>
+                </div>
+                <div className="chat-submit-actions">
+                  <AttachmentButton setImages={setImages} images={images} />
+                  <button
+                    className="btn btn-primary send-btn"
+                    type="submit"
+                    disabled={!task.trim() || isSubmitting}
+                    aria-label="Start home session"
+                  >
+                    <i className="bi bi-arrow-up"></i>
+                  </button>
+                </div>
+              </div>
             </div>
-            <button className="btn btn-light btn-icon" aria-label="Open menu">
-              ☰
-            </button>
-          </header>
+          </form>
 
-          <div className="content-wrap">
-            <section className="hero-section">
-              <h1>Start a new session</h1>
-              <p className="text-secondary mb-3">
-                Describe what you'd like the agent to work on.
-              </p>
-              <div className="hero-stats" aria-label="Session status summary">
-                <span><strong>{runningCount}</strong> running</span>
-                <span><strong>{queuedCount}</strong> queued</span>
-                <span><strong>{pausedCount}</strong> paused</span>
-                <span><strong>{completedCount}</strong> completed</span>
-              </div>
-
-              <form
-                className="start-card card"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void startSession();
-                }}
-              >
-                <div className="task-editor position-relative">
-                  <textarea
-                    className="form-control"
-                    value={task}
-                    onChange={(e) => setTask(e.target.value)}
-                    placeholder="What would you like the agent to do?"
-                    rows={4}
-                  />
-                  <div className="editor-actions position-absolute end-0 bottom-0 p-2">
-                    <button
-                      type="button"
-                      className="btn btn-sm border rounded-2 text-secondary bg-transparent"
-                      aria-label="Improve prompt"
-                    >
-                      <i className="bi bi-stars" aria-hidden="true"></i>
-                    </button>
-                  </div>
-                </div>
-                <ImageAttachments images={images} setImages={setImages} />
-
-                <div className="session-controls d-flex flex-column flex-md-row gap-3 align-items-md-center justify-content-between p-3">
-                  <p className="text-secondary small m-0">
-                    Home sessions start without a repository. Ask a research question, or say
-                    <code> Create a new repo called my-app…</code> to bootstrap a project.
-                    Project-specific work lives under Projects.
-                  </p>
-                  <div className="chat-submit-actions">
-                    <AttachmentButton setImages={setImages} images={images} />
-                    <button
-                      className="btn btn-primary start-button"
-                      type="submit"
-                      disabled={!task.trim() || isSubmitting}
-                    >
-                      <i className="bi bi-play-fill me-1"></i> Start session
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </section>
-
-            <section className="sessions-section">
-              <div className="section-header d-flex align-items-center justify-content-between mb-3">
-                <h2 className="h6 fw-bold m-0">Recent sessions</h2>
-                <a
-                  href="#"
-                  className="text-decoration-none small fw-medium text-blue"
-                >
-                  View all sessions
-                </a>
-              </div>
-
-              <div className="session-list list-group">
-                {sessions.length === 0 ? (
-                  <div className="list-group-item text-secondary small">
-                    No sessions yet
-                  </div>
-                ) : (
-                  sessions.map((s) => {
-                    let statusClass = "";
-                    let statusText: string = s.status;
-                    if (s.status === "running") {
-                      statusClass = "status-running";
-                      statusText = "Running";
-                    } else if (s.status === "completed") {
-                      statusClass = "status-completed";
-                      statusText = "Completed";
-                    } else if (s.status === "queued") {
-                      statusClass = "status-queued";
-                      statusText = "Queued";
-                    }
-
-                    return (
-                      <button
-                        key={s.session_id}
-                        type="button"
-                        className={`session-row list-group-item list-group-item-action py-3 px-4 ${s.status}`}
-                        onClick={() => navigate(`/sessions/${s.session_id}`)}
-                      >
-                        <div
-                          className={`state-dot rounded-circle bg-${s.status === "running" ? "green" : s.status === "completed" ? "blue" : "gray"}`}
-                        />
-                        <div className="session-icon">&gt;_</div>
-                        <div className="session-main">
-                          <strong>{sessionTitle(s)}</strong>
-                          <span>
-                            {projectName(s.workdir)} ·{" "}
-                            {formatStartTime(s.updated_at_ms)}
-                          </span>
-                        </div>
-                        <span className={`status-pill ${statusClass}`}>
-                          {statusText}
-                        </span>
-                        <span className="chevron">›</span>
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-          </div>
+          <section className="sessions-section project-sessions-panel">
+            <h2>Recent sessions</h2>
+            <SessionFilters
+              filter={filter}
+              counts={counts}
+              onFilterChange={setFilter}
+            />
+            <SessionRows
+              sessions={visibleSessions}
+              emptyText="No sessions match this filter."
+              onOpenSession={(session) =>
+                navigate(`/sessions/${session.session_id}`)}
+            />
+          </section>
         </section>
+
+        <aside className="project-aside home-aside">
+          <section className="card soft-card aside-card">
+            <div className="card-body">
+              <div className="card-title-row">
+                <h2>Home usage</h2>
+                <i className="bi bi-info-circle"></i>
+              </div>
+              <div className="info-list usage-list">
+                <UsageMetrics
+                  usage={usage}
+                  todaysUsage={todaysUsage}
+                  scopeLabel="Across all sessions"
+                />
+              </div>
+            </div>
+          </section>
+          <section className="card soft-card aside-card">
+            <div className="card-body">
+              <h2>Home overview</h2>
+              <div className="info-list key-value-list">
+                <div>
+                  <span>Current session</span>
+                  <strong>{runningSession ? "Running" : "None running"}</strong>
+                </div>
+                <div>
+                  <span>Queue</span>
+                  <strong>{counts.queued} waiting</strong>
+                </div>
+                <div>
+                  <span>Last active</span>
+                  <strong>{lastActive}</strong>
+                </div>
+              </div>
+            </div>
+          </section>
+        </aside>
       </div>
-    </>
+    </PageShell>
   );
-}
-
-function AttachmentButton({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
-  const onFiles = async (files: FileList | null) => {
-    if (!files) return;
-    const loaded = await Promise.all(Array.from(files).filter((file) => file.type.startsWith("image/")).map(async (file) => ({
-      name: file.name,
-      mime: file.type || "application/octet-stream",
-      base64: await fileToBase64(file),
-    })));
-    setImages([...images, ...loaded]);
-  };
-  return <label className="btn btn-light attach-btn" aria-label="Attach images" title="Attach images">
-    <i className="bi bi-paperclip" aria-hidden="true"></i>
-    <input className="visually-hidden" type="file" accept="image/*" multiple onChange={(e) => void onFiles(e.target.files)} />
-  </label>;
-}
-
-function ImageAttachments({ images, setImages }: { images: SessionAttachment[]; setImages: (images: SessionAttachment[]) => void }) {
-  if (images.length === 0) return null;
-  return <div className="attachment-row small text-secondary mt-2">
-    {images.map((image, index) => <span key={`${image.name}-${index}`} className="badge text-bg-light ms-2">{image.name}<button type="button" className="btn-close btn-close-sm ms-2" aria-label={`Remove ${image.name}`} onClick={() => setImages(images.filter((_, i) => i !== index))}></button></span>)}
-  </div>;
-}
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 }
