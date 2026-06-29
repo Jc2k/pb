@@ -267,6 +267,20 @@ function ErrorEventBubble({
   );
 }
 
+function CorrectionNotice({
+  event,
+}: {
+  event: Extract<AgentEvent, { type: "correction" }>;
+}) {
+  const text = (event.summary || event.message || "Agent framework correction").trim();
+
+  return (
+    <article className="session-correction" aria-label="Agent framework correction">
+      <span>{text}</span>
+      {event.timestamp_ms ? <time>{formatEventTime(event.timestamp_ms)}</time> : null}
+    </article>
+  );
+}
 
 export function InitialUserMessage({ task, timestampMs }: { task: string; timestampMs?: number }) {
   return (
@@ -390,6 +404,9 @@ export function MessageBubble({
           </div>
         </article>
       );
+
+    case "correction":
+      return <CorrectionNotice event={e} />;
 
     case "user_answer":
       return (

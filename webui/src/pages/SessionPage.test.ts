@@ -11,3 +11,16 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
   ok(css.includes("width: auto;"));
   ok(css.includes("white-space: nowrap;"));
 });
+
+Deno.test("session corrections render as centered plain notices", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const css = await Deno.readTextFile("webui/src/session.css");
+  const types = await Deno.readTextFile("webui/src/types/index.ts");
+
+  ok(types.includes('type: "correction"'));
+  ok(component.includes('case "correction"'));
+  ok(component.includes('className="session-correction"'));
+  ok(css.includes(".session-correction"));
+  ok(css.includes("align-self: center;"));
+  ok(!css.includes(".session-correction .bubble"));
+});

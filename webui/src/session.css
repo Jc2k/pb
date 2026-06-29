@@ -196,6 +196,26 @@ body {
     align-items: flex-start;
     gap: 0.75rem;
 }
+
+.session-correction {
+    align-self: center;
+    max-width: min(520px, 88%);
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.35;
+    text-align: center;
+}
+
+.session-correction span {
+    overflow-wrap: anywhere;
+}
+
+.session-correction time {
+    display: block;
+    margin-top: 0.15rem;
+    font-size: 0.72rem;
+    color: #9ca3af;
+}
 .message-row.compact {
     margin-top: 0.15rem;
 }

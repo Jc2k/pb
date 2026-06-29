@@ -132,6 +132,15 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    Correction {
+        message: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     SubAgentStarted {
         profile: String,
         task: String,
@@ -361,6 +370,20 @@ impl EventEnvelope {
                 event: AgentEvent::UserAnswer {
                     question_id,
                     answer,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::Correction {
+                message,
+                summary,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::Correction {
+                    message,
+                    summary,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
