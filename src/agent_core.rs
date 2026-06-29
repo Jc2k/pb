@@ -2765,17 +2765,34 @@ fn parse_action(output: &str) -> Result<AgentAction> {
         return Ok(action);
     }
 
-    let json_candidate = extract_json_object(output)
-        .with_context(|| format!("model output did not contain a valid JSON action:\n{output}"))?;
-    serde_json::from_str::<AgentAction>(&json_candidate)
-        .with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
+    let json_candidates = extract_json_objects(output);
+    if json_candidates.is_empty() {
+        bail!("model output did not contain a valid JSON action:\n{output}");
+    }
+
+    let mut first_error = None;
+    for json_candidate in &json_candidates {
+        match serde_json::from_str::<AgentAction>(json_candidate) {
+            Ok(action) => return Ok(action),
+            Err(error) if first_error.is_none() => {
+                first_error = Some((json_candidate.clone(), error));
+            }
+            Err(_) => {}
+        }
+    }
+
+    let (json_candidate, error) =
+        first_error.expect("non-empty candidates should record parse error");
+    Err(error).with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
 }
 
-fn extract_json_object(input: &str) -> Option<String> {
+fn extract_json_objects(input: &str) -> Vec<String> {
     let mut start = None;
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escape = false;
+
+    let mut objects = Vec::new();
 
     for (i, ch) in input.char_indices() {
         if start.is_none() {
@@ -2807,8 +2824,9 @@ fn extract_json_object(input: &str) -> Option<String> {
             '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let s = start?;
-                    return Some(input[s..=i].to_string());
+                    if let Some(s) = start.take() {
+                        objects.push(input[s..=i].to_string());
+                    }
                 }
             }
             _ => {}
@@ -2821,10 +2839,10 @@ fn extract_json_object(input: &str) -> Option<String> {
     {
         let mut candidate = input[s..].trim_end().to_string();
         candidate.extend(std::iter::repeat_n('}', depth));
-        return Some(candidate);
+        objects.push(candidate);
     }
 
-    None
+    objects
 }
 
 struct ToolContext<'a> {
@@ -5083,8 +5101,11 @@ mod tests {
     #[test]
     fn extract_json_object_handles_noise() {
         let output = "hello {\"type\":\"final\",\"content\":\"ok\"} trailing";
-        let extracted = extract_json_object(output).expect("json should be extracted");
-        assert_eq!(extracted, "{\"type\":\"final\",\"content\":\"ok\"}");
+        let extracted = extract_json_objects(output);
+        assert_eq!(
+            extracted,
+            vec!["{\"type\":\"final\",\"content\":\"ok\"}".to_string()]
+        );
     }
 
     #[test]
@@ -5116,6 +5137,23 @@ mod tests {
         assert_eq!(calls[1].tool, "mcp_github_search");
         assert_eq!(calls[1].arguments["query"], "pb");
         assert_eq!(thinking.as_deref(), Some("I can gather both inputs now."));
+    }
+
+    #[test]
+    fn parse_action_skips_non_action_json_before_valid_tool_call() {
+        let output = r#"debug {"note":"not an action"} then {"type":"tool_call","tool":"read_file","arguments":{"path":"webui/src/pages/ProjectsPage.tsx","start":500,"end":540},"thinking":"I can inspect the relevant range."}"#;
+        let action = parse_action(output).expect("valid later JSON action should parse");
+
+        let AgentAction::ToolCall {
+            tool, arguments, ..
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool, "read_file");
+        assert_eq!(arguments["path"], "webui/src/pages/ProjectsPage.tsx");
+        assert_eq!(arguments["start"], 500);
+        assert_eq!(arguments["end"], 540);
     }
 
     #[test]
