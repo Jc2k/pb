@@ -430,7 +430,7 @@ pub struct AgentRunResult {
     pub reached_final: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RunMetrics {
     llm_invocations: usize,
     llm_runtime_ms: u64,
@@ -442,6 +442,21 @@ struct RunMetrics {
     llm_energy_kwh: f64,
     tool_energy_joules: f64,
     tool_energy_kwh: f64,
+}
+
+impl RunMetrics {
+    fn add(&mut self, other: &RunMetrics) {
+        self.llm_invocations = self.llm_invocations.saturating_add(other.llm_invocations);
+        self.llm_runtime_ms = self.llm_runtime_ms.saturating_add(other.llm_runtime_ms);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.generated_tokens = self.generated_tokens.saturating_add(other.generated_tokens);
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        self.tool_runtime_ms = self.tool_runtime_ms.saturating_add(other.tool_runtime_ms);
+        self.llm_energy_joules += other.llm_energy_joules;
+        self.llm_energy_kwh += other.llm_energy_kwh;
+        self.tool_energy_joules += other.tool_energy_joules;
+        self.tool_energy_kwh += other.tool_energy_kwh;
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1801,6 +1816,7 @@ fn tool_allowed(
 struct StepRunOutcome {
     reached_final: bool,
     final_content: Option<String>,
+    metrics: RunMetrics,
 }
 
 struct ToolExecutionEnv<'a> {
@@ -1935,20 +1951,22 @@ fn run_agent_steps(
                         timestamp_ms: Some(now_millis()),
                     });
                 }
-                sink.emit(AgentEvent::SessionMetrics {
-                    llm_invocations: metrics.llm_invocations,
-                    llm_runtime_ms: metrics.llm_runtime_ms,
-                    prompt_tokens: metrics.prompt_tokens,
-                    generated_tokens: metrics.generated_tokens,
-                    tool_calls: metrics.tool_calls,
-                    tool_runtime_ms: metrics.tool_runtime_ms,
-                    llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
-                    llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
-                    tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
-                    tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
+                if nesting_depth == 0 {
+                    sink.emit(AgentEvent::SessionMetrics {
+                        llm_invocations: metrics.llm_invocations,
+                        llm_runtime_ms: metrics.llm_runtime_ms,
+                        prompt_tokens: metrics.prompt_tokens,
+                        generated_tokens: metrics.generated_tokens,
+                        tool_calls: metrics.tool_calls,
+                        tool_runtime_ms: metrics.tool_runtime_ms,
+                        llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
+                        llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
+                        tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
+                        tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
+                        nesting_depth: None,
+                        timestamp_ms: Some(now_millis()),
+                    });
+                }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
@@ -1958,6 +1976,7 @@ fn run_agent_steps(
                 return Ok(StepRunOutcome {
                     reached_final: true,
                     final_content: Some(content),
+                    metrics,
                 });
             }
             AgentAction::ToolCall {
@@ -2065,6 +2084,7 @@ fn run_agent_steps(
                 personal_memory_repo,
                 nesting_depth,
                 sink,
+                &mut metrics,
             )? {
                 messages.push(ChatMessage {
                     role: "tool",
@@ -2084,20 +2104,22 @@ fn run_agent_steps(
     let message = format!(
         "The agent reached the step limit ({effective_max_steps}) before producing a final response."
     );
-    sink.emit(AgentEvent::SessionMetrics {
-        llm_invocations: metrics.llm_invocations,
-        llm_runtime_ms: metrics.llm_runtime_ms,
-        prompt_tokens: metrics.prompt_tokens,
-        generated_tokens: metrics.generated_tokens,
-        tool_calls: metrics.tool_calls,
-        tool_runtime_ms: metrics.tool_runtime_ms,
-        llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
-        llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
-        tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
-        tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
-        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-        timestamp_ms: Some(now_millis()),
-    });
+    if nesting_depth == 0 {
+        sink.emit(AgentEvent::SessionMetrics {
+            llm_invocations: metrics.llm_invocations,
+            llm_runtime_ms: metrics.llm_runtime_ms,
+            prompt_tokens: metrics.prompt_tokens,
+            generated_tokens: metrics.generated_tokens,
+            tool_calls: metrics.tool_calls,
+            tool_runtime_ms: metrics.tool_runtime_ms,
+            llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
+            llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
+            tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
+            tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+    }
     sink.emit(AgentEvent::Error {
         summary: "Step limit reached".to_string(),
         message,
@@ -2108,6 +2130,7 @@ fn run_agent_steps(
     Ok(StepRunOutcome {
         reached_final: false,
         final_content: None,
+        metrics,
     })
 }
 
@@ -2128,6 +2151,7 @@ fn run_step_limit_monitor(
     personal_memory_repo: Option<&Path>,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
+    metrics: &mut RunMetrics,
 ) -> Result<Option<String>> {
     let monitor_task = format!(
         "The primary {} agent has just used its configured step budget ({}) without a final response. Audit the current transcript for loops, off-track behavior, blockers, and whether it should receive a small extra step grant. Return status, evidence, immediate next action, whether to grant more steps, and stop conditions.",
@@ -2187,6 +2211,7 @@ fn run_step_limit_monitor(
         nesting_depth + 1,
         sink,
     )?;
+    metrics.add(&outcome.metrics);
     let result = outcome
         .final_content
         .unwrap_or_else(|| "monitor reached its own step limit before finalizing".to_string());
@@ -2345,7 +2370,7 @@ fn execute_tool_calls(
         for call in runnable {
             let energy_start = energy::sample();
             let started = Instant::now();
-            let result = match run_tool(&call.tool, &call.arguments, &tool_context, sink) {
+            let result = match run_tool(&call.tool, &call.arguments, &tool_context, sink, metrics) {
                 Ok(result) => result,
                 Err(error) => {
                     let result = format_tool_error(&call.tool, &error);
@@ -2946,6 +2971,7 @@ fn run_tool(
     arguments: &Value,
     context: &ToolContext<'_>,
     sink: &mut dyn EventSink,
+    metrics: &mut RunMetrics,
 ) -> Result<String> {
     if context.mcp_registry.tool(tool).is_some() {
         return mcp::call_tool(context.mcp_registry, tool, arguments);
@@ -3254,7 +3280,7 @@ fn run_tool(
         | "react_find"
         | "react_renders"
         | "react_errors" => browser_tools::call_tool(tool, arguments),
-        "sub_agent" => run_sub_agent(arguments, context, sink),
+        "sub_agent" => run_sub_agent(arguments, context, sink, metrics),
         "attachments" => Ok(serde_json::to_string_pretty(&context.request.attachments)?),
         "vision_describe" => run_vision_describe(arguments, context),
         "run_command" => {
@@ -3567,6 +3593,7 @@ fn run_sub_agent(
     arguments: &Value,
     context: &ToolContext<'_>,
     sink: &mut dyn EventSink,
+    metrics: &mut RunMetrics,
 ) -> Result<String> {
     let profile_name = arguments
         .get("profile")
@@ -3638,6 +3665,8 @@ fn run_sub_agent(
         context.request.sub_agent_depth + 1,
         sink,
     )?;
+
+    metrics.add(&outcome.metrics);
 
     let result = if outcome.reached_final {
         match outcome.final_content {
