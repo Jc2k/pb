@@ -97,6 +97,8 @@ export function getToolDetail(
     }
     case "git_commit":
       return (args.message as string) || "(no message)";
+    case "session_title":
+      return (args.title as string) || "(no title)";
     case "git_revert":
       return (args.commit as string) || "(no commit)";
     default:
