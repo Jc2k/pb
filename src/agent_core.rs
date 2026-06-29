@@ -1883,7 +1883,7 @@ fn run_agent_steps(
                 let parse_message = format!("{parse_summary}: {error}\n\nModel output:\n{output}",);
                 sink.emit(AgentEvent::Error {
                     message: parse_message,
-                    summary: parse_summary,
+                    summary: parse_summary.clone(),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -1898,6 +1898,12 @@ fn run_agent_steps(
                     repeated_parse_failures,
                     MAX_CONSECUTIVE_PARSE_FAILURES,
                 );
+                sink.emit(AgentEvent::Correction {
+                    message: error_msg.clone(),
+                    summary: parse_summary,
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
                 messages.push(ChatMessage {
                     role: "tool",
                     content: error_msg,
@@ -1985,6 +1991,12 @@ fn run_agent_steps(
                     &mut metrics,
                 )?;
                 if let Some(feedback) = loop_feedback {
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Repeated tool call detected".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
                     messages.push(ChatMessage {
                         role: "tool",
                         content: feedback,
@@ -2017,6 +2029,12 @@ fn run_agent_steps(
                     &mut metrics,
                 )?;
                 if let Some(feedback) = loop_feedback {
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Repeated tool call detected".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
                     messages.push(ChatMessage {
                         role: "tool",
                         content: feedback,
@@ -2327,8 +2345,19 @@ fn execute_tool_calls(
         for call in runnable {
             let energy_start = energy::sample();
             let started = Instant::now();
-            let result = run_tool(&call.tool, &call.arguments, &tool_context, sink)
-                .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
+            let result = match run_tool(&call.tool, &call.arguments, &tool_context, sink) {
+                Ok(result) => result,
+                Err(error) => {
+                    let result = format_tool_error(&call.tool, &error);
+                    sink.emit(AgentEvent::Correction {
+                        message: result.clone(),
+                        summary: format!("{} tool call needs corrected arguments", call.tool),
+                        nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    result
+                }
+            };
             let energy =
                 energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
             let duration_ms = duration_millis(started);

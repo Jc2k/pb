@@ -68,6 +68,16 @@ pub fn render_event(event: &AgentEvent) {
             answer,
             ..
         } => print_block(&format!("answer {question_id}"), answer),
+        AgentEvent::Correction {
+            summary, message, ..
+        } => {
+            let body = if summary.trim().is_empty() {
+                message
+            } else {
+                summary
+            };
+            print_header("correction", body);
+        }
         AgentEvent::SubAgentStarted {
             profile,
             task,

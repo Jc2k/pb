@@ -59,6 +59,13 @@ export type AgentEvent =
       timestamp_ms?: number;
     }
   | {
+      type: "correction";
+      message: string;
+      summary?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
       type: "sub_agent_started";
       profile: string;
       task: string;
