@@ -5,6 +5,7 @@ import {
   buildToolSummaries,
   chatEventsWithOnlyLatestStep,
   getToolDetail,
+  latestAssistantProfile,
 } from "./sessionUtils.ts";
 
 Deno.test("getToolDetail shows session_title call title", () => {
@@ -92,4 +93,30 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     chatEventsWithOnlyLatestStep(events).map((event) => event.event.type),
     ["started", "step_started"],
   );
+});
+
+Deno.test("latestAssistantProfile falls back to the started profile for early activity", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "started",
+        task: "Implement loading state",
+        model: "/models/local.gguf",
+        workspace: "/repo",
+        branch: "feat-loading-state",
+        profile: "build",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "step_started",
+        step: 1,
+        max_steps: 20,
+      },
+    },
+  ];
+
+  equal(latestAssistantProfile(events), "build");
 });

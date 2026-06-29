@@ -4,8 +4,20 @@ import { Aside } from "../Aside";
 import type { EventEnvelope, SessionDetails } from "../types";
 import { SCROLL_THRESHOLD } from "../lib/constants";
 import { formatStartTime, groupToolEvents, sessionTitle } from "../lib/helpers";
-import { DrawerPanel, InitialUserMessage, MessageBubble, TodoDrawer, ToolDrawerSummary, ToolGroupBubble } from "../components/Session";
-import { buildTodoTasks, buildToolSummaries, chatEventsWithOnlyLatestStep } from "../lib/sessionUtils";
+import {
+  DrawerPanel,
+  InitialUserMessage,
+  MessageBubble,
+  TodoDrawer,
+  ToolDrawerSummary,
+  ToolGroupBubble,
+} from "../components/Session";
+import {
+  buildTodoTasks,
+  buildToolSummaries,
+  chatEventsWithOnlyLatestStep,
+  latestAssistantProfile,
+} from "../lib/sessionUtils";
 
 export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -255,6 +267,7 @@ export function SessionPage() {
                     <MessageBubble
                       key={i}
                       envelope={grouped as EventEnvelope}
+                      activityProfile={latestAssistantProfile(events)}
                     />
                   );
                 },
