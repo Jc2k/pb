@@ -96,6 +96,37 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
   );
 });
 
+
+Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated by final message", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "final",
+        content: "Fixed the bug.",
+        profile: "build",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "session_summary",
+        branch: "fix-duplicate-summary",
+        commits: "abc123 fix: avoid duplicate summary",
+        summary: " Fixed the bug. ",
+      },
+    },
+  ];
+
+  const summaryEvent = chatEventsWithOnlyLatestStep(events)[1];
+
+  equal(summaryEvent.event.type, "session_summary");
+  if (summaryEvent.event.type === "session_summary") {
+    equal(summaryEvent.event.summary, undefined);
+    equal(summaryEvent.event.commits, "abc123 fix: avoid duplicate summary");
+  }
+});
+
 Deno.test("latestAssistantProfile falls back to the started profile for early activity", () => {
   const events: EventEnvelope[] = [
     {
