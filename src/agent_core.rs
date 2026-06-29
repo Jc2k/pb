@@ -286,7 +286,7 @@ impl AgentProfile {
                 "Profile: research. You are Emmanuel. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or call teammates. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
             }
             Self::Monitor => {
-                "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. When a transcript is provided, audit that transcript directly; do not repeat the primary agent's failed searches or tool calls just to confirm the loop. If you see a repeated typo, wrong filename, wrong glob, or other obviously self-repeating action, call it off_track and give the corrected next action. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
+                "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. When a transcript is provided, audit that transcript directly; do not repeat the primary agent's failed searches or tool calls just to confirm the loop. Treat repeated claims that a file is corrupt as off_track unless the transcript contains objective evidence such as read errors, parse/test failures, or an unexpected diff; if the diff/checks look normal, tell the primary agent to stop re-reading or reverting and proceed from the diff. If you see a repeated typo, wrong filename, wrong glob, or other obviously self-repeating action, call it off_track and give the corrected next action. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
             }
         }
     }
@@ -942,7 +942,7 @@ fn build_agent_instructions(
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
         instructions.push_str(
-            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. For build work, when you believe the implementation is complete, request a review before finalizing; if review passes, run applicable guard commands and try to git_commit with a semantic commit message that follows project guidelines; if review does not pass, address the review output before requesting another review.\n",
+            "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. After an edit, trust the tool-reported diff as the primary source of what changed; do not conclude a file is corrupt from a partial read, unexpected line numbers, or model uncertainty alone. If you suspect corruption, verify with git diff plus a targeted parser/test command before attempting to undo work, and never revert working changes solely because of a hallucinated or unverified corruption concern. For build work, when you believe the implementation is complete, request a review before finalizing; if review passes, run applicable guard commands and try to git_commit with a semantic commit message that follows project guidelines; if review does not pass, address the review output before requesting another review.\n",
         );
     } else {
         instructions.push_str(
@@ -5380,6 +5380,8 @@ mod tests {
         assert!(instructions.contains("If Eugene passes the work"));
         assert!(instructions.contains("try to git_commit with a semantic commit message"));
         assert!(instructions.contains("If Eugene does not pass the work"));
+        assert!(instructions.contains("trust the tool-reported diff"));
+        assert!(instructions.contains("never revert working changes solely because of a hallucinated or unverified corruption concern"));
         assert!(instructions.contains("Batch obvious discovery reads/searches"));
         assert!(instructions.contains("Do not finalize merely because an initial search"));
         assert!(instructions.contains("broaden the query"));
@@ -5559,6 +5561,27 @@ mod tests {
         std::fs::write(&projector, b"GGUF projector").unwrap();
 
         assert_eq!(find_multimodal_projector(&model).unwrap(), projector);
+    }
+
+    #[test]
+    fn monitor_profile_instructions_treat_unverified_corruption_as_off_track() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Monitor,
+            false,
+            false,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+        assert!(instructions.contains("Profile: monitor"));
+        assert!(instructions.contains("Treat repeated claims that a file is corrupt as off_track"));
+        assert!(instructions.contains("stop re-reading or reverting and proceed from the diff"));
     }
 
     #[test]
