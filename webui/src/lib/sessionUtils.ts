@@ -225,8 +225,31 @@ function isTransientActivityEvent(event: EventEnvelope): boolean {
     event.event.type === "step_started";
 }
 
+function withoutDuplicateSessionSummary(event: EventEnvelope, previousFinalContent?: string): EventEnvelope {
+  if (event.event.type !== "session_summary" || !event.event.summary || !previousFinalContent) {
+    return event;
+  }
+
+  if (event.event.summary.trim() !== previousFinalContent.trim()) {
+    return event;
+  }
+
+  const { summary: _summary, ...sessionSummary } = event.event;
+  return {
+    ...event,
+    event: sessionSummary,
+  };
+}
+
 export function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnvelope[] {
-  const chatEvents = events.filter((event) => !isHiddenChatEvent(event));
+  let lastFinalContent: string | undefined;
+  const chatEvents = events
+    .filter((event) => !isHiddenChatEvent(event))
+    .map((event) => {
+      const normalized = withoutDuplicateSessionSummary(event, lastFinalContent);
+      if (event.event.type === "final") lastFinalContent = event.event.content;
+      return normalized;
+    });
   const lastVisibleIndex = chatEvents.length - 1;
   return chatEvents.filter((event, index) =>
     !isTransientActivityEvent(event) || index === lastVisibleIndex
