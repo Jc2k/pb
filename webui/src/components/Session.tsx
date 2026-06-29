@@ -19,6 +19,68 @@ function formatEnergy(kwh?: number, joules?: number): string {
   return "not available";
 }
 
+const FUN_ENERGY_UNITS = [
+  {
+    singular: "second of a cozy LED bulb",
+    plural: "seconds of a cozy LED bulb",
+    kwh: 0.01 / 3600,
+    minAmount: 1,
+  },
+  {
+    singular: "minute of a cozy LED bulb",
+    plural: "minutes of a cozy LED bulb",
+    kwh: 0.01 / 60,
+    minAmount: 1,
+  },
+  {
+    singular: "hour of a cozy LED bulb",
+    plural: "hours of a cozy LED bulb",
+    kwh: 0.01,
+    minAmount: 0.1,
+  },
+  { singular: "phone charge", plural: "phone charges", kwh: 0.015, minAmount: 0.1 },
+  { singular: "slice of toast", plural: "slices of toast", kwh: 0.02, minAmount: 0.1 },
+  { singular: "cup of tea", plural: "cups of tea", kwh: 0.03, minAmount: 0.1 },
+  {
+    singular: "bag of microwave popcorn",
+    plural: "bags of microwave popcorn",
+    kwh: 0.05,
+    minAmount: 0.1,
+  },
+];
+
+function formatNumber(value: number): string {
+  return Math.trunc(value).toLocaleString("en-US");
+}
+
+function formatFunAmount(amount: number): string {
+  if (amount >= 10) return amount.toFixed(0);
+  if (amount >= 1) {
+    const rounded = Math.round(amount * 10) / 10;
+    return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1);
+  }
+  return amount.toFixed(1);
+}
+
+function funEnergySummary(tokens: number, energyKwh: number): string {
+  if (energyKwh <= 0 || !Number.isFinite(energyKwh)) {
+    return `This session used ${formatNumber(tokens)} tokens.`;
+  }
+
+  const unit = FUN_ENERGY_UNITS
+    .map((candidate) => {
+      const amount = energyKwh / candidate.kwh;
+      const score = amount < candidate.minAmount
+        ? Number.POSITIVE_INFINITY
+        : Math.abs(amount - (amount < 1 ? 1 : Math.round(amount)));
+      return { ...candidate, score };
+    })
+    .sort((left, right) => left.score - right.score)[0];
+  const amountLabel = formatFunAmount(energyKwh / unit.kwh);
+  const noun = amountLabel === "1" ? unit.singular : unit.plural;
+  return `This session used ${formatNumber(tokens)} tokens and enough electricity for ${amountLabel} ${noun}.`;
+}
+
 function RichText({ content }: { content: string }) {
   const blocks = parseRichText(content);
 
@@ -573,6 +635,8 @@ export function MessageBubble({
 
     case "session_metrics": {
       const md = e.nesting_depth || 0;
+      const totalTokens = e.prompt_tokens + e.generated_tokens;
+      const totalEnergyKwh = (e.llm_energy_kwh ?? 0) + (e.tool_energy_kwh ?? 0);
       return (
         <article
           className="message-row assistant-message compact"
@@ -587,6 +651,7 @@ export function MessageBubble({
               <li>LLM: {e.llm_invocations} calls, {formatDurationMs(e.llm_runtime_ms)}, {e.prompt_tokens} prompt tokens, {e.generated_tokens} generated tokens</li>
               <li>Tools: {e.tool_calls} calls, {formatDurationMs(e.tool_runtime_ms)}</li>
               <li>Energy: LLM {formatEnergy(e.llm_energy_kwh, e.llm_energy_joules)}, tools {formatEnergy(e.tool_energy_kwh, e.tool_energy_joules)}</li>
+              <li>{funEnergySummary(totalTokens, totalEnergyKwh)}</li>
             </ul>
           </div>
         </article>
@@ -617,6 +682,12 @@ export function MessageBubble({
               <>
                 <strong>Commits</strong>
                 <pre className="small result-pre">{e.commits}</pre>
+              </>
+            ) : null}
+            {e.power_summary?.trim() ? (
+              <>
+                <strong>Power</strong>
+                <p className="small mb-2">{e.power_summary}</p>
               </>
             ) : null}
             {e.diff_stat?.trim() ? (

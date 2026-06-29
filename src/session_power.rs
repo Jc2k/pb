@@ -3,6 +3,7 @@ pub struct FunEnergyUnit {
     pub singular: &'static str,
     pub plural: &'static str,
     pub kwh: f64,
+    pub min_amount: f64,
 }
 
 // Add new deliberately-non-metric session summary units here. Values are rough,
@@ -12,26 +13,43 @@ const FUN_ENERGY_UNITS: &[FunEnergyUnit] = &[
         singular: "cup of tea",
         plural: "cups of tea",
         kwh: 0.03,
+        min_amount: 0.1,
     },
     FunEnergyUnit {
         singular: "phone charge",
         plural: "phone charges",
         kwh: 0.015,
+        min_amount: 0.1,
+    },
+    FunEnergyUnit {
+        singular: "second of a cozy LED bulb",
+        plural: "seconds of a cozy LED bulb",
+        kwh: 0.01 / 3600.0,
+        min_amount: 1.0,
+    },
+    FunEnergyUnit {
+        singular: "minute of a cozy LED bulb",
+        plural: "minutes of a cozy LED bulb",
+        kwh: 0.01 / 60.0,
+        min_amount: 1.0,
     },
     FunEnergyUnit {
         singular: "hour of a cozy LED bulb",
         plural: "hours of a cozy LED bulb",
         kwh: 0.01,
+        min_amount: 0.1,
     },
     FunEnergyUnit {
         singular: "slice of toast",
         plural: "slices of toast",
         kwh: 0.02,
+        min_amount: 0.1,
     },
     FunEnergyUnit {
         singular: "bag of microwave popcorn",
         plural: "bags of microwave popcorn",
         kwh: 0.05,
+        min_amount: 0.1,
     },
 ];
 
@@ -59,15 +77,18 @@ fn choose_fun_unit(energy_kwh: f64) -> FunEnergyUnit {
         .iter()
         .copied()
         .min_by(|left, right| {
-            let left_score = unit_score(energy_kwh, left.kwh);
-            let right_score = unit_score(energy_kwh, right.kwh);
+            let left_score = unit_score(energy_kwh, left);
+            let right_score = unit_score(energy_kwh, right);
             left_score.total_cmp(&right_score)
         })
         .expect("fun energy units should not be empty")
 }
 
-fn unit_score(energy_kwh: f64, unit_kwh: f64) -> f64 {
-    let amount = energy_kwh / unit_kwh;
+fn unit_score(energy_kwh: f64, unit: FunEnergyUnit) -> f64 {
+    let amount = energy_kwh / unit.kwh;
+    if amount < unit.min_amount {
+        return f64::INFINITY;
+    }
     let nearest_fun_amount = if amount < 1.0 { 1.0 } else { amount.round() };
     (amount - nearest_fun_amount).abs()
 }
@@ -108,6 +129,14 @@ mod tests {
         assert_eq!(
             session_power_summary(13_567, 0.06),
             "This session used 13,567 tokens and enough electricity for 2 cups of tea."
+        );
+    }
+
+    #[test]
+    fn formats_tiny_energy_as_nonzero_fun_unit() {
+        assert_eq!(
+            session_power_summary(460_502, 0.00001052),
+            "This session used 460,502 tokens and enough electricity for 3.8 seconds of a cozy LED bulb."
         );
     }
 
