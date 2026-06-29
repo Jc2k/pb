@@ -1,10 +1,11 @@
 import type React from "react";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import type { AgentEvent, EventEnvelope, SessionItem } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
 import { formatEventTime, getAvatarForProfile, projectName, relativeTime, sessionTitle } from "../lib/helpers";
 import { TODO_STATUS_LABELS, errorSummary, getToolDetail, profileJobTitle, profileName } from "../lib/sessionUtils";
 import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
+import { parseRichText } from "../lib/richText";
 
 function formatDurationMs(ms?: number): string {
   if (ms === undefined) return "unknown runtime";
@@ -16,6 +17,50 @@ function formatEnergy(kwh?: number, joules?: number): string {
   if (kwh !== undefined) return `${kwh.toExponential(3)} kWh`;
   if (joules !== undefined) return `${joules.toFixed(2)} J`;
   return "not available";
+}
+
+function RichText({ content }: { content: string }) {
+  const blocks = parseRichText(content);
+
+  return (
+    <div className="rich-text">
+      {blocks.map((block, index) => {
+        switch (block.type) {
+          case "heading": {
+            const Heading = `h${block.level + 2}` as keyof React.JSX.IntrinsicElements;
+            return <Heading key={index}>{block.text}</Heading>;
+          }
+          case "unordered_list":
+            return (
+              <ul key={index}>
+                {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
+              </ul>
+            );
+          case "ordered_list":
+            return (
+              <ol key={index}>
+                {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
+              </ol>
+            );
+          case "code":
+            return (
+              <pre key={index} className="rich-text-code"><code>{block.code}</code></pre>
+            );
+          case "paragraph":
+            return (
+              <p key={index}>
+                {block.lines.map((line, lineIndex) => (
+                  <Fragment key={lineIndex}>
+                    {line}
+                    {lineIndex < block.lines.length - 1 ? <br /> : null}
+                  </Fragment>
+                ))}
+              </p>
+            );
+        }
+      })}
+    </div>
+  );
 }
 
 export function DiffView({ diff }: { diff: string }) {
@@ -373,7 +418,7 @@ export function MessageBubble({
               <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble thought-bubble">
-              <p>{e.content}</p>
+              <RichText content={e.content} />
             </div>
           </div>
         </article>
@@ -502,7 +547,7 @@ export function MessageBubble({
               <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble thought-bubble">
-              <p>{e.content}</p>
+              <RichText content={e.content} />
             </div>
           </div>
         </article>

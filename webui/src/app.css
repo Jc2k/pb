@@ -2103,3 +2103,40 @@ body {
     margin-top: 0;
   }
 }
+
+.rich-text > :first-child {
+  margin-top: 0;
+}
+
+.rich-text > :last-child {
+  margin-bottom: 0;
+}
+
+.rich-text p {
+  margin-bottom: 0.75rem;
+}
+
+.rich-text h3,
+.rich-text h4,
+.rich-text h5 {
+  font-size: 1rem;
+  font-weight: 800;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.rich-text ul,
+.rich-text ol {
+  margin: 0 0 0.75rem;
+  padding-left: 1.25rem;
+}
+
+.rich-text-code {
+  background: rgba(15, 23, 42, 0.08);
+  border-radius: 0.75rem;
+  color: inherit;
+  font-size: 0.875rem;
+  margin: 0 0 0.75rem;
+  overflow-x: auto;
+  padding: 0.75rem;
+  white-space: pre;
+}
