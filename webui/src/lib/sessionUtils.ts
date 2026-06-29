@@ -220,10 +220,17 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
   return event.event.type === "sub_agent_started" || event.event.type === "sub_agent_finished";
 }
 
+function isTransientActivityEvent(event: EventEnvelope): boolean {
+  return event.event.type === "model_loading" ||
+    event.event.type === "step_started";
+}
+
 export function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnvelope[] {
   const chatEvents = events.filter((event) => !isHiddenChatEvent(event));
   const lastVisibleIndex = chatEvents.length - 1;
-  return chatEvents.filter((event, index) => event.event.type !== "step_started" || index === lastVisibleIndex);
+  return chatEvents.filter((event, index) =>
+    !isTransientActivityEvent(event) || index === lastVisibleIndex
+  );
 }
 
 export function profileName(profile: string): string {

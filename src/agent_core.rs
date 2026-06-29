@@ -690,6 +690,21 @@ pub fn run_agent<S: EventSink>(
         (branch, is_continuation)
     };
 
+    sink.emit(AgentEvent::Started {
+        task: args.task.clone(),
+        model: model_path.display().to_string(),
+        workspace: workspace_root.display().to_string(),
+        branch: branch.clone(),
+        attachments: args.attachments.clone(),
+        timestamp_ms: Some(now_millis()),
+    });
+
+    sink.emit(AgentEvent::ModelLoading {
+        model: model_path.display().to_string(),
+        nesting_depth: Some(0),
+        timestamp_ms: Some(now_millis()),
+    });
+
     suppress_llama_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     backend.void_logs();
@@ -751,15 +766,6 @@ pub fn run_agent<S: EventSink>(
     } else {
         PolicyConfig::load(&workspace_root)?.unwrap_or_default()
     };
-
-    sink.emit(AgentEvent::Started {
-        task: args.task.clone(),
-        model: model_path.display().to_string(),
-        workspace: workspace_root.display().to_string(),
-        branch: branch.clone(),
-        attachments: args.attachments.clone(),
-        timestamp_ms: Some(now_millis()),
-    });
 
     let instructions = build_agent_instructions(
         &workspace_root,

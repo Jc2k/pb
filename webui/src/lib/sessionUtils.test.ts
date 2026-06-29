@@ -1,7 +1,11 @@
 /// <reference lib="deno.ns" />
 import { deepEqual, equal } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
-import { buildToolSummaries, getToolDetail } from "./sessionUtils.ts";
+import {
+  buildToolSummaries,
+  chatEventsWithOnlyLatestStep,
+  getToolDetail,
+} from "./sessionUtils.ts";
 
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
@@ -52,4 +56,40 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
       ],
     },
   ]);
+});
+
+Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicator", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "started",
+        task: "Implement loading state",
+        model: "/models/local.gguf",
+        workspace: "/repo",
+        branch: "feat-loading-state",
+        profile: "build",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "model_loading",
+        model: "/models/local.gguf",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "step_started",
+        step: 1,
+        max_steps: 20,
+      },
+    },
+  ];
+
+  deepEqual(
+    chatEventsWithOnlyLatestStep(events).map((event) => event.event.type),
+    ["started", "step_started"],
+  );
 });
