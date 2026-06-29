@@ -1295,6 +1295,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.sender,
                         &session.history,
                         AgentEvent::Error {
+                            summary: "Session failed".to_string(),
                             message: err.to_string(),
                             nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
@@ -1307,6 +1308,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.sender,
                         &session.history,
                         AgentEvent::Error {
+                            summary: "Session failed".to_string(),
                             message: err.to_string(),
                             nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
