@@ -3757,17 +3757,10 @@ fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) 
 
 fn unified_diff(old: &str, new: &str, path: &str) -> String {
     let diff = TextDiff::from_lines(old, new);
-    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            similar::ChangeTag::Delete => "-",
-            similar::ChangeTag::Insert => "+",
-            similar::ChangeTag::Equal => " ",
-        };
-        out.push_str(sign);
-        out.push_str(change.value());
-    }
-    out
+    diff.unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5864,6 +5857,26 @@ mod tests {
         let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n";
         let paths = validate_patch_paths(patch, &workspace).unwrap();
         assert_eq!(paths, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn unified_diff_uses_hunks_instead_of_full_file() {
+        let old = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let new = old.replace("line 10\n", "line ten\n");
+
+        let diff = unified_diff(&old, &new, "notes.txt");
+
+        assert!(diff.contains("--- a/notes.txt"), "{diff}");
+        assert!(diff.contains("+++ b/notes.txt"), "{diff}");
+        assert!(diff.contains("@@ -7,7 +7,7 @@"), "{diff}");
+        assert!(diff.contains("-line 10"), "{diff}");
+        assert!(diff.contains("+line ten"), "{diff}");
+        assert!(diff.contains("line 7"), "{diff}");
+        assert!(diff.contains("line 13"), "{diff}");
+        assert!(!diff.contains("line 1\n"), "{diff}");
+        assert!(!diff.contains("line 20"), "{diff}");
     }
 
     #[test]
