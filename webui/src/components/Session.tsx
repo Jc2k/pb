@@ -644,24 +644,13 @@ export function MessageBubble({
       return null;
 
     case "session_metrics": {
-      const md = e.nesting_depth || 0;
       const totalTokens = e.prompt_tokens + e.generated_tokens;
       const totalEnergyKwh = (e.llm_energy_kwh ?? 0) + (e.tool_energy_kwh ?? 0);
       const totalRuntimeMs = e.llm_runtime_ms + e.tool_runtime_ms;
       return (
-        <article
-          className="message-row assistant-message compact"
-          style={{ marginLeft: `${md}rem` }}
-        >
-          <div className="bot-avatar">
-            <i className="bi bi-speedometer2"></i>
-          </div>
-          <div className="bubble thought-bubble">
-            <p>Session metrics</p>
-            <p className="small mb-0">
-              {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)}
-            </p>
-          </div>
+        <article className="session-correction" aria-label="Session metrics">
+          <span>{funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)}</span>
+          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
         </article>
       );
     }

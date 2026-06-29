@@ -58,6 +58,10 @@ Deno.test("session metrics show a concise human summary after session summary", 
   ok(types.includes("power_summary?: string"));
   ok(component.includes("funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)"));
   ok(component.includes("used enough electricity to power an LED bulb"));
+  ok(component.includes('case "session_metrics"'));
+  ok(component.includes('<article className="session-correction" aria-label="Session metrics">'));
+  ok(component.includes("{e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}"));
   ok(!component.includes("<strong>Power</strong>"));
   ok(!component.includes("e.power_summary"));
+  ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
 });
