@@ -4,6 +4,7 @@ import type { EventEnvelope } from "../types/index";
 import {
   buildToolSummaries,
   chatEventsWithOnlyLatestStep,
+  errorSummary,
   getToolDetail,
   latestAssistantProfile,
 } from "./sessionUtils.ts";
@@ -119,4 +120,15 @@ Deno.test("latestAssistantProfile falls back to the started profile for early ac
   ];
 
   equal(latestAssistantProfile(events), "build");
+});
+
+Deno.test("errorSummary prefers explicit error summaries", () => {
+  equal(
+    errorSummary({
+      type: "error",
+      summary: "Invalid pb JSON action on step 10/12",
+      message: "Invalid pb JSON action on step 10/12: failed to parse agent JSON action",
+    }),
+    "Invalid pb JSON action on step 10/12",
+  );
 });

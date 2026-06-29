@@ -218,6 +218,8 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,12 +501,14 @@ impl EventEnvelope {
             },
             AgentEvent::Error {
                 message,
+                summary,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::Error {
                     message,
+                    summary,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },

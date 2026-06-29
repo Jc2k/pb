@@ -60,6 +60,7 @@ const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
 const MONITOR_STEP_BUDGET: usize = 3;
+const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
@@ -1840,6 +1841,9 @@ fn run_agent_steps(
     let mut effective_max_steps = args.max_steps;
     let mut monitor_used = false;
     let mut step = 1;
+    let mut consecutive_parse_failures = 0usize;
+    let mut last_parse_failure_signature: Option<u64> = None;
+    let mut repeated_parse_failures = 0usize;
 
     while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -1862,31 +1866,57 @@ fn run_agent_steps(
         )? {
             Ok(parsed) => parsed,
             Err(ParseFailure { output, error }) => {
-                let parse_message = format!(
-                    "The model returned output that could not be parsed as a pb JSON action on step {step}/{max_steps}: {error}",
+                consecutive_parse_failures = consecutive_parse_failures.saturating_add(1);
+                let signature = parse_failure_signature(&output, &error.to_string());
+                repeated_parse_failures = if last_parse_failure_signature == Some(signature) {
+                    repeated_parse_failures.saturating_add(1)
+                } else {
+                    1
+                };
+                last_parse_failure_signature = Some(signature);
+
+                let parse_summary = format!(
+                    "Invalid pb JSON action on step {step}/{max_steps}",
                     max_steps = effective_max_steps
                 );
+                let parse_message = format!("{parse_summary}: {error}\n\nModel output:\n{output}",);
                 sink.emit(AgentEvent::Error {
                     message: parse_message,
+                    summary: parse_summary,
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
                 messages.push(ChatMessage {
                     role: "assistant",
-                    content: output,
+                    content: output.clone(),
                 });
 
-                let error_msg = format!(
-                    "JSON parsing error: {error}\n\nPlease fix the JSON structure and try again."
+                let error_msg = parse_failure_feedback(
+                    &error.to_string(),
+                    consecutive_parse_failures,
+                    repeated_parse_failures,
+                    MAX_CONSECUTIVE_PARSE_FAILURES,
                 );
                 messages.push(ChatMessage {
                     role: "tool",
                     content: error_msg,
                 });
 
+                if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
+                    || repeated_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
+                {
+                    bail!(
+                        "model produced {consecutive_parse_failures} consecutive unparsable pb JSON actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
+                    );
+                }
+
+                step += 1;
                 continue;
             }
         };
+        consecutive_parse_failures = 0;
+        last_parse_failure_signature = None;
+        repeated_parse_failures = 0;
 
         match action {
             AgentAction::Final { content, thinking } => {
@@ -2035,6 +2065,7 @@ fn run_agent_steps(
         timestamp_ms: Some(now_millis()),
     });
     sink.emit(AgentEvent::Error {
+        summary: "Step limit reached".to_string(),
         message,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
@@ -2327,6 +2358,48 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
 struct ParseFailure {
     output: String,
     error: anyhow::Error,
+}
+
+fn parse_failure_signature(output: &str, error: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    output.trim().hash(&mut hasher);
+    error.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn parse_failure_feedback(
+    error: &str,
+    consecutive_failures: usize,
+    repeated_failures: usize,
+    max_failures: usize,
+) -> String {
+    let remaining = max_failures.saturating_sub(consecutive_failures);
+    let mut feedback = format!(
+        "JSON parsing error after attempt {consecutive_failures}/{max_failures}: {error}\n\n\
+         Your previous response was not accepted as a pb action. The next response must be exactly one JSON object, with no markdown fences or prose.\n\
+         Valid forms:\n\
+         {tool_call}\n\
+         {tool_calls}\n\
+         {final_action}\n",
+        tool_call = r#"{"type":"tool_call","tool":"read_file","arguments":{"path":"Cargo.toml"},"thinking":"why this action is useful"}"#,
+        tool_calls = r#"{"type":"tool_calls","calls":[{"tool":"read_file","arguments":{"path":"Cargo.toml"}}],"thinking":"why this batch is useful"}"#,
+        final_action = r#"{"type":"final","content":"summary of completed work","thinking":"why the task is complete"}"#,
+    );
+    if repeated_failures > 1 {
+        feedback.push_str(&format!(
+            "\nThis appears to be the same parse failure repeated {repeated_failures} times. Change strategy: use a simpler action, remove any unsupported fields, or provide a final response if blocked.\n",
+        ));
+    }
+    if remaining == 0 {
+        feedback.push_str(
+            "\nNo parse-retry budget remains; pb is stopping this run to avoid an infinite loop.\n",
+        );
+    } else {
+        feedback.push_str(&format!(
+            "\n{remaining} parse-retry step(s) remain before pb stops this run to avoid an infinite loop.\n",
+        ));
+    }
+    feedback
 }
 
 struct CompletionOutput {
@@ -4913,6 +4986,37 @@ mod tests {
         assert_eq!(calls[1].tool, "mcp_github_search");
         assert_eq!(calls[1].arguments["query"], "pb");
         assert_eq!(thinking.as_deref(), Some("I can gather both inputs now."));
+    }
+
+    #[test]
+    fn parse_action_accepts_read_file_with_range_and_thinking() {
+        let output = r#"{"type":"tool_call","tool":"read_file","arguments":{"path":"webui/src/pages/ProjectsPage.tsx","start":500,"end":540},"thinking":"I can inspect the relevant range."}"#;
+        let action = parse_action(output).expect("read_file range JSON action should parse");
+
+        let AgentAction::ToolCall {
+            tool,
+            arguments,
+            thinking,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool, "read_file");
+        assert_eq!(arguments["path"], "webui/src/pages/ProjectsPage.tsx");
+        assert_eq!(arguments["start"], 500);
+        assert_eq!(arguments["end"], 540);
+        assert_eq!(
+            thinking.as_deref(),
+            Some("I can inspect the relevant range.")
+        );
+    }
+
+    #[test]
+    fn parse_failure_feedback_warns_on_repeats_and_budget() {
+        let feedback = parse_failure_feedback("bad json", 2, 2, 3);
+        assert!(feedback.contains("attempt 2/3"));
+        assert!(feedback.contains("same parse failure repeated 2 times"));
+        assert!(feedback.contains("1 parse-retry step(s) remain"));
     }
 
     #[test]

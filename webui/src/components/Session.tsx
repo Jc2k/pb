@@ -228,8 +228,13 @@ function ErrorEventBubble({
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const summary = errorSummary(event);
-  const detail = String(event.message || "").trim() || "No error details provided.";
-  const hasDetail = detail !== summary;
+  const rawDetail = String(event.message || "").trim();
+  const detail = rawDetail.startsWith(`${summary}:`)
+    ? rawDetail.slice(summary.length + 1).trim()
+    : rawDetail === summary
+      ? ""
+      : rawDetail;
+  const hasDetail = detail.length > 0;
 
   return (
     <article className="message-row compact tool-message error-message">
@@ -251,8 +256,10 @@ function ErrorEventBubble({
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`}>
           <div className="error-detail">
-            {hasDetail ? <strong>{summary}</strong> : null}
-            <pre className="mb-0 small result-pre">{detail}</pre>
+            {hasDetail ? <pre className="mb-0 small result-pre">{detail}</pre> : null}
+            {!hasDetail ? (
+              <p className="mb-0">{summary || "No error details provided."}</p>
+            ) : null}
           </div>
         </div>
       </div>
