@@ -11,7 +11,9 @@ pub mod metrics {
 
     impl Sampler {
         pub fn new(interval_ms: u64) -> Self {
-            Self { _interval_ms: interval_ms }
+            Self {
+                _interval_ms: interval_ms,
+            }
         }
 
         pub fn snapshot(&self) -> Metrics {
@@ -93,13 +95,20 @@ mod power {
         let amperage_ma = dict_i32(props, "Amperage").unwrap_or_default();
         let battery_watts = ((voltage_mv as f64 * amperage_ma as f64).abs() / 1_000_000.0) as f32;
         let adapter_watts = dict_i32(props, "AdapterPower")
-            .map(|raw| f32::from_bits(raw as u32))
+            .map(adapter_power_watts_from_registry_value)
             .filter(|watts| watts.is_finite() && *watts > 0.0)
             .unwrap_or_default();
         unsafe { CFRelease(props as _) };
         [adapter_watts, battery_watts]
             .into_iter()
             .find(|watts| watts.is_finite() && *watts > 0.0)
+    }
+
+    pub(super) fn adapter_power_watts_from_registry_value(raw: i32) -> f32 {
+        // AppleSmartBattery exposes AdapterPower as an integer watt value. Treating
+        // those integer bits as an IEEE-754 float turns normal adapter values such
+        // as 70 W into tiny denormals, which makes energy estimates look near-zero.
+        raw as f32
     }
 
     fn smart_battery_properties() -> Option<CfMutableDictionaryRef> {
@@ -131,7 +140,8 @@ mod power {
     fn dict_i32(dict: CfDictionaryRef, key: &str) -> Option<i32> {
         unsafe {
             let key = CString::new(key).ok()?;
-            let key_ref = CFStringCreateWithCString(ptr::null(), key.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+            let key_ref =
+                CFStringCreateWithCString(ptr::null(), key.as_ptr(), K_CF_STRING_ENCODING_UTF8);
             if key_ref.is_null() {
                 return None;
             }
@@ -147,5 +157,15 @@ mod power {
                 None
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::power::adapter_power_watts_from_registry_value;
+
+    #[test]
+    fn adapter_power_registry_value_is_integer_watts_not_float_bits() {
+        assert_eq!(adapter_power_watts_from_registry_value(70), 70.0);
     }
 }
