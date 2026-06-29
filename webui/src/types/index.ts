@@ -17,6 +17,12 @@ export type AgentEvent =
       nesting_depth?: number;
       timestamp_ms?: number;
     }
+  | {
+      type: "model_loading";
+      model: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
   | { type: "reasoning"; content: string; profile: string; nesting_depth?: number; timestamp_ms?: number }
   | {
       type: "tool_call";

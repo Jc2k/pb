@@ -19,6 +19,9 @@ pub fn render_event(event: &AgentEvent) {
         } => {
             print_header("step", &format!("{step}/{max_steps}"));
         }
+        AgentEvent::ModelLoading { model, .. } => {
+            print_header("model", &format!("loading {model}"));
+        }
         AgentEvent::Reasoning {
             content,
             profile: _,

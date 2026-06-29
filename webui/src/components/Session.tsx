@@ -304,13 +304,17 @@ export function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
         </article>
       );
 
-    case "step_started":
+    case "model_loading":
+    case "step_started": {
       const sd = e.nesting_depth || 0;
+      const label = e.type === "model_loading"
+        ? "Loading model"
+        : `Working step ${e.step} of ${e.max_steps}`;
       return (
         <article
           className="message-row assistant-message compact typing-row"
           style={{ marginLeft: `${sd}rem` }}
-          aria-label={`Working step ${e.step} of ${e.max_steps}`}
+          aria-label={label}
         >
           <div className="typing-indicator" aria-hidden="true">
             <span></span>
@@ -319,6 +323,7 @@ export function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
           </div>
         </article>
       );
+    }
 
     case "reasoning":
       const rd = e.nesting_depth || 0;

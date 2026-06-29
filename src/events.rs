@@ -79,6 +79,13 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    ModelLoading {
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     Reasoning {
         content: String,
         profile: AgentProfile,
@@ -263,6 +270,18 @@ impl EventEnvelope {
                 event: AgentEvent::StepStarted {
                     step,
                     max_steps,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ModelLoading {
+                model,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ModelLoading {
+                    model,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
