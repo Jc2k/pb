@@ -856,6 +856,21 @@ pub fn run_agent<S: EventSink>(
         timestamp_ms: Some(now_millis()),
     });
 
+    sink.emit(AgentEvent::SessionMetrics {
+        llm_invocations: outcome.metrics.llm_invocations,
+        llm_runtime_ms: outcome.metrics.llm_runtime_ms,
+        prompt_tokens: outcome.metrics.prompt_tokens,
+        generated_tokens: outcome.metrics.generated_tokens,
+        tool_calls: outcome.metrics.tool_calls,
+        tool_runtime_ms: outcome.metrics.tool_runtime_ms,
+        llm_energy_joules: nonzero_f64(outcome.metrics.llm_energy_joules),
+        llm_energy_kwh: nonzero_f64(outcome.metrics.llm_energy_kwh),
+        tool_energy_joules: nonzero_f64(outcome.metrics.tool_energy_joules),
+        tool_energy_kwh: nonzero_f64(outcome.metrics.tool_energy_kwh),
+        nesting_depth: None,
+        timestamp_ms: Some(now_millis()),
+    });
+
     // `command_backend` is dropped here, which removes task containers when used.
 
     Ok(AgentRunResult {
@@ -1957,22 +1972,6 @@ fn run_agent_steps(
                         content: reasoning,
                         profile: args.profile,
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
-                }
-                if nesting_depth == 0 {
-                    sink.emit(AgentEvent::SessionMetrics {
-                        llm_invocations: metrics.llm_invocations,
-                        llm_runtime_ms: metrics.llm_runtime_ms,
-                        prompt_tokens: metrics.prompt_tokens,
-                        generated_tokens: metrics.generated_tokens,
-                        tool_calls: metrics.tool_calls,
-                        tool_runtime_ms: metrics.tool_runtime_ms,
-                        llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
-                        llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
-                        tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
-                        tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
-                        nesting_depth: None,
                         timestamp_ms: Some(now_millis()),
                     });
                 }

@@ -51,12 +51,13 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(css.includes(".session-header .share-action,"));
 });
 
-Deno.test("session metrics include fun nonzero power summary", async () => {
+Deno.test("session metrics show a concise human summary after session summary", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(types.includes("power_summary?: string"));
-  ok(component.includes("funEnergySummary(totalTokens, totalEnergyKwh)"));
-  ok(component.includes("second of a cozy LED bulb"));
-  ok(component.includes("e.power_summary"));
+  ok(component.includes("funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)"));
+  ok(component.includes("used enough electricity to power an LED bulb"));
+  ok(!component.includes("<strong>Power</strong>"));
+  ok(!component.includes("e.power_summary"));
 });

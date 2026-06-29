@@ -7,34 +7,39 @@ import { TODO_STATUS_LABELS, errorSummary, getToolDetail, profileJobTitle, profi
 import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
 import { parseRichText } from "../lib/richText";
 
-function formatDurationMs(ms?: number): string {
-  if (ms === undefined) return "unknown runtime";
-  if (ms < 1000) return `${ms} ms`;
-  return `${(ms / 1000).toFixed(1)} s`;
-}
+function formatHumanDurationMs(ms?: number): string {
+  if (ms === undefined) return "an unknown amount of time";
 
-function formatEnergy(kwh?: number, joules?: number): string {
-  if (kwh !== undefined) return `${kwh.toExponential(3)} kWh`;
-  if (joules !== undefined) return `${joules.toFixed(2)} J`;
-  return "not available";
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h${minutes.toString().padStart(2, "0")}`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m${seconds.toString().padStart(2, "0")}`;
+  }
+  return `${seconds}s`;
 }
 
 const FUN_ENERGY_UNITS = [
   {
-    singular: "second of a cozy LED bulb",
-    plural: "seconds of a cozy LED bulb",
+    singular: "second",
+    plural: "seconds",
     kwh: 0.01 / 3600,
     minAmount: 1,
   },
   {
-    singular: "minute of a cozy LED bulb",
-    plural: "minutes of a cozy LED bulb",
+    singular: "minute",
+    plural: "minutes",
     kwh: 0.01 / 60,
     minAmount: 1,
   },
   {
-    singular: "hour of a cozy LED bulb",
-    plural: "hours of a cozy LED bulb",
+    singular: "hour",
+    plural: "hours",
     kwh: 0.01,
     minAmount: 0.1,
   },
@@ -62,9 +67,14 @@ function formatFunAmount(amount: number): string {
   return amount.toFixed(1);
 }
 
-function funEnergySummary(tokens: number, energyKwh: number): string {
+function funEnergySummary(
+  runtimeMs: number,
+  tokens: number,
+  energyKwh: number,
+): string {
+  const prefix = `This session ran for ${formatHumanDurationMs(runtimeMs)}, used ${formatNumber(tokens)} tokens`;
   if (energyKwh <= 0 || !Number.isFinite(energyKwh)) {
-    return `This session used ${formatNumber(tokens)} tokens.`;
+    return `${prefix}.`;
   }
 
   const unit = FUN_ENERGY_UNITS
@@ -78,7 +88,7 @@ function funEnergySummary(tokens: number, energyKwh: number): string {
     .sort((left, right) => left.score - right.score)[0];
   const amountLabel = formatFunAmount(energyKwh / unit.kwh);
   const noun = amountLabel === "1" ? unit.singular : unit.plural;
-  return `This session used ${formatNumber(tokens)} tokens and enough electricity for ${amountLabel} ${noun}.`;
+  return `${prefix} and used enough electricity to power an LED bulb for ${amountLabel} ${noun}.`;
 }
 
 function RichText({ content }: { content: string }) {
@@ -637,6 +647,7 @@ export function MessageBubble({
       const md = e.nesting_depth || 0;
       const totalTokens = e.prompt_tokens + e.generated_tokens;
       const totalEnergyKwh = (e.llm_energy_kwh ?? 0) + (e.tool_energy_kwh ?? 0);
+      const totalRuntimeMs = e.llm_runtime_ms + e.tool_runtime_ms;
       return (
         <article
           className="message-row assistant-message compact"
@@ -647,12 +658,9 @@ export function MessageBubble({
           </div>
           <div className="bubble thought-bubble">
             <p>Session metrics</p>
-            <ul className="mb-0 small">
-              <li>LLM: {e.llm_invocations} calls, {formatDurationMs(e.llm_runtime_ms)}, {e.prompt_tokens} prompt tokens, {e.generated_tokens} generated tokens</li>
-              <li>Tools: {e.tool_calls} calls, {formatDurationMs(e.tool_runtime_ms)}</li>
-              <li>Energy: LLM {formatEnergy(e.llm_energy_kwh, e.llm_energy_joules)}, tools {formatEnergy(e.tool_energy_kwh, e.tool_energy_joules)}</li>
-              <li>{funEnergySummary(totalTokens, totalEnergyKwh)}</li>
-            </ul>
+            <p className="small mb-0">
+              {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)}
+            </p>
           </div>
         </article>
       );
@@ -682,12 +690,6 @@ export function MessageBubble({
               <>
                 <strong>Commits</strong>
                 <pre className="small result-pre">{e.commits}</pre>
-              </>
-            ) : null}
-            {e.power_summary?.trim() ? (
-              <>
-                <strong>Power</strong>
-                <p className="small mb-2">{e.power_summary}</p>
               </>
             ) : null}
             {e.diff_stat?.trim() ? (
