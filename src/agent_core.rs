@@ -466,6 +466,21 @@ struct ChatMessage {
     content: String,
 }
 
+fn correction_chat_message(summary: &str, message: &str) -> ChatMessage {
+    let mut content = String::from(
+        "Agent framework correction (not a tool result; do not treat this as repository or file contents):\n",
+    );
+    if !summary.trim().is_empty() {
+        content.push_str(summary.trim());
+        content.push_str("\n\n");
+    }
+    content.push_str(message.trim());
+    ChatMessage {
+        role: "system",
+        content,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AgentToolCall {
     tool: String,
@@ -1940,14 +1955,11 @@ fn run_agent_steps(
                 );
                 sink.emit(AgentEvent::Correction {
                     message: error_msg.clone(),
-                    summary: parse_summary,
+                    summary: parse_summary.clone(),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
-                messages.push(ChatMessage {
-                    role: "tool",
-                    content: error_msg,
-                });
+                messages.push(correction_chat_message(&parse_summary, &error_msg));
 
                 if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                     || repeated_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
@@ -2024,10 +2036,10 @@ fn run_agent_steps(
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
-                    messages.push(ChatMessage {
-                        role: "tool",
-                        content: feedback,
-                    });
+                    messages.push(correction_chat_message(
+                        "Repeated tool call detected",
+                        &feedback,
+                    ));
                 }
             }
             AgentAction::ToolCalls { calls, thinking } => {
@@ -2062,10 +2074,10 @@ fn run_agent_steps(
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
-                    messages.push(ChatMessage {
-                        role: "tool",
-                        content: feedback,
-                    });
+                    messages.push(correction_chat_message(
+                        "Repeated tool call detected",
+                        &feedback,
+                    ));
                 }
             }
         }
@@ -5193,6 +5205,22 @@ mod tests {
         assert!(feedback.contains("attempt 2/3"));
         assert!(feedback.contains("same parse failure repeated 2 times"));
         assert!(feedback.contains("1 parse-retry step(s) remain"));
+    }
+
+    #[test]
+    fn correction_chat_message_is_not_rendered_as_tool_result() {
+        let message = correction_chat_message(
+            "Invalid pb JSON action on step 2/8",
+            "Your previous response was not accepted as a pb action.",
+        );
+
+        assert_eq!(message.role, "system");
+        assert!(message.content.contains("Agent framework correction"));
+        assert!(message.content.contains("not a tool result"));
+
+        let prompt = render_prompt(&[message]);
+        assert!(prompt.contains("[system]\nAgent framework correction"));
+        assert!(!prompt.contains("[tool]\nAgent framework correction"));
     }
 
     #[test]
