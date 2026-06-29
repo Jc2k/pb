@@ -347,6 +347,45 @@ export function InitialUserMessage({ task, timestampMs }: { task: string; timest
   );
 }
 
+type AssistantMessageRowProps = {
+  profile: string;
+  timestampMs?: number;
+  nestingDepth?: number;
+  compact?: boolean;
+  children: React.ReactNode;
+};
+
+function AssistantMessageRow({
+  profile,
+  timestampMs,
+  nestingDepth = 0,
+  compact = false,
+  children,
+}: AssistantMessageRowProps) {
+  return (
+    <article
+      className={`bot message-row assistant-message${
+        compact ? " compact" : ""
+      }`}
+      style={{ marginLeft: `${nestingDepth}rem` }}
+    >
+      <div className="bot-avatar">
+        <img src={getAvatarForProfile(profile)} alt={profileName(profile)} />
+      </div>
+      <div className="message-container">
+        <div className="author-line">
+          <strong>{profileName(profile)}</strong>
+          <span>{profileJobTitle(profile)}</span>
+          {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
+        </div>
+        <div className="bubble thought-bubble">
+          {children}
+        </div>
+      </div>
+    </article>
+  );
+}
+
 export function MessageBubble({
   envelope,
   activityProfile,
@@ -402,26 +441,14 @@ export function MessageBubble({
     }
 
     case "reasoning":
-      const rd = e.nesting_depth || 0;
       return (
-        <article
-          className="bot message-row assistant-message"
-          style={{ paddingLeft: `${rd}rem` }}
+        <AssistantMessageRow
+          profile={e.profile}
+          timestampMs={e.timestamp_ms}
+          nestingDepth={e.nesting_depth || 0}
         >
-          <div className="bot-avatar">
-            <img src={`/static/images/avatar-${e.profile}.png`} />
-          </div>
-          <div className="message-container">
-            <div className="author-line">
-              <strong>{profileName(e.profile)}</strong>
-              <span>{profileJobTitle(e.profile)}</span>
-              <time>{formatEventTime(e.timestamp_ms)}</time>
-            </div>
-            <div className="bubble thought-bubble">
-              <RichText content={e.content} />
-            </div>
-          </div>
-        </article>
+          <RichText content={e.content} />
+        </AssistantMessageRow>
       );
 
     case "user_question":
@@ -531,26 +558,14 @@ export function MessageBubble({
       );
 
     case "final":
-      const ffd = e.nesting_depth || 0;
       return (
-        <article
-          className="bot message-row assistant-message"
-          style={{ marginLeft: `${ffd}rem` }}
+        <AssistantMessageRow
+          profile={e.profile}
+          timestampMs={e.timestamp_ms}
+          nestingDepth={e.nesting_depth || 0}
         >
-          <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
-          </div>
-          <div className="message-container">
-            <div className="author-line">
-              <strong>{profileName(e.profile)}</strong>
-              <span>{profileJobTitle(e.profile)}</span>
-              <time>{formatEventTime(e.timestamp_ms)}</time>
-            </div>
-            <div className="bubble thought-bubble">
-              <RichText content={e.content} />
-            </div>
-          </div>
-        </article>
+          <RichText content={e.content} />
+        </AssistantMessageRow>
       );
 
     case "llm_invocation":
