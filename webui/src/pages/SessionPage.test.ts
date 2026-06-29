@@ -50,3 +50,13 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(css.includes("overflow-wrap: anywhere;"));
   ok(css.includes(".session-header .share-action,"));
 });
+
+Deno.test("session metrics include fun nonzero power summary", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const types = await Deno.readTextFile("webui/src/types/index.ts");
+
+  ok(types.includes("power_summary?: string"));
+  ok(component.includes("funEnergySummary(totalTokens, totalEnergyKwh)"));
+  ok(component.includes("second of a cozy LED bulb"));
+  ok(component.includes("e.power_summary"));
+});

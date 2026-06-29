@@ -118,6 +118,7 @@ export type AgentEvent =
       branch: string;
       commits: string;
       summary?: string;
+      power_summary?: string;
       diff_stat?: string;
       diff?: string;
       nesting_depth?: number;
