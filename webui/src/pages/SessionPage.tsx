@@ -364,13 +364,13 @@ export function SessionPage() {
             )}
           </form>
         ) : session.status === "paused" ? (
-          <footer className="composer">
-            <div className="flex-grow-1 small text-body-secondary">
+          <footer className="composer paused-composer">
+            <div className="paused-composer-copy small text-body-secondary">
               This session was restored after a daemon restart and is paused
               until you resume it.
             </div>
             <button
-              className="btn btn-warning"
+              className="btn btn-warning composer-action"
               onClick={() => void resumeSession()}
             >
               Resume
