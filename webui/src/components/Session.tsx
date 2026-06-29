@@ -281,7 +281,13 @@ export function InitialUserMessage({ task, timestampMs }: { task: string; timest
   );
 }
 
-export function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
+export function MessageBubble({
+  envelope,
+  activityProfile,
+}: {
+  envelope: EventEnvelope;
+  activityProfile?: string;
+}) {
   const e = envelope.event;
 
   switch (e.type) {
@@ -310,12 +316,16 @@ export function MessageBubble({ envelope }: { envelope: EventEnvelope }) {
       const label = e.type === "model_loading"
         ? "Loading model"
         : `Working step ${e.step} of ${e.max_steps}`;
+      const profile = activityProfile || "build";
       return (
         <article
           className="message-row assistant-message compact typing-row"
           style={{ marginLeft: `${sd}rem` }}
           aria-label={label}
         >
+          <div className="bot-avatar typing-avatar">
+            <img src={getAvatarForProfile(profile)} alt="" aria-hidden="true" />
+          </div>
           <div className="typing-indicator" aria-hidden="true">
             <span></span>
             <span></span>

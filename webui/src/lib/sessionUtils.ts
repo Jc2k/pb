@@ -233,6 +233,23 @@ export function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnve
   );
 }
 
+export function latestAssistantProfile(events: EventEnvelope[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i].event;
+    if (
+      event.type === "started" ||
+      event.type === "reasoning" ||
+      event.type === "final" ||
+      event.type === "user_question" ||
+      event.type === "sub_agent_started" ||
+      event.type === "sub_agent_finished"
+    ) {
+      return event.profile;
+    }
+  }
+  return undefined;
+}
+
 export function profileName(profile: string): string {
   switch (profile) {
     case "plan": return "Dade Murphy";

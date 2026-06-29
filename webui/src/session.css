@@ -202,7 +202,10 @@ body {
 
 .typing-row {
     min-height: 1.4rem;
-    padding-left: calc(64px + 0.75rem);
+}
+
+.typing-avatar {
+    visibility: hidden;
 }
 
 .typing-indicator {
