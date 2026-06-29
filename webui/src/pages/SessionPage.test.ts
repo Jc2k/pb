@@ -37,3 +37,16 @@ Deno.test("final assistant messages use profile avatars", async () => {
   ok(component.includes('case "final"'));
   ok(!component.includes('case "final":\n      const ffd'));
 });
+
+Deno.test("session page respects iPhone safe areas and prevents horizontal overflow", async () => {
+  const css = await Deno.readTextFile("webui/src/session.css");
+
+  ok(css.includes("max-width: 100vw;"));
+  ok(css.includes("overflow-x: hidden;"));
+  ok(css.includes("env(safe-area-inset-top)"));
+  ok(css.includes("env(safe-area-inset-left)"));
+  ok(css.includes("env(safe-area-inset-right)"));
+  ok(css.includes(".message-container"));
+  ok(css.includes("overflow-wrap: anywhere;"));
+  ok(css.includes(".session-header .share-action,"));
+});
