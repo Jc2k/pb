@@ -285,7 +285,7 @@ impl AgentProfile {
                 "Profile: research. You are Emmanuel. Deep dive into external knowledge needed for the task: current documentation, public sources, ecosystem behavior, error messages, build failures, API details, or domain background. Use skill_search to find targeted research workflows before broad web searches when the repository provides skills. Prefer web_search and web_fetch, combine findings with targeted repository reads or commands when useful, and clearly separate sourced facts from inferences. Do not edit files, create commits, or call teammates. Return concise findings, source URLs or file evidence, confidence, and how the primary agent should integrate the research."
             }
             Self::Monitor => {
-                "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
+                "Profile: monitor. You are Trinity. Audit an in-progress or stalled agent session for health. Look for repeated failed tool calls, circular reasoning, ignored todos, unclear ownership, missing tests, uncommitted changes, and whether the remaining work is bounded enough to continue. When a transcript is provided, audit that transcript directly; do not repeat the primary agent's failed searches or tool calls just to confirm the loop. If you see a repeated typo, wrong filename, wrong glob, or other obviously self-repeating action, call it off_track and give the corrected next action. Do not edit files, create commits, or call teammates. Return a concise checkpoint with: status (on_track, needs_more_steps, off_track, blocked), evidence, immediate next action, whether to re-delegate with a larger max_steps, and any stop conditions."
             }
         }
     }
@@ -1844,6 +1844,7 @@ fn run_agent_steps(
     let mut consecutive_parse_failures = 0usize;
     let mut last_parse_failure_signature: Option<u64> = None;
     let mut repeated_parse_failures = 0usize;
+    let mut tool_loop_guard = ToolLoopGuard::default();
 
     while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -1958,31 +1959,8 @@ fn run_agent_steps(
                 arguments,
                 thinking,
             } => {
-                execute_tool_calls(
-                    vec![AgentToolCall { tool, arguments }],
-                    thinking,
-                    &output,
-                    ToolExecutionEnv {
-                        backend,
-                        model,
-                        model_path,
-                        args,
-                        workspace_root,
-                        command_backend,
-                        env_config,
-                        todo_memory,
-                        mcp_registry,
-                        lsp_registry,
-                        policy_config,
-                        personal_memory_repo,
-                        nesting_depth,
-                    },
-                    messages,
-                    sink,
-                    &mut metrics,
-                )?;
-            }
-            AgentAction::ToolCalls { calls, thinking } => {
+                let calls = vec![AgentToolCall { tool, arguments }];
+                let loop_feedback = tool_loop_guard.record_calls(&calls);
                 execute_tool_calls(
                     calls,
                     thinking,
@@ -2006,6 +1984,44 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
+                if let Some(feedback) = loop_feedback {
+                    messages.push(ChatMessage {
+                        role: "tool",
+                        content: feedback,
+                    });
+                }
+            }
+            AgentAction::ToolCalls { calls, thinking } => {
+                let loop_feedback = tool_loop_guard.record_calls(&calls);
+                execute_tool_calls(
+                    calls,
+                    thinking,
+                    &output,
+                    ToolExecutionEnv {
+                        backend,
+                        model,
+                        model_path,
+                        args,
+                        workspace_root,
+                        command_backend,
+                        env_config,
+                        todo_memory,
+                        mcp_registry,
+                        lsp_registry,
+                        policy_config,
+                        personal_memory_repo,
+                        nesting_depth,
+                    },
+                    messages,
+                    sink,
+                    &mut metrics,
+                )?;
+                if let Some(feedback) = loop_feedback {
+                    messages.push(ChatMessage {
+                        role: "tool",
+                        content: feedback,
+                    });
+                }
             }
         }
 
@@ -2167,12 +2183,25 @@ fn run_step_limit_monitor(
 
 fn monitor_recommends_more_steps(audit: &str) -> bool {
     let normalized = audit.to_ascii_lowercase();
-    (normalized.contains("needs_more_steps")
-        || normalized.contains("grant more")
-        || normalized.contains("more steps")
-        || normalized.contains("on_track"))
-        && !normalized.contains("off_track")
-        && !normalized.contains("blocked")
+    let negative_recommendation = normalized.contains("off_track")
+        || normalized.contains("blocked")
+        || normalized.contains("loop")
+        || normalized.contains("repeated")
+        || normalized.contains("circular")
+        || normalized.contains("grant more steps: no")
+        || normalized.contains("grant more: no")
+        || normalized.contains("more steps: no")
+        || normalized.contains("re-delegate with a larger max_steps: no")
+        || normalized.contains("re-delegate: no");
+    let positive_recommendation = normalized.contains("status: needs_more_steps")
+        || normalized.contains("status: on_track")
+        || normalized.contains("grant more steps: yes")
+        || normalized.contains("grant more: yes")
+        || normalized.contains("more steps: yes")
+        || normalized.contains("re-delegate with a larger max_steps: yes")
+        || normalized.contains("re-delegate: yes");
+
+    positive_recommendation && !negative_recommendation
 }
 
 fn execute_tool_calls(
@@ -2400,6 +2429,49 @@ fn parse_failure_feedback(
         ));
     }
     feedback
+}
+
+#[derive(Default)]
+struct ToolLoopGuard {
+    signatures_seen: HashMap<String, usize>,
+}
+
+impl ToolLoopGuard {
+    fn record_calls(&mut self, calls: &[AgentToolCall]) -> Option<String> {
+        let mut repeated = Vec::new();
+        for call in calls {
+            let signature = tool_call_signature(call);
+            let seen = self.signatures_seen.entry(signature).or_insert(0);
+            *seen = seen.saturating_add(1);
+            if *seen >= 2 {
+                repeated.push((call.tool.as_str(), &call.arguments, *seen));
+            }
+        }
+
+        repeated_tool_call_feedback(&repeated)
+    }
+}
+
+fn tool_call_signature(call: &AgentToolCall) -> String {
+    format!("{}\n{}", call.tool, call.arguments)
+}
+
+fn repeated_tool_call_feedback(repeated: &[(&str, &Value, usize)]) -> Option<String> {
+    if repeated.is_empty() {
+        return None;
+    }
+
+    let mut feedback = String::from(
+        "Loop guard: this run repeated an exact tool call with the same arguments. Do not call the same tool with the same arguments again unless the user explicitly asked you to retry it.\n\
+         Change strategy on the next step: inspect a parent or sibling path, broaden or correct the glob/search term, use a different tool, or provide a final response if the repeated result means you are blocked.\n",
+    );
+    feedback.push_str("Repeated calls:\n");
+    for (tool, arguments, count) in repeated {
+        feedback.push_str(&format!(
+            "- {tool} with args {arguments} has been called {count} times in this run.\n"
+        ));
+    }
+    Some(feedback.trim_end().to_string())
 }
 
 struct CompletionOutput {
@@ -5020,6 +5092,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_loop_guard_warns_on_exact_repeated_tool_call() {
+        let mut guard = ToolLoopGuard::default();
+        let call = AgentToolCall {
+            tool: "search".to_string(),
+            arguments: json!({"pattern": "**/ProjectPage.*"}),
+        };
+
+        assert!(guard.record_calls(std::slice::from_ref(&call)).is_none());
+        let feedback = guard
+            .record_calls(std::slice::from_ref(&call))
+            .expect("second identical call should trigger loop feedback");
+
+        assert!(feedback.contains("Loop guard"));
+        assert!(feedback.contains("same arguments"));
+        assert!(feedback.contains("**/ProjectPage.*"));
+        assert!(feedback.contains("broaden or correct"));
+    }
+
+    #[test]
     fn monitor_recommendation_parser_grants_only_healthy_extra_steps() {
         assert!(monitor_recommends_more_steps(
             "status: needs_more_steps\nevidence: on_track\ngrant more steps: yes"
@@ -5029,6 +5120,12 @@ mod tests {
         ));
         assert!(!monitor_recommends_more_steps(
             "status: blocked\nevidence: waiting on user"
+        ));
+        assert!(!monitor_recommends_more_steps(
+            "status: needs_more_steps\nevidence: loop detected searching **/ProjectPage.* repeatedly\ngrant more steps: no"
+        ));
+        assert!(!monitor_recommends_more_steps(
+            "status: on_track\nevidence: progress is bounded\ngrant more steps: no"
         ));
     }
 
