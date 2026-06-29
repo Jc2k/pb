@@ -51,6 +51,12 @@ export function sessionTitle(session: Pick<SessionItem, "task" | "title">): stri
   return session.title?.trim() || session.task;
 }
 
+export function sessionPageDocumentTitle(
+  session: Pick<SessionItem, "task" | "title">,
+): string {
+  return `pb session: ${sessionTitle(session)}`;
+}
+
 export function groupToolEvents(
   events: EventEnvelope[],
 ): (

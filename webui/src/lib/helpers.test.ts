@@ -6,6 +6,7 @@ import {
   groupToolEvents,
   projectName,
   projectSettingsPath,
+  sessionPageDocumentTitle,
   sessionTitle,
   usageStatsForToday,
 } from "./helpers.ts";
@@ -14,6 +15,17 @@ Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () 
   equal(sessionTitle({ title: "  Fix login  ", task: "Investigate auth" }), "Fix login");
   equal(sessionTitle({ title: "   ", task: "Investigate auth" }), "Investigate auth");
   equal(sessionTitle({ title: null, task: "Investigate auth" }), "Investigate auth");
+});
+
+Deno.test("sessionPageDocumentTitle follows updated session title", () => {
+  equal(
+    sessionPageDocumentTitle({ title: "New heading", task: "Old prompt" }),
+    "pb session: New heading",
+  );
+  equal(
+    sessionPageDocumentTitle({ title: null, task: "Original prompt" }),
+    "pb session: Original prompt",
+  );
 });
 
 Deno.test("projectName extracts the final path segment across platforms", () => {

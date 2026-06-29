@@ -899,6 +899,15 @@ async fn answer_question_inner(
     Ok(SessionResponse { session_id: id })
 }
 
+fn effective_session_title(session: &SessionState) -> Option<String> {
+    session
+        .history
+        .lock()
+        .ok()
+        .and_then(|history| latest_session_title(&history))
+        .or_else(|| session.title.clone())
+}
+
 async fn list_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<SessionListItem>> {
@@ -908,7 +917,7 @@ async fn list_sessions(
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
-            title: session.title.clone(),
+            title: effective_session_title(session),
             running: session.running,
             paused: session.paused,
             status: session.status,
@@ -942,7 +951,7 @@ async fn get_session(
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
-        title: session.title.clone(),
+        title: effective_session_title(session),
         running: session.running,
         paused: session.paused,
         status: session.status,
@@ -1659,9 +1668,7 @@ fn build_project_usage_cache(
 fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
-    let title = persisted
-        .title
-        .or_else(|| latest_session_title(&persisted.events));
+    let title = latest_session_title(&persisted.events).or(persisted.title);
     let history = Arc::new(StdMutex::new(persisted.events));
     (
         session_id,
@@ -1724,7 +1731,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .map(|(session_id, session)| SessionListItem {
             session_id: session_id.clone(),
             task: session.task.clone(),
-            title: session.title.clone(),
+            title: effective_session_title(session),
             running: session.running,
             paused: session.paused,
             status: session.status,
@@ -1766,7 +1773,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
-        title: session.title.clone(),
+        title: effective_session_title(session),
         running: session.running,
         paused: session.paused,
         status: session.status,
