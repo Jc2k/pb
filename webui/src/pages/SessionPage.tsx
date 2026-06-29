@@ -3,7 +3,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Aside } from "../Aside";
 import type { EventEnvelope, SessionDetails } from "../types";
 import { SCROLL_THRESHOLD } from "../lib/constants";
-import { formatStartTime, groupToolEvents, sessionTitle } from "../lib/helpers";
+import {
+  formatStartTime,
+  groupToolEvents,
+  sessionPageDocumentTitle,
+  sessionTitle,
+} from "../lib/helpers";
 import {
   DrawerPanel,
   InitialUserMessage,
@@ -90,7 +95,7 @@ export function SessionPage() {
     if (!session) return;
     const shareUrl = new URL(`/sessions/${session.session_id}`, window.location.origin).toString();
     const shareData: ShareData = {
-      title: `pb session: ${sessionTitle(session)}`,
+      title: sessionPageDocumentTitle(session),
       text: `View this pb session: ${sessionTitle(session)}`,
       url: shareUrl,
     };
@@ -143,6 +148,11 @@ export function SessionPage() {
     void fetchSession().then(() => openEvents(sessionId));
     return () => sourceRef.current?.close();
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!session) return;
+    document.title = sessionPageDocumentTitle(session);
+  }, [session]);
 
   useEffect(() => {
     if (!shareMessage) return;
