@@ -859,7 +859,7 @@ fn build_agent_instructions(
         "Prefer batching independent work: when one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass. Batch obvious discovery reads/searches, multiple independent file reads, and independent web/MCP lookups instead of spending separate steps. Do not batch dependent actions where a later call needs an earlier result.\n",
     );
     instructions.push_str(
-        "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it.\n",
+        "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it. Do not finalize merely because an initial search, file listing, or tool batch returned no matches; treat that as a signal to broaden the query, inspect parent or sibling directories, list candidate files, or ask a targeted teammate while you still have tool steps available. Only finalize when the task is complete, a real external blocker prevents progress, a required user decision is needed, or the step budget is exhausted by pb.\n",
     );
     instructions.push_str(profile.instructions());
     instructions.push('\n');
@@ -5076,6 +5076,8 @@ mod tests {
         assert!(instructions.contains("try to git_commit with a semantic commit message"));
         assert!(instructions.contains("If Eugene does not pass the work"));
         assert!(instructions.contains("Batch obvious discovery reads/searches"));
+        assert!(instructions.contains("Do not finalize merely because an initial search"));
+        assert!(instructions.contains("broaden the query"));
         assert!(instructions.contains("Use todos only to track multiple meaningful tasks"));
         assert!(instructions.contains("do not create a todo list for one straightforward task"));
         assert!(!instructions.contains("requiring each build sub-agent to git_commit"));
