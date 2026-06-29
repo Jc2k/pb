@@ -77,8 +77,8 @@ fn choose_fun_unit(energy_kwh: f64) -> FunEnergyUnit {
         .iter()
         .copied()
         .min_by(|left, right| {
-            let left_score = unit_score(energy_kwh, left);
-            let right_score = unit_score(energy_kwh, right);
+            let left_score = unit_score(energy_kwh, *left);
+            let right_score = unit_score(energy_kwh, *right);
             left_score.total_cmp(&right_score)
         })
         .expect("fun energy units should not be empty")
