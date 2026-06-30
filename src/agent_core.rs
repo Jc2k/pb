@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use similar::TextDiff;
 use std::cell::RefCell;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -1871,7 +1871,15 @@ struct ToolExecutionEnv<'a> {
     lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
+    gate_state: &'a RefCell<GateState>,
     nesting_depth: usize,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    read_paths: HashSet<String>,
+    wrote_file: bool,
+    review_completed_successfully: bool,
 }
 
 fn run_agent_steps(
@@ -1900,6 +1908,7 @@ fn run_agent_steps(
     let mut last_parse_failure_signature: Option<u64> = None;
     let mut repeated_parse_failures = 0usize;
     let mut tool_loop_guard = ToolLoopGuard::default();
+    let gate_state = RefCell::new(GateState::default());
 
     while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -1987,6 +1996,25 @@ fn run_agent_steps(
                         timestamp_ms: Some(now_millis()),
                     });
                 }
+                if let Some(feedback) = completion_gate_feedback(args.profile, &gate_state.borrow())
+                {
+                    sink.emit(AgentEvent::Correction {
+                        message: "Agent tried to end session too soo".to_string(),
+                        summary: "Completion gate blocked final response".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    messages.push(ChatMessage {
+                        role: "assistant",
+                        content: output.clone(),
+                    });
+                    messages.push(correction_chat_message(
+                        "Completion gate blocked final response",
+                        &feedback,
+                    ));
+                    step += 1;
+                    continue;
+                }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
@@ -2023,6 +2051,7 @@ fn run_agent_steps(
                         lsp_registry,
                         policy_config,
                         personal_memory_repo,
+                        gate_state: &gate_state,
                         nesting_depth,
                     },
                     messages,
@@ -2061,6 +2090,7 @@ fn run_agent_steps(
                         lsp_registry,
                         policy_config,
                         personal_memory_repo,
+                        gate_state: &gate_state,
                         nesting_depth,
                     },
                     messages,
@@ -2351,6 +2381,7 @@ fn execute_tool_calls(
         lsp_registry: env.lsp_registry,
         policy_config: env.policy_config,
         personal_memory_repo: env.personal_memory_repo,
+        gate_state: env.gate_state,
     };
 
     let all_mcp = !runnable.is_empty()
@@ -2878,6 +2909,29 @@ struct ToolContext<'a> {
     lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
+    gate_state: &'a RefCell<GateState>,
+}
+
+fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
+    if profile != AgentProfile::Build {
+        return None;
+    }
+
+    let mut missing = Vec::new();
+    if !gate_state.wrote_file {
+        missing.push("change at least one file");
+    }
+    if !gate_state.review_completed_successfully {
+        missing.push("ask Eugene (review) to review the completed work successfully");
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Agent tried to end session too soo. Completion gate is not satisfied: {}. Continue the task instead of finalizing.",
+            missing.join(" and ")
+        ))
+    }
 }
 
 fn tool_result_limit(arguments: &Value, tool: &str, default_limit: usize) -> Result<usize> {
@@ -3055,6 +3109,11 @@ fn run_tool(
                         .with_context(|| format!("failed to read file: {}", resolved.display()));
                 }
             };
+            context
+                .gate_state
+                .borrow_mut()
+                .read_paths
+                .insert(gate_path_key(workspace_root, &resolved));
 
             let lines: Vec<_> = text.lines().collect();
             if let Some(end) = end
@@ -3110,6 +3169,7 @@ fn run_tool(
                 .context("edit_file requires string argument: new_text")?;
 
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             let existing = std::fs::read_to_string(&resolved)
                 .with_context(|| format!("failed to read {}", resolved.display()))?;
 
@@ -3129,6 +3189,7 @@ fn run_tool(
                     .then_some(context.request.sub_agent_depth),
                 timestamp_ms: Some(now_millis()),
             });
+            context.gate_state.borrow_mut().wrote_file = true;
             Ok(format!("updated {}", resolved.display()))
         }
         "apply_patch" => {
@@ -3137,6 +3198,10 @@ fn run_tool(
                 .and_then(Value::as_str)
                 .context("apply_patch requires string argument: patch")?;
             let changed_paths = validate_patch_paths(patch, workspace_root)?;
+            for path in &changed_paths {
+                let resolved = resolve_workspace_path(workspace_root, path, false)?;
+                ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
+            }
             run_git_apply_patch(patch, workspace_root)?;
             let diff = git_diff_paths(workspace_root, &changed_paths)?;
             if !diff.trim().is_empty() {
@@ -3148,6 +3213,7 @@ fn run_tool(
                     timestamp_ms: Some(now_millis()),
                 });
             }
+            context.gate_state.borrow_mut().wrote_file = true;
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
         }
         "mv" => {
@@ -3161,6 +3227,13 @@ fn run_tool(
                 .context("mv requires string argument: destination")?;
             let source_path = resolve_workspace_path(workspace_root, source, true)?;
             let destination_path = resolve_workspace_path(workspace_root, destination, false)?;
+            ensure_file_was_read(context.gate_state, workspace_root, &source_path, source)?;
+            ensure_file_was_read(
+                context.gate_state,
+                workspace_root,
+                &destination_path,
+                destination,
+            )?;
             if source_path == workspace_root {
                 bail!("mv cannot move the workspace root");
             }
@@ -3177,6 +3250,7 @@ fn run_tool(
                     destination_path.display()
                 )
             })?;
+            context.gate_state.borrow_mut().wrote_file = true;
             Ok(format!(
                 "moved {} to {}",
                 source_path.display(),
@@ -3193,6 +3267,7 @@ fn run_tool(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             if resolved == workspace_root {
                 bail!("rm cannot remove the workspace root");
             }
@@ -3208,6 +3283,7 @@ fn run_tool(
                 std::fs::remove_file(&resolved)
             }
             .with_context(|| format!("failed to remove {}", resolved.display()))?;
+            context.gate_state.borrow_mut().wrote_file = true;
             Ok(format!("removed {}", resolved.display()))
         }
         "web_search" => {
@@ -3360,6 +3436,38 @@ fn question_choices(arguments: &Value) -> Result<Vec<String>> {
 
 fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
     format!("tool '{tool}' failed: {error:#}")
+}
+
+fn gate_path_key(workspace_root: &Path, resolved: &Path) -> String {
+    resolved
+        .strip_prefix(workspace_root)
+        .unwrap_or(resolved)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn ensure_file_was_read(
+    gate_state: &RefCell<GateState>,
+    workspace_root: &Path,
+    resolved: &Path,
+    path: &str,
+) -> Result<()> {
+    if !resolved.exists() {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(resolved)
+        .with_context(|| format!("failed to stat {}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let key = gate_path_key(workspace_root, resolved);
+    if gate_state.borrow().read_paths.contains(&key) {
+        Ok(())
+    } else {
+        bail!(
+            "read-before-write gate blocked write to '{path}': call read_file on this file before overwriting it"
+        )
+    }
 }
 
 fn run_guard_commands(
@@ -3648,6 +3756,7 @@ fn run_sub_agent(
         .map(|v| v as usize)
         .unwrap_or(DEFAULT_SUB_AGENT_MAX_STEPS)
         .clamp(1, context.request.max_steps.max(1));
+    let workspace_status_before = git_status_porcelain(context.workspace_root).ok();
 
     sink.emit(AgentEvent::SubAgentStarted {
         profile: profile.as_str().to_string(),
@@ -3705,6 +3814,17 @@ fn run_sub_agent(
     )?;
 
     metrics.add(&outcome.metrics);
+    if workspace_status_before.as_deref()
+        != git_status_porcelain(context.workspace_root).ok().as_deref()
+    {
+        context.gate_state.borrow_mut().wrote_file = true;
+    }
+    if profile == AgentProfile::Review && outcome.reached_final {
+        context
+            .gate_state
+            .borrow_mut()
+            .review_completed_successfully = true;
+    }
 
     let result = if outcome.reached_final {
         match outcome.final_content {
@@ -3930,6 +4050,20 @@ fn git_diff_paths(workdir: &Path, paths: &[String]) -> Result<String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("git diff failed: {stderr}")
+    }
+}
+
+fn git_status_porcelain(workdir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workdir)
+        .output()
+        .context("failed to run git status")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git status failed: {stderr}")
     }
 }
 
@@ -5753,6 +5887,44 @@ mod tests {
         assert!(formatted.contains("tool 'read_file' failed"));
         assert!(formatted.contains("failed to run"));
         assert!(formatted.contains("missing thing"));
+    }
+
+    #[test]
+    fn build_completion_gate_requires_change_and_review() {
+        let mut state = GateState::default();
+        let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
+        assert!(feedback.contains("change at least one file"));
+        assert!(feedback.contains("review"));
+        assert!(feedback.contains("Agent tried to end session too soo"));
+
+        state.wrote_file = true;
+        let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
+        assert!(!feedback.contains("change at least one file"));
+        assert!(feedback.contains("review"));
+
+        state.review_completed_successfully = true;
+        assert!(completion_gate_feedback(AgentProfile::Build, &state).is_none());
+        assert!(completion_gate_feedback(AgentProfile::Ask, &GateState::default()).is_none());
+    }
+
+    #[test]
+    fn read_before_write_gate_requires_prior_file_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("note.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let state = RefCell::new(GateState::default());
+
+        let err = ensure_file_was_read(&state, tmp.path(), &file, "note.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-before-write gate blocked write"));
+
+        state
+            .borrow_mut()
+            .read_paths
+            .insert(gate_path_key(tmp.path(), &file));
+        ensure_file_was_read(&state, tmp.path(), &file, "note.txt").unwrap();
+        ensure_file_was_read(&state, tmp.path(), &tmp.path().join("new.txt"), "new.txt").unwrap();
     }
 
     #[test]
