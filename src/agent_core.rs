@@ -154,9 +154,29 @@ pub fn infer_agent_profile(
     inference_args.top_k = 1;
 
     let prompt = profile_inference_prompt(task);
-    let output = generate_completion(backend, model, &inference_args, &prompt)?.content;
+    let output = generate_llama_completion(backend, model, &inference_args, &prompt)?.content;
     parse_inferred_agent_profile(&output)
         .with_context(|| format!("failed to infer an agent profile from model output: {output}"))
+}
+
+fn infer_agent_profile_flashmoe(
+    engine: &mut crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    task: &str,
+) -> Result<AgentProfile> {
+    let prompt = profile_inference_prompt(task);
+    let output = engine
+        .generate(&crate::inference::flashmoe::GenerationRequest {
+            prompt,
+            max_tokens: args.max_tokens.clamp(8, 32),
+            temperature: 0.0,
+            top_k: 1,
+            seed: args.seed,
+        })?
+        .content;
+    parse_inferred_agent_profile(&output).with_context(|| {
+        format!("failed to infer an agent profile from Flash-MoE output: {output}")
+    })
 }
 
 fn profile_inference_prompt(task: &str) -> String {
@@ -699,7 +719,11 @@ pub fn run_agent<S: EventSink>(
     models_root: &Path,
     mut sink: S,
 ) -> Result<AgentRunResult> {
-    let model_path = find_model_in_cache_in(models_root, &args.model)?;
+    let flashmoe_plan = crate::inference::flashmoe::plan(&args.model, models_root);
+    let model_label = flashmoe_plan
+        .as_ref()
+        .map(|plan| plan.describe())
+        .unwrap_or_else(|| args.model.clone());
     let workdir = args
         .workdir
         .clone()
@@ -724,7 +748,7 @@ pub fn run_agent<S: EventSink>(
 
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
-        model: model_path.display().to_string(),
+        model: model_label.clone(),
         workspace: workspace_root.display().to_string(),
         branch: branch.clone(),
         attachments: args.attachments.clone(),
@@ -732,20 +756,72 @@ pub fn run_agent<S: EventSink>(
     });
 
     sink.emit(AgentEvent::ModelLoading {
-        model: model_path.display().to_string(),
+        model: model_label,
         nesting_depth: Some(0),
         timestamp_ms: Some(now_millis()),
     });
 
-    suppress_llama_logs();
-    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    backend.void_logs();
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-        .with_context(|| format!("failed to load model {}", model_path.display()))?;
+    let mut flashmoe_engine = None;
+    if let Some(plan) = flashmoe_plan.as_ref() {
+        match crate::inference::flashmoe::load(plan) {
+            Ok(engine) => {
+                tracing::info!(
+                    model = %plan.model,
+                    cache_dir = %plan.runtime_dir.display(),
+                    quantization = plan.quantization.as_str(),
+                    "using Flash-MoE backend for agent text generation"
+                );
+                flashmoe_engine = Some(engine);
+            }
+            Err(error) => {
+                let message = format!(
+                    "Flash-MoE is the default backend for {model} on ARM macOS, \
+                     but pb is falling back to llama.cpp: {error}",
+                    model = plan.model,
+                );
+                tracing::warn!(
+                    model = %plan.model,
+                    cache_dir = %plan.runtime_dir.display(),
+                    quantization = plan.quantization.as_str(),
+                    "{message}"
+                );
+                sink.emit(AgentEvent::Correction {
+                    message,
+                    summary: "using llama.cpp fallback for this session".to_string(),
+                    nesting_depth: Some(0),
+                    timestamp_ms: Some(now_millis()),
+                });
+            }
+        }
+    }
+
+    let mut llama_backend = None;
+    let mut llama_model = None;
+    let mut llama_model_path = None;
+    if flashmoe_engine.is_none() {
+        let path = find_model_in_cache_in(models_root, &args.model)?;
+        suppress_llama_logs();
+        let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+        backend.void_logs();
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
+        let model = LlamaModel::load_from_file(&backend, &path, &model_params)
+            .with_context(|| format!("failed to load model {}", path.display()))?;
+        llama_model_path = Some(path);
+        llama_model = Some(model);
+        llama_backend = Some(backend);
+    } else {
+        tracing::info!(
+            model = %args.model,
+            "Flash-MoE text backend selected; llama.cpp fallback/vision model will be loaded only if a llama-only path is requested"
+        );
+    }
 
     if args.infer_profile {
-        args.profile = infer_agent_profile(&backend, &model, &args, &args.task)?;
+        if let (Some(backend), Some(model)) = (llama_backend.as_ref(), llama_model.as_ref()) {
+            args.profile = infer_agent_profile(backend, model, &args, &args.task)?;
+        } else if let Some(engine) = flashmoe_engine.as_mut() {
+            args.profile = infer_agent_profile_flashmoe(engine, &args, &args.task)?;
+        }
         args.infer_profile = false;
     }
 
@@ -825,13 +901,32 @@ pub fn run_agent<S: EventSink>(
         },
     ];
 
+    let mut llama_generator;
+    let mut flashmoe_generator;
+    let generator: &mut dyn CompletionEngine = if let Some(engine) = flashmoe_engine {
+        flashmoe_generator = FlashMoeCompletionEngine { engine };
+        &mut flashmoe_generator
+    } else {
+        llama_generator = LlamaCompletionEngine {
+            backend: llama_backend
+                .as_ref()
+                .context("llama.cpp backend was not loaded")?,
+            model: llama_model
+                .as_ref()
+                .context("llama.cpp model was not loaded")?,
+        };
+        &mut llama_generator
+    };
+
     let outcome = run_agent_steps(
-        &backend,
-        &model,
-        &model_path,
+        generator,
+        llama_backend.as_ref(),
+        llama_model.as_ref(),
+        llama_model_path.as_deref(),
         &args,
         &mut messages,
         &workspace_root,
+        models_root,
         command_backend.as_ref(),
         env_config.as_ref(),
         &todo_memory,
@@ -1859,11 +1954,12 @@ struct StepRunOutcome {
 }
 
 struct ToolExecutionEnv<'a> {
-    backend: &'a LlamaBackend,
-    model: &'a LlamaModel,
-    model_path: &'a Path,
+    backend: Option<&'a LlamaBackend>,
+    model: Option<&'a LlamaModel>,
+    model_path: Option<&'a Path>,
     args: &'a AgentRequest,
     workspace_root: &'a Path,
+    models_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
@@ -1883,12 +1979,14 @@ struct GateState {
 }
 
 fn run_agent_steps(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
-    model_path: &Path,
+    generator: &mut dyn CompletionEngine,
+    backend: Option<&LlamaBackend>,
+    model: Option<&LlamaModel>,
+    model_path: Option<&Path>,
     args: &AgentRequest,
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
+    models_root: &Path,
     command_backend: Option<&CommandBackend>,
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
@@ -1920,8 +2018,7 @@ fn run_agent_steps(
 
         let prompt = render_prompt(messages);
         let (output, action) = match generate_and_parse_action_with_retries(
-            backend,
-            model,
+            generator,
             args,
             &prompt,
             step,
@@ -2044,6 +2141,7 @@ fn run_agent_steps(
                         model_path,
                         args,
                         workspace_root,
+                        models_root,
                         command_backend,
                         env_config,
                         todo_memory,
@@ -2083,6 +2181,7 @@ fn run_agent_steps(
                         model_path,
                         args,
                         workspace_root,
+                        models_root,
                         command_backend,
                         env_config,
                         todo_memory,
@@ -2118,24 +2217,27 @@ fn run_agent_steps(
             && args.sub_agent_depth < MAX_SUB_AGENT_DEPTH
         {
             monitor_used = true;
-            if let Some(audit) = run_step_limit_monitor(
-                backend,
-                model,
-                model_path,
-                args,
-                messages,
-                workspace_root,
-                command_backend,
-                env_config,
-                todo_memory,
-                mcp_registry,
-                lsp_registry,
-                policy_config,
-                personal_memory_repo,
-                nesting_depth,
-                sink,
-                &mut metrics,
-            )? {
+            if let (Some(backend), Some(model), Some(model_path)) = (backend, model, model_path)
+                && let Some(audit) = run_step_limit_monitor(
+                    backend,
+                    model,
+                    model_path,
+                    args,
+                    messages,
+                    workspace_root,
+                    models_root,
+                    command_backend,
+                    env_config,
+                    todo_memory,
+                    mcp_registry,
+                    lsp_registry,
+                    policy_config,
+                    personal_memory_repo,
+                    nesting_depth,
+                    sink,
+                    &mut metrics,
+                )?
+            {
                 messages.push(ChatMessage {
                     role: "tool",
                     content: format!(
@@ -2192,6 +2294,7 @@ fn run_step_limit_monitor(
     args: &AgentRequest,
     messages: &[ChatMessage],
     workspace_root: &Path,
+    models_root: &Path,
     command_backend: Option<&CommandBackend>,
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
@@ -2244,13 +2347,16 @@ fn run_step_limit_monitor(
     monitor_request.max_steps = MONITOR_STEP_BUDGET;
     monitor_request.sub_agent_depth = args.sub_agent_depth + 1;
 
+    let mut monitor_generator = LlamaCompletionEngine { backend, model };
     let outcome = run_agent_steps(
-        backend,
-        model,
-        model_path,
+        &mut monitor_generator,
+        Some(backend),
+        Some(model),
+        Some(model_path),
         &monitor_request,
         &mut monitor_messages,
         workspace_root,
+        models_root,
         command_backend,
         env_config,
         todo_memory,
@@ -2374,6 +2480,7 @@ fn execute_tool_calls(
         model_path: env.model_path,
         request: env.args,
         workspace_root: env.workspace_root,
+        models_root: env.models_root,
         command_backend: env.command_backend,
         env_config: env.env_config,
         todo_memory: env.todo_memory,
@@ -2594,9 +2701,53 @@ enum CompletionFinishReason {
     MaxTokens,
 }
 
+trait CompletionEngine {
+    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput>;
+}
+
+struct LlamaCompletionEngine<'a> {
+    backend: &'a LlamaBackend,
+    model: &'a LlamaModel,
+}
+
+impl CompletionEngine for LlamaCompletionEngine<'_> {
+    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
+        generate_llama_completion(self.backend, self.model, args, prompt)
+    }
+}
+
+struct FlashMoeCompletionEngine {
+    engine: crate::inference::flashmoe::FlashMoeEngine,
+}
+
+impl CompletionEngine for FlashMoeCompletionEngine {
+    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
+        let energy_start = energy::sample();
+        let started = Instant::now();
+        let output = self
+            .engine
+            .generate(&crate::inference::flashmoe::GenerationRequest {
+                prompt: prompt.to_string(),
+                max_tokens: args.max_tokens,
+                temperature: args.temperature,
+                top_k: args.top_k,
+                seed: args.seed,
+            })?;
+        let energy =
+            energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+        Ok(CompletionOutput {
+            content: output.content,
+            finish_reason: CompletionFinishReason::EndOfGeneration,
+            prompt_tokens: prompt.split_whitespace().count(),
+            generated_tokens: output.generated_tokens,
+            duration_ms: duration_millis(started),
+            energy,
+        })
+    }
+}
+
 fn generate_and_parse_action_with_retries(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
+    generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
     prompt: &str,
     step: usize,
@@ -2609,7 +2760,7 @@ fn generate_and_parse_action_with_retries(
     loop {
         let mut request = args.clone();
         request.max_tokens = max_tokens;
-        let completion = generate_completion(backend, model, &request, prompt)?;
+        let completion = generator.generate(&request, prompt)?;
         metrics.llm_invocations += 1;
         metrics.llm_runtime_ms = metrics
             .llm_runtime_ms
@@ -2677,7 +2828,7 @@ fn next_retry_max_tokens(current: i32) -> i32 {
     current.saturating_mul(2).min(MAX_TOKEN_RETRY_CAP)
 }
 
-fn generate_completion(
+fn generate_llama_completion(
     backend: &LlamaBackend,
     model: &LlamaModel,
     args: &AgentRequest,
@@ -2897,11 +3048,12 @@ fn extract_json_objects(input: &str) -> Vec<String> {
 }
 
 struct ToolContext<'a> {
-    backend: &'a LlamaBackend,
-    model: &'a LlamaModel,
-    model_path: &'a Path,
+    backend: Option<&'a LlamaBackend>,
+    model: Option<&'a LlamaModel>,
+    model_path: Option<&'a Path>,
     request: &'a AgentRequest,
     workspace_root: &'a Path,
+    models_root: &'a Path,
     command_backend: Option<&'a CommandBackend>,
     env_config: Option<&'a EnvironmentConfig>,
     todo_memory: &'a RefCell<TodoMemory>,
@@ -3553,10 +3705,19 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.max_tokens = boosted_max_tokens(&request).max(2048);
     request.temperature = 0.0;
     request.top_k = 1;
+    let backend = context
+        .backend
+        .context("vision_describe requires a loaded llama.cpp vision model")?;
+    let model = context
+        .model
+        .context("vision_describe requires a loaded llama.cpp vision model")?;
+    let model_path = context
+        .model_path
+        .context("vision_describe requires a loaded llama.cpp vision model")?;
     let output = generate_vision_completion(
-        context.backend,
-        context.model,
-        context.model_path,
+        backend,
+        model,
+        model_path,
         &request,
         &structured_prompt,
         &absolute,
@@ -3795,13 +3956,50 @@ fn run_sub_agent(
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
     sub_request.repository_less = context.request.repository_less;
 
+    let mut llama_generator;
+    let mut flashmoe_generator;
+    let (generator, backend, model, model_path): (
+        &mut dyn CompletionEngine,
+        Option<&LlamaBackend>,
+        Option<&LlamaModel>,
+        Option<&Path>,
+    ) = if let (Some(backend), Some(model), Some(model_path)) =
+        (context.backend, context.model, context.model_path)
+    {
+        llama_generator = LlamaCompletionEngine { backend, model };
+        (
+            &mut llama_generator,
+            Some(backend),
+            Some(model),
+            Some(model_path),
+        )
+    } else {
+        let plan = crate::inference::flashmoe::plan(&sub_request.model, context.models_root)
+            .with_context(|| {
+                format!(
+                    "sub_agent cannot find a llama.cpp fallback or Flash-MoE plan for {}",
+                    sub_request.model
+                )
+            })?;
+        let engine = crate::inference::flashmoe::load(&plan).with_context(|| {
+            format!(
+                "sub_agent failed to load Flash-MoE backend for {} from {}",
+                plan.model,
+                plan.runtime_dir.display()
+            )
+        })?;
+        flashmoe_generator = FlashMoeCompletionEngine { engine };
+        (&mut flashmoe_generator, None, None, None)
+    };
     let outcome = run_agent_steps(
-        context.backend,
-        context.model,
-        context.model_path,
+        generator,
+        backend,
+        model,
+        model_path,
         &sub_request,
         &mut messages,
         context.workspace_root,
+        context.models_root,
         context.command_backend,
         context.env_config,
         context.todo_memory,
