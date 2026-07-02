@@ -1630,6 +1630,7 @@ struct QwenTokenizer {
     im_start: Option<u32>,
     im_end: Option<u32>,
     vocab_size: usize,
+    #[cfg(test)]
     candidate_ids: Vec<u32>,
 }
 
@@ -1737,16 +1738,20 @@ impl QwenTokenizer {
                 *slot = token.clone();
             }
         }
-        let mut candidate_ids: Vec<u32> = token_to_id
-            .values()
-            .copied()
-            .filter(|id| (*id as usize) < vocab_size)
-            .collect();
-        candidate_ids.sort_unstable();
-        candidate_ids.dedup();
-        if candidate_ids.is_empty() {
-            bail!("Qwen tokenizer vocabulary is empty");
-        }
+        #[cfg(test)]
+        let candidate_ids = {
+            let mut ids: Vec<u32> = token_to_id
+                .values()
+                .copied()
+                .filter(|id| (*id as usize) < vocab_size)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                bail!("Qwen tokenizer vocabulary is empty");
+            }
+            ids
+        };
         Ok(Self {
             id_to_token,
             token_to_id,
@@ -1759,6 +1764,7 @@ impl QwenTokenizer {
             im_start,
             im_end,
             vocab_size,
+            #[cfg(test)]
             candidate_ids,
         })
     }
@@ -1832,6 +1838,7 @@ impl QwenTokenizer {
         self.vocab_size
     }
 
+    #[cfg(test)]
     fn candidate_token_ids(&self) -> &[u32] {
         &self.candidate_ids
     }
