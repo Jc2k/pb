@@ -2433,9 +2433,10 @@ struct TopKCandidates {
 
 impl TopKCandidates {
     fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
         Self {
-            limit: limit.max(1),
-            values: Vec::with_capacity(limit.max(1)),
+            limit,
+            values: Vec::with_capacity(limit),
         }
     }
 
@@ -2445,11 +2446,11 @@ impl TopKCandidates {
             .values
             .binary_search_by(|current| compare_scored_tokens(current, &entry))
             .unwrap_or_else(|idx| idx);
-        if insert_at < self.limit || self.values.len() < self.limit {
+        if self.values.len() < self.limit {
             self.values.insert(insert_at.min(self.values.len()), entry);
-            if self.values.len() > self.limit {
-                self.values.pop();
-            }
+        } else if insert_at < self.limit {
+            self.values.insert(insert_at, entry);
+            self.values.pop();
         }
     }
 
