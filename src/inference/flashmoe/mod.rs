@@ -1263,8 +1263,13 @@ impl FlashMoeEngine {
         for position in
             prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
         {
-            let token =
-                self.sample_next_token(&mut sampler, &prompt_tokens, &generated, &mut kv_cache, position)?;
+            let token = self.sample_next_token(
+                &mut sampler,
+                &prompt_tokens,
+                &generated,
+                &mut kv_cache,
+                position,
+            )?;
             if self.tokenizer.is_eos(token) {
                 break;
             }
@@ -1312,9 +1317,12 @@ impl FlashMoeEngine {
         )? {
             return sampler.sample_candidates(candidates);
         }
-        let logits = self
-            .dense
-            .lm_head_logits_with_metal(self.metal.as_ref(), 0, &hidden, &self.tokenizer)?;
+        let logits = self.dense.lm_head_logits_with_metal(
+            self.metal.as_ref(),
+            0,
+            &hidden,
+            &self.tokenizer,
+        )?;
         sampler.sample(&logits, prompt_tokens, generated)
     }
 
@@ -2356,6 +2364,7 @@ impl TokenSampler {
         candidates.into_sorted_vec()
     }
 
+    #[cfg(test)]
     fn process_logits(&self, logits: &[f32], prompt: &[u32], generated: &[u32]) -> Vec<f32> {
         let repeated = self.repeated_tokens(prompt, generated);
         logits
@@ -5588,8 +5597,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, shape))| {
-                let byte_len: u64 =
-                    shape.iter().product::<usize>() as u64 * 2; // BF16 = 2 bytes/elem
+                let byte_len: u64 = shape.iter().product::<usize>() as u64 * 2; // BF16 = 2 bytes/elem
                 DenseTensorRef {
                     tensor: name.to_string(),
                     shard: "shard.safetensors".to_string(),
@@ -5731,23 +5739,93 @@ mod tests {
         // shared_expert projections.  Shapes are consistent with the config above.
         // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
         let dense_shard = make_typed_safetensors(&[
-            ("model.embed_tokens.weight",             "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
-            ("lm_head.weight",                        "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
-            ("model.norm.weight",                     "BF16", vec![8],       &vec![0u8; 8*2]),
-            ("model.layers.0.self_attn.q_proj.weight","BF16", vec![8, 8],    &vec![0u8; 8*8*2]),
-            ("model.layers.0.self_attn.k_proj.weight","BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
-            ("model.layers.0.self_attn.v_proj.weight","BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
-            ("model.layers.0.self_attn.o_proj.weight","BF16", vec![8, 8],    &vec![0u8; 8*8*2]),
+            (
+                "model.embed_tokens.weight",
+                "BF16",
+                vec![300, 8],
+                &vec![0u8; 300 * 8 * 2],
+            ),
+            (
+                "lm_head.weight",
+                "BF16",
+                vec![300, 8],
+                &vec![0u8; 300 * 8 * 2],
+            ),
+            ("model.norm.weight", "BF16", vec![8], &vec![0u8; 8 * 2]),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                "BF16",
+                vec![8, 8],
+                &vec![0u8; 8 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "BF16",
+                vec![8, 8],
+                &vec![0u8; 8 * 8 * 2],
+            ),
             // QK-norm tensors present in Qwen3 MoE checkpoints
-            ("model.layers.0.self_attn.q_norm.weight","BF16", vec![4],       &vec![0u8; 4*2]),
-            ("model.layers.0.self_attn.k_norm.weight","BF16", vec![4],       &vec![0u8; 4*2]),
-            ("model.layers.0.input_layernorm.weight", "BF16", vec![8],       &vec![0u8; 8*2]),
-            ("model.layers.0.post_attention_layernorm.weight","BF16",vec![8],&vec![0u8; 8*2]),
-            ("model.layers.0.mlp.gate.weight",        "BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
+            (
+                "model.layers.0.self_attn.q_norm.weight",
+                "BF16",
+                vec![4],
+                &vec![0u8; 4 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.k_norm.weight",
+                "BF16",
+                vec![4],
+                &vec![0u8; 4 * 2],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "BF16",
+                vec![8],
+                &vec![0u8; 8 * 2],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "BF16",
+                vec![8],
+                &vec![0u8; 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.gate.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
             // Shared expert (always active, not gated): treated as dense, not packed
-            ("model.layers.0.mlp.shared_expert.gate_proj.weight","BF16",vec![16,8],&vec![0u8;16*8*2]),
-            ("model.layers.0.mlp.shared_expert.up_proj.weight",  "BF16",vec![16,8],&vec![0u8;16*8*2]),
-            ("model.layers.0.mlp.shared_expert.down_proj.weight","BF16",vec![8,16],&vec![0u8;8*16*2]),
+            (
+                "model.layers.0.mlp.shared_expert.gate_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &vec![0u8; 16 * 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.shared_expert.up_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &vec![0u8; 16 * 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.shared_expert.down_proj.weight",
+                "BF16",
+                vec![8, 16],
+                &vec![0u8; 8 * 16 * 2],
+            ),
         ]);
         std::fs::write(snapshot.join("dense.safetensors"), dense_shard).unwrap();
 
@@ -5759,9 +5837,21 @@ mod tests {
             .flat_map(|e| {
                 let pfx = format!("model.layers.0.mlp.experts.{e}");
                 [
-                    (format!("{pfx}.gate_proj.weight"), "gate".to_string(), format!("{e}-gate")),
-                    (format!("{pfx}.up_proj.weight"),   "up".to_string(),   format!("{e}-up")),
-                    (format!("{pfx}.down_proj.weight"),  "down".to_string(), format!("{e}-down")),
+                    (
+                        format!("{pfx}.gate_proj.weight"),
+                        "gate".to_string(),
+                        format!("{e}-gate"),
+                    ),
+                    (
+                        format!("{pfx}.up_proj.weight"),
+                        "up".to_string(),
+                        format!("{e}-up"),
+                    ),
+                    (
+                        format!("{pfx}.down_proj.weight"),
+                        "down".to_string(),
+                        format!("{e}-down"),
+                    ),
                 ]
             })
             .collect();
@@ -5804,11 +5894,17 @@ mod tests {
             "model.layers.0.mlp.shared_expert.up_proj.weight",
             "model.layers.0.mlp.shared_expert.down_proj.weight",
         ] {
-            weight_map.insert(name.to_string(), serde_json::Value::String("dense.safetensors".to_string()));
+            weight_map.insert(
+                name.to_string(),
+                serde_json::Value::String("dense.safetensors".to_string()),
+            );
         }
         // expert tensors
         for (name, _, _) in &names {
-            weight_map.insert(name.clone(), serde_json::Value::String("expert.safetensors".to_string()));
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("expert.safetensors".to_string()),
+            );
         }
         std::fs::write(
             snapshot.join("model.safetensors.index.json"),
@@ -5823,15 +5919,24 @@ mod tests {
         let manifest: FlashMoeManifest =
             serde_json::from_slice(&std::fs::read(&plan.tensor_manifest).unwrap()).unwrap();
         assert!(
-            manifest.dense_tensors.iter().any(|t| t.tensor.contains("q_norm")),
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("q_norm")),
             "q_norm should be a dense tensor"
         );
         assert!(
-            manifest.dense_tensors.iter().any(|t| t.tensor.contains("k_norm")),
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("k_norm")),
             "k_norm should be a dense tensor"
         );
         assert!(
-            manifest.dense_tensors.iter().any(|t| t.tensor.contains("shared_expert")),
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("shared_expert")),
             "shared_expert should be a dense tensor"
         );
         // 4 experts × 3 projections = 12 expert tensor entries
