@@ -3796,8 +3796,6 @@ struct PendingExpertRead {
 #[derive(Debug, Clone, Default)]
 struct ExpertSchedulerMetrics {
     issued_reads: u64,
-    cache_hits: u64,
-    cache_misses: u64,
     read_failures: u64,
     total_read_latency: Duration,
     max_read_latency: Duration,
@@ -3806,8 +3804,6 @@ struct ExpertSchedulerMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExpertSchedulerSnapshot {
     pub issued_reads: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
     pub read_failures: u64,
     pub total_read_latency: Duration,
     pub max_read_latency: Duration,
@@ -3839,7 +3835,6 @@ impl ExpertScheduler {
             // maintaining a second in-process cache of hot expert packs. Cold expert reads still
             // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
             // evicts them, which matches the behavior described in the upstream notes.
-            self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
             pending.push(PendingExpertRead {
@@ -3873,8 +3868,6 @@ impl ExpertScheduler {
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
         ExpertSchedulerSnapshot {
             issued_reads: self.metrics.issued_reads,
-            cache_hits: self.metrics.cache_hits,
-            cache_misses: self.metrics.cache_misses,
             read_failures: self.metrics.read_failures,
             total_read_latency: self.metrics.total_read_latency,
             max_read_latency: self.metrics.max_read_latency,
@@ -4351,6 +4344,7 @@ pub fn q4_fma_matvec(
     }
     let mut out = vec![0.0f32; rows];
     let packed_stride = cols.div_ceil(2);
+    debug_assert_eq!(groups_per_row, cols.div_ceil(GROUP_SIZE));
     for row in 0..rows {
         let mut acc = 0.0f32;
         let packed_row = row * packed_stride;
@@ -7101,8 +7095,6 @@ mod tests {
         assert!(experts.iter().all(|expert| expert.layer == 0));
         let first = scheduler.snapshot();
         assert_eq!(first.issued_reads, 2);
-        assert_eq!(first.cache_hits, 0);
-        assert_eq!(first.cache_misses, 2);
 
         let pending = scheduler.issue(0, &[3, 7]).unwrap();
         let experts = scheduler.finish(pending).unwrap();
@@ -7111,8 +7103,6 @@ mod tests {
         assert_eq!(experts[1].expert, 7);
         let second = scheduler.snapshot();
         assert_eq!(second.issued_reads, 4);
-        assert_eq!(second.cache_hits, 0);
-        assert_eq!(second.cache_misses, 4);
 
         let pending = scheduler.issue(0, &[3]).unwrap();
         let experts = scheduler.finish(pending).unwrap();
@@ -7120,8 +7110,6 @@ mod tests {
         assert_eq!(experts[0].expert, 3);
         let third = scheduler.snapshot();
         assert_eq!(third.issued_reads, 5);
-        assert_eq!(third.cache_hits, 0);
-        assert_eq!(third.cache_misses, 5);
     }
 
     #[test]
