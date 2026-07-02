@@ -2364,17 +2364,6 @@ impl TokenSampler {
         candidates.into_sorted_vec()
     }
 
-    #[cfg(test)]
-    fn process_logits(&self, logits: &[f32], prompt: &[u32], generated: &[u32]) -> Vec<f32> {
-        let repeated = self.repeated_tokens(prompt, generated);
-        logits
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(token, logit)| self.process_logit(token, logit, &repeated))
-            .collect()
-    }
-
     fn apply_top_p(&self, candidates: &mut Vec<(usize, f32)>, probabilities: &mut Vec<f32>) {
         if self.top_p >= 1.0 || candidates.len() <= 1 {
             return;
@@ -2451,10 +2440,16 @@ impl TopKCandidates {
     }
 
     fn push(&mut self, token: usize, score: f32) {
-        self.values.push((token, score));
-        self.values.sort_by(compare_scored_tokens);
-        if self.values.len() > self.limit {
-            self.values.truncate(self.limit);
+        let entry = (token, score);
+        let insert_at = self
+            .values
+            .binary_search_by(|current| compare_scored_tokens(current, &entry))
+            .unwrap_or_else(|idx| idx);
+        if insert_at < self.limit || self.values.len() < self.limit {
+            self.values.insert(insert_at.min(self.values.len()), entry);
+            if self.values.len() > self.limit {
+                self.values.pop();
+            }
         }
     }
 
@@ -2463,6 +2458,7 @@ impl TopKCandidates {
     }
 }
 
+/// Sort by descending score, then ascending token id for stable tie-breaking.
 fn compare_scored_tokens(left: &(usize, f32), right: &(usize, f32)) -> std::cmp::Ordering {
     right
         .1
@@ -5381,7 +5377,13 @@ mod tests {
     fn token_sampler_applies_repeat_penalty_before_sampling() {
         let logits = vec![0.0, 2.0, 1.95];
         let sampler = TokenSampler::new(0.7, 3, 7);
-        let processed = sampler.process_logits(&logits, &[], &[1]);
+        let repeated = sampler.repeated_tokens(&[], &[1]);
+        let processed: Vec<f32> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(token, logit)| sampler.process_logit(token, logit, &repeated))
+            .collect();
         assert!(processed[1] < logits[1]);
         assert_eq!(processed[2], logits[2]);
     }
