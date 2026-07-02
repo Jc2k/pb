@@ -289,7 +289,7 @@ impl LlamaCppBackend {
         Ok(Output {
             content: output,
             finish_reason,
-            prompt_tokens: chunks.total_tokens(),
+            prompt_tokens: chunks.total_positions() as usize,
             generated_tokens,
             duration_ms: duration_millis(started),
             energy,
