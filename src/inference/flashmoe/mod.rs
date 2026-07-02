@@ -36,6 +36,15 @@ pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
 pub const HIDDEN_DIM: usize = 4096;
 pub const GROUP_SIZE: usize = 64;
+pub const FULL_ATTN_INTERVAL: usize = 4;
+pub const LINEAR_NUM_V_HEADS: usize = 64;
+pub const LINEAR_NUM_K_HEADS: usize = 16;
+pub const LINEAR_KEY_DIM: usize = 128;
+pub const LINEAR_VALUE_DIM: usize = 128;
+pub const LINEAR_TOTAL_KEY: usize = LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM;
+pub const LINEAR_TOTAL_VALUE: usize = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM;
+pub const LINEAR_CONV_DIM: usize = LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE;
+pub const CONV_KERNEL_SIZE: usize = 4;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
 pub const EXPECTED_EXPERT_BYTES: u64 =
@@ -1588,97 +1597,13 @@ impl FlashMoeEngine {
             } else {
                 self.dense.rms_norm(input_norm_name.as_str(), &hidden)?
             };
-            let mut q = self.dense.project_with_metal(
-                self.metal.as_ref(),
-                layer,
-                "q_proj",
-                &normed,
-                runtime.width,
-            )?;
-            // Issue 1 fix: k/v projections have shape [kv_width, hidden_size]; use kv_width.
-            let mut k = self.dense.project_with_metal(
-                self.metal.as_ref(),
-                layer,
-                "k_proj",
-                &normed,
-                runtime.kv_width,
-            )?;
-            let v = self.dense.project_with_metal(
-                self.metal.as_ref(),
-                layer,
-                "v_proj",
-                &normed,
-                runtime.kv_width,
-            )?;
-            if let Some(metal) = &self.metal {
-                q = metal.apply_rope(
-                    &q,
-                    position,
-                    runtime.head_dim,
-                    self.config.rope_theta.unwrap_or(1_000_000.0),
-                )?;
-                k = metal.apply_rope(
-                    &k,
-                    position,
-                    runtime.head_dim,
-                    self.config.rope_theta.unwrap_or(1_000_000.0),
-                )?;
+            let projected = if self.dense.has_linear_attention_layer(layer)
+                && !is_full_attention_layer(layer)
+            {
+                self.linear_attention_projected(layer, &normed, kv_cache, runtime.width)?
             } else {
-                apply_rotary(
-                    &mut q,
-                    position,
-                    runtime.head_dim,
-                    self.config.rope_theta.unwrap_or(1_000_000.0),
-                );
-                apply_rotary(
-                    &mut k,
-                    position,
-                    runtime.head_dim,
-                    self.config.rope_theta.unwrap_or(1_000_000.0),
-                );
-            }
-            // Issue 3 fix: apply per-head QK-norm when present (Qwen3 MoE).
-            let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
-            let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
-            if let Some(q_norm_w) = self.dense.norm_weight(&q_norm_name, runtime.head_dim)? {
-                for head in q.chunks_mut(runtime.head_dim) {
-                    rms_norm_with_weight_in_place(head, Some(&q_norm_w));
-                }
-            }
-            if let Some(k_norm_w) = self.dense.norm_weight(&k_norm_name, runtime.head_dim)? {
-                for head in k.chunks_mut(runtime.head_dim) {
-                    rms_norm_with_weight_in_place(head, Some(&k_norm_w));
-                }
-            }
-            // Issue 4 fix: multi-head GQA attention.
-            let attended = if let Some(metal) = &self.metal {
-                metal.record_kv(position, layer, &k, &v)?;
-                metal.causal_attention_cached(
-                    position,
-                    layer,
-                    &q,
-                    runtime.num_q_heads,
-                    runtime.kv_heads,
-                    runtime.head_dim,
-                )?
-            } else {
-                kv_cache.record_kv(position, layer, k, v)?;
-                kv_cache.causal_attention(
-                    position,
-                    layer,
-                    &q,
-                    runtime.num_q_heads,
-                    runtime.kv_heads,
-                    runtime.head_dim,
-                )?
+                self.full_attention_projected(layer, &normed, kv_cache, position, &runtime)?
             };
-            let projected = self.dense.project_with_metal(
-                self.metal.as_ref(),
-                layer,
-                "o_proj",
-                &attended,
-                runtime.width,
-            )?;
             hidden = attention_residual;
             add_in_place(&mut hidden, &projected);
 
@@ -1707,8 +1632,8 @@ impl FlashMoeEngine {
             if self.metal.is_none() {
                 softmax_in_place(&mut weights);
             }
+            let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
             let experts = self.scheduler.finish(pending_experts)?;
-            let mut moe = vec![0.0f32; runtime.width];
             for (expert, weight) in experts.iter().zip(weights) {
                 state = state.wrapping_add(
                     expert
@@ -1721,45 +1646,6 @@ impl FlashMoeEngine {
                     expert.mlp(&normed, runtime.width)?
                 };
                 add_scaled_in_place(&mut moe, &contribution, weight);
-            }
-            // Issue 2 fix: apply always-active shared experts (Qwen3 MoE).
-            let num_shared = self.config.num_shared_experts.unwrap_or(0);
-            let shared_inter = self.config.shared_expert_intermediate_size();
-            if num_shared > 0 && shared_inter > 0 {
-                let gate_name = shared_expert_tensor_name(layer, "gate_proj");
-                let up_name = shared_expert_tensor_name(layer, "up_proj");
-                let down_name = shared_expert_tensor_name(layer, "down_proj");
-                let gate_opt = self.dense.project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
-                    &gate_name,
-                    &normed,
-                    shared_inter,
-                )?;
-                let up_opt = self.dense.project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
-                    &up_name,
-                    &normed,
-                    shared_inter,
-                )?;
-                if let (Some(gate), Some(up)) = (gate_opt, up_opt) {
-                    // SiLU-gated activation
-                    let mut activated: Vec<f32> = gate
-                        .iter()
-                        .zip(up.iter())
-                        .map(|(g, u)| silu(*g) * u)
-                        .collect();
-                    if let Some(shared_out) = self.dense.project_dense_tensor_with_metal(
-                        self.metal.as_ref(),
-                        &down_name,
-                        &activated,
-                        runtime.width,
-                    )? {
-                        add_in_place(&mut moe, &shared_out);
-                    } else {
-                        // down_proj absent: still zero-fill so activated is dropped cleanly
-                        activated.fill(0.0);
-                    }
-                }
             }
             hidden = mlp_residual;
             add_in_place(&mut hidden, &moe);
@@ -1776,6 +1662,286 @@ impl FlashMoeEngine {
             kv_cache.record_generated_token(position, previous)?;
         }
         Ok(hidden)
+    }
+
+    fn full_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        kv_cache: &mut KvCache,
+        position: usize,
+        runtime: &DenseTransformerRuntime,
+    ) -> Result<Vec<f32>> {
+        let mut q =
+            self.dense
+                .project_with_metal(self.metal.as_ref(), layer, "q_proj", normed, runtime.width)?;
+        let mut k = self.dense.project_with_metal(
+            self.metal.as_ref(),
+            layer,
+            "k_proj",
+            normed,
+            runtime.kv_width,
+        )?;
+        let v = self.dense.project_with_metal(
+            self.metal.as_ref(),
+            layer,
+            "v_proj",
+            normed,
+            runtime.kv_width,
+        )?;
+        if let Some(metal) = &self.metal {
+            q = metal.apply_rope(
+                &q,
+                position,
+                runtime.head_dim,
+                self.config.rope_theta.unwrap_or(1_000_000.0),
+            )?;
+            k = metal.apply_rope(
+                &k,
+                position,
+                runtime.head_dim,
+                self.config.rope_theta.unwrap_or(1_000_000.0),
+            )?;
+        } else {
+            apply_rotary(
+                &mut q,
+                position,
+                runtime.head_dim,
+                self.config.rope_theta.unwrap_or(1_000_000.0),
+            );
+            apply_rotary(
+                &mut k,
+                position,
+                runtime.head_dim,
+                self.config.rope_theta.unwrap_or(1_000_000.0),
+            );
+        }
+        let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
+        let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
+        if let Some(q_norm_w) = self.dense.norm_weight(&q_norm_name, runtime.head_dim)? {
+            for head in q.chunks_mut(runtime.head_dim) {
+                rms_norm_with_weight_in_place(head, Some(&q_norm_w));
+            }
+        }
+        if let Some(k_norm_w) = self.dense.norm_weight(&k_norm_name, runtime.head_dim)? {
+            for head in k.chunks_mut(runtime.head_dim) {
+                rms_norm_with_weight_in_place(head, Some(&k_norm_w));
+            }
+        }
+        let attended = if let Some(metal) = &self.metal {
+            metal.record_kv(position, layer, &k, &v)?;
+            metal.causal_attention_cached(
+                position,
+                layer,
+                &q,
+                runtime.num_q_heads,
+                runtime.kv_heads,
+                runtime.head_dim,
+            )?
+        } else {
+            kv_cache.record_kv(position, layer, k, v)?;
+            kv_cache.causal_attention(
+                position,
+                layer,
+                &q,
+                runtime.num_q_heads,
+                runtime.kv_heads,
+                runtime.head_dim,
+            )?
+        };
+        self.dense
+            .project_with_metal(self.metal.as_ref(), layer, "o_proj", &attended, runtime.width)
+    }
+
+    fn linear_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        kv_cache: &mut KvCache,
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+        let conv_name = linear_attention_tensor_name(layer, "conv1d");
+        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+        let norm_name = linear_attention_tensor_name(layer, "norm");
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+
+        let mut qkv = self
+            .dense
+            .project_dense_tensor_with_metal(self.metal.as_ref(), &qkv_name, normed, LINEAR_CONV_DIM)?
+            .context("missing linear_attn.in_proj_qkv tensor for GatedDeltaNet layer")?;
+        let z = self
+            .dense
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &z_name,
+                normed,
+                LINEAR_TOTAL_VALUE,
+            )?
+            .context("missing linear_attn.in_proj_z tensor for GatedDeltaNet layer")?;
+        let beta = self
+            .dense
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &b_name,
+                normed,
+                LINEAR_NUM_V_HEADS,
+            )?
+            .context("missing linear_attn.in_proj_b tensor for GatedDeltaNet layer")?;
+        let alpha = self
+            .dense
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &a_name,
+                normed,
+                LINEAR_NUM_V_HEADS,
+            )?
+            .context("missing linear_attn.in_proj_a tensor for GatedDeltaNet layer")?;
+        let conv_weight = self
+            .dense
+            .read_full_tensor_f32(&conv_name)?
+            .context("missing linear_attn.conv1d tensor for GatedDeltaNet layer")?;
+        let a_log = self
+            .dense
+            .read_full_tensor_f32(&a_log_name)?
+            .context("missing linear_attn.A_log tensor for GatedDeltaNet layer")?;
+        let dt_bias = self
+            .dense
+            .read_full_tensor_f32(&dt_bias_name)?
+            .context("missing linear_attn.dt_bias tensor for GatedDeltaNet layer")?;
+
+        let state = kv_cache.linear_state_mut(layer)?;
+        let mut conv_out = vec![0.0f32; LINEAR_CONV_DIM];
+        conv1d_step(
+            &state.conv_state,
+            &qkv,
+            &conv_weight,
+            &mut conv_out,
+            LINEAR_CONV_DIM,
+            CONV_KERNEL_SIZE,
+        );
+        state
+            .conv_state
+            .copy_within(LINEAR_CONV_DIM..(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM, 0);
+        state.conv_state[(CONV_KERNEL_SIZE - 2) * LINEAR_CONV_DIM..].copy_from_slice(&qkv);
+        qkv.clear();
+
+        let (lin_q, rest) = conv_out.split_at_mut(LINEAR_TOTAL_KEY);
+        let (lin_k, lin_v) = rest.split_at_mut(LINEAR_TOTAL_KEY);
+        let inv_scale = 1.0f32 / (LINEAR_KEY_DIM as f32).sqrt();
+        for head in 0..LINEAR_NUM_K_HEADS {
+            let start = head * LINEAR_KEY_DIM;
+            let end = start + LINEAR_KEY_DIM;
+            rms_norm_in_place(&mut lin_q[start..end]);
+            for value in &mut lin_q[start..end] {
+                *value *= inv_scale * inv_scale;
+            }
+            rms_norm_in_place(&mut lin_k[start..end]);
+            for value in &mut lin_k[start..end] {
+                *value *= inv_scale;
+            }
+        }
+
+        let mut out_values = vec![0.0f32; LINEAR_TOTAL_VALUE];
+        let k_heads_per_v = (LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS).max(1);
+        for vh in 0..LINEAR_NUM_V_HEADS {
+            let kh = vh / k_heads_per_v;
+            let a_val = alpha.get(vh).copied().unwrap_or(0.0);
+            let dt_b = dt_bias.get(vh).copied().unwrap_or(0.0);
+            let a_weight = a_log.get(vh).copied().unwrap_or(0.0).exp();
+            let softplus = (1.0 + (a_val + dt_b).exp()).ln();
+            let decay = (-a_weight * softplus).exp();
+            let beta_gate = 1.0 / (1.0 + (-beta.get(vh).copied().unwrap_or(0.0)).exp());
+
+            let state_base = vh * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
+            let v_base = vh * LINEAR_VALUE_DIM;
+            let k_base = kh * LINEAR_KEY_DIM;
+            let q_base = kh * LINEAR_KEY_DIM;
+            for vi in 0..LINEAR_VALUE_DIM {
+                let row_base = state_base + vi * LINEAR_KEY_DIM;
+                let row = &mut state.ssm_state[row_base..row_base + LINEAR_KEY_DIM];
+                for slot in row.iter_mut() {
+                    *slot *= decay;
+                }
+                let mut kv_mem = 0.0f32;
+                for ki in 0..LINEAR_KEY_DIM {
+                    kv_mem = row[ki].mul_add(lin_k[k_base + ki], kv_mem);
+                }
+                let delta = (lin_v[v_base + vi] - kv_mem) * beta_gate;
+                for ki in 0..LINEAR_KEY_DIM {
+                    row[ki] = lin_k[k_base + ki].mul_add(delta, row[ki]);
+                }
+                let mut sum = 0.0f32;
+                for ki in 0..LINEAR_KEY_DIM {
+                    sum = row[ki].mul_add(lin_q[q_base + ki], sum);
+                }
+                out_values[v_base + vi] = sum;
+            }
+        }
+
+        let norm_weight = self.dense.norm_weight(&norm_name, LINEAR_VALUE_DIM)?;
+        for vh in 0..LINEAR_NUM_V_HEADS {
+            let start = vh * LINEAR_VALUE_DIM;
+            let end = start + LINEAR_VALUE_DIM;
+            let chunk = &mut out_values[start..end];
+            rms_norm_with_weight_in_place(chunk, norm_weight.as_deref());
+            for (idx, value) in chunk.iter_mut().enumerate() {
+                let z_idx = start + idx;
+                *value *= silu(*z.get(z_idx).unwrap_or(&0.0));
+            }
+        }
+
+        self.dense
+            .project_dense_tensor_with_metal(self.metal.as_ref(), &out_proj_name, &out_values, width)?
+            .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")
+    }
+
+    fn shared_expert_contribution(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let mut moe = vec![0.0f32; width];
+        let num_shared = self.config.num_shared_experts.unwrap_or(0);
+        let shared_inter = self.config.shared_expert_intermediate_size();
+        if num_shared == 0 || shared_inter == 0 {
+            return Ok(moe);
+        }
+        let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+        let up_name = shared_expert_tensor_name(layer, "up_proj");
+        let down_name = shared_expert_tensor_name(layer, "down_proj");
+        let gate_opt = self.dense.project_dense_tensor_with_metal(
+            self.metal.as_ref(),
+            &gate_name,
+            normed,
+            shared_inter,
+        )?;
+        let up_opt =
+            self.dense
+                .project_dense_tensor_with_metal(self.metal.as_ref(), &up_name, normed, shared_inter)?;
+        if let (Some(gate), Some(up)) = (gate_opt, up_opt) {
+            let mut activated: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(g, u)| silu(*g) * u)
+                .collect();
+            if let Some(shared_out) = self.dense.project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &down_name,
+                &activated,
+                width,
+            )? {
+                add_in_place(&mut moe, &shared_out);
+            } else {
+                activated.fill(0.0);
+            }
+        }
+        Ok(moe)
     }
 
     pub fn read_active_experts(
@@ -2530,6 +2696,21 @@ fn byte_level_piece_to_bytes(piece: &str) -> Option<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
+struct LinearAttentionState {
+    conv_state: Vec<f32>,
+    ssm_state: Vec<f32>,
+}
+
+impl LinearAttentionState {
+    fn new() -> Self {
+        Self {
+            conv_state: vec![0.0; (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM],
+            ssm_state: vec![0.0; LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct KvCache {
     layers: usize,
     capacity: usize,
@@ -2537,6 +2718,7 @@ struct KvCache {
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
     kv: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
+    linear_states: BTreeMap<usize, LinearAttentionState>,
 }
 
 impl KvCache {
@@ -2548,6 +2730,7 @@ impl KvCache {
             generated_tokens: Vec::new(),
             layer_states: Vec::new(),
             kv: vec![vec![None; capacity]; layers],
+            linear_states: BTreeMap::new(),
         }
     }
 
@@ -2616,6 +2799,16 @@ impl KvCache {
             kv_heads,
             head_dim,
         ))
+    }
+
+    fn linear_state_mut(&mut self, layer: usize) -> Result<&mut LinearAttentionState> {
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        Ok(self
+            .linear_states
+            .entry(layer)
+            .or_insert_with(LinearAttentionState::new))
     }
 
     #[allow(dead_code)]
@@ -2946,27 +3139,78 @@ fn validate_required_tensor_manifest(
             &[config.vocab_size, config.hidden_size],
         )?;
     }
+    let has_linear_attention = (0..config.num_hidden_layers)
+        .any(|layer| registry.tensor(&linear_attention_tensor_name(layer, "in_proj_qkv")).is_some());
     for layer in 0..config.num_hidden_layers {
-        require_tensor_shape(
-            registry,
-            &attention_tensor_name(layer, "q_proj"),
-            &[config.hidden_size, config.hidden_size],
-        )?;
-        require_tensor_shape(
-            registry,
-            &attention_tensor_name(layer, "k_proj"),
-            &[kv_width, config.hidden_size],
-        )?;
-        require_tensor_shape(
-            registry,
-            &attention_tensor_name(layer, "v_proj"),
-            &[kv_width, config.hidden_size],
-        )?;
-        require_tensor_shape(
-            registry,
-            &attention_tensor_name(layer, "o_proj"),
-            &[config.hidden_size, config.hidden_size],
-        )?;
+        let is_full = !has_linear_attention || is_full_attention_layer(layer);
+        if is_full {
+            require_tensor_shape(
+                registry,
+                &attention_tensor_name(layer, "q_proj"),
+                &[config.hidden_size, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &attention_tensor_name(layer, "k_proj"),
+                &[kv_width, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &attention_tensor_name(layer, "v_proj"),
+                &[kv_width, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &attention_tensor_name(layer, "o_proj"),
+                &[config.hidden_size, config.hidden_size],
+            )?;
+        } else {
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "in_proj_qkv"),
+                &[LINEAR_CONV_DIM, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "in_proj_z"),
+                &[LINEAR_TOTAL_VALUE, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "in_proj_b"),
+                &[LINEAR_NUM_V_HEADS, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "in_proj_a"),
+                &[LINEAR_NUM_V_HEADS, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "out_proj"),
+                &[config.hidden_size, LINEAR_TOTAL_VALUE],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_scalar_tensor_name(layer, "A_log"),
+                &[LINEAR_NUM_V_HEADS],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                &[LINEAR_NUM_V_HEADS],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "norm"),
+                &[LINEAR_VALUE_DIM],
+            )?;
+            require_tensor_shape(
+                registry,
+                &linear_attention_tensor_name(layer, "conv1d"),
+                &[LINEAR_CONV_DIM, CONV_KERNEL_SIZE],
+            )?;
+        }
         require_tensor_shape(
             registry,
             &layer_norm_tensor_name(layer, "input_layernorm"),
@@ -3030,6 +3274,18 @@ fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
 
 fn attention_tensor_name(layer: usize, projection: &str) -> String {
     format!("model.layers.{layer}.self_attn.{projection}.weight")
+}
+
+fn linear_attention_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{projection}.weight")
+}
+
+fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{name}")
+}
+
+fn is_full_attention_layer(layer: usize) -> bool {
+    (layer + 1) % FULL_ATTN_INTERVAL == 0
 }
 
 fn router_tensor_name(layer: usize) -> String {
@@ -3130,6 +3386,12 @@ impl DenseStore {
 
     pub fn registry(&self) -> &TensorRegistry {
         &self.registry
+    }
+
+    fn has_linear_attention_layer(&self, layer: usize) -> bool {
+        self.registry
+            .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
+            .is_some()
     }
 
     fn seed(&self, position: usize, previous: u32) -> Result<u64> {
@@ -4123,6 +4385,39 @@ fn fold_rows_to_width(rows: &[f32], width: usize) -> Vec<f32> {
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+fn conv1d_step(
+    conv_state: &[f32],
+    new_input: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    channels: usize,
+    kernel_size: usize,
+) {
+    for c in 0..channels.min(out.len()) {
+        let mut acc = 0.0f32;
+        for k in 0..kernel_size.saturating_sub(1) {
+            let w_idx = c
+                .checked_mul(kernel_size)
+                .and_then(|idx| idx.checked_add(k))
+                .unwrap_or(0);
+            let s_idx = k
+                .checked_mul(channels)
+                .and_then(|idx| idx.checked_add(c))
+                .unwrap_or(0);
+            if let (Some(w), Some(state)) = (weight.get(w_idx), conv_state.get(s_idx)) {
+                acc = state.mul_add(*w, acc);
+            }
+        }
+        let tail_w = c
+            .checked_mul(kernel_size)
+            .and_then(|idx| idx.checked_add(kernel_size.saturating_sub(1)))
+            .and_then(|idx| weight.get(idx).copied())
+            .unwrap_or(0.0);
+        let input = new_input.get(c).copied().unwrap_or(0.0);
+        out[c] = silu(input.mul_add(tail_w, acc));
+    }
 }
 
 fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWeights> {
@@ -6635,6 +6930,132 @@ mod tests {
             dense_tensors,
         };
         (config, manifest)
+    }
+
+    fn make_dense_ref(tensor: &str, shape: Vec<usize>, slot: usize) -> DenseTensorRef {
+        let byte_len: u64 = shape.iter().product::<usize>() as u64 * 2;
+        DenseTensorRef {
+            tensor: tensor.to_string(),
+            shard: "hybrid.safetensors".to_string(),
+            dtype: "BF16".to_string(),
+            shape,
+            source_offsets: [0, byte_len],
+            runtime_offset: slot as u64 * 4096,
+            byte_len,
+        }
+    }
+
+    #[test]
+    fn hybrid_attention_schedule_matches_flashmoe() {
+        assert!(!is_full_attention_layer(0));
+        assert!(!is_full_attention_layer(1));
+        assert!(!is_full_attention_layer(2));
+        assert!(is_full_attention_layer(3));
+        assert!(!is_full_attention_layer(4));
+        assert!(!is_full_attention_layer(5));
+        assert!(!is_full_attention_layer(6));
+        assert!(is_full_attention_layer(7));
+    }
+
+    #[test]
+    fn validate_accepts_hybrid_gated_deltanet_manifest() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":4,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            "lm_head.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        let kv_width = config.kv_heads() * head_dim;
+        for layer in 0..config.num_hidden_layers {
+            push(
+                layer_norm_tensor_name(layer, "input_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                layer_norm_tensor_name(layer, "post_attention_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(router_tensor_name(layer), vec![config.experts(), config.hidden_size]);
+            if is_full_attention_layer(layer) {
+                push(
+                    attention_tensor_name(layer, "q_proj"),
+                    vec![config.hidden_size, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "k_proj"),
+                    vec![kv_width, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "v_proj"),
+                    vec![kv_width, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "o_proj"),
+                    vec![config.hidden_size, config.hidden_size],
+                );
+            } else {
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_qkv"),
+                    vec![LINEAR_CONV_DIM, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_z"),
+                    vec![LINEAR_TOTAL_VALUE, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_b"),
+                    vec![LINEAR_NUM_V_HEADS, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_a"),
+                    vec![LINEAR_NUM_V_HEADS, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "conv1d"),
+                    vec![LINEAR_CONV_DIM, CONV_KERNEL_SIZE],
+                );
+                push(
+                    linear_attention_scalar_tensor_name(layer, "A_log"),
+                    vec![LINEAR_NUM_V_HEADS],
+                );
+                push(
+                    linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                    vec![LINEAR_NUM_V_HEADS],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "norm"),
+                    vec![LINEAR_VALUE_DIM],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "out_proj"),
+                    vec![config.hidden_size, LINEAR_TOTAL_VALUE],
+                );
+            }
+        }
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["hybrid.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("hybrid manifest should validate for GatedDeltaNet/full-attn layer mix");
     }
 
     #[test]
