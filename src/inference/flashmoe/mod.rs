@@ -1263,9 +1263,8 @@ impl FlashMoeEngine {
         for position in
             prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
         {
-            let logits =
-                self.forward_next_token(&prompt_tokens, &generated, &mut kv_cache, position)?;
-            let token = sampler.sample(&logits, &prompt_tokens, &generated)?;
+            let token =
+                self.sample_next_token(&mut sampler, &prompt_tokens, &generated, &mut kv_cache, position)?;
             if self.tokenizer.is_eos(token) {
                 break;
             }
@@ -1284,27 +1283,42 @@ impl FlashMoeEngine {
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
-            let _ = self.forward_token(token, kv_cache, position, false)?;
+            let _ = self.forward_hidden(token, kv_cache, position, false)?;
         }
         Ok(())
     }
 
-    fn forward_next_token(
+    fn sample_next_token(
         &mut self,
+        sampler: &mut TokenSampler,
         prompt_tokens: &[u32],
         generated: &[u32],
         kv_cache: &mut KvCache,
         position: usize,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<u32> {
         let previous = generated
             .last()
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        self.forward_token(previous, kv_cache, position, true)
+        let hidden = self.forward_hidden(previous, kv_cache, position, true)?;
+        if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
+            self.metal.as_ref(),
+            &hidden,
+            &self.tokenizer,
+            sampler,
+            prompt_tokens,
+            generated,
+        )? {
+            return sampler.sample_candidates(candidates);
+        }
+        let logits = self
+            .dense
+            .lm_head_logits_with_metal(self.metal.as_ref(), 0, &hidden, &self.tokenizer)?;
+        sampler.sample(&logits, prompt_tokens, generated)
     }
 
-    fn forward_token(
+    fn forward_hidden(
         &mut self,
         previous: u32,
         kv_cache: &mut KvCache,
@@ -1443,12 +1457,7 @@ impl FlashMoeEngine {
         if record_generated {
             kv_cache.record_generated_token(position, previous)?;
         }
-        Ok(self.dense.lm_head_logits_with_metal(
-            self.metal.as_ref(),
-            state,
-            &hidden,
-            &self.tokenizer,
-        )?)
+        Ok(hidden)
     }
 
     pub fn read_active_experts(
@@ -2302,8 +2311,11 @@ impl TokenSampler {
         if logits.is_empty() {
             bail!("cannot sample from empty logits");
         }
-        let processed = self.process_logits(logits, prompt, generated);
-        let mut candidates = top_k(&processed, self.top_k.min(processed.len()).max(1));
+        let candidates = self.top_candidates(logits, prompt, generated);
+        self.sample_candidates(candidates)
+    }
+
+    fn sample_candidates(&mut self, mut candidates: Vec<(usize, f32)>) -> Result<u32> {
         if candidates.is_empty() {
             bail!("no logits candidates available");
         }
@@ -2330,31 +2342,28 @@ impl TokenSampler {
         u32::try_from(fallback).context("sampled token id does not fit u32")
     }
 
-    fn process_logits(&self, logits: &[f32], prompt: &[u32], generated: &[u32]) -> Vec<f32> {
-        let mut processed: Vec<f32> = logits
-            .iter()
-            .map(|logit| {
-                if logit.is_finite() {
-                    *logit
-                } else {
-                    f32::NEG_INFINITY
-                }
-            })
-            .collect();
-        if self.repeat_penalty > 1.0 {
-            let window = generated.len().saturating_sub(256);
-            for token in prompt.iter().chain(generated[window..].iter()).copied() {
-                let idx = token as usize;
-                if let Some(logit) = processed.get_mut(idx) {
-                    if *logit > 0.0 {
-                        *logit /= self.repeat_penalty;
-                    } else {
-                        *logit *= self.repeat_penalty;
-                    }
-                }
-            }
+    fn top_candidates(
+        &self,
+        logits: &[f32],
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Vec<(usize, f32)> {
+        let repeated = self.repeated_tokens(prompt, generated);
+        let mut candidates = TopKCandidates::new(self.top_k.min(logits.len()).max(1));
+        for (token, logit) in logits.iter().copied().enumerate() {
+            candidates.push(token, self.process_logit(token, logit, &repeated));
         }
-        processed
+        candidates.into_sorted_vec()
+    }
+
+    fn process_logits(&self, logits: &[f32], prompt: &[u32], generated: &[u32]) -> Vec<f32> {
+        let repeated = self.repeated_tokens(prompt, generated);
+        logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(token, logit)| self.process_logit(token, logit, &repeated))
+            .collect()
     }
 
     fn apply_top_p(&self, candidates: &mut Vec<(usize, f32)>, probabilities: &mut Vec<f32>) {
@@ -2388,6 +2397,68 @@ impl TokenSampler {
             .wrapping_add(1442695040888963407);
         ((self.state >> 40) as f32) / ((1u64 << 24) as f32)
     }
+
+    fn repeated_tokens(&self, prompt: &[u32], generated: &[u32]) -> BTreeSet<usize> {
+        if self.repeat_penalty <= 1.0 {
+            return BTreeSet::new();
+        }
+        let window = generated.len().saturating_sub(256);
+        prompt
+            .iter()
+            .chain(generated[window..].iter())
+            .map(|token| *token as usize)
+            .collect()
+    }
+
+    fn process_logit(&self, token: usize, logit: f32, repeated: &BTreeSet<usize>) -> f32 {
+        let mut processed = if logit.is_finite() {
+            logit
+        } else {
+            f32::NEG_INFINITY
+        };
+        if self.repeat_penalty > 1.0 && repeated.contains(&token) {
+            if processed > 0.0 {
+                processed /= self.repeat_penalty;
+            } else {
+                processed *= self.repeat_penalty;
+            }
+        }
+        processed
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TopKCandidates {
+    limit: usize,
+    values: Vec<(usize, f32)>,
+}
+
+impl TopKCandidates {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            values: Vec::with_capacity(limit.max(1)),
+        }
+    }
+
+    fn push(&mut self, token: usize, score: f32) {
+        self.values.push((token, score));
+        self.values.sort_by(compare_scored_tokens);
+        if self.values.len() > self.limit {
+            self.values.truncate(self.limit);
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<(usize, f32)> {
+        self.values
+    }
+}
+
+fn compare_scored_tokens(left: &(usize, f32), right: &(usize, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -2861,6 +2932,52 @@ impl DenseStore {
         }
 
         self.lm_head_logits(lm_head_name, hidden, tokenizer)
+    }
+
+    fn lm_head_top_candidates_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        hidden: &[f32],
+        tokenizer: &QwenTokenizer,
+        sampler: &TokenSampler,
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let Some(metal) = metal else {
+            return Ok(None);
+        };
+        let lm_head_name = self.lm_head_tensor_name()?;
+        let Some(entry) = self.registry.tensor(lm_head_name) else {
+            return Ok(None);
+        };
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        let rows = entry
+            .shape
+            .first()
+            .copied()
+            .unwrap_or(tokenizer.vocab_size())
+            .min(tokenizer.vocab_size());
+        if rows == 0 || cols == 0 || cols > hidden.len() {
+            return Ok(None);
+        }
+
+        let repeated = sampler.repeated_tokens(prompt, generated);
+        let mut candidates = TopKCandidates::new(sampler.top_k.min(rows).max(1));
+        let tile_rows = dense_projection_tile_rows(cols, rows);
+        let inv_norm = 1.0 / (cols.max(1) as f32).sqrt();
+        for start in (0..rows).step_by(tile_rows) {
+            let end = (start + tile_rows).min(rows);
+            let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
+            let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+            for (offset, value) in projected.into_iter().enumerate() {
+                let token = start + offset;
+                candidates.push(
+                    token,
+                    sampler.process_logit(token, value * inv_norm, &repeated),
+                );
+            }
+        }
+        Ok(Some(candidates.into_sorted_vec()))
     }
 
     fn lm_head_logits(
@@ -3843,7 +3960,7 @@ fn expert_path(root: &Path, layer: usize, expert: usize) -> PathBuf {
 
 pub fn top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    indexed.sort_by(compare_scored_tokens);
     indexed.truncate(k.min(indexed.len()));
     indexed
 }
@@ -5258,6 +5375,34 @@ mod tests {
         let processed = sampler.process_logits(&logits, &[], &[1]);
         assert!(processed[1] < logits[1]);
         assert_eq!(processed[2], logits[2]);
+    }
+
+    #[test]
+    fn token_sampler_sampling_from_candidates_matches_full_logits() {
+        let logits = vec![0.1, 3.0, 2.9, 0.0, -0.5, 2.0];
+        let prompt = vec![5];
+        let generated = vec![1, 4];
+
+        let mut full = TokenSampler::new(0.7, 4, 99);
+        let mut candidate = TokenSampler::new(0.7, 4, 99);
+        let candidates = candidate.top_candidates(&logits, &prompt, &generated);
+
+        assert_eq!(
+            full.sample(&logits, &prompt, &generated).unwrap(),
+            candidate.sample_candidates(candidates).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_k_candidates_matches_full_top_k_across_tiles() {
+        let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0];
+        let mut candidates = TopKCandidates::new(3);
+        for (offset, chunk) in scores.chunks(2).enumerate() {
+            for (inner, score) in chunk.iter().copied().enumerate() {
+                candidates.push(offset * 2 + inner, score);
+            }
+        }
+        assert_eq!(candidates.into_sorted_vec(), top_k(&scores, 3));
     }
 
     #[test]
