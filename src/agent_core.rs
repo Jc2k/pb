@@ -1,3 +1,4 @@
+use crate::inference::llamacpp::{self as llamacpp, LlamaCppBackend, LlamaCppRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use futures::StreamExt;
@@ -5,7 +6,6 @@ use globset::GlobBuilder;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8 as GrepUtf8};
 use ignore::WalkBuilder;
-use crate::inference::llamacpp::{self as llamacpp, LlamaCppBackend, LlamaCppRequest};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2769,9 +2769,7 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         Ok(CompletionOutput {
             content: output.content,
             finish_reason: match output.finish_reason {
-                llamacpp::FinishReason::EndOfGeneration => {
-                    CompletionFinishReason::EndOfGeneration
-                }
+                llamacpp::FinishReason::EndOfGeneration => CompletionFinishReason::EndOfGeneration,
                 llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
             },
             prompt_tokens: output.prompt_tokens,
@@ -3665,16 +3663,14 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
                     )
                 })?;
                 let output = engine
-                    .generate_with_image(
-                        &crate::inference::flashmoe::VisionGenerationRequest {
-                            prompt: structured_prompt,
-                            image_path: absolute,
-                            max_tokens: request.max_tokens,
-                            temperature: request.temperature,
-                            top_k: request.top_k,
-                            seed: request.seed,
-                        },
-                    )
+                    .generate_with_image(&crate::inference::flashmoe::VisionGenerationRequest {
+                        prompt: structured_prompt,
+                        image_path: absolute,
+                        max_tokens: request.max_tokens,
+                        temperature: request.temperature,
+                        top_k: request.top_k,
+                        seed: request.seed,
+                    })
                     .context("vision_describe Qwen3-VL model invocation failed")?;
                 return Ok(output.content.trim().to_string());
             }

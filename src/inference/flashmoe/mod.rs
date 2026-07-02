@@ -6,7 +6,6 @@
 //! Metal kernels.  This module captures that runtime contract in pb instead of
 //! pretending a GGUF file is required for Qwen3.5.
 
-use std::collections::VecDeque;
 use std::ffi::OsString;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CString, c_char, c_void};
@@ -635,9 +634,13 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
-                .inner
-                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim);
+            return self.inner.causal_attention(
+                query,
+                keys_values,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            );
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -674,9 +677,14 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
-                .inner
-                .causal_attention_cached(position, layer, query, num_q_heads, kv_heads, head_dim);
+            return self.inner.causal_attention_cached(
+                position,
+                layer,
+                query,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            );
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1260,8 +1268,7 @@ impl MetalExecutorInner {
 
             // Step 3: weighted sum of values
             let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
-            let output_buffer =
-                self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
+            let output_buffer = self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
@@ -1449,10 +1456,9 @@ impl FlashMoeEngine {
             .vision_config
             .as_ref()
             .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
-        let encoder = self
-            .vision_encoder
-            .as_ref()
-            .context("generate_with_image requires a loaded VisionEncoder; this plan has no vision weights")?;
+        let encoder = self.vision_encoder.as_ref().context(
+            "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
+        )?;
         let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
         let visual_embeddings = encoder.encode(&preprocessor, &request.image_path)?;
         let num_visual_tokens = visual_embeddings.len();
@@ -1477,9 +1483,8 @@ impl FlashMoeEngine {
         let mut text_tokens = self.tokenizer.encode(&chat_text)?;
 
         // Splice vision tokens in front of the text
-        let mut prompt_tokens: Vec<u32> = Vec::with_capacity(
-            2 + num_visual_tokens + text_tokens.len(),
-        );
+        let mut prompt_tokens: Vec<u32> =
+            Vec::with_capacity(2 + num_visual_tokens + text_tokens.len());
         prompt_tokens.push(vs_tok);
         prompt_tokens.extend(std::iter::repeat(pad_tok).take(num_visual_tokens));
         prompt_tokens.push(ve_tok);
@@ -1493,8 +1498,7 @@ impl FlashMoeEngine {
         self.prefill_with_vision(&prompt_tokens, &visual_embeddings, pad_tok, &mut kv_cache)?;
 
         // ── 4. Decode ─────────────────────────────────────────────────────────
-        let mut sampler =
-            TokenSampler::new(request.temperature, request.top_k, request.seed);
+        let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
         for position in
             prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
@@ -3311,8 +3315,7 @@ impl DenseStore {
                     for start in (0..rows).step_by(tile_rows) {
                         let end = (start + tile_rows).min(rows);
                         let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-                        let projected =
-                            metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+                        let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
                         for (offset, value) in projected.into_iter().enumerate() {
                             logits[start + offset] = value;
                         }
@@ -3361,10 +3364,7 @@ impl DenseStore {
             let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
             for (offset, value) in projected.into_iter().enumerate() {
                 let token = start + offset;
-                candidates.push(
-                    token,
-                    sampler.process_logit(token, value, &repeated),
-                );
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
             }
         }
         Ok(Some(candidates.into_sorted_vec()))
@@ -3653,7 +3653,6 @@ impl DenseStore {
         let bytes = self.read_range(entry.byte_offset, byte_len)?;
         Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
     }
-
 }
 
 fn dtype_size(dtype: &str) -> Option<usize> {
@@ -3782,8 +3781,6 @@ impl ExpertStore {
     }
 }
 
-const DEFAULT_EXPERT_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpertKey {
     layer: usize,
@@ -3792,17 +3789,13 @@ struct ExpertKey {
 
 #[derive(Debug)]
 struct PendingExpertRead {
-    key: ExpertKey,
-    cached: Option<Arc<ExpertWeights>>,
-    handle: Option<thread::JoinHandle<Result<ExpertWeights>>>,
+    handle: thread::JoinHandle<Result<ExpertWeights>>,
     issued_at: Instant,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ExpertSchedulerMetrics {
     issued_reads: u64,
-    cache_hits: u64,
-    cache_misses: u64,
     read_failures: u64,
     total_read_latency: Duration,
     max_read_latency: Duration,
@@ -3811,11 +3804,7 @@ struct ExpertSchedulerMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExpertSchedulerSnapshot {
     pub issued_reads: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
     pub read_failures: u64,
-    pub cached_bytes: usize,
-    pub max_cached_bytes: usize,
     pub total_read_latency: Duration,
     pub max_read_latency: Duration,
 }
@@ -3823,10 +3812,6 @@ pub struct ExpertSchedulerSnapshot {
 #[derive(Debug, Clone)]
 struct ExpertScheduler {
     store: ExpertStore,
-    cache: BTreeMap<ExpertKey, Arc<ExpertWeights>>,
-    lru: VecDeque<ExpertKey>,
-    cached_bytes: usize,
-    max_cached_bytes: usize,
     metrics: ExpertSchedulerMetrics,
 }
 
@@ -3834,10 +3819,6 @@ impl ExpertScheduler {
     fn new(store: ExpertStore) -> Self {
         Self {
             store,
-            cache: BTreeMap::new(),
-            lru: VecDeque::new(),
-            cached_bytes: 0,
-            max_cached_bytes: DEFAULT_EXPERT_CACHE_BYTES,
             metrics: ExpertSchedulerMetrics::default(),
         }
     }
@@ -3850,27 +3831,14 @@ impl ExpertScheduler {
                 expert: *expert,
             };
             let issued_at = Instant::now();
-            if let Some(cached) = self.cache.get(&key).cloned() {
-                self.metrics.cache_hits = self.metrics.cache_hits.saturating_add(1);
-                self.touch(key);
-                pending.push(PendingExpertRead {
-                    key,
-                    cached: Some(cached),
-                    handle: None,
-                    issued_at,
-                });
-                continue;
-            }
-
-            self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
+            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
+            // maintaining a second in-process cache of hot expert packs. Cold expert reads still
+            // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
+            // evicts them, which matches the behavior described in the upstream notes.
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
             pending.push(PendingExpertRead {
-                key,
-                cached: None,
-                handle: Some(thread::spawn(move || {
-                    read_one_expert(&root, key.layer, key.expert)
-                })),
+                handle: thread::spawn(move || read_one_expert(&root, key.layer, key.expert)),
                 issued_at,
             });
         }
@@ -3880,16 +3848,8 @@ impl ExpertScheduler {
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
-            if let Some(cached) = pending.cached {
-                out.push(cached);
-                continue;
-            }
-
-            let handle = pending
-                .handle
-                .context("pending expert read missing thread handle")?;
             let started = pending.issued_at;
-            let expert = match handle.join() {
+            let expert = match pending.handle.join() {
                 Ok(result) => result,
                 Err(_) => {
                     self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
@@ -3900,46 +3860,15 @@ impl ExpertScheduler {
             self.metrics.total_read_latency += latency;
             self.metrics.max_read_latency = self.metrics.max_read_latency.max(latency);
             let expert = Arc::new(expert);
-            self.insert_cache(pending.key, expert.clone());
             out.push(expert);
         }
         Ok(out)
     }
 
-    fn insert_cache(&mut self, key: ExpertKey, expert: Arc<ExpertWeights>) {
-        let size = expert.packed.len();
-        if let Some(previous) = self.cache.insert(key, expert) {
-            self.cached_bytes = self.cached_bytes.saturating_sub(previous.packed.len());
-        }
-        self.cached_bytes = self.cached_bytes.saturating_add(size);
-        self.touch(key);
-        self.evict_to_budget();
-    }
-
-    fn touch(&mut self, key: ExpertKey) {
-        self.lru.retain(|existing| *existing != key);
-        self.lru.push_back(key);
-    }
-
-    fn evict_to_budget(&mut self) {
-        while self.cached_bytes > self.max_cached_bytes {
-            let Some(victim) = self.lru.pop_front() else {
-                break;
-            };
-            if let Some(expert) = self.cache.remove(&victim) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(expert.packed.len());
-            }
-        }
-    }
-
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
         ExpertSchedulerSnapshot {
             issued_reads: self.metrics.issued_reads,
-            cache_hits: self.metrics.cache_hits,
-            cache_misses: self.metrics.cache_misses,
             read_failures: self.metrics.read_failures,
-            cached_bytes: self.cached_bytes,
-            max_cached_bytes: self.max_cached_bytes,
             total_read_latency: self.metrics.total_read_latency,
             max_read_latency: self.metrics.max_read_latency,
         }
@@ -4414,14 +4343,25 @@ pub fn q4_fma_matvec(
         );
     }
     let mut out = vec![0.0f32; rows];
+    let packed_stride = cols.div_ceil(2);
+    debug_assert_eq!(groups_per_row, cols.div_ceil(GROUP_SIZE));
     for row in 0..rows {
         let mut acc = 0.0f32;
-        for col in 0..cols {
-            let byte = packed[row * cols.div_ceil(2) + col / 2];
-            let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
-            let group = col / GROUP_SIZE;
+        let packed_row = row * packed_stride;
+        for group in 0..groups_per_row {
             let idx = row * groups_per_row + group;
-            acc = q.mul_add(scales[idx] * input[col], acc + biases[idx] * input[col]);
+            let scale = scales[idx];
+            let bias = biases[idx];
+            let start = group * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(cols);
+            for col in start..end {
+                let x = input[col];
+                let scale_x = scale * x;
+                let bias_x = bias * x;
+                let byte = packed[packed_row + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                acc = q.mul_add(scale_x, acc + bias_x);
+            }
         }
         out[row] = acc;
     }
@@ -4739,12 +4679,20 @@ kernel void q4_fma_matvec(
     uint row [[thread_position_in_grid]]) {
     float acc = 0.0f;
     uint packed_row = row * ((cols + 1) / 2);
-    for (uint col = 0; col < cols; ++col) {
-        uchar byte = packed[packed_row + col / 2];
-        float q = float((col & 1) == 0 ? (byte & 0x0f) : (byte >> 4));
-        uint group = col / 64;
+    for (uint group = 0; group < groups_per_row; ++group) {
         uint idx = row * groups_per_row + group;
-        acc = fma(q * scales[idx] + biases[idx], input[col], acc);
+        float scale = scales[idx];
+        float bias = biases[idx];
+        uint start = group * 64;
+        uint end = min(start + 64, cols);
+        for (uint col = start; col < end; ++col) {
+            uchar byte = packed[packed_row + col / 2];
+            float q = float((col & 1) == 0 ? (byte & 0x0f) : (byte >> 4));
+            float x = input[col];
+            float scale_x = scale * x;
+            float bias_x = bias * x;
+            acc = fma(q, scale_x, bias_x + acc);
+        }
     }
     output[row] = acc;
 }
@@ -5078,17 +5026,14 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
             })?;
         }
         // Write vision_config.json (the nested vision_config object from config.json).
-        if let (Some(vc), Some(vc_path)) =
-            (config.as_ref().and_then(|c| c.vision_config.as_ref()), plan.vision_config_path.as_ref())
-        {
-            let vc_bytes = serde_json::to_vec_pretty(vc)
-                .context("failed to encode vision config")?;
-            fs::write(vc_path, vc_bytes).with_context(|| {
-                format!(
-                    "failed to write vision config {}",
-                    vc_path.display()
-                )
-            })?;
+        if let (Some(vc), Some(vc_path)) = (
+            config.as_ref().and_then(|c| c.vision_config.as_ref()),
+            plan.vision_config_path.as_ref(),
+        ) {
+            let vc_bytes =
+                serde_json::to_vec_pretty(vc).context("failed to encode vision config")?;
+            fs::write(vc_path, vc_bytes)
+                .with_context(|| format!("failed to write vision config {}", vc_path.display()))?;
         }
     }
 
@@ -5103,7 +5048,11 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     Ok(plan)
 }
 
-fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
+fn build_manifest(
+    model: &str,
+    snapshot_dir: &Path,
+    index_json: &Path,
+) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
     let index: SafetensorsIndex = serde_json::from_slice(
         &fs::read(index_json)
             .with_context(|| format!("failed to read {}", index_json.display()))?,
@@ -5338,9 +5287,7 @@ fn pack_expert_tensors(
                 let mmap = unsafe {
                     memmap2::MmapOptions::new()
                         .map(&file)
-                        .with_context(|| {
-                            format!("failed to memory-map {}", shard_path.display())
-                        })?
+                        .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
                 };
                 shard_cache.insert(
                     tensor.shard.clone(),
@@ -5743,8 +5690,7 @@ impl ImagePreprocessor {
                         for kx in 0..self.patch_size {
                             let src_y = py * self.patch_size + ky;
                             let src_x = px * self.patch_size + kx;
-                            let pixel_idx =
-                                (src_y * target_w as usize + src_x) * 3 + c;
+                            let pixel_idx = (src_y * target_w as usize + src_x) * 3 + c;
                             let raw = pixels[pixel_idx] as f32 / 255.0;
                             let normed = (raw - self.image_mean[c]) / self.image_std[c];
                             let dst = patch_idx * 3 * patch_pixels
@@ -5998,9 +5944,7 @@ impl VisionEncoder {
                 let projected = self
                     .dense
                     .matvec_tensor_prefix(&proj_name, &h, embed_dim)?
-                    .with_context(|| {
-                        format!("vision: required tensor '{proj_name}' is missing")
-                    })?;
+                    .with_context(|| format!("vision: required tensor '{proj_name}' is missing"))?;
                 self.vit_add_bias(&proj_bias_name, projected)
             })
             .collect::<Result<_>>()?;
@@ -6100,10 +6044,7 @@ impl VisionEncoder {
     ///
     /// Returns `values` unchanged when the bias tensor is absent.
     fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
-        if let Some(bias) = self
-            .dense
-            .read_full_tensor_f32(bias_name)?
-        {
+        if let Some(bias) = self.dense.read_full_tensor_f32(bias_name)? {
             for (v, b) in values.iter_mut().zip(bias.iter()) {
                 *v += b;
             }
@@ -6129,7 +6070,11 @@ impl VisionEncoder {
             .enumerate()
             .map(|(i, x)| {
                 let normed = (x - mean) * std_inv;
-                let w = weight.as_ref().and_then(|w| w.get(i)).copied().unwrap_or(1.0);
+                let w = weight
+                    .as_ref()
+                    .and_then(|w| w.get(i))
+                    .copied()
+                    .unwrap_or(1.0);
                 let b = bias.as_ref().and_then(|b| b.get(i)).copied().unwrap_or(0.0);
                 normed * w + b
             })
@@ -6144,7 +6089,6 @@ fn gelu_approx(x: f32) -> f32 {
     const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
     0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -7124,7 +7068,7 @@ mod tests {
     }
 
     #[test]
-    fn expert_scheduler_reads_only_active_experts_and_reuses_cache() {
+    fn expert_scheduler_reads_only_active_experts_without_process_cache() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(
@@ -7151,17 +7095,21 @@ mod tests {
         assert!(experts.iter().all(|expert| expert.layer == 0));
         let first = scheduler.snapshot();
         assert_eq!(first.issued_reads, 2);
-        assert_eq!(first.cache_hits, 0);
-        assert_eq!(first.cache_misses, 2);
 
         let pending = scheduler.issue(0, &[3, 7]).unwrap();
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
+        assert_eq!(experts[0].expert, 3);
+        assert_eq!(experts[1].expert, 7);
         let second = scheduler.snapshot();
-        assert_eq!(second.issued_reads, 3);
-        assert_eq!(second.cache_hits, 1);
-        assert_eq!(second.cache_misses, 3);
-        assert!(second.cached_bytes >= 2 * b"PBQ4EXPERT ".len());
+        assert_eq!(second.issued_reads, 4);
+
+        let pending = scheduler.issue(0, &[3]).unwrap();
+        let experts = scheduler.finish(pending).unwrap();
+        assert_eq!(experts.len(), 1);
+        assert_eq!(experts[0].expert, 3);
+        let third = scheduler.snapshot();
+        assert_eq!(third.issued_reads, 5);
     }
 
     #[test]
