@@ -3805,7 +3805,7 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.max_tokens = boosted_max_tokens(&request).max(2048);
     request.temperature = 0.0;
     request.top_k = 1;
-    let lazy_loaded =
+    let lazy_loaded_model =
         if context.backend.is_none() || context.model.is_none() || context.model_path.is_none() {
             Some(
                 load_llama_model_from_cache(
@@ -3828,7 +3828,9 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     {
         (backend, model, model_path)
     } else {
-        let (backend, model, model_path) = lazy_loaded.as_ref().expect("lazy loaded llama model");
+        let (backend, model, model_path) = lazy_loaded_model
+            .as_ref()
+            .expect("BUG: lazy-loaded llama model must exist when vision context is missing");
         (backend, model, model_path.as_path())
     };
     let output = generate_vision_completion(
