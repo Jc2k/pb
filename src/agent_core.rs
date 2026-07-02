@@ -392,6 +392,10 @@ pub struct SessionAttachment {
     pub size: u64,
 }
 
+fn default_moe_cpu_offload() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRequest {
     pub task: String,
@@ -422,6 +426,10 @@ pub struct AgentRequest {
     pub session_id: String,
     #[serde(default)]
     pub attachments: Vec<SessionAttachment>,
+    /// When true and gpu_layers > 0, keep MoE expert tensors in CPU RAM so the OS page
+    /// cache manages expert caching. This mirrors the flash-moe "Trust the OS" technique.
+    #[serde(default = "default_moe_cpu_offload")]
+    pub moe_cpu_offload: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -740,8 +748,12 @@ pub fn run_agent<S: EventSink>(
     suppress_llama_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     backend.void_logs();
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+    let mut model_params =
+        Box::pin(LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers));
+    if args.moe_cpu_offload && args.gpu_layers > 0 {
+        model_params.as_mut().add_cpu_moe_override();
+    }
+    let model = LlamaModel::load_from_file(&backend, &model_path, &*model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
 
     if args.infer_profile {
@@ -5249,6 +5261,7 @@ mod tests {
             environment: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
+            moe_cpu_offload: true,
         }
     }
 
@@ -6032,6 +6045,7 @@ mod tests {
             environment: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
+            moe_cpu_offload: true,
         };
 
         let workdir = tempfile::tempdir().unwrap();
@@ -6090,6 +6104,7 @@ mod tests {
             environment: None,
             session_id: "session-456".to_string(),
             attachments: Vec::new(),
+            moe_cpu_offload: true,
         };
 
         // Should find and use existing branch with same session_id

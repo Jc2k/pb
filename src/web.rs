@@ -82,6 +82,7 @@ pub struct StartSessionRequest {
     pub profile: Option<AgentProfile>,
     pub top_k: Option<i32>,
     pub seed: Option<u32>,
+    pub moe_cpu_offload: Option<bool>,
     #[serde(default)]
     pub attachments: Vec<InlineAttachment>,
 }
@@ -545,6 +546,9 @@ async fn start_session_inner(
     }
     request.top_k = req.top_k.unwrap_or(request.top_k);
     request.seed = req.seed.unwrap_or(request.seed);
+    if let Some(moe_cpu_offload) = req.moe_cpu_offload {
+        request.moe_cpu_offload = moe_cpu_offload;
+    }
     request.attachments =
         materialize_attachments(&session_id, request.workdir.as_deref(), req.attachments)?;
 

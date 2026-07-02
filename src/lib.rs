@@ -581,6 +581,7 @@ async fn run_serve() -> Result<()> {
         repository_less: false,
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
+        moe_cpu_offload: user_config.effective_moe_cpu_offload(),
         environment: None,
         session_id: String::new(),
         attachments: Vec::new(),
@@ -1069,6 +1070,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
                 profile: args.profile,
                 top_k: args.top_k,
                 seed: args.seed,
+                moe_cpu_offload: None,
                 attachments: args
                     .images
                     .iter()

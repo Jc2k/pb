@@ -56,6 +56,10 @@ pub struct ModelConfig {
     pub profile: Option<AgentProfile>,
     pub top_k: Option<i32>,
     pub seed: Option<u32>,
+    /// When true and gpu_layers > 0, keep MoE expert tensors in CPU RAM so the OS page
+    /// cache manages expert caching ("Trust the OS" from the flash-moe paper). This avoids
+    /// exhausting GPU memory on large MoE models and is a no-op for non-MoE models.
+    pub moe_cpu_offload: Option<bool>,
 }
 
 impl UserConfig {
@@ -105,6 +109,9 @@ impl UserConfig {
             "model.profile" => self.model.profile.map(|value| value.to_string()),
             "model.top_k" => self.model.top_k.map(|value| value.to_string()),
             "model.seed" => self.model.seed.map(|value| value.to_string()),
+            "model.moe_cpu_offload" => {
+                self.model.moe_cpu_offload.map(|value| value.to_string())
+            }
             "memory.personal_repo" => self.memory.personal_repo.as_ref().map(display_path),
             _ => bail_unknown_key(key)?,
         })
@@ -134,6 +141,9 @@ impl UserConfig {
             }
             "model.top_k" => self.model.top_k = Some(parse_value(key, value)?),
             "model.seed" => self.model.seed = Some(parse_value(key, value)?),
+            "model.moe_cpu_offload" => {
+                self.model.moe_cpu_offload = Some(parse_value(key, value)?)
+            }
             "memory.personal_repo" => self.memory.personal_repo = Some(PathBuf::from(value)),
             _ => return bail_unknown_key(key),
         }
@@ -217,6 +227,10 @@ impl UserConfig {
         self.model.seed.unwrap_or(1337)
     }
 
+    pub fn effective_moe_cpu_offload(&self) -> bool {
+        self.model.moe_cpu_offload.unwrap_or(true)
+    }
+
     pub fn effective_personal_memory_repo(&self) -> Option<PathBuf> {
         self.memory.personal_repo.clone()
     }
@@ -243,7 +257,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, and disabled fields. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, model.moe_cpu_offload. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, and disabled fields. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, and disabled fields"
     )
 }
 

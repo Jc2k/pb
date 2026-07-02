@@ -333,6 +333,7 @@ mod tests {
             environment: None::<EnvironmentConfig>,
             session_id: String::new(),
             attachments: Vec::new(),
+            moe_cpu_offload: true,
         }
     }
 
