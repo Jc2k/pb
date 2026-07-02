@@ -3789,7 +3789,6 @@ struct ExpertKey {
 
 #[derive(Debug)]
 struct PendingExpertRead {
-    cached: Option<Arc<ExpertWeights>>,
     handle: Option<thread::JoinHandle<Result<ExpertWeights>>>,
     issued_at: Instant,
 }
@@ -3810,8 +3809,6 @@ pub struct ExpertSchedulerSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub read_failures: u64,
-    pub cached_bytes: usize,
-    pub max_cached_bytes: usize,
     pub total_read_latency: Duration,
     pub max_read_latency: Duration,
 }
@@ -3844,7 +3841,6 @@ impl ExpertScheduler {
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
             pending.push(PendingExpertRead {
-                cached: None,
                 handle: Some(thread::spawn(move || {
                     read_one_expert(&root, key.layer, key.expert)
                 })),
@@ -3857,11 +3853,6 @@ impl ExpertScheduler {
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
-            if let Some(cached) = pending.cached {
-                out.push(cached);
-                continue;
-            }
-
             let handle = pending
                 .handle
                 .context("pending expert read missing thread handle")?;
@@ -3888,8 +3879,6 @@ impl ExpertScheduler {
             cache_hits: self.metrics.cache_hits,
             cache_misses: self.metrics.cache_misses,
             read_failures: self.metrics.read_failures,
-            cached_bytes: 0,
-            max_cached_bytes: 0,
             total_read_latency: self.metrics.total_read_latency,
             max_read_latency: self.metrics.max_read_latency,
         }
@@ -7117,18 +7106,16 @@ mod tests {
         assert_eq!(first.issued_reads, 2);
         assert_eq!(first.cache_hits, 0);
         assert_eq!(first.cache_misses, 2);
-        assert_eq!(first.cached_bytes, 0);
-        assert_eq!(first.max_cached_bytes, 0);
 
         let pending = scheduler.issue(0, &[3, 7]).unwrap();
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
+        assert_eq!(experts[0].expert, 3);
+        assert_eq!(experts[1].expert, 7);
         let second = scheduler.snapshot();
         assert_eq!(second.issued_reads, 4);
         assert_eq!(second.cache_hits, 0);
         assert_eq!(second.cache_misses, 4);
-        assert_eq!(second.cached_bytes, 0);
-        assert_eq!(second.max_cached_bytes, 0);
     }
 
     #[test]
