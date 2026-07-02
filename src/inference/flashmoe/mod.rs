@@ -257,6 +257,14 @@ impl QwenModelConfig {
     fn active_experts(&self) -> usize {
         self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN)
     }
+
+    /// Returns the intermediate hidden size used by each shared expert MLP.
+    fn shared_expert_intermediate_size(&self) -> usize {
+        self.shared_expert_intermediate_size
+            .or(self.moe_intermediate_size)
+            .or(self.intermediate_size)
+            .unwrap_or(0)
+    }
 }
 
 pub fn select_backend(model: &str) -> BackendSelection {
@@ -504,15 +512,25 @@ impl MetalExecutor {
         &self,
         query: &[f32],
         keys_values: &[(&[f32], &[f32])],
+        num_q_heads: usize,
+        kv_heads: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.causal_attention(query, keys_values, head_dim);
+            return self
+                .inner
+                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim);
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            Ok(causal_attention(query, keys_values, head_dim))
+            Ok(causal_attention(
+                query,
+                keys_values,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            ))
         }
     }
 
@@ -533,17 +551,19 @@ impl MetalExecutor {
         position: usize,
         layer: usize,
         query: &[f32],
+        num_q_heads: usize,
+        kv_heads: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             return self
                 .inner
-                .causal_attention_cached(position, layer, query, head_dim);
+                .causal_attention_cached(position, layer, query, num_q_heads, kv_heads, head_dim);
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (position, layer, head_dim);
+            let _ = (position, layer, num_q_heads, kv_heads, head_dim);
             Ok(vec![0.0; query.len()])
         }
     }
@@ -565,6 +585,8 @@ struct MetalExecutorInner {
     expert_mlp_pipeline: ObjcId,
     lm_head_pipeline: ObjcId,
     topk_vocab_pipeline: ObjcId,
+    gqa_scores_pipeline: ObjcId,
+    gqa_read_pipeline: ObjcId,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     reusable: std::sync::Mutex<Vec<ObjcId>>,
 }
@@ -600,6 +622,8 @@ impl Drop for MetalExecutorInner {
             release(self.expert_mlp_pipeline);
             release(self.lm_head_pipeline);
             release(self.topk_vocab_pipeline);
+            release(self.gqa_scores_pipeline);
+            release(self.gqa_read_pipeline);
             if let Ok(kv_cache) = self.kv_cache.get_mut() {
                 if let Some(kv_cache) = kv_cache.take() {
                     release(kv_cache.keys);
@@ -653,6 +677,8 @@ impl MetalExecutorInner {
             let expert_mlp_pipeline = compile_pipeline(device, library, "expert_mlp_fused")?;
             let lm_head_pipeline = compile_pipeline(device, library, "lm_head_logits")?;
             let topk_vocab_pipeline = compile_pipeline(device, library, "topk_vocab")?;
+            let gqa_scores_pipeline = compile_pipeline(device, library, "gqa_attention_scores")?;
+            let gqa_read_pipeline = compile_pipeline(device, library, "gqa_kv_read_attention")?;
             release(library);
 
             let command_queue = msg_send_id0(device, sel("newCommandQueue"));
@@ -668,6 +694,8 @@ impl MetalExecutorInner {
                 release(expert_mlp_pipeline);
                 release(lm_head_pipeline);
                 release(topk_vocab_pipeline);
+                release(gqa_scores_pipeline);
+                release(gqa_read_pipeline);
                 release(device);
                 bail!("failed to create Flash-MoE Metal command queue");
             }
@@ -675,21 +703,21 @@ impl MetalExecutorInner {
             let runtime = DenseTransformerRuntime::new(config);
             let max_context = metal_kv_max_context(
                 config,
-                runtime.width,
+                runtime.kv_width,
                 system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
             );
             let kv_cache = allocate_metal_kv_cache(
                 device,
                 config.num_hidden_layers,
                 max_context,
-                runtime.width,
+                runtime.kv_width,
             )?;
 
             tracing::info!(
                 model = %plan.model,
                 layers = config.num_hidden_layers,
                 max_context,
-                kv_cache_mib = (metal_kv_cache_bytes(config.num_hidden_layers, max_context, runtime.width) / (1024 * 1024)),
+                kv_cache_mib = (metal_kv_cache_bytes(config.num_hidden_layers, max_context, runtime.kv_width) / (1024 * 1024)),
                 experts = config.experts(),
                 "Flash-MoE Metal executor initialized"
             );
@@ -708,6 +736,8 @@ impl MetalExecutorInner {
                 expert_mlp_pipeline,
                 lm_head_pipeline,
                 topk_vocab_pipeline,
+                gqa_scores_pipeline,
+                gqa_read_pipeline,
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
                 reusable: std::sync::Mutex::new(Vec::new()),
             })
@@ -962,69 +992,21 @@ impl MetalExecutorInner {
         &self,
         query: &[f32],
         keys_values: &[(&[f32], &[f32])],
+        num_q_heads: usize,
+        kv_heads: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>> {
-        if query.is_empty() || keys_values.is_empty() {
+        if query.is_empty() || keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
             return Ok(vec![0.0; query.len()]);
         }
-        let width = query.len();
-        let mut keys = Vec::with_capacity(keys_values.len() * width);
-        let mut values = Vec::with_capacity(keys_values.len() * width);
-        for (key, value) in keys_values {
-            keys.extend(key.iter().copied().take(width));
-            values.extend(value.iter().copied().take(width));
-        }
-        unsafe {
-            let query_buffer = self.buffer_with_bytes(f32_as_bytes(query))?;
-            let keys_buffer = self.buffer_with_bytes(f32_as_bytes(&keys))?;
-            let scores_buffer =
-                self.buffer_with_len(keys_values.len() * std::mem::size_of::<f32>())?;
-            let width_u32 = width as u32;
-            let head_dim_u32 = head_dim as u32;
-            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
-            let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
-            self.dispatch_unary(
-                self.attention_pipeline,
-                &[
-                    query_buffer,
-                    keys_buffer,
-                    scores_buffer,
-                    width_buffer,
-                    head_dim_buffer,
-                ],
-                keys_values.len() as u64,
-            )?;
-            let mut scores = read_f32_buffer(scores_buffer, keys_values.len());
-            softmax_in_place(&mut scores);
-
-            let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
-            let values_buffer = self.buffer_with_bytes(f32_as_bytes(&values))?;
-            let output_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let tokens_u32 = keys_values.len() as u32;
-            let tokens_buffer = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
-            self.dispatch_unary(
-                self.kv_read_attention_pipeline,
-                &[
-                    scores_buffer_2,
-                    values_buffer,
-                    output_buffer,
-                    width_buffer,
-                    tokens_buffer,
-                ],
-                width as u64,
-            )?;
-            let output = read_f32_buffer(output_buffer, width);
-            self.recycle(query_buffer);
-            self.recycle(keys_buffer);
-            self.recycle(scores_buffer);
-            self.recycle(width_buffer);
-            self.recycle(head_dim_buffer);
-            self.recycle(scores_buffer_2);
-            self.recycle(values_buffer);
-            self.recycle(output_buffer);
-            self.recycle(tokens_buffer);
-            Ok(output)
-        }
+        // Fall back to CPU GQA for the non-cached path
+        Ok(causal_attention(
+            query,
+            keys_values,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+        ))
     }
 
     fn record_kv(&self, position: usize, layer: usize, key: &[f32], value: &[f32]) -> Result<()> {
@@ -1081,6 +1063,8 @@ impl MetalExecutorInner {
         position: usize,
         layer: usize,
         query: &[f32],
+        num_q_heads: usize,
+        kv_heads: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>> {
         let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
@@ -1094,26 +1078,35 @@ impl MetalExecutorInner {
                 kv_cache.max_context
             );
         }
-        if query.len() < kv_cache.width {
+        let q_width = num_q_heads * head_dim;
+        if query.len() < q_width {
             bail!(
-                "Metal KV attention query width {} is smaller than cache width {}",
+                "Metal GQA attention query len {} is smaller than q_width {}",
                 query.len(),
-                kv_cache.width
+                q_width
             );
         }
         let tokens = position + 1;
+        let groups_per_kv = num_q_heads / kv_heads.max(1);
         let layer_offset_items = layer
             .checked_mul(kv_cache.max_context)
             .and_then(|items| items.checked_mul(kv_cache.width))
             .context("Metal KV layer offset overflow")?;
         let layer_offset_bytes = (layer_offset_items * std::mem::size_of::<f32>()) as u64;
         unsafe {
-            let query_buffer = self.buffer_with_bytes(f32_as_bytes(&query[..kv_cache.width]))?;
-            let scores_buffer = self.buffer_with_len(tokens * std::mem::size_of::<f32>())?;
-            let width_u32 = kv_cache.width as u32;
+            let query_buffer = self.buffer_with_bytes(f32_as_bytes(&query[..q_width]))?;
+            let scores_buffer =
+                self.buffer_with_len(num_q_heads * tokens * std::mem::size_of::<f32>())?;
             let head_dim_u32 = head_dim as u32;
-            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
-            let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
+            let groups_per_kv_u32 = groups_per_kv as u32;
+            let tokens_u32 = tokens as u32;
+            let kv_width_u32 = kv_cache.width as u32;
+            let head_dim_buf = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
+            let gpk_buf = self.buffer_with_bytes(u32_as_bytes(&groups_per_kv_u32))?;
+            let tokens_buf = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
+            let kv_width_buf = self.buffer_with_bytes(u32_as_bytes(&kv_width_u32))?;
+
+            // Step 1: compute raw dot-product scores for all (q_head, token) pairs
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
@@ -1126,27 +1119,32 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.attention_pipeline,
+                self.gqa_scores_pipeline,
             );
             set_buffer(encoder, query_buffer, 0);
             set_buffer_with_offset(encoder, kv_cache.keys, layer_offset_bytes, 1);
             set_buffer(encoder, scores_buffer, 2);
-            set_buffer(encoder, width_buffer, 3);
-            set_buffer(encoder, head_dim_buffer, 4);
-            dispatch_threads(encoder, tokens as u64);
+            set_buffer(encoder, head_dim_buf, 3);
+            set_buffer(encoder, gpk_buf, 4);
+            set_buffer(encoder, tokens_buf, 5);
+            set_buffer(encoder, kv_width_buf, 6);
+            dispatch_threads(encoder, (num_q_heads * tokens) as u64);
             msg_send_void0(encoder, sel("endEncoding"));
             msg_send_void0(command_buffer, sel("commit"));
             msg_send_void0(command_buffer, sel("waitUntilCompleted"));
             release(encoder);
             release(command_buffer);
 
-            let mut scores = read_f32_buffer(scores_buffer, tokens);
-            softmax_in_place(&mut scores);
+            // Step 2: softmax per Q-head independently (CPU)
+            let mut scores = read_f32_buffer(scores_buffer, num_q_heads * tokens);
+            for qh in 0..num_q_heads {
+                softmax_in_place(&mut scores[qh * tokens..(qh + 1) * tokens]);
+            }
+
+            // Step 3: weighted sum of values
             let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
             let output_buffer =
-                self.buffer_with_len(kv_cache.width * std::mem::size_of::<f32>())?;
-            let tokens_u32 = tokens as u32;
-            let tokens_buffer = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
+                self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
@@ -1159,27 +1157,30 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.kv_read_attention_pipeline,
+                self.gqa_read_pipeline,
             );
             set_buffer(encoder, scores_buffer_2, 0);
             set_buffer_with_offset(encoder, kv_cache.values, layer_offset_bytes, 1);
             set_buffer(encoder, output_buffer, 2);
-            set_buffer(encoder, width_buffer, 3);
-            set_buffer(encoder, tokens_buffer, 4);
-            dispatch_threads(encoder, kv_cache.width as u64);
+            set_buffer(encoder, head_dim_buf, 3);
+            set_buffer(encoder, gpk_buf, 4);
+            set_buffer(encoder, tokens_buf, 5);
+            set_buffer(encoder, kv_width_buf, 6);
+            dispatch_threads(encoder, q_width as u64);
             msg_send_void0(encoder, sel("endEncoding"));
             msg_send_void0(command_buffer, sel("commit"));
             msg_send_void0(command_buffer, sel("waitUntilCompleted"));
-            let output = read_f32_buffer(output_buffer, kv_cache.width);
+            let output = read_f32_buffer(output_buffer, q_width);
             release(encoder);
             release(command_buffer);
             self.recycle(query_buffer);
             self.recycle(scores_buffer);
-            self.recycle(width_buffer);
-            self.recycle(head_dim_buffer);
+            self.recycle(head_dim_buf);
+            self.recycle(gpk_buf);
+            self.recycle(tokens_buf);
+            self.recycle(kv_width_buf);
             self.recycle(scores_buffer_2);
             self.recycle(output_buffer);
-            self.recycle(tokens_buffer);
             Ok(output)
         }
     }
@@ -1353,19 +1354,20 @@ impl FlashMoeEngine {
                 &normed,
                 runtime.width,
             )?;
+            // Issue 1 fix: k/v projections have shape [kv_width, hidden_size]; use kv_width.
             let mut k = self.dense.project_with_metal(
                 self.metal.as_ref(),
                 layer,
                 "k_proj",
                 &normed,
-                runtime.width,
+                runtime.kv_width,
             )?;
             let v = self.dense.project_with_metal(
                 self.metal.as_ref(),
                 layer,
                 "v_proj",
                 &normed,
-                runtime.width,
+                runtime.kv_width,
             )?;
             if let Some(metal) = &self.metal {
                 q = metal.apply_rope(
@@ -1394,12 +1396,40 @@ impl FlashMoeEngine {
                     self.config.rope_theta.unwrap_or(1_000_000.0),
                 );
             }
+            // Issue 3 fix: apply per-head QK-norm when present (Qwen3 MoE).
+            let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
+            let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
+            if let Some(q_norm_w) = self.dense.norm_weight(&q_norm_name, runtime.head_dim)? {
+                for head in q.chunks_mut(runtime.head_dim) {
+                    rms_norm_with_weight_in_place(head, Some(&q_norm_w));
+                }
+            }
+            if let Some(k_norm_w) = self.dense.norm_weight(&k_norm_name, runtime.head_dim)? {
+                for head in k.chunks_mut(runtime.head_dim) {
+                    rms_norm_with_weight_in_place(head, Some(&k_norm_w));
+                }
+            }
+            // Issue 4 fix: multi-head GQA attention.
             let attended = if let Some(metal) = &self.metal {
                 metal.record_kv(position, layer, &k, &v)?;
-                metal.causal_attention_cached(position, layer, &q, runtime.head_dim)?
+                metal.causal_attention_cached(
+                    position,
+                    layer,
+                    &q,
+                    runtime.num_q_heads,
+                    runtime.kv_heads,
+                    runtime.head_dim,
+                )?
             } else {
                 kv_cache.record_kv(position, layer, k, v)?;
-                kv_cache.causal_attention(position, layer, &q, runtime.head_dim)?
+                kv_cache.causal_attention(
+                    position,
+                    layer,
+                    &q,
+                    runtime.num_q_heads,
+                    runtime.kv_heads,
+                    runtime.head_dim,
+                )?
             };
             let projected = self.dense.project_with_metal(
                 self.metal.as_ref(),
@@ -1451,6 +1481,45 @@ impl FlashMoeEngine {
                 };
                 add_scaled_in_place(&mut moe, &contribution, weight);
             }
+            // Issue 2 fix: apply always-active shared experts (Qwen3 MoE).
+            let num_shared = self.config.num_shared_experts.unwrap_or(0);
+            let shared_inter = self.config.shared_expert_intermediate_size();
+            if num_shared > 0 && shared_inter > 0 {
+                let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+                let up_name = shared_expert_tensor_name(layer, "up_proj");
+                let down_name = shared_expert_tensor_name(layer, "down_proj");
+                let gate_opt = self.dense.project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &gate_name,
+                    &normed,
+                    shared_inter,
+                )?;
+                let up_opt = self.dense.project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &up_name,
+                    &normed,
+                    shared_inter,
+                )?;
+                if let (Some(gate), Some(up)) = (gate_opt, up_opt) {
+                    // SiLU-gated activation
+                    let mut activated: Vec<f32> = gate
+                        .iter()
+                        .zip(up.iter())
+                        .map(|(g, u)| silu(*g) * u)
+                        .collect();
+                    if let Some(shared_out) = self.dense.project_dense_tensor_with_metal(
+                        self.metal.as_ref(),
+                        &down_name,
+                        &activated,
+                        runtime.width,
+                    )? {
+                        add_in_place(&mut moe, &shared_out);
+                    } else {
+                        // down_proj absent: still zero-fill so activated is dropped cleanly
+                        activated.fill(0.0);
+                    }
+                }
+            }
             hidden = mlp_residual;
             add_in_place(&mut hidden, &moe);
             kv_cache.record_layer_state(position, layer, state)?;
@@ -1485,18 +1554,26 @@ impl FlashMoeEngine {
 struct DenseTransformerRuntime {
     width: usize,
     head_dim: usize,
+    /// Width of each K/V projection: kv_heads × head_dim.
+    kv_width: usize,
+    num_q_heads: usize,
+    kv_heads: usize,
 }
 
 impl DenseTransformerRuntime {
     fn new(config: &QwenModelConfig) -> Self {
-        let full_head_dim = config.hidden_size / config.num_attention_heads.max(1);
+        let head_dim = config.hidden_size / config.num_attention_heads.max(1);
+        let kv_heads = config.kv_heads();
         Self {
             // The runtime width is the model hidden size. Truncating this value
             // makes every projection, residual, expert output, and LM-head row
             // numerically incompatible with the checkpoint even if the tensor
             // manifest validates successfully.
             width: config.hidden_size,
-            head_dim: full_head_dim,
+            head_dim,
+            kv_width: kv_heads * head_dim,
+            num_q_heads: config.num_attention_heads,
+            kv_heads,
         }
     }
 }
@@ -1596,19 +1673,40 @@ fn system_memory_bytes() -> Option<usize> {
     }
 }
 
-fn causal_attention(q: &[f32], keys_values: &[(&[f32], &[f32])], head_dim: usize) -> Vec<f32> {
-    if keys_values.is_empty() {
+fn causal_attention(
+    q: &[f32],
+    keys_values: &[(&[f32], &[f32])],
+    num_q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    if keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
         return vec![0.0; q.len()];
     }
-    let scale = (head_dim.max(1) as f32).sqrt().recip();
-    let mut scores: Vec<f32> = keys_values
-        .iter()
-        .map(|(k, _)| q.iter().zip(*k).map(|(a, b)| a * b).sum::<f32>() * scale)
-        .collect();
-    softmax_in_place(&mut scores);
-    let mut out = vec![0.0f32; q.len()];
-    for (weight, (_, value)) in scores.into_iter().zip(keys_values) {
-        add_scaled_in_place(&mut out, value, weight);
+    let q_width = num_q_heads * head_dim;
+    let groups_per_kv = num_q_heads / kv_heads.max(1);
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut out = vec![0.0f32; q_width];
+    for qh in 0..num_q_heads {
+        let kv_head = qh / groups_per_kv.max(1);
+        let q_slice = &q[qh * head_dim..(qh + 1) * head_dim];
+        // score this Q head against every token's corresponding K head
+        let mut scores: Vec<f32> = keys_values
+            .iter()
+            .map(|(k, _)| {
+                let k_slice = &k[kv_head * head_dim..(kv_head + 1) * head_dim];
+                q_slice.iter().zip(k_slice).map(|(a, b)| a * b).sum::<f32>() * scale
+            })
+            .collect();
+        softmax_in_place(&mut scores);
+        // weighted sum of corresponding V head
+        let out_slice = &mut out[qh * head_dim..(qh + 1) * head_dim];
+        for (weight, (_, value)) in scores.into_iter().zip(keys_values.iter()) {
+            let v_slice = &value[kv_head * head_dim..(kv_head + 1) * head_dim];
+            for (o, v) in out_slice.iter_mut().zip(v_slice) {
+                *o += weight * v;
+            }
+        }
     }
     out
 }
@@ -2248,6 +2346,8 @@ impl KvCache {
         position: usize,
         layer: usize,
         query: &[f32],
+        num_q_heads: usize,
+        kv_heads: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>> {
         self.ensure_position(position)?;
@@ -2263,7 +2363,13 @@ impl KvCache {
                     .map(|(key, value)| (key.as_slice(), value.as_slice()))
             })
             .collect();
-        Ok(causal_attention(query, &keys_values, head_dim))
+        Ok(causal_attention(
+            query,
+            &keys_values,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+        ))
     }
 
     #[allow(dead_code)]
@@ -2688,6 +2794,10 @@ fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
     format!("model.layers.{layer}.{name}.weight")
 }
 
+fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert.{projection}.weight")
+}
+
 fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {
     let bytes_per_row = cols.saturating_mul(std::mem::size_of::<f32>()).max(1);
     (DENSE_PROJECTION_TILE_BYTES / bytes_per_row)
@@ -2833,6 +2943,45 @@ impl DenseStore {
             }
         }
         self.project(layer, name, input, width)
+    }
+
+    /// Project using a fully-qualified canonical tensor name (e.g. for shared
+    /// experts or any non-attention projection).  Falls back to a zero-vector
+    /// when the tensor is absent (tensor not present in this checkpoint means
+    /// the feature is disabled for this model variant).
+    fn project_dense_tensor_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        tensor_name: &str,
+        input: &[f32],
+        output_width: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let entry = match self.registry.tensor(tensor_name) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        let rows = entry
+            .shape
+            .first()
+            .copied()
+            .unwrap_or(output_width)
+            .min(output_width);
+        if rows == 0 || cols == 0 {
+            return Ok(None);
+        }
+        if let Some(metal) = metal {
+            let used_cols = cols.min(input.len());
+            if used_cols > 0 && used_cols == cols {
+                return self
+                    .metal_matvec_tiled(metal, tensor_name, input, rows, cols, output_width)
+                    .map(Some);
+            }
+        }
+        if let Some(projected) = self.matvec_tensor_prefix(tensor_name, input, output_width)? {
+            return Ok(Some(projected));
+        }
+        Ok(None)
     }
 
     fn rms_norm(&self, canonical_name: &str, input: &[f32]) -> Result<Vec<f32>> {
@@ -4498,6 +4647,58 @@ kernel void topk_vocab(
     indices[slot] = best_i;
     values[slot] = best;
 }
+
+// Multi-head GQA attention scores.
+// One thread per (q_head, token) pair: tid = q_head * tokens + token.
+// query   : [num_q_heads * head_dim]
+// keys    : [tokens * kv_width]   (layer-offset slice supplied by the caller)
+// scores  : [num_q_heads * tokens]  (output)
+kernel void gqa_attention_scores(
+    device const float* query       [[buffer(0)]],
+    device const float* keys        [[buffer(1)]],
+    device float*       scores      [[buffer(2)]],
+    constant uint& head_dim         [[buffer(3)]],
+    constant uint& groups_per_kv    [[buffer(4)]],
+    constant uint& tokens           [[buffer(5)]],
+    constant uint& kv_width         [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]) {
+    uint q_head  = tid / max(tokens, 1u);
+    uint token   = tid % max(tokens, 1u);
+    uint kv_head = q_head / max(groups_per_kv, 1u);
+    float acc = 0.0f;
+    uint q_base = q_head  * head_dim;
+    uint k_base = token   * kv_width + kv_head * head_dim;
+    for (uint d = 0; d < head_dim; ++d) {
+        acc = fma(query[q_base + d], keys[k_base + d], acc);
+    }
+    scores[q_head * max(tokens, 1u) + token] = acc * rsqrt(float(max(head_dim, 1u)));
+}
+
+// Multi-head GQA weighted value aggregation.
+// One thread per output element idx = q_head * head_dim + d.
+// scores  : [num_q_heads * tokens]  (softmax-normalised per Q-head, supplied by caller)
+// values  : [tokens * kv_width]     (layer-offset slice supplied by the caller)
+// output  : [num_q_heads * head_dim]
+kernel void gqa_kv_read_attention(
+    device const float* scores      [[buffer(0)]],
+    device const float* values      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    constant uint& head_dim         [[buffer(3)]],
+    constant uint& groups_per_kv    [[buffer(4)]],
+    constant uint& tokens           [[buffer(5)]],
+    constant uint& kv_width         [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint q_head  = idx / max(head_dim, 1u);
+    uint d       = idx % max(head_dim, 1u);
+    uint kv_head = q_head / max(groups_per_kv, 1u);
+    float acc = 0.0f;
+    for (uint token = 0; token < tokens; ++token) {
+        float w = scores[q_head * max(tokens, 1u) + token];
+        float v = values[token * kv_width + kv_head * head_dim + d];
+        acc = fma(w, v, acc);
+    }
+    output[idx] = acc;
+}
 "#;
 
 pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<FlashMoePlan> {
@@ -5455,6 +5656,8 @@ mod tests {
             "expert_mlp_fused",
             "lm_head_logits",
             "topk_vocab",
+            "gqa_attention_scores",
+            "gqa_kv_read_attention",
         ] {
             assert!(
                 METAL_SHADERS.contains(&format!("kernel void {kernel}")),
@@ -6014,7 +6217,13 @@ mod tests {
         rms_norm_in_place(&mut hidden);
         let before = hidden.clone();
         apply_rotary(&mut hidden, 4, runtime.head_dim, config.rope_theta.unwrap());
-        let attended = causal_attention(&hidden, &[(&before, &before)], runtime.head_dim);
+        let attended = causal_attention(
+            &hidden,
+            &[(&before, &before)],
+            runtime.num_q_heads,
+            runtime.kv_heads,
+            runtime.head_dim,
+        );
         assert_eq!(attended.len(), runtime.width);
     }
 
@@ -6035,10 +6244,13 @@ mod tests {
             br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4,"max_position_embeddings":131072}"#,
         )
         .unwrap();
-        let context = metal_kv_max_context(&config, 4096, 64 * 1024 * 1024 * 1024);
+        let runtime = DenseTransformerRuntime::new(&config);
+        // kv_width = kv_heads * head_dim = 8 * 128 = 1024
+        assert_eq!(runtime.kv_width, 1024);
+        let context = metal_kv_max_context(&config, runtime.kv_width, 64 * 1024 * 1024 * 1024);
         assert!(context < 131_072);
         assert!(
-            metal_kv_cache_bytes(config.num_hidden_layers, context, 4096)
+            metal_kv_cache_bytes(config.num_hidden_layers, context, runtime.kv_width)
                 <= 16 * 1024 * 1024 * 1024
         );
     }
