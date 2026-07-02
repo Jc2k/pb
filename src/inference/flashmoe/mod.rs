@@ -160,6 +160,15 @@ pub struct QwenModelConfig {
     pub moe_intermediate_size: Option<usize>,
     pub intermediate_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
+    /// Whether the output projection (lm_head) shares weights with the input embedding
+    /// (model.embed_tokens).  When true or absent, lm_head.weight is optional in the manifest.
+    pub tie_word_embeddings: Option<bool>,
+    /// Number of always-active shared experts per MoE layer (Qwen3 MoE architecture).
+    /// These are dense and live in the dense store rather than the per-expert pack files.
+    pub num_shared_experts: Option<usize>,
+    /// Intermediate size for the shared expert MLPs.  Falls back to moe_intermediate_size
+    /// then intermediate_size when absent.
+    pub shared_expert_intermediate_size: Option<usize>,
 }
 
 impl QwenModelConfig {
@@ -2492,23 +2501,15 @@ fn validate_required_tensor_manifest(
 ) -> Result<()> {
     let head_dim = config.hidden_size / config.num_attention_heads.max(1);
     let kv_width = config.kv_heads() * head_dim;
-    let intermediate = config
-        .moe_intermediate_size
-        .or(config.intermediate_size)
-        .context("Qwen config is missing moe_intermediate_size/intermediate_size")?;
     require_tensor_shape(
         registry,
         "model.embed_tokens.weight",
         &[config.vocab_size, config.hidden_size],
     )?;
     require_tensor_shape(registry, "model.norm.weight", &[config.hidden_size])?;
-    if registry.tensor("lm_head.weight").is_none()
-        && registry.tensor("model.embed_tokens.weight").is_none()
-    {
-        bail!(
-            "Flash-MoE dense tensor registry is missing lm_head.weight and tied model.embed_tokens.weight"
-        );
-    }
+    // lm_head.weight is optional: when absent (or when tie_word_embeddings is true) the model
+    // uses tied embeddings and reuses model.embed_tokens.weight (already validated above) for
+    // the output projection.
     if registry.tensor("lm_head.weight").is_some() {
         require_tensor_shape(
             registry,
@@ -2552,24 +2553,16 @@ fn validate_required_tensor_manifest(
             &router_tensor_name(layer),
             &[config.experts(), config.hidden_size],
         )?;
-        for expert in 0..config.experts() {
-            let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
-            require_tensor_shape(
-                registry,
-                &format!("{prefix}.gate_proj.weight"),
-                &[intermediate, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &format!("{prefix}.up_proj.weight"),
-                &[intermediate, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &format!("{prefix}.down_proj.weight"),
-                &[config.hidden_size, intermediate],
-            )?;
-        }
+        // Per-expert tensor presence is intentionally not validated here.
+        //
+        // Reasons:
+        // 1. Expert MLP correctness (gate/up/down projection shapes) is enforced per-expert at
+        //    pack time by `validate_expert_tensor_group`.
+        // 2. At runtime the packed expert files are managed by `ExpertStore`; the registry records
+        //    their original source metadata but is not used for expert inference.
+        // 3. Real Qwen3 revision checkpoints may differ in expert naming (e.g. shared experts)
+        //    or use a naming scheme that doesn't match the exact pattern assumed here.
+        //    A rigid per-name loop would cause false rejections for such models.
     }
     Ok(())
 }
@@ -5422,6 +5415,288 @@ mod tests {
             err.to_string().contains("model.embed_tokens.weight"),
             "{err:#}"
         );
+    }
+
+    /// Build a `FlashMoeManifest` containing every dense tensor required by `validate_required_tensor_manifest`
+    /// for a tiny 1-layer, 8-hidden-dim, 2-head, 1-kv-head, 128-vocab, 4-expert model.
+    fn minimal_dense_manifest(with_lm_head: bool) -> (QwenModelConfig, FlashMoeManifest) {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
+        let mut tensors = vec![
+            ("model.embed_tokens.weight", vec![128usize, 8]),
+            ("model.norm.weight", vec![8]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+            ("model.layers.0.input_layernorm.weight", vec![8]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![8]),
+            ("model.layers.0.mlp.gate.weight", vec![4, 8]),
+        ];
+        if with_lm_head {
+            tensors.push(("lm_head.weight", vec![128, 8]));
+        }
+        let dense_tensors = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, shape))| {
+                let byte_len: u64 =
+                    shape.iter().product::<usize>() as u64 * 2; // BF16 = 2 bytes/elem
+                DenseTensorRef {
+                    tensor: name.to_string(),
+                    shard: "shard.safetensors".to_string(),
+                    dtype: "BF16".to_string(),
+                    shape: shape.clone(),
+                    source_offsets: [0, byte_len],
+                    runtime_offset: i as u64 * 4096,
+                    byte_len,
+                }
+            })
+            .collect();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["shard.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors,
+        };
+        (config, manifest)
+    }
+
+    #[test]
+    fn validate_accepts_tied_lm_head() {
+        // lm_head.weight absent → tied embeddings; validator should pass.
+        let (config, manifest) = minimal_dense_manifest(false);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("tied-embedding manifest should pass validation");
+    }
+
+    #[test]
+    fn validate_accepts_separate_lm_head() {
+        // lm_head.weight present with correct shape → should pass.
+        let (config, manifest) = minimal_dense_manifest(true);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("manifest with separate lm_head should pass validation");
+    }
+
+    #[test]
+    fn validate_rejects_misshapen_lm_head() {
+        let (config, mut manifest) = minimal_dense_manifest(true);
+        // Corrupt the lm_head shape so it has wrong dimensions.
+        for t in &mut manifest.dense_tensors {
+            if t.tensor == "lm_head.weight" {
+                t.shape = vec![128, 16]; // should be [128, 8]
+            }
+        }
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("lm_head.weight"),
+            "expected lm_head shape error, got: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("expected"),
+            "expected shape mismatch message, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_expert_tensors_absent_from_registry() {
+        // Expert tensors are packed into ExpertStore files and need not all appear in the dense
+        // registry.  The validator must not reject a registry that has no expert entries.
+        let (config, manifest) = minimal_dense_manifest(false);
+        assert!(manifest.expert_tensors.is_empty());
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("registry without expert tensors should still pass dense validation");
+    }
+
+    #[test]
+    fn qwen_config_deserializes_qwen3_moe_extra_fields() {
+        // Real Qwen3 MoE checkpoints include additional config fields that should be parsed
+        // without error and reflected in the struct.
+        let json = br#"{
+            "model_type": "qwen3_moe",
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "num_hidden_layers": 60,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "rope_theta": 1000000.0,
+            "torch_dtype": "bfloat16",
+            "num_experts": 512,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1536,
+            "tie_word_embeddings": false,
+            "num_shared_experts": 1,
+            "shared_expert_intermediate_size": 1536
+        }"#;
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.tie_word_embeddings, Some(false));
+        assert_eq!(config.num_shared_experts, Some(1));
+        assert_eq!(config.shared_expert_intermediate_size, Some(1536));
+        assert_eq!(config.experts(), 512);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
+        // Fixture derived from the Qwen3 MoE architecture:
+        //   - q_norm / k_norm per attention layer (Qwen3 QK-norm)
+        //   - shared_expert MLP that is always active (not routed through gate)
+        //   - separate lm_head.weight (tie_word_embeddings=false)
+        //   - 4 routable experts per layer
+        // All of these tensors should be classified correctly (dense vs expert) and the
+        // validator should accept the resulting manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+
+        // config.json with Qwen3-style extra fields
+        std::fs::write(
+            snapshot.join("config.json"),
+            br#"{
+                "model_type": "qwen3_moe",
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "num_hidden_layers": 1,
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "vocab_size": 300,
+                "rope_theta": 1000000.0,
+                "torch_dtype": "bfloat16",
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 16,
+                "tie_word_embeddings": false,
+                "num_shared_experts": 1,
+                "shared_expert_intermediate_size": 16
+            }"#,
+        )
+        .unwrap();
+
+        // Dense shard: all non-expert tensors including Qwen3-specific q_norm/k_norm and
+        // shared_expert projections.  Shapes are consistent with the config above.
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
+        let dense_shard = make_typed_safetensors(&[
+            ("model.embed_tokens.weight",             "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
+            ("lm_head.weight",                        "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
+            ("model.norm.weight",                     "BF16", vec![8],       &vec![0u8; 8*2]),
+            ("model.layers.0.self_attn.q_proj.weight","BF16", vec![8, 8],    &vec![0u8; 8*8*2]),
+            ("model.layers.0.self_attn.k_proj.weight","BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
+            ("model.layers.0.self_attn.v_proj.weight","BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
+            ("model.layers.0.self_attn.o_proj.weight","BF16", vec![8, 8],    &vec![0u8; 8*8*2]),
+            // QK-norm tensors present in Qwen3 MoE checkpoints
+            ("model.layers.0.self_attn.q_norm.weight","BF16", vec![4],       &vec![0u8; 4*2]),
+            ("model.layers.0.self_attn.k_norm.weight","BF16", vec![4],       &vec![0u8; 4*2]),
+            ("model.layers.0.input_layernorm.weight", "BF16", vec![8],       &vec![0u8; 8*2]),
+            ("model.layers.0.post_attention_layernorm.weight","BF16",vec![8],&vec![0u8; 8*2]),
+            ("model.layers.0.mlp.gate.weight",        "BF16", vec![4, 8],    &vec![0u8; 4*8*2]),
+            // Shared expert (always active, not gated): treated as dense, not packed
+            ("model.layers.0.mlp.shared_expert.gate_proj.weight","BF16",vec![16,8],&vec![0u8;16*8*2]),
+            ("model.layers.0.mlp.shared_expert.up_proj.weight",  "BF16",vec![16,8],&vec![0u8;16*8*2]),
+            ("model.layers.0.mlp.shared_expert.down_proj.weight","BF16",vec![8,16],&vec![0u8;8*16*2]),
+        ]);
+        std::fs::write(snapshot.join("dense.safetensors"), dense_shard).unwrap();
+
+        // Expert shard: 4 routed experts, each with gate/up/down projections.
+        let mut expert_entries: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+        let gate_bytes = vec![0u8; 16 * 8 * 2];
+        let down_bytes = vec![0u8; 8 * 16 * 2];
+        let names: Vec<(String, String, String)> = (0..4)
+            .flat_map(|e| {
+                let pfx = format!("model.layers.0.mlp.experts.{e}");
+                [
+                    (format!("{pfx}.gate_proj.weight"), "gate".to_string(), format!("{e}-gate")),
+                    (format!("{pfx}.up_proj.weight"),   "up".to_string(),   format!("{e}-up")),
+                    (format!("{pfx}.down_proj.weight"),  "down".to_string(), format!("{e}-down")),
+                ]
+            })
+            .collect();
+        for (name, proj, _) in &names {
+            let (shape, data): (Vec<usize>, &[u8]) = if proj == "down" {
+                (vec![8, 16], &down_bytes)
+            } else {
+                (vec![16, 8], &gate_bytes)
+            };
+            expert_entries.push((name.as_str(), "BF16", shape, data.to_vec()));
+        }
+        std::fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(
+                &expert_entries
+                    .iter()
+                    .map(|(n, d, s, b)| (*n, *d, s.clone(), b.as_slice()))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap();
+
+        // Build weight_map: all tensors → their shard file
+        let mut weight_map = serde_json::Map::new();
+        // dense tensors
+        for name in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.norm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.layers.0.mlp.shared_expert.down_proj.weight",
+        ] {
+            weight_map.insert(name.to_string(), serde_json::Value::String("dense.safetensors".to_string()));
+        }
+        // expert tensors
+        for (name, _, _) in &names {
+            weight_map.insert(name.clone(), serde_json::Value::String("expert.safetensors".to_string()));
+        }
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            serde_json::to_string(&serde_json::json!({"weight_map": weight_map})).unwrap(),
+        )
+        .unwrap();
+
+        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot)
+            .expect("build should succeed for Qwen3-style snapshot with qknorm and shared_expert");
+
+        // Validate: manifest should classify shared_expert and q/k_norm as dense, not expert.
+        let manifest: FlashMoeManifest =
+            serde_json::from_slice(&std::fs::read(&plan.tensor_manifest).unwrap()).unwrap();
+        assert!(
+            manifest.dense_tensors.iter().any(|t| t.tensor.contains("q_norm")),
+            "q_norm should be a dense tensor"
+        );
+        assert!(
+            manifest.dense_tensors.iter().any(|t| t.tensor.contains("k_norm")),
+            "k_norm should be a dense tensor"
+        );
+        assert!(
+            manifest.dense_tensors.iter().any(|t| t.tensor.contains("shared_expert")),
+            "shared_expert should be a dense tensor"
+        );
+        // 4 experts × 3 projections = 12 expert tensor entries
+        assert_eq!(manifest.expert_tensors.len(), 12);
+
+        // The validator must accept the resulting registry.
+        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let registry = TensorRegistry::load(&plan.tensor_manifest).unwrap();
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("Qwen3-style manifest should pass validation");
     }
 
     #[test]
