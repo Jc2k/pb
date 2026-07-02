@@ -26,6 +26,9 @@ use std::io::{Seek, Write};
 pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
 pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
+/// Lowercase substring used to identify Qwen3 MoE checkpoints with active
+/// parameter counts in their HF repository names, e.g. Qwen3-30B-A3B.
+pub const QWEN3_ACTIVE_PARAMS_MARKER: &str = "-a";
 /// Hugging Face model URI for the Qwen3-VL multimodal MoE model.
 pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
 /// Lowercase substring used to identify Qwen3-VL MoE model strings.
@@ -202,6 +205,9 @@ pub struct QwenModelConfig {
     pub num_key_value_heads: Option<usize>,
     pub vocab_size: usize,
     pub rope_theta: Option<f64>,
+    /// Optional Qwen-family partial rotary factor. Standard Qwen attention normally
+    /// uses full-head RoPE when absent. Gated-Q Flash-MoE attention defaults to 0.25.
+    pub partial_rotary_factor: Option<f64>,
     pub torch_dtype: Option<String>,
     pub num_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
@@ -346,6 +352,11 @@ impl QwenModelConfig {
                 bail!("rope_theta must be positive and finite, got {theta}");
             }
         }
+        if let Some(factor) = self.partial_rotary_factor {
+            if !factor.is_finite() || factor <= 0.0 || factor > 1.0 {
+                bail!("partial_rotary_factor must be in (0, 1], got {factor}");
+            }
+        }
         if let Some(dtype) = &self.torch_dtype {
             let dtype = dtype.to_ascii_lowercase();
             if !matches!(
@@ -388,11 +399,15 @@ pub fn select_backend(model: &str) -> BackendSelection {
 }
 
 pub fn supports_flashmoe(model: &str) -> bool {
-    is_arm_macos() && (is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model))
+    is_arm_macos() && is_flashmoe_model_name(model)
 }
 
 pub fn is_arm_macos() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+fn is_flashmoe_model_name(model: &str) -> bool {
+    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model)
 }
 
 pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
@@ -403,6 +418,27 @@ pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
 /// Returns `true` when `model` identifies a Qwen3-VL MoE multimodal model.
 pub fn is_qwen3_vl(model: &str) -> bool {
     model.to_ascii_lowercase().contains(QWEN3_VL_MODEL_MARKER)
+}
+
+/// Returns `true` for HuggingFace-style Qwen3 MoE checkpoint names such as
+/// `Qwen3-30B-A3B` and `Qwen3-235B-A22B-Instruct`.
+pub fn is_qwen3_moe(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains("qwen3")
+        && (normalized.contains("moe") || contains_active_parameter_marker(&normalized))
+}
+
+fn contains_active_parameter_marker(model: &str) -> bool {
+    let mut remainder = model;
+    while let Some(start) = remainder.find(QWEN3_ACTIVE_PARAMS_MARKER) {
+        let rest = &remainder[start + QWEN3_ACTIVE_PARAMS_MARKER.len()..];
+        let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digits > 0 && rest[digits..].starts_with('b') {
+            return true;
+        }
+        remainder = rest;
+    }
+    false
 }
 
 pub fn canonical_model(model: &str) -> String {
@@ -506,6 +542,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         plan.tensor_manifest.clone(),
     )?;
     validate_required_tensor_manifest(&config, dense.registry())?;
+    let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
     let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
     Ok(FlashMoeEngine {
         plan: plan.clone(),
@@ -516,6 +553,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         metal: MetalExecutor::new(plan, &config)?,
         vision_encoder,
         config,
+        runtime,
     })
 }
 
@@ -528,6 +566,7 @@ pub struct FlashMoeEngine {
     tokenizer: QwenTokenizer,
     metal: Option<MetalExecutor>,
     config: QwenModelConfig,
+    runtime: DenseTransformerRuntime,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
 }
@@ -1572,7 +1611,7 @@ impl FlashMoeEngine {
         position: usize,
         record_generated: bool,
     ) -> Result<Vec<f32>> {
-        let runtime = DenseTransformerRuntime::new(&self.config);
+        let runtime = &self.runtime;
         let mut hidden = if let Some(mut emb) = embedding_override {
             if emb.len() != runtime.width {
                 tracing::warn!(
@@ -1674,83 +1713,72 @@ impl FlashMoeEngine {
         position: usize,
         runtime: &DenseTransformerRuntime,
     ) -> Result<Vec<f32>> {
-        let mut q =
-            self.dense
-                .project_with_metal(self.metal.as_ref(), layer, "q_proj", normed, runtime.width)?;
+        let layout = runtime.full_attention_layout(layer)?;
+
+        let q_projected = self.dense.project_with_metal(
+            self.metal.as_ref(),
+            layer,
+            "q_proj",
+            normed,
+            layout.q_projection_width,
+        )?;
         let mut k = self.dense.project_with_metal(
             self.metal.as_ref(),
             layer,
             "k_proj",
             normed,
-            runtime.kv_width,
+            layout.kv_width,
         )?;
         let v = self.dense.project_with_metal(
             self.metal.as_ref(),
             layer,
             "v_proj",
             normed,
-            runtime.kv_width,
+            layout.kv_width,
         )?;
-        if let Some(metal) = &self.metal {
-            q = metal.apply_rope(
-                &q,
-                position,
-                runtime.head_dim,
-                self.config.rope_theta.unwrap_or(1_000_000.0),
-            )?;
-            k = metal.apply_rope(
-                &k,
-                position,
-                runtime.head_dim,
-                self.config.rope_theta.unwrap_or(1_000_000.0),
-            )?;
-        } else {
-            apply_rotary(
-                &mut q,
-                position,
-                runtime.head_dim,
-                self.config.rope_theta.unwrap_or(1_000_000.0),
-            );
-            apply_rotary(
-                &mut k,
-                position,
-                runtime.head_dim,
-                self.config.rope_theta.unwrap_or(1_000_000.0),
-            );
-        }
+
+        let (mut q, q_gate) = split_q_projection(q_projected, layout)?;
+
+        // Qwen full-attention variants apply Q/K RMSNorm before RoPE.
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
         let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
-        if let Some(q_norm_w) = self.dense.norm_weight(&q_norm_name, runtime.head_dim)? {
-            for head in q.chunks_mut(runtime.head_dim) {
-                rms_norm_with_weight_in_place(head, Some(&q_norm_w));
+
+        let q_norm_w = self.dense.norm_weight(&q_norm_name, layout.head_dim)?;
+        apply_per_head_rms_norm(&mut q, layout.num_q_heads, layout.head_dim, q_norm_w.as_deref())?;
+
+        let k_norm_w = self.dense.norm_weight(&k_norm_name, layout.head_dim)?;
+        apply_per_head_rms_norm(&mut k, layout.kv_heads, layout.head_dim, k_norm_w.as_deref())?;
+
+        let theta = self.config.rope_theta.unwrap_or_else(|| {
+            if layout.q_layout == FullAttentionQLayout::Gated {
+                10_000_000.0
+            } else {
+                1_000_000.0
+            }
+        });
+        apply_rotary_for_layout(&mut q, &mut k, position, theta, layout);
+
+        // Soundness-first path:
+        // The existing Metal KV cache has a single global width derived from config.
+        // That is not safe for gated-Q/full-attention layouts whose K/V width is
+        // inferred from the manifest.  Use the CPU-side KvCache here until the Metal
+        // KV cache is made layout-aware.
+        kv_cache.record_kv(position, layer, k, v)?;
+        let mut attended = kv_cache.causal_attention(
+            position,
+            layer,
+            &q,
+            layout.num_q_heads,
+            layout.kv_heads,
+            layout.head_dim,
+        )?;
+
+        if let Some(q_gate) = q_gate {
+            for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
+                *value *= sigmoid(*gate);
             }
         }
-        if let Some(k_norm_w) = self.dense.norm_weight(&k_norm_name, runtime.head_dim)? {
-            for head in k.chunks_mut(runtime.head_dim) {
-                rms_norm_with_weight_in_place(head, Some(&k_norm_w));
-            }
-        }
-        let attended = if let Some(metal) = &self.metal {
-            metal.record_kv(position, layer, &k, &v)?;
-            metal.causal_attention_cached(
-                position,
-                layer,
-                &q,
-                runtime.num_q_heads,
-                runtime.kv_heads,
-                runtime.head_dim,
-            )?
-        } else {
-            kv_cache.record_kv(position, layer, k, v)?;
-            kv_cache.causal_attention(
-                position,
-                layer,
-                &q,
-                runtime.num_q_heads,
-                runtime.kv_heads,
-                runtime.head_dim,
-            )?
-        };
+
         self.dense
             .project_with_metal(self.metal.as_ref(), layer, "o_proj", &attended, runtime.width)
     }
@@ -1774,7 +1802,12 @@ impl FlashMoeEngine {
 
         let mut qkv = self
             .dense
-            .project_dense_tensor_with_metal(self.metal.as_ref(), &qkv_name, normed, LINEAR_CONV_DIM)?
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &qkv_name,
+                normed,
+                LINEAR_CONV_DIM,
+            )?
             .context("missing linear_attn.in_proj_qkv tensor for GatedDeltaNet layer")?;
         let z = self
             .dense
@@ -1899,7 +1932,12 @@ impl FlashMoeEngine {
         }
 
         self.dense
-            .project_dense_tensor_with_metal(self.metal.as_ref(), &out_proj_name, &out_values, width)?
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &out_proj_name,
+                &out_values,
+                width,
+            )?
             .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")
     }
 
@@ -1924,9 +1962,12 @@ impl FlashMoeEngine {
             normed,
             shared_inter,
         )?;
-        let up_opt =
-            self.dense
-                .project_dense_tensor_with_metal(self.metal.as_ref(), &up_name, normed, shared_inter)?;
+        let up_opt = self.dense.project_dense_tensor_with_metal(
+            self.metal.as_ref(),
+            &up_name,
+            normed,
+            shared_inter,
+        )?;
         if let (Some(gate), Some(up)) = (gate_opt, up_opt) {
             let mut activated: Vec<f32> = gate
                 .iter()
@@ -1960,14 +2001,16 @@ impl FlashMoeEngine {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DenseTransformerRuntime {
     width: usize,
     head_dim: usize,
-    /// Width of each K/V projection: kv_heads × head_dim.
+    /// Config-derived default K/V width. This remains useful for legacy Metal
+    /// allocation, but full-attention execution should use per-layer layouts.
     kv_width: usize,
     num_q_heads: usize,
     kv_heads: usize,
+    full_attention: Vec<Option<FullAttentionLayout>>,
 }
 
 impl DenseTransformerRuntime {
@@ -1975,15 +2018,227 @@ impl DenseTransformerRuntime {
         let head_dim = config.hidden_size / config.num_attention_heads.max(1);
         let kv_heads = config.kv_heads();
         Self {
-            // The runtime width is the model hidden size. Truncating this value
-            // makes every projection, residual, expert output, and LM-head row
-            // numerically incompatible with the checkpoint even if the tensor
-            // manifest validates successfully.
             width: config.hidden_size,
             head_dim,
             kv_width: kv_heads * head_dim,
             num_q_heads: config.num_attention_heads,
             kv_heads,
+            full_attention: vec![None; config.num_hidden_layers],
+        }
+    }
+
+    fn from_registry(config: &QwenModelConfig, registry: &TensorRegistry) -> Result<Self> {
+        let mut runtime = Self::new(config);
+        let has_linear_attention = (0..config.num_hidden_layers)
+            .filter(|layer| !is_full_attention_layer(*layer))
+            .any(|layer| registry.tensor(&linear_attention_tensor_name(layer, "in_proj_qkv")).is_some());
+
+        for layer in 0..config.num_hidden_layers {
+            let is_full = !has_linear_attention || is_full_attention_layer(layer);
+            if is_full {
+                runtime.full_attention[layer] =
+                    Some(infer_full_attention_layout(config, registry, layer)?);
+            }
+        }
+
+        Ok(runtime)
+    }
+
+    fn full_attention_layout(&self, layer: usize) -> Result<FullAttentionLayout> {
+        self.full_attention
+            .get(layer)
+            .copied()
+            .flatten()
+            .with_context(|| format!("missing full-attention runtime layout for layer {layer}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAttentionQLayout {
+    Standard,
+    Gated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotaryPairing {
+    Adjacent,
+    SplitHalf,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionLayout {
+    q_layout: FullAttentionQLayout,
+    q_projection_width: usize,
+    q_width: usize,
+    kv_width: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    num_q_heads: usize,
+    kv_heads: usize,
+    rotary_pairing: RotaryPairing,
+}
+
+fn infer_full_attention_layout(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<FullAttentionLayout> {
+    let q_name = attention_tensor_name(layer, "q_proj");
+    let k_name = attention_tensor_name(layer, "k_proj");
+    let v_name = attention_tensor_name(layer, "v_proj");
+    let o_name = attention_tensor_name(layer, "o_proj");
+
+    let (q_rows, q_cols) = require_2d_tensor_shape(registry, &q_name)?;
+    let (k_rows, k_cols) = require_2d_tensor_shape(registry, &k_name)?;
+    let (v_rows, v_cols) = require_2d_tensor_shape(registry, &v_name)?;
+    let (o_rows, o_cols) = require_2d_tensor_shape(registry, &o_name)?;
+
+    let num_q_heads = config.num_attention_heads;
+    let kv_heads = config.kv_heads();
+
+    if q_cols != config.hidden_size
+        || k_cols != config.hidden_size
+        || v_cols != config.hidden_size
+    {
+        bail!(
+            "full-attention layer {layer} projection input widths are q={q_cols}, k={k_cols}, v={v_cols}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if o_rows != config.hidden_size {
+        bail!(
+            "full-attention layer {layer} o_proj output rows {o_rows}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if k_rows != v_rows {
+        bail!(
+            "full-attention layer {layer} k_proj rows {k_rows} do not match v_proj rows {v_rows}"
+        );
+    }
+    if k_rows == 0 || k_rows % kv_heads != 0 {
+        bail!(
+            "full-attention layer {layer} k/v width {k_rows} is not divisible by kv_heads {kv_heads}"
+        );
+    }
+
+    let head_dim = k_rows / kv_heads;
+    let q_width = num_q_heads
+        .checked_mul(head_dim)
+        .context("full-attention q_width overflow")?;
+    let gated_q_width = q_width
+        .checked_mul(2)
+        .context("gated full-attention q_width overflow")?;
+
+    if q_rows == q_width && o_cols == q_width {
+        return Ok(FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: q_width,
+            q_width,
+            kv_width: k_rows,
+            head_dim,
+            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Standard),
+            num_q_heads,
+            kv_heads,
+            rotary_pairing: RotaryPairing::Adjacent,
+        });
+    }
+
+    if q_rows == gated_q_width && o_cols == q_width {
+        return Ok(FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Gated,
+            q_projection_width: gated_q_width,
+            q_width,
+            kv_width: k_rows,
+            head_dim,
+            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Gated),
+            num_q_heads,
+            kv_heads,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        });
+    }
+
+    bail!(
+        "unsupported full-attention layer {layer} layout: q_proj rows={q_rows}, k/v rows={k_rows}, o_proj shape=[{o_rows},{o_cols}], num_q_heads={num_q_heads}, kv_heads={kv_heads}, inferred head_dim={head_dim}; expected standard q_rows={q_width}, o_cols={q_width}, or gated q_rows={gated_q_width}, o_cols={q_width}"
+    )
+}
+
+fn rotary_dim_for(
+    config: &QwenModelConfig,
+    head_dim: usize,
+    q_layout: FullAttentionQLayout,
+) -> usize {
+    let factor = config.partial_rotary_factor.unwrap_or_else(|| {
+        if q_layout == FullAttentionQLayout::Gated {
+            0.25
+        } else {
+            1.0
+        }
+    });
+
+    let mut rotary_dim = ((head_dim as f64) * factor).round() as usize;
+    rotary_dim = rotary_dim.clamp(2, head_dim);
+    rotary_dim - (rotary_dim % 2)
+}
+
+fn require_2d_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+) -> Result<(usize, usize)> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [rows, cols] if *rows > 0 && *cols > 0 => Ok((*rows, *cols)),
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 2-D matrix",
+            shape
+        ),
+    }
+}
+
+fn split_q_projection(
+    projected: Vec<f32>,
+    layout: FullAttentionLayout,
+) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+    match layout.q_layout {
+        FullAttentionQLayout::Standard => {
+            if projected.len() != layout.q_width {
+                bail!(
+                    "standard q_proj produced {} values; expected {}",
+                    projected.len(),
+                    layout.q_width
+                );
+            }
+            Ok((projected, None))
+        }
+        FullAttentionQLayout::Gated => {
+            if projected.len() != layout.q_projection_width {
+                bail!(
+                    "gated q_proj produced {} values; expected {}",
+                    projected.len(),
+                    layout.q_projection_width
+                );
+            }
+
+            let mut q = vec![0.0f32; layout.q_width];
+            let mut gate = vec![0.0f32; layout.q_width];
+
+            for head in 0..layout.num_q_heads {
+                let src = head * 2 * layout.head_dim;
+                let dst = head * layout.head_dim;
+
+                q[dst..dst + layout.head_dim]
+                    .copy_from_slice(&projected[src..src + layout.head_dim]);
+                gate[dst..dst + layout.head_dim]
+                    .copy_from_slice(&projected[src + layout.head_dim..src + 2 * layout.head_dim]);
+            }
+
+            Ok((q, Some(gate)))
         }
     }
 }
@@ -2008,10 +2263,67 @@ fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
 }
 
 fn apply_rotary(values: &mut [f32], position: usize, head_dim: usize, theta: f64) {
+    apply_rotary_adjacent(values, position, head_dim, head_dim, theta);
+}
+
+fn apply_per_head_rms_norm(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    weight: Option<&[f32]>,
+) -> Result<()> {
+    if values.len() != heads.saturating_mul(head_dim) {
+        bail!(
+            "per-head RMSNorm got {} values; expected heads {heads} * head_dim {head_dim}",
+            values.len()
+        );
+    }
+    if let Some(weight) = weight {
+        if weight.len() < head_dim {
+            bail!(
+                "per-head RMSNorm weight has len {}; expected at least head_dim {head_dim}",
+                weight.len()
+            );
+        }
+    }
+    for head in values.chunks_mut(head_dim) {
+        rms_norm_with_weight_in_place(head, weight.map(|w| &w[..head_dim]));
+    }
+    Ok(())
+}
+
+fn apply_rotary_for_layout(
+    q: &mut [f32],
+    k: &mut [f32],
+    position: usize,
+    theta: f64,
+    layout: FullAttentionLayout,
+) {
+    match layout.rotary_pairing {
+        RotaryPairing::Adjacent => {
+            apply_rotary_adjacent(q, position, layout.head_dim, layout.rotary_dim, theta);
+            apply_rotary_adjacent(k, position, layout.head_dim, layout.rotary_dim, theta);
+        }
+        RotaryPairing::SplitHalf => {
+            apply_rotary_split_half(q, position, layout.head_dim, layout.rotary_dim, theta);
+            apply_rotary_split_half(k, position, layout.head_dim, layout.rotary_dim, theta);
+        }
+    }
+}
+
+fn apply_rotary_adjacent(
+    values: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+) {
     let theta = theta.max(1.0) as f32;
     let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+
     for head in values.chunks_mut(head_dim) {
-        let rotary_dims = head.len() - (head.len() % 2);
+        let rotary_dims = rotary_dim.min(head.len()) - (rotary_dim.min(head.len()) % 2);
         for pair_idx in (0..rotary_dims).step_by(2) {
             let inv_freq = theta.powf(-(pair_idx as f32) / head_dim as f32);
             let angle = (position as f32) * inv_freq;
@@ -2022,6 +2334,38 @@ fn apply_rotary(values: &mut [f32], position: usize, head_dim: usize, theta: f64
             head[pair_idx + 1] = x * sin + y * cos;
         }
     }
+}
+
+fn apply_rotary_split_half(
+    values: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+    let half = rotary_dim / 2;
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let inv_freq = theta.powf(-((2 * i) as f32) / rotary_dim as f32);
+            let angle = (position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
 }
 
 #[allow(dead_code)]
@@ -3124,8 +3468,6 @@ fn validate_required_tensor_manifest(
     config: &QwenModelConfig,
     registry: &TensorRegistry,
 ) -> Result<()> {
-    let head_dim = config.hidden_size / config.num_attention_heads.max(1);
-    let kv_width = config.kv_heads() * head_dim;
     require_tensor_shape(
         registry,
         "model.embed_tokens.weight",
@@ -3144,30 +3486,15 @@ fn validate_required_tensor_manifest(
     }
     let has_linear_attention = (0..config.num_hidden_layers)
         .filter(|layer| !is_full_attention_layer(*layer))
-        .any(|layer| registry.tensor(&linear_attention_tensor_name(layer, "in_proj_qkv")).is_some());
+        .any(|layer| {
+            registry
+                .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
+                .is_some()
+        });
     for layer in 0..config.num_hidden_layers {
         let is_full = !has_linear_attention || is_full_attention_layer(layer);
         if is_full {
-            require_tensor_shape(
-                registry,
-                &attention_tensor_name(layer, "q_proj"),
-                &[config.hidden_size, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &attention_tensor_name(layer, "k_proj"),
-                &[kv_width, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &attention_tensor_name(layer, "v_proj"),
-                &[kv_width, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &attention_tensor_name(layer, "o_proj"),
-                &[config.hidden_size, config.hidden_size],
-            )?;
+            let _ = infer_full_attention_layout(config, registry, layer)?;
         } else {
             require_tensor_shape(
                 registry,
@@ -5868,7 +6195,7 @@ fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
 }
 
 pub fn is_flashmoe_hf_model(model: &str) -> bool {
-    model.starts_with("hf://") && (is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model))
+    model.starts_with("hf://") && is_flashmoe_model_name(model)
 }
 
 // ── Image preprocessor ────────────────────────────────────────────────────────
@@ -6630,7 +6957,7 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen35_and_legacy_alias_are_considered_for_flashmoe() {
+    fn qwen35_and_legacy_alias_are_flashmoe_names() {
         assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
         assert!(is_qwen35_or_legacy_alias("qwen3-coder-next"));
         assert!(!is_qwen35_or_legacy_alias("qwen-vision.gguf"));
@@ -6638,6 +6965,15 @@ mod tests {
             select_backend("qwen-vision.gguf"),
             BackendSelection::LlamaCpp
         );
+    }
+
+    #[test]
+    fn qwen3_moe_hf_repos_are_flashmoe_pull_candidates() {
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-30B-A3B"));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-235B-A22B-Instruct"));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-MoE-Instruct"));
+        assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
+        assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
     }
 
     #[test]
@@ -6996,7 +7332,10 @@ mod tests {
                 layer_norm_tensor_name(layer, "post_attention_layernorm"),
                 vec![config.hidden_size],
             );
-            push(router_tensor_name(layer), vec![config.experts(), config.hidden_size]);
+            push(
+                router_tensor_name(layer),
+                vec![config.experts(), config.hidden_size],
+            );
             if is_full_attention_layer(layer) {
                 push(
                     attention_tensor_name(layer, "q_proj"),

@@ -1748,7 +1748,7 @@ async fn pull_flashmoe_from_hf(
         })
         .collect();
     if wanted.is_empty() {
-        bail!("no Qwen3.5 safetensors or tokenizer/config files found in {owner}/{repo}");
+        bail!("no Qwen-family safetensors or tokenizer/config files found in {owner}/{repo}");
     }
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
@@ -1811,13 +1811,13 @@ async fn pull_from_hf(
     parallel: usize,
     retries: u32,
 ) -> Result<()> {
-    let (owner, repo, explicit_filename) =
-        parse_hf_uri(hf_uri).with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
-
     if crate::inference::flashmoe::is_flashmoe_hf_model(hf_uri) {
+        let flashmoe_hf_uri = crate::inference::flashmoe::canonical_model(hf_uri);
+        let (owner, repo, _) = parse_hf_uri(&flashmoe_hf_uri)
+            .with_context(|| format!("invalid Hugging Face URI: {flashmoe_hf_uri}"))?;
         return pull_flashmoe_from_hf(
             client,
-            hf_uri,
+            &flashmoe_hf_uri,
             &owner,
             &repo,
             output_root,
@@ -1826,6 +1826,9 @@ async fn pull_from_hf(
         )
         .await;
     }
+
+    let (owner, repo, explicit_filename) =
+        parse_hf_uri(hf_uri).with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
 
     let siblings = list_hf_gguf_files(client, &owner, &repo).await?;
     if siblings.is_empty() {
@@ -2316,6 +2319,15 @@ mod tests {
                 "Qwen3-Coder-Next-GGUF".to_owned(),
                 Some("Qwen3-Coder-Next-Q4_K_M.gguf".to_owned())
             ))
+        );
+    }
+
+    #[test]
+    fn default_model_canonicalizes_to_flashmoe_safetensors_snapshot() {
+        let canonical = crate::inference::flashmoe::canonical_model(DEFAULT_MODEL);
+        assert_eq!(
+            parse_hf_uri(&canonical),
+            Some(("Qwen".to_owned(), "Qwen3.5-397B-A17B".to_owned(), None))
         );
     }
 
