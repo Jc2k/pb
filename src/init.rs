@@ -205,9 +205,7 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
                 info.prefers_container_backend = true;
             }
             n if matches!(
-                std::path::Path::new(n)
-                    .extension()
-                    .and_then(|e| e.to_str()),
+                std::path::Path::new(n).extension().and_then(|e| e.to_str()),
                 Some("png" | "jpg" | "jpeg" | "webp" | "gif")
             ) =>
             {

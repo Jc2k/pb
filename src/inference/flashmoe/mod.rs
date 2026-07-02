@@ -634,9 +634,13 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
-                .inner
-                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim);
+            return self.inner.causal_attention(
+                query,
+                keys_values,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            );
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -673,9 +677,14 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
-                .inner
-                .causal_attention_cached(position, layer, query, num_q_heads, kv_heads, head_dim);
+            return self.inner.causal_attention_cached(
+                position,
+                layer,
+                query,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            );
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1259,8 +1268,7 @@ impl MetalExecutorInner {
 
             // Step 3: weighted sum of values
             let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
-            let output_buffer =
-                self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
+            let output_buffer = self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
@@ -1448,10 +1456,9 @@ impl FlashMoeEngine {
             .vision_config
             .as_ref()
             .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
-        let encoder = self
-            .vision_encoder
-            .as_ref()
-            .context("generate_with_image requires a loaded VisionEncoder; this plan has no vision weights")?;
+        let encoder = self.vision_encoder.as_ref().context(
+            "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
+        )?;
         let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
         let visual_embeddings = encoder.encode(&preprocessor, &request.image_path)?;
         let num_visual_tokens = visual_embeddings.len();
@@ -1476,9 +1483,8 @@ impl FlashMoeEngine {
         let mut text_tokens = self.tokenizer.encode(&chat_text)?;
 
         // Splice vision tokens in front of the text
-        let mut prompt_tokens: Vec<u32> = Vec::with_capacity(
-            2 + num_visual_tokens + text_tokens.len(),
-        );
+        let mut prompt_tokens: Vec<u32> =
+            Vec::with_capacity(2 + num_visual_tokens + text_tokens.len());
         prompt_tokens.push(vs_tok);
         prompt_tokens.extend(std::iter::repeat(pad_tok).take(num_visual_tokens));
         prompt_tokens.push(ve_tok);
@@ -1492,8 +1498,7 @@ impl FlashMoeEngine {
         self.prefill_with_vision(&prompt_tokens, &visual_embeddings, pad_tok, &mut kv_cache)?;
 
         // ── 4. Decode ─────────────────────────────────────────────────────────
-        let mut sampler =
-            TokenSampler::new(request.temperature, request.top_k, request.seed);
+        let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
         for position in
             prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
@@ -3310,8 +3315,7 @@ impl DenseStore {
                     for start in (0..rows).step_by(tile_rows) {
                         let end = (start + tile_rows).min(rows);
                         let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-                        let projected =
-                            metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+                        let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
                         for (offset, value) in projected.into_iter().enumerate() {
                             logits[start + offset] = value;
                         }
@@ -3360,10 +3364,7 @@ impl DenseStore {
             let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
             for (offset, value) in projected.into_iter().enumerate() {
                 let token = start + offset;
-                candidates.push(
-                    token,
-                    sampler.process_logit(token, value, &repeated),
-                );
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
             }
         }
         Ok(Some(candidates.into_sorted_vec()))
@@ -3652,7 +3653,6 @@ impl DenseStore {
         let bytes = self.read_range(entry.byte_offset, byte_len)?;
         Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
     }
-
 }
 
 fn dtype_size(dtype: &str) -> Option<usize> {
@@ -5048,17 +5048,14 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
             })?;
         }
         // Write vision_config.json (the nested vision_config object from config.json).
-        if let (Some(vc), Some(vc_path)) =
-            (config.as_ref().and_then(|c| c.vision_config.as_ref()), plan.vision_config_path.as_ref())
-        {
-            let vc_bytes = serde_json::to_vec_pretty(vc)
-                .context("failed to encode vision config")?;
-            fs::write(vc_path, vc_bytes).with_context(|| {
-                format!(
-                    "failed to write vision config {}",
-                    vc_path.display()
-                )
-            })?;
+        if let (Some(vc), Some(vc_path)) = (
+            config.as_ref().and_then(|c| c.vision_config.as_ref()),
+            plan.vision_config_path.as_ref(),
+        ) {
+            let vc_bytes =
+                serde_json::to_vec_pretty(vc).context("failed to encode vision config")?;
+            fs::write(vc_path, vc_bytes)
+                .with_context(|| format!("failed to write vision config {}", vc_path.display()))?;
         }
     }
 
@@ -5073,7 +5070,11 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     Ok(plan)
 }
 
-fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
+fn build_manifest(
+    model: &str,
+    snapshot_dir: &Path,
+    index_json: &Path,
+) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
     let index: SafetensorsIndex = serde_json::from_slice(
         &fs::read(index_json)
             .with_context(|| format!("failed to read {}", index_json.display()))?,
@@ -5308,9 +5309,7 @@ fn pack_expert_tensors(
                 let mmap = unsafe {
                     memmap2::MmapOptions::new()
                         .map(&file)
-                        .with_context(|| {
-                            format!("failed to memory-map {}", shard_path.display())
-                        })?
+                        .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
                 };
                 shard_cache.insert(
                     tensor.shard.clone(),
@@ -5713,8 +5712,7 @@ impl ImagePreprocessor {
                         for kx in 0..self.patch_size {
                             let src_y = py * self.patch_size + ky;
                             let src_x = px * self.patch_size + kx;
-                            let pixel_idx =
-                                (src_y * target_w as usize + src_x) * 3 + c;
+                            let pixel_idx = (src_y * target_w as usize + src_x) * 3 + c;
                             let raw = pixels[pixel_idx] as f32 / 255.0;
                             let normed = (raw - self.image_mean[c]) / self.image_std[c];
                             let dst = patch_idx * 3 * patch_pixels
@@ -5968,9 +5966,7 @@ impl VisionEncoder {
                 let projected = self
                     .dense
                     .matvec_tensor_prefix(&proj_name, &h, embed_dim)?
-                    .with_context(|| {
-                        format!("vision: required tensor '{proj_name}' is missing")
-                    })?;
+                    .with_context(|| format!("vision: required tensor '{proj_name}' is missing"))?;
                 self.vit_add_bias(&proj_bias_name, projected)
             })
             .collect::<Result<_>>()?;
@@ -6070,10 +6066,7 @@ impl VisionEncoder {
     ///
     /// Returns `values` unchanged when the bias tensor is absent.
     fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
-        if let Some(bias) = self
-            .dense
-            .read_full_tensor_f32(bias_name)?
-        {
+        if let Some(bias) = self.dense.read_full_tensor_f32(bias_name)? {
             for (v, b) in values.iter_mut().zip(bias.iter()) {
                 *v += b;
             }
@@ -6099,7 +6092,11 @@ impl VisionEncoder {
             .enumerate()
             .map(|(i, x)| {
                 let normed = (x - mean) * std_inv;
-                let w = weight.as_ref().and_then(|w| w.get(i)).copied().unwrap_or(1.0);
+                let w = weight
+                    .as_ref()
+                    .and_then(|w| w.get(i))
+                    .copied()
+                    .unwrap_or(1.0);
                 let b = bias.as_ref().and_then(|b| b.get(i)).copied().unwrap_or(0.0);
                 normed * w + b
             })
@@ -6114,7 +6111,6 @@ fn gelu_approx(x: f32) -> f32 {
     const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
     0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
-
 
 #[cfg(test)]
 mod tests {
