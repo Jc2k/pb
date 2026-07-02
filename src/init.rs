@@ -42,6 +42,10 @@ pub struct ProjectInspection {
     // Already configured?
     pub has_pb_environment: bool,
 
+    // Vision / image assets
+    /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
+    pub has_image_assets: bool,
+
     // Scout signals
     pub setup_commands: Vec<String>,
     pub session_commands: Vec<String>,
@@ -199,6 +203,13 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             "Dockerfile" => {
                 info.has_dockerfile = info.has_dockerfile || path == root.join("Dockerfile");
                 info.prefers_container_backend = true;
+            }
+            n if matches!(
+                std::path::Path::new(n).extension().and_then(|e| e.to_str()),
+                Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+            ) =>
+            {
+                info.has_image_assets = true;
             }
             _ => {}
         }
@@ -534,6 +545,12 @@ fn print_detection_summary(info: &ProjectInspection) {
         println!("  languages: (none detected)");
     } else {
         println!("  languages: {}", langs.join(", "));
+    }
+    if info.has_image_assets {
+        println!(
+            "  image assets: found (consider `pb env pull hf://Qwen/Qwen3-VL-MoE-Instruct` \
+             for multimodal vision_describe support)"
+        );
     }
 }
 
