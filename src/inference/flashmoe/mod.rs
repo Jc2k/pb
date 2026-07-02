@@ -1724,7 +1724,7 @@ fn cpu_dense_matvec(weights: &[f32], input: &[f32], rows: usize, cols: usize) ->
             .zip(input.iter().take(used_cols))
             .map(|(weight, value)| weight * value)
             .sum::<f32>();
-        *slot = acc / (used_cols.max(1) as f32).sqrt();
+        *slot = acc;
     }
     out
 }
@@ -3006,7 +3006,7 @@ impl DenseStore {
                 .zip(hidden)
                 .map(|(weight, value)| weight * value)
                 .sum::<f32>();
-            return Ok(acc / (hidden.len().max(1) as f32).sqrt());
+            return Ok(acc);
         }
         ensure_synthetic_runtime_allowed(&tensor_name)?;
         let salt = self.tensor_seed(&tensor_name, ((layer as u64) << 32) ^ expert as u64);
@@ -3016,7 +3016,7 @@ impl DenseStore {
             let weight = ((bits >> 40) as f32 / ((1u64 << 24) as f32)) * 2.0 - 1.0;
             acc = value.mul_add(weight, acc);
         }
-        Ok(acc / (hidden.len().max(1) as f32).sqrt())
+        Ok(acc)
     }
 
     fn router_scores_with_metal(
@@ -3032,7 +3032,7 @@ impl DenseStore {
                 let cols = entry.shape.last().copied().unwrap_or(0);
                 let rows = entry.shape.first().copied().unwrap_or(experts).min(experts);
                 if rows > 0 && cols > 0 && cols <= hidden.len() {
-                    let mut scores =
+                    let scores =
                         self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
                     return Ok(scores);
                 }
@@ -3145,8 +3145,7 @@ impl DenseStore {
                 .iter()
                 .zip(hidden)
                 .map(|(weight, value)| weight * value)
-                .sum::<f32>()
-                / (hidden.len().max(1) as f32).sqrt();
+                .sum::<f32>();
         }
         Ok(logits)
     }
@@ -3195,7 +3194,7 @@ impl DenseStore {
                     .zip(input.iter().take(used_cols))
                     .map(|(weight, value)| weight * value)
                     .sum::<f32>();
-                *slot = acc / (used_cols.max(1) as f32).sqrt();
+                *slot = acc;
             }
             return Ok(Some(out));
         }
@@ -3210,7 +3209,7 @@ impl DenseStore {
                 .zip(input.iter().take(used_cols))
                 .map(|(weight, value)| weight * value)
                 .sum::<f32>();
-            *slot = acc / (used_cols.max(1) as f32).sqrt();
+            *slot = acc;
         }
         Ok(Some(out))
     }
@@ -4512,7 +4511,7 @@ kernel void dense_matvec(
     for (uint col = 0; col < cols; ++col) {
         acc = fma(weights[row * cols + col], input[col], acc);
     }
-    output[row] = acc * rsqrt(float(max(cols, 1u)));
+    output[row] = acc;
 }
 
 kernel void rms_norm(
@@ -4615,7 +4614,7 @@ kernel void lm_head_logits(
     for (uint i = 0; i < hidden_width; ++i) {
         acc = fma(lm_head[token * hidden_width + i], hidden[i], acc);
     }
-    logits[token] = acc * rsqrt(float(max(hidden_width, 1u)));
+    logits[token] = acc;
 }
 
 kernel void topk_vocab(
@@ -4869,25 +4868,34 @@ fn align_to(value: u64, alignment: u64) -> u64 {
 }
 
 fn parse_safetensors_header(path: &Path) -> Result<SafetensorShard> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read safetensors shard {}", path.display()))?;
-    if bytes.len() < 8 {
+    use std::io::Read;
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open safetensors shard {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat safetensors shard {}", path.display()))?
+        .len();
+    if file_len < 8 {
         bail!(
             "safetensors shard {} is too small to contain a header",
             path.display()
         );
     }
     let mut header_len_bytes = [0u8; 8];
-    header_len_bytes.copy_from_slice(&bytes[..8]);
+    file.read_exact(&mut header_len_bytes)
+        .with_context(|| format!("failed to read header length from {}", path.display()))?;
     let header_len = u64::from_le_bytes(header_len_bytes) as usize;
     let header_start = 8usize;
     let header_end = header_start
         .checked_add(header_len)
         .context("safetensors header length overflow")?;
-    if header_end > bytes.len() {
+    if header_end as u64 > file_len {
         bail!("safetensors shard {} has truncated header", path.display());
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes[header_start..header_end])
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .with_context(|| format!("failed to read safetensors header from {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&header_bytes)
         .with_context(|| format!("failed to parse safetensors header {}", path.display()))?;
     let mut tensors = BTreeMap::new();
     let object = value
@@ -4903,7 +4911,7 @@ fn parse_safetensors_header(path: &Path) -> Result<SafetensorShard> {
             bail!("tensor {name} has invalid safetensors data_offsets");
         }
         let absolute_end = header_end as u64 + info.data_offsets[1];
-        if absolute_end > bytes.len() as u64 {
+        if absolute_end > file_len {
             bail!(
                 "tensor {name} data range exceeds shard length in {}",
                 path.display()
@@ -4929,13 +4937,20 @@ fn write_dense_tensor_store(
         )
     })?;
     let mut current = 0u64;
-    let mut shard_cache = BTreeMap::<String, (Vec<u8>, SafetensorShard)>::new();
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
     for tensor in dense_tensors {
         if !shard_cache.contains_key(&tensor.shard) {
             let path = snapshot_dir.join(&tensor.shard);
+            let file = fs::File::open(&path)
+                .with_context(|| format!("failed to open shard {}", path.display()))?;
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .map(&file)
+                    .with_context(|| format!("failed to memory-map {}", path.display()))?
+            };
             shard_cache.insert(
                 tensor.shard.clone(),
-                (fs::read(&path)?, parse_safetensors_header(&path)?),
+                (mmap, parse_safetensors_header(&path)?),
             );
         }
         if current < tensor.runtime_offset {
@@ -4976,7 +4991,7 @@ fn pack_expert_tensors(
         }
     }
 
-    let mut shard_cache = BTreeMap::<String, (Vec<u8>, SafetensorShard)>::new();
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
     for ((layer, expert), tensors) in by_expert {
         validate_expert_tensor_group(layer, expert, &tensors, config)?;
         let path = expert_path(&plan.experts_dir, layer, expert);
@@ -4988,12 +5003,18 @@ fn pack_expert_tensors(
         for tensor in tensors {
             if !shard_cache.contains_key(&tensor.shard) {
                 let shard_path = snapshot_dir.join(&tensor.shard);
+                let file = fs::File::open(&shard_path)
+                    .with_context(|| format!("failed to open shard {}", shard_path.display()))?;
+                let mmap = unsafe {
+                    memmap2::MmapOptions::new()
+                        .map(&file)
+                        .with_context(|| {
+                            format!("failed to memory-map {}", shard_path.display())
+                        })?
+                };
                 shard_cache.insert(
                     tensor.shard.clone(),
-                    (
-                        fs::read(&shard_path)?,
-                        parse_safetensors_header(&shard_path)?,
-                    ),
+                    (mmap, parse_safetensors_header(&shard_path)?),
                 );
             }
             let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
