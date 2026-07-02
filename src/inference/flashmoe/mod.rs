@@ -6,7 +6,6 @@
 //! Metal kernels.  This module captures that runtime contract in pb instead of
 //! pretending a GGUF file is required for Qwen3.5.
 
-use std::collections::VecDeque;
 use std::ffi::OsString;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CString, c_char, c_void};
@@ -3782,8 +3781,6 @@ impl ExpertStore {
     }
 }
 
-const DEFAULT_EXPERT_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpertKey {
     layer: usize,
@@ -3823,10 +3820,6 @@ pub struct ExpertSchedulerSnapshot {
 #[derive(Debug, Clone)]
 struct ExpertScheduler {
     store: ExpertStore,
-    cache: BTreeMap<ExpertKey, Arc<ExpertWeights>>,
-    lru: VecDeque<ExpertKey>,
-    cached_bytes: usize,
-    max_cached_bytes: usize,
     metrics: ExpertSchedulerMetrics,
 }
 
@@ -3834,10 +3827,6 @@ impl ExpertScheduler {
     fn new(store: ExpertStore) -> Self {
         Self {
             store,
-            cache: BTreeMap::new(),
-            lru: VecDeque::new(),
-            cached_bytes: 0,
-            max_cached_bytes: DEFAULT_EXPERT_CACHE_BYTES,
             metrics: ExpertSchedulerMetrics::default(),
         }
     }
@@ -3850,18 +3839,8 @@ impl ExpertScheduler {
                 expert: *expert,
             };
             let issued_at = Instant::now();
-            if let Some(cached) = self.cache.get(&key).cloned() {
-                self.metrics.cache_hits = self.metrics.cache_hits.saturating_add(1);
-                self.touch(key);
-                pending.push(PendingExpertRead {
-                    key,
-                    cached: Some(cached),
-                    handle: None,
-                    issued_at,
-                });
-                continue;
-            }
-
+            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
+            // maintaining a second in-process cache of hot expert packs.
             self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
@@ -3900,36 +3879,9 @@ impl ExpertScheduler {
             self.metrics.total_read_latency += latency;
             self.metrics.max_read_latency = self.metrics.max_read_latency.max(latency);
             let expert = Arc::new(expert);
-            self.insert_cache(pending.key, expert.clone());
             out.push(expert);
         }
         Ok(out)
-    }
-
-    fn insert_cache(&mut self, key: ExpertKey, expert: Arc<ExpertWeights>) {
-        let size = expert.packed.len();
-        if let Some(previous) = self.cache.insert(key, expert) {
-            self.cached_bytes = self.cached_bytes.saturating_sub(previous.packed.len());
-        }
-        self.cached_bytes = self.cached_bytes.saturating_add(size);
-        self.touch(key);
-        self.evict_to_budget();
-    }
-
-    fn touch(&mut self, key: ExpertKey) {
-        self.lru.retain(|existing| *existing != key);
-        self.lru.push_back(key);
-    }
-
-    fn evict_to_budget(&mut self) {
-        while self.cached_bytes > self.max_cached_bytes {
-            let Some(victim) = self.lru.pop_front() else {
-                break;
-            };
-            if let Some(expert) = self.cache.remove(&victim) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(expert.packed.len());
-            }
-        }
     }
 
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
@@ -3938,8 +3890,8 @@ impl ExpertScheduler {
             cache_hits: self.metrics.cache_hits,
             cache_misses: self.metrics.cache_misses,
             read_failures: self.metrics.read_failures,
-            cached_bytes: self.cached_bytes,
-            max_cached_bytes: self.max_cached_bytes,
+            cached_bytes: 0,
+            max_cached_bytes: 0,
             total_read_latency: self.metrics.total_read_latency,
             max_read_latency: self.metrics.max_read_latency,
         }
@@ -4414,14 +4366,24 @@ pub fn q4_fma_matvec(
         );
     }
     let mut out = vec![0.0f32; rows];
+    let packed_stride = cols.div_ceil(2);
     for row in 0..rows {
         let mut acc = 0.0f32;
-        for col in 0..cols {
-            let byte = packed[row * cols.div_ceil(2) + col / 2];
-            let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
-            let group = col / GROUP_SIZE;
+        let packed_row = row * packed_stride;
+        for group in 0..groups_per_row {
             let idx = row * groups_per_row + group;
-            acc = q.mul_add(scales[idx] * input[col], acc + biases[idx] * input[col]);
+            let scale = scales[idx];
+            let bias = biases[idx];
+            let start = group * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(cols);
+            for col in start..end {
+                let x = input[col];
+                let scale_x = scale * x;
+                let bias_x = bias * x;
+                let byte = packed[packed_row + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                acc = q.mul_add(scale_x, acc + bias_x);
+            }
         }
         out[row] = acc;
     }
@@ -4739,12 +4701,20 @@ kernel void q4_fma_matvec(
     uint row [[thread_position_in_grid]]) {
     float acc = 0.0f;
     uint packed_row = row * ((cols + 1) / 2);
-    for (uint col = 0; col < cols; ++col) {
-        uchar byte = packed[packed_row + col / 2];
-        float q = float((col & 1) == 0 ? (byte & 0x0f) : (byte >> 4));
-        uint group = col / 64;
+    for (uint group = 0; group < groups_per_row; ++group) {
         uint idx = row * groups_per_row + group;
-        acc = fma(q * scales[idx] + biases[idx], input[col], acc);
+        float scale = scales[idx];
+        float bias = biases[idx];
+        uint start = group * 64;
+        uint end = min(start + 64, cols);
+        for (uint col = start; col < end; ++col) {
+            uchar byte = packed[packed_row + col / 2];
+            float q = float((col & 1) == 0 ? (byte & 0x0f) : (byte >> 4));
+            float x = input[col];
+            float scale_x = scale * x;
+            float bias_x = bias * x;
+            acc = fma(q, scale_x, bias_x + acc);
+        }
     }
     output[row] = acc;
 }
@@ -7124,7 +7094,7 @@ mod tests {
     }
 
     #[test]
-    fn expert_scheduler_reads_only_active_experts_and_reuses_cache() {
+    fn expert_scheduler_reads_only_active_experts_without_process_cache() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(
@@ -7153,15 +7123,18 @@ mod tests {
         assert_eq!(first.issued_reads, 2);
         assert_eq!(first.cache_hits, 0);
         assert_eq!(first.cache_misses, 2);
+        assert_eq!(first.cached_bytes, 0);
+        assert_eq!(first.max_cached_bytes, 0);
 
         let pending = scheduler.issue(0, &[3, 7]).unwrap();
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
         let second = scheduler.snapshot();
-        assert_eq!(second.issued_reads, 3);
-        assert_eq!(second.cache_hits, 1);
-        assert_eq!(second.cache_misses, 3);
-        assert!(second.cached_bytes >= 2 * b"PBQ4EXPERT ".len());
+        assert_eq!(second.issued_reads, 4);
+        assert_eq!(second.cache_hits, 0);
+        assert_eq!(second.cache_misses, 4);
+        assert_eq!(second.cached_bytes, 0);
+        assert_eq!(second.max_cached_bytes, 0);
     }
 
     #[test]
