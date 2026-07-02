@@ -3789,7 +3789,6 @@ struct ExpertKey {
 
 #[derive(Debug)]
 struct PendingExpertRead {
-    key: ExpertKey,
     cached: Option<Arc<ExpertWeights>>,
     handle: Option<thread::JoinHandle<Result<ExpertWeights>>>,
     issued_at: Instant,
@@ -3845,7 +3844,6 @@ impl ExpertScheduler {
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
             pending.push(PendingExpertRead {
-                key,
                 cached: None,
                 handle: Some(thread::spawn(move || {
                     read_one_expert(&root, key.layer, key.expert)
