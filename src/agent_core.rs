@@ -748,8 +748,10 @@ pub fn run_agent<S: EventSink>(
     suppress_llama_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     backend.void_logs();
-    let mut model_params =
-        Box::pin(LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers));
+    // `add_cpu_moe_override` creates a self-referential struct (params holds a raw pointer
+    // into buft_overrides), so we must pin to prevent the value from moving afterwards.
+    let model_params_raw = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
+    let mut model_params = std::pin::pin!(model_params_raw);
     if args.moe_cpu_offload && args.gpu_layers > 0 {
         model_params.as_mut().add_cpu_moe_override();
     }
