@@ -2507,8 +2507,9 @@ fn validate_required_tensor_manifest(
         &[config.vocab_size, config.hidden_size],
     )?;
     require_tensor_shape(registry, "model.norm.weight", &[config.hidden_size])?;
-    // lm_head.weight is optional: when absent the model uses tied embeddings and reuses
-    // model.embed_tokens.weight (already validated above) for output projection.
+    // lm_head.weight is optional: when absent (or when tie_word_embeddings is true) the model
+    // uses tied embeddings and reuses model.embed_tokens.weight (already validated above) for
+    // the output projection.
     if registry.tensor("lm_head.weight").is_some() {
         require_tensor_shape(
             registry,
@@ -5423,7 +5424,7 @@ mod tests {
             br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
         )
         .unwrap();
-        // kv_width = kv_heads(1) * head_dim(hidden/heads = 8/2 = 4) = 4
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
         let mut tensors = vec![
             ("model.embed_tokens.weight", vec![128usize, 8]),
             ("model.norm.weight", vec![8]),
@@ -5583,7 +5584,7 @@ mod tests {
 
         // Dense shard: all non-expert tensors including Qwen3-specific q_norm/k_norm and
         // shared_expert projections.  Shapes are consistent with the config above.
-        // kv_width = kv_heads(1) * head_dim(8/2=4) = 4
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
         let dense_shard = make_typed_safetensors(&[
             ("model.embed_tokens.weight",             "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
             ("lm_head.weight",                        "BF16", vec![300, 8],  &vec![0u8; 300*8*2]),
