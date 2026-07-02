@@ -1633,7 +1633,7 @@ impl FlashMoeEngine {
                 softmax_in_place(&mut weights);
             }
             // Deferred CMD3-style overlap: while expert reads are still pending, compute
-            // the always-active shared-expert branch on the CPU/GPU.
+            // the always-active shared-expert branch on CPU or Metal.
             let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
             let experts = self.scheduler.finish(pending_experts)?;
             for (expert, weight) in experts.iter().zip(weights) {
@@ -3289,8 +3289,8 @@ fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
 }
 
 fn is_full_attention_layer(layer: usize) -> bool {
-    // Flash-MoE schedules full attention every 4th layer in 1-indexed form:
-    // layers 3, 7, 11, ... (0-indexed), hence (layer + 1) % 4 == 0.
+    // Flash-MoE schedules full attention every 4th layer when counted from 1.
+    // In 0-indexed coordinates that is layers 3, 7, 11, ...
     (layer + 1) % FULL_ATTN_INTERVAL == 0
 }
 
@@ -4402,7 +4402,7 @@ fn conv1d_step(
     kernel_size: usize,
 ) {
     debug_assert_eq!(out.len(), channels);
-    for c in 0..channels.min(out.len()) {
+    for c in 0..channels {
         let mut acc = 0.0f32;
         for k in 0..kernel_size.saturating_sub(1) {
             let w_idx = c
