@@ -82,7 +82,7 @@ enum TextBackendKind {
 fn load_llama_model_from_cache(
     models_root: &Path,
     model: &str,
-    gpu_layers: i32,
+    gpu_layers: u32,
 ) -> Result<(LlamaBackend, LlamaModel, PathBuf)> {
     let path = find_model_in_cache_in(models_root, model)?;
     suppress_llama_logs();
@@ -3805,30 +3805,31 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.max_tokens = boosted_max_tokens(&request).max(2048);
     request.temperature = 0.0;
     request.top_k = 1;
-    let mut lazy_backend = None;
-    let mut lazy_model = None;
-    let mut lazy_model_path = None;
-    let (backend, model, model_path) = if let (Some(backend), Some(model), Some(model_path)) =
-        (context.backend, context.model, context.model_path)
-    {
-        (backend, model, model_path)
-    } else {
-        let (backend, model, model_path) =
-            load_llama_model_from_cache(context.models_root, &context.request.model, request.gpu_layers)
+    let lazy_loaded =
+        if context.backend.is_none() || context.model.is_none() || context.model_path.is_none() {
+            Some(
+                load_llama_model_from_cache(
+                    context.models_root,
+                    &context.request.model,
+                    request.gpu_layers,
+                )
                 .with_context(|| {
                     format!(
                         "vision_describe requires llama.cpp vision support; failed to lazy-load fallback model {} from cache",
                         context.request.model
                     )
-                })?;
-        lazy_model_path = Some(model_path);
-        lazy_model = Some(model);
-        lazy_backend = Some(backend);
-        (
-            lazy_backend.as_ref().expect("lazy backend"),
-            lazy_model.as_ref().expect("lazy model"),
-            lazy_model_path.as_deref().expect("lazy model path"),
-        )
+                })?,
+            )
+        } else {
+            None
+        };
+    let (backend, model, model_path) = if let (Some(backend), Some(model), Some(model_path)) =
+        (context.backend, context.model, context.model_path)
+    {
+        (backend, model, model_path)
+    } else {
+        let (backend, model, model_path) = lazy_loaded.as_ref().expect("lazy loaded llama model");
+        (backend, model, model_path.as_path())
     };
     let output = generate_vision_completion(
         backend,
