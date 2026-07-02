@@ -73,6 +73,66 @@ fn suppress_llama_logs() {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextBackendKind {
+    LlamaCpp,
+    FlashMoe,
+}
+
+fn load_llama_model_from_cache(
+    models_root: &Path,
+    model: &str,
+    gpu_layers: i32,
+) -> Result<(LlamaBackend, LlamaModel, PathBuf)> {
+    let path = find_model_in_cache_in(models_root, model)?;
+    suppress_llama_logs();
+    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
+    backend.void_logs();
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+    let loaded_model = LlamaModel::load_from_file(&backend, &path, &model_params)
+        .with_context(|| format!("failed to load model {}", path.display()))?;
+    Ok((backend, loaded_model, path))
+}
+
+fn flashmoe_cache_diagnostics(plan: &crate::inference::flashmoe::FlashMoePlan) -> String {
+    match plan.cache_status() {
+        Ok(status) => {
+            let missing = if status.missing.is_empty() {
+                "none".to_string()
+            } else {
+                status
+                    .missing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "Flash-MoE cache diagnostics for {}:\n\
+                 - runtime_dir: {}\n\
+                 - missing_artifacts: {}\n\
+                 - packed_expert_files: {}\n\
+                 - packed_expert_bytes: {}\n\
+                 - action: run `pb pull {}` on ARM macOS to rebuild the Flash-MoE cache.",
+                plan.model,
+                plan.runtime_dir.display(),
+                missing,
+                status.expert_files,
+                status.expert_bytes,
+                plan.model,
+            )
+        }
+        Err(error) => format!(
+            "Flash-MoE cache diagnostics for {} were unavailable at {}: {}.\n\
+             Action: run `pb pull {}` on ARM macOS to rebuild the Flash-MoE cache.",
+            plan.model,
+            plan.runtime_dir.display(),
+            error,
+            plan.model,
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSearchResult {
     title: String,
@@ -762,6 +822,7 @@ pub fn run_agent<S: EventSink>(
     });
 
     let mut flashmoe_engine = None;
+    let mut flashmoe_setup_error = None;
     if let Some(plan) = flashmoe_plan.as_ref() {
         match crate::inference::flashmoe::load(plan) {
             Ok(engine) => {
@@ -774,19 +835,31 @@ pub fn run_agent<S: EventSink>(
                 flashmoe_engine = Some(engine);
             }
             Err(error) => {
+                let diagnostics = flashmoe_cache_diagnostics(plan);
                 let message = format!(
-                    "Flash-MoE is the default backend for {model} on ARM macOS, \
-                     but pb is falling back to llama.cpp: {error}",
-                    model = plan.model,
+                    "Flash-MoE setup failed for {}: {error}\n\n{diagnostics}",
+                    plan.model
                 );
-                tracing::warn!(
+                tracing::error!(
                     model = %plan.model,
                     cache_dir = %plan.runtime_dir.display(),
                     quantization = plan.quantization.as_str(),
                     "{message}"
                 );
+                sink.emit(AgentEvent::Error {
+                    message: message.clone(),
+                    summary: "Flash-MoE setup failed".to_string(),
+                    nesting_depth: Some(0),
+                    timestamp_ms: Some(now_millis()),
+                });
+                flashmoe_setup_error = Some(message);
+                let fallback_note = format!(
+                    "Flash-MoE is the default backend for {model} on ARM macOS, \
+                     but pb is falling back to llama.cpp.",
+                    model = plan.model,
+                );
                 sink.emit(AgentEvent::Correction {
-                    message,
+                    message: fallback_note,
                     summary: "using llama.cpp fallback for this session".to_string(),
                     nesting_depth: Some(0),
                     timestamp_ms: Some(now_millis()),
@@ -799,22 +872,41 @@ pub fn run_agent<S: EventSink>(
     let mut llama_model = None;
     let mut llama_model_path = None;
     if flashmoe_engine.is_none() {
-        let path = find_model_in_cache_in(models_root, &args.model)?;
-        suppress_llama_logs();
-        let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-        backend.void_logs();
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &path, &model_params)
-            .with_context(|| format!("failed to load model {}", path.display()))?;
-        llama_model_path = Some(path);
-        llama_model = Some(model);
-        llama_backend = Some(backend);
+        match load_llama_model_from_cache(models_root, &args.model, args.gpu_layers) {
+            Ok((backend, model, path)) => {
+                llama_model_path = Some(path);
+                llama_model = Some(model);
+                llama_backend = Some(backend);
+            }
+            Err(error) => {
+                let message = if let Some(flashmoe_error) = flashmoe_setup_error.as_deref() {
+                    format!(
+                        "{flashmoe_error}\n\nllama.cpp fallback setup failed for {}: {error}",
+                        args.model
+                    )
+                } else {
+                    format!("llama.cpp setup failed for {}: {error}", args.model)
+                };
+                sink.emit(AgentEvent::Error {
+                    message: message.clone(),
+                    summary: "Model setup failed".to_string(),
+                    nesting_depth: Some(0),
+                    timestamp_ms: Some(now_millis()),
+                });
+                bail!(message);
+            }
+        }
     } else {
         tracing::info!(
             model = %args.model,
             "Flash-MoE text backend selected; llama.cpp fallback/vision model will be loaded only if a llama-only path is requested"
         );
     }
+    let text_backend = if flashmoe_engine.is_some() {
+        TextBackendKind::FlashMoe
+    } else {
+        TextBackendKind::LlamaCpp
+    };
 
     if args.infer_profile {
         if let (Some(backend), Some(model)) = (llama_backend.as_ref(), llama_model.as_ref()) {
@@ -920,6 +1012,7 @@ pub fn run_agent<S: EventSink>(
 
     let outcome = run_agent_steps(
         generator,
+        text_backend,
         llama_backend.as_ref(),
         llama_model.as_ref(),
         llama_model_path.as_deref(),
@@ -1954,6 +2047,7 @@ struct StepRunOutcome {
 }
 
 struct ToolExecutionEnv<'a> {
+    text_backend: TextBackendKind,
     backend: Option<&'a LlamaBackend>,
     model: Option<&'a LlamaModel>,
     model_path: Option<&'a Path>,
@@ -1980,6 +2074,7 @@ struct GateState {
 
 fn run_agent_steps(
     generator: &mut dyn CompletionEngine,
+    text_backend: TextBackendKind,
     backend: Option<&LlamaBackend>,
     model: Option<&LlamaModel>,
     model_path: Option<&Path>,
@@ -2136,6 +2231,7 @@ fn run_agent_steps(
                     thinking,
                     &output,
                     ToolExecutionEnv {
+                        text_backend,
                         backend,
                         model,
                         model_path,
@@ -2176,6 +2272,7 @@ fn run_agent_steps(
                     thinking,
                     &output,
                     ToolExecutionEnv {
+                        text_backend,
                         backend,
                         model,
                         model_path,
@@ -2350,6 +2447,7 @@ fn run_step_limit_monitor(
     let mut monitor_generator = LlamaCompletionEngine { backend, model };
     let outcome = run_agent_steps(
         &mut monitor_generator,
+        TextBackendKind::LlamaCpp,
         Some(backend),
         Some(model),
         Some(model_path),
@@ -2475,6 +2573,7 @@ fn execute_tool_calls(
     }
 
     let tool_context = ToolContext {
+        text_backend: env.text_backend,
         backend: env.backend,
         model: env.model,
         model_path: env.model_path,
@@ -3048,6 +3147,7 @@ fn extract_json_objects(input: &str) -> Vec<String> {
 }
 
 struct ToolContext<'a> {
+    text_backend: TextBackendKind,
     backend: Option<&'a LlamaBackend>,
     model: Option<&'a LlamaModel>,
     model_path: Option<&'a Path>,
@@ -3705,15 +3805,31 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.max_tokens = boosted_max_tokens(&request).max(2048);
     request.temperature = 0.0;
     request.top_k = 1;
-    let backend = context
-        .backend
-        .context("vision_describe requires a loaded llama.cpp vision model")?;
-    let model = context
-        .model
-        .context("vision_describe requires a loaded llama.cpp vision model")?;
-    let model_path = context
-        .model_path
-        .context("vision_describe requires a loaded llama.cpp vision model")?;
+    let mut lazy_backend = None;
+    let mut lazy_model = None;
+    let mut lazy_model_path = None;
+    let (backend, model, model_path) = if let (Some(backend), Some(model), Some(model_path)) =
+        (context.backend, context.model, context.model_path)
+    {
+        (backend, model, model_path)
+    } else {
+        let (backend, model, model_path) =
+            load_llama_model_from_cache(context.models_root, &context.request.model, request.gpu_layers)
+                .with_context(|| {
+                    format!(
+                        "vision_describe requires llama.cpp vision support; failed to lazy-load fallback model {} from cache",
+                        context.request.model
+                    )
+                })?;
+        lazy_model_path = Some(model_path);
+        lazy_model = Some(model);
+        lazy_backend = Some(backend);
+        (
+            lazy_backend.as_ref().expect("lazy backend"),
+            lazy_model.as_ref().expect("lazy model"),
+            lazy_model_path.as_deref().expect("lazy model path"),
+        )
+    };
     let output = generate_vision_completion(
         backend,
         model,
@@ -3958,41 +4074,53 @@ fn run_sub_agent(
 
     let mut llama_generator;
     let mut flashmoe_generator;
+    let sub_text_backend;
     let (generator, backend, model, model_path): (
         &mut dyn CompletionEngine,
         Option<&LlamaBackend>,
         Option<&LlamaModel>,
         Option<&Path>,
-    ) = if let (Some(backend), Some(model), Some(model_path)) =
-        (context.backend, context.model, context.model_path)
-    {
-        llama_generator = LlamaCompletionEngine { backend, model };
-        (
-            &mut llama_generator,
-            Some(backend),
-            Some(model),
-            Some(model_path),
-        )
-    } else {
-        let plan = crate::inference::flashmoe::plan(&sub_request.model, context.models_root)
-            .with_context(|| {
+    ) = match context.text_backend {
+        TextBackendKind::LlamaCpp => {
+            let (backend, model, model_path) = (context.backend, context.model, context.model_path);
+            let (backend, model, model_path) = (
+                backend.context("sub_agent requires a loaded llama.cpp backend")?,
+                model.context("sub_agent requires a loaded llama.cpp model")?,
+                model_path.context("sub_agent requires a loaded llama.cpp model path")?,
+            );
+            sub_text_backend = TextBackendKind::LlamaCpp;
+            llama_generator = LlamaCompletionEngine { backend, model };
+            (
+                &mut llama_generator,
+                Some(backend),
+                Some(model),
+                Some(model_path),
+            )
+        }
+        TextBackendKind::FlashMoe => {
+            let plan = crate::inference::flashmoe::plan(&sub_request.model, context.models_root)
+                .with_context(|| {
+                    format!(
+                        "sub_agent cannot resolve Flash-MoE plan for {} while the parent session is using Flash-MoE",
+                        sub_request.model
+                    )
+                })?;
+            let engine = crate::inference::flashmoe::load(&plan).with_context(|| {
                 format!(
-                    "sub_agent cannot find a llama.cpp fallback or Flash-MoE plan for {}",
-                    sub_request.model
+                    "sub_agent failed to load Flash-MoE backend for {} from {}.\n{}",
+                    plan.model,
+                    plan.runtime_dir.display(),
+                    flashmoe_cache_diagnostics(&plan),
                 )
             })?;
-        let engine = crate::inference::flashmoe::load(&plan).with_context(|| {
-            format!(
-                "sub_agent failed to load Flash-MoE backend for {} from {}",
-                plan.model,
-                plan.runtime_dir.display()
-            )
-        })?;
-        flashmoe_generator = FlashMoeCompletionEngine { engine };
-        (&mut flashmoe_generator, None, None, None)
+            sub_text_backend = TextBackendKind::FlashMoe;
+            flashmoe_generator = FlashMoeCompletionEngine { engine };
+            (&mut flashmoe_generator, None, None, None)
+        }
     };
     let outcome = run_agent_steps(
         generator,
+        sub_text_backend,
         backend,
         model,
         model_path,
@@ -6131,6 +6259,21 @@ mod tests {
         std::fs::write(tmp.path().join("marker.txt"), "ok").unwrap();
         let output = run_local_shell_command("cat marker.txt", tmp.path()).unwrap();
         assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn flashmoe_cache_diagnostics_report_actionable_cache_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plan = crate::inference::flashmoe::plan_unchecked(
+            crate::inference::flashmoe::QWEN35_MODEL,
+            tmp.path(),
+        );
+        let diagnostics = flashmoe_cache_diagnostics(&plan);
+        assert!(diagnostics.contains("Flash-MoE cache diagnostics"));
+        assert!(diagnostics.contains("runtime_dir"));
+        assert!(diagnostics.contains("missing_artifacts"));
+        assert!(diagnostics.contains("packed_expert_files"));
+        assert!(diagnostics.contains("pb pull"));
     }
 
     #[test]
