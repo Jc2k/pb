@@ -27,7 +27,6 @@ pub mod environment;
 pub mod events;
 mod github_oauth;
 pub mod init;
-pub mod inference;
 pub mod integrations;
 pub mod lsp;
 pub mod mcp;
