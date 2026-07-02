@@ -94,7 +94,7 @@ fn load_llama_model_from_cache(
     Ok((backend, loaded_model, path))
 }
 
-fn flashmoe_cache_diagnostics(plan: &crate::inference::flashmoe::FlashMoePlan) -> String {
+fn flash_moe_cache_diagnostics(plan: &crate::inference::flashmoe::FlashMoePlan) -> String {
     match plan.cache_status() {
         Ok(status) => {
             let missing = if status.missing.is_empty() {
@@ -835,7 +835,7 @@ pub fn run_agent<S: EventSink>(
                 flashmoe_engine = Some(engine);
             }
             Err(error) => {
-                let diagnostics = flashmoe_cache_diagnostics(plan);
+                let diagnostics = flash_moe_cache_diagnostics(plan);
                 let message = format!(
                     "Flash-MoE setup failed for {}: {error}\n\n{diagnostics}",
                     plan.model
@@ -3830,7 +3830,7 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     } else {
         let (backend, model, model_path) = lazy_loaded_model
             .as_ref()
-            .expect("BUG: lazy-loaded llama model must exist when vision context is missing");
+            .expect("BUG: lazy-loaded llama model should exist when vision context is unavailable; this indicates a logic error in vision_describe");
         (backend, model, model_path.as_path())
     };
     let output = generate_vision_completion(
@@ -4077,7 +4077,6 @@ fn run_sub_agent(
 
     let mut llama_generator;
     let mut flashmoe_generator;
-    let sub_text_backend;
     let (generator, backend, model, model_path): (
         &mut dyn CompletionEngine,
         Option<&LlamaBackend>,
@@ -4091,7 +4090,6 @@ fn run_sub_agent(
                 model.context("sub_agent requires a loaded llama.cpp model")?,
                 model_path.context("sub_agent requires a loaded llama.cpp model path")?,
             );
-            sub_text_backend = TextBackendKind::LlamaCpp;
             llama_generator = LlamaCompletionEngine { backend, model };
             (
                 &mut llama_generator,
@@ -4113,17 +4111,16 @@ fn run_sub_agent(
                     "sub_agent failed to load Flash-MoE backend for {} from {}.\n{}",
                     plan.model,
                     plan.runtime_dir.display(),
-                    flashmoe_cache_diagnostics(&plan),
+                    flash_moe_cache_diagnostics(&plan),
                 )
             })?;
-            sub_text_backend = TextBackendKind::FlashMoe;
             flashmoe_generator = FlashMoeCompletionEngine { engine };
             (&mut flashmoe_generator, None, None, None)
         }
     };
     let outcome = run_agent_steps(
         generator,
-        sub_text_backend,
+        context.text_backend,
         backend,
         model,
         model_path,
@@ -6271,7 +6268,7 @@ mod tests {
             crate::inference::flashmoe::QWEN35_MODEL,
             tmp.path(),
         );
-        let diagnostics = flashmoe_cache_diagnostics(&plan);
+        let diagnostics = flash_moe_cache_diagnostics(&plan);
         assert!(diagnostics.contains("Flash-MoE cache diagnostics"));
         assert!(diagnostics.contains("runtime_dir"));
         assert!(diagnostics.contains("missing_artifacts"));
