@@ -26,6 +26,7 @@ pub mod energy;
 pub mod environment;
 pub mod events;
 mod github_oauth;
+pub mod inference;
 pub mod init;
 pub mod integrations;
 pub mod lsp;
@@ -1605,7 +1606,7 @@ fn select_hf_gguf_files(files: &[String]) -> Vec<String> {
     files.to_vec()
 }
 
-async fn list_hf_gguf_files(
+async fn list_hf_files(
     client: &reqwest::Client,
     owner: &str,
     repo: &str,
@@ -1622,8 +1623,16 @@ async fn list_hf_gguf_files(
         .await
         .with_context(|| format!("failed to parse Hugging Face model info for {owner}/{repo}"))?;
 
-    Ok(info
-        .siblings
+    Ok(info.siblings)
+}
+
+async fn list_hf_gguf_files(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<HfSibling>> {
+    Ok(list_hf_files(client, owner, repo)
+        .await?
         .into_iter()
         .filter(|s| s.rfilename.ends_with(".gguf"))
         .collect())
@@ -1719,6 +1728,82 @@ fn build_progress_bar(total: u64, initial: u64) -> Result<ProgressBar> {
     Ok(pb)
 }
 
+async fn pull_flashmoe_from_hf(
+    client: &reqwest::Client,
+    hf_uri: &str,
+    owner: &str,
+    repo: &str,
+    output_root: &Path,
+    parallel: usize,
+    retries: u32,
+) -> Result<()> {
+    let siblings = list_hf_files(client, owner, repo).await?;
+    let wanted: Vec<&HfSibling> = siblings
+        .iter()
+        .filter(|s| {
+            s.rfilename.ends_with(".safetensors")
+                || crate::inference::flashmoe::expected_hf_files()
+                    .iter()
+                    .any(|name| name == &std::ffi::OsString::from(&s.rfilename))
+        })
+        .collect();
+    if wanted.is_empty() {
+        bail!("no Qwen3.5 safetensors or tokenizer/config files found in {owner}/{repo}");
+    }
+
+    let cache_dir = output_root.join(cache_dir_name(hf_uri));
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+
+    let mut files = Vec::with_capacity(wanted.len());
+    for sibling in wanted {
+        let filename = sibling.rfilename.clone();
+        let size = match hf_sibling_size(sibling) {
+            s @ Some(_) => s,
+            None => {
+                let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+                fetch_content_length(client, &url).await
+            }
+        };
+        files.push((filename, size));
+    }
+
+    let total_bytes: u64 = files.iter().map(|(_, size)| size.unwrap_or(0)).sum();
+    let initial_bytes = files.iter().try_fold(0u64, |acc, (filename, size)| {
+        existing_bytes(&cache_dir.join(filename), *size).map(|n| acc + n)
+    })?;
+    let progress = build_progress_bar(total_bytes, initial_bytes)?;
+
+    let total_files = files.len();
+    let tasks = stream::iter(files.into_iter().map(|(filename, size)| {
+        let client = client.clone();
+        let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+        let dest = cache_dir.join(&filename);
+        let progress = progress.clone();
+        async move {
+            download_file_with_retry(&client, &url, &dest, size, &progress, &filename, retries)
+                .await
+        }
+    }))
+    .buffer_unordered(parallel)
+    .collect::<Vec<_>>();
+
+    let results = tasks.await;
+    for result in results {
+        result?;
+    }
+    progress.finish_with_message("download complete");
+
+    let plan = crate::inference::flashmoe::build_cache_from_hf_snapshot(hf_uri, &cache_dir)?;
+    println!(
+        "Pull complete: {total_files} Hugging Face file(s) available in {}; Flash-MoE cache prepared at {}",
+        cache_dir.display(),
+        plan.runtime_dir.display()
+    );
+    Ok(())
+}
+
 async fn pull_from_hf(
     client: &reqwest::Client,
     hf_uri: &str,
@@ -1728,6 +1813,19 @@ async fn pull_from_hf(
 ) -> Result<()> {
     let (owner, repo, explicit_filename) =
         parse_hf_uri(hf_uri).with_context(|| format!("invalid Hugging Face URI: {hf_uri}"))?;
+
+    if crate::inference::flashmoe::is_flashmoe_hf_model(hf_uri) {
+        return pull_flashmoe_from_hf(
+            client,
+            hf_uri,
+            &owner,
+            &repo,
+            output_root,
+            parallel,
+            retries,
+        )
+        .await;
+    }
 
     let siblings = list_hf_gguf_files(client, &owner, &repo).await?;
     if siblings.is_empty() {

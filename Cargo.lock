@@ -1494,6 +1494,7 @@ dependencies = [
  "libc",
  "llama-cpp-2",
  "macpow",
+ "memmap2",
  "mime_guess",
  "objc2",
  "objc2-foundation",
