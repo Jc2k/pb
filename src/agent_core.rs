@@ -1,21 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
-use encoding_rs::UTF_8;
 use futures::StreamExt;
 use globset::GlobBuilder;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8 as GrepUtf8};
 use ignore::WalkBuilder;
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
-};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use crate::inference::llamacpp::{self as llamacpp, LlamaCppBackend, LlamaCppRequest};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -27,8 +17,6 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU32;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -47,8 +35,6 @@ use crate::policy::{PolicyConfig, PolicyOutcome};
 use crate::session_power::session_power_summary;
 use crate::session_store::now_millis;
 
-const LLAMA_BATCH_SIZE: usize = 512;
-const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_GLOB_RESULTS: usize = 200;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
@@ -66,32 +52,10 @@ const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
 
-fn suppress_llama_logs() {
-    static LLAMA_LOGS_SUPPRESSED: OnceLock<()> = OnceLock::new();
-    LLAMA_LOGS_SUPPRESSED.get_or_init(|| {
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-    });
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextBackendKind {
     LlamaCpp,
     FlashMoe,
-}
-
-fn load_llama_model_from_cache(
-    models_root: &Path,
-    model: &str,
-    gpu_layers: u32,
-) -> Result<(LlamaBackend, LlamaModel, PathBuf)> {
-    let path = find_model_in_cache_in(models_root, model)?;
-    suppress_llama_logs();
-    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    backend.void_logs();
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-    let loaded_model = LlamaModel::load_from_file(&backend, &path, &model_params)
-        .with_context(|| format!("failed to load model {}", path.display()))?;
-    Ok((backend, loaded_model, path))
 }
 
 fn flash_moe_cache_diagnostics(plan: &crate::inference::flashmoe::FlashMoePlan) -> String {
@@ -203,18 +167,22 @@ impl fmt::Display for AgentProfile {
 /// profile responsibilities and lets the model classify the request instead of
 /// relying on hard-coded trigger phrases.
 pub fn infer_agent_profile(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
+    llamacpp_backend: &LlamaCppBackend,
     args: &AgentRequest,
     task: &str,
 ) -> Result<AgentProfile> {
-    let mut inference_args = args.clone();
-    inference_args.max_tokens = args.max_tokens.clamp(8, 32);
-    inference_args.temperature = 0.0;
-    inference_args.top_k = 1;
-
-    let prompt = profile_inference_prompt(task);
-    let output = generate_llama_completion(backend, model, &inference_args, &prompt)?.content;
+    let request = LlamaCppRequest {
+        prompt: profile_inference_prompt(task),
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        max_tokens: args.max_tokens.clamp(8, 32),
+        top_k: 1,
+        temperature: 0.0,
+        seed: args.seed,
+    };
+    let output = llamacpp_backend.generate(&request)?.content;
     parse_inferred_agent_profile(&output)
         .with_context(|| format!("failed to infer an agent profile from model output: {output}"))
 }
@@ -868,15 +836,12 @@ pub fn run_agent<S: EventSink>(
         }
     }
 
-    let mut llama_backend = None;
-    let mut llama_model = None;
-    let mut llama_model_path = None;
+    let mut llamacpp_backend: Option<LlamaCppBackend> = None;
     if flashmoe_engine.is_none() {
-        match load_llama_model_from_cache(models_root, &args.model, args.gpu_layers) {
-            Ok((backend, model, path)) => {
-                llama_model_path = Some(path);
-                llama_model = Some(model);
-                llama_backend = Some(backend);
+        let path = find_model_in_cache_in(models_root, &args.model);
+        match path.and_then(|p| llamacpp::load_from_file(&p, args.gpu_layers)) {
+            Ok(backend) => {
+                llamacpp_backend = Some(backend);
             }
             Err(error) => {
                 let message = if let Some(flashmoe_error) = flashmoe_setup_error.as_deref() {
@@ -909,8 +874,8 @@ pub fn run_agent<S: EventSink>(
     };
 
     if args.infer_profile {
-        if let (Some(backend), Some(model)) = (llama_backend.as_ref(), llama_model.as_ref()) {
-            args.profile = infer_agent_profile(backend, model, &args, &args.task)?;
+        if let Some(backend) = llamacpp_backend.as_ref() {
+            args.profile = infer_agent_profile(backend, &args, &args.task)?;
         } else if let Some(engine) = flashmoe_engine.as_mut() {
             args.profile = infer_agent_profile_flashmoe(engine, &args, &args.task)?;
         }
@@ -1000,12 +965,9 @@ pub fn run_agent<S: EventSink>(
         &mut flashmoe_generator
     } else {
         llama_generator = LlamaCompletionEngine {
-            backend: llama_backend
+            llamacpp: llamacpp_backend
                 .as_ref()
                 .context("llama.cpp backend was not loaded")?,
-            model: llama_model
-                .as_ref()
-                .context("llama.cpp model was not loaded")?,
         };
         &mut llama_generator
     };
@@ -1013,9 +975,7 @@ pub fn run_agent<S: EventSink>(
     let outcome = run_agent_steps(
         generator,
         text_backend,
-        llama_backend.as_ref(),
-        llama_model.as_ref(),
-        llama_model_path.as_deref(),
+        llamacpp_backend.as_ref(),
         &args,
         &mut messages,
         &workspace_root,
@@ -2048,9 +2008,7 @@ struct StepRunOutcome {
 
 struct ToolExecutionEnv<'a> {
     text_backend: TextBackendKind,
-    backend: Option<&'a LlamaBackend>,
-    model: Option<&'a LlamaModel>,
-    model_path: Option<&'a Path>,
+    llamacpp: Option<&'a LlamaCppBackend>,
     args: &'a AgentRequest,
     workspace_root: &'a Path,
     models_root: &'a Path,
@@ -2075,9 +2033,7 @@ struct GateState {
 fn run_agent_steps(
     generator: &mut dyn CompletionEngine,
     text_backend: TextBackendKind,
-    backend: Option<&LlamaBackend>,
-    model: Option<&LlamaModel>,
-    model_path: Option<&Path>,
+    llamacpp: Option<&LlamaCppBackend>,
     args: &AgentRequest,
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
@@ -2232,9 +2188,7 @@ fn run_agent_steps(
                     &output,
                     ToolExecutionEnv {
                         text_backend,
-                        backend,
-                        model,
-                        model_path,
+                        llamacpp,
                         args,
                         workspace_root,
                         models_root,
@@ -2273,9 +2227,7 @@ fn run_agent_steps(
                     &output,
                     ToolExecutionEnv {
                         text_backend,
-                        backend,
-                        model,
-                        model_path,
+                        llamacpp,
                         args,
                         workspace_root,
                         models_root,
@@ -2314,11 +2266,9 @@ fn run_agent_steps(
             && args.sub_agent_depth < MAX_SUB_AGENT_DEPTH
         {
             monitor_used = true;
-            if let (Some(backend), Some(model), Some(model_path)) = (backend, model, model_path)
+            if let Some(llamacpp) = llamacpp
                 && let Some(audit) = run_step_limit_monitor(
-                    backend,
-                    model,
-                    model_path,
+                    llamacpp,
                     args,
                     messages,
                     workspace_root,
@@ -2385,9 +2335,7 @@ fn run_agent_steps(
 
 #[allow(clippy::too_many_arguments)]
 fn run_step_limit_monitor(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
-    model_path: &Path,
+    llamacpp: &LlamaCppBackend,
     args: &AgentRequest,
     messages: &[ChatMessage],
     workspace_root: &Path,
@@ -2444,13 +2392,11 @@ fn run_step_limit_monitor(
     monitor_request.max_steps = MONITOR_STEP_BUDGET;
     monitor_request.sub_agent_depth = args.sub_agent_depth + 1;
 
-    let mut monitor_generator = LlamaCompletionEngine { backend, model };
+    let mut monitor_generator = LlamaCompletionEngine { llamacpp };
     let outcome = run_agent_steps(
         &mut monitor_generator,
         TextBackendKind::LlamaCpp,
-        Some(backend),
-        Some(model),
-        Some(model_path),
+        Some(llamacpp),
         &monitor_request,
         &mut monitor_messages,
         workspace_root,
@@ -2574,9 +2520,7 @@ fn execute_tool_calls(
 
     let tool_context = ToolContext {
         text_backend: env.text_backend,
-        backend: env.backend,
-        model: env.model,
-        model_path: env.model_path,
+        llamacpp: env.llamacpp,
         request: env.args,
         workspace_root: env.workspace_root,
         models_root: env.models_root,
@@ -2805,13 +2749,36 @@ trait CompletionEngine {
 }
 
 struct LlamaCompletionEngine<'a> {
-    backend: &'a LlamaBackend,
-    model: &'a LlamaModel,
+    llamacpp: &'a LlamaCppBackend,
 }
 
 impl CompletionEngine for LlamaCompletionEngine<'_> {
     fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
-        generate_llama_completion(self.backend, self.model, args, prompt)
+        let request = LlamaCppRequest {
+            prompt: prompt.to_string(),
+            ctx_size: args.ctx_size,
+            threads: args.threads,
+            threads_batch: args.threads_batch,
+            gpu_layers: args.gpu_layers,
+            max_tokens: args.max_tokens,
+            top_k: args.top_k,
+            temperature: args.temperature,
+            seed: args.seed,
+        };
+        let output = self.llamacpp.generate(&request)?;
+        Ok(CompletionOutput {
+            content: output.content,
+            finish_reason: match output.finish_reason {
+                llamacpp::FinishReason::EndOfGeneration => {
+                    CompletionFinishReason::EndOfGeneration
+                }
+                llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
+            },
+            prompt_tokens: output.prompt_tokens,
+            generated_tokens: output.generated_tokens,
+            duration_ms: output.duration_ms,
+            energy: output.energy,
+        })
     }
 }
 
@@ -2927,104 +2894,6 @@ fn next_retry_max_tokens(current: i32) -> i32 {
     current.saturating_mul(2).min(MAX_TOKEN_RETRY_CAP)
 }
 
-fn generate_llama_completion(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
-    args: &AgentRequest,
-    prompt: &str,
-) -> Result<CompletionOutput> {
-    let energy_start = energy::sample();
-    let started = Instant::now();
-    let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
-    let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
-    if let Some(threads) = args.threads {
-        ctx_params = ctx_params.with_n_threads(threads);
-    }
-    if let Some(threads_batch) = args.threads_batch.or(args.threads) {
-        ctx_params = ctx_params.with_n_threads_batch(threads_batch);
-    }
-
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .context("failed to create llama context")?;
-
-    let tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .with_context(|| "failed to tokenize prompt")?;
-
-    ensure_prompt_fits_context(tokens.len(), args.max_tokens, ctx.n_ctx())?;
-
-    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
-    for range in prompt_batch_ranges(tokens.len(), LLAMA_BATCH_SIZE) {
-        batch.clear();
-        let is_final_batch = range.end == tokens.len();
-        for token_index in range.clone() {
-            let is_last_prompt_token = is_final_batch && token_index + 1 == tokens.len();
-            batch
-                .add(tokens[token_index], token_index as i32, &[0], is_last_prompt_token)
-                .with_context(|| {
-                    format!(
-                        "failed to add prompt token {token_index} to batch (batch capacity: {LLAMA_BATCH_SIZE}, prompt tokens: {})",
-                        tokens.len()
-                    )
-                })?;
-        }
-
-        ctx.decode(&mut batch).with_context(|| {
-            format!(
-                "failed to decode prompt batch {}..{}",
-                range.start, range.end
-            )
-        })?;
-    }
-
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::top_k(args.top_k),
-        LlamaSampler::temp(args.temperature),
-        LlamaSampler::dist(args.seed),
-    ]);
-
-    let mut decoder = UTF_8.new_decoder();
-    let mut output = String::new();
-    let mut n_cur = i32::try_from(tokens.len()).context("prompt token count exceeds i32::MAX")?;
-    let mut generated_tokens: usize = 0;
-
-    let mut finish_reason = CompletionFinishReason::MaxTokens;
-    while generated_tokens < usize::try_from(args.max_tokens).unwrap_or(0) {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if model.is_eog_token(token) {
-            finish_reason = CompletionFinishReason::EndOfGeneration;
-            break;
-        }
-
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .context("failed to decode output token")?;
-        output.push_str(&piece);
-
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .context("failed to queue generated token")?;
-        ctx.decode(&mut batch)
-            .context("failed to decode generated token")?;
-        n_cur += 1;
-        generated_tokens += 1;
-    }
-
-    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
-    Ok(CompletionOutput {
-        content: output,
-        finish_reason,
-        prompt_tokens: tokens.len(),
-        generated_tokens,
-        duration_ms: duration_millis(started),
-        energy,
-    })
-}
-
 fn duration_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -3038,27 +2907,6 @@ fn add_energy(total_joules: &mut f64, total_kwh: &mut f64, energy: Option<Energy
 
 fn nonzero_f64(value: f64) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
-}
-
-fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {
-    let n_ctx = usize::try_from(n_ctx).context("context size does not fit usize")?;
-    let requested_generation_tokens = usize::try_from(max_tokens.max(0))
-        .context("requested generation token count does not fit usize")?;
-    let reserved_generation_tokens = requested_generation_tokens.max(MIN_GENERATION_CONTEXT_TOKENS);
-    if prompt_tokens + reserved_generation_tokens > n_ctx {
-        bail!(
-            "prompt is too long for the configured context: {prompt_tokens} prompt tokens + {reserved_generation_tokens} reserved generation tokens exceeds ctx-size {n_ctx}. Increase --ctx-size or reduce the task/history size."
-        );
-    }
-    Ok(())
-}
-
-fn prompt_batch_ranges(token_count: usize, batch_size: usize) -> Vec<Range<usize>> {
-    assert!(batch_size > 0, "batch_size must be greater than zero");
-    (0..token_count)
-        .step_by(batch_size)
-        .map(|start| start..std::cmp::min(start + batch_size, token_count))
-        .collect()
 }
 
 fn parse_action(output: &str) -> Result<AgentAction> {
@@ -3148,9 +2996,7 @@ fn extract_json_objects(input: &str) -> Vec<String> {
 
 struct ToolContext<'a> {
     text_backend: TextBackendKind,
-    backend: Option<&'a LlamaBackend>,
-    model: Option<&'a LlamaModel>,
-    model_path: Option<&'a Path>,
+    llamacpp: Option<&'a LlamaCppBackend>,
     request: &'a AgentRequest,
     workspace_root: &'a Path,
     models_root: &'a Path,
@@ -3836,181 +3682,40 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     }
 
     // ── llama.cpp multimodal path ─────────────────────────────────────────────
-    let lazy_loaded_model =
-        if context.backend.is_none() || context.model.is_none() || context.model_path.is_none() {
-            Some(
-                load_llama_model_from_cache(
-                    context.models_root,
-                    &context.request.model,
-                    request.gpu_layers,
-                )
-                .with_context(|| {
-                    format!(
-                        "vision_describe requires llama.cpp vision support; failed to lazy-load fallback model {} from cache",
-                        context.request.model
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
-    let (backend, model, model_path) = if let (Some(backend), Some(model), Some(model_path)) =
-        (context.backend, context.model, context.model_path)
-    {
-        (backend, model, model_path)
+    let lazy_loaded;
+    let llamacpp = if let Some(backend) = context.llamacpp {
+        backend
     } else {
-        let (backend, model, model_path) = lazy_loaded_model
-            .as_ref()
-            .expect("BUG: lazy-loaded llama model should exist when vision context is unavailable; this indicates a logic error in vision_describe");
-        (backend, model, model_path.as_path())
-    };
-    let output = generate_vision_completion(
-        backend,
-        model,
-        model_path,
-        &request,
-        &structured_prompt,
-        &absolute,
-    )
-    .context("vision_describe model invocation failed")?;
-    Ok(output.content.trim().to_string())
-}
-
-fn generate_vision_completion(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
-    model_path: &Path,
-    args: &AgentRequest,
-    prompt: &str,
-    image_path: &Path,
-) -> Result<CompletionOutput> {
-    let mmproj_path = find_multimodal_projector(model_path)?;
-    let energy_start = energy::sample();
-    let started = Instant::now();
-    let n_ctx = NonZeroU32::new(args.ctx_size).context("ctx-size must be > 0")?;
-    let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
-    if let Some(threads) = args.threads {
-        ctx_params = ctx_params.with_n_threads(threads);
-    }
-    if let Some(threads_batch) = args.threads_batch.or(args.threads) {
-        ctx_params = ctx_params.with_n_threads_batch(threads_batch);
-    }
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .context("failed to create llama context for vision tool")?;
-
-    let mtmd_params = MtmdContextParams {
-        use_gpu: args.gpu_layers > 0,
-        print_timings: false,
-        n_threads: args.threads_batch.or(args.threads).unwrap_or(0),
-        media_marker: std::ffi::CString::new(mtmd_default_marker())?,
-    };
-    let mtmd = MtmdContext::init_from_file(&mmproj_path.to_string_lossy(), model, &mtmd_params)
-        .with_context(|| {
+        let path = find_model_in_cache_in(context.models_root, &context.request.model)
+            .with_context(|| {
+                format!(
+                    "vision_describe requires llama.cpp vision support; failed to find model {} in cache",
+                    context.request.model
+                )
+            })?;
+        lazy_loaded = llamacpp::load_from_file(&path, request.gpu_layers).with_context(|| {
             format!(
-                "failed to initialize multimodal projector {}",
-                mmproj_path.display()
+                "vision_describe requires llama.cpp vision support; failed to lazy-load fallback model {} from cache",
+                context.request.model
             )
         })?;
-    if !mtmd.support_vision() {
-        bail!(
-            "multimodal projector {} does not report vision support",
-            mmproj_path.display()
-        );
-    }
-    let bitmap = MtmdBitmap::from_file(&mtmd, &image_path.to_string_lossy())
-        .with_context(|| format!("failed to load vision image {}", image_path.display()))?;
-    let prompt_with_image = format!("{prompt}\n\nImage: {}", mtmd_default_marker());
-    let chunks = mtmd
-        .tokenize(
-            MtmdInputText {
-                text: prompt_with_image,
-                add_special: true,
-                parse_special: true,
-            },
-            &[&bitmap],
-        )
-        .context("failed to tokenize multimodal vision prompt")?;
-
-    ensure_prompt_fits_context(
-        chunks.total_positions() as usize,
-        args.max_tokens,
-        ctx.n_ctx(),
-    )?;
-    let mut n_cur = chunks
-        .eval_chunks(&mtmd, &ctx, 0, 0, LLAMA_BATCH_SIZE as i32, true)
-        .context("failed to evaluate multimodal vision prompt")?;
-
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::top_k(args.top_k),
-        LlamaSampler::temp(args.temperature),
-        LlamaSampler::dist(args.seed),
-    ]);
-    let mut decoder = UTF_8.new_decoder();
-    let mut output = String::new();
-    let mut generated_tokens: usize = 0;
-    let mut finish_reason = CompletionFinishReason::MaxTokens;
-    let mut batch = LlamaBatch::new(LLAMA_BATCH_SIZE, 1);
-    let mut sample_index = -1;
-    while generated_tokens < usize::try_from(args.max_tokens).unwrap_or(0) {
-        let token = sampler.sample(&ctx, sample_index);
-        sampler.accept(token);
-        if model.is_eog_token(token) {
-            finish_reason = CompletionFinishReason::EndOfGeneration;
-            break;
-        }
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .context("failed to decode vision output token")?;
-        output.push_str(&piece);
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .context("failed to queue generated vision token")?;
-        ctx.decode(&mut batch)
-            .context("failed to decode generated vision token")?;
-        n_cur += 1;
-        generated_tokens += 1;
-        sample_index = batch.n_tokens() - 1;
-    }
-
-    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
-    Ok(CompletionOutput {
-        content: output,
-        finish_reason,
-        prompt_tokens: chunks.total_tokens(),
-        generated_tokens,
-        duration_ms: duration_millis(started),
-        energy,
-    })
-}
-
-fn find_multimodal_projector(model_path: &Path) -> Result<PathBuf> {
-    let model_dir = model_path
-        .parent()
-        .context("model path has no parent directory")?;
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(model_dir)
-        .with_context(|| format!("failed to read model directory {}", model_dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path != model_path)
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| {
-                    let name = name.to_ascii_lowercase();
-                    name.contains("mmproj") && name.ends_with(".gguf")
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-    candidates.sort();
-    candidates.into_iter().next().with_context(|| {
-        format!(
-            "no multimodal projector (mmproj*.gguf) found next to model {}; pull a Qwen vision GGUF with its mmproj file",
-            model_path.display()
-        )
-    })
+        &lazy_loaded
+    };
+    let vision_request = LlamaCppRequest {
+        prompt: structured_prompt,
+        ctx_size: request.ctx_size,
+        threads: request.threads,
+        threads_batch: request.threads_batch,
+        gpu_layers: request.gpu_layers,
+        max_tokens: request.max_tokens,
+        top_k: request.top_k,
+        temperature: request.temperature,
+        seed: request.seed,
+    };
+    let output = llamacpp
+        .generate_vision(&vision_request, &absolute)
+        .context("vision_describe model invocation failed")?;
+    Ok(output.content.trim().to_string())
 }
 
 fn vision_describe_prompt(focus: &str, image_path: &Path) -> Result<String> {
@@ -4108,26 +3813,13 @@ fn run_sub_agent(
 
     let mut llama_generator;
     let mut flashmoe_generator;
-    let (generator, backend, model, model_path): (
-        &mut dyn CompletionEngine,
-        Option<&LlamaBackend>,
-        Option<&LlamaModel>,
-        Option<&Path>,
-    ) = match context.text_backend {
+    let generator: &mut dyn CompletionEngine = match context.text_backend {
         TextBackendKind::LlamaCpp => {
-            let (backend, model, model_path) = (context.backend, context.model, context.model_path);
-            let (backend, model, model_path) = (
-                backend.context("sub_agent requires a loaded llama.cpp backend")?,
-                model.context("sub_agent requires a loaded llama.cpp model")?,
-                model_path.context("sub_agent requires a loaded llama.cpp model path")?,
-            );
-            llama_generator = LlamaCompletionEngine { backend, model };
-            (
-                &mut llama_generator,
-                Some(backend),
-                Some(model),
-                Some(model_path),
-            )
+            let llamacpp = context
+                .llamacpp
+                .context("sub_agent requires a loaded llama.cpp backend")?;
+            llama_generator = LlamaCompletionEngine { llamacpp };
+            &mut llama_generator
         }
         TextBackendKind::FlashMoe => {
             let plan = crate::inference::flashmoe::plan(&sub_request.model, context.models_root)
@@ -4146,15 +3838,13 @@ fn run_sub_agent(
                 )
             })?;
             flashmoe_generator = FlashMoeCompletionEngine { engine };
-            (&mut flashmoe_generator, None, None, None)
+            &mut flashmoe_generator
         }
     };
     let outcome = run_agent_steps(
         generator,
         context.text_backend,
-        backend,
-        model,
-        model_path,
+        context.llamacpp,
         &sub_request,
         &mut messages,
         context.workspace_root,
@@ -5753,29 +5443,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_batch_ranges_splits_prompts_larger_than_batch_capacity() {
-        assert_eq!(
-            prompt_batch_ranges(1_025, 512),
-            vec![0..512, 512..1_024, 1_024..1_025]
-        );
-    }
-
-    #[test]
-    fn ensure_prompt_fits_context_allows_generation_room() {
-        ensure_prompt_fits_context(8_000, 128, 8_192).unwrap();
-    }
-
-    #[test]
-    fn ensure_prompt_fits_context_rejects_overflow_with_actionable_message() {
-        let err = ensure_prompt_fits_context(8_100, 128, 8_192)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("prompt is too long"), "error was: {err}");
-        assert!(err.contains("--ctx-size"), "error was: {err}");
-    }
-
-    #[test]
     fn boosted_max_tokens_applies_general_floor() {
         let mut args = test_agent_request(AgentProfile::Ask, 384);
         assert_eq!(boosted_max_tokens(&args), DEFAULT_TURN_MAX_TOKENS);
@@ -6068,17 +5735,6 @@ mod tests {
         assert!(prompt.contains("\"elements\""));
         assert!(prompt.contains("\"implementation_hints\""));
         assert!(prompt.contains("Focus: match this mockup"));
-    }
-
-    #[test]
-    fn vision_projector_is_resolved_from_model_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let model = tmp.path().join("qwen-vision.gguf");
-        let projector = tmp.path().join("mmproj-qwen-vision.gguf");
-        std::fs::write(&model, b"GGUF model").unwrap();
-        std::fs::write(&projector, b"GGUF projector").unwrap();
-
-        assert_eq!(find_multimodal_projector(&model).unwrap(), projector);
     }
 
     #[test]
