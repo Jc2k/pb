@@ -3034,9 +3034,6 @@ impl DenseStore {
                 if rows > 0 && cols > 0 && cols <= hidden.len() {
                     let mut scores =
                         self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
-                    for score in scores.iter_mut().take(rows) {
-                        *score /= (cols.max(1) as f32).sqrt();
-                    }
                     return Ok(scores);
                 }
             }
@@ -3072,11 +3069,8 @@ impl DenseStore {
                     for start in (0..rows).step_by(tile_rows) {
                         let end = (start + tile_rows).min(rows);
                         let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-                        let mut projected =
+                        let projected =
                             metal.dense_matvec(&tensor, hidden, end - start, cols)?;
-                        for value in &mut projected {
-                            *value /= (cols.max(1) as f32).sqrt();
-                        }
                         for (offset, value) in projected.into_iter().enumerate() {
                             logits[start + offset] = value;
                         }
@@ -3119,7 +3113,6 @@ impl DenseStore {
         let repeated = sampler.repeated_tokens(prompt, generated);
         let mut candidates = TopKCandidates::new(sampler.top_k.min(rows).max(1));
         let tile_rows = dense_projection_tile_rows(cols, rows);
-        let inv_norm = 1.0 / (cols.max(1) as f32).sqrt();
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
             let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
@@ -3128,7 +3121,7 @@ impl DenseStore {
                 let token = start + offset;
                 candidates.push(
                     token,
-                    sampler.process_logit(token, value * inv_norm, &repeated),
+                    sampler.process_logit(token, value, &repeated),
                 );
             }
         }
@@ -3951,11 +3944,11 @@ fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWei
     } else {
         bail!("failed to read expert {}", path.display());
     };
-    if !cfg!(test) && !packed.starts_with(b"PBQ4EXPERT ") {
+    if !cfg!(test) && !packed.starts_with(b"PBQ4EXPERT ") {
         bail!("expert {} is not a pb q4 expert pack", path.display());
     }
     let metadata = read_expert_pack_metadata(root, layer, expert)?;
-    let records = if packed.starts_with(b"PBQ4EXPERT ") {
+    let records = if packed.starts_with(b"PBQ4EXPERT ") {
         parse_pbq4_expert_pack(&packed, metadata.as_ref())
             .with_context(|| format!("failed to parse expert pack {}", path.display()))?
     } else {
@@ -3998,7 +3991,7 @@ fn parse_pbq4_expert_pack(
     bytes: &[u8],
     metadata: Option<&ExpertPackMetadata>,
 ) -> Result<Vec<PackedExpertTensor>> {
-    const MAGIC: &[u8] = b"PBQ4EXPERT\0";
+    const MAGIC: &[u8] = b"PBQ4EXPERT ";
     if !bytes.starts_with(MAGIC) {
         bail!("expert pack is missing PBQ4EXPERT header");
     }
@@ -4990,7 +4983,7 @@ fn pack_expert_tensors(
         let mut out = fs::File::create(&path)
             .with_context(|| format!("failed to create packed expert {}", path.display()))?;
         let mut records = Vec::new();
-        out.write_all(b"PBQ4EXPERT ")
+        out.write_all(b"PBQ4EXPERT ")
             .with_context(|| format!("failed to write packed expert header {}", path.display()))?;
         for tensor in tensors {
             if !shard_cache.contains_key(&tensor.shard) {
@@ -6293,7 +6286,7 @@ mod tests {
         assert_eq!(second.issued_reads, 3);
         assert_eq!(second.cache_hits, 1);
         assert_eq!(second.cache_misses, 3);
-        assert!(second.cached_bytes >= 2 * b"PBQ4EXPERT\0".len());
+        assert!(second.cached_bytes >= 2 * b"PBQ4EXPERT ".len());
     }
 
     #[test]
@@ -6313,7 +6306,7 @@ mod tests {
                     dtype: "F32".to_string(),
                     shape: vec![1, 4],
                     source_offsets: [0, 4],
-                    record_offset: b"PBQ4EXPERT\0".len() as u64,
+                    record_offset: b"PBQ4EXPERT ".len() as u64,
                     packed_bytes: 2,
                     groups: 1,
                     group_size: GROUP_SIZE,
@@ -6650,7 +6643,7 @@ mod tests {
 
     fn test_expert_pack(name: &str) -> Vec<u8> {
         let mut pack = Vec::new();
-        pack.extend_from_slice(b"PBQ4EXPERT\0");
+        pack.extend_from_slice(b"PBQ4EXPERT ");
         pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
         pack.extend_from_slice(name.as_bytes());
         pack.extend_from_slice(&2u64.to_le_bytes());
