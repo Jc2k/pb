@@ -3789,7 +3789,7 @@ struct ExpertKey {
 
 #[derive(Debug)]
 struct PendingExpertRead {
-    handle: Option<thread::JoinHandle<Result<ExpertWeights>>>,
+    handle: thread::JoinHandle<Result<ExpertWeights>>,
     issued_at: Instant,
 }
 
@@ -3836,14 +3836,14 @@ impl ExpertScheduler {
             };
             let issued_at = Instant::now();
             // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
-            // maintaining a second in-process cache of hot expert packs.
+            // maintaining a second in-process cache of hot expert packs. Cold expert reads still
+            // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
+            // evicts them, which matches the behavior described in the upstream notes.
             self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
             let root = self.store.root.clone();
             pending.push(PendingExpertRead {
-                handle: Some(thread::spawn(move || {
-                    read_one_expert(&root, key.layer, key.expert)
-                })),
+                handle: thread::spawn(move || read_one_expert(&root, key.layer, key.expert)),
                 issued_at,
             });
         }
@@ -3853,11 +3853,8 @@ impl ExpertScheduler {
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
-            let handle = pending
-                .handle
-                .context("pending expert read missing thread handle")?;
             let started = pending.issued_at;
-            let expert = match handle.join() {
+            let expert = match pending.handle.join() {
                 Ok(result) => result,
                 Err(_) => {
                     self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
@@ -7116,6 +7113,15 @@ mod tests {
         assert_eq!(second.issued_reads, 4);
         assert_eq!(second.cache_hits, 0);
         assert_eq!(second.cache_misses, 4);
+
+        let pending = scheduler.issue(0, &[3]).unwrap();
+        let experts = scheduler.finish(pending).unwrap();
+        assert_eq!(experts.len(), 1);
+        assert_eq!(experts[0].expert, 3);
+        let third = scheduler.snapshot();
+        assert_eq!(third.issued_reads, 5);
+        assert_eq!(third.cache_hits, 0);
+        assert_eq!(third.cache_misses, 5);
     }
 
     #[test]
