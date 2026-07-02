@@ -6,16 +6,6 @@ use globset::GlobBuilder;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8 as GrepUtf8};
 use ignore::WalkBuilder;
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
-};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -40,6 +30,11 @@ use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::AgentEvent;
+use crate::inference::llama::{
+    AddBos, LlamaBackend, LlamaBatch, LlamaContextParams, LlamaModel, LlamaModelParams,
+    LlamaSampler, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, init_backend,
+    mtmd_default_marker,
+};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
@@ -65,13 +60,6 @@ const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
-
-fn suppress_llama_logs() {
-    static LLAMA_LOGS_SUPPRESSED: OnceLock<()> = OnceLock::new();
-    LLAMA_LOGS_SUPPRESSED.get_or_init(|| {
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-    });
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSearchResult {
@@ -737,9 +725,7 @@ pub fn run_agent<S: EventSink>(
         timestamp_ms: Some(now_millis()),
     });
 
-    suppress_llama_logs();
-    let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
-    backend.void_logs();
+    let backend = init_backend()?;
     let model_params = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {}", model_path.display()))?;
