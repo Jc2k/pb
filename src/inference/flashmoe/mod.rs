@@ -1561,8 +1561,14 @@ impl FlashMoeEngine {
     ) -> Result<Vec<f32>> {
         let runtime = DenseTransformerRuntime::new(&self.config);
         let mut hidden = if let Some(mut emb) = embedding_override {
-            // Resize the override embedding to the runtime width if needed.
-            emb.resize(runtime.width, 0.0);
+            if emb.len() != runtime.width {
+                tracing::warn!(
+                    got = emb.len(),
+                    expected = runtime.width,
+                    "vision embedding dimension mismatch; zero-padding to runtime width"
+                );
+                emb.resize(runtime.width, 0.0);
+            }
             emb
         } else {
             self.dense.embedding(previous, runtime.width)?
@@ -5681,8 +5687,11 @@ impl ImagePreprocessor {
         }
         // Scale down while preserving aspect ratio.
         let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
-        let h2 = ((((orig_h as f64) * scale / (stride as f64)).max(1.0).round()) as u32) * stride;
-        let w2 = ((((orig_w as f64) * scale / (stride as f64)).max(1.0).round()) as u32) * stride;
+        let stride_f = stride as f64;
+        let scaled_h = ((orig_h as f64) * scale / stride_f).max(1.0).round() as u32;
+        let scaled_w = ((orig_w as f64) * scale / stride_f).max(1.0).round() as u32;
+        let h2 = scaled_h.max(1) * stride;
+        let w2 = scaled_w.max(1) * stride;
         (h2.max(stride), w2.max(stride))
     }
 
@@ -5841,7 +5850,7 @@ impl VisionEncoder {
         let projected = self
             .dense
             .matvec_tensor_prefix(name, patch, embed_dim)?
-            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
         // Add bias if present
         let with_bias = self.vit_add_bias("visual.patch_embed.proj.bias", projected)?;
         Ok(with_bias)
@@ -5896,7 +5905,9 @@ impl VisionEncoder {
 
     /// Multi-head self-attention (without positional encoding).
     ///
-    /// TODO: Apply 2D M-RoPE to Q and K for spatially-aware attention.
+    /// TODO(#vision-mrope): Apply 2D M-RoPE to Q and K for spatially-aware
+    /// attention.  Without it the model has no explicit spatial bias in the ViT
+    /// layers, but the merger MLP still produces useful token embeddings.
     fn vit_attention(
         &self,
         layer: usize,
@@ -5920,7 +5931,7 @@ impl VisionEncoder {
                 let projected = self
                     .dense
                     .matvec_tensor_prefix(&qkv_name, h, qkv_width)?
-                    .unwrap_or_else(|| vec![0.0f32; qkv_width]);
+                    .with_context(|| format!("vision: required tensor '{qkv_name}' is missing"))?;
                 self.vit_add_bias(&qkv_bias_name, projected)
             })
             .collect::<Result<_>>()?;
@@ -5954,11 +5965,14 @@ impl VisionEncoder {
                 }
             }
 
-            // Softmax over keys dimension
+            // Softmax over keys dimension (two-pass: exp then normalise)
             for i in 0..num_tokens {
                 let row = &mut scores[i * num_tokens..(i + 1) * num_tokens];
                 let max_s = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = row.iter_mut().map(|s| { *s = (*s - max_s).exp(); *s }).sum();
+                for s in row.iter_mut() {
+                    *s = (*s - max_s).exp();
+                }
+                let sum: f32 = row.iter().sum();
                 if sum > 0.0 {
                     row.iter_mut().for_each(|s| *s /= sum);
                 }
@@ -5984,7 +5998,9 @@ impl VisionEncoder {
                 let projected = self
                     .dense
                     .matvec_tensor_prefix(&proj_name, &h, embed_dim)?
-                    .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+                    .with_context(|| {
+                        format!("vision: required tensor '{proj_name}' is missing")
+                    })?;
                 self.vit_add_bias(&proj_bias_name, projected)
             })
             .collect::<Result<_>>()?;
@@ -6004,7 +6020,7 @@ impl VisionEncoder {
         let mut mid = self
             .dense
             .matvec_tensor_prefix(&fc1_name, hidden, mlp_hidden)?
-            .unwrap_or_else(|| vec![0.0f32; mlp_hidden]);
+            .with_context(|| format!("vision: required tensor '{fc1_name}' is missing"))?;
         mid = self.vit_add_bias(&fc1_bias, mid)?;
         for v in mid.iter_mut() {
             *v = gelu_approx(*v);
@@ -6014,7 +6030,7 @@ impl VisionEncoder {
         let out = self
             .dense
             .matvec_tensor_prefix(&fc2_name, &mid, embed_dim)?
-            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+            .with_context(|| format!("vision: required tensor '{fc2_name}' is missing"))?;
         self.vit_add_bias(&fc2_bias, out)
     }
 
@@ -6064,7 +6080,7 @@ impl VisionEncoder {
                 let mut mid = self
                     .dense
                     .matvec_tensor_prefix(&mlp0_w, &concat, concat_dim)?
-                    .unwrap_or_else(|| vec![0.0f32; concat_dim]);
+                    .with_context(|| format!("vision: required tensor '{mlp0_w}' is missing"))?;
                 mid = self.vit_add_bias(&mlp0_b, mid)?;
                 for v in mid.iter_mut() {
                     *v = gelu_approx(*v);
@@ -6072,7 +6088,7 @@ impl VisionEncoder {
                 let out = self
                     .dense
                     .matvec_tensor_prefix(&mlp2_w, &mid, out_dim)?
-                    .unwrap_or_else(|| vec![0.0f32; out_dim]);
+                    .with_context(|| format!("vision: required tensor '{mlp2_w}' is missing"))?;
                 let out = self.vit_add_bias(&mlp2_b, out)?;
                 merged_tokens.push(out);
             }
@@ -6125,8 +6141,8 @@ impl VisionEncoder {
 /// Approximate GeLU: `0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))`.
 #[inline]
 fn gelu_approx(x: f32) -> f32 {
-    let c = 0.797_884_6_f32; // sqrt(2/π)
-    0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
+    const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
+    0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
 
 
