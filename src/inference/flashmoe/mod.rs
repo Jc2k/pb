@@ -2870,11 +2870,7 @@ impl DenseStore {
         tokenizer: &QwenTokenizer,
     ) -> Result<Vec<f32>> {
         let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
-        for token in tokenizer.candidate_token_ids().iter().copied() {
-            let idx = token as usize;
-            if idx >= logits.len() {
-                continue;
-            }
+        for idx in 0..tokenizer.vocab_size() {
             let Some(row) = self.read_tensor_row_f32(lm_head_name, idx, hidden.len())? else {
                 bail!(
                     "Flash-MoE LM head tensor {lm_head_name} cannot provide row for token {idx}; refusing synthetic logits"
@@ -5634,6 +5630,124 @@ mod tests {
             tokenizer.encode("<|im_start|>hello<|im_end|>").unwrap(),
             vec![100, 8, 101]
         );
+    }
+
+    #[test]
+    fn lm_head_logits_scores_full_vocab_in_cpu_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(tokenizer.vocab_size(), 3);
+        assert_eq!(tokenizer.candidate_token_ids(), &[0, 2]);
+
+        let mut bytes = Vec::new();
+        for row in 0..tokenizer.vocab_size() {
+            let value = (row as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![tokenizer.vocab_size(), 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let logits = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap();
+
+        assert_eq!(logits.len(), 3);
+        assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn lm_head_logits_rejects_missing_vocab_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        for row in 0..2usize {
+            let value = (row as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap_err();
+        assert!(err.to_string().contains("token 2"), "{err:#}");
     }
 
     #[test]
