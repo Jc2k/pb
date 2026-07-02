@@ -5216,21 +5216,6 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
             model
         );
     }
-
-    // Multi-shard GGUF models (e.g. Qwen3.5-397B-A17B) are split into files
-    // named like `model-Q4_K_M-00001-of-00010.gguf`.  llama.cpp requires the
-    // first shard as the entry-point and auto-discovers the rest.  Prefer any
-    // file whose name contains "-00001-of-"; fall back to the largest file for
-    // single-file or Ollama-blob models.
-    if let Some(first_shard) = gguf_files.iter().find(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.contains("-00001-of-"))
-            .unwrap_or(false)
-    }) {
-        return Ok(first_shard.clone());
-    }
-
     gguf_files
         .sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
 
@@ -5997,31 +5982,6 @@ mod tests {
 
         let path = find_model_in_cache_in(tmp.path(), "mymodel").expect("should find GGUF");
         assert_eq!(path.file_name().unwrap(), "sha256_large");
-    }
-
-    #[test]
-    fn find_model_in_cache_returns_first_shard_for_sharded_models() {
-        // Multi-shard GGUF models (e.g. Qwen3.5-397B-A17B) use filenames like
-        // `model-Q4_K_M-00001-of-00010.gguf`.  llama.cpp requires the first
-        // shard as the entry-point; passing any other shard causes a load
-        // failure.  All shards are the same size, so size-based sorting is
-        // non-deterministic — the code must explicitly prefer shard 00001.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let model_dir = tmp.path().join("unsloth_Qwen3.5-397B-A17B-GGUF");
-        std::fs::create_dir_all(&model_dir).unwrap();
-
-        let shard_data: Vec<u8> = b"GGUF".iter().chain(&[0u8; 64]).copied().collect();
-        for i in 1u32..=3 {
-            let name = format!("Qwen3.5-397B-A17B-Q4_K_M-{i:05}-of-00003.gguf");
-            std::fs::write(model_dir.join(&name), &shard_data).unwrap();
-        }
-
-        let path = find_model_in_cache_in(tmp.path(), "unsloth_Qwen3.5-397B-A17B-GGUF")
-            .expect("should find first shard");
-        assert_eq!(
-            path.file_name().unwrap().to_str().unwrap(),
-            "Qwen3.5-397B-A17B-Q4_K_M-00001-of-00003.gguf"
-        );
     }
 
     #[test]
