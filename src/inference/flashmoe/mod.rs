@@ -5724,8 +5724,8 @@ mod tests {
         .unwrap();
 
         let mut bytes = Vec::new();
-        for row in 0..2usize {
-            let value = (row as f32) + 1.0;
+        for row_idx in 0..2usize {
+            let value = (row_idx as f32) + 1.0;
             bytes.extend_from_slice(&value.to_le_bytes());
             bytes.extend_from_slice(&value.to_le_bytes());
         }
