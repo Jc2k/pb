@@ -1632,6 +1632,8 @@ impl FlashMoeEngine {
             if self.metal.is_none() {
                 softmax_in_place(&mut weights);
             }
+            // Deferred CMD3-style overlap: while expert reads are still pending, compute
+            // the always-active shared-expert branch on the CPU/GPU.
             let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
             let experts = self.scheduler.finish(pending_experts)?;
             for (expert, weight) in experts.iter().zip(weights) {
@@ -1837,6 +1839,7 @@ impl FlashMoeEngine {
             let start = head * LINEAR_KEY_DIM;
             let end = start + LINEAR_KEY_DIM;
             rms_norm_in_place(&mut lin_q[start..end]);
+            // Qwen3.5 GatedDeltaNet scales Q by inv_scale^2 and K by inv_scale.
             for value in &mut lin_q[start..end] {
                 *value *= inv_scale * inv_scale;
             }
@@ -3140,6 +3143,7 @@ fn validate_required_tensor_manifest(
         )?;
     }
     let has_linear_attention = (0..config.num_hidden_layers)
+        .filter(|layer| !is_full_attention_layer(*layer))
         .any(|layer| registry.tensor(&linear_attention_tensor_name(layer, "in_proj_qkv")).is_some());
     for layer in 0..config.num_hidden_layers {
         let is_full = !has_linear_attention || is_full_attention_layer(layer);
@@ -3285,6 +3289,8 @@ fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
 }
 
 fn is_full_attention_layer(layer: usize) -> bool {
+    // Flash-MoE schedules full attention every 4th layer in 1-indexed form:
+    // layers 3, 7, 11, ... (0-indexed), hence (layer + 1) % 4 == 0.
     (layer + 1) % FULL_ATTN_INTERVAL == 0
 }
 
@@ -4395,6 +4401,7 @@ fn conv1d_step(
     channels: usize,
     kernel_size: usize,
 ) {
+    debug_assert_eq!(out.len(), channels);
     for c in 0..channels.min(out.len()) {
         let mut acc = 0.0f32;
         for k in 0..kernel_size.saturating_sub(1) {
