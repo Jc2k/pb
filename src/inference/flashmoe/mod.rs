@@ -5754,7 +5754,9 @@ mod tests {
         let err = store
             .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
             .unwrap_err();
-        assert!(err.to_string().contains("token 2"), "{err:#}");
+        let message = err.to_string();
+        assert!(message.contains("cannot provide row"), "{err:#}");
+        assert!(message.contains("token 2"), "{err:#}");
     }
 
     #[test]
