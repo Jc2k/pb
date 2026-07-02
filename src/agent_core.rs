@@ -3805,6 +3805,37 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.max_tokens = boosted_max_tokens(&request).max(2048);
     request.temperature = 0.0;
     request.top_k = 1;
+
+    // ── FlashMoe Qwen3-VL path ────────────────────────────────────────────────
+    if context.text_backend == TextBackendKind::FlashMoe {
+        if let Some(plan) =
+            crate::inference::flashmoe::plan(&context.request.model, context.models_root)
+        {
+            if crate::inference::flashmoe::is_qwen3_vl(&plan.model) {
+                let mut engine = crate::inference::flashmoe::load(&plan).with_context(|| {
+                    format!(
+                        "vision_describe: failed to load Qwen3-VL engine for {}",
+                        plan.model
+                    )
+                })?;
+                let output = engine
+                    .generate_with_image(
+                        &crate::inference::flashmoe::VisionGenerationRequest {
+                            prompt: structured_prompt,
+                            image_path: absolute,
+                            max_tokens: request.max_tokens,
+                            temperature: request.temperature,
+                            top_k: request.top_k,
+                            seed: request.seed,
+                        },
+                    )
+                    .context("vision_describe Qwen3-VL model invocation failed")?;
+                return Ok(output.content.trim().to_string());
+            }
+        }
+    }
+
+    // ── llama.cpp multimodal path ─────────────────────────────────────────────
     let lazy_loaded_model =
         if context.backend.is_none() || context.model.is_none() || context.model_path.is_none() {
             Some(

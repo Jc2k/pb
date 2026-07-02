@@ -27,6 +27,10 @@ use std::io::{Seek, Write};
 pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
 pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
+/// Hugging Face model URI for the Qwen3-VL multimodal MoE model.
+pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
+/// Lowercase substring used to identify Qwen3-VL MoE model strings.
+pub const QWEN3_VL_MODEL_MARKER: &str = "qwen3-vl-moe";
 pub const CACHE_VERSION: &str = "flashmoe-v1";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
@@ -37,6 +41,23 @@ const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
 pub const EXPECTED_EXPERT_BYTES: u64 =
     FOUR_BIT_EXPERT_SIZE * NUM_LAYERS as u64 * NUM_EXPERTS as u64;
+
+// ── Vision constants (Qwen3-VL image preprocessor) ───────────────────────────
+
+/// Pixels per spatial patch edge (14 px for Qwen3-VL ViT).
+pub const VIT_PATCH_SIZE: usize = 14;
+/// Spatial patches merged into one visual language-model token (2×2 = 4).
+pub const VIT_MERGE_SIZE: usize = 2;
+/// Pixel stride per merged visual token: `VIT_PATCH_SIZE * VIT_MERGE_SIZE`.
+pub const VIT_SPATIAL_MERGE_SIZE: usize = VIT_PATCH_SIZE * VIT_MERGE_SIZE; // 28
+/// ImageNet pixel mean for ViT normalisation (RGB order).
+pub const VIT_IMAGE_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+/// ImageNet pixel std for ViT normalisation (RGB order).
+pub const VIT_IMAGE_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+/// Upper pixel budget for an input image (~1 280 merged visual tokens).
+pub const VIT_MAX_PIXELS: usize = 1280 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
+/// Lower pixel budget for an input image (at least 4 merged visual tokens).
+pub const VIT_MIN_PIXELS: usize = 4 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -57,6 +78,12 @@ pub struct FlashMoePlan {
     pub uses_metal: bool,
     pub streams_experts_from_nand: bool,
     pub quantization: ExpertQuantization,
+    /// Packed vision-encoder weights (present only for Qwen3-VL MoE plans).
+    pub vision_weights: Option<PathBuf>,
+    /// Vision-encoder tensor manifest JSON (present only for Qwen3-VL MoE plans).
+    pub vision_manifest: Option<PathBuf>,
+    /// Persisted vision-encoder config JSON (present only for Qwen3-VL MoE plans).
+    pub vision_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +120,19 @@ pub struct GenerationRequest {
 pub struct GenerationOutput {
     pub content: String,
     pub generated_tokens: usize,
+}
+
+/// A generation request that includes an image for multimodal (Qwen3-VL) inference.
+#[derive(Debug, Clone)]
+pub struct VisionGenerationRequest {
+    /// Text prompt (will be wrapped in the model's chat template).
+    pub prompt: String,
+    /// Path to the image to encode.
+    pub image_path: PathBuf,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +209,70 @@ pub struct QwenModelConfig {
     /// Intermediate size for the shared expert MLPs.  Falls back to moe_intermediate_size
     /// then intermediate_size when absent.
     pub shared_expert_intermediate_size: Option<usize>,
+    /// Vision encoder configuration; present only for Qwen3-VL multimodal models.
+    pub vision_config: Option<Qwen3VLVisionConfig>,
+}
+
+/// Vision-encoder (ViT) configuration for Qwen3-VL MoE models.
+///
+/// Mirrors the `vision_config` sub-object found in the HuggingFace `config.json`
+/// for `Qwen/Qwen3-VL-MoE-Instruct` and related checkpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Qwen3VLVisionConfig {
+    /// Number of transformer layers in the ViT encoder.
+    pub depth: usize,
+    /// Hidden dimension of the ViT (equals `hidden_size` in the HF config).
+    pub embed_dim: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// FFN hidden-size ratio (defaults to 4.0).
+    #[serde(default = "default_vit_mlp_ratio")]
+    pub mlp_ratio: f64,
+    /// Pixel edge-length of each square patch (defaults to 14).
+    #[serde(default = "default_vit_patch_size")]
+    pub patch_size: usize,
+    /// How many patches are spatially merged into one language-model token
+    /// along each axis (defaults to 2, giving 2×2 = 4 patches per token).
+    #[serde(default = "default_vit_merge_size")]
+    pub merge_size: usize,
+    /// Input channels (defaults to 3 for RGB).
+    #[serde(default = "default_vit_in_chans")]
+    pub in_chans: usize,
+}
+
+fn default_vit_mlp_ratio() -> f64 {
+    4.0
+}
+fn default_vit_patch_size() -> usize {
+    VIT_PATCH_SIZE
+}
+fn default_vit_merge_size() -> usize {
+    VIT_MERGE_SIZE
+}
+fn default_vit_in_chans() -> usize {
+    3
+}
+
+impl Qwen3VLVisionConfig {
+    /// Pixel stride per merged visual token (`patch_size * merge_size`).
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    /// Number of patches that form one merged visual token (`merge_size ^ 2`).
+    pub fn patches_per_token(&self) -> usize {
+        self.merge_size * self.merge_size
+    }
+
+    /// Flattened input dimension for the patch-embedding linear layer.
+    pub fn patch_flat_dim(&self) -> usize {
+        self.in_chans * self.patch_size * self.patch_size
+    }
+
+    /// Intermediate size of each ViT MLP layer.
+    pub fn mlp_hidden_size(&self) -> usize {
+        (self.embed_dim as f64 * self.mlp_ratio).round() as usize
+    }
 }
 
 impl QwenModelConfig {
@@ -276,7 +380,7 @@ pub fn select_backend(model: &str) -> BackendSelection {
 }
 
 pub fn supports_flashmoe(model: &str) -> bool {
-    is_arm_macos() && is_qwen35_or_legacy_alias(model)
+    is_arm_macos() && (is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model))
 }
 
 pub fn is_arm_macos() -> bool {
@@ -286,6 +390,11 @@ pub fn is_arm_macos() -> bool {
 pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
     let normalized = model.to_ascii_lowercase();
     normalized.contains(QWEN35_MODEL_MARKER) || normalized.contains(LEGACY_QWEN_CODER_MARKER)
+}
+
+/// Returns `true` when `model` identifies a Qwen3-VL MoE multimodal model.
+pub fn is_qwen3_vl(model: &str) -> bool {
+    model.to_ascii_lowercase().contains(QWEN3_VL_MODEL_MARKER)
 }
 
 pub fn canonical_model(model: &str) -> String {
@@ -307,15 +416,19 @@ pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
     let model = canonical_model(model);
     let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
     let runtime_dir = model_cache_dir.join(CACHE_VERSION);
+    let vl = is_qwen3_vl(&model);
     FlashMoePlan {
-        model,
-        model_cache_dir,
+        vision_weights: vl.then(|| runtime_dir.join("vision_weights.bin")),
+        vision_manifest: vl.then(|| runtime_dir.join("vision_weights.json")),
+        vision_config_path: vl.then(|| runtime_dir.join("vision_config.json")),
         non_expert_weights: runtime_dir.join("model_weights.bin"),
         tensor_manifest: runtime_dir.join("model_weights.json"),
         model_config: runtime_dir.join("config.json"),
         tokenizer: runtime_dir.join("tokenizer.bin"),
         experts_dir: runtime_dir.join("packed_experts"),
         runtime_dir,
+        model,
+        model_cache_dir,
         uses_metal: true,
         streams_experts_from_nand: true,
         quantization: ExpertQuantization::FourBitProduction,
@@ -385,6 +498,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         plan.tensor_manifest.clone(),
     )?;
     validate_required_tensor_manifest(&config, dense.registry())?;
+    let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
     Ok(FlashMoeEngine {
         plan: plan.clone(),
         experts: ExpertStore::open(plan.experts_dir.clone())?,
@@ -392,6 +506,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         dense,
         tokenizer: QwenTokenizer::from_file(&plan.tokenizer)?,
         metal: MetalExecutor::new(plan, &config)?,
+        vision_encoder,
         config,
     })
 }
@@ -405,6 +520,8 @@ pub struct FlashMoeEngine {
     tokenizer: QwenTokenizer,
     metal: Option<MetalExecutor>,
     config: QwenModelConfig,
+    /// Vision encoder, present only for Qwen3-VL plans.
+    vision_encoder: Option<VisionEncoder>,
 }
 
 #[derive(Debug, Clone)]
@@ -1289,9 +1406,116 @@ impl FlashMoeEngine {
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
-            let _ = self.forward_hidden(token, kv_cache, position, false)?;
+            let _ = self.forward_hidden(token, None, kv_cache, position, false)?;
         }
         Ok(())
+    }
+
+    /// Prefill the KV cache for a vision prompt, substituting visual embeddings
+    /// in place of `image_pad_token` positions.
+    fn prefill_with_vision(
+        &mut self,
+        prompt_tokens: &[u32],
+        visual_embeddings: &[Vec<f32>],
+        image_pad_token: u32,
+        kv_cache: &mut KvCache,
+    ) -> Result<()> {
+        let mut vis_idx = 0usize;
+        for (position, &token) in prompt_tokens.iter().enumerate() {
+            kv_cache.record_prompt_token(position, token)?;
+            let override_emb = if token == image_pad_token && vis_idx < visual_embeddings.len() {
+                let emb = visual_embeddings[vis_idx].clone();
+                vis_idx += 1;
+                Some(emb)
+            } else {
+                None
+            };
+            let _ = self.forward_hidden(token, override_emb, kv_cache, position, false)?;
+        }
+        Ok(())
+    }
+
+    /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
+    ///
+    /// Returns an error when the engine was not loaded from a Qwen3-VL plan
+    /// (i.e. `plan.vision_weights` is `None`).
+    pub fn generate_with_image(
+        &mut self,
+        request: &VisionGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        // ── 1. Encode the image ───────────────────────────────────────────────
+        let vision_config = self
+            .config
+            .vision_config
+            .as_ref()
+            .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
+        let encoder = self
+            .vision_encoder
+            .as_ref()
+            .context("generate_with_image requires a loaded VisionEncoder; this plan has no vision weights")?;
+        let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
+        let visual_embeddings = encoder.encode(&preprocessor, &request.image_path)?;
+        let num_visual_tokens = visual_embeddings.len();
+
+        // ── 2. Build the prompt with vision-pad placeholders ──────────────────
+        // Qwen3-VL chat template: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
+        let vision_start = self.tokenizer.token_id("<|vision_start|>");
+        let vision_end = self.tokenizer.token_id("<|vision_end|>");
+        let image_pad = self.tokenizer.token_id("<|image_pad|>");
+
+        let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
+            (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
+            _ => bail!(
+                "Qwen3-VL tokenizer is missing required vision special tokens \
+                 (<|vision_start|>, <|vision_end|>, <|image_pad|>); \
+                 ensure the tokenizer.json is from a VL checkpoint"
+            ),
+        };
+
+        // Render the chat-template text prompt (system + user prefix)
+        let chat_text = self.tokenizer.apply_chat_template(&request.prompt);
+        let mut text_tokens = self.tokenizer.encode(&chat_text)?;
+
+        // Splice vision tokens in front of the text
+        let mut prompt_tokens: Vec<u32> = Vec::with_capacity(
+            2 + num_visual_tokens + text_tokens.len(),
+        );
+        prompt_tokens.push(vs_tok);
+        prompt_tokens.extend(std::iter::repeat(pad_tok).take(num_visual_tokens));
+        prompt_tokens.push(ve_tok);
+        prompt_tokens.append(&mut text_tokens);
+
+        // ── 3. Prefill with visual embeddings injected ────────────────────────
+        let mut kv_cache = KvCache::new(
+            self.config.num_hidden_layers,
+            prompt_tokens.len() + request.max_tokens.max(0) as usize,
+        );
+        self.prefill_with_vision(&prompt_tokens, &visual_embeddings, pad_tok, &mut kv_cache)?;
+
+        // ── 4. Decode ─────────────────────────────────────────────────────────
+        let mut sampler =
+            TokenSampler::new(request.temperature, request.top_k, request.seed);
+        let mut generated = Vec::new();
+        for position in
+            prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
+        {
+            let token = self.sample_next_token(
+                &mut sampler,
+                &prompt_tokens,
+                &generated,
+                &mut kv_cache,
+                position,
+            )?;
+            if self.tokenizer.is_eos(token) {
+                break;
+            }
+            generated.push(token);
+        }
+
+        Ok(GenerationOutput {
+            content: self.tokenizer.decode(&generated)?,
+            generated_tokens: generated.len(),
+        })
     }
 
     fn sample_next_token(
@@ -1307,7 +1531,7 @@ impl FlashMoeEngine {
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        let hidden = self.forward_hidden(previous, kv_cache, position, true)?;
+        let hidden = self.forward_hidden(previous, None, kv_cache, position, true)?;
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
             self.metal.as_ref(),
             &hidden,
@@ -1330,12 +1554,19 @@ impl FlashMoeEngine {
     fn forward_hidden(
         &mut self,
         previous: u32,
+        embedding_override: Option<Vec<f32>>,
         kv_cache: &mut KvCache,
         position: usize,
         record_generated: bool,
     ) -> Result<Vec<f32>> {
         let runtime = DenseTransformerRuntime::new(&self.config);
-        let mut hidden = self.dense.embedding(previous, runtime.width)?;
+        let mut hidden = if let Some(mut emb) = embedding_override {
+            // Resize the override embedding to the runtime width if needed.
+            emb.resize(runtime.width, 0.0);
+            emb
+        } else {
+            self.dense.embedding(previous, runtime.width)?
+        };
         let mut state = self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64);
 
         for layer in 0..self.config.num_hidden_layers {
@@ -1956,6 +2187,11 @@ impl QwenTokenizer {
 
     fn eos_token_id(&self) -> u32 {
         self.eos_token
+    }
+
+    /// Look up a token string and return its ID, or `None` if not present.
+    fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id.get(token).copied()
     }
 
     fn vocab_size(&self) -> usize {
@@ -3392,6 +3628,26 @@ impl DenseStore {
         }
         Ok(u64::from_le_bytes(out) ^ offset_hint.rotate_left(7))
     }
+
+    /// Read a full 1-D or 2-D F32/BF16 tensor into a `Vec<f32>`.
+    ///
+    /// Returns `Ok(None)` when the tensor name is absent from the manifest.
+    fn read_full_tensor_f32(&self, canonical_name: &str) -> Result<Option<Vec<f32>>> {
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            return Ok(None);
+        };
+        let Some(_element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        let byte_len = entry.byte_len as usize;
+        let bytes = self.read_range(entry.byte_offset, byte_len)?;
+        Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
+    }
+
 }
 
 fn dtype_size(dtype: &str) -> Option<usize> {
@@ -4455,6 +4711,13 @@ pub fn expected_hf_files() -> Vec<OsString> {
     .collect()
 }
 
+/// The minimum set of HuggingFace snapshot files required for a Qwen3-VL
+/// (vision-language) FlashMoe model.  The ViT tensors are embedded in the
+/// same shards as the text tensors and are split out during caching.
+pub fn expected_vl_hf_files() -> Vec<OsString> {
+    expected_hf_files()
+}
+
 pub const METAL_SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4751,16 +5014,19 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     }
 
     let index_json = snapshot_dir.join("model.safetensors.index.json");
-    let manifest = if index_json.is_file() {
+    let (manifest, visual_tensor_refs) = if index_json.is_file() {
         build_manifest(model, snapshot_dir, &index_json)?
     } else {
-        FlashMoeManifest {
-            model: canonical_model(model),
-            cache_version: CACHE_VERSION.to_string(),
-            dense_shards: Vec::new(),
-            expert_tensors: Vec::new(),
-            dense_tensors: Vec::new(),
-        }
+        (
+            FlashMoeManifest {
+                model: canonical_model(model),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: Vec::new(),
+                expert_tensors: Vec::new(),
+                dense_tensors: Vec::new(),
+            },
+            Vec::new(),
+        )
     };
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).context("failed to encode Flash-MoE manifest")?;
@@ -4783,6 +5049,43 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
         config.as_ref(),
     )?;
 
+    // For VL models, build and write the vision weights store.
+    if let (Some(vision_weights), Some(vision_manifest)) =
+        (plan.vision_weights.as_ref(), plan.vision_manifest.as_ref())
+    {
+        if !visual_tensor_refs.is_empty() {
+            write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
+            let vision_manifest_data = FlashMoeManifest {
+                model: canonical_model(model),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: Vec::new(),
+                expert_tensors: Vec::new(),
+                dense_tensors: visual_tensor_refs,
+            };
+            let vision_manifest_bytes = serde_json::to_vec_pretty(&vision_manifest_data)
+                .context("failed to encode vision weights manifest")?;
+            fs::write(vision_manifest, vision_manifest_bytes).with_context(|| {
+                format!(
+                    "failed to write vision weights manifest {}",
+                    vision_manifest.display()
+                )
+            })?;
+        }
+        // Write vision_config.json (the nested vision_config object from config.json).
+        if let (Some(vc), Some(vc_path)) =
+            (config.as_ref().and_then(|c| c.vision_config.as_ref()), plan.vision_config_path.as_ref())
+        {
+            let vc_bytes = serde_json::to_vec_pretty(vc)
+                .context("failed to encode vision config")?;
+            fs::write(vc_path, vc_bytes).with_context(|| {
+                format!(
+                    "failed to write vision config {}",
+                    vc_path.display()
+                )
+            })?;
+        }
+    }
+
     fs::write(plan.runtime_dir.join("kernels.metal"), METAL_SHADERS).with_context(|| {
         format!(
             "failed to write Metal kernels to {}",
@@ -4794,7 +5097,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     Ok(plan)
 }
 
-fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result<FlashMoeManifest> {
+fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
     let index: SafetensorsIndex = serde_json::from_slice(
         &fs::read(index_json)
             .with_context(|| format!("failed to read {}", index_json.display()))?,
@@ -4802,9 +5105,11 @@ fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result
     .with_context(|| format!("failed to parse {}", index_json.display()))?;
     let mut dense_shards = BTreeSet::new();
     let mut dense_tensor_refs = Vec::new();
+    let mut visual_tensor_refs = Vec::new();
     let mut expert_tensors = Vec::new();
     let mut shard_cache = BTreeMap::<String, SafetensorShard>::new();
     let mut runtime_offset = 0u64;
+    let mut visual_offset = 0u64;
     for (tensor, shard) in index.weight_map {
         let shard_path = snapshot_dir.join(&shard);
         if !shard_path.is_file() {
@@ -4831,6 +5136,22 @@ fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result
                 shape: tensor_info.shape.clone(),
                 source_offsets: Some(tensor_info.data_offsets),
             });
+        } else if tensor.starts_with("visual.") {
+            // Vision encoder tensors go into a separate store.
+            let byte_len = tensor_info.data_offsets[1]
+                .checked_sub(tensor_info.data_offsets[0])
+                .with_context(|| format!("invalid data_offsets for visual tensor {tensor}"))?;
+            visual_offset = align_to(visual_offset, TENSOR_ALIGNMENT);
+            visual_tensor_refs.push(DenseTensorRef {
+                tensor,
+                shard,
+                dtype: tensor_info.dtype.clone(),
+                shape: tensor_info.shape.clone(),
+                source_offsets: tensor_info.data_offsets,
+                runtime_offset: visual_offset,
+                byte_len,
+            });
+            visual_offset = visual_offset.saturating_add(byte_len);
         } else {
             dense_shards.insert(shard.clone());
             let byte_len = tensor_info.data_offsets[1]
@@ -4849,13 +5170,16 @@ fn build_manifest(model: &str, snapshot_dir: &Path, index_json: &Path) -> Result
             runtime_offset = runtime_offset.saturating_add(byte_len);
         }
     }
-    Ok(FlashMoeManifest {
-        model: canonical_model(model),
-        cache_version: CACHE_VERSION.to_string(),
-        dense_shards: dense_shards.into_iter().collect(),
-        expert_tensors,
-        dense_tensors: dense_tensor_refs,
-    })
+    Ok((
+        FlashMoeManifest {
+            model: canonical_model(model),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: dense_shards.into_iter().collect(),
+            expert_tensors,
+            dense_tensors: dense_tensor_refs,
+        },
+        visual_tensor_refs,
+    ))
 }
 
 const TENSOR_ALIGNMENT: u64 = 4096;
@@ -5289,8 +5613,522 @@ fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
 }
 
 pub fn is_flashmoe_hf_model(model: &str) -> bool {
-    model.starts_with("hf://") && is_qwen35_or_legacy_alias(model)
+    model.starts_with("hf://") && (is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model))
 }
+
+// ── Image preprocessor ────────────────────────────────────────────────────────
+
+/// Image preprocessor for Qwen3-VL vision inputs.
+///
+/// Resizes the input image to fit within the pixel budget, splits it into
+/// `patch_size × patch_size` pixel patches, applies channel-wise normalisation,
+/// and returns the patches in `[N, C, patch_h, patch_w]` order ready for the
+/// ViT patch-embedding layer.
+#[derive(Debug, Clone)]
+pub struct ImagePreprocessor {
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub max_pixels: usize,
+    pub min_pixels: usize,
+}
+
+impl ImagePreprocessor {
+    /// Construct from a [`Qwen3VLVisionConfig`].
+    pub fn from_vision_config(config: &Qwen3VLVisionConfig) -> Self {
+        Self {
+            patch_size: config.patch_size,
+            merge_size: config.merge_size,
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    /// Construct with the published Qwen3-VL defaults.
+    pub fn default_qwen3_vl() -> Self {
+        Self {
+            patch_size: VIT_PATCH_SIZE,
+            merge_size: VIT_MERGE_SIZE,
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    /// Pixels covered by one merged visual token along each spatial axis.
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    /// Resize `(orig_h, orig_w)` so that:
+    ///
+    /// 1. Both dimensions are multiples of `token_stride`.
+    /// 2. `height × width` stays within `[min_pixels, max_pixels]`.
+    ///
+    /// Returns `(target_h, target_w)`.
+    pub fn smart_resize(&self, orig_h: u32, orig_w: u32) -> (u32, u32) {
+        let stride = self.token_stride() as u32;
+        // Round each dimension up to the nearest multiple of stride.
+        let h = ((orig_h.max(stride) + stride - 1) / stride) * stride;
+        let w = ((orig_w.max(stride) + stride - 1) / stride) * stride;
+        let pixels = (h as usize) * (w as usize);
+        if pixels <= self.max_pixels {
+            return (h, w);
+        }
+        // Scale down while preserving aspect ratio.
+        let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
+        let h2 = ((((orig_h as f64) * scale / (stride as f64)).max(1.0).round()) as u32) * stride;
+        let w2 = ((((orig_w as f64) * scale / (stride as f64)).max(1.0).round()) as u32) * stride;
+        (h2.max(stride), w2.max(stride))
+    }
+
+    /// Preprocess the image at `path`:
+    ///
+    /// 1. Decode and resize to target dimensions.
+    /// 2. Normalise: `(pixel / 255 - mean) / std` per channel.
+    /// 3. Split into `patch_size × patch_size` patches.
+    ///
+    /// Returns `(grid_h, grid_w, flat_patch_data)` where `flat_patch_data` is
+    /// laid out as `[num_patches × channels × patch_h × patch_w]`
+    /// (channel-first patch ordering).
+    pub fn preprocess(&self, path: &Path) -> Result<(usize, usize, Vec<f32>)> {
+        let img = image::ImageReader::open(path)
+            .with_context(|| format!("vision: failed to open image {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("vision: failed to guess format for {}", path.display()))?
+            .decode()
+            .with_context(|| format!("vision: failed to decode image {}", path.display()))?
+            .to_rgb8();
+
+        let (orig_w, orig_h) = img.dimensions();
+        let (target_h, target_w) = self.smart_resize(orig_h, orig_w);
+
+        let img = if (orig_h, orig_w) != (target_h, target_w) {
+            image::imageops::resize(
+                &img,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            img
+        };
+
+        let grid_h = (target_h as usize) / self.patch_size;
+        let grid_w = (target_w as usize) / self.patch_size;
+        let num_patches = grid_h * grid_w;
+        let patch_pixels = self.patch_size * self.patch_size;
+        // Layout: [num_patches, channels=3, patch_h, patch_w]
+        let mut patches = vec![0.0f32; num_patches * 3 * patch_pixels];
+        let pixels = img.as_raw(); // interleaved RGBRGB...
+
+        for py in 0..grid_h {
+            for px in 0..grid_w {
+                let patch_idx = py * grid_w + px;
+                for c in 0..3usize {
+                    for ky in 0..self.patch_size {
+                        for kx in 0..self.patch_size {
+                            let src_y = py * self.patch_size + ky;
+                            let src_x = px * self.patch_size + kx;
+                            let pixel_idx =
+                                (src_y * target_w as usize + src_x) * 3 + c;
+                            let raw = pixels[pixel_idx] as f32 / 255.0;
+                            let normed = (raw - self.image_mean[c]) / self.image_std[c];
+                            let dst = patch_idx * 3 * patch_pixels
+                                + c * patch_pixels
+                                + ky * self.patch_size
+                                + kx;
+                            patches[dst] = normed;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((grid_h, grid_w, patches))
+    }
+}
+
+// ── Vision encoder (ViT) ──────────────────────────────────────────────────────
+
+/// Vision Transformer encoder for Qwen3-VL MoE.
+///
+/// Implements the forward pass that converts an image into a sequence of visual
+/// token embeddings at the text model's hidden size, ready for injection into
+/// the MoE language-model prefix.
+///
+/// The ViT architecture follows the Qwen3-VL specification:
+/// - Patch embedding: linear(`in_chans × patch_h × patch_w`, `embed_dim`)
+/// - `depth` transformer blocks (LayerNorm → QKV-attention → LayerNorm → MLP)
+/// - Spatial merger: 2×2 patch groups → LayerNorm → MLP → `text_hidden_size`
+///
+/// **Note**: Multimodal 2D Rotary Position Embeddings (M-RoPE) are not yet
+/// applied to the ViT attention; adding them is tracked as a follow-up.
+#[derive(Debug, Clone)]
+pub struct VisionEncoder {
+    config: Qwen3VLVisionConfig,
+    /// Target hidden size of the language-model decoder.
+    text_hidden_size: usize,
+    dense: DenseStore,
+}
+
+impl VisionEncoder {
+    /// Try to construct a `VisionEncoder` from a Flash-MoE plan.
+    ///
+    /// Returns `Ok(None)` when the plan has no vision weights (text-only model).
+    pub fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Option<Self>> {
+        let (Some(weights), Some(manifest), Some(vc)) = (
+            plan.vision_weights.as_ref(),
+            plan.vision_manifest.as_ref(),
+            text_config.vision_config.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if !weights.is_file() || !manifest.is_file() {
+            tracing::debug!(
+                model = %plan.model,
+                "vision weights not found on disk; VisionEncoder skipped"
+            );
+            return Ok(None);
+        }
+        let dense = DenseStore::open(weights.clone(), manifest.clone())?;
+        Ok(Some(Self {
+            config: vc.clone(),
+            text_hidden_size: text_config.hidden_size,
+            dense,
+        }))
+    }
+
+    /// Encode an image into a sequence of visual token embeddings.
+    ///
+    /// Returns a `Vec<Vec<f32>>` of shape `[num_merged_tokens, text_hidden_size]`.
+    pub fn encode(
+        &self,
+        preprocessor: &ImagePreprocessor,
+        image_path: &Path,
+    ) -> Result<Vec<Vec<f32>>> {
+        // 1. Preprocess → patches [N, C, pH, pW]
+        let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
+        let num_patches = grid_h * grid_w;
+        let patch_flat = self.config.patch_flat_dim();
+
+        // 2. Patch embedding → [num_patches, embed_dim]
+        let mut hidden: Vec<Vec<f32>> = (0..num_patches)
+            .map(|i| {
+                let patch = &flat_patches[i * patch_flat..(i + 1) * patch_flat];
+                self.patch_embed(patch)
+            })
+            .collect::<Result<_>>()?;
+
+        // 3. Transformer blocks
+        for layer in 0..self.config.depth {
+            self.vit_block(layer, &mut hidden)?;
+        }
+
+        // 4. Merge 2×2 patch groups into language-model visual tokens
+        self.merge_visual_tokens(&hidden, grid_h, grid_w)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Linear patch embedding: `[patch_flat] → [embed_dim]`.
+    fn patch_embed(&self, patch: &[f32]) -> Result<Vec<f32>> {
+        let name = "visual.patch_embed.proj.weight";
+        let embed_dim = self.config.embed_dim;
+        let projected = self
+            .dense
+            .matvec_tensor_prefix(name, patch, embed_dim)?
+            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+        // Add bias if present
+        let with_bias = self.vit_add_bias("visual.patch_embed.proj.bias", projected)?;
+        Ok(with_bias)
+    }
+
+    /// Run one ViT transformer block in-place.
+    fn vit_block(&self, layer: usize, hidden: &mut Vec<Vec<f32>>) -> Result<()> {
+        let embed_dim = self.config.embed_dim;
+
+        // Pre-attention LayerNorm
+        let norm1_w_name = format!("visual.blocks.{layer}.norm1.weight");
+        let norm1_b_name = format!("visual.blocks.{layer}.norm1.bias");
+
+        let normed: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| self.layer_norm_named(h, &norm1_w_name, &norm1_b_name))
+            .collect::<Result<_>>()?;
+
+        // Self-attention
+        let attn_out = self.vit_attention(layer, &normed, embed_dim)?;
+
+        // Residual
+        for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
+            for (hi, ai) in h.iter_mut().zip(a.iter()) {
+                *hi += ai;
+            }
+        }
+
+        // Pre-MLP LayerNorm
+        let norm2_w_name = format!("visual.blocks.{layer}.norm2.weight");
+        let norm2_b_name = format!("visual.blocks.{layer}.norm2.bias");
+
+        let normed2: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| self.layer_norm_named(h, &norm2_w_name, &norm2_b_name))
+            .collect::<Result<_>>()?;
+
+        // MLP
+        let mlp_out: Vec<Vec<f32>> = normed2
+            .iter()
+            .map(|h| self.vit_mlp(layer, h))
+            .collect::<Result<_>>()?;
+
+        // Residual
+        for (h, m) in hidden.iter_mut().zip(mlp_out.iter()) {
+            for (hi, mi) in h.iter_mut().zip(m.iter()) {
+                *hi += mi;
+            }
+        }
+        Ok(())
+    }
+
+    /// Multi-head self-attention (without positional encoding).
+    ///
+    /// TODO: Apply 2D M-RoPE to Q and K for spatially-aware attention.
+    fn vit_attention(
+        &self,
+        layer: usize,
+        hidden: &[Vec<f32>],
+        embed_dim: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let num_heads = self.config.num_heads;
+        let head_dim = embed_dim / num_heads;
+        let num_tokens = hidden.len();
+
+        let qkv_name = format!("visual.blocks.{layer}.attn.qkv.weight");
+        let qkv_bias_name = format!("visual.blocks.{layer}.attn.qkv.bias");
+        let proj_name = format!("visual.blocks.{layer}.attn.proj.weight");
+        let proj_bias_name = format!("visual.blocks.{layer}.attn.proj.bias");
+
+        // Compute Q, K, V for all tokens at once: [num_tokens, 3*embed_dim]
+        let qkv_width = 3 * embed_dim;
+        let mut all_qkv: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&qkv_name, h, qkv_width)?
+                    .unwrap_or_else(|| vec![0.0f32; qkv_width]);
+                self.vit_add_bias(&qkv_bias_name, projected)
+            })
+            .collect::<Result<_>>()?;
+
+        // Separate Q, K, V
+        let mut q_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut k_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut v_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        for (t, qkv) in all_qkv.iter_mut().enumerate() {
+            q_all[t].copy_from_slice(&qkv[..embed_dim]);
+            k_all[t].copy_from_slice(&qkv[embed_dim..2 * embed_dim]);
+            v_all[t].copy_from_slice(&qkv[2 * embed_dim..]);
+        }
+
+        // Multi-head attention: for each head, compute scores then weighted values
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attn_output = vec![vec![0.0f32; embed_dim]; num_tokens];
+
+        for h in 0..num_heads {
+            let h_start = h * head_dim;
+            let h_end = h_start + head_dim;
+
+            // Compute attention scores: [num_tokens, num_tokens]
+            let mut scores = vec![0.0f32; num_tokens * num_tokens];
+            for i in 0..num_tokens {
+                for j in 0..num_tokens {
+                    let qi = &q_all[i][h_start..h_end];
+                    let kj = &k_all[j][h_start..h_end];
+                    let dot: f32 = qi.iter().zip(kj.iter()).map(|(a, b)| a * b).sum();
+                    scores[i * num_tokens + j] = dot * scale;
+                }
+            }
+
+            // Softmax over keys dimension
+            for i in 0..num_tokens {
+                let row = &mut scores[i * num_tokens..(i + 1) * num_tokens];
+                let max_s = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = row.iter_mut().map(|s| { *s = (*s - max_s).exp(); *s }).sum();
+                if sum > 0.0 {
+                    row.iter_mut().for_each(|s| *s /= sum);
+                }
+            }
+
+            // Weighted values
+            for i in 0..num_tokens {
+                for j in 0..num_tokens {
+                    let w = scores[i * num_tokens + j];
+                    let vj = &v_all[j][h_start..h_end];
+                    let out = &mut attn_output[i][h_start..h_end];
+                    for (o, v) in out.iter_mut().zip(vj.iter()) {
+                        *o += w * v;
+                    }
+                }
+            }
+        }
+
+        // Output projection
+        let out: Vec<Vec<f32>> = attn_output
+            .into_iter()
+            .map(|h| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&proj_name, &h, embed_dim)?
+                    .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+                self.vit_add_bias(&proj_bias_name, projected)
+            })
+            .collect::<Result<_>>()?;
+        Ok(out)
+    }
+
+    /// Two-layer MLP with approximate GeLU activation.
+    fn vit_mlp(&self, layer: usize, hidden: &[f32]) -> Result<Vec<f32>> {
+        let embed_dim = self.config.embed_dim;
+        let mlp_hidden = self.config.mlp_hidden_size();
+        let fc1_name = format!("visual.blocks.{layer}.mlp.fc1.weight");
+        let fc1_bias = format!("visual.blocks.{layer}.mlp.fc1.bias");
+        let fc2_name = format!("visual.blocks.{layer}.mlp.fc2.weight");
+        let fc2_bias = format!("visual.blocks.{layer}.mlp.fc2.bias");
+
+        // fc1 + bias + GeLU
+        let mut mid = self
+            .dense
+            .matvec_tensor_prefix(&fc1_name, hidden, mlp_hidden)?
+            .unwrap_or_else(|| vec![0.0f32; mlp_hidden]);
+        mid = self.vit_add_bias(&fc1_bias, mid)?;
+        for v in mid.iter_mut() {
+            *v = gelu_approx(*v);
+        }
+
+        // fc2 + bias
+        let out = self
+            .dense
+            .matvec_tensor_prefix(&fc2_name, &mid, embed_dim)?
+            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+        self.vit_add_bias(&fc2_bias, out)
+    }
+
+    /// Merge 2×2 groups of patch embeddings into language-model visual tokens.
+    ///
+    /// Layout assumption: the `hidden` slice contains patches in row-major
+    /// order for a `grid_h × grid_w` grid.  Patches are merged in
+    /// `merge_size × merge_size` groups.
+    fn merge_visual_tokens(
+        &self,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let embed_dim = self.config.embed_dim;
+        let m = self.config.merge_size;
+        let merged_h = grid_h / m;
+        let merged_w = grid_w / m;
+        let group_size = m * m;
+        let concat_dim = group_size * embed_dim;
+        let out_dim = self.text_hidden_size;
+
+        let ln_w = format!("visual.merger.ln_q.weight");
+        let ln_b = format!("visual.merger.ln_q.bias");
+        let mlp0_w = format!("visual.merger.mlp.0.weight");
+        let mlp0_b = format!("visual.merger.mlp.0.bias");
+        let mlp2_w = format!("visual.merger.mlp.2.weight");
+        let mlp2_b = format!("visual.merger.mlp.2.bias");
+
+        let mut merged_tokens = Vec::with_capacity(merged_h * merged_w);
+
+        for my in 0..merged_h {
+            for mx in 0..merged_w {
+                // Gather patches in this merge group
+                let mut concat = Vec::with_capacity(concat_dim);
+                for dy in 0..m {
+                    for dx in 0..m {
+                        let py = my * m + dy;
+                        let px = mx * m + dx;
+                        let patch_idx = py * grid_w + px;
+                        let normed = self.layer_norm_named(&hidden[patch_idx], &ln_w, &ln_b)?;
+                        concat.extend_from_slice(&normed);
+                    }
+                }
+
+                // MLP: fc1 + GeLU + fc2
+                let mut mid = self
+                    .dense
+                    .matvec_tensor_prefix(&mlp0_w, &concat, concat_dim)?
+                    .unwrap_or_else(|| vec![0.0f32; concat_dim]);
+                mid = self.vit_add_bias(&mlp0_b, mid)?;
+                for v in mid.iter_mut() {
+                    *v = gelu_approx(*v);
+                }
+                let out = self
+                    .dense
+                    .matvec_tensor_prefix(&mlp2_w, &mid, out_dim)?
+                    .unwrap_or_else(|| vec![0.0f32; out_dim]);
+                let out = self.vit_add_bias(&mlp2_b, out)?;
+                merged_tokens.push(out);
+            }
+        }
+        Ok(merged_tokens)
+    }
+
+    /// Load a bias vector and add it to `values`, returning the result.
+    ///
+    /// Returns `values` unchanged when the bias tensor is absent.
+    fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
+        if let Some(bias) = self
+            .dense
+            .read_full_tensor_f32(bias_name)?
+        {
+            for (v, b) in values.iter_mut().zip(bias.iter()) {
+                *v += b;
+            }
+        }
+        Ok(values)
+    }
+
+    /// LayerNorm: `(x - mean) / sqrt(var + eps) * weight + bias`.
+    fn layer_norm_named(&self, input: &[f32], w_name: &str, b_name: &str) -> Result<Vec<f32>> {
+        let n = input.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let mean: f32 = input.iter().sum::<f32>() / n as f32;
+        let var: f32 = input.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        let std_inv = 1.0 / (var + 1e-6).sqrt();
+
+        let weight = self.dense.read_full_tensor_f32(w_name)?;
+        let bias = self.dense.read_full_tensor_f32(b_name)?;
+
+        let out: Vec<f32> = input
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let normed = (x - mean) * std_inv;
+                let w = weight.as_ref().and_then(|w| w.get(i)).copied().unwrap_or(1.0);
+                let b = bias.as_ref().and_then(|b| b.get(i)).copied().unwrap_or(0.0);
+                normed * w + b
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
+/// Approximate GeLU: `0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))`.
+#[inline]
+fn gelu_approx(x: f32) -> f32 {
+    let c = 0.797_884_6_f32; // sqrt(2/π)
+    0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -6553,6 +7391,7 @@ mod tests {
             tokenizer,
             metal: None,
             config,
+            vision_encoder: None,
         };
         let output = engine
             .generate(&GenerationRequest {
