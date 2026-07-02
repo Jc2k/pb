@@ -2140,7 +2140,7 @@ fn infer_full_attention_layout(
             rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Standard),
             num_q_heads,
             kv_heads,
-            rotary_pairing: RotaryPairing::Adjacent,
+            rotary_pairing: RotaryPairing::SplitHalf,
         });
     }
 
@@ -2263,7 +2263,7 @@ fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
 }
 
 fn apply_rotary(values: &mut [f32], position: usize, head_dim: usize, theta: f64) {
-    apply_rotary_adjacent(values, position, head_dim, head_dim, theta);
+    apply_rotary_split_half(values, position, head_dim, head_dim, theta);
 }
 
 fn apply_per_head_rms_norm(
@@ -8243,5 +8243,106 @@ mod tests {
         pack.extend_from_slice(&1.0f32.to_le_bytes());
         pack.extend_from_slice(&[0x21, 0x43]);
         pack
+    }
+}
+
+
+#[cfg(test)]
+mod flashmoe_rope_tests {
+    use super::*;
+
+    fn assert_close(left: f32, right: f32) {
+        let diff = (left - right).abs();
+        assert!(
+            diff <= 1e-5,
+            "values differ: left={left:.9}, right={right:.9}, diff={diff:.9}"
+        );
+    }
+
+    #[test]
+    fn flashmoe_rope_split_half_matches_reference() {
+        // Mirrors danveloper/flash-moe:
+        //   half = rotary_dim / 2
+        //   freq = 1 / pow(theta, 2*i / rotary_dim)
+        //   pairs are (x[i], x[i + half]), not adjacent pairs.
+        let position = 3usize;
+        let head_dim = 8usize;
+        let rotary_dim = 4usize;
+        let theta = 10_000_000.0f64;
+
+        let mut got = vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        apply_rotary_split_half(&mut got, position, head_dim, rotary_dim, theta);
+
+        let mut expected = vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        let half = rotary_dim / 2;
+        for i in 0..half {
+            let freq = 1.0f32 / (theta as f32).powf((2 * i) as f32 / rotary_dim as f32);
+            let angle = position as f32 * freq;
+            let (sin_a, cos_a) = angle.sin_cos();
+
+            let x0 = expected[i];
+            let x1 = expected[i + half];
+            expected[i] = x0 * cos_a - x1 * sin_a;
+            expected[i + half] = x0 * sin_a + x1 * cos_a;
+        }
+
+        for (left, right) in got.iter().zip(expected.iter()) {
+            assert_close(*left, *right);
+        }
+
+        // Non-rotary tail must be untouched.
+        assert_eq!(&got[rotary_dim..], &[100.0, 200.0, 300.0, 400.0]);
+    }
+
+    #[test]
+    fn gated_flashmoe_rope_defaults_to_partial_split_half() {
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: 4096,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(2),
+            vocab_size: 248320,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("bfloat16".to_string()),
+            num_experts: Some(512),
+            num_experts_per_tok: Some(4),
+            moe_intermediate_size: Some(1024),
+            intermediate_size: None,
+            max_position_embeddings: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+
+        let rotary_dim = rotary_dim_for(&config, 256, FullAttentionQLayout::Gated);
+        assert_eq!(rotary_dim, 64);
+    }
+
+    #[test]
+    fn standard_qwen_rope_uses_split_half_pairing() {
+        let layout = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 8,
+            q_width: 8,
+            kv_width: 8,
+            head_dim: 8,
+            rotary_dim: 8,
+            num_q_heads: 1,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+
+        let mut q = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let mut k = q.clone();
+        apply_rotary_for_layout(&mut q, &mut k, 1, 1_000_000.0, layout);
+
+        // Adjacent pairing would rotate (0,1), (2,3), ...
+        // Split-half pairing rotates (0,4), (1,5), ...
+        assert_ne!(q[1], 2.0);
+        assert_ne!(q[5], 20.0);
     }
 }
