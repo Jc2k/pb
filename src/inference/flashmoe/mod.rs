@@ -11,7 +11,10 @@ use std::ffi::OsString;
 use std::ffi::{CString, c_char, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,7 +24,7 @@ use std::ptr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 
 pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
@@ -637,9 +640,13 @@ impl FlashMoePlan {
         }
 
         let (expert_files, expert_bytes) = expert_store_size(&self.experts_dir)?;
-        let expected_expert_files =
-            expected_packed_expert_files(&self.tensor_manifest).unwrap_or(NUM_LAYERS * NUM_EXPERTS);
-        let ready = missing.is_empty() && expert_files >= expected_expert_files && expert_bytes > 0;
+        if self.experts_dir.is_dir()
+            && let Some(missing_expert) =
+                first_missing_expert_pack(&self.experts_dir, &self.model_config)?
+        {
+            missing.push(missing_expert);
+        }
+        let ready = missing.is_empty() && expert_bytes > 0;
 
         Ok(CacheStatus {
             ready,
@@ -6110,94 +6117,577 @@ fn pack_expert_tensors(
     config: Option<&QwenModelConfig>,
 ) -> Result<()> {
     let mut by_expert: BTreeMap<(usize, usize), Vec<&ExpertTensorRef>> = BTreeMap::new();
+    let mut aggregate_by_layer: BTreeMap<usize, Vec<&ExpertTensorRef>> = BTreeMap::new();
     for tensor in expert_tensors {
         if let (Some(layer), Some(expert)) = (tensor.layer, tensor.expert) {
             by_expert.entry((layer, expert)).or_default().push(tensor);
+        } else if let Some(layer) = tensor.layer
+            && aggregate_expert_tensor_kind(&tensor.tensor).is_some()
+        {
+            aggregate_by_layer.entry(layer).or_default().push(tensor);
         }
     }
 
+    let deleted_temps = cleanup_stale_expert_temp_files(&plan.experts_dir)?;
+    if deleted_temps > 0 {
+        eprintln!(
+            "deleted {deleted_temps} stale temporary expert pack file(s) from {}",
+            plan.experts_dir.display()
+        );
+    }
+
+    let aggregate_layers = aggregate_by_layer.len();
+    if aggregate_layers > 0 {
+        eprintln!("packing aggregate experts across {aggregate_layers} layer(s)");
+    }
     let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+    for (layer_index, (layer, tensors)) in aggregate_by_layer.into_iter().enumerate() {
+        pack_aggregate_expert_layer(
+            snapshot_dir,
+            plan,
+            layer,
+            layer_index + 1,
+            aggregate_layers,
+            &tensors,
+            config,
+        )?;
+    }
     for ((layer, expert), tensors) in by_expert {
         validate_expert_tensor_group(layer, expert, &tensors, config)?;
         let path = expert_path(&plan.experts_dir, layer, expert);
-        let mut out = fs::File::create(&path)
-            .with_context(|| format!("failed to create packed expert {}", path.display()))?;
+        let temp_path = temp_pack_path(&path);
+        let mut out = fs::File::create(&temp_path).with_context(|| {
+            format!(
+                "failed to create temporary packed expert {}",
+                temp_path.display()
+            )
+        })?;
         let mut records = Vec::new();
         out.write_all(b"PBQ4EXPERT ")
             .with_context(|| format!("failed to write packed expert header {}", path.display()))?;
         for tensor in tensors {
-            if !shard_cache.contains_key(&tensor.shard) {
-                let shard_path = snapshot_dir.join(&tensor.shard);
-                let file = fs::File::open(&shard_path)
-                    .with_context(|| format!("failed to open shard {}", shard_path.display()))?;
-                let mmap = unsafe {
-                    memmap2::MmapOptions::new()
-                        .map(&file)
-                        .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
-                };
-                shard_cache.insert(
-                    tensor.shard.clone(),
-                    (mmap, parse_safetensors_header(&shard_path)?),
-                );
-            }
-            let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
-            let [start, end] = tensor.source_offsets.with_context(|| {
-                format!("expert tensor {} is missing source offsets", tensor.tensor)
-            })?;
-            let abs_start = shard.data_start + start;
-            let abs_end = shard.data_start + end;
-            let raw = &bytes[abs_start as usize..abs_end as usize];
             let dtype = tensor.dtype.as_deref().unwrap_or("unknown");
-            let values = decode_dense_tensor_f32(dtype, raw).with_context(|| {
-                format!(
-                    "failed to decode expert tensor {} as {dtype} before q4 quantization",
-                    tensor.tensor
-                )
-            })?;
-            let packed = quantize_q4(&values, &tensor.shape, GROUP_SIZE).with_context(|| {
-                format!(
-                    "failed to quantize decoded expert tensor {} into q4 groups",
-                    tensor.tensor
-                )
-            })?;
-            let record_offset = out
-                .stream_position()
-                .context("failed to get expert record offset")?;
-            out.write_all(&(tensor.tensor.len() as u32).to_le_bytes())?;
-            out.write_all(tensor.tensor.as_bytes())?;
-            out.write_all(&(packed.values.len() as u64).to_le_bytes())?;
-            out.write_all(&(packed.scales.len() as u64).to_le_bytes())?;
-            for scale in &packed.scales {
-                out.write_all(&scale.to_le_bytes())?;
-            }
-            for bias in &packed.biases {
-                out.write_all(&bias.to_le_bytes())?;
-            }
-            out.write_all(&packed.values)?;
-            records.push(ExpertPackRecord {
-                tensor: tensor.tensor.clone(),
-                dtype: tensor
-                    .dtype
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                shape: tensor.shape.clone(),
-                source_offsets: tensor.source_offsets.unwrap_or([0, 0]),
-                record_offset,
-                packed_bytes: packed.values.len() as u64,
-                groups: packed.scales.len(),
-                group_size: GROUP_SIZE,
-            });
+            let (values, source_offsets) = decode_expert_tensor_range(
+                snapshot_dir,
+                &mut shard_cache,
+                tensor,
+                0,
+                tensor.shape.iter().product(),
+            )?;
+            write_quantized_expert_record(
+                &mut out,
+                &mut records,
+                ExpertRecordInput {
+                    tensor: tensor.tensor.clone(),
+                    dtype: dtype.to_string(),
+                    shape: tensor.shape.clone(),
+                    source_offsets,
+                    values,
+                },
+            )?;
         }
         let metadata = ExpertPackMetadata {
             layer,
             expert,
             records,
         };
-        fs::write(
-            expert_metadata_path(&plan.experts_dir, layer, expert),
-            serde_json::to_vec_pretty(&metadata).context("failed to encode expert metadata")?,
-        )?;
+        finish_expert_pack_atomically(out, &temp_path, &path)?;
+        write_expert_metadata_atomically(&plan.experts_dir, layer, expert, &metadata)?;
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateExpertTensorKind {
+    GateUp,
+    Down,
+}
+
+fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind> {
+    if name.ends_with(".mlp.experts.gate_up_proj")
+        || name.ends_with(".mlp.experts.gate_up_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::GateUp)
+    } else if name.ends_with(".mlp.experts.down_proj")
+        || name.ends_with(".mlp.experts.down_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Down)
+    } else {
+        None
+    }
+}
+
+fn cleanup_stale_expert_temp_files(experts_dir: &Path) -> Result<usize> {
+    if !experts_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    for entry in fs::read_dir(experts_dir)
+        .with_context(|| format!("failed to read {}", experts_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.contains(".tmp-") {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to delete stale temp file {}", path.display()))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn pack_aggregate_expert_layer(
+    snapshot_dir: &Path,
+    plan: &FlashMoePlan,
+    layer: usize,
+    layer_index: usize,
+    layer_total: usize,
+    tensors: &[&ExpertTensorRef],
+    config: Option<&QwenModelConfig>,
+) -> Result<()> {
+    let config = config.context("Qwen config is required to split aggregate expert tensors")?;
+    let layout = AggregateExpertLayout::new(config)?;
+
+    let gate_up =
+        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?.clone();
+    let down =
+        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?.clone();
+    validate_aggregate_expert_tensor_shape(
+        &gate_up,
+        &[layout.experts, layout.intermediate * 2, layout.hidden],
+        "gate_up_proj",
+    )?;
+    validate_aggregate_expert_tensor_shape(
+        &down,
+        &[layout.experts, layout.hidden, layout.intermediate],
+        "down_proj",
+    )?;
+
+    let workers = aggregate_pack_parallelism(layout.experts);
+    eprintln!(
+        "packing aggregate experts for layer {layer} ({layer_index}/{layer_total}): {} experts using {workers} workers",
+        layout.experts
+    );
+    let completed = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let chunk = layout.experts.div_ceil(workers).max(1);
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for start in (0..layout.experts).step_by(chunk) {
+            let end = (start + chunk).min(layout.experts);
+            let completed = &completed;
+            let skipped = &skipped;
+            let layout = layout;
+            let gate_up = gate_up.clone();
+            let down = down.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+                for expert in start..end {
+                    if expert_pack_is_complete(&plan.experts_dir, layer, expert) {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        pack_aggregate_expert(
+                            snapshot_dir,
+                            plan,
+                            layer,
+                            expert,
+                            &gate_up,
+                            &down,
+                            layout,
+                            &mut shard_cache,
+                        )?;
+                    }
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == layout.experts || done % 32 == 0 {
+                        let skipped = skipped.load(Ordering::Relaxed);
+                        eprintln!(
+                            "prepared aggregate experts for layer {layer} ({layer_index}/{layer_total}): {done}/{} ({skipped} reused)",
+                            layout.experts,
+                        );
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("aggregate expert pack worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AggregateExpertLayout {
+    experts: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_expert_values: usize,
+    single_projection_values: usize,
+    down_expert_values: usize,
+}
+
+impl AggregateExpertLayout {
+    fn new(config: &QwenModelConfig) -> Result<Self> {
+        let experts = config.experts();
+        let hidden = config.hidden_size;
+        let intermediate = config
+            .moe_intermediate_size
+            .or(config.intermediate_size)
+            .context("Qwen config is missing moe_intermediate_size/intermediate_size for aggregate expert packing")?;
+
+        let gate_up_expert_values = intermediate
+            .checked_mul(2)
+            .and_then(|rows| rows.checked_mul(hidden))
+            .context("aggregate gate_up expert element count overflow")?;
+        let single_projection_values = intermediate
+            .checked_mul(hidden)
+            .context("aggregate gate/up projection element count overflow")?;
+        let down_expert_values = hidden
+            .checked_mul(intermediate)
+            .context("aggregate down projection element count overflow")?;
+        Ok(Self {
+            experts,
+            hidden,
+            intermediate,
+            gate_up_expert_values,
+            single_projection_values,
+            down_expert_values,
+        })
+    }
+}
+
+fn aggregate_pack_parallelism(experts: usize) -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .clamp(1, experts.max(1))
+}
+
+fn pack_aggregate_expert(
+    snapshot_dir: &Path,
+    plan: &FlashMoePlan,
+    layer: usize,
+    expert: usize,
+    gate_up: &ExpertTensorRef,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+) -> Result<()> {
+    let path = expert_path(&plan.experts_dir, layer, expert);
+    let temp_path = temp_pack_path(&path);
+    let mut out = fs::File::create(&temp_path).with_context(|| {
+        format!(
+            "failed to create temporary packed expert {}",
+            temp_path.display()
+        )
+    })?;
+    let mut records = Vec::new();
+    out.write_all(b"PBQ4EXPERT ")
+        .with_context(|| format!("failed to write packed expert header {}", path.display()))?;
+
+    let gate_up_base = expert
+        .checked_mul(layout.gate_up_expert_values)
+        .context("aggregate gate_up expert offset overflow")?;
+    let (gate_values, gate_offsets) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        gate_up_base,
+        layout.single_projection_values,
+    )?;
+    write_quantized_expert_record(
+        &mut out,
+        &mut records,
+        ExpertRecordInput {
+            tensor: format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+            dtype: gate_up
+                .dtype
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            shape: vec![layout.intermediate, layout.hidden],
+            source_offsets: gate_offsets,
+            values: gate_values,
+        },
+    )?;
+
+    let (up_values, up_offsets) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        gate_up_base + layout.single_projection_values,
+        layout.single_projection_values,
+    )?;
+    write_quantized_expert_record(
+        &mut out,
+        &mut records,
+        ExpertRecordInput {
+            tensor: format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+            dtype: gate_up
+                .dtype
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            shape: vec![layout.intermediate, layout.hidden],
+            source_offsets: up_offsets,
+            values: up_values,
+        },
+    )?;
+
+    let down_base = expert
+        .checked_mul(layout.down_expert_values)
+        .context("aggregate down expert offset overflow")?;
+    let (down_values, down_offsets) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        down,
+        down_base,
+        layout.down_expert_values,
+    )?;
+    write_quantized_expert_record(
+        &mut out,
+        &mut records,
+        ExpertRecordInput {
+            tensor: format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            dtype: down.dtype.clone().unwrap_or_else(|| "unknown".to_string()),
+            shape: vec![layout.hidden, layout.intermediate],
+            source_offsets: down_offsets,
+            values: down_values,
+        },
+    )?;
+
+    let metadata = ExpertPackMetadata {
+        layer,
+        expert,
+        records,
+    };
+    finish_expert_pack_atomically(out, &temp_path, &path)?;
+    write_expert_metadata_atomically(&plan.experts_dir, layer, expert, &metadata)?;
+    Ok(())
+}
+
+fn temp_pack_path(path: &Path) -> PathBuf {
+    let suffix = format!("tmp-{}-{:?}", std::process::id(), thread::current().id());
+    let extension = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => format!("{ext}.{suffix}"),
+        None => suffix,
+    };
+    path.with_extension(extension)
+}
+
+fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
+    let path = expert_path(root, layer, expert);
+    let Ok(mut file) = fs::File::open(&path) else {
+        return false;
+    };
+    let mut magic = [0u8; 11];
+    if file.read_exact(&mut magic).is_err() || magic != *b"PBQ4EXPERT " {
+        return false;
+    }
+    matches!(read_expert_pack_metadata(root, layer, expert), Ok(Some(_)))
+}
+
+fn finish_expert_pack_atomically(
+    mut out: fs::File,
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<()> {
+    out.flush()
+        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+    out.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    drop(out);
+    fs::rename(temp_path, final_path).with_context(|| {
+        format!(
+            "failed to atomically move {} to {}",
+            temp_path.display(),
+            final_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_expert_metadata_atomically(
+    root: &Path,
+    layer: usize,
+    expert: usize,
+    metadata: &ExpertPackMetadata,
+) -> Result<()> {
+    let path = expert_metadata_path(root, layer, expert);
+    let temp_path = temp_pack_path(&path);
+    let bytes = serde_json::to_vec_pretty(metadata).context("failed to encode expert metadata")?;
+    {
+        let mut out = fs::File::create(&temp_path).with_context(|| {
+            format!(
+                "failed to create temporary expert metadata {}",
+                temp_path.display()
+            )
+        })?;
+        out.write_all(&bytes)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        out.flush()
+            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+        out.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    }
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to atomically move {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn single_aggregate_expert_tensor<'a>(
+    tensors: &[&'a ExpertTensorRef],
+    kind: AggregateExpertTensorKind,
+    layer: usize,
+) -> Result<&'a ExpertTensorRef> {
+    let matches: Vec<&ExpertTensorRef> = tensors
+        .iter()
+        .copied()
+        .filter(|tensor| aggregate_expert_tensor_kind(&tensor.tensor) == Some(kind))
+        .collect();
+    match matches.as_slice() {
+        [tensor] => Ok(*tensor),
+        [] => bail!("aggregate expert layer {layer} is missing {kind:?} tensor"),
+        _ => bail!("aggregate expert layer {layer} has duplicate {kind:?} tensors"),
+    }
+}
+
+fn validate_aggregate_expert_tensor_shape(
+    tensor: &ExpertTensorRef,
+    expected: &[usize; 3],
+    label: &str,
+) -> Result<()> {
+    if tensor.shape.as_slice() != expected {
+        bail!(
+            "aggregate expert tensor {} has shape {:?}; expected {:?} for {label}",
+            tensor.tensor,
+            tensor.shape,
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn decode_expert_tensor_range(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    tensor: &ExpertTensorRef,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<(Vec<f32>, [u64; 2])> {
+    if !shard_cache.contains_key(&tensor.shard) {
+        let shard_path = snapshot_dir.join(&tensor.shard);
+        let file = fs::File::open(&shard_path)
+            .with_context(|| format!("failed to open shard {}", shard_path.display()))?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
+        };
+        shard_cache.insert(
+            tensor.shard.clone(),
+            (mmap, parse_safetensors_header(&shard_path)?),
+        );
+    }
+    let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
+    let [tensor_start, tensor_end] = tensor
+        .source_offsets
+        .with_context(|| format!("expert tensor {} is missing source offsets", tensor.tensor))?;
+    let dtype = tensor.dtype.as_deref().unwrap_or("unknown");
+    let element_size = dtype_size(dtype).with_context(|| {
+        format!(
+            "expert tensor {} has unsupported dtype {dtype}",
+            tensor.tensor
+        )
+    })?;
+    let byte_start = tensor_start
+        .checked_add(
+            (element_offset
+                .checked_mul(element_size)
+                .context("expert tensor byte offset overflow")?) as u64,
+        )
+        .context("expert tensor source offset overflow")?;
+    let byte_len = element_count
+        .checked_mul(element_size)
+        .context("expert tensor byte length overflow")?;
+    let byte_end = byte_start
+        .checked_add(byte_len as u64)
+        .context("expert tensor byte range overflow")?;
+    if byte_end > tensor_end {
+        bail!(
+            "expert tensor {} range {}..{} exceeds source offsets {:?}",
+            tensor.tensor,
+            byte_start,
+            byte_end,
+            [tensor_start, tensor_end]
+        );
+    }
+    let abs_start = shard.data_start + byte_start;
+    let abs_end = shard.data_start + byte_end;
+    let raw = &bytes[abs_start as usize..abs_end as usize];
+    let values = decode_dense_tensor_f32(dtype, raw).with_context(|| {
+        format!(
+            "failed to decode expert tensor {} as {dtype} before q4 quantization",
+            tensor.tensor
+        )
+    })?;
+    Ok((values, [byte_start, byte_end]))
+}
+
+struct ExpertRecordInput {
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    values: Vec<f32>,
+}
+
+fn write_quantized_expert_record(
+    out: &mut fs::File,
+    records: &mut Vec<ExpertPackRecord>,
+    input: ExpertRecordInput,
+) -> Result<()> {
+    let packed = quantize_q4(&input.values, &input.shape, GROUP_SIZE).with_context(|| {
+        format!(
+            "failed to quantize decoded expert tensor {} into q4 groups",
+            input.tensor
+        )
+    })?;
+    let record_offset = out
+        .stream_position()
+        .context("failed to get expert record offset")?;
+    out.write_all(&(input.tensor.len() as u32).to_le_bytes())?;
+    out.write_all(input.tensor.as_bytes())?;
+    out.write_all(&(packed.values.len() as u64).to_le_bytes())?;
+    out.write_all(&(packed.scales.len() as u64).to_le_bytes())?;
+    for scale in &packed.scales {
+        out.write_all(&scale.to_le_bytes())?;
+    }
+    for bias in &packed.biases {
+        out.write_all(&bias.to_le_bytes())?;
+    }
+    out.write_all(&packed.values)?;
+    records.push(ExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        record_offset,
+        packed_bytes: packed.values.len() as u64,
+        groups: packed.scales.len(),
+        group_size: GROUP_SIZE,
+    });
     Ok(())
 }
 
@@ -6377,20 +6867,20 @@ fn expert_metadata_path(root: &Path, layer: usize, expert: usize) -> PathBuf {
     root.join(format!("layer_{layer:02}_expert_{expert:03}.json"))
 }
 
-fn expected_packed_expert_files(manifest_path: &Path) -> Result<usize> {
-    let manifest: FlashMoeManifest =
-        serde_json::from_slice(&fs::read(manifest_path).with_context(|| {
-            format!(
-                "failed to read Flash-MoE manifest {}",
-                manifest_path.display()
-            )
-        })?)?;
-    let unique: BTreeSet<(usize, usize)> = manifest
-        .expert_tensors
-        .iter()
-        .filter_map(|tensor| Some((tensor.layer?, tensor.expert?)))
-        .collect();
-    Ok(unique.len())
+fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<Option<PathBuf>> {
+    let (layers, experts) = match QwenModelConfig::from_file(model_config) {
+        Ok(config) => (config.num_hidden_layers, config.experts()),
+        Err(_) => (NUM_LAYERS, NUM_EXPERTS),
+    };
+    for layer in 0..layers {
+        for expert in 0..experts {
+            let path = expert_path(experts_dir, layer, expert);
+            if !path.is_file() {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn is_expert_tensor_name(name: &str) -> bool {
@@ -7218,6 +7708,58 @@ mod tests {
                 .any(|p| p.ends_with("model_weights.bin"))
         );
         assert_eq!(status.expert_files, 0);
+    }
+
+    #[test]
+    fn cache_status_rejects_partial_expert_layer_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+        fs::write(&plan.non_expert_weights, b"dense").unwrap();
+        fs::write(
+            &plan.tensor_manifest,
+            br#"{"model":"","cache_version":"","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &plan.model_config,
+            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        fs::write(&plan.tokenizer, test_tokenizer_json()).unwrap();
+        for expert in 0..8 {
+            fs::write(expert_path(&plan.experts_dir, 0, expert), b"expert").unwrap();
+        }
+
+        let status = plan.cache_status().unwrap();
+        assert!(!status.ready);
+        assert!(
+            status
+                .missing
+                .iter()
+                .any(|path| path.ends_with("layer_01_expert_000.bin"))
+        );
+    }
+
+    #[test]
+    fn cleanup_deletes_stale_expert_temp_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let experts_dir = tmp.path();
+        let final_bin = experts_dir.join("layer_00_expert_000.bin");
+        let temp_bin = experts_dir.join("layer_00_expert_000.bin.tmp-123-ThreadId(1)");
+        let temp_json = experts_dir.join("layer_00_expert_000.json.tmp-123-ThreadId(1)");
+
+        fs::write(&final_bin, b"PBQ4EXPERT ").unwrap();
+        fs::write(&temp_bin, b"partial").unwrap();
+        fs::write(&temp_json, b"partial").unwrap();
+
+        let deleted = cleanup_stale_expert_temp_files(experts_dir).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(final_bin.is_file());
+        assert!(!temp_bin.exists());
+        assert!(!temp_json.exists());
     }
 
     #[test]
@@ -8081,6 +8623,74 @@ mod tests {
         let registry = TensorRegistry::load(&plan.tensor_manifest).unwrap();
         validate_required_tensor_manifest(&config, &registry)
             .expect("Qwen3-style manifest should pass validation");
+    }
+
+    #[test]
+    fn packer_splits_qwen35_aggregate_expert_tensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        fs::create_dir_all(&snapshot).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+
+        let gate_up_bytes: Vec<u8> = (0u8..16).collect();
+        let down_bytes: Vec<u8> = (16u8..24).collect();
+        fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&[
+                (
+                    "model.layers.1.mlp.experts.gate_up_proj",
+                    "U8",
+                    vec![2, 4, 2],
+                    &gate_up_bytes,
+                ),
+                (
+                    "model.layers.1.mlp.experts.down_proj",
+                    "U8",
+                    vec![2, 2, 2],
+                    &down_bytes,
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+        let tensors = vec![
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.gate_up_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 4, 2],
+                source_offsets: Some([0, 16]),
+            },
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([16, 24]),
+            },
+        ];
+
+        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+
+        let expert0 = read_one_expert(&plan.experts_dir, 1, 0).unwrap();
+        let expert1 = read_one_expert(&plan.experts_dir, 1, 1).unwrap();
+        assert!(expert_pack_is_complete(&plan.experts_dir, 1, 0));
+        assert!(expert_pack_is_complete(&plan.experts_dir, 1, 1));
+        for expert in [expert0, expert1] {
+            assert_eq!(expert.records.len(), 3);
+            assert!(expert.record_suffix("gate_proj.weight").is_some());
+            assert!(expert.record_suffix("up_proj.weight").is_some());
+            assert!(expert.record_suffix("down_proj.weight").is_some());
+        }
     }
 
     #[test]
