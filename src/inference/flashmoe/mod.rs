@@ -73,6 +73,8 @@ pub const VIT_IMAGE_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 pub const VIT_MAX_PIXELS: usize = 1280 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
 /// Lower pixel budget for an input image (at least 4 merged visual tokens).
 pub const VIT_MIN_PIXELS: usize = 4 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
+/// Default Qwen3-VL text M-RoPE frequency allocation: temporal, height, width.
+pub const DEFAULT_MROPE_SECTION: [usize; 3] = [24, 20, 20];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -218,6 +220,8 @@ pub struct QwenModelConfig {
     pub moe_intermediate_size: Option<usize>,
     pub intermediate_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
+    /// Qwen3-VL Interleaved-MRoPE frequency allocation for text attention.
+    pub mrope_section: Option<[usize; 3]>,
     /// Whether the output projection (lm_head) shares weights with the input embedding
     /// (model.embed_tokens).  When true or absent, lm_head.weight is optional in the manifest.
     pub tie_word_embeddings: Option<bool>,
@@ -288,6 +292,7 @@ struct RawQwenModelConfig {
     vision_config: Option<Qwen3VLVisionConfig>,
     text_config: Option<RawQwenTextConfig>,
     rope_parameters: Option<RawQwenRopeParameters>,
+    rope_scaling: Option<RawQwenRopeParameters>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -312,12 +317,14 @@ struct RawQwenTextConfig {
     num_shared_experts: Option<usize>,
     shared_expert_intermediate_size: Option<usize>,
     rope_parameters: Option<RawQwenRopeParameters>,
+    rope_scaling: Option<RawQwenRopeParameters>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawQwenRopeParameters {
     rope_theta: Option<f64>,
     partial_rotary_factor: Option<f64>,
+    mrope_section: Option<[usize; 3]>,
 }
 
 impl<'de> Deserialize<'de> for QwenModelConfig {
@@ -359,9 +366,19 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                         .as_ref()
                         .and_then(|params| params.rope_theta)
                 })
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
                 .or(text.rope_theta)
                 .or_else(|| {
                     text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .or_else(|| {
+                    text.rope_scaling
                         .as_ref()
                         .and_then(|params| params.rope_theta)
                 }),
@@ -372,9 +389,19 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                         .as_ref()
                         .and_then(|params| params.partial_rotary_factor)
                 })
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
                 .or(text.partial_rotary_factor)
                 .or_else(|| {
                     text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
+                .or_else(|| {
+                    text.rope_scaling
                         .as_ref()
                         .and_then(|params| params.partial_rotary_factor)
                 }),
@@ -388,6 +415,25 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
             moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
             intermediate_size: raw.intermediate_size.or(text.intermediate_size),
             max_position_embeddings: raw.max_position_embeddings.or(text.max_position_embeddings),
+            mrope_section: raw
+                .rope_parameters
+                .as_ref()
+                .and_then(|params| params.mrope_section)
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                })
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                })
+                .or_else(|| {
+                    text.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                }),
             tie_word_embeddings: raw.tie_word_embeddings.or(text.tie_word_embeddings),
             num_shared_experts: raw.num_shared_experts.or(text.num_shared_experts),
             shared_expert_intermediate_size: raw
@@ -502,6 +548,11 @@ impl QwenModelConfig {
                 bail!("partial_rotary_factor must be in (0, 1], got {factor}");
             }
         }
+        if let Some(section) = self.mrope_section {
+            if section.contains(&0) {
+                bail!("mrope_section entries must be positive, got {section:?}");
+            }
+        }
         if let Some(dtype) = &self.torch_dtype {
             let dtype = dtype.to_ascii_lowercase();
             if !matches!(
@@ -524,6 +575,11 @@ impl QwenModelConfig {
 
     fn active_experts(&self) -> usize {
         self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN)
+    }
+
+    fn text_mrope_section(&self) -> Option<[usize; 3]> {
+        self.mrope_section
+            .or_else(|| self.vision_config.as_ref().map(|_| DEFAULT_MROPE_SECTION))
     }
 
     /// Returns the intermediate hidden size used by each shared expert MLP.
@@ -718,6 +774,91 @@ pub struct FlashMoeEngine {
     runtime: DenseTransformerRuntime,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MropePosition {
+    temporal: usize,
+    height: usize,
+    width: usize,
+}
+
+impl MropePosition {
+    fn text(position: usize) -> Self {
+        Self {
+            temporal: position,
+            height: position,
+            width: position,
+        }
+    }
+
+    fn axis(self, axis: MropeAxis) -> usize {
+        match axis {
+            MropeAxis::Temporal => self.temporal,
+            MropeAxis::Height => self.height,
+            MropeAxis::Width => self.width,
+        }
+    }
+}
+
+fn qwen3vl_single_image_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    image_grid_h: usize,
+    image_grid_w: usize,
+) -> Result<(Vec<MropePosition>, usize)> {
+    let expected_image_tokens = image_grid_h.saturating_mul(image_grid_w);
+    let actual_image_tokens = prompt_tokens
+        .iter()
+        .filter(|&&token| token == image_pad_token)
+        .count();
+    if actual_image_tokens != expected_image_tokens {
+        bail!(
+            "image placeholder count {actual_image_tokens} does not match merged image grid {image_grid_h}x{image_grid_w}"
+        );
+    }
+
+    let mut positions = Vec::with_capacity(prompt_tokens.len());
+    let mut current_pos = 0usize;
+    let mut i = 0usize;
+    while i < prompt_tokens.len() {
+        if prompt_tokens[i] == image_pad_token {
+            let start_position = current_pos;
+            let mut image_idx = 0usize;
+            while i < prompt_tokens.len() && prompt_tokens[i] == image_pad_token {
+                let row = if image_grid_w > 0 {
+                    image_idx / image_grid_w
+                } else {
+                    0
+                };
+                let col = if image_grid_w > 0 {
+                    image_idx % image_grid_w
+                } else {
+                    0
+                };
+                positions.push(MropePosition {
+                    temporal: start_position,
+                    height: start_position + row,
+                    width: start_position + col,
+                });
+                image_idx += 1;
+                i += 1;
+            }
+            current_pos += image_grid_h.max(image_grid_w);
+        } else {
+            positions.push(MropePosition::text(current_pos));
+            current_pos += 1;
+            i += 1;
+        }
+    }
+    Ok((positions, current_pos))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MropeAxis {
+    Temporal,
+    Height,
+    Width,
 }
 
 #[derive(Debug, Clone)]
@@ -1591,6 +1732,7 @@ impl FlashMoeEngine {
                 &generated,
                 &mut kv_cache,
                 position,
+                MropePosition::text(position),
             )?;
             if self.tokenizer.is_eos(token) {
                 break;
@@ -1610,7 +1752,14 @@ impl FlashMoeEngine {
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
-            let _ = self.forward_hidden(token, None, kv_cache, position, false)?;
+            let _ = self.forward_hidden(
+                token,
+                None,
+                kv_cache,
+                position,
+                MropePosition::text(position),
+                false,
+            )?;
         }
         Ok(())
     }
@@ -1622,8 +1771,16 @@ impl FlashMoeEngine {
         prompt_tokens: &[u32],
         visual_embeddings: &[Vec<f32>],
         image_pad_token: u32,
+        mrope_positions: &[MropePosition],
         kv_cache: &mut KvCache,
     ) -> Result<()> {
+        if mrope_positions.len() != prompt_tokens.len() {
+            bail!(
+                "vision M-RoPE positions length {} does not match prompt length {}",
+                mrope_positions.len(),
+                prompt_tokens.len()
+            );
+        }
         let mut vis_idx = 0usize;
         for (position, &token) in prompt_tokens.iter().enumerate() {
             kv_cache.record_prompt_token(position, token)?;
@@ -1634,7 +1791,20 @@ impl FlashMoeEngine {
             } else {
                 None
             };
-            let _ = self.forward_hidden(token, override_emb, kv_cache, position, false)?;
+            let _ = self.forward_hidden(
+                token,
+                override_emb,
+                kv_cache,
+                position,
+                mrope_positions[position],
+                false,
+            )?;
+        }
+        if vis_idx != visual_embeddings.len() {
+            bail!(
+                "consumed {vis_idx} visual embeddings but {} were provided",
+                visual_embeddings.len()
+            );
         }
         Ok(())
     }
@@ -1657,8 +1827,8 @@ impl FlashMoeEngine {
             "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
         )?;
         let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
-        let visual_embeddings = encoder.encode(&preprocessor, &request.image_path)?;
-        let num_visual_tokens = visual_embeddings.len();
+        let visual = encoder.encode(&preprocessor, &request.image_path)?;
+        let num_visual_tokens = visual.embeddings.len();
 
         // ── 2. Build the prompt with vision-pad placeholders ──────────────────
         // Qwen3-VL chat template: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
@@ -1686,13 +1856,25 @@ impl FlashMoeEngine {
         prompt_tokens.extend(std::iter::repeat(pad_tok).take(num_visual_tokens));
         prompt_tokens.push(ve_tok);
         prompt_tokens.append(&mut text_tokens);
+        let (mrope_positions, next_mrope_position) = qwen3vl_single_image_mrope_positions(
+            &prompt_tokens,
+            pad_tok,
+            visual.merged_grid_h,
+            visual.merged_grid_w,
+        )?;
 
         // ── 3. Prefill with visual embeddings injected ────────────────────────
         let mut kv_cache = KvCache::new(
             self.config.num_hidden_layers,
             prompt_tokens.len() + request.max_tokens.max(0) as usize,
         );
-        self.prefill_with_vision(&prompt_tokens, &visual_embeddings, pad_tok, &mut kv_cache)?;
+        self.prefill_with_vision(
+            &prompt_tokens,
+            &visual.embeddings,
+            pad_tok,
+            &mrope_positions,
+            &mut kv_cache,
+        )?;
 
         // ── 4. Decode ─────────────────────────────────────────────────────────
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
@@ -1706,6 +1888,7 @@ impl FlashMoeEngine {
                 &generated,
                 &mut kv_cache,
                 position,
+                MropePosition::text(next_mrope_position + generated.len()),
             )?;
             if self.tokenizer.is_eos(token) {
                 break;
@@ -1726,13 +1909,15 @@ impl FlashMoeEngine {
         generated: &[u32],
         kv_cache: &mut KvCache,
         position: usize,
+        rope_position: MropePosition,
     ) -> Result<u32> {
         let previous = generated
             .last()
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        let hidden = self.forward_hidden(previous, None, kv_cache, position, true)?;
+        let hidden =
+            self.forward_hidden(previous, None, kv_cache, position, rope_position, true)?;
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
             self.metal.as_ref(),
             &hidden,
@@ -1758,6 +1943,7 @@ impl FlashMoeEngine {
         embedding_override: Option<Vec<f32>>,
         kv_cache: &mut KvCache,
         position: usize,
+        rope_position: MropePosition,
         record_generated: bool,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
@@ -1790,7 +1976,14 @@ impl FlashMoeEngine {
             {
                 self.linear_attention_projected(layer, &normed, kv_cache, runtime.width)?
             } else {
-                self.full_attention_projected(layer, &normed, kv_cache, position, &runtime)?
+                self.full_attention_projected(
+                    layer,
+                    &normed,
+                    kv_cache,
+                    position,
+                    rope_position,
+                    &runtime,
+                )?
             };
             hidden = attention_residual;
             add_in_place(&mut hidden, &projected);
@@ -1858,6 +2051,7 @@ impl FlashMoeEngine {
         normed: &[f32],
         kv_cache: &mut KvCache,
         position: usize,
+        rope_position: MropePosition,
         runtime: &DenseTransformerRuntime,
     ) -> Result<Vec<f32>> {
         let layout = runtime.full_attention_layout(layer)?;
@@ -1913,7 +2107,14 @@ impl FlashMoeEngine {
                 1_000_000.0
             }
         });
-        apply_rotary_for_layout(&mut q, &mut k, position, theta, layout);
+        apply_rotary_for_layout(
+            &mut q,
+            &mut k,
+            rope_position,
+            theta,
+            layout,
+            self.config.text_mrope_section(),
+        );
 
         // Soundness-first path:
         // The existing Metal KV cache has a single global width derived from config.
@@ -2473,18 +2674,81 @@ fn apply_optional_per_head_rms_norm(
 fn apply_rotary_for_layout(
     q: &mut [f32],
     k: &mut [f32],
-    position: usize,
+    position: MropePosition,
     theta: f64,
     layout: FullAttentionLayout,
+    mrope_section: Option<[usize; 3]>,
 ) {
     match layout.rotary_pairing {
         RotaryPairing::Adjacent => {
-            apply_rotary_adjacent(q, position, layout.head_dim, layout.rotary_dim, theta);
-            apply_rotary_adjacent(k, position, layout.head_dim, layout.rotary_dim, theta);
+            if let Some(section) = mrope_section {
+                apply_rotary_adjacent_mrope(
+                    q,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+                apply_rotary_adjacent_mrope(
+                    k,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+            } else {
+                apply_rotary_adjacent(
+                    q,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+                apply_rotary_adjacent(
+                    k,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+            }
         }
         RotaryPairing::SplitHalf => {
-            apply_rotary_split_half(q, position, layout.head_dim, layout.rotary_dim, theta);
-            apply_rotary_split_half(k, position, layout.head_dim, layout.rotary_dim, theta);
+            if let Some(section) = mrope_section {
+                apply_rotary_split_half_mrope(
+                    q,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+                apply_rotary_split_half_mrope(
+                    k,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+            } else {
+                apply_rotary_split_half(
+                    q,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+                apply_rotary_split_half(
+                    k,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+            }
         }
     }
 }
@@ -2505,6 +2769,34 @@ fn apply_rotary_adjacent(
         for pair_idx in (0..rotary_dims).step_by(2) {
             let inv_freq = theta.powf(-(pair_idx as f32) / head_dim as f32);
             let angle = (position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x = head[pair_idx];
+            let y = head[pair_idx + 1];
+            head[pair_idx] = x * cos - y * sin;
+            head[pair_idx + 1] = x * sin + y * cos;
+        }
+    }
+}
+
+fn apply_rotary_adjacent_mrope(
+    values: &mut [f32],
+    position: MropePosition,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: [usize; 3],
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+
+    for head in values.chunks_mut(head_dim) {
+        let rotary_dims = rotary_dim.min(head.len()) - (rotary_dim.min(head.len()) % 2);
+        for pair_idx in (0..rotary_dims).step_by(2) {
+            let freq_idx = pair_idx / 2;
+            let axis = mrope_axis_for_frequency(freq_idx, mrope_section);
+            let inv_freq = theta.powf(-(pair_idx as f32) / head_dim as f32);
+            let angle = (position.axis(axis) as f32) * inv_freq;
             let (sin, cos) = angle.sin_cos();
             let x = head[pair_idx];
             let y = head[pair_idx + 1];
@@ -2539,6 +2831,83 @@ fn apply_rotary_split_half(
             head[i] = x0 * cos - x1 * sin;
             head[i + half] = x0 * sin + x1 * cos;
         }
+    }
+}
+
+fn apply_rotary_split_half_mrope(
+    values: &mut [f32],
+    position: MropePosition,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: [usize; 3],
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+    let half = rotary_dim / 2;
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let axis = mrope_axis_for_frequency(i, mrope_section);
+            let inv_freq = theta.powf(-((2 * i) as f32) / rotary_dim as f32);
+            let angle = (position.axis(axis) as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn apply_vision_spatial_rotary(
+    values: &mut [f32],
+    row: usize,
+    col: usize,
+    head_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = head_dim - (head_dim % 2);
+    let half = rotary_dim / 2;
+    let spatial_half = half / 2;
+    if spatial_half == 0 {
+        return;
+    }
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let (axis_position, axis_idx) = if i < spatial_half {
+                (row, i)
+            } else {
+                (col, i - spatial_half)
+            };
+            let inv_freq = theta.powf(-((2 * axis_idx) as f32) / half as f32);
+            let angle = (axis_position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn mrope_axis_for_frequency(index: usize, section: [usize; 3]) -> MropeAxis {
+    if index % 3 == 1 && index < section[1].saturating_mul(3) {
+        MropeAxis::Height
+    } else if index % 3 == 2 && index < section[2].saturating_mul(3) {
+        MropeAxis::Width
+    } else {
+        MropeAxis::Temporal
     }
 }
 
@@ -7337,14 +7706,21 @@ impl ImagePreprocessor {
 /// - `depth` transformer blocks (LayerNorm → QKV-attention → LayerNorm → MLP)
 /// - Spatial merger: 2×2 patch groups → LayerNorm → MLP → `text_hidden_size`
 ///
-/// **Note**: Multimodal 2D Rotary Position Embeddings (M-RoPE) are not yet
-/// applied to the ViT attention; adding them is tracked as a follow-up.
+/// Applies Qwen3-VL's spatial rotary embeddings to ViT Q/K states before
+/// attention, then merges patch groups into decoder visual tokens.
 #[derive(Debug, Clone)]
 pub struct VisionEncoder {
     config: Qwen3VLVisionConfig,
     /// Target hidden size of the language-model decoder.
     text_hidden_size: usize,
     dense: DenseStore,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisionEncoding {
+    pub embeddings: Vec<Vec<f32>>,
+    pub merged_grid_h: usize,
+    pub merged_grid_w: usize,
 }
 
 impl VisionEncoder {
@@ -7376,12 +7752,12 @@ impl VisionEncoder {
 
     /// Encode an image into a sequence of visual token embeddings.
     ///
-    /// Returns a `Vec<Vec<f32>>` of shape `[num_merged_tokens, text_hidden_size]`.
+    /// Returns visual token embeddings plus their merged spatial grid.
     pub fn encode(
         &self,
         preprocessor: &ImagePreprocessor,
         image_path: &Path,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<VisionEncoding> {
         // 1. Preprocess → patches [N, C, pH, pW]
         let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
         let num_patches = grid_h * grid_w;
@@ -7397,11 +7773,16 @@ impl VisionEncoder {
 
         // 3. Transformer blocks
         for layer in 0..self.config.depth {
-            self.vit_block(layer, &mut hidden)?;
+            self.vit_block(layer, &mut hidden, grid_h, grid_w)?;
         }
 
         // 4. Merge 2×2 patch groups into language-model visual tokens
-        self.merge_visual_tokens(&hidden, grid_h, grid_w)
+        let embeddings = self.merge_visual_tokens(&hidden, grid_h, grid_w)?;
+        Ok(VisionEncoding {
+            embeddings,
+            merged_grid_h: grid_h / self.config.merge_size,
+            merged_grid_w: grid_w / self.config.merge_size,
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -7420,7 +7801,13 @@ impl VisionEncoder {
     }
 
     /// Run one ViT transformer block in-place.
-    fn vit_block(&self, layer: usize, hidden: &mut Vec<Vec<f32>>) -> Result<()> {
+    fn vit_block(
+        &self,
+        layer: usize,
+        hidden: &mut Vec<Vec<f32>>,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
         let embed_dim = self.config.embed_dim;
 
         // Pre-attention LayerNorm
@@ -7433,7 +7820,7 @@ impl VisionEncoder {
             .collect::<Result<_>>()?;
 
         // Self-attention
-        let attn_out = self.vit_attention(layer, &normed, embed_dim)?;
+        let attn_out = self.vit_attention(layer, &normed, embed_dim, grid_h, grid_w)?;
 
         // Residual
         for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
@@ -7466,16 +7853,14 @@ impl VisionEncoder {
         Ok(())
     }
 
-    /// Multi-head self-attention (without positional encoding).
-    ///
-    /// TODO(#vision-mrope): Apply 2D M-RoPE to Q and K for spatially-aware
-    /// attention.  Without it the model has no explicit spatial bias in the ViT
-    /// layers, but the merger MLP still produces useful token embeddings.
+    /// Multi-head self-attention with Qwen3-VL spatial rotary embeddings.
     fn vit_attention(
         &self,
         layer: usize,
         hidden: &[Vec<f32>],
         embed_dim: usize,
+        grid_h: usize,
+        grid_w: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let num_heads = self.config.num_heads;
         let head_dim = embed_dim / num_heads;
@@ -7507,6 +7892,28 @@ impl VisionEncoder {
             q_all[t].copy_from_slice(&qkv[..embed_dim]);
             k_all[t].copy_from_slice(&qkv[embed_dim..2 * embed_dim]);
             v_all[t].copy_from_slice(&qkv[2 * embed_dim..]);
+        }
+
+        let theta = 10_000.0f64;
+        for token_idx in 0..num_tokens {
+            let row = if grid_w > 0 { token_idx / grid_w } else { 0 };
+            let col = if grid_w > 0 { token_idx % grid_w } else { 0 };
+            let merged_row = row / self.config.merge_size;
+            let merged_col = col / self.config.merge_size;
+            apply_vision_spatial_rotary(
+                &mut q_all[token_idx],
+                merged_row,
+                merged_col,
+                head_dim,
+                theta,
+            );
+            apply_vision_spatial_rotary(
+                &mut k_all[token_idx],
+                merged_row,
+                merged_col,
+                head_dim,
+                theta,
+            );
         }
 
         // Multi-head attention: for each head, compute scores then weighted values
@@ -8702,6 +9109,35 @@ mod tests {
     }
 
     #[test]
+    fn qwen_config_deserializes_mrope_section_from_rope_scaling() {
+        let json = br#"{
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 128,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "vocab_size": 1024,
+                "rope_scaling": {
+                    "rope_theta": 1000000.0,
+                    "mrope_section": [24, 20, 20]
+                }
+            },
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 64,
+                "num_heads": 4
+            }
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.rope_theta, Some(1_000_000.0));
+        assert_eq!(config.mrope_section, Some(DEFAULT_MROPE_SECTION));
+        assert_eq!(config.text_mrope_section(), Some(DEFAULT_MROPE_SECTION));
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
         // Fixture derived from the Qwen3 MoE architecture:
         //   - q_norm / k_norm per attention layer (Qwen3 QK-norm)
@@ -9682,6 +10118,7 @@ mod flashmoe_rope_tests {
             moe_intermediate_size: Some(1024),
             intermediate_size: None,
             max_position_embeddings: None,
+            mrope_section: None,
             tie_word_embeddings: None,
             num_shared_experts: None,
             shared_expert_intermediate_size: None,
@@ -9708,11 +10145,99 @@ mod flashmoe_rope_tests {
 
         let mut q = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
         let mut k = q.clone();
-        apply_rotary_for_layout(&mut q, &mut k, 1, 1_000_000.0, layout);
+        apply_rotary_for_layout(
+            &mut q,
+            &mut k,
+            MropePosition::text(1),
+            1_000_000.0,
+            layout,
+            None,
+        );
 
         // Adjacent pairing would rotate (0,1), (2,3), ...
         // Split-half pairing rotates (0,4), (1,5), ...
         assert_ne!(q[1], 2.0);
         assert_ne!(q[5], 20.0);
+    }
+
+    #[test]
+    fn qwen3vl_mrope_interleaves_height_and_width_frequency_slots() {
+        let position = MropePosition {
+            temporal: 2,
+            height: 5,
+            width: 7,
+        };
+        let section = [2, 1, 1];
+        let head_dim = 8usize;
+        let theta = 10_000.0f64;
+
+        let mut got = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        apply_rotary_split_half_mrope(&mut got, position, head_dim, head_dim, theta, section);
+
+        let mut expected = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let half = head_dim / 2;
+        for i in 0..half {
+            let axis = match i {
+                1 => position.height,
+                2 => position.width,
+                _ => position.temporal,
+            };
+            let freq = 1.0f32 / (theta as f32).powf((2 * i) as f32 / head_dim as f32);
+            let angle = axis as f32 * freq;
+            let (sin_a, cos_a) = angle.sin_cos();
+            let x0 = expected[i];
+            let x1 = expected[i + half];
+            expected[i] = x0 * cos_a - x1 * sin_a;
+            expected[i + half] = x0 * sin_a + x1 * cos_a;
+        }
+
+        for (left, right) in got.iter().zip(expected.iter()) {
+            assert_close(*left, *right);
+        }
+    }
+
+    #[test]
+    fn qwen3vl_image_mrope_positions_match_single_image_get_rope_index_shape() {
+        let tokens = [101, 999, 999, 999, 999, 102, 201, 202];
+        let (positions, next_position) =
+            qwen3vl_single_image_mrope_positions(&tokens, 999, 2, 2).unwrap();
+
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(
+            positions[1],
+            MropePosition {
+                temporal: 1,
+                height: 1,
+                width: 1,
+            }
+        );
+        assert_eq!(
+            positions[2],
+            MropePosition {
+                temporal: 1,
+                height: 1,
+                width: 2,
+            }
+        );
+        assert_eq!(
+            positions[3],
+            MropePosition {
+                temporal: 1,
+                height: 2,
+                width: 1,
+            }
+        );
+        assert_eq!(
+            positions[4],
+            MropePosition {
+                temporal: 1,
+                height: 2,
+                width: 2,
+            }
+        );
+        assert_eq!(positions[5], MropePosition::text(3));
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(positions[7], MropePosition::text(5));
+        assert_eq!(next_position, 6);
     }
 }
