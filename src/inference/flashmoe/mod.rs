@@ -870,6 +870,12 @@ fn qwen3vl_single_image_mrope_positions(
             "image placeholder count {actual_image_tokens} does not match merged image grid {image_grid_h}x{image_grid_w}"
         );
     }
+    let image_runs = count_token_runs(prompt_tokens, image_pad_token);
+    if image_runs > 1 {
+        bail!(
+            "single-image prompt contains {image_runs} separate image placeholder runs; placeholders for one image must be contiguous"
+        );
+    }
 
     let mut positions = Vec::with_capacity(prompt_tokens.len());
     let mut current_pos = 0usize;
@@ -917,6 +923,12 @@ fn expand_single_image_placeholders(
         .filter(|&&token| token == image_pad_token)
         .count();
     if image_pad_count == expected_image_tokens {
+        let image_runs = count_token_runs(&prompt_tokens, image_pad_token);
+        if image_runs > 1 {
+            bail!(
+                "single-image prompt contains {image_runs} separate image placeholder runs; use one contiguous <|image_pad|> span per image"
+            );
+        }
         return Ok(prompt_tokens);
     }
     if image_pad_count == 1 {
@@ -934,6 +946,22 @@ fn expand_single_image_placeholders(
     bail!(
         "prompt contains {image_pad_count} image placeholders but the encoded image produced {expected_image_tokens} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token"
     );
+}
+
+fn count_token_runs(tokens: &[u32], needle: u32) -> usize {
+    let mut runs = 0usize;
+    let mut in_run = false;
+    for &token in tokens {
+        if token == needle {
+            if !in_run {
+                runs += 1;
+                in_run = true;
+            }
+        } else {
+            in_run = false;
+        }
+    }
+    runs
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9563,6 +9591,8 @@ mod tests {
             vec![1, 9, 9, 2]
         );
         assert!(expand_single_image_placeholders(vec![1, 2], 9, 2).is_err());
+        assert!(expand_single_image_placeholders(vec![1, 9, 2, 9], 9, 2).is_err());
+        assert!(qwen3vl_single_image_mrope_positions(&[1, 9, 2, 9], 9, 1, 2).is_err());
     }
 
     #[test]
