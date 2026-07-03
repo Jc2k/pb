@@ -4,7 +4,7 @@ use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, sleep};
@@ -106,6 +106,12 @@ pub enum Commands {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// FlashMoe backend utilities
+    #[command(name = "flashmoe")]
+    FlashMoe {
+        #[command(subcommand)]
+        command: FlashMoeCommand,
     },
     /// Inspect a project and configure it for use with pb
     Init(InitArgs),
@@ -322,6 +328,63 @@ pub enum ServiceCommand {
     Stop,
     /// Restart the pb serve service
     Restart,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlashMoeCommand {
+    /// Benchmark FlashMoe generation and emit per-token/per-layer timing TSV
+    Bench(FlashMoeBenchArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FlashMoeBenchArgs {
+    /// FlashMoe model identifier to load
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Directory containing pulled model blobs; defaults to the configured model dir
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Prompt to run; repeat for a multi-prompt smoke set
+    #[arg(long = "prompt")]
+    pub prompts: Vec<String>,
+
+    /// Use pb's built-in deterministic smoke prompts
+    #[arg(long = "quality-smoke")]
+    pub quality_smoke: bool,
+
+    /// Baseline JSON to compare deterministic smoke outputs against
+    #[arg(long)]
+    pub baseline: Option<PathBuf>,
+
+    /// Write or replace the baseline JSON after running prompts
+    #[arg(long)]
+    pub update_baseline: bool,
+
+    /// Append TSV timing rows to this file as well as stdout
+    #[arg(long)]
+    pub results: Option<PathBuf>,
+
+    /// Experiment disposition for TSV logs, following kept/discarded results discipline
+    #[arg(long, default_value = "kept")]
+    pub status: String,
+
+    /// Maximum generated tokens per prompt
+    #[arg(long, default_value_t = 16)]
+    pub max_tokens: i32,
+
+    /// Sampling temperature; quality-smoke forces deterministic 0.0
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Top-k; quality-smoke forces deterministic 1
+    #[arg(long, default_value_t = 1)]
+    pub top_k: i32,
+
+    /// RNG seed
+    #[arg(long, default_value_t = 1)]
+    pub seed: u32,
 }
 
 #[derive(Args, Debug)]
@@ -555,6 +618,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Mcp { command } => run_mcp_command(command).await,
         Commands::Integrations { command } => run_integrations_command(command).await,
         Commands::Service { command } => run_service_command(command),
+        Commands::FlashMoe { command } => run_flashmoe_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
 }
@@ -1295,6 +1359,338 @@ fn run_service_command(command: ServiceCommand) -> Result<()> {
         ServiceCommand::Stop => service::stop(),
         ServiceCommand::Restart => service::restart(),
     }
+}
+
+fn run_flashmoe_command(command: FlashMoeCommand) -> Result<()> {
+    match command {
+        FlashMoeCommand::Bench(args) => run_flashmoe_bench(args),
+    }
+}
+
+fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
+    let status = match args.status.as_str() {
+        "kept" | "discarded" => args.status.as_str(),
+        _ => bail!("--status must be kept or discarded"),
+    };
+    let user_config = UserConfig::load()?;
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| user_config.effective_model());
+    let models_root = args
+        .model_dir
+        .clone()
+        .or_else(|| user_config.effective_model_dir())
+        .unwrap_or_else(default_models_dir);
+    let plan = inference::flashmoe::plan_unchecked(&model, &models_root);
+    let mut engine = inference::flashmoe::load(&plan)?;
+    let prompts = flashmoe_bench_prompts(&args);
+    let temperature = if args.quality_smoke {
+        0.0
+    } else {
+        args.temperature
+    };
+    let top_k = if args.quality_smoke { 1 } else { args.top_k };
+    let seed = args.seed;
+
+    let baseline = if let Some(path) = &args.baseline
+        && path.is_file()
+    {
+        Some(load_flashmoe_smoke_baseline(path)?)
+    } else {
+        None
+    };
+
+    let mut smoke_results = Vec::new();
+    let mut tsv = String::new();
+    tsv.push_str(FLASHMOE_TIMING_TSV_HEADER);
+    for (prompt_index, prompt) in prompts.iter().enumerate() {
+        let timed = engine.generate_timed(&inference::flashmoe::GenerationRequest {
+            prompt: prompt.clone(),
+            max_tokens: args.max_tokens,
+            temperature,
+            top_k,
+            seed,
+        })?;
+        let expected = baseline.as_ref().and_then(|baseline| {
+            baseline
+                .results
+                .iter()
+                .find(|item| item.prompt == *prompt)
+                .map(|item| item.output.as_str())
+        });
+        let quality = match expected {
+            Some(expected) if expected == timed.output.content => "pass",
+            Some(_) => "fail",
+            None => "NA",
+        };
+        smoke_results.push(FlashMoeSmokeResult {
+            prompt: prompt.clone(),
+            output: timed.output.content.clone(),
+            generated_tokens: timed.output.generated_tokens,
+        });
+        append_flashmoe_timing_tsv(&mut tsv, status, prompt_index, prompt, quality, &timed);
+    }
+
+    if args.update_baseline {
+        let path = args
+            .baseline
+            .as_ref()
+            .context("--update-baseline requires --baseline")?;
+        write_flashmoe_smoke_baseline(
+            path,
+            &FlashMoeSmokeBaseline {
+                model: plan.model.clone(),
+                max_tokens: args.max_tokens,
+                temperature,
+                top_k,
+                seed,
+                results: smoke_results,
+            },
+        )?;
+    }
+
+    if let Some(path) = &args.results {
+        append_or_create_flashmoe_results(path, &tsv)?;
+    }
+    print!("{tsv}");
+    if tsv.lines().any(|line| line.contains("\tfail\t")) {
+        bail!("FlashMoe quality smoke failed against baseline");
+    }
+    Ok(())
+}
+
+const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\trouting_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlashMoeSmokeBaseline {
+    model: String,
+    max_tokens: i32,
+    temperature: f32,
+    top_k: i32,
+    seed: u32,
+    results: Vec<FlashMoeSmokeResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlashMoeSmokeResult {
+    prompt: String,
+    output: String,
+    generated_tokens: usize,
+}
+
+fn flashmoe_bench_prompts(args: &FlashMoeBenchArgs) -> Vec<String> {
+    if !args.prompts.is_empty() {
+        return args.prompts.clone();
+    }
+    if args.quality_smoke {
+        return vec![
+            "Answer with exactly one word: ready".to_string(),
+            "Write a tiny Rust function name for adding two numbers.".to_string(),
+        ];
+    }
+    vec!["Answer with exactly one word: ready".to_string()]
+}
+
+fn append_flashmoe_timing_tsv(
+    out: &mut String,
+    status: &str,
+    prompt_index: usize,
+    prompt: &str,
+    quality: &str,
+    timed: &inference::flashmoe::TimedGenerationOutput,
+) {
+    let dims = &timed.timing.dimensions;
+    push_tsv_row(
+        out,
+        &[
+            status,
+            "model",
+            &timed.timing.model,
+            &prompt_index.to_string(),
+            prompt,
+            quality,
+            "NA",
+            "NA",
+            "NA",
+            "NA",
+            "NA",
+            "NA",
+            "NA",
+            &dims.hidden_size.to_string(),
+            "NA",
+            "NA",
+            "NA",
+            &fmt_option_usize(dims.experts_per_layer),
+            &fmt_option_usize(dims.active_experts_per_token),
+            &fmt_option_usize(dims.shared_experts),
+            "0.000",
+            "0.000",
+            "0.000",
+            "0.000",
+            "0.000",
+            "0",
+            "0",
+            "0.000",
+            "0",
+            "0.000",
+            "0.000",
+            "0.000",
+            &fmt_duration_ms(timed.timing.total_wall),
+            &timed.output.generated_tokens.to_string(),
+            &timed.output.content,
+        ],
+    );
+    for token in &timed.timing.tokens {
+        push_tsv_row(
+            out,
+            &[
+                status,
+                "token",
+                &timed.timing.model,
+                &prompt_index.to_string(),
+                prompt,
+                quality,
+                token.phase.as_str(),
+                &token.token_index.to_string(),
+                &token.position.to_string(),
+                &token.input_token.to_string(),
+                &fmt_option_u32(token.sampled_token),
+                "NA",
+                "NA",
+                &dims.hidden_size.to_string(),
+                "NA",
+                "NA",
+                "NA",
+                &fmt_option_usize(dims.experts_per_layer),
+                &fmt_option_usize(dims.active_experts_per_token),
+                &fmt_option_usize(dims.shared_experts),
+                &fmt_duration_ms(token.buckets.attention_projection),
+                &fmt_duration_ms(token.buckets.routing),
+                &fmt_duration_ms(token.buckets.expert_io),
+                &fmt_duration_ms(token.buckets.expert_queue),
+                &fmt_duration_ms(token.buckets.expert_read),
+                &token.buckets.expert_bytes_read.to_string(),
+                &token.buckets.expert_warm_reads.to_string(),
+                &fmt_duration_ms(token.buckets.expert_warm_read),
+                &token.buckets.expert_warm_bytes_read.to_string(),
+                &fmt_duration_ms(token.buckets.expert_compute),
+                &fmt_duration_ms(token.buckets.combine_norm),
+                &fmt_duration_ms(token.buckets.sampling),
+                &fmt_duration_ms(token.buckets.total_wall),
+                &timed.output.generated_tokens.to_string(),
+                "",
+            ],
+        );
+        for layer in &token.layers {
+            push_tsv_row(
+                out,
+                &[
+                    status,
+                    "layer",
+                    &timed.timing.model,
+                    &prompt_index.to_string(),
+                    prompt,
+                    quality,
+                    token.phase.as_str(),
+                    &token.token_index.to_string(),
+                    &token.position.to_string(),
+                    &token.input_token.to_string(),
+                    &fmt_option_u32(token.sampled_token),
+                    &layer.layer.to_string(),
+                    layer.layer_kind.as_str(),
+                    &layer.dimensions.hidden_size.to_string(),
+                    &fmt_option_usize(layer.dimensions.q_width),
+                    &fmt_option_usize(layer.dimensions.kv_width),
+                    &fmt_option_usize(layer.dimensions.head_dim),
+                    &fmt_option_usize(layer.dimensions.experts_per_layer),
+                    &layer.active_experts.to_string(),
+                    &fmt_option_usize(layer.dimensions.shared_experts),
+                    &fmt_duration_ms(layer.buckets.attention_projection),
+                    &fmt_duration_ms(layer.buckets.routing),
+                    &fmt_duration_ms(layer.buckets.expert_io),
+                    &fmt_duration_ms(layer.buckets.expert_queue),
+                    &fmt_duration_ms(layer.buckets.expert_read),
+                    &layer.buckets.expert_bytes_read.to_string(),
+                    &layer.buckets.expert_warm_reads.to_string(),
+                    &fmt_duration_ms(layer.buckets.expert_warm_read),
+                    &layer.buckets.expert_warm_bytes_read.to_string(),
+                    &fmt_duration_ms(layer.buckets.expert_compute),
+                    &fmt_duration_ms(layer.buckets.combine_norm),
+                    &fmt_duration_ms(layer.buckets.sampling),
+                    &fmt_duration_ms(layer.buckets.total_wall),
+                    &timed.output.generated_tokens.to_string(),
+                    "",
+                ],
+            );
+        }
+    }
+}
+
+fn push_tsv_row(out: &mut String, fields: &[&str]) {
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            out.push('\t');
+        }
+        let sanitized = field
+            .replace('\t', " ")
+            .replace('\n', " ")
+            .replace('\r', " ");
+        out.push_str(&sanitized);
+    }
+    out.push('\n');
+}
+
+fn fmt_option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NA".to_string())
+}
+
+fn fmt_option_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NA".to_string())
+}
+
+fn fmt_duration_ms(duration: Duration) -> String {
+    format!("{:.3}", duration.as_secs_f64() * 1000.0)
+}
+
+fn load_flashmoe_smoke_baseline(path: &Path) -> Result<FlashMoeSmokeBaseline> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_flashmoe_smoke_baseline(path: &Path, baseline: &FlashMoeSmokeBaseline) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(baseline).context("failed to serialize baseline")?;
+    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn append_or_create_flashmoe_results(path: &Path, tsv: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let exists = path.is_file();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let data = if exists {
+        tsv.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n"
+    } else {
+        tsv.to_string()
+    };
+    use std::io::Write as _;
+    file.write_all(data.as_bytes())
+        .with_context(|| format!("failed to append {}", path.display()))
 }
 
 /// Resolve the project root from an optional `--workdir` flag.
