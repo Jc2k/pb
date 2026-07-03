@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::ffi::{CString, c_char, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -809,7 +809,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FlashMoeEngine {
     plan: FlashMoePlan,
     experts: ExpertStore,
@@ -5199,6 +5199,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[derive(Debug, Clone)]
 pub struct ExpertStore {
     root: PathBuf,
+    layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
 impl ExpertStore {
@@ -5206,7 +5207,10 @@ impl ExpertStore {
         if !root.is_dir() {
             bail!("expert store {} does not exist", root.display());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            layers: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
@@ -5226,6 +5230,22 @@ impl ExpertStore {
         }
         Ok(out)
     }
+
+    fn layer_reader(&self, layer: usize) -> Result<Arc<ExpertLayerReader>> {
+        if let Some(reader) = self
+            .layers
+            .lock()
+            .expect("expert layer cache poisoned")
+            .get(&layer)
+            .cloned()
+        {
+            return Ok(reader);
+        }
+
+        let reader = Arc::new(ExpertLayerReader::open(&self.root, layer)?);
+        let mut layers = self.layers.lock().expect("expert layer cache poisoned");
+        Ok(layers.entry(layer).or_insert_with(|| reader).clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -5234,10 +5254,86 @@ struct ExpertKey {
     expert: usize,
 }
 
-#[derive(Debug)]
 struct PendingExpertRead {
-    handle: thread::JoinHandle<Result<ExpertWeights>>,
-    issued_at: Instant,
+    id: u64,
+    rx: mpsc::Receiver<ExpertReadResponse>,
+}
+
+#[derive(Debug)]
+struct ExpertLayerReader {
+    path: PathBuf,
+    file: fs::File,
+    metadata: ExpertLayerPackMetadata,
+}
+
+impl ExpertLayerReader {
+    fn open(root: &Path, layer: usize) -> Result<Self> {
+        let path = expert_layer_path(root, layer);
+        let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
+            format!(
+                "failed to read expert layer metadata {}",
+                expert_layer_metadata_path(root, layer).display()
+            )
+        })?;
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open expert layer {}", path.display()))?;
+        Ok(Self {
+            path,
+            file,
+            metadata,
+        })
+    }
+
+    fn prepare_read(&self, expert: usize) -> Result<(ExpertPackMetadata, u64, Vec<u8>)> {
+        let metadata = self.metadata.pack_for(expert).cloned().with_context(|| {
+            format!(
+                "expert layer {} has no metadata for expert {expert}",
+                self.metadata.layer
+            )
+        })?;
+        if metadata.packed_bytes > self.metadata.expert_size {
+            bail!(
+                "expert layer {} expert {expert} metadata length {} exceeds slot size {}",
+                self.metadata.layer,
+                metadata.packed_bytes,
+                self.metadata.expert_size
+            );
+        }
+        let offset = expert_slot_offset(expert, self.metadata.expert_size)?;
+        let packed_len = usize::try_from(metadata.packed_bytes)
+            .context("expert pack length does not fit usize")?;
+        Ok((metadata, offset, vec![0u8; packed_len]))
+    }
+
+    fn read_prepared(
+        &self,
+        expert: usize,
+        metadata: ExpertPackMetadata,
+        offset: u64,
+        mut packed: Vec<u8>,
+    ) -> Result<ExpertWeights> {
+        read_exact_at_positioned(&self.file, &mut packed, offset).with_context(|| {
+            format!(
+                "failed to read expert {expert} from {}",
+                self.path.display()
+            )
+        })?;
+        if !cfg!(test) && !packed.starts_with(PBQ4_EXPERT_MAGIC) {
+            bail!("expert {} is not a pb q4 expert pack", self.path.display());
+        }
+        let records = if packed.starts_with(PBQ4_EXPERT_MAGIC) {
+            parse_pbq4_expert_pack(&packed, Some(&metadata))
+                .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?
+        } else {
+            Vec::new()
+        };
+        Ok(ExpertWeights {
+            layer: self.metadata.layer,
+            expert,
+            packed,
+            records,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5256,38 +5352,57 @@ pub struct ExpertSchedulerSnapshot {
     pub max_read_latency: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ExpertScheduler {
     store: ExpertStore,
+    pool: ExpertIoWorkerPool,
     metrics: ExpertSchedulerMetrics,
+    next_read_id: u64,
 }
 
 impl ExpertScheduler {
     fn new(store: ExpertStore) -> Self {
         Self {
             store,
+            pool: ExpertIoWorkerPool::default(),
             metrics: ExpertSchedulerMetrics::default(),
+            next_read_id: 0,
         }
     }
 
     fn issue(&mut self, layer: usize, experts: &[usize]) -> Result<Vec<PendingExpertRead>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pool.ensure_workers(experts.len().max(1));
+        let reader = self.store.layer_reader(layer)?;
         let mut pending = Vec::with_capacity(experts.len());
         for expert in experts {
             let key = ExpertKey {
                 layer,
                 expert: *expert,
             };
+            let (metadata, offset, packed) = reader.prepare_read(key.expert)?;
             let issued_at = Instant::now();
             // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
             // maintaining a second in-process cache of hot expert packs. Cold expert reads still
             // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
             // evicts them, which matches the behavior described in the upstream notes.
             self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
-            let root = self.store.root.clone();
-            pending.push(PendingExpertRead {
-                handle: thread::spawn(move || read_one_expert(&root, key.layer, key.expert)),
+            let id = self.next_read_id;
+            self.next_read_id = self.next_read_id.wrapping_add(1);
+            let (tx, rx) = mpsc::channel();
+            self.pool.submit(ExpertReadJob {
+                id,
+                key,
+                reader: Arc::clone(&reader),
+                metadata,
+                offset,
+                packed,
                 issued_at,
-            });
+                tx,
+            })?;
+            pending.push(PendingExpertRead { id, rx });
         }
         Ok(pending)
     }
@@ -5295,19 +5410,27 @@ impl ExpertScheduler {
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
-            let started = pending.issued_at;
-            let expert = match pending.handle.join() {
-                Ok(result) => result,
-                Err(_) => {
+            let response = pending
+                .rx
+                .recv()
+                .context("expert I/O worker dropped response channel")?;
+            if response.id != pending.id {
+                self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
+                bail!(
+                    "expert I/O worker returned response {} for pending read {}",
+                    response.id,
+                    pending.id
+                );
+            }
+            self.metrics.total_read_latency += response.latency;
+            self.metrics.max_read_latency = self.metrics.max_read_latency.max(response.latency);
+            match response.result {
+                Ok(expert) => out.push(Arc::new(expert)),
+                Err(error) => {
                     self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
-                    bail!("expert read thread panicked");
+                    return Err(error);
                 }
-            }?;
-            let latency = started.elapsed();
-            self.metrics.total_read_latency += latency;
-            self.metrics.max_read_latency = self.metrics.max_read_latency.max(latency);
-            let expert = Arc::new(expert);
-            out.push(expert);
+            }
         }
         Ok(out)
     }
@@ -5320,6 +5443,95 @@ impl ExpertScheduler {
             max_read_latency: self.metrics.max_read_latency,
         }
     }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.pool.worker_count()
+    }
+}
+
+#[derive(Default)]
+struct ExpertIoWorkerPool {
+    workers: Vec<thread::JoinHandle<()>>,
+    senders: Vec<mpsc::Sender<ExpertReadJob>>,
+    next_worker: usize,
+}
+
+impl std::fmt::Debug for ExpertIoWorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertIoWorkerPool")
+            .field("workers", &self.workers.len())
+            .field("next_worker", &self.next_worker)
+            .finish()
+    }
+}
+
+impl ExpertIoWorkerPool {
+    fn ensure_workers(&mut self, workers: usize) {
+        while self.workers.len() < workers {
+            let (tx, rx) = mpsc::channel::<ExpertReadJob>();
+            let handle = thread::spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let latency_start = job.issued_at;
+                    let result = job.reader.read_prepared(
+                        job.key.expert,
+                        job.metadata,
+                        job.offset,
+                        job.packed,
+                    );
+                    let _ = job.tx.send(ExpertReadResponse {
+                        id: job.id,
+                        latency: latency_start.elapsed(),
+                        result,
+                    });
+                }
+            });
+            self.senders.push(tx);
+            self.workers.push(handle);
+        }
+    }
+
+    fn submit(&mut self, job: ExpertReadJob) -> Result<()> {
+        if self.senders.is_empty() {
+            self.ensure_workers(1);
+        }
+        let worker = self.next_worker % self.senders.len();
+        self.next_worker = self.next_worker.wrapping_add(1);
+        self.senders[worker]
+            .send(job)
+            .context("failed to submit expert read to I/O worker")
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl Drop for ExpertIoWorkerPool {
+    fn drop(&mut self) {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct ExpertReadJob {
+    id: u64,
+    key: ExpertKey,
+    reader: Arc<ExpertLayerReader>,
+    metadata: ExpertPackMetadata,
+    offset: u64,
+    packed: Vec<u8>,
+    issued_at: Instant,
+    tx: mpsc::Sender<ExpertReadResponse>,
+}
+
+struct ExpertReadResponse {
+    id: u64,
+    latency: Duration,
+    result: Result<ExpertWeights>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10599,26 +10811,92 @@ mod tests {
         let mut scheduler =
             ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
         let pending = scheduler.issue(0, &[1, 3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
         assert!(experts.iter().all(|expert| expert.layer == 0));
+        assert_eq!(experts[0].expert, 1);
+        assert_eq!(experts[1].expert, 3);
         let first = scheduler.snapshot();
         assert_eq!(first.issued_reads, 2);
+        assert_eq!(first.read_failures, 0);
+        assert!(first.total_read_latency >= first.max_read_latency);
 
         let pending = scheduler.issue(0, &[3, 7]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
         assert_eq!(experts[0].expert, 3);
         assert_eq!(experts[1].expert, 7);
         let second = scheduler.snapshot();
         assert_eq!(second.issued_reads, 4);
+        assert_eq!(second.read_failures, 0);
+        assert!(second.total_read_latency >= second.max_read_latency);
 
         let pending = scheduler.issue(0, &[3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 1);
         assert_eq!(experts[0].expert, 3);
         let third = scheduler.snapshot();
         assert_eq!(third.issued_reads, 5);
+        assert_eq!(third.read_failures, 0);
+    }
+
+    #[test]
+    fn expert_scheduler_preserves_requested_result_order() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let packs: Vec<_> = [1usize, 3, 7]
+            .into_iter()
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let pending = scheduler.issue(0, &[7, 1, 3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 3);
+        let experts = scheduler.finish(pending).unwrap();
+        let order: Vec<_> = experts.iter().map(|expert| expert.expert).collect();
+        assert_eq!(order, vec![7, 1, 3]);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 3);
+        assert_eq!(snapshot.read_failures, 0);
+    }
+
+    #[test]
+    fn expert_scheduler_records_worker_read_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let tensor = "model.layers.0.mlp.experts.2.down_proj.weight";
+        let pack = test_expert_pack(tensor);
+        let metadata = test_expert_pack_metadata(0, 2, tensor, pack.len());
+        write_test_expert_layer(temp.path(), 0, vec![(2, pack, metadata)], 8).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(expert_layer_path(temp.path(), 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let pending = scheduler.issue(0, &[2]).unwrap();
+        let err = scheduler.finish(pending).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to read expert 2"),
+            "{err:#}"
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 1);
+        assert_eq!(snapshot.read_failures, 1);
+        assert!(snapshot.total_read_latency >= snapshot.max_read_latency);
     }
 
     #[test]
@@ -10869,6 +11147,7 @@ mod tests {
         .unwrap();
         let tokenizer = QwenTokenizer::from_file(&plan.tokenizer).unwrap();
         let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
         let mut engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -10877,6 +11156,7 @@ mod tests {
             tokenizer,
             metal: None,
             config,
+            runtime,
             vision_encoder: None,
         };
         let output = engine
