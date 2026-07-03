@@ -1816,9 +1816,7 @@ impl FlashMoeEngine {
             let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
             let pending_experts = self.scheduler.issue(layer, &active_ids)?;
             let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
-            if self.metal.is_none() {
-                softmax_in_place(&mut weights);
-            }
+            softmax_in_place(&mut weights);
             // Deferred CMD3-style overlap: while expert reads are still pending, compute
             // the always-active shared-expert branch on CPU or Metal.
             let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
@@ -2119,35 +2117,37 @@ impl FlashMoeEngine {
         let gate_name = shared_expert_tensor_name(layer, "gate_proj");
         let up_name = shared_expert_tensor_name(layer, "up_proj");
         let down_name = shared_expert_tensor_name(layer, "down_proj");
-        let gate_opt = self.dense.project_dense_tensor_with_metal(
-            self.metal.as_ref(),
-            &gate_name,
-            normed,
-            shared_inter,
-        )?;
-        let up_opt = self.dense.project_dense_tensor_with_metal(
-            self.metal.as_ref(),
-            &up_name,
-            normed,
-            shared_inter,
-        )?;
-        if let (Some(gate), Some(up)) = (gate_opt, up_opt) {
-            let mut activated: Vec<f32> = gate
-                .iter()
-                .zip(up.iter())
-                .map(|(g, u)| silu(*g) * u)
-                .collect();
-            if let Some(shared_out) = self.dense.project_dense_tensor_with_metal(
+        let shared_gate_name = shared_expert_gate_tensor_name(layer);
+        let gate = self
+            .dense
+            .project_dense_tensor_with_metal(self.metal.as_ref(), &gate_name, normed, shared_inter)?
+            .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
+        let up = self
+            .dense
+            .project_dense_tensor_with_metal(self.metal.as_ref(), &up_name, normed, shared_inter)?
+            .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
+        let shared_gate = self
+            .dense
+            .project_dense_tensor_with_metal(
                 self.metal.as_ref(),
-                &down_name,
-                &activated,
-                width,
-            )? {
-                add_in_place(&mut moe, &shared_out);
-            } else {
-                activated.fill(0.0);
-            }
-        }
+                &shared_gate_name,
+                normed,
+                num_shared,
+            )?
+            .with_context(|| {
+                format!("missing configured shared expert gate tensor {shared_gate_name}")
+            })?;
+        let activated: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(g, u)| silu(*g) * u)
+            .collect();
+        let shared_out = self
+            .dense
+            .project_dense_tensor_with_metal(self.metal.as_ref(), &down_name, &activated, width)?
+            .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
+        let shared_weight = sigmoid(shared_gate.first().copied().unwrap_or(0.0));
+        add_scaled_in_place(&mut moe, &shared_out, shared_weight);
         Ok(moe)
     }
 
@@ -3739,6 +3739,40 @@ fn validate_required_tensor_manifest(
             &router_tensor_name(layer),
             &[config.experts(), config.hidden_size],
         )?;
+        let shared_experts = config.num_shared_experts.unwrap_or(0);
+        if shared_experts > 0 {
+            if shared_experts != 1 {
+                bail!(
+                    "Flash-MoE currently supports exactly one shared expert per layer, found {shared_experts}"
+                );
+            }
+            let shared_inter = config.shared_expert_intermediate_size();
+            if shared_inter == 0 {
+                bail!(
+                    "Qwen config declares {shared_experts} shared expert(s) but no shared expert intermediate size"
+                );
+            }
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "gate_proj"),
+                &[shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "up_proj"),
+                &[shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "down_proj"),
+                &[config.hidden_size, shared_inter],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_gate_tensor_name(layer),
+                &[shared_experts, config.hidden_size],
+            )?;
+        }
         // Per-expert tensor presence is intentionally not validated here.
         //
         // Reasons:
@@ -3844,6 +3878,10 @@ fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
 
 fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
     format!("model.layers.{layer}.mlp.shared_expert.{projection}.weight")
+}
+
+fn shared_expert_gate_tensor_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
 }
 
 fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {
@@ -4558,22 +4596,9 @@ impl ExpertStore {
     }
 
     pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
-        if layer >= NUM_LAYERS {
-            bail!("layer {layer} is outside 0..{NUM_LAYERS}");
-        }
-        if experts.len() > ACTIVE_EXPERTS_PER_TOKEN {
-            bail!(
-                "requested {} experts, max active experts is {}",
-                experts.len(),
-                ACTIVE_EXPERTS_PER_TOKEN
-            );
-        }
         let root = Arc::new(self.root.clone());
         let mut handles = Vec::with_capacity(experts.len());
         for &expert in experts {
-            if expert >= NUM_EXPERTS {
-                bail!("expert {expert} is outside 0..{NUM_EXPERTS}");
-            }
             let root = Arc::clone(&root);
             handles.push(thread::spawn(move || read_one_expert(&root, layer, expert)));
         }
@@ -5554,9 +5579,7 @@ kernel void route_top4(
         else if (score > best.z) { best.w = best.z; best_i.w = best_i.z; best.z = score; best_i.z = i; }
         else if (score > best.w) { best.w = score; best_i.w = i; }
     }
-    float m = max(max(best.x, best.y), max(best.z, best.w));
-    float4 e = exp(best - m);
-    weights[token] = e / (e.x + e.y + e.z + e.w);
+    weights[token] = best;
     indices[token] = best_i;
 }
 
@@ -8048,6 +8071,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_configured_shared_expert_without_gate() {
+        let (mut config, mut manifest) = minimal_dense_manifest(true);
+        config.num_shared_experts = Some(1);
+        config.shared_expert_intermediate_size = Some(16);
+        let mut slot = manifest.dense_tensors.len();
+        for (name, shape) in [
+            (
+                shared_expert_tensor_name(0, "gate_proj"),
+                vec![16, config.hidden_size],
+            ),
+            (
+                shared_expert_tensor_name(0, "up_proj"),
+                vec![16, config.hidden_size],
+            ),
+            (
+                shared_expert_tensor_name(0, "down_proj"),
+                vec![config.hidden_size, 16],
+            ),
+        ] {
+            manifest
+                .dense_tensors
+                .push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        }
+
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("shared_expert_gate.weight"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn hybrid_attention_schedule_matches_flashmoe() {
         assert!(!is_full_attention_layer(0));
         assert!(!is_full_attention_layer(1));
@@ -8378,7 +8435,7 @@ mod tests {
     fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
         // Fixture derived from the Qwen3 MoE architecture:
         //   - q_norm / k_norm per attention layer (Qwen3 QK-norm)
-        //   - shared_expert MLP that is always active (not routed through gate)
+        //   - shared_expert MLP that is always active and gated by shared_expert_gate
         //   - separate lm_head.weight (tie_word_embeddings=false)
         //   - 4 routable experts per layer
         // All of these tensors should be classified correctly (dense vs expert) and the
@@ -8502,6 +8559,12 @@ mod tests {
                 vec![8, 16],
                 &vec![0u8; 8 * 16 * 2],
             ),
+            (
+                "model.layers.0.mlp.shared_expert_gate.weight",
+                "BF16",
+                vec![1, 8],
+                &vec![0u8; 8 * 2],
+            ),
         ]);
         std::fs::write(snapshot.join("dense.safetensors"), dense_shard).unwrap();
 
@@ -8569,6 +8632,7 @@ mod tests {
             "model.layers.0.mlp.shared_expert.gate_proj.weight",
             "model.layers.0.mlp.shared_expert.up_proj.weight",
             "model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.layers.0.mlp.shared_expert_gate.weight",
         ] {
             weight_map.insert(
                 name.to_string(),
