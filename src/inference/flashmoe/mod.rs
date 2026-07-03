@@ -269,6 +269,13 @@ pub struct Qwen3VLVisionConfig {
     /// Size of the learned square absolute-position table used by the ViT.
     #[serde(default)]
     pub num_position_embeddings: Option<usize>,
+    /// Vision layers whose merged features are injected into early decoder layers.
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+    /// Output hidden size of the vision merger.  Defaults to the text hidden size
+    /// when omitted by older configs.
+    #[serde(default)]
+    pub out_hidden_size: Option<usize>,
     /// Input channels (defaults to 3 for RGB).
     #[serde(alias = "in_channels")]
     #[serde(default = "default_vit_in_chans")]
@@ -581,6 +588,17 @@ impl QwenModelConfig {
                     vision.num_heads
                 );
             }
+            if let Some(idx) = vision
+                .deepstack_visual_indexes
+                .iter()
+                .copied()
+                .find(|idx| *idx >= vision.depth)
+            {
+                bail!(
+                    "vision deepstack_visual_indexes contains {idx}, but depth is {}",
+                    vision.depth
+                );
+            }
         }
         if let Some(dtype) = &self.torch_dtype {
             let dtype = dtype.to_ascii_lowercase();
@@ -805,6 +823,12 @@ pub struct FlashMoeEngine {
     vision_encoder: Option<VisionEncoder>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DeepstackTokenContext<'a> {
+    features: &'a [Vec<Vec<f32>>],
+    visual_index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MropePosition {
     temporal: usize,
@@ -881,6 +905,35 @@ fn qwen3vl_single_image_mrope_positions(
         }
     }
     Ok((positions, current_pos))
+}
+
+fn expand_single_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    image_pad_token: u32,
+    expected_image_tokens: usize,
+) -> Result<Vec<u32>> {
+    let image_pad_count = prompt_tokens
+        .iter()
+        .filter(|&&token| token == image_pad_token)
+        .count();
+    if image_pad_count == expected_image_tokens {
+        return Ok(prompt_tokens);
+    }
+    if image_pad_count == 1 {
+        let mut expanded =
+            Vec::with_capacity(prompt_tokens.len() + expected_image_tokens.saturating_sub(1));
+        for token in prompt_tokens {
+            if token == image_pad_token {
+                expanded.extend(std::iter::repeat(image_pad_token).take(expected_image_tokens));
+            } else {
+                expanded.push(token);
+            }
+        }
+        return Ok(expanded);
+    }
+    bail!(
+        "prompt contains {image_pad_count} image placeholders but the encoded image produced {expected_image_tokens} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1798,6 +1851,7 @@ impl FlashMoeEngine {
                 kv_cache,
                 position,
                 MropePosition::text(position),
+                None,
                 false,
             )?);
         }
@@ -1810,6 +1864,7 @@ impl FlashMoeEngine {
         &mut self,
         prompt_tokens: &[u32],
         visual_embeddings: &[Vec<f32>],
+        deepstack_features: &[Vec<Vec<f32>>],
         image_pad_token: u32,
         mrope_positions: &[MropePosition],
         kv_cache: &mut KvCache,
@@ -1825,19 +1880,29 @@ impl FlashMoeEngine {
         let mut last_hidden = None;
         for (position, &token) in prompt_tokens.iter().enumerate() {
             kv_cache.record_prompt_token(position, token)?;
-            let override_emb = if token == image_pad_token && vis_idx < visual_embeddings.len() {
-                let emb = visual_embeddings[vis_idx].clone();
+            let visual_index = if token == image_pad_token && vis_idx < visual_embeddings.len() {
+                let idx = vis_idx;
                 vis_idx += 1;
-                Some(emb)
+                Some(idx)
             } else {
                 None
             };
+            let override_emb = if let Some(idx) = visual_index {
+                Some(visual_embeddings[idx].clone())
+            } else {
+                None
+            };
+            let deepstack = visual_index.map(|idx| DeepstackTokenContext {
+                features: deepstack_features,
+                visual_index: idx,
+            });
             last_hidden = Some(self.forward_hidden(
                 token,
                 override_emb,
                 kv_cache,
                 position,
                 mrope_positions[position],
+                deepstack,
                 false,
             )?);
         }
@@ -1877,8 +1942,8 @@ impl FlashMoeEngine {
         let vision_end = self.tokenizer.token_id("<|vision_end|>");
         let image_pad = self.tokenizer.token_id("<|image_pad|>");
 
-        let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
-            (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
+        let pad_tok = match (vision_start, vision_end, image_pad) {
+            (Some(_), Some(_), Some(pad)) => pad,
             _ => bail!(
                 "Qwen3-VL tokenizer is missing required vision special tokens \
                  (<|vision_start|>, <|vision_end|>, <|image_pad|>); \
@@ -1886,17 +1951,19 @@ impl FlashMoeEngine {
             ),
         };
 
-        // Render the chat-template text prompt (system + user prefix)
-        let chat_text = self.tokenizer.apply_chat_template(&request.prompt);
-        let mut text_tokens = self.tokenizer.encode(&chat_text)?;
-
-        // Splice vision tokens in front of the text
-        let mut prompt_tokens: Vec<u32> =
-            Vec::with_capacity(2 + num_visual_tokens + text_tokens.len());
-        prompt_tokens.push(vs_tok);
-        prompt_tokens.extend(std::iter::repeat(pad_tok).take(num_visual_tokens));
-        prompt_tokens.push(ve_tok);
-        prompt_tokens.append(&mut text_tokens);
+        let vision_block = format!(
+            "<|vision_start|>{}<|vision_end|>",
+            "<|image_pad|>".repeat(num_visual_tokens)
+        );
+        let prompt_for_template = if request.prompt.contains("<|image_pad|>") {
+            request.prompt.clone()
+        } else {
+            format!("{vision_block}{}", request.prompt)
+        };
+        let chat_text = self.tokenizer.apply_chat_template(&prompt_for_template);
+        let mut prompt_tokens = self.tokenizer.encode(&chat_text)?;
+        prompt_tokens =
+            expand_single_image_placeholders(prompt_tokens, pad_tok, num_visual_tokens)?;
         let (mrope_positions, next_mrope_position) = qwen3vl_single_image_mrope_positions(
             &prompt_tokens,
             pad_tok,
@@ -1912,6 +1979,7 @@ impl FlashMoeEngine {
         let prefill_hidden = self.prefill_with_vision(
             &prompt_tokens,
             &visual.embeddings,
+            &visual.deepstack_features,
             pad_tok,
             &mrope_positions,
             &mut kv_cache,
@@ -1967,8 +2035,15 @@ impl FlashMoeEngine {
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        let hidden =
-            self.forward_hidden(previous, None, kv_cache, position, rope_position, true)?;
+        let hidden = self.forward_hidden(
+            previous,
+            None,
+            kv_cache,
+            position,
+            rope_position,
+            None,
+            true,
+        )?;
         self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)
     }
 
@@ -2005,6 +2080,7 @@ impl FlashMoeEngine {
         kv_cache: &mut KvCache,
         position: usize,
         rope_position: MropePosition,
+        deepstack: Option<DeepstackTokenContext<'_>>,
         record_generated: bool,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
@@ -2091,6 +2167,27 @@ impl FlashMoeEngine {
             }
             hidden = mlp_residual;
             add_in_place(&mut hidden, &moe);
+            if let Some(context) = deepstack {
+                if let Some(features_for_layer) = context.features.get(layer) {
+                    let feature =
+                        features_for_layer
+                            .get(context.visual_index)
+                            .with_context(|| {
+                                format!(
+                                    "deepstack layer {layer} has no feature for visual token {}",
+                                    context.visual_index
+                                )
+                            })?;
+                    if feature.len() != hidden.len() {
+                        bail!(
+                            "deepstack feature for layer {layer} has len {}; expected {}",
+                            feature.len(),
+                            hidden.len()
+                        );
+                    }
+                    add_in_place(&mut hidden, feature);
+                }
+            }
             kv_cache.record_layer_state(position, layer, state)?;
         }
 
@@ -7675,21 +7772,35 @@ impl ImagePreprocessor {
     /// Returns `(target_h, target_w)`.
     pub fn smart_resize(&self, orig_h: u32, orig_w: u32) -> (u32, u32) {
         let stride = self.token_stride() as u32;
-        // Round each dimension up to the nearest multiple of stride.
-        let h = ((orig_h.max(stride) + stride - 1) / stride) * stride;
-        let w = ((orig_w.max(stride) + stride - 1) / stride) * stride;
+        let mut h = round_up_to_stride(orig_h.max(stride), stride);
+        let mut w = round_up_to_stride(orig_w.max(stride), stride);
         let pixels = (h as usize) * (w as usize);
-        if pixels <= self.max_pixels {
-            return (h, w);
+        if pixels > self.max_pixels {
+            let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
+        } else if pixels < self.min_pixels {
+            let scale = ((self.min_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
         }
-        // Scale down while preserving aspect ratio.
-        let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
-        let stride_f = stride as f64;
-        let scaled_h = ((orig_h as f64) * scale / stride_f).max(1.0).round() as u32;
-        let scaled_w = ((orig_w as f64) * scale / stride_f).max(1.0).round() as u32;
-        let h2 = scaled_h.max(1) * stride;
-        let w2 = scaled_w.max(1) * stride;
-        (h2.max(stride), w2.max(stride))
+        while (h as usize) * (w as usize) > self.max_pixels && (h > stride || w > stride) {
+            if h >= w && h > stride {
+                h -= stride;
+            } else if w > stride {
+                w -= stride;
+            } else {
+                break;
+            }
+        }
+        while (h as usize) * (w as usize) < self.min_pixels {
+            if h <= w {
+                h = h.saturating_add(stride);
+            } else {
+                w = w.saturating_add(stride);
+            }
+        }
+        (h.max(stride), w.max(stride))
     }
 
     /// Preprocess the image at `path`:
@@ -7767,6 +7878,15 @@ impl ImagePreprocessor {
         }
         Ok((grid_h, grid_w, patches))
     }
+}
+
+fn round_up_to_stride(value: u32, stride: u32) -> u32 {
+    ((value + stride - 1) / stride) * stride
+}
+
+fn round_to_stride(value: f64, stride: u32) -> u32 {
+    let stride_f = stride as f64;
+    ((value / stride_f).max(1.0).round() as u32).max(1) * stride
 }
 
 // ── Vision encoder (ViT) ──────────────────────────────────────────────────────
@@ -7860,6 +7980,7 @@ pub struct VisionEncoder {
 #[derive(Debug, Clone)]
 pub struct VisionEncoding {
     pub embeddings: Vec<Vec<f32>>,
+    pub deepstack_features: Vec<Vec<Vec<f32>>>,
     pub merged_grid_h: usize,
     pub merged_grid_w: usize,
 }
@@ -7913,15 +8034,31 @@ impl VisionEncoder {
             .collect::<Result<_>>()?;
         self.add_vision_pos_embeds(&mut hidden, grid_h, grid_w)?;
 
-        // 3. Transformer blocks
+        // 3. Transformer blocks, retaining configured DeepStack features.
+        let mut deepstack_features = Vec::new();
         for layer in 0..self.config.depth {
             self.vit_block(layer, &mut hidden, grid_h, grid_w)?;
+            if let Some(merger_idx) = self
+                .config
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&idx| idx == layer)
+            {
+                deepstack_features.push(self.merge_visual_tokens_with_prefix(
+                    &format!("visual.deepstack_merger_list.{merger_idx}"),
+                    true,
+                    &hidden,
+                    grid_h,
+                    grid_w,
+                )?);
+            }
         }
 
         // 4. Merge 2×2 patch groups into language-model visual tokens
         let embeddings = self.merge_visual_tokens(&hidden, grid_h, grid_w)?;
         Ok(VisionEncoding {
             embeddings,
+            deepstack_features,
             merged_grid_h: grid_h / self.config.merge_size,
             merged_grid_w: grid_w / self.config.merge_size,
         })
@@ -8232,46 +8369,80 @@ impl VisionEncoder {
         grid_h: usize,
         grid_w: usize,
     ) -> Result<Vec<Vec<f32>>> {
+        self.merge_visual_tokens_with_prefix("visual.merger", false, hidden, grid_h, grid_w)
+    }
+
+    fn merge_visual_tokens_with_prefix(
+        &self,
+        prefix: &str,
+        use_postshuffle_norm: bool,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
         let embed_dim = self.config.embed_dim;
         let m = self.config.merge_size;
         let merged_h = grid_h / m;
         let merged_w = grid_w / m;
         let group_size = m * m;
         let concat_dim = group_size * embed_dim;
-        let out_dim = self.text_hidden_size;
+        let out_dim = self.config.out_hidden_size.unwrap_or(self.text_hidden_size);
 
-        let ln_w = format!("visual.merger.ln_q.weight");
-        let ln_b = format!("visual.merger.ln_q.bias");
-        let mlp0_w = format!("visual.merger.mlp.0.weight");
-        let mlp0_b = format!("visual.merger.mlp.0.bias");
-        let mlp2_w = format!("visual.merger.mlp.2.weight");
-        let mlp2_b = format!("visual.merger.mlp.2.bias");
+        let qwen3_norm_w = format!("{prefix}.norm.weight");
+        let has_qwen3_names = self.dense.registry().tensor(&qwen3_norm_w).is_some();
+        let (norm_w, norm_b, fc1_w, fc1_b, fc2_w, fc2_b) = if has_qwen3_names {
+            (
+                qwen3_norm_w,
+                format!("{prefix}.norm.bias"),
+                format!("{prefix}.linear_fc1.weight"),
+                format!("{prefix}.linear_fc1.bias"),
+                format!("{prefix}.linear_fc2.weight"),
+                format!("{prefix}.linear_fc2.bias"),
+            )
+        } else {
+            (
+                format!("{prefix}.ln_q.weight"),
+                format!("{prefix}.ln_q.bias"),
+                format!("{prefix}.mlp.0.weight"),
+                format!("{prefix}.mlp.0.bias"),
+                format!("{prefix}.mlp.2.weight"),
+                format!("{prefix}.mlp.2.bias"),
+            )
+        };
 
         let mut merged_tokens = Vec::with_capacity(merged_h * merged_w);
 
         for group_idx in 0..merged_h * merged_w {
             // Patches are already block-major, so each merge group is contiguous.
             let mut concat = Vec::with_capacity(concat_dim);
-            for offset in 0..group_size {
-                let patch_idx = group_idx * group_size + offset;
-                let normed = self.layer_norm_named(&hidden[patch_idx], &ln_w, &ln_b)?;
-                concat.extend_from_slice(&normed);
+            if use_postshuffle_norm {
+                for offset in 0..group_size {
+                    let patch_idx = group_idx * group_size + offset;
+                    concat.extend_from_slice(&hidden[patch_idx]);
+                }
+                concat = self.layer_norm_named(&concat, &norm_w, &norm_b)?;
+            } else {
+                for offset in 0..group_size {
+                    let patch_idx = group_idx * group_size + offset;
+                    let normed = self.layer_norm_named(&hidden[patch_idx], &norm_w, &norm_b)?;
+                    concat.extend_from_slice(&normed);
+                }
             }
 
             // MLP: fc1 + GeLU + fc2
             let mut mid = self
                 .dense
-                .matvec_tensor_prefix(&mlp0_w, &concat, concat_dim)?
-                .with_context(|| format!("vision: required tensor '{mlp0_w}' is missing"))?;
-            mid = self.vit_add_bias(&mlp0_b, mid)?;
+                .matvec_tensor_prefix(&fc1_w, &concat, concat_dim)?
+                .with_context(|| format!("vision: required tensor '{fc1_w}' is missing"))?;
+            mid = self.vit_add_bias(&fc1_b, mid)?;
             for v in mid.iter_mut() {
                 *v = gelu_approx(*v);
             }
             let out = self
                 .dense
-                .matvec_tensor_prefix(&mlp2_w, &mid, out_dim)?
-                .with_context(|| format!("vision: required tensor '{mlp2_w}' is missing"))?;
-            let out = self.vit_add_bias(&mlp2_b, out)?;
+                .matvec_tensor_prefix(&fc2_w, &mid, out_dim)?
+                .with_context(|| format!("vision: required tensor '{fc2_w}' is missing"))?;
+            let out = self.vit_add_bias(&fc2_b, out)?;
             merged_tokens.push(out);
         }
         Ok(merged_tokens)
@@ -9284,6 +9455,7 @@ mod tests {
             "tie_word_embeddings": false,
             "vision_config": {
                 "depth": 27,
+                "deepstack_visual_indexes": [5, 11, 17],
                 "hidden_size": 1152,
                 "in_channels": 3,
                 "intermediate_size": 4304,
@@ -9317,6 +9489,8 @@ mod tests {
         assert_eq!(vision.merge_size, 2);
         assert_eq!(vision.temporal_patch_size, 2);
         assert_eq!(vision.in_chans, 3);
+        assert_eq!(vision.deepstack_visual_indexes, vec![5, 11, 17]);
+        assert_eq!(vision.out_hidden_size, Some(4096));
         assert_eq!(vision.patch_flat_dim(), 3 * 2 * 16 * 16);
         assert_eq!(vision.mlp_hidden_size(), 4304);
 
@@ -9350,6 +9524,57 @@ mod tests {
         assert_eq!(config.mrope_section, Some(DEFAULT_MROPE_SECTION));
         assert_eq!(config.text_mrope_section(), Some(DEFAULT_MROPE_SECTION));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen3vl_config_rejects_out_of_range_deepstack_index() {
+        let json = br#"{
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 128,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 1024
+            },
+            "vision_config": {
+                "depth": 2,
+                "hidden_size": 64,
+                "num_heads": 4,
+                "deepstack_visual_indexes": [0, 2]
+            }
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("deepstack_visual_indexes"),
+            "expected deepstack bounds error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_single_image_placeholder_is_expanded_in_place() {
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 9, 2], 9, 4).unwrap(),
+            vec![1, 9, 9, 9, 9, 2]
+        );
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 9, 9, 2], 9, 2).unwrap(),
+            vec![1, 9, 9, 2]
+        );
+        assert!(expand_single_image_placeholders(vec![1, 2], 9, 2).is_err());
+    }
+
+    #[test]
+    fn qwen3vl_smart_resize_obeys_pixel_budget_after_rounding() {
+        let preprocessor = ImagePreprocessor::default_qwen3_vl();
+        let (h, w) = preprocessor.smart_resize(10_000, 10_000);
+        assert_eq!(h % VIT_SPATIAL_MERGE_SIZE as u32, 0);
+        assert_eq!(w % VIT_SPATIAL_MERGE_SIZE as u32, 0);
+        assert!((h as usize) * (w as usize) <= preprocessor.max_pixels);
+
+        let (small_h, small_w) = preprocessor.smart_resize(1, 1);
+        assert!((small_h as usize) * (small_w as usize) >= preprocessor.min_pixels);
     }
 
     #[test]
