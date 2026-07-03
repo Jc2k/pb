@@ -3566,8 +3566,9 @@ impl TensorRegistry {
     fn from_manifest(manifest: &FlashMoeManifest) -> Self {
         let mut tensors = BTreeMap::new();
         for tensor in &manifest.dense_tensors {
-            tensors.insert(
-                tensor.tensor.clone(),
+            insert_tensor_entry_with_aliases(
+                &mut tensors,
+                &tensor.tensor,
                 RuntimeTensorEntry {
                     name: tensor.tensor.clone(),
                     dtype: tensor.dtype.clone(),
@@ -3581,8 +3582,9 @@ impl TensorRegistry {
         }
         for tensor in &manifest.expert_tensors {
             if let Some([start, end]) = tensor.source_offsets {
-                tensors.insert(
-                    tensor.tensor.clone(),
+                insert_tensor_entry_with_aliases(
+                    &mut tensors,
+                    &tensor.tensor,
                     RuntimeTensorEntry {
                         name: tensor.tensor.clone(),
                         dtype: tensor
@@ -3619,6 +3621,20 @@ impl TensorRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
+    }
+}
+
+fn insert_tensor_entry_with_aliases(
+    tensors: &mut BTreeMap<String, RuntimeTensorEntry>,
+    name: &str,
+    entry: RuntimeTensorEntry,
+) {
+    tensors
+        .entry(name.to_string())
+        .or_insert_with(|| entry.clone());
+    let canonical_name = canonical_hf_tensor_name(name);
+    if canonical_name != name {
+        tensors.entry(canonical_name).or_insert(entry);
     }
 }
 
@@ -3694,10 +3710,11 @@ fn validate_required_tensor_manifest(
                 &linear_attention_tensor_name(layer, "norm"),
                 &[LINEAR_VALUE_DIM],
             )?;
-            require_tensor_shape(
+            require_conv1d_tensor_shape(
                 registry,
                 &linear_attention_tensor_name(layer, "conv1d"),
-                &[LINEAR_CONV_DIM, CONV_KERNEL_SIZE],
+                LINEAR_CONV_DIM,
+                CONV_KERNEL_SIZE,
             )?;
         }
         require_tensor_shape(
@@ -3749,6 +3766,37 @@ fn require_tensor_shape(
         );
     }
     Ok(())
+}
+
+fn require_conv1d_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+    channels: usize,
+    kernel_size: usize,
+) -> Result<()> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [actual_channels, actual_kernel]
+            if *actual_channels == channels && *actual_kernel == kernel_size =>
+        {
+            Ok(())
+        }
+        [actual_channels, 1, actual_kernel]
+            if *actual_channels == channels && *actual_kernel == kernel_size =>
+        {
+            Ok(())
+        }
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected [{channels}, {kernel_size}] or [{channels}, 1, {kernel_size}]",
+            shape
+        ),
+    }
 }
 
 fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
@@ -5853,6 +5901,7 @@ fn build_manifest(
     let mut runtime_offset = 0u64;
     let mut visual_offset = 0u64;
     for (tensor, shard) in index.weight_map {
+        let canonical_tensor = canonical_hf_tensor_name(&tensor);
         let shard_path = snapshot_dir.join(&shard);
         if !shard_path.is_file() {
             bail!(
@@ -5867,10 +5916,10 @@ fn build_manifest(
         let tensor_info = shard_info.tensors.get(&tensor).with_context(|| {
             format!("tensor {tensor} listed in index but missing from safetensors header {shard}")
         })?;
-        if is_expert_tensor_name(&tensor) {
-            let (layer, expert) = parse_layer_expert(&tensor);
+        if is_expert_tensor_name(&canonical_tensor) {
+            let (layer, expert) = parse_layer_expert(&canonical_tensor);
             expert_tensors.push(ExpertTensorRef {
-                tensor,
+                tensor: canonical_tensor,
                 shard,
                 layer,
                 expert,
@@ -5878,14 +5927,14 @@ fn build_manifest(
                 shape: tensor_info.shape.clone(),
                 source_offsets: Some(tensor_info.data_offsets),
             });
-        } else if tensor.starts_with("visual.") {
+        } else if canonical_tensor.starts_with("visual.") {
             // Vision encoder tensors go into a separate store.
             let byte_len = tensor_info.data_offsets[1]
                 .checked_sub(tensor_info.data_offsets[0])
                 .with_context(|| format!("invalid data_offsets for visual tensor {tensor}"))?;
             visual_offset = align_to(visual_offset, TENSOR_ALIGNMENT);
             visual_tensor_refs.push(DenseTensorRef {
-                tensor,
+                tensor: canonical_tensor,
                 shard,
                 dtype: tensor_info.dtype.clone(),
                 shape: tensor_info.shape.clone(),
@@ -5901,7 +5950,7 @@ fn build_manifest(
                 .with_context(|| format!("invalid data_offsets for tensor {tensor}"))?;
             runtime_offset = align_to(runtime_offset, TENSOR_ALIGNMENT);
             dense_tensor_refs.push(DenseTensorRef {
-                tensor,
+                tensor: canonical_tensor,
                 shard,
                 dtype: tensor_info.dtype.clone(),
                 shape: tensor_info.shape.clone(),
@@ -5922,6 +5971,16 @@ fn build_manifest(
         },
         visual_tensor_refs,
     ))
+}
+
+fn canonical_hf_tensor_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("model.language_model.") {
+        format!("model.{rest}")
+    } else if let Some(rest) = name.strip_prefix("model.visual.") {
+        format!("visual.{rest}")
+    } else {
+        name.to_string()
+    }
 }
 
 const TENSOR_ALIGNMENT: u64 = 4096;
@@ -7563,6 +7622,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_hf_conv1d_singleton_axis_shape() {
+        let tensor_name = linear_attention_tensor_name(0, "conv1d");
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["hybrid.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.clone(),
+                shard: "hybrid.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![LINEAR_CONV_DIM, 1, CONV_KERNEL_SIZE],
+                source_offsets: [0, 0],
+                runtime_offset: 0,
+                byte_len: 0,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        require_conv1d_tensor_shape(&registry, &tensor_name, LINEAR_CONV_DIM, CONV_KERNEL_SIZE)
+            .expect("HF conv1d [channels, 1, kernel] shape should validate");
+    }
+
+    #[test]
     fn validate_accepts_tied_lm_head() {
         // lm_head.weight absent → tied embeddings; validator should pass.
         let (config, manifest) = minimal_dense_manifest(false);
@@ -7610,6 +7693,50 @@ mod tests {
         let registry = TensorRegistry::from_manifest(&manifest);
         validate_required_tensor_manifest(&config, &registry)
             .expect("registry without expert tensors should still pass dense validation");
+    }
+
+    #[test]
+    fn tensor_registry_aliases_qwen35_language_model_prefix() {
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "model.language_model.embed_tokens.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![248320, 4096],
+                source_offsets: [0, 0],
+                runtime_offset: 0,
+                byte_len: 0,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        assert!(
+            registry
+                .tensor("model.language_model.embed_tokens.weight")
+                .is_some()
+        );
+        assert!(registry.tensor("model.embed_tokens.weight").is_some());
+    }
+
+    #[test]
+    fn qwen35_hf_tensor_names_are_canonicalized_for_runtime() {
+        assert_eq!(
+            canonical_hf_tensor_name("model.language_model.embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("model.language_model.layers.7.self_attn.q_proj.weight"),
+            "model.layers.7.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("model.visual.patch_embed.proj.weight"),
+            "visual.patch_embed.proj.weight"
+        );
+        assert_eq!(canonical_hf_tensor_name("lm_head.weight"), "lm_head.weight");
     }
 
     #[test]

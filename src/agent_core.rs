@@ -805,7 +805,7 @@ pub fn run_agent<S: EventSink>(
             Err(error) => {
                 let diagnostics = flash_moe_cache_diagnostics(plan);
                 let message = format!(
-                    "Flash-MoE setup failed for {}: {error}\n\n{diagnostics}",
+                    "Flash-MoE setup failed for {}: {error:#}\n\n{diagnostics}",
                     plan.model
                 );
                 tracing::error!(
