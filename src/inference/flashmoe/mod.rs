@@ -915,37 +915,53 @@ fn qwen3vl_single_image_mrope_positions(
 
 fn expand_single_image_placeholders(
     prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
     image_pad_token: u32,
     expected_image_tokens: usize,
 ) -> Result<Vec<u32>> {
-    let image_pad_count = prompt_tokens
-        .iter()
-        .filter(|&&token| token == image_pad_token)
-        .count();
-    if image_pad_count == expected_image_tokens {
-        let image_runs = count_token_runs(&prompt_tokens, image_pad_token);
-        if image_runs > 1 {
-            bail!(
-                "single-image prompt contains {image_runs} separate image placeholder runs; use one contiguous <|image_pad|> span per image"
-            );
-        }
-        return Ok(prompt_tokens);
+    let image_runs = count_token_runs(&prompt_tokens, image_pad_token);
+    if image_runs == 0 {
+        bail!(
+            "prompt contains no image placeholders but the encoded image produced {expected_image_tokens} visual tokens"
+        );
     }
-    if image_pad_count == 1 {
-        let mut expanded =
-            Vec::with_capacity(prompt_tokens.len() + expected_image_tokens.saturating_sub(1));
-        for token in prompt_tokens {
-            if token == image_pad_token {
-                expanded.extend(std::iter::repeat(image_pad_token).take(expected_image_tokens));
-            } else {
-                expanded.push(token);
-            }
-        }
-        return Ok(expanded);
+    if image_runs > 1 {
+        bail!(
+            "single-image prompt contains {image_runs} separate image placeholder runs; use one contiguous <|image_pad|> span per image"
+        );
     }
-    bail!(
-        "prompt contains {image_pad_count} image placeholders but the encoded image produced {expected_image_tokens} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token"
+    let Some((run_start, run_end, image_pad_count)) =
+        single_token_run_bounds(&prompt_tokens, image_pad_token)
+    else {
+        bail!("failed to locate image placeholder run");
+    };
+    if image_pad_count != 1 && image_pad_count != expected_image_tokens {
+        bail!(
+            "prompt contains {image_pad_count} image placeholders but the encoded image produced {expected_image_tokens} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token"
+        );
+    }
+    let has_start = run_start > 0 && prompt_tokens[run_start - 1] == vision_start_token;
+    let has_end = run_end < prompt_tokens.len() && prompt_tokens[run_end] == vision_end_token;
+    if has_start != has_end {
+        bail!("image placeholders must be wrapped by both <|vision_start|> and <|vision_end|>");
+    }
+
+    let mut expanded = Vec::with_capacity(
+        prompt_tokens.len()
+            + expected_image_tokens.saturating_sub(image_pad_count)
+            + if has_start { 0 } else { 2 },
     );
+    expanded.extend_from_slice(&prompt_tokens[..run_start]);
+    if !has_start {
+        expanded.push(vision_start_token);
+    }
+    expanded.extend(std::iter::repeat(image_pad_token).take(expected_image_tokens));
+    if !has_end {
+        expanded.push(vision_end_token);
+    }
+    expanded.extend_from_slice(&prompt_tokens[run_end..]);
+    Ok(expanded)
 }
 
 fn count_token_runs(tokens: &[u32], needle: u32) -> usize {
@@ -962,6 +978,31 @@ fn count_token_runs(tokens: &[u32], needle: u32) -> usize {
         }
     }
     runs
+}
+
+fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize, usize)> {
+    let mut start = None;
+    let mut end = None;
+    let mut count = 0usize;
+    let mut in_run = false;
+    let mut runs = 0usize;
+    for (idx, &token) in tokens.iter().enumerate() {
+        if token == needle {
+            count += 1;
+            if !in_run {
+                runs += 1;
+                if runs > 1 {
+                    return None;
+                }
+                start = Some(idx);
+                in_run = true;
+            }
+            end = Some(idx + 1);
+        } else {
+            in_run = false;
+        }
+    }
+    Some((start?, end?, count))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1970,8 +2011,8 @@ impl FlashMoeEngine {
         let vision_end = self.tokenizer.token_id("<|vision_end|>");
         let image_pad = self.tokenizer.token_id("<|image_pad|>");
 
-        let pad_tok = match (vision_start, vision_end, image_pad) {
-            (Some(_), Some(_), Some(pad)) => pad,
+        let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
+            (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
             _ => bail!(
                 "Qwen3-VL tokenizer is missing required vision special tokens \
                  (<|vision_start|>, <|vision_end|>, <|image_pad|>); \
@@ -1990,8 +2031,13 @@ impl FlashMoeEngine {
         };
         let chat_text = self.tokenizer.apply_chat_template(&prompt_for_template);
         let mut prompt_tokens = self.tokenizer.encode(&chat_text)?;
-        prompt_tokens =
-            expand_single_image_placeholders(prompt_tokens, pad_tok, num_visual_tokens)?;
+        prompt_tokens = expand_single_image_placeholders(
+            prompt_tokens,
+            vs_tok,
+            ve_tok,
+            pad_tok,
+            num_visual_tokens,
+        )?;
         let (mrope_positions, next_mrope_position) = qwen3vl_single_image_mrope_positions(
             &prompt_tokens,
             pad_tok,
@@ -9583,15 +9629,20 @@ mod tests {
     #[test]
     fn qwen3vl_single_image_placeholder_is_expanded_in_place() {
         assert_eq!(
-            expand_single_image_placeholders(vec![1, 9, 2], 9, 4).unwrap(),
-            vec![1, 9, 9, 9, 9, 2]
+            expand_single_image_placeholders(vec![1, 9, 2], 7, 8, 9, 4).unwrap(),
+            vec![1, 7, 9, 9, 9, 9, 8, 2]
         );
         assert_eq!(
-            expand_single_image_placeholders(vec![1, 9, 9, 2], 9, 2).unwrap(),
-            vec![1, 9, 9, 2]
+            expand_single_image_placeholders(vec![1, 7, 9, 9, 8, 2], 7, 8, 9, 2).unwrap(),
+            vec![1, 7, 9, 9, 8, 2]
         );
-        assert!(expand_single_image_placeholders(vec![1, 2], 9, 2).is_err());
-        assert!(expand_single_image_placeholders(vec![1, 9, 2, 9], 9, 2).is_err());
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 9, 9, 2], 7, 8, 9, 2).unwrap(),
+            vec![1, 7, 9, 9, 8, 2]
+        );
+        assert!(expand_single_image_placeholders(vec![1, 2], 7, 8, 9, 2).is_err());
+        assert!(expand_single_image_placeholders(vec![1, 9, 2, 9], 7, 8, 9, 2).is_err());
+        assert!(expand_single_image_placeholders(vec![1, 7, 9, 2], 7, 8, 9, 2).is_err());
         assert!(qwen3vl_single_image_mrope_positions(&[1, 9, 2, 9], 9, 1, 2).is_err());
     }
 
