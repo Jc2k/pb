@@ -262,6 +262,13 @@ pub struct Qwen3VLVisionConfig {
     #[serde(alias = "spatial_merge_size")]
     #[serde(default = "default_vit_merge_size")]
     pub merge_size: usize,
+    /// Temporal frames folded into each Conv3d patch (2 for Qwen3-VL images,
+    /// where the still image is duplicated across the temporal window).
+    #[serde(default = "default_vit_temporal_patch_size")]
+    pub temporal_patch_size: usize,
+    /// Size of the learned square absolute-position table used by the ViT.
+    #[serde(default)]
+    pub num_position_embeddings: Option<usize>,
     /// Input channels (defaults to 3 for RGB).
     #[serde(alias = "in_channels")]
     #[serde(default = "default_vit_in_chans")]
@@ -453,6 +460,9 @@ fn default_vit_patch_size() -> usize {
 fn default_vit_merge_size() -> usize {
     VIT_MERGE_SIZE
 }
+fn default_vit_temporal_patch_size() -> usize {
+    2
+}
 fn default_vit_in_chans() -> usize {
     3
 }
@@ -470,7 +480,7 @@ impl Qwen3VLVisionConfig {
 
     /// Flattened input dimension for the patch-embedding linear layer.
     pub fn patch_flat_dim(&self) -> usize {
-        self.in_chans * self.patch_size * self.patch_size
+        self.in_chans * self.temporal_patch_size * self.patch_size * self.patch_size
     }
 
     /// Intermediate size of each ViT MLP layer.
@@ -551,6 +561,25 @@ impl QwenModelConfig {
         if let Some(section) = self.mrope_section {
             if section.contains(&0) {
                 bail!("mrope_section entries must be positive, got {section:?}");
+            }
+        }
+        if let Some(vision) = &self.vision_config {
+            if vision.depth == 0
+                || vision.embed_dim == 0
+                || vision.num_heads == 0
+                || vision.patch_size == 0
+                || vision.merge_size == 0
+                || vision.temporal_patch_size == 0
+                || vision.in_chans == 0
+            {
+                bail!("Qwen3-VL vision_config contains zero-valued required dimensions");
+            }
+            if vision.embed_dim % vision.num_heads != 0 {
+                bail!(
+                    "vision hidden_size {} is not divisible by num_heads {}",
+                    vision.embed_dim,
+                    vision.num_heads
+                );
             }
         }
         if let Some(dtype) = &self.torch_dtype {
@@ -1719,13 +1748,23 @@ impl FlashMoeEngine {
             self.config.num_hidden_layers,
             prompt_tokens.len() + request.max_tokens.max(0) as usize,
         );
-        self.prefill(&prompt_tokens, &mut kv_cache)?;
+        let prefill_hidden = self.prefill(&prompt_tokens, &mut kv_cache)?;
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
-        for position in
-            prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
-        {
+        let max_tokens = request.max_tokens.max(0) as usize;
+        let mut stopped = false;
+        if max_tokens > 0 {
+            let token =
+                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            if !self.tokenizer.is_eos(token) {
+                generated.push(token);
+            } else {
+                stopped = true;
+            }
+        }
+        while !stopped && generated.len() < max_tokens {
+            let position = prompt_tokens.len() + generated.len() - 1;
             let token = self.sample_next_token(
                 &mut sampler,
                 &prompt_tokens,
@@ -1746,22 +1785,23 @@ impl FlashMoeEngine {
         })
     }
 
-    fn prefill(&mut self, prompt_tokens: &[u32], kv_cache: &mut KvCache) -> Result<()> {
+    fn prefill(&mut self, prompt_tokens: &[u32], kv_cache: &mut KvCache) -> Result<Vec<f32>> {
+        let mut last_hidden = None;
         for (position, token) in prompt_tokens.iter().copied().enumerate() {
             kv_cache.record_prompt_token(position, token)?;
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
-            let _ = self.forward_hidden(
+            last_hidden = Some(self.forward_hidden(
                 token,
                 None,
                 kv_cache,
                 position,
                 MropePosition::text(position),
                 false,
-            )?;
+            )?);
         }
-        Ok(())
+        last_hidden.context("cannot generate from an empty prompt")
     }
 
     /// Prefill the KV cache for a vision prompt, substituting visual embeddings
@@ -1773,7 +1813,7 @@ impl FlashMoeEngine {
         image_pad_token: u32,
         mrope_positions: &[MropePosition],
         kv_cache: &mut KvCache,
-    ) -> Result<()> {
+    ) -> Result<Vec<f32>> {
         if mrope_positions.len() != prompt_tokens.len() {
             bail!(
                 "vision M-RoPE positions length {} does not match prompt length {}",
@@ -1782,6 +1822,7 @@ impl FlashMoeEngine {
             );
         }
         let mut vis_idx = 0usize;
+        let mut last_hidden = None;
         for (position, &token) in prompt_tokens.iter().enumerate() {
             kv_cache.record_prompt_token(position, token)?;
             let override_emb = if token == image_pad_token && vis_idx < visual_embeddings.len() {
@@ -1791,14 +1832,14 @@ impl FlashMoeEngine {
             } else {
                 None
             };
-            let _ = self.forward_hidden(
+            last_hidden = Some(self.forward_hidden(
                 token,
                 override_emb,
                 kv_cache,
                 position,
                 mrope_positions[position],
                 false,
-            )?;
+            )?);
         }
         if vis_idx != visual_embeddings.len() {
             bail!(
@@ -1806,7 +1847,7 @@ impl FlashMoeEngine {
                 visual_embeddings.len()
             );
         }
-        Ok(())
+        last_hidden.context("cannot generate from an empty vision prompt")
     }
 
     /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
@@ -1868,7 +1909,7 @@ impl FlashMoeEngine {
             self.config.num_hidden_layers,
             prompt_tokens.len() + request.max_tokens.max(0) as usize,
         );
-        self.prefill_with_vision(
+        let prefill_hidden = self.prefill_with_vision(
             &prompt_tokens,
             &visual.embeddings,
             pad_tok,
@@ -1879,16 +1920,26 @@ impl FlashMoeEngine {
         // ── 4. Decode ─────────────────────────────────────────────────────────
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
-        for position in
-            prompt_tokens.len()..prompt_tokens.len() + request.max_tokens.max(0) as usize
-        {
+        let max_tokens = request.max_tokens.max(0) as usize;
+        let mut stopped = false;
+        if max_tokens > 0 {
+            let token =
+                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            if !self.tokenizer.is_eos(token) {
+                generated.push(token);
+            } else {
+                stopped = true;
+            }
+        }
+        while !stopped && generated.len() < max_tokens {
+            let position = prompt_tokens.len() + generated.len() - 1;
             let token = self.sample_next_token(
                 &mut sampler,
                 &prompt_tokens,
                 &generated,
                 &mut kv_cache,
                 position,
-                MropePosition::text(next_mrope_position + generated.len()),
+                MropePosition::text(next_mrope_position + generated.len() - 1),
             )?;
             if self.tokenizer.is_eos(token) {
                 break;
@@ -1918,9 +1969,19 @@ impl FlashMoeEngine {
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
         let hidden =
             self.forward_hidden(previous, None, kv_cache, position, rope_position, true)?;
+        self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)
+    }
+
+    fn sample_from_hidden(
+        &self,
+        sampler: &mut TokenSampler,
+        hidden: &[f32],
+        prompt_tokens: &[u32],
+        generated: &[u32],
+    ) -> Result<u32> {
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
             self.metal.as_ref(),
-            &hidden,
+            hidden,
             &self.tokenizer,
             sampler,
             prompt_tokens,
@@ -1931,7 +1992,7 @@ impl FlashMoeEngine {
         let logits = self.dense.lm_head_logits_with_metal(
             self.metal.as_ref(),
             0,
-            &hidden,
+            hidden,
             &self.tokenizer,
         )?;
         sampler.sample(&logits, prompt_tokens, generated)
@@ -7567,6 +7628,7 @@ pub fn is_flashmoe_hf_model(model: &str) -> bool {
 pub struct ImagePreprocessor {
     pub patch_size: usize,
     pub merge_size: usize,
+    pub temporal_patch_size: usize,
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
     pub max_pixels: usize,
@@ -7579,6 +7641,7 @@ impl ImagePreprocessor {
         Self {
             patch_size: config.patch_size,
             merge_size: config.merge_size,
+            temporal_patch_size: config.temporal_patch_size,
             image_mean: VIT_IMAGE_MEAN,
             image_std: VIT_IMAGE_STD,
             max_pixels: VIT_MAX_PIXELS,
@@ -7591,6 +7654,7 @@ impl ImagePreprocessor {
         Self {
             patch_size: VIT_PATCH_SIZE,
             merge_size: VIT_MERGE_SIZE,
+            temporal_patch_size: default_vit_temporal_patch_size(),
             image_mean: VIT_IMAGE_MEAN,
             image_std: VIT_IMAGE_STD,
             max_pixels: VIT_MAX_PIXELS,
@@ -7664,27 +7728,39 @@ impl ImagePreprocessor {
         let grid_w = (target_w as usize) / self.patch_size;
         let num_patches = grid_h * grid_w;
         let patch_pixels = self.patch_size * self.patch_size;
-        // Layout: [num_patches, channels=3, patch_h, patch_w]
-        let mut patches = vec![0.0f32; num_patches * 3 * patch_pixels];
+        let patch_flat = 3 * self.temporal_patch_size * patch_pixels;
+        // Layout per patch: [channels=3, temporal_patch_size, patch_h, patch_w].
+        // Patches are ordered block-major so each spatial-merge group is contiguous.
+        let mut patches = vec![0.0f32; num_patches * patch_flat];
         let pixels = img.as_raw(); // interleaved RGBRGB...
 
-        for py in 0..grid_h {
-            for px in 0..grid_w {
-                let patch_idx = py * grid_w + px;
-                for c in 0..3usize {
-                    for ky in 0..self.patch_size {
-                        for kx in 0..self.patch_size {
-                            let src_y = py * self.patch_size + ky;
-                            let src_x = px * self.patch_size + kx;
-                            let pixel_idx = (src_y * target_w as usize + src_x) * 3 + c;
-                            let raw = pixels[pixel_idx] as f32 / 255.0;
-                            let normed = (raw - self.image_mean[c]) / self.image_std[c];
-                            let dst = patch_idx * 3 * patch_pixels
-                                + c * patch_pixels
-                                + ky * self.patch_size
-                                + kx;
-                            patches[dst] = normed;
+        let mut patch_idx = 0usize;
+        for block_y in 0..grid_h / self.merge_size {
+            for block_x in 0..grid_w / self.merge_size {
+                for dy in 0..self.merge_size {
+                    for dx in 0..self.merge_size {
+                        let py = block_y * self.merge_size + dy;
+                        let px = block_x * self.merge_size + dx;
+                        for c in 0..3usize {
+                            for temporal in 0..self.temporal_patch_size {
+                                for ky in 0..self.patch_size {
+                                    for kx in 0..self.patch_size {
+                                        let src_y = py * self.patch_size + ky;
+                                        let src_x = px * self.patch_size + kx;
+                                        let pixel_idx = (src_y * target_w as usize + src_x) * 3 + c;
+                                        let raw = pixels[pixel_idx] as f32 / 255.0;
+                                        let normed = (raw - self.image_mean[c]) / self.image_std[c];
+                                        let dst = patch_idx * patch_flat
+                                            + c * self.temporal_patch_size * patch_pixels
+                                            + temporal * patch_pixels
+                                            + ky * self.patch_size
+                                            + kx;
+                                        patches[dst] = normed;
+                                    }
+                                }
+                            }
                         }
+                        patch_idx += 1;
                     }
                 }
             }
@@ -7694,6 +7770,71 @@ impl ImagePreprocessor {
 }
 
 // ── Vision encoder (ViT) ──────────────────────────────────────────────────────
+
+fn block_major_patch_coords(
+    grid_h: usize,
+    grid_w: usize,
+    merge_size: usize,
+) -> Vec<(usize, usize)> {
+    if merge_size == 0 || grid_h == 0 || grid_w == 0 {
+        return Vec::new();
+    }
+    let mut coords = Vec::with_capacity(grid_h.saturating_mul(grid_w));
+    for block_y in 0..grid_h / merge_size {
+        for block_x in 0..grid_w / merge_size {
+            for dy in 0..merge_size {
+                for dx in 0..merge_size {
+                    coords.push((block_y * merge_size + dy, block_x * merge_size + dx));
+                }
+            }
+        }
+    }
+    coords
+}
+
+fn perfect_square_side(entries: usize) -> Option<usize> {
+    let side = (entries as f64).sqrt() as usize;
+    if side.saturating_mul(side) == entries {
+        Some(side)
+    } else if (side + 1).saturating_mul(side + 1) == entries {
+        Some(side + 1)
+    } else {
+        None
+    }
+}
+
+fn bilinear_position_corners(
+    row: usize,
+    col: usize,
+    grid_h: usize,
+    grid_w: usize,
+    side: usize,
+) -> [(usize, f32); 4] {
+    let side = side.max(1);
+    let h_pos = if grid_h > 1 {
+        row as f32 * (side - 1) as f32 / (grid_h - 1) as f32
+    } else {
+        0.0
+    };
+    let w_pos = if grid_w > 1 {
+        col as f32 * (side - 1) as f32 / (grid_w - 1) as f32
+    } else {
+        0.0
+    };
+    let h_floor = h_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let w_floor = w_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let h_ceil = (h_floor + 1).min(side - 1);
+    let w_ceil = (w_floor + 1).min(side - 1);
+    let h_frac = h_pos - h_floor as f32;
+    let w_frac = w_pos - w_floor as f32;
+
+    [
+        (h_floor * side + w_floor, (1.0 - h_frac) * (1.0 - w_frac)),
+        (h_floor * side + w_ceil, (1.0 - h_frac) * w_frac),
+        (h_ceil * side + w_floor, h_frac * (1.0 - w_frac)),
+        (h_ceil * side + w_ceil, h_frac * w_frac),
+    ]
+}
 
 /// Vision Transformer encoder for Qwen3-VL MoE.
 ///
@@ -7758,7 +7899,7 @@ impl VisionEncoder {
         preprocessor: &ImagePreprocessor,
         image_path: &Path,
     ) -> Result<VisionEncoding> {
-        // 1. Preprocess → patches [N, C, pH, pW]
+        // 1. Preprocess → patches [N, C, temporal, pH, pW]
         let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
         let num_patches = grid_h * grid_w;
         let patch_flat = self.config.patch_flat_dim();
@@ -7770,6 +7911,7 @@ impl VisionEncoder {
                 self.patch_embed(patch)
             })
             .collect::<Result<_>>()?;
+        self.add_vision_pos_embeds(&mut hidden, grid_h, grid_w)?;
 
         // 3. Transformer blocks
         for layer in 0..self.config.depth {
@@ -7791,13 +7933,100 @@ impl VisionEncoder {
     fn patch_embed(&self, patch: &[f32]) -> Result<Vec<f32>> {
         let name = "visual.patch_embed.proj.weight";
         let embed_dim = self.config.embed_dim;
-        let projected = self
+        let entry = self
             .dense
-            .matvec_tensor_prefix(name, patch, embed_dim)?
+            .registry()
+            .tensor(name)
             .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        if entry.shape.len() < 2 {
+            bail!(
+                "vision: {name} has shape {:?}; expected Conv3d weight",
+                entry.shape
+            );
+        }
+        let rows = entry.shape.first().copied().unwrap_or(0);
+        let cols = entry.shape[1..]
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .context("vision: patch embedding shape overflow")?;
+        if rows != embed_dim || cols != patch.len() {
+            bail!(
+                "vision: {name} shape {:?} is incompatible with embed_dim {embed_dim} and patch len {}",
+                entry.shape,
+                patch.len()
+            );
+        }
+        let weights = self
+            .dense
+            .read_full_tensor_f32(name)?
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        let mut projected = vec![0.0f32; embed_dim];
+        for row in 0..embed_dim {
+            let start = row * cols;
+            let end = start + cols;
+            projected[row] = weights[start..end]
+                .iter()
+                .zip(patch.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+        }
         // Add bias if present
         let with_bias = self.vit_add_bias("visual.patch_embed.proj.bias", projected)?;
         Ok(with_bias)
+    }
+
+    fn add_vision_pos_embeds(
+        &self,
+        hidden: &mut [Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
+        let pos_embed = self
+            .dense
+            .read_full_tensor_f32("visual.pos_embed.weight")?
+            .context("vision: required tensor 'visual.pos_embed.weight' is missing")?;
+        let embed_dim = self.config.embed_dim;
+        if embed_dim == 0 || pos_embed.len() % embed_dim != 0 {
+            bail!(
+                "vision: visual.pos_embed.weight has {} values; expected a multiple of embed_dim {embed_dim}",
+                pos_embed.len()
+            );
+        }
+        let entries = pos_embed.len() / embed_dim;
+        if entries == 0 {
+            bail!("vision: visual.pos_embed.weight has no position rows");
+        }
+        let side = perfect_square_side(entries).with_context(|| {
+            format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
+        })?;
+        if let Some(config_entries) = self.config.num_position_embeddings {
+            if config_entries != entries {
+                bail!(
+                    "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
+                );
+            }
+        }
+
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != hidden.len() {
+            bail!(
+                "vision: {} patch coordinates for {} hidden patches",
+                coords.len(),
+                hidden.len()
+            );
+        }
+        for (patch, (row, col)) in hidden.iter_mut().zip(coords.into_iter()) {
+            for (idx, weight) in bilinear_position_corners(row, col, grid_h, grid_w, side) {
+                let start = idx * embed_dim;
+                for (value, pos) in patch
+                    .iter_mut()
+                    .zip(pos_embed[start..start + embed_dim].iter())
+                {
+                    *value += weight * *pos;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run one ViT transformer block in-place.
@@ -7894,26 +8123,17 @@ impl VisionEncoder {
             v_all[t].copy_from_slice(&qkv[2 * embed_dim..]);
         }
 
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != num_tokens {
+            bail!(
+                "vision: {} rotary coordinates for {num_tokens} attention tokens",
+                coords.len()
+            );
+        }
         let theta = 10_000.0f64;
-        for token_idx in 0..num_tokens {
-            let row = if grid_w > 0 { token_idx / grid_w } else { 0 };
-            let col = if grid_w > 0 { token_idx % grid_w } else { 0 };
-            let merged_row = row / self.config.merge_size;
-            let merged_col = col / self.config.merge_size;
-            apply_vision_spatial_rotary(
-                &mut q_all[token_idx],
-                merged_row,
-                merged_col,
-                head_dim,
-                theta,
-            );
-            apply_vision_spatial_rotary(
-                &mut k_all[token_idx],
-                merged_row,
-                merged_col,
-                head_dim,
-                theta,
-            );
+        for (token_idx, (row, col)) in coords.into_iter().enumerate() {
+            apply_vision_spatial_rotary(&mut q_all[token_idx], row, col, head_dim, theta);
+            apply_vision_spatial_rotary(&mut k_all[token_idx], row, col, head_dim, theta);
         }
 
         // Multi-head attention: for each head, compute scores then weighted values
@@ -8004,9 +8224,8 @@ impl VisionEncoder {
 
     /// Merge 2×2 groups of patch embeddings into language-model visual tokens.
     ///
-    /// Layout assumption: the `hidden` slice contains patches in row-major
-    /// order for a `grid_h × grid_w` grid.  Patches are merged in
-    /// `merge_size × merge_size` groups.
+    /// Layout assumption: the `hidden` slice contains patches in block-major
+    /// order, with each `merge_size × merge_size` group contiguous.
     fn merge_visual_tokens(
         &self,
         hidden: &[Vec<f32>],
@@ -8030,36 +8249,30 @@ impl VisionEncoder {
 
         let mut merged_tokens = Vec::with_capacity(merged_h * merged_w);
 
-        for my in 0..merged_h {
-            for mx in 0..merged_w {
-                // Gather patches in this merge group
-                let mut concat = Vec::with_capacity(concat_dim);
-                for dy in 0..m {
-                    for dx in 0..m {
-                        let py = my * m + dy;
-                        let px = mx * m + dx;
-                        let patch_idx = py * grid_w + px;
-                        let normed = self.layer_norm_named(&hidden[patch_idx], &ln_w, &ln_b)?;
-                        concat.extend_from_slice(&normed);
-                    }
-                }
-
-                // MLP: fc1 + GeLU + fc2
-                let mut mid = self
-                    .dense
-                    .matvec_tensor_prefix(&mlp0_w, &concat, concat_dim)?
-                    .with_context(|| format!("vision: required tensor '{mlp0_w}' is missing"))?;
-                mid = self.vit_add_bias(&mlp0_b, mid)?;
-                for v in mid.iter_mut() {
-                    *v = gelu_approx(*v);
-                }
-                let out = self
-                    .dense
-                    .matvec_tensor_prefix(&mlp2_w, &mid, out_dim)?
-                    .with_context(|| format!("vision: required tensor '{mlp2_w}' is missing"))?;
-                let out = self.vit_add_bias(&mlp2_b, out)?;
-                merged_tokens.push(out);
+        for group_idx in 0..merged_h * merged_w {
+            // Patches are already block-major, so each merge group is contiguous.
+            let mut concat = Vec::with_capacity(concat_dim);
+            for offset in 0..group_size {
+                let patch_idx = group_idx * group_size + offset;
+                let normed = self.layer_norm_named(&hidden[patch_idx], &ln_w, &ln_b)?;
+                concat.extend_from_slice(&normed);
             }
+
+            // MLP: fc1 + GeLU + fc2
+            let mut mid = self
+                .dense
+                .matvec_tensor_prefix(&mlp0_w, &concat, concat_dim)?
+                .with_context(|| format!("vision: required tensor '{mlp0_w}' is missing"))?;
+            mid = self.vit_add_bias(&mlp0_b, mid)?;
+            for v in mid.iter_mut() {
+                *v = gelu_approx(*v);
+            }
+            let out = self
+                .dense
+                .matvec_tensor_prefix(&mlp2_w, &mid, out_dim)?
+                .with_context(|| format!("vision: required tensor '{mlp2_w}' is missing"))?;
+            let out = self.vit_add_bias(&mlp2_b, out)?;
+            merged_tokens.push(out);
         }
         Ok(merged_tokens)
     }
@@ -9102,7 +9315,9 @@ mod tests {
         assert_eq!(vision.num_heads, 16);
         assert_eq!(vision.patch_size, 16);
         assert_eq!(vision.merge_size, 2);
+        assert_eq!(vision.temporal_patch_size, 2);
         assert_eq!(vision.in_chans, 3);
+        assert_eq!(vision.patch_flat_dim(), 3 * 2 * 16 * 16);
         assert_eq!(vision.mlp_hidden_size(), 4304);
 
         config.validate().unwrap();
@@ -9135,6 +9350,31 @@ mod tests {
         assert_eq!(config.mrope_section, Some(DEFAULT_MROPE_SECTION));
         assert_eq!(config.text_mrope_section(), Some(DEFAULT_MROPE_SECTION));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen3vl_vision_patch_coords_are_block_major() {
+        assert_eq!(
+            block_major_patch_coords(4, 4, 2),
+            vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (0, 2),
+                (0, 3),
+                (1, 2),
+                (1, 3),
+                (2, 0),
+                (2, 1),
+                (3, 0),
+                (3, 1),
+                (2, 2),
+                (2, 3),
+                (3, 2),
+                (3, 3),
+            ]
+        );
     }
 
     #[test]
