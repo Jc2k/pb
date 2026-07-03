@@ -40,6 +40,7 @@ pub const CACHE_VERSION: &str = "flashmoe-v1";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
+const FLASHMOE_METAL_ROUTING_ENV: &str = "PB_FLASHMOE_METAL_ROUTING";
 pub const HIDDEN_DIM: usize = 4096;
 pub const GROUP_SIZE: usize = 64;
 pub const FULL_ATTN_INTERVAL: usize = 4;
@@ -80,6 +81,19 @@ pub const DEFAULT_MROPE_SECTION: [usize; 3] = [24, 20, 20];
 pub enum BackendSelection {
     FlashMoePreferred,
     LlamaCpp,
+}
+
+fn metal_route_top4_enabled() -> bool {
+    std::env::var_os(FLASHMOE_METAL_ROUTING_ENV)
+        .as_ref()
+        .is_some_and(env_flag_enabled)
+}
+
+fn env_flag_enabled(value: &OsString) -> bool {
+    matches!(
+        value.to_string_lossy().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "metal" | "top4"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +151,137 @@ pub struct GenerationRequest {
 pub struct GenerationOutput {
     pub content: String,
     pub generated_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimedGenerationOutput {
+    pub output: GenerationOutput,
+    pub timing: FlashMoeGenerationTiming,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeGenerationTiming {
+    pub model: String,
+    pub dimensions: FlashMoeModelDimensions,
+    pub tokens: Vec<FlashMoeTokenTiming>,
+    pub total_wall: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeModelDimensions {
+    pub layers: usize,
+    pub hidden_size: usize,
+    pub attention_heads: usize,
+    pub kv_heads: usize,
+    pub vocab_size: usize,
+    pub experts_per_layer: Option<usize>,
+    pub active_experts_per_token: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub shared_experts: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeTokenTiming {
+    pub token_index: usize,
+    pub position: usize,
+    pub phase: FlashMoeTokenPhase,
+    pub input_token: u32,
+    pub sampled_token: Option<u32>,
+    pub layers: Vec<FlashMoeLayerTiming>,
+    pub buckets: FlashMoeTimingBuckets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashMoeTokenPhase {
+    Prefill,
+    Decode,
+}
+
+impl FlashMoeTokenPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeLayerTiming {
+    pub layer: usize,
+    pub layer_kind: FlashMoeLayerKind,
+    pub active_experts: usize,
+    pub dimensions: FlashMoeLayerDimensions,
+    pub buckets: FlashMoeTimingBuckets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashMoeLayerKind {
+    FullAttention,
+    LinearAttention,
+    Unknown,
+}
+
+impl FlashMoeLayerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAttention => "full_attention",
+            Self::LinearAttention => "linear_attention",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeLayerDimensions {
+    pub hidden_size: usize,
+    pub q_width: Option<usize>,
+    pub kv_width: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub experts_per_layer: Option<usize>,
+    pub active_experts_per_token: Option<usize>,
+    pub shared_experts: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlashMoeTimingBuckets {
+    pub attention_projection: Duration,
+    pub routing: Duration,
+    pub expert_io: Duration,
+    pub expert_compute: Duration,
+    pub combine_norm: Duration,
+    pub sampling: Duration,
+    pub total_wall: Duration,
+}
+
+impl FlashMoeTimingBuckets {
+    fn add(&mut self, other: Self) {
+        self.attention_projection += other.attention_projection;
+        self.routing += other.routing;
+        self.expert_io += other.expert_io;
+        self.expert_compute += other.expert_compute;
+        self.combine_norm += other.combine_norm;
+        self.sampling += other.sampling;
+    }
+}
+
+impl FlashMoeTokenTiming {
+    fn new(
+        token_index: usize,
+        position: usize,
+        phase: FlashMoeTokenPhase,
+        input_token: u32,
+    ) -> Self {
+        Self {
+            token_index,
+            position,
+            phase,
+            input_token,
+            sampled_token: None,
+            layers: Vec::new(),
+            buckets: FlashMoeTimingBuckets::default(),
+        }
+    }
 }
 
 /// A generation request that includes an image for multimodal (Qwen3-VL) inference.
@@ -1016,6 +1161,7 @@ enum MropeAxis {
 struct MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     inner: Arc<MetalExecutorInner>,
+    route_top4_enabled: bool,
 }
 
 impl MetalExecutor {
@@ -1025,8 +1171,10 @@ impl MetalExecutor {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
+            let route_top4_enabled = metal_route_top4_enabled();
             return Ok(Some(Self {
-                inner: Arc::new(MetalExecutorInner::new(plan, config)?),
+                inner: Arc::new(MetalExecutorInner::new(plan, config, route_top4_enabled)?),
+                route_top4_enabled,
             }));
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1053,9 +1201,12 @@ impl MetalExecutor {
     }
 
     fn route_topk(&self, scores: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
+        if !self.route_top4_enabled || k != ACTIVE_EXPERTS_PER_TOKEN {
+            return Ok(top_k(scores, k));
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.route_topk(scores, k);
+            return self.inner.route_top4(scores);
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1189,7 +1340,7 @@ struct MetalExecutorInner {
     device: ObjcId,
     command_queue: ObjcId,
     q4_pipeline: ObjcId,
-    route_pipeline: ObjcId,
+    route_pipeline: Option<ObjcId>,
     dense_matvec_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
     rope_pipeline: ObjcId,
@@ -1226,7 +1377,9 @@ impl Drop for MetalExecutorInner {
     fn drop(&mut self) {
         unsafe {
             release(self.q4_pipeline);
-            release(self.route_pipeline);
+            if let Some(route_pipeline) = self.route_pipeline {
+                release(route_pipeline);
+            }
             release(self.dense_matvec_pipeline);
             release(self.rms_norm_pipeline);
             release(self.rope_pipeline);
@@ -1257,7 +1410,11 @@ impl Drop for MetalExecutorInner {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalExecutorInner {
-    fn new(plan: &FlashMoePlan, config: &QwenModelConfig) -> Result<Self> {
+    fn new(
+        plan: &FlashMoePlan,
+        config: &QwenModelConfig,
+        route_top4_enabled: bool,
+    ) -> Result<Self> {
         unsafe {
             let device = MTLCreateSystemDefaultDevice();
             if device.is_null() {
@@ -1280,7 +1437,11 @@ impl MetalExecutorInner {
             }
 
             let q4_pipeline = compile_pipeline(device, library, "q4_fma_matvec")?;
-            let route_pipeline = compile_pipeline(device, library, "route_top4")?;
+            let route_pipeline = if route_top4_enabled {
+                Some(compile_pipeline(device, library, "route_top4")?)
+            } else {
+                None
+            };
             let dense_matvec_pipeline = compile_pipeline(device, library, "dense_matvec")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
@@ -1298,7 +1459,9 @@ impl MetalExecutorInner {
             let command_queue = msg_send_id0(device, sel("newCommandQueue"));
             if command_queue.is_null() {
                 release(q4_pipeline);
-                release(route_pipeline);
+                if let Some(route_pipeline) = route_pipeline {
+                    release(route_pipeline);
+                }
                 release(dense_matvec_pipeline);
                 release(rms_norm_pipeline);
                 release(rope_pipeline);
@@ -1333,6 +1496,7 @@ impl MetalExecutorInner {
                 max_context,
                 kv_cache_mib = (metal_kv_cache_bytes(config.num_hidden_layers, max_context, runtime.kv_width) / (1024 * 1024)),
                 experts = config.experts(),
+                route_top4 = route_top4_enabled,
                 "Flash-MoE Metal executor initialized"
             );
 
@@ -1449,13 +1613,13 @@ impl MetalExecutorInner {
         }
     }
 
-    fn route_topk(&self, scores: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
-        if scores.is_empty() || k == 0 {
+    fn route_top4(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
+        if scores.is_empty() {
             return Ok(Vec::new());
         }
-        if k > ACTIVE_EXPERTS_PER_TOKEN {
-            return Ok(top_k(scores, k));
-        }
+        let route_pipeline = self
+            .route_pipeline
+            .context("Metal route_top4 requested but routing pipeline is disabled")?;
         unsafe {
             let scores_buffer = self.buffer_with_bytes(f32_as_bytes(scores))?;
             let indices_buffer = self.buffer_with_len(4 * std::mem::size_of::<u32>())?;
@@ -1473,11 +1637,7 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE routing compute encoder");
             }
 
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.route_pipeline,
-            );
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), route_pipeline);
             set_buffer(encoder, scores_buffer, 0);
             set_buffer(encoder, indices_buffer, 1);
             set_buffer(encoder, weights_buffer, 2);
@@ -1489,8 +1649,8 @@ impl MetalExecutorInner {
 
             let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
             let weights_ptr = msg_send_ptr0(weights_buffer, sel("contents")).cast::<f32>();
-            let mut routed = Vec::with_capacity(k);
-            for idx in 0..k.min(ACTIVE_EXPERTS_PER_TOKEN) {
+            let mut routed = Vec::with_capacity(ACTIVE_EXPERTS_PER_TOKEN);
+            for idx in 0..ACTIVE_EXPERTS_PER_TOKEN {
                 routed.push((*indices_ptr.add(idx) as usize, *weights_ptr.add(idx)));
             }
 
@@ -1864,21 +2024,49 @@ impl MetalExecutorInner {
 
 impl FlashMoeEngine {
     pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
+        Ok(self.generate_inner(request, None)?.output)
+    }
+
+    pub fn generate_timed(&mut self, request: &GenerationRequest) -> Result<TimedGenerationOutput> {
+        let mut timing = FlashMoeGenerationTiming {
+            model: self.plan.model.clone(),
+            dimensions: self.model_dimensions(),
+            tokens: Vec::new(),
+            total_wall: Duration::ZERO,
+        };
+        self.generate_inner(request, Some(&mut timing))
+    }
+
+    fn generate_inner(
+        &mut self,
+        request: &GenerationRequest,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<TimedGenerationOutput> {
+        let generation_started = Instant::now();
         let prompt = self.tokenizer.apply_chat_template(&request.prompt);
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let mut kv_cache = KvCache::new(
             self.config.num_hidden_layers,
             prompt_tokens.len() + request.max_tokens.max(0) as usize,
         );
-        let prefill_hidden = self.prefill(&prompt_tokens, &mut kv_cache)?;
+        let prefill_hidden = self.prefill(&prompt_tokens, &mut kv_cache, timing.as_deref_mut())?;
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
         let max_tokens = request.max_tokens.max(0) as usize;
         let mut stopped = false;
         if max_tokens > 0 {
+            let sample_started = Instant::now();
             let token =
                 self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            if let Some(timing) = timing.as_deref_mut()
+                && let Some(last) = timing.tokens.last_mut()
+            {
+                let elapsed = sample_started.elapsed();
+                last.buckets.sampling += elapsed;
+                last.buckets.total_wall += elapsed;
+                last.sampled_token = Some(token);
+            }
             if !self.tokenizer.is_eos(token) {
                 generated.push(token);
             } else {
@@ -1894,6 +2082,7 @@ impl FlashMoeEngine {
                 &mut kv_cache,
                 position,
                 MropePosition::text(position),
+                timing.as_deref_mut(),
             )?;
             if self.tokenizer.is_eos(token) {
                 break;
@@ -1901,16 +2090,40 @@ impl FlashMoeEngine {
             generated.push(token);
         }
 
-        Ok(GenerationOutput {
+        let output = GenerationOutput {
             content: self.tokenizer.decode(&generated)?,
             generated_tokens: generated.len(),
+        };
+        let total_wall = generation_started.elapsed();
+        if let Some(timing) = timing {
+            timing.total_wall = total_wall;
+            return Ok(TimedGenerationOutput {
+                output,
+                timing: timing.clone(),
+            });
+        }
+        Ok(TimedGenerationOutput {
+            output,
+            timing: FlashMoeGenerationTiming {
+                model: self.plan.model.clone(),
+                dimensions: self.model_dimensions(),
+                tokens: Vec::new(),
+                total_wall,
+            },
         })
     }
 
-    fn prefill(&mut self, prompt_tokens: &[u32], kv_cache: &mut KvCache) -> Result<Vec<f32>> {
+    fn prefill(
+        &mut self,
+        prompt_tokens: &[u32],
+        kv_cache: &mut KvCache,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<Vec<f32>> {
         let mut last_hidden = None;
         for (position, token) in prompt_tokens.iter().copied().enumerate() {
             kv_cache.record_prompt_token(position, token)?;
+            let mut token_timing =
+                FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
@@ -1922,7 +2135,15 @@ impl FlashMoeEngine {
                 MropePosition::text(position),
                 None,
                 false,
+                if timing.is_some() {
+                    Some(&mut token_timing)
+                } else {
+                    None
+                },
             )?);
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.tokens.push(token_timing);
+            }
         }
         last_hidden.context("cannot generate from an empty prompt")
     }
@@ -1973,6 +2194,7 @@ impl FlashMoeEngine {
                 mrope_positions[position],
                 deepstack,
                 false,
+                None,
             )?);
         }
         if vis_idx != visual_embeddings.len() {
@@ -2082,6 +2304,7 @@ impl FlashMoeEngine {
                 &mut kv_cache,
                 position,
                 MropePosition::text(next_mrope_position + generated.len() - 1),
+                None,
             )?;
             if self.tokenizer.is_eos(token) {
                 break;
@@ -2103,12 +2326,19 @@ impl FlashMoeEngine {
         kv_cache: &mut KvCache,
         position: usize,
         rope_position: MropePosition,
+        timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<u32> {
         let previous = generated
             .last()
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
+        let mut token_timing = FlashMoeTokenTiming::new(
+            prompt_tokens.len() + generated.len(),
+            position,
+            FlashMoeTokenPhase::Decode,
+            previous,
+        );
         let hidden = self.forward_hidden(
             previous,
             None,
@@ -2117,8 +2347,22 @@ impl FlashMoeEngine {
             rope_position,
             None,
             true,
+            if timing.is_some() {
+                Some(&mut token_timing)
+            } else {
+                None
+            },
         )?;
-        self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)
+        let sample_started = Instant::now();
+        let token = self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)?;
+        let elapsed = sample_started.elapsed();
+        token_timing.buckets.sampling += elapsed;
+        token_timing.buckets.total_wall += elapsed;
+        token_timing.sampled_token = Some(token);
+        if let Some(timing) = timing {
+            timing.tokens.push(token_timing);
+        }
+        Ok(token)
     }
 
     fn sample_from_hidden(
@@ -2156,8 +2400,10 @@ impl FlashMoeEngine {
         rope_position: MropePosition,
         deepstack: Option<DeepstackTokenContext<'_>>,
         record_generated: bool,
+        mut timing: Option<&mut FlashMoeTokenTiming>,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
+        let token_started = Instant::now();
         let mut hidden = if let Some(mut emb) = embedding_override {
             if emb.len() != runtime.width {
                 tracing::warn!(
@@ -2174,7 +2420,16 @@ impl FlashMoeEngine {
         let mut state = self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64);
 
         for layer in 0..self.config.num_hidden_layers {
+            let layer_started = Instant::now();
+            let mut layer_timing = FlashMoeLayerTiming {
+                layer,
+                layer_kind: self.layer_kind(layer),
+                active_experts: 0,
+                dimensions: self.layer_dimensions(layer),
+                buckets: FlashMoeTimingBuckets::default(),
+            };
             let attention_residual = hidden.clone();
+            let combine_started = Instant::now();
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
             let input_norm_weight = self.dense.norm_weight(&input_norm_name, hidden.len())?;
             let mut normed = if let Some(metal) = &self.metal {
@@ -2182,6 +2437,8 @@ impl FlashMoeEngine {
             } else {
                 self.dense.rms_norm(input_norm_name.as_str(), &hidden)?
             };
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            let attention_started = Instant::now();
             let projected = if self.dense.has_linear_attention_layer(layer)
                 && !is_full_attention_layer(layer)
             {
@@ -2196,6 +2453,8 @@ impl FlashMoeEngine {
                     &runtime,
                 )?
             };
+            layer_timing.buckets.attention_projection += attention_started.elapsed();
+            let combine_started = Instant::now();
             hidden = attention_residual;
             add_in_place(&mut hidden, &projected);
 
@@ -2207,6 +2466,8 @@ impl FlashMoeEngine {
             } else {
                 self.dense.rms_norm(post_norm_name.as_str(), &hidden)?
             };
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            let routing_started = Instant::now();
             let router_scores = self.dense.router_scores_with_metal(
                 self.metal.as_ref(),
                 layer,
@@ -2218,14 +2479,23 @@ impl FlashMoeEngine {
             } else {
                 top_k(&router_scores, self.config.active_experts())
             };
+            layer_timing.buckets.routing += routing_started.elapsed();
+            layer_timing.active_experts = active.len();
             let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
+            let expert_io_started = Instant::now();
             let pending_experts = self.scheduler.issue(layer, &active_ids)?;
+            layer_timing.buckets.expert_io += expert_io_started.elapsed();
             let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
             softmax_in_place(&mut weights);
             // Deferred CMD3-style overlap: while expert reads are still pending, compute
             // the always-active shared-expert branch on CPU or Metal.
+            let shared_compute_started = Instant::now();
             let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
+            layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
+            let expert_io_started = Instant::now();
             let experts = self.scheduler.finish(pending_experts)?;
+            layer_timing.buckets.expert_io += expert_io_started.elapsed();
+            let expert_compute_started = Instant::now();
             for (expert, weight) in experts.iter().zip(weights) {
                 state = state.wrapping_add(
                     expert
@@ -2239,6 +2509,8 @@ impl FlashMoeEngine {
                 };
                 add_scaled_in_place(&mut moe, &contribution, weight);
             }
+            layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
+            let combine_started = Instant::now();
             hidden = mlp_residual;
             add_in_place(&mut hidden, &moe);
             if let Some(context) = deepstack {
@@ -2263,8 +2535,15 @@ impl FlashMoeEngine {
                 }
             }
             kv_cache.record_layer_state(position, layer, state)?;
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            layer_timing.buckets.total_wall = layer_started.elapsed();
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.buckets.add(layer_timing.buckets);
+                timing.layers.push(layer_timing);
+            }
         }
 
+        let combine_started = Instant::now();
         let final_norm_weight = self.dense.norm_weight("model.norm.weight", hidden.len())?;
         hidden = if let Some(metal) = &self.metal {
             metal.rms_norm(&hidden, final_norm_weight.as_deref())?
@@ -2273,6 +2552,10 @@ impl FlashMoeEngine {
         };
         if record_generated {
             kv_cache.record_generated_token(position, previous)?;
+        }
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.buckets.combine_norm += combine_started.elapsed();
+            timing.buckets.total_wall = token_started.elapsed();
         }
         Ok(hidden)
     }
@@ -2595,6 +2878,56 @@ impl FlashMoeEngine {
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
         self.scheduler.snapshot()
+    }
+
+    fn model_dimensions(&self) -> FlashMoeModelDimensions {
+        FlashMoeModelDimensions {
+            layers: self.config.num_hidden_layers,
+            hidden_size: self.config.hidden_size,
+            attention_heads: self.config.num_attention_heads,
+            kv_heads: self.config.kv_heads(),
+            vocab_size: self.config.vocab_size,
+            experts_per_layer: self.config.num_experts,
+            active_experts_per_token: self.config.num_experts_per_tok,
+            moe_intermediate_size: self
+                .config
+                .moe_intermediate_size
+                .or(self.config.intermediate_size),
+            shared_experts: self.config.num_shared_experts,
+        }
+    }
+
+    fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
+        if self.dense.has_linear_attention_layer(layer) && !is_full_attention_layer(layer) {
+            FlashMoeLayerKind::LinearAttention
+        } else if self
+            .runtime
+            .full_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+        {
+            FlashMoeLayerKind::FullAttention
+        } else {
+            FlashMoeLayerKind::Unknown
+        }
+    }
+
+    fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
+        let layout = self
+            .runtime
+            .full_attention
+            .get(layer)
+            .and_then(|layout| *layout);
+        FlashMoeLayerDimensions {
+            hidden_size: self.config.hidden_size,
+            q_width: layout.map(|layout| layout.q_width),
+            kv_width: layout.map(|layout| layout.kv_width),
+            head_dim: layout.map(|layout| layout.head_dim),
+            experts_per_layer: self.config.num_experts,
+            active_experts_per_token: self.config.num_experts_per_tok,
+            shared_experts: self.config.num_shared_experts,
+        }
     }
 }
 
@@ -9360,7 +9693,7 @@ mod tests {
                 br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
             )
             .unwrap();
-            let _executor = MetalExecutorInner::new(&plan, &config).unwrap();
+            let _executor = MetalExecutorInner::new(&plan, &config, false).unwrap();
         }
 
         #[test]
@@ -9576,6 +9909,34 @@ mod tests {
     }
 
     #[test]
+    fn cpu_routing_topk_and_softmax_support_non_four_k() {
+        let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0, 1.5];
+        let active = top_k(&scores, 5);
+        let active_ids: Vec<_> = active.iter().map(|(expert, _)| *expert).collect();
+        assert_eq!(active_ids, vec![4, 6, 5, 7, 1]);
+
+        let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(
+            weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
+        );
+    }
+
+    #[test]
+    fn metal_route_top4_flag_is_explicit_opt_in() {
+        for enabled in ["1", "true", "yes", "on", "metal", "top4"] {
+            assert!(env_flag_enabled(&OsString::from(enabled)));
+        }
+        for disabled in ["", "0", "false", "cpu", "off", "route"] {
+            assert!(!env_flag_enabled(&OsString::from(disabled)));
+        }
+    }
+
+    #[test]
     fn build_cache_writes_runtime_metadata_and_metal_kernels() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
@@ -9714,6 +10075,16 @@ mod tests {
         assert_eq!(config.kv_heads(), 8);
         assert_eq!(config.experts(), 512);
         assert_eq!(config.active_experts(), 4);
+    }
+
+    #[test]
+    fn qwen_config_accepts_arbitrary_num_experts_per_tok() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.active_experts(), 10);
     }
 
     #[test]
@@ -11170,6 +11541,26 @@ mod tests {
             .unwrap();
         assert_eq!(output.generated_tokens, 16);
         assert!(!output.content.is_empty());
+
+        let timed = engine
+            .generate_timed(&GenerationRequest {
+                prompt: "hello".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                seed: 1,
+            })
+            .unwrap();
+        assert_eq!(timed.output.generated_tokens, 2);
+        assert_eq!(timed.timing.dimensions.hidden_size, 8);
+        assert!(!timed.timing.tokens.is_empty());
+        assert!(
+            timed
+                .timing
+                .tokens
+                .iter()
+                .any(|token| !token.layers.is_empty())
+        );
     }
 
     #[test]
