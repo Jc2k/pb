@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, Write};
 
@@ -195,7 +195,7 @@ struct SafetensorTensorInfo {
     data_offsets: [u64; 2],
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QwenModelConfig {
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
@@ -236,9 +236,13 @@ pub struct Qwen3VLVisionConfig {
     /// Number of transformer layers in the ViT encoder.
     pub depth: usize,
     /// Hidden dimension of the ViT (equals `hidden_size` in the HF config).
+    #[serde(alias = "hidden_size")]
     pub embed_dim: usize,
     /// Number of attention heads.
     pub num_heads: usize,
+    /// Explicit ViT MLP hidden size used by Qwen3.5 vision configs.
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
     /// FFN hidden-size ratio (defaults to 4.0).
     #[serde(default = "default_vit_mlp_ratio")]
     pub mlp_ratio: f64,
@@ -247,11 +251,147 @@ pub struct Qwen3VLVisionConfig {
     pub patch_size: usize,
     /// How many patches are spatially merged into one language-model token
     /// along each axis (defaults to 2, giving 2×2 = 4 patches per token).
+    #[serde(alias = "spatial_merge_size")]
     #[serde(default = "default_vit_merge_size")]
     pub merge_size: usize,
     /// Input channels (defaults to 3 for RGB).
+    #[serde(alias = "in_channels")]
     #[serde(default = "default_vit_in_chans")]
     pub in_chans: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenModelConfig {
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    vocab_size: Option<usize>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    torch_dtype: Option<String>,
+    dtype: Option<String>,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
+    num_shared_experts: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    vision_config: Option<Qwen3VLVisionConfig>,
+    text_config: Option<RawQwenTextConfig>,
+    rope_parameters: Option<RawQwenRopeParameters>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenTextConfig {
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    vocab_size: Option<usize>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    torch_dtype: Option<String>,
+    dtype: Option<String>,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
+    num_shared_experts: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    rope_parameters: Option<RawQwenRopeParameters>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenRopeParameters {
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for QwenModelConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let raw = RawQwenModelConfig::deserialize(deserializer)?;
+        let text = raw.text_config.unwrap_or_default();
+
+        let required = |field: &'static str,
+                        top: Option<usize>,
+                        nested: Option<usize>|
+         -> std::result::Result<usize, D::Error> {
+            top.or(nested)
+                .ok_or_else(|| de::Error::missing_field(field))
+        };
+
+        Ok(Self {
+            model_type: raw.model_type.or(text.model_type),
+            architectures: raw.architectures.or(text.architectures),
+            num_hidden_layers: required(
+                "num_hidden_layers",
+                raw.num_hidden_layers,
+                text.num_hidden_layers,
+            )?,
+            hidden_size: required("hidden_size", raw.hidden_size, text.hidden_size)?,
+            num_attention_heads: required(
+                "num_attention_heads",
+                raw.num_attention_heads,
+                text.num_attention_heads,
+            )?,
+            num_key_value_heads: raw.num_key_value_heads.or(text.num_key_value_heads),
+            vocab_size: required("vocab_size", raw.vocab_size, text.vocab_size)?,
+            rope_theta: raw
+                .rope_theta
+                .or_else(|| {
+                    raw.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .or(text.rope_theta)
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                }),
+            partial_rotary_factor: raw
+                .partial_rotary_factor
+                .or_else(|| {
+                    raw.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
+                .or(text.partial_rotary_factor)
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                }),
+            torch_dtype: raw
+                .torch_dtype
+                .or(raw.dtype)
+                .or(text.torch_dtype)
+                .or(text.dtype),
+            num_experts: raw.num_experts.or(text.num_experts),
+            num_experts_per_tok: raw.num_experts_per_tok.or(text.num_experts_per_tok),
+            moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
+            intermediate_size: raw.intermediate_size.or(text.intermediate_size),
+            max_position_embeddings: raw.max_position_embeddings.or(text.max_position_embeddings),
+            tie_word_embeddings: raw.tie_word_embeddings.or(text.tie_word_embeddings),
+            num_shared_experts: raw.num_shared_experts.or(text.num_shared_experts),
+            shared_expert_intermediate_size: raw
+                .shared_expert_intermediate_size
+                .or(text.shared_expert_intermediate_size),
+            vision_config: raw.vision_config,
+        })
+    }
 }
 
 fn default_vit_mlp_ratio() -> f64 {
@@ -285,7 +425,8 @@ impl Qwen3VLVisionConfig {
 
     /// Intermediate size of each ViT MLP layer.
     pub fn mlp_hidden_size(&self) -> usize {
-        (self.embed_dim as f64 * self.mlp_ratio).round() as usize
+        self.intermediate_size
+            .unwrap_or_else(|| (self.embed_dim as f64 * self.mlp_ratio).round() as usize)
     }
 }
 
@@ -1744,10 +1885,20 @@ impl FlashMoeEngine {
         let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
 
         let q_norm_w = self.dense.norm_weight(&q_norm_name, layout.head_dim)?;
-        apply_per_head_rms_norm(&mut q, layout.num_q_heads, layout.head_dim, q_norm_w.as_deref())?;
+        apply_per_head_rms_norm(
+            &mut q,
+            layout.num_q_heads,
+            layout.head_dim,
+            q_norm_w.as_deref(),
+        )?;
 
         let k_norm_w = self.dense.norm_weight(&k_norm_name, layout.head_dim)?;
-        apply_per_head_rms_norm(&mut k, layout.kv_heads, layout.head_dim, k_norm_w.as_deref())?;
+        apply_per_head_rms_norm(
+            &mut k,
+            layout.kv_heads,
+            layout.head_dim,
+            k_norm_w.as_deref(),
+        )?;
 
         let theta = self.config.rope_theta.unwrap_or_else(|| {
             if layout.q_layout == FullAttentionQLayout::Gated {
@@ -1779,8 +1930,13 @@ impl FlashMoeEngine {
             }
         }
 
-        self.dense
-            .project_with_metal(self.metal.as_ref(), layer, "o_proj", &attended, runtime.width)
+        self.dense.project_with_metal(
+            self.metal.as_ref(),
+            layer,
+            "o_proj",
+            &attended,
+            runtime.width,
+        )
     }
 
     fn linear_attention_projected(
@@ -2031,7 +2187,11 @@ impl DenseTransformerRuntime {
         let mut runtime = Self::new(config);
         let has_linear_attention = (0..config.num_hidden_layers)
             .filter(|layer| !is_full_attention_layer(*layer))
-            .any(|layer| registry.tensor(&linear_attention_tensor_name(layer, "in_proj_qkv")).is_some());
+            .any(|layer| {
+                registry
+                    .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
+                    .is_some()
+            });
 
         for layer in 0..config.num_hidden_layers {
             let is_full = !has_linear_attention || is_full_attention_layer(layer);
@@ -2096,9 +2256,7 @@ fn infer_full_attention_layout(
     let num_q_heads = config.num_attention_heads;
     let kv_heads = config.kv_heads();
 
-    if q_cols != config.hidden_size
-        || k_cols != config.hidden_size
-        || v_cols != config.hidden_size
+    if q_cols != config.hidden_size || k_cols != config.hidden_size || v_cols != config.hidden_size
     {
         bail!(
             "full-attention layer {layer} projection input widths are q={q_cols}, k={k_cols}, v={v_cols}; expected hidden_size {}",
@@ -7484,6 +7642,70 @@ mod tests {
     }
 
     #[test]
+    fn qwen_config_deserializes_qwen35_nested_text_and_vision_fields() {
+        let json = br#"{
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "image_token_id": 248056,
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "dtype": "bfloat16",
+                "hidden_size": 4096,
+                "max_position_embeddings": 262144,
+                "model_type": "qwen3_5_moe_text",
+                "moe_intermediate_size": 1024,
+                "num_attention_heads": 32,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "num_hidden_layers": 60,
+                "num_key_value_heads": 2,
+                "shared_expert_intermediate_size": 1024,
+                "vocab_size": 248320,
+                "rope_parameters": {
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25
+                }
+            },
+            "tie_word_embeddings": false,
+            "vision_config": {
+                "depth": 27,
+                "hidden_size": 1152,
+                "in_channels": 3,
+                "intermediate_size": 4304,
+                "num_heads": 16,
+                "out_hidden_size": 4096,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            },
+            "vision_end_token_id": 248054,
+            "vision_start_token_id": 248053
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.num_hidden_layers, 60);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, Some(2));
+        assert_eq!(config.vocab_size, 248320);
+        assert_eq!(config.rope_theta, Some(10000000.0));
+        assert_eq!(config.partial_rotary_factor, Some(0.25));
+        assert_eq!(config.torch_dtype.as_deref(), Some("bfloat16"));
+        assert_eq!(config.num_experts_per_tok, Some(10));
+        assert_eq!(config.tie_word_embeddings, Some(false));
+
+        let vision = config.vision_config.as_ref().unwrap();
+        assert_eq!(vision.depth, 27);
+        assert_eq!(vision.embed_dim, 1152);
+        assert_eq!(vision.num_heads, 16);
+        assert_eq!(vision.patch_size, 16);
+        assert_eq!(vision.merge_size, 2);
+        assert_eq!(vision.in_chans, 3);
+        assert_eq!(vision.mlp_hidden_size(), 4304);
+
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
         // Fixture derived from the Qwen3 MoE architecture:
         //   - q_norm / k_norm per attention layer (Qwen3 QK-norm)
@@ -8245,7 +8467,6 @@ mod tests {
         pack
     }
 }
-
 
 #[cfg(test)]
 mod flashmoe_rope_tests {
