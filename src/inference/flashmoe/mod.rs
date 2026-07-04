@@ -1698,6 +1698,7 @@ impl MetalExecutorInner {
                 &payload.biases,
                 payload.rows,
                 payload.cols,
+                payload.group_size,
             )?;
             Ok(Some(output))
         })
@@ -1711,7 +1712,11 @@ impl MetalExecutorInner {
         biases: &[f32],
         rows: usize,
         cols: usize,
+        group_size: usize,
     ) -> Result<Vec<f32>> {
+        if group_size == 0 {
+            bail!("group_size must be positive");
+        }
         unsafe {
             let output_bytes = rows
                 .checked_mul(std::mem::size_of::<f32>())
@@ -1721,10 +1726,14 @@ impl MetalExecutorInner {
             let scale_buffer = self.buffer_with_bytes(f32_as_bytes(scales))?;
             let bias_buffer = self.buffer_with_bytes(f32_as_bytes(biases))?;
             let output_buffer = self.buffer_with_len(output_bytes)?;
+            let rows_u32 = rows as u32;
             let cols_u32 = cols as u32;
-            let groups = cols.div_ceil(GROUP_SIZE).max(1) as u32;
+            let groups = cols.div_ceil(group_size).max(1) as u32;
+            let group_size_u32 = group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
             let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
             let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups))?;
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
 
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
             if command_buffer.is_null() {
@@ -1742,9 +1751,11 @@ impl MetalExecutorInner {
             set_buffer(encoder, scale_buffer, 2);
             set_buffer(encoder, bias_buffer, 3);
             set_buffer(encoder, output_buffer, 4);
-            set_buffer(encoder, cols_buffer, 5);
-            set_buffer(encoder, groups_buffer, 6);
-            dispatch_threads(encoder, rows as u64);
+            set_buffer(encoder, rows_buffer, 5);
+            set_buffer(encoder, cols_buffer, 6);
+            set_buffer(encoder, groups_buffer, 7);
+            set_buffer(encoder, group_size_buffer, 8);
+            dispatch_q4_threadgroups(encoder, rows as u64);
             msg_send_void0(encoder, sel("endEncoding"));
             msg_send_void0(command_buffer, sel("commit"));
             msg_send_void0(command_buffer, sel("waitUntilCompleted"));
@@ -1760,8 +1771,10 @@ impl MetalExecutorInner {
             self.recycle(scale_buffer);
             self.recycle(bias_buffer);
             self.recycle(output_buffer);
+            self.recycle(rows_buffer);
             self.recycle(cols_buffer);
             self.recycle(groups_buffer);
+            self.recycle(group_size_buffer);
             Ok(output)
         }
     }
@@ -2050,21 +2063,29 @@ impl MetalExecutorInner {
         buffers.push(scale_buffer);
         let bias_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.biases))?;
         buffers.push(bias_buffer);
+        let rows_u32 = payload.rows as u32;
         let cols_u32 = payload.cols as u32;
-        let groups_u32 = payload.cols.div_ceil(GROUP_SIZE).max(1) as u32;
+        let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
+        let group_size_u32 = payload.group_size as u32;
+        let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+        buffers.push(rows_buffer);
         let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
         buffers.push(cols_buffer);
         let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
         buffers.push(groups_buffer);
+        let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+        buffers.push(group_size_buffer);
         msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
         set_buffer(encoder, packed_buffer, 0);
         set_buffer(encoder, input_buffer, 1);
         set_buffer(encoder, scale_buffer, 2);
         set_buffer(encoder, bias_buffer, 3);
         set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
-        set_buffer(encoder, cols_buffer, 5);
-        set_buffer(encoder, groups_buffer, 6);
-        dispatch_threads(encoder, payload.rows as u64);
+        set_buffer(encoder, rows_buffer, 5);
+        set_buffer(encoder, cols_buffer, 6);
+        set_buffer(encoder, groups_buffer, 7);
+        set_buffer(encoder, group_size_buffer, 8);
+        dispatch_q4_threadgroups(encoder, payload.rows as u64);
         Ok(())
     }
 
@@ -6657,13 +6678,14 @@ impl ExpertWeights {
                 let Some(payload) = tensor.matvec_payload(hidden, width) else {
                     continue;
                 };
-                let projected = q4_fma_matvec(
+                let projected = q4_fma_matvec_with_group_size(
                     &payload.packed,
                     &hidden[..payload.cols],
                     &payload.scales,
                     &payload.biases,
                     payload.rows,
                     payload.cols,
+                    payload.group_size,
                 )
                 .with_context(|| {
                     format!(
@@ -6778,13 +6800,14 @@ impl ExpertWeights {
         ) else {
             return Ok(None);
         };
-        let projected = q4_fma_matvec(
+        let projected = q4_fma_matvec_with_group_size(
             &payload.packed,
             &input[..payload.cols],
             &payload.scales,
             &payload.biases,
             payload.rows,
             payload.cols,
+            payload.group_size,
         )
         .with_context(|| {
             format!(
@@ -6829,7 +6852,7 @@ pub struct PackedExpertTensor {
 
 impl PackedExpertTensor {
     fn matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload> {
-        if hidden.is_empty() || width == 0 || self.packed.is_empty() {
+        if hidden.is_empty() || width == 0 || self.packed.is_empty() || self.group_size == 0 {
             return None;
         }
         let shape_cols = self.shape.last().copied().unwrap_or(hidden.len());
@@ -6848,6 +6871,7 @@ impl PackedExpertTensor {
         Some(Q4MatvecPayload {
             rows,
             cols,
+            group_size: self.group_size,
             packed: self.packed[..needed_packed].to_vec(),
             scales: self.scales[..needed_groups].to_vec(),
             biases: self.biases[..needed_groups].to_vec(),
@@ -6859,6 +6883,7 @@ impl PackedExpertTensor {
 struct Q4MatvecPayload {
     rows: usize,
     cols: usize,
+    group_size: usize,
     packed: Vec<u8>,
     scales: Vec<f32>,
     biases: Vec<f32>,
@@ -7215,12 +7240,27 @@ pub fn q4_fma_matvec(
     rows: usize,
     cols: usize,
 ) -> Result<Vec<f32>> {
+    q4_fma_matvec_with_group_size(packed, input, scales, biases, rows, cols, GROUP_SIZE)
+}
+
+pub fn q4_fma_matvec_with_group_size(
+    packed: &[u8],
+    input: &[f32],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    if group_size == 0 {
+        bail!("group_size must be positive");
+    }
     if input.len() != cols {
         bail!("input length {} does not match cols {cols}", input.len());
     }
-    let groups_per_row = cols.div_ceil(GROUP_SIZE);
+    let groups_per_row = cols.div_ceil(group_size);
     if scales.len() < rows * groups_per_row || biases.len() < rows * groups_per_row {
-        bail!("scale/bias arrays are too small for {rows}x{cols} with group size {GROUP_SIZE}");
+        bail!("scale/bias arrays are too small for {rows}x{cols} with group size {group_size}");
     }
     let needed_packed = rows * cols.div_ceil(2);
     if packed.len() < needed_packed {
@@ -7231,7 +7271,7 @@ pub fn q4_fma_matvec(
     }
     let mut out = vec![0.0f32; rows];
     let packed_stride = cols.div_ceil(2);
-    debug_assert_eq!(groups_per_row, cols.div_ceil(GROUP_SIZE));
+    debug_assert_eq!(groups_per_row, cols.div_ceil(group_size));
     for row in 0..rows {
         let mut acc = 0.0f32;
         let packed_row = row * packed_stride;
@@ -7239,15 +7279,15 @@ pub fn q4_fma_matvec(
             let idx = row * groups_per_row + group;
             let scale = scales[idx];
             let bias = biases[idx];
-            let start = group * GROUP_SIZE;
-            let end = (start + GROUP_SIZE).min(cols);
+            let start = group * group_size;
+            let end = (start + group_size).min(cols);
             for col in start..end {
                 let x = input[col];
                 let scale_x = scale * x;
                 let bias_x = bias * x;
                 let byte = packed[packed_row + col / 2];
                 let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
-                acc = q.mul_add(scale_x, acc + bias_x);
+                acc += q.mul_add(scale_x, bias_x);
             }
         }
         out[row] = acc;
@@ -7371,6 +7411,27 @@ unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
     msg_send_void2_size(
         encoder,
         sel("dispatchThreads:threadsPerThreadgroup:"),
+        grid,
+        threadgroup,
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
+    const Q4_ROWS_PER_THREADGROUP: u64 = 8;
+    let grid = MtlSize {
+        width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup = MtlSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    msg_send_void2_size(
+        encoder,
+        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
         grid,
         threadgroup,
     );
@@ -7570,27 +7631,55 @@ kernel void q4_fma_matvec(
     device const float* scales [[buffer(2)]],
     device const float* biases [[buffer(3)]],
     device float* output [[buffer(4)]],
-    constant uint& cols [[buffer(5)]],
-    constant uint& groups_per_row [[buffer(6)]],
-    uint row [[thread_position_in_grid]]) {
-    float acc = 0.0f;
-    uint packed_row = row * ((cols + 1) / 2);
-    for (uint group = 0; group < groups_per_row; ++group) {
-        uint idx = row * groups_per_row + group;
-        float scale = scales[idx];
-        float bias = biases[idx];
-        uint start = group * 64;
-        uint end = min(start + 64, cols);
-        for (uint col = start; col < end; ++col) {
-            uchar byte = packed[packed_row + col / 2];
-            float q = float((col & 1) == 0 ? (byte & 0x0f) : (byte >> 4));
-            float x = input[col];
-            float scale_x = scale * x;
-            float bias_x = bias * x;
-            acc = fma(q, scale_x, bias_x + acc);
+    constant uint& rows [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& groups_per_row [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 4096;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[4096];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
         }
     }
-    output[row] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+        uchar byte = packed[packed_row + packed_col];
+        uint col0 = packed_col * 2;
+        float x0 = use_input_cache ? input_cache[col0] : input[col0];
+        uint group0 = col0 / group_size;
+        float scale0 = scales[scale_row + group0];
+        float bias0 = biases[scale_row + group0];
+        acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+
+        uint col1 = col0 + 1;
+        if (col1 < cols) {
+            float x1 = use_input_cache ? input_cache[col1] : input[col1];
+            uint group1 = col1 / group_size;
+            float scale1 = scales[scale_row + group1];
+            float bias1 = biases[scale_row + group1];
+            acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
 }
 
 kernel void route_top4(
@@ -10783,6 +10872,11 @@ mod tests {
                 "missing Metal kernel {kernel}"
             );
         }
+        assert!(METAL_SHADERS.contains("threadgroup float input_cache"));
+        assert!(METAL_SHADERS.contains("simd_sum(acc)"));
+        assert!(METAL_SHADERS.contains("thread_index_in_simdgroup"));
+        assert!(METAL_SHADERS.contains("constant uint& group_size"));
+        assert!(METAL_SHADERS.contains("fma(float(byte & 0x0f), scale0 * x0, bias0 * x0)"));
     }
 
     #[test]
@@ -12509,6 +12603,44 @@ mod tests {
             + (3.0 * 0.5 + 1.0) * 3.0
             + (4.0 * 0.5 + 1.0) * 4.0;
         assert!((out[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn q4_fma_matvec_supports_variable_groups_and_odd_shapes() {
+        let rows = 3;
+        let cols = 5;
+        let group_size = 3;
+        let packed = [
+            0x10, 0x32, 0x04, // row 0: 0, 1, 2, 3, 4
+            0x65, 0x87, 0x09, // row 1: 5, 6, 7, 8, 9
+            0xba, 0xdc, 0x0e, // row 2: 10, 11, 12, 13, 14
+        ];
+        let input = [0.25, -1.0, 2.0, 0.5, -0.75];
+        let scales = [0.5, -0.25, 0.125, 0.75, -0.5, 0.25];
+        let biases = [1.0, 2.0, -1.5, 0.25, 0.0, -0.5];
+        let out = q4_fma_matvec_with_group_size(
+            &packed, &input, &scales, &biases, rows, cols, group_size,
+        )
+        .unwrap();
+
+        let mut expected = [0.0f32; 3];
+        let groups_per_row = cols.div_ceil(group_size);
+        for row in 0..rows {
+            for col in 0..cols {
+                let byte = packed[row * cols.div_ceil(2) + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                let group = col / group_size;
+                let idx = row * groups_per_row + group;
+                expected[row] += q.mul_add(scales[idx] * input[col], biases[idx] * input[col]);
+            }
+        }
+
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 1e-6,
+                "actual {actual} expected {expected}"
+            );
+        }
     }
 
     fn test_expert_pack(name: &str) -> Vec<u8> {
