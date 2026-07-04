@@ -3390,9 +3390,7 @@ impl FlashMoeEngine {
             };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
-            let projected = if self.dense.has_linear_attention_layer(layer)
-                && !is_full_attention_layer(layer)
-            {
+            let projected = if self.runtime.is_linear_attention_layer(layer) {
                 self.linear_attention_projected(layer, &normed, kv_cache, runtime)?
             } else {
                 self.full_attention_projected(
@@ -4017,19 +4015,7 @@ impl FlashMoeEngine {
     }
 
     fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
-        if self.dense.has_linear_attention_layer(layer) && !is_full_attention_layer(layer) {
-            FlashMoeLayerKind::LinearAttention
-        } else if self
-            .runtime
-            .full_attention
-            .get(layer)
-            .and_then(|layout| *layout)
-            .is_some()
-        {
-            FlashMoeLayerKind::FullAttention
-        } else {
-            FlashMoeLayerKind::Unknown
-        }
+        self.runtime.layer_kind(layer)
     }
 
     fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
@@ -4091,22 +4077,16 @@ impl DenseTransformerRuntime {
 
     fn from_registry(config: &QwenModelConfig, registry: &TensorRegistry) -> Result<Self> {
         let mut runtime = Self::new(config);
-        let has_linear_attention = (0..config.num_hidden_layers)
-            .filter(|layer| !is_full_attention_layer(*layer))
-            .any(|layer| {
-                registry
-                    .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
-                    .is_some()
-            });
-
         for layer in 0..config.num_hidden_layers {
-            let is_full = !has_linear_attention || is_full_attention_layer(layer);
-            if is_full {
-                runtime.full_attention[layer] =
-                    Some(infer_full_attention_layout(config, registry, layer)?);
-            } else {
-                runtime.linear_attention[layer] =
-                    Some(infer_linear_attention_layout(config, registry, layer)?);
+            match infer_attention_layer_type(registry, layer)? {
+                AttentionLayerType::Full => {
+                    runtime.full_attention[layer] =
+                        Some(infer_full_attention_layout(config, registry, layer)?);
+                }
+                AttentionLayerType::Linear => {
+                    runtime.linear_attention[layer] =
+                        Some(infer_linear_attention_layout(config, registry, layer)?);
+                }
             }
         }
 
@@ -4128,6 +4108,39 @@ impl DenseTransformerRuntime {
             .flatten()
             .with_context(|| format!("missing linear-attention runtime layout for layer {layer}"))
     }
+
+    fn is_linear_attention_layer(&self, layer: usize) -> bool {
+        self.linear_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+    }
+
+    fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
+        if self
+            .linear_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+        {
+            FlashMoeLayerKind::LinearAttention
+        } else if self
+            .full_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+        {
+            FlashMoeLayerKind::FullAttention
+        } else {
+            FlashMoeLayerKind::Unknown
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionLayerType {
+    Full,
+    Linear,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6095,6 +6108,10 @@ impl TensorRegistry {
         self.tensors.get(canonical_name)
     }
 
+    fn has_tensor_with_prefix(&self, prefix: &str) -> bool {
+        self.tensors.keys().any(|name| name.starts_with(prefix))
+    }
+
     pub fn require(&self, canonical_name: &str) -> Result<&RuntimeTensorEntry> {
         self.tensor(canonical_name)
             .with_context(|| format!("Flash-MoE tensor registry is missing {canonical_name}"))
@@ -6143,19 +6160,14 @@ fn validate_required_tensor_manifest(
             &[config.vocab_size, config.hidden_size],
         )?;
     }
-    let has_linear_attention = (0..config.num_hidden_layers)
-        .filter(|layer| !is_full_attention_layer(*layer))
-        .any(|layer| {
-            registry
-                .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
-                .is_some()
-        });
     for layer in 0..config.num_hidden_layers {
-        let is_full = !has_linear_attention || is_full_attention_layer(layer);
-        if is_full {
-            let _ = infer_full_attention_layout(config, registry, layer)?;
-        } else {
-            let _ = infer_linear_attention_layout(config, registry, layer)?;
+        match infer_attention_layer_type(registry, layer)? {
+            AttentionLayerType::Full => {
+                let _ = infer_full_attention_layout(config, registry, layer)?;
+            }
+            AttentionLayerType::Linear => {
+                let _ = infer_linear_attention_layout(config, registry, layer)?;
+            }
         }
         require_tensor_shape(
             registry,
@@ -6304,7 +6316,36 @@ fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
     format!("model.layers.{layer}.linear_attn.{name}")
 }
 
+fn infer_attention_layer_type(
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<AttentionLayerType> {
+    let linear_prefix = format!("model.layers.{layer}.linear_attn.");
+    let has_linear = registry.has_tensor_with_prefix(&linear_prefix);
+    let has_full = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        .iter()
+        .any(|projection| {
+            registry
+                .tensor(&attention_tensor_name(layer, projection))
+                .is_some()
+        });
+
+    match (has_linear, has_full) {
+        (true, true) => bail!(
+            "Flash-MoE tensor manifest has both linear-attention tensors ({linear_prefix}*) and full-attention self_attn projection tensors for layer {layer}"
+        ),
+        (true, false) => Ok(AttentionLayerType::Linear),
+        (false, true) => Ok(AttentionLayerType::Full),
+        (false, false) => bail!(
+            "Flash-MoE tensor manifest is missing attention tensors for layer {layer}; expected either model.layers.{layer}.linear_attn.* or model.layers.{layer}.self_attn.{{q,k,v,o}}_proj.weight"
+        ),
+    }
+}
+
 fn is_full_attention_layer(layer: usize) -> bool {
+    // Compatibility helper for Qwen3.5-397B-A17B's Flash-MoE schedule.
+    // Runtime layer type inference must use the tensor manifest instead.
+    //
     // Flash-MoE schedules full attention every 4th layer when counted from 1.
     // In 0-indexed coordinates that is layers 3, 7, 11, ...
     (layer + 1) % FULL_ATTN_INTERVAL == 0
@@ -6412,12 +6453,6 @@ impl DenseStore {
 
     pub fn registry(&self) -> &TensorRegistry {
         &self.registry
-    }
-
-    fn has_linear_attention_layer(&self, layer: usize) -> bool {
-        self.registry
-            .tensor(&linear_attention_tensor_name(layer, "in_proj_qkv"))
-            .is_some()
     }
 
     fn seed(&self, position: usize, previous: u32) -> Result<u64> {
@@ -12223,6 +12258,138 @@ mod tests {
         }
     }
 
+    fn tiny_attention_manifest(
+        layer_types: &[AttentionLayerType],
+    ) -> (QwenModelConfig, FlashMoeManifest) {
+        let (mut config, _) = minimal_dense_manifest(true);
+        config.num_hidden_layers = layer_types.len();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            "lm_head.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+
+        for (layer, layer_type) in layer_types.iter().copied().enumerate() {
+            push(
+                layer_norm_tensor_name(layer, "input_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                layer_norm_tensor_name(layer, "post_attention_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                router_tensor_name(layer),
+                vec![config.experts(), config.hidden_size],
+            );
+            match layer_type {
+                AttentionLayerType::Full => {
+                    push(
+                        attention_tensor_name(layer, "q_proj"),
+                        vec![config.hidden_size, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "k_proj"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "v_proj"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "o_proj"),
+                        vec![config.hidden_size, config.hidden_size],
+                    );
+                }
+                AttentionLayerType::Linear => {
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_qkv"),
+                        vec![12, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_z"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_b"),
+                        vec![2, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_a"),
+                        vec![2, config.hidden_size],
+                    );
+                    push(linear_attention_tensor_name(layer, "conv1d"), vec![12, 3]);
+                    push(linear_attention_scalar_tensor_name(layer, "A_log"), vec![2]);
+                    push(
+                        linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                        vec![2],
+                    );
+                    push(linear_attention_tensor_name(layer, "norm"), vec![2]);
+                    push(
+                        linear_attention_tensor_name(layer, "out_proj"),
+                        vec![config.hidden_size, 4],
+                    );
+                }
+            }
+        }
+
+        let manifest = FlashMoeManifest {
+            model: "hf://example/tiny-attention".to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["tiny.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        (config, manifest)
+    }
+
+    fn assert_manifest_attention_kinds(layer_types: &[AttentionLayerType]) {
+        let (config, manifest) = tiny_attention_manifest(layer_types);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("manifest-driven attention schedule should validate");
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry)
+            .expect("manifest-driven attention schedule should build runtime layouts");
+
+        for (layer, layer_type) in layer_types.iter().copied().enumerate() {
+            match layer_type {
+                AttentionLayerType::Full => {
+                    assert_eq!(runtime.layer_kind(layer), FlashMoeLayerKind::FullAttention);
+                    runtime
+                        .full_attention_layout(layer)
+                        .expect("full-attention layer should have full layout");
+                    assert!(
+                        runtime.linear_attention_layout(layer).is_err(),
+                        "full-attention layer {layer} should not have a linear layout"
+                    );
+                }
+                AttentionLayerType::Linear => {
+                    assert_eq!(
+                        runtime.layer_kind(layer),
+                        FlashMoeLayerKind::LinearAttention
+                    );
+                    runtime
+                        .linear_attention_layout(layer)
+                        .expect("linear-attention layer should have linear layout");
+                    assert!(
+                        runtime.full_attention_layout(layer).is_err(),
+                        "linear-attention layer {layer} should not have a full layout"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn validate_rejects_configured_shared_expert_without_gate() {
         let (mut config, mut manifest) = minimal_dense_manifest(true);
@@ -12267,6 +12434,57 @@ mod tests {
         assert!(!is_full_attention_layer(5));
         assert!(!is_full_attention_layer(6));
         assert!(is_full_attention_layer(7));
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_all_full_attention() {
+        assert_manifest_attention_kinds(&[
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+        ]);
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_qwen35_mixed_schedule() {
+        let layer_types: Vec<_> = (0..8)
+            .map(|layer| {
+                if is_full_attention_layer(layer) {
+                    AttentionLayerType::Full
+                } else {
+                    AttentionLayerType::Linear
+                }
+            })
+            .collect();
+
+        assert_manifest_attention_kinds(&layer_types);
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_non_every_fourth_mixed_schedule() {
+        assert_manifest_attention_kinds(&[
+            AttentionLayerType::Full,
+            AttentionLayerType::Linear,
+            AttentionLayerType::Full,
+            AttentionLayerType::Linear,
+        ]);
+    }
+
+    #[test]
+    fn manifest_attention_detection_rejects_conflicting_layer_layouts() {
+        let (config, mut manifest) = tiny_attention_manifest(&[AttentionLayerType::Full]);
+        let slot = manifest.dense_tensors.len();
+        manifest.dense_tensors.push(make_dense_ref(
+            &linear_attention_tensor_name(0, "in_proj_qkv"),
+            vec![12, config.hidden_size],
+            slot,
+        ));
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+
+        assert!(err.to_string().contains("both linear-attention"), "{err:#}");
+        assert!(err.to_string().contains("full-attention"), "{err:#}");
     }
 
     #[test]
