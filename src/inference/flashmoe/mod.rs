@@ -7,6 +7,8 @@
 //! pretending a GGUF file is required for Qwen3.5.
 
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+use std::ffi::c_int;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CString, c_char, c_void};
 use std::fs;
@@ -57,6 +59,43 @@ pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
 pub const EXPECTED_EXPERT_BYTES: u64 =
     FOUR_BIT_EXPERT_SIZE * NUM_LAYERS as u64 * NUM_EXPERTS as u64;
 const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
+
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: c_int = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: c_int = 111;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sscal(n: c_int, alpha: f32, x: *mut f32, inc_x: c_int);
+    fn cblas_sgemv(
+        order: c_int,
+        trans_a: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: f32,
+        a: *const f32,
+        lda: c_int,
+        x: *const f32,
+        inc_x: c_int,
+        beta: f32,
+        y: *mut f32,
+        inc_y: c_int,
+    );
+    fn cblas_sger(
+        order: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: f32,
+        x: *const f32,
+        inc_x: c_int,
+        y: *const f32,
+        inc_y: c_int,
+        a: *mut f32,
+        lda: c_int,
+    );
+}
 
 // ── Vision constants (Qwen3-VL image preprocessor) ───────────────────────────
 
@@ -2965,7 +3004,7 @@ impl FlashMoeEngine {
             let projected = if self.dense.has_linear_attention_layer(layer)
                 && !is_full_attention_layer(layer)
             {
-                self.linear_attention_projected(layer, &normed, kv_cache, runtime.width)?
+                self.linear_attention_projected(layer, &normed, kv_cache, runtime)?
             } else {
                 self.full_attention_projected(
                     layer,
@@ -3242,8 +3281,9 @@ impl FlashMoeEngine {
         layer: usize,
         normed: &[f32],
         kv_cache: &mut KvCache,
-        width: usize,
+        runtime: &DenseTransformerRuntime,
     ) -> Result<Vec<f32>> {
+        let layout = runtime.linear_attention_layout(layer)?;
         let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
         let z_name = linear_attention_tensor_name(layer, "in_proj_z");
         let b_name = linear_attention_tensor_name(layer, "in_proj_b");
@@ -3260,7 +3300,7 @@ impl FlashMoeEngine {
                 self.metal.as_ref(),
                 &qkv_name,
                 normed,
-                LINEAR_CONV_DIM,
+                layout.conv_dim,
             )?
             .context("missing linear_attn.in_proj_qkv tensor for GatedDeltaNet layer")?;
         let z = self
@@ -3269,7 +3309,7 @@ impl FlashMoeEngine {
                 self.metal.as_ref(),
                 &z_name,
                 normed,
-                LINEAR_TOTAL_VALUE,
+                layout.total_value_width,
             )?
             .context("missing linear_attn.in_proj_z tensor for GatedDeltaNet layer")?;
         let beta = self
@@ -3278,7 +3318,7 @@ impl FlashMoeEngine {
                 self.metal.as_ref(),
                 &b_name,
                 normed,
-                LINEAR_NUM_V_HEADS,
+                layout.num_value_heads,
             )?
             .context("missing linear_attn.in_proj_b tensor for GatedDeltaNet layer")?;
         let alpha = self
@@ -3287,7 +3327,7 @@ impl FlashMoeEngine {
                 self.metal.as_ref(),
                 &a_name,
                 normed,
-                LINEAR_NUM_V_HEADS,
+                layout.num_value_heads,
             )?
             .context("missing linear_attn.in_proj_a tensor for GatedDeltaNet layer")?;
         let conv_weight = self
@@ -3303,28 +3343,30 @@ impl FlashMoeEngine {
             .read_full_tensor_f32(&dt_bias_name)?
             .context("missing linear_attn.dt_bias tensor for GatedDeltaNet layer")?;
 
-        let state = kv_cache.linear_state_mut(layer)?;
-        let mut conv_out = vec![0.0f32; LINEAR_CONV_DIM];
+        let state = kv_cache.linear_state_mut(layer, layout)?;
+        let mut conv_out = vec![0.0f32; layout.conv_dim];
         conv1d_step(
             &state.conv_state,
             &qkv,
             &conv_weight,
             &mut conv_out,
-            LINEAR_CONV_DIM,
-            CONV_KERNEL_SIZE,
+            layout.conv_dim,
+            layout.conv_kernel_size,
         );
-        state
-            .conv_state
-            .copy_within(LINEAR_CONV_DIM..(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM, 0);
-        state.conv_state[(CONV_KERNEL_SIZE - 2) * LINEAR_CONV_DIM..].copy_from_slice(&qkv);
+        state.conv_state.copy_within(
+            layout.conv_dim..layout.conv_kernel_size.saturating_sub(1) * layout.conv_dim,
+            0,
+        );
+        state.conv_state[layout.conv_kernel_size.saturating_sub(2) * layout.conv_dim..]
+            .copy_from_slice(&qkv);
         qkv.clear();
 
-        let (lin_q, rest) = conv_out.split_at_mut(LINEAR_TOTAL_KEY);
-        let (lin_k, lin_v) = rest.split_at_mut(LINEAR_TOTAL_KEY);
-        let inv_scale = 1.0f32 / (LINEAR_KEY_DIM as f32).sqrt();
-        for head in 0..LINEAR_NUM_K_HEADS {
-            let start = head * LINEAR_KEY_DIM;
-            let end = start + LINEAR_KEY_DIM;
+        let (lin_q, rest) = conv_out.split_at_mut(layout.total_key_width);
+        let (lin_k, lin_v) = rest.split_at_mut(layout.total_key_width);
+        let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+        for head in 0..layout.num_key_heads {
+            let start = head * layout.key_dim;
+            let end = start + layout.key_dim;
             rms_norm_in_place(&mut lin_q[start..end]);
             // Qwen3.5 GatedDeltaNet scales Q by inv_scale^2 and K by inv_scale.
             for value in &mut lin_q[start..end] {
@@ -3336,47 +3378,24 @@ impl FlashMoeEngine {
             }
         }
 
-        let mut out_values = vec![0.0f32; LINEAR_TOTAL_VALUE];
-        let k_heads_per_v = (LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS).max(1);
-        for vh in 0..LINEAR_NUM_V_HEADS {
-            let kh = vh / k_heads_per_v;
-            let a_val = alpha.get(vh).copied().unwrap_or(0.0);
-            let dt_b = dt_bias.get(vh).copied().unwrap_or(0.0);
-            let a_weight = a_log.get(vh).copied().unwrap_or(0.0).exp();
-            let softplus = (1.0 + (a_val + dt_b).exp()).ln();
-            let decay = (-a_weight * softplus).exp();
-            let beta_gate = 1.0 / (1.0 + (-beta.get(vh).copied().unwrap_or(0.0)).exp());
+        let mut out_values = vec![0.0f32; layout.total_value_width];
+        apply_gated_delta_recurrence(
+            layout,
+            &mut state.ssm_state,
+            lin_q,
+            lin_k,
+            lin_v,
+            &alpha,
+            &beta,
+            &a_log,
+            &dt_bias,
+            &mut out_values,
+        );
 
-            let state_base = vh * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
-            let v_base = vh * LINEAR_VALUE_DIM;
-            let k_base = kh * LINEAR_KEY_DIM;
-            let q_base = kh * LINEAR_KEY_DIM;
-            for vi in 0..LINEAR_VALUE_DIM {
-                let row_base = state_base + vi * LINEAR_KEY_DIM;
-                let row = &mut state.ssm_state[row_base..row_base + LINEAR_KEY_DIM];
-                for slot in row.iter_mut() {
-                    *slot *= decay;
-                }
-                let mut kv_mem = 0.0f32;
-                for ki in 0..LINEAR_KEY_DIM {
-                    kv_mem = row[ki].mul_add(lin_k[k_base + ki], kv_mem);
-                }
-                let delta = (lin_v[v_base + vi] - kv_mem) * beta_gate;
-                for ki in 0..LINEAR_KEY_DIM {
-                    row[ki] = lin_k[k_base + ki].mul_add(delta, row[ki]);
-                }
-                let mut sum = 0.0f32;
-                for ki in 0..LINEAR_KEY_DIM {
-                    sum = row[ki].mul_add(lin_q[q_base + ki], sum);
-                }
-                out_values[v_base + vi] = sum;
-            }
-        }
-
-        let norm_weight = self.dense.norm_weight(&norm_name, LINEAR_VALUE_DIM)?;
-        for vh in 0..LINEAR_NUM_V_HEADS {
-            let start = vh * LINEAR_VALUE_DIM;
-            let end = start + LINEAR_VALUE_DIM;
+        let norm_weight = self.dense.norm_weight(&norm_name, layout.value_dim)?;
+        for vh in 0..layout.num_value_heads {
+            let start = vh * layout.value_dim;
+            let end = start + layout.value_dim;
             let chunk = &mut out_values[start..end];
             rms_norm_with_weight_in_place(chunk, norm_weight.as_deref());
             for (idx, value) in chunk.iter_mut().enumerate() {
@@ -3390,7 +3409,7 @@ impl FlashMoeEngine {
                 self.metal.as_ref(),
                 &out_proj_name,
                 &out_values,
-                width,
+                runtime.width,
             )?
             .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")
     }
@@ -3523,16 +3542,27 @@ impl FlashMoeEngine {
     }
 
     fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
-        let layout = self
+        let full_layout = self
             .runtime
             .full_attention
             .get(layer)
             .and_then(|layout| *layout);
+        let linear_layout = self
+            .runtime
+            .linear_attention
+            .get(layer)
+            .and_then(|layout| *layout);
         FlashMoeLayerDimensions {
             hidden_size: self.config.hidden_size,
-            q_width: layout.map(|layout| layout.q_width),
-            kv_width: layout.map(|layout| layout.kv_width),
-            head_dim: layout.map(|layout| layout.head_dim),
+            q_width: full_layout
+                .map(|layout| layout.q_width)
+                .or_else(|| linear_layout.map(|layout| layout.total_key_width)),
+            kv_width: full_layout
+                .map(|layout| layout.kv_width)
+                .or_else(|| linear_layout.map(|layout| layout.total_value_width)),
+            head_dim: full_layout
+                .map(|layout| layout.head_dim)
+                .or_else(|| linear_layout.map(|layout| layout.key_dim)),
             experts_per_layer: self.config.num_experts,
             active_experts_per_token: self.config.num_experts_per_tok,
             shared_experts: self.config.num_shared_experts,
@@ -3550,6 +3580,7 @@ struct DenseTransformerRuntime {
     num_q_heads: usize,
     kv_heads: usize,
     full_attention: Vec<Option<FullAttentionLayout>>,
+    linear_attention: Vec<Option<LinearAttentionLayout>>,
 }
 
 impl DenseTransformerRuntime {
@@ -3563,6 +3594,7 @@ impl DenseTransformerRuntime {
             num_q_heads: config.num_attention_heads,
             kv_heads,
             full_attention: vec![None; config.num_hidden_layers],
+            linear_attention: vec![None; config.num_hidden_layers],
         }
     }
 
@@ -3581,6 +3613,9 @@ impl DenseTransformerRuntime {
             if is_full {
                 runtime.full_attention[layer] =
                     Some(infer_full_attention_layout(config, registry, layer)?);
+            } else {
+                runtime.linear_attention[layer] =
+                    Some(infer_linear_attention_layout(config, registry, layer)?);
             }
         }
 
@@ -3593,6 +3628,14 @@ impl DenseTransformerRuntime {
             .copied()
             .flatten()
             .with_context(|| format!("missing full-attention runtime layout for layer {layer}"))
+    }
+
+    fn linear_attention_layout(&self, layer: usize) -> Result<LinearAttentionLayout> {
+        self.linear_attention
+            .get(layer)
+            .copied()
+            .flatten()
+            .with_context(|| format!("missing linear-attention runtime layout for layer {layer}"))
     }
 }
 
@@ -3619,6 +3662,149 @@ struct FullAttentionLayout {
     num_q_heads: usize,
     kv_heads: usize,
     rotary_pairing: RotaryPairing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinearAttentionLayout {
+    num_value_heads: usize,
+    num_key_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    total_key_width: usize,
+    total_value_width: usize,
+    conv_dim: usize,
+    conv_kernel_size: usize,
+}
+
+impl LinearAttentionLayout {
+    fn conv_state_len(self) -> usize {
+        self.conv_kernel_size.saturating_sub(1) * self.conv_dim
+    }
+
+    fn ssm_state_len(self) -> usize {
+        self.num_value_heads * self.value_dim * self.key_dim
+    }
+
+    fn value_heads_per_key_head(self) -> usize {
+        (self.num_value_heads / self.num_key_heads).max(1)
+    }
+}
+
+fn infer_linear_attention_layout(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<LinearAttentionLayout> {
+    let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+    let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+    let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+    let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+    let conv_name = linear_attention_tensor_name(layer, "conv1d");
+    let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+    let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+    let norm_name = linear_attention_tensor_name(layer, "norm");
+    let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+
+    let (qkv_rows, qkv_cols) = require_2d_tensor_shape(registry, &qkv_name)?;
+    let (z_rows, z_cols) = require_2d_tensor_shape(registry, &z_name)?;
+    let (b_rows, b_cols) = require_2d_tensor_shape(registry, &b_name)?;
+    let (a_rows, a_cols) = require_2d_tensor_shape(registry, &a_name)?;
+    let (out_rows, out_cols) = require_2d_tensor_shape(registry, &out_proj_name)?;
+    let a_log_len = require_1d_tensor_shape(registry, &a_log_name)?;
+    let dt_bias_len = require_1d_tensor_shape(registry, &dt_bias_name)?;
+    let value_dim = require_1d_tensor_shape(registry, &norm_name)?;
+    let (conv_channels, conv_kernel_size) = require_conv1d_tensor_shape(registry, &conv_name)?;
+    if conv_kernel_size < 2 {
+        bail!(
+            "linear-attention layer {layer} conv1d kernel size {conv_kernel_size} must be at least 2"
+        );
+    }
+
+    if qkv_cols != config.hidden_size
+        || z_cols != config.hidden_size
+        || b_cols != config.hidden_size
+        || a_cols != config.hidden_size
+    {
+        bail!(
+            "linear-attention layer {layer} projection input widths are qkv={qkv_cols}, z={z_cols}, b={b_cols}, a={a_cols}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if out_rows != config.hidden_size {
+        bail!(
+            "linear-attention layer {layer} out_proj output rows {out_rows}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if z_rows != out_cols {
+        bail!(
+            "linear-attention layer {layer} z width {z_rows} does not match out_proj input width {out_cols}"
+        );
+    }
+    if value_dim == 0 || z_rows % value_dim != 0 {
+        bail!(
+            "linear-attention layer {layer} value width {z_rows} is not divisible by norm/value dim {value_dim}"
+        );
+    }
+    let num_value_heads = z_rows / value_dim;
+    if b_rows != num_value_heads
+        || a_rows != num_value_heads
+        || a_log_len != num_value_heads
+        || dt_bias_len != num_value_heads
+    {
+        bail!(
+            "linear-attention layer {layer} value head counts disagree: inferred={num_value_heads}, b={b_rows}, a={a_rows}, A_log={a_log_len}, dt_bias={dt_bias_len}"
+        );
+    }
+    if qkv_rows < z_rows {
+        bail!(
+            "linear-attention layer {layer} qkv width {qkv_rows} is smaller than value width {z_rows}"
+        );
+    }
+    let paired_key_width = qkv_rows - z_rows;
+    if paired_key_width % 2 != 0 {
+        bail!(
+            "linear-attention layer {layer} qkv non-value width {paired_key_width} cannot split evenly into Q and K"
+        );
+    }
+    let total_key_width = paired_key_width / 2;
+    let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
+    let key_dim = if config_head_dim > 0 && total_key_width % config_head_dim == 0 {
+        config_head_dim
+    } else if total_key_width % value_dim == 0 {
+        value_dim
+    } else if total_key_width == LINEAR_TOTAL_KEY && z_rows == LINEAR_TOTAL_VALUE {
+        LINEAR_KEY_DIM
+    } else {
+        bail!(
+            "linear-attention layer {layer} key width {total_key_width} is not divisible by config head_dim {config_head_dim} or value_dim {value_dim}"
+        );
+    };
+    let num_key_heads = total_key_width / key_dim;
+    if num_key_heads == 0 {
+        bail!("linear-attention layer {layer} inferred zero key heads");
+    }
+    if num_value_heads % num_key_heads != 0 {
+        bail!(
+            "linear-attention layer {layer} value heads {num_value_heads} must be divisible by key heads {num_key_heads}"
+        );
+    }
+    if conv_channels != qkv_rows {
+        bail!(
+            "linear-attention layer {layer} conv1d channels {conv_channels} do not match qkv width {qkv_rows}"
+        );
+    }
+
+    Ok(LinearAttentionLayout {
+        num_value_heads,
+        num_key_heads,
+        key_dim,
+        value_dim,
+        total_key_width,
+        total_value_width: z_rows,
+        conv_dim: qkv_rows,
+        conv_kernel_size,
+    })
 }
 
 fn infer_full_attention_layout(
@@ -4835,11 +5021,16 @@ struct LinearAttentionState {
 }
 
 impl LinearAttentionState {
-    fn new() -> Self {
+    fn new(layout: LinearAttentionLayout) -> Self {
         Self {
-            conv_state: vec![0.0; (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM],
-            ssm_state: vec![0.0; LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM],
+            conv_state: vec![0.0; layout.conv_state_len()],
+            ssm_state: vec![0.0; layout.ssm_state_len()],
         }
+    }
+
+    fn matches_layout(&self, layout: LinearAttentionLayout) -> bool {
+        self.conv_state.len() == layout.conv_state_len()
+            && self.ssm_state.len() == layout.ssm_state_len()
     }
 }
 
@@ -4934,14 +5125,22 @@ impl KvCache {
         ))
     }
 
-    fn linear_state_mut(&mut self, layer: usize) -> Result<&mut LinearAttentionState> {
+    fn linear_state_mut(
+        &mut self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+    ) -> Result<&mut LinearAttentionState> {
         if layer >= self.layers {
             bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
         }
-        Ok(self
+        let state = self
             .linear_states
             .entry(layer)
-            .or_insert_with(LinearAttentionState::new))
+            .or_insert_with(|| LinearAttentionState::new(layout));
+        if !state.matches_layout(layout) {
+            *state = LinearAttentionState::new(layout);
+        }
+        Ok(state)
     }
 
     #[allow(dead_code)]
@@ -5298,52 +5497,7 @@ fn validate_required_tensor_manifest(
         if is_full {
             let _ = infer_full_attention_layout(config, registry, layer)?;
         } else {
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "in_proj_qkv"),
-                &[LINEAR_CONV_DIM, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "in_proj_z"),
-                &[LINEAR_TOTAL_VALUE, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "in_proj_b"),
-                &[LINEAR_NUM_V_HEADS, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "in_proj_a"),
-                &[LINEAR_NUM_V_HEADS, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "out_proj"),
-                &[config.hidden_size, LINEAR_TOTAL_VALUE],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_scalar_tensor_name(layer, "A_log"),
-                &[LINEAR_NUM_V_HEADS],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_scalar_tensor_name(layer, "dt_bias"),
-                &[LINEAR_NUM_V_HEADS],
-            )?;
-            require_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "norm"),
-                &[LINEAR_VALUE_DIM],
-            )?;
-            require_conv1d_tensor_shape(
-                registry,
-                &linear_attention_tensor_name(layer, "conv1d"),
-                LINEAR_CONV_DIM,
-                CONV_KERNEL_SIZE,
-            )?;
+            let _ = infer_linear_attention_layout(config, registry, layer)?;
         }
         require_tensor_shape(
             registry,
@@ -5428,12 +5582,7 @@ fn require_tensor_shape(
     Ok(())
 }
 
-fn require_conv1d_tensor_shape(
-    registry: &TensorRegistry,
-    canonical_name: &str,
-    channels: usize,
-    kernel_size: usize,
-) -> Result<()> {
+fn require_1d_tensor_shape(registry: &TensorRegistry, canonical_name: &str) -> Result<usize> {
     let tensor = registry.require(canonical_name)?;
     if dtype_size(&tensor.dtype).is_none() {
         bail!(
@@ -5442,18 +5591,34 @@ fn require_conv1d_tensor_shape(
         );
     }
     match tensor.shape.as_slice() {
-        [actual_channels, actual_kernel]
-            if *actual_channels == channels && *actual_kernel == kernel_size =>
-        {
-            Ok(())
+        [width] if *width > 0 => Ok(*width),
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 1-D vector",
+            shape
+        ),
+    }
+}
+
+fn require_conv1d_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+) -> Result<(usize, usize)> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [channels, kernel_size] if *channels > 0 && *kernel_size > 0 => {
+            Ok((*channels, *kernel_size))
         }
-        [actual_channels, 1, actual_kernel]
-            if *actual_channels == channels && *actual_kernel == kernel_size =>
-        {
-            Ok(())
+        [channels, 1, kernel_size] if *channels > 0 && *kernel_size > 0 => {
+            Ok((*channels, *kernel_size))
         }
         shape => bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected [{channels}, {kernel_size}] or [{channels}, 1, {kernel_size}]",
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty [channels, kernel] or [channels, 1, kernel]",
             shape
         ),
     }
@@ -6969,6 +7134,190 @@ fn conv1d_step(
             .unwrap_or(0.0);
         let input = new_input.get(c).copied().unwrap_or(0.0);
         out[c] = silu(input.mul_add(tail_w, acc));
+    }
+}
+
+fn apply_gated_delta_recurrence(
+    layout: LinearAttentionLayout,
+    ssm_state: &mut [f32],
+    lin_q: &[f32],
+    lin_k: &[f32],
+    lin_v: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    out_values: &mut [f32],
+) {
+    let heads_per_key = layout.value_heads_per_key_head();
+    let matrix_len = layout.value_dim * layout.key_dim;
+    let mut kv_mem = vec![0.0f32; layout.value_dim];
+    let mut delta = vec![0.0f32; layout.value_dim];
+    for vh in 0..layout.num_value_heads {
+        let kh = vh / heads_per_key;
+        let a_val = alpha.get(vh).copied().unwrap_or(0.0);
+        let dt_b = dt_bias.get(vh).copied().unwrap_or(0.0);
+        let a_weight = a_log.get(vh).copied().unwrap_or(0.0).exp();
+        let softplus = (1.0 + (a_val + dt_b).exp()).ln();
+        let decay = (-a_weight * softplus).exp();
+        let beta_gate = 1.0 / (1.0 + (-beta.get(vh).copied().unwrap_or(0.0)).exp());
+
+        let state_base = vh * matrix_len;
+        let v_base = vh * layout.value_dim;
+        let k_base = kh * layout.key_dim;
+        let q_base = kh * layout.key_dim;
+        let state = &mut ssm_state[state_base..state_base + matrix_len];
+        let value = &lin_v[v_base..v_base + layout.value_dim];
+        let key = &lin_k[k_base..k_base + layout.key_dim];
+        let query = &lin_q[q_base..q_base + layout.key_dim];
+        let out = &mut out_values[v_base..v_base + layout.value_dim];
+
+        #[cfg(target_os = "macos")]
+        if gated_delta_head_step_accelerate(
+            layout.value_dim,
+            layout.key_dim,
+            state,
+            key,
+            query,
+            value,
+            decay,
+            beta_gate,
+            &mut kv_mem,
+            &mut delta,
+            out,
+        ) {
+            continue;
+        }
+
+        gated_delta_head_step_scalar(
+            layout.value_dim,
+            layout.key_dim,
+            state,
+            key,
+            query,
+            value,
+            decay,
+            beta_gate,
+            out,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gated_delta_head_step_accelerate(
+    value_dim: usize,
+    key_dim: usize,
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    value: &[f32],
+    decay: f32,
+    beta_gate: f32,
+    kv_mem: &mut [f32],
+    delta: &mut [f32],
+    out: &mut [f32],
+) -> bool {
+    let Ok(m) = c_int::try_from(value_dim) else {
+        return false;
+    };
+    let Ok(n) = c_int::try_from(key_dim) else {
+        return false;
+    };
+    let Ok(items) = c_int::try_from(value_dim.saturating_mul(key_dim)) else {
+        return false;
+    };
+    if state.len() != value_dim * key_dim
+        || key.len() != key_dim
+        || query.len() != key_dim
+        || value.len() != value_dim
+        || kv_mem.len() != value_dim
+        || delta.len() != value_dim
+        || out.len() != value_dim
+    {
+        return false;
+    }
+
+    unsafe {
+        cblas_sscal(items, decay, state.as_mut_ptr(), 1);
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            m,
+            n,
+            1.0,
+            state.as_ptr(),
+            n,
+            key.as_ptr(),
+            1,
+            0.0,
+            kv_mem.as_mut_ptr(),
+            1,
+        );
+    }
+    for vi in 0..value_dim {
+        delta[vi] = (value[vi] - kv_mem[vi]) * beta_gate;
+    }
+    unsafe {
+        cblas_sger(
+            CBLAS_ROW_MAJOR,
+            m,
+            n,
+            1.0,
+            delta.as_ptr(),
+            1,
+            key.as_ptr(),
+            1,
+            state.as_mut_ptr(),
+            n,
+        );
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            m,
+            n,
+            1.0,
+            state.as_ptr(),
+            n,
+            query.as_ptr(),
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            1,
+        );
+    }
+    true
+}
+
+fn gated_delta_head_step_scalar(
+    value_dim: usize,
+    key_dim: usize,
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    value: &[f32],
+    decay: f32,
+    beta_gate: f32,
+    out: &mut [f32],
+) {
+    for vi in 0..value_dim {
+        let row_base = vi * key_dim;
+        let row = &mut state[row_base..row_base + key_dim];
+        for slot in row.iter_mut() {
+            *slot *= decay;
+        }
+        let mut kv_mem = 0.0f32;
+        for ki in 0..key_dim {
+            kv_mem = row[ki].mul_add(key[ki], kv_mem);
+        }
+        let delta = (value[vi] - kv_mem) * beta_gate;
+        for ki in 0..key_dim {
+            row[ki] = key[ki].mul_add(delta, row[ki]);
+        }
+        let mut sum = 0.0f32;
+        for ki in 0..key_dim {
+            sum = row[ki].mul_add(query[ki], sum);
+        }
+        out[vi] = sum;
     }
 }
 
@@ -11278,8 +11627,146 @@ mod tests {
         };
         let registry = TensorRegistry::from_manifest(&manifest);
 
-        require_conv1d_tensor_shape(&registry, &tensor_name, LINEAR_CONV_DIM, CONV_KERNEL_SIZE)
-            .expect("HF conv1d [channels, 1, kernel] shape should validate");
+        assert_eq!(
+            require_conv1d_tensor_shape(&registry, &tensor_name)
+                .expect("HF conv1d [channels, 1, kernel] shape should validate"),
+            (LINEAR_CONV_DIM, CONV_KERNEL_SIZE)
+        );
+    }
+
+    #[test]
+    fn linear_attention_layout_infers_non_qwen35_dimensions() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            layer_norm_tensor_name(0, "input_layernorm"),
+            vec![config.hidden_size],
+        );
+        push(
+            layer_norm_tensor_name(0, "post_attention_layernorm"),
+            vec![config.hidden_size],
+        );
+        push(
+            router_tensor_name(0),
+            vec![config.experts(), config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_qkv"),
+            vec![12, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_z"),
+            vec![4, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_b"),
+            vec![2, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_a"),
+            vec![2, config.hidden_size],
+        );
+        push(linear_attention_tensor_name(0, "conv1d"), vec![12, 3]);
+        push(linear_attention_scalar_tensor_name(0, "A_log"), vec![2]);
+        push(linear_attention_scalar_tensor_name(0, "dt_bias"), vec![2]);
+        push(linear_attention_tensor_name(0, "norm"), vec![2]);
+        push(
+            linear_attention_tensor_name(0, "out_proj"),
+            vec![config.hidden_size, 4],
+        );
+
+        let manifest = FlashMoeManifest {
+            model: "hf://example/tiny-linear".to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["tiny.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("variable linear attention layout should validate");
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry).unwrap();
+        let layout = runtime.linear_attention_layout(0).unwrap();
+
+        assert_eq!(layout.num_value_heads, 2);
+        assert_eq!(layout.num_key_heads, 1);
+        assert_eq!(layout.key_dim, 4);
+        assert_eq!(layout.value_dim, 2);
+        assert_eq!(layout.conv_dim, 12);
+        assert_eq!(layout.conv_kernel_size, 3);
+        assert_eq!(layout.conv_state_len(), 24);
+        assert_eq!(layout.ssm_state_len(), 16);
+    }
+
+    #[test]
+    fn gated_delta_recurrence_matches_scalar_reference() {
+        let layout = LinearAttentionLayout {
+            num_value_heads: 2,
+            num_key_heads: 1,
+            key_dim: 3,
+            value_dim: 2,
+            total_key_width: 3,
+            total_value_width: 4,
+            conv_dim: 10,
+            conv_kernel_size: 2,
+        };
+        let mut state = vec![
+            0.10, 0.20, 0.30, 0.40, 0.50, 0.60, -0.10, 0.05, 0.15, 0.25, -0.20, 0.35,
+        ];
+        let mut expected_state = state.clone();
+        let lin_q = vec![0.7, -0.2, 0.3];
+        let lin_k = vec![0.4, 0.1, -0.5];
+        let lin_v = vec![0.2, -0.1, 0.6, 0.05];
+        let alpha = vec![0.1, -0.3];
+        let beta = vec![0.2, 0.5];
+        let a_log = vec![-0.2, 0.4];
+        let dt_bias = vec![0.05, -0.15];
+        let mut out = vec![0.0; layout.total_value_width];
+        let mut expected_out = vec![0.0; layout.total_value_width];
+
+        for vh in 0..layout.num_value_heads {
+            let a_weight = a_log[vh].exp();
+            let softplus = (1.0 + (alpha[vh] + dt_bias[vh]).exp()).ln();
+            let decay = (-a_weight * softplus).exp();
+            let beta_gate = 1.0 / (1.0 + (-beta[vh]).exp());
+            let state_base = vh * layout.value_dim * layout.key_dim;
+            let value_base = vh * layout.value_dim;
+            gated_delta_head_step_scalar(
+                layout.value_dim,
+                layout.key_dim,
+                &mut expected_state[state_base..state_base + layout.value_dim * layout.key_dim],
+                &lin_k,
+                &lin_q,
+                &lin_v[value_base..value_base + layout.value_dim],
+                decay,
+                beta_gate,
+                &mut expected_out[value_base..value_base + layout.value_dim],
+            );
+        }
+
+        apply_gated_delta_recurrence(
+            layout, &mut state, &lin_q, &lin_k, &lin_v, &alpha, &beta, &a_log, &dt_bias, &mut out,
+        );
+
+        for (got, expected) in out.iter().zip(expected_out.iter()) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
+        for (got, expected) in state.iter().zip(expected_state.iter()) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
     }
 
     #[test]
