@@ -3,6 +3,8 @@
 The parity tests in `src/inference/flashmoe/mod.rs` use tiny synthetic manifests,
 tokenizers, expert packs, and images. They intentionally avoid importing
 Qwen3.5-397B or baking in assumptions that only hold for that checkpoint.
+They are functional fixtures only: no timing harnesses, throughput assertions, or
+benchmark infrastructure belong here.
 
 Refresh the fixture goldens when upstream Qwen tokenizer, chat-template, config,
 or Qwen3-VL image-processor behavior changes:
@@ -21,3 +23,7 @@ or Qwen3-VL image-processor behavior changes:
 5. Run `cargo test flashmoe_parity --lib` and `cargo test qwen3vl_parity --lib`
    after updating the goldens, then run the broader FlashMoe unit tests before
    committing.
+
+Optional real-model fixtures must stay ignored or feature/env gated and should
+document the exact local cache they require. The default CI/test path should
+continue to run with only the synthetic tokenizer/config/image fixtures above.

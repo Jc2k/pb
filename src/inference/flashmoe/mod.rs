@@ -12635,6 +12635,90 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum FlashMoeFixtureFamily {
+        Qwen35FlashMoe,
+        Qwen3Moe,
+        Qwen3VlMoe,
+    }
+
+    impl FlashMoeFixtureFamily {
+        fn model(self) -> &'static str {
+            match self {
+                Self::Qwen35FlashMoe => QWEN35_MODEL,
+                Self::Qwen3Moe => "hf://Qwen/Qwen3-30B-A3B",
+                Self::Qwen3VlMoe => QWEN3_VL_MODEL,
+            }
+        }
+
+        fn config_json(self) -> &'static [u8] {
+            match self {
+                Self::Qwen35FlashMoe => {
+                    br#"{
+  "model_type": "qwen3_5_moe",
+  "architectures": ["Qwen3_5MoeForCausalLM"],
+  "num_hidden_layers": 60,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 2,
+  "vocab_size": 248320,
+  "rope_theta": 10000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "moe_intermediate_size": 1536
+}"#
+                }
+                Self::Qwen3Moe => {
+                    br#"{
+  "model_type": "qwen3_moe",
+  "architectures": ["Qwen3MoeForCausalLM"],
+  "num_hidden_layers": 2,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "vocab_size": 151936,
+  "rope_theta": 1000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 2,
+  "moe_intermediate_size": 1536
+}"#
+                }
+                Self::Qwen3VlMoe => {
+                    br#"{
+  "model_type": "qwen3_vl_moe",
+  "architectures": ["Qwen3VLMoeForConditionalGeneration"],
+  "num_hidden_layers": 2,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "vocab_size": 248320,
+  "rope_theta": 1000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 3,
+  "moe_intermediate_size": 1536,
+  "rope_scaling": {"mrope_section": [24, 20, 20]},
+  "vision_config": {
+    "depth": 1,
+    "hidden_size": 64,
+    "num_heads": 4,
+    "patch_size": 14,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2,
+    "out_hidden_size": 4096
+  }
+}"#
+                }
+            }
+        }
+
+        fn config(self) -> QwenModelConfig {
+            serde_json::from_slice(self.config_json()).unwrap()
+        }
+    }
+
     fn tiny_q4_expert_pack() -> (Vec<u8>, ExpertPackMetadata) {
         let prefix = "model.layers.0.mlp.experts.1";
         build_expert_pack(
@@ -13491,6 +13575,29 @@ mod tests {
 
         assert_eq!(policy.active_experts, 2);
         assert_eq!(policy.source, ActiveExpertsSource::ModelConfig);
+    }
+
+    #[test]
+    fn flashmoe_parity_routing_defaults_are_model_family_aware() {
+        let qwen35 = FlashMoeRoutingPolicy::default()
+            .resolve(
+                FlashMoeFixtureFamily::Qwen35FlashMoe.model(),
+                &FlashMoeFixtureFamily::Qwen35FlashMoe.config(),
+            )
+            .unwrap();
+        assert_eq!(qwen35.active_experts, 4);
+        assert_eq!(qwen35.source, ActiveExpertsSource::Qwen35FlashMoeProfile);
+
+        for (family, expected_k) in [
+            (FlashMoeFixtureFamily::Qwen3Moe, 2),
+            (FlashMoeFixtureFamily::Qwen3VlMoe, 3),
+        ] {
+            let policy = FlashMoeRoutingPolicy::default()
+                .resolve(family.model(), &family.config())
+                .unwrap();
+            assert_eq!(policy.active_experts, expected_k, "{family:?}");
+            assert_eq!(policy.source, ActiveExpertsSource::ModelConfig);
+        }
     }
 
     #[test]
@@ -14739,6 +14846,145 @@ mod tests {
     }
 
     #[test]
+    fn qwen3vl_parity_multiple_images_render_expand_and_position() {
+        let tokenizer = QwenTokenizer::from_json_bytes(test_qwen3vl_tokenizer_json()).unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![
+                        ChatContentPart::Text {
+                            text: "describe ".to_string(),
+                        },
+                        ChatContentPart::Image {
+                            image: Some("first.png".to_string()),
+                            placeholder_tokens: None,
+                        },
+                        ChatContentPart::Text {
+                            text: " now ".to_string(),
+                        },
+                        ChatContentPart::Image {
+                            image: Some("second.png".to_string()),
+                            placeholder_tokens: None,
+                        },
+                    ]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\ndescribe <|vision_start|><|image_pad|><|vision_end|> now <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let vision_start = tokenizer.token_id("<|vision_start|>").unwrap();
+        let vision_end = tokenizer.token_id("<|vision_end|>").unwrap();
+        let image_pad = tokenizer.token_id("<|image_pad|>").unwrap();
+        let prompt_tokens = tokenizer.encode(&rendered).unwrap();
+        assert_eq!(
+            token_run_bounds(&prompt_tokens, image_pad),
+            vec![(4, 5, 1), (8, 9, 1)]
+        );
+
+        let expanded = expand_multimodal_image_placeholders(
+            prompt_tokens,
+            vision_start,
+            vision_end,
+            image_pad,
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 4,
+                    grid_h: 2,
+                    grid_w: 2,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.tokens,
+            vec![
+                100, 5, 7, 200, 202, 202, 202, 202, 201, 8, 200, 202, 202, 201, 101, 100, 6
+            ]
+        );
+        assert_eq!(
+            expanded.image_spans,
+            vec![
+                VisualTokenSpan {
+                    start: 4,
+                    end: 8,
+                    grid_h: 2,
+                    grid_w: 2,
+                },
+                VisualTokenSpan {
+                    start: 11,
+                    end: 13,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+            ]
+        );
+
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, image_pad, &expanded.image_spans)
+                .unwrap();
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[3], MropePosition::text(3));
+        assert_eq!(
+            &positions[4..8],
+            &[
+                MropePosition {
+                    temporal: 4,
+                    height: 4,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 4,
+                    width: 5,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 5,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 5,
+                    width: 5,
+                },
+            ]
+        );
+        assert_eq!(positions[8], MropePosition::text(6));
+        assert_eq!(positions[10], MropePosition::text(8));
+        assert_eq!(
+            &positions[11..13],
+            &[
+                MropePosition {
+                    temporal: 9,
+                    height: 9,
+                    width: 9,
+                },
+                MropePosition {
+                    temporal: 9,
+                    height: 9,
+                    width: 10,
+                },
+            ]
+        );
+        assert_eq!(positions[16], MropePosition::text(14));
+        assert_eq!(next_position, 15);
+    }
+
+    #[test]
     fn qwen3vl_smart_resize_obeys_pixel_budget_after_rounding() {
         let preprocessor = ImagePreprocessor::default_qwen3_vl();
         let (h, w) = preprocessor.smart_resize(10_000, 10_000);
@@ -15699,6 +15945,57 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: serde_json::json!({"city": "London"}),
             }]
+        );
+    }
+
+    #[test]
+    fn flashmoe_parity_qwen_tool_call_serialization_and_parsing_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "");
+        assistant.tool_calls = vec![
+            ChatToolCall {
+                id: Some("call_1".to_string()),
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "London"}),
+            },
+            ChatToolCall {
+                id: Some("call_2".to_string()),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "forecast"}),
+            },
+        ];
+
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[assistant], &[], false)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>assistant\n<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"London\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"search\",\"arguments\":{\"query\":\"forecast\"}}\n</tool_call>\n<|im_end|>\n"
+        );
+
+        let (content, calls) = parse_qwen_tool_call_output(
+            "ready\n<tool_call>\n{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"London\\\"}\"}}\n</tool_call>\n<tool_call>\n{\"tool_call_id\":\"call_2\",\"name\":\"search\",\"arguments\":{\"query\":\"forecast\"}}\n</tool_call>\n",
+        )
+        .unwrap();
+        assert_eq!(content, "ready");
+        assert_eq!(
+            calls,
+            vec![
+                ChatToolCall {
+                    id: Some("call_1".to_string()),
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "London"}),
+                },
+                ChatToolCall {
+                    id: Some("call_2".to_string()),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({"query": "forecast"}),
+                },
+            ]
         );
     }
 
