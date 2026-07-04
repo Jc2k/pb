@@ -1334,9 +1334,9 @@ impl MetalExecutor {
         }
     }
 
-    fn submit_expert_phase(
+    fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         &self,
-        experts: &[ExpertWeights],
+        experts: &[E],
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
@@ -2036,9 +2036,9 @@ impl MetalExecutorInner {
         }
     }
 
-    fn submit_expert_phase(
+    fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         self: &Arc<Self>,
-        experts: &[ExpertWeights],
+        experts: &[E],
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
@@ -2056,7 +2056,7 @@ impl MetalExecutorInner {
         }
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts {
-            let Some(payload) = expert_phase_mlp_payload(expert, normed, width) else {
+            let Some(payload) = expert_phase_mlp_payload(expert.as_ref(), normed, width) else {
                 return Ok(None);
             };
             payloads.push(payload);
@@ -3914,7 +3914,8 @@ impl FlashMoeEngine {
             return Ok(vec![0.0f32; width]);
         };
         let residual = vec![0.0f32; width];
-        Ok(compute_expert_phase_cpu(&[], &[], normed, &residual, Some(&shared), None)?.hidden)
+        let experts: &[ExpertWeights] = &[];
+        Ok(compute_expert_phase_cpu(experts, &[], normed, &residual, Some(&shared), None)?.hidden)
     }
 
     fn shared_expert_phase_weights(
@@ -5030,8 +5031,8 @@ fn add_scaled_in_place(target: &mut [f32], update: &[f32], scale: f32) {
     }
 }
 
-fn compute_expert_phase_cpu(
-    experts: &[ExpertWeights],
+fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
+    experts: &[E],
     weights: &[f32],
     normed: &[f32],
     residual: &[f32],
@@ -5079,7 +5080,7 @@ fn compute_expert_phase_cpu(
         add_in_place(&mut moe, &shared_out);
     }
     for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
-        let contribution = expert.mlp(normed, width)?;
+        let contribution = expert.as_ref().mlp(normed, width)?;
         add_scaled_in_place(&mut moe, &contribution, weight);
     }
     let mut hidden = residual.to_vec();
@@ -7478,6 +7479,12 @@ pub struct ExpertWeights {
     pub expert: usize,
     pub packed: Vec<u8>,
     pub records: Vec<PackedExpertTensor>,
+}
+
+impl AsRef<ExpertWeights> for ExpertWeights {
+    fn as_ref(&self) -> &ExpertWeights {
+        self
+    }
 }
 
 impl ExpertWeights {
@@ -12000,8 +12007,9 @@ mod tests {
         };
         let residual = vec![0.5, -1.0];
         let normed = vec![2.0, 4.0];
+        let experts: &[ExpertWeights] = &[];
         let out = compute_expert_phase_cpu(
-            &[],
+            experts,
             &[],
             &normed,
             &residual,
