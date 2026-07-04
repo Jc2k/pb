@@ -3768,18 +3768,12 @@ fn infer_linear_attention_layout(
         );
     }
     let total_key_width = paired_key_width / 2;
-    let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
-    let key_dim = if config_head_dim > 0 && total_key_width % config_head_dim == 0 {
-        config_head_dim
-    } else if total_key_width % value_dim == 0 {
-        value_dim
-    } else if total_key_width == LINEAR_TOTAL_KEY && z_rows == LINEAR_TOTAL_VALUE {
-        LINEAR_KEY_DIM
-    } else {
-        bail!(
-            "linear-attention layer {layer} key width {total_key_width} is not divisible by config head_dim {config_head_dim} or value_dim {value_dim}"
-        );
-    };
+    let key_dim = infer_linear_attention_key_dim(config, total_key_width, z_rows, value_dim)
+        .with_context(|| {
+            format!(
+                "linear-attention layer {layer} cannot infer key dimension from key width {total_key_width}, value width {z_rows}, value dim {value_dim}"
+            )
+        })?;
     let num_key_heads = total_key_width / key_dim;
     if num_key_heads == 0 {
         bail!("linear-attention layer {layer} inferred zero key heads");
@@ -3805,6 +3799,37 @@ fn infer_linear_attention_layout(
         conv_dim: qkv_rows,
         conv_kernel_size,
     })
+}
+
+fn infer_linear_attention_key_dim(
+    config: &QwenModelConfig,
+    total_key_width: usize,
+    total_value_width: usize,
+    value_dim: usize,
+) -> Result<usize> {
+    let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
+    if config_head_dim > 0 && total_key_width % config_head_dim == 0 {
+        return Ok(config_head_dim);
+    }
+    if is_known_qwen35_linear_attention_shape(total_key_width, total_value_width, value_dim) {
+        return Ok(LINEAR_KEY_DIM);
+    }
+    if total_key_width % value_dim == 0 {
+        return Ok(value_dim);
+    }
+    bail!(
+        "key width is not divisible by config head_dim {config_head_dim} or manifest value_dim {value_dim}"
+    )
+}
+
+fn is_known_qwen35_linear_attention_shape(
+    total_key_width: usize,
+    total_value_width: usize,
+    value_dim: usize,
+) -> bool {
+    total_key_width == LINEAR_TOTAL_KEY
+        && total_value_width == LINEAR_TOTAL_VALUE
+        && value_dim == LINEAR_VALUE_DIM
 }
 
 fn infer_full_attention_layout(
@@ -11709,6 +11734,35 @@ mod tests {
         assert_eq!(layout.conv_kernel_size, 3);
         assert_eq!(layout.conv_state_len(), 24);
         assert_eq!(layout.ssm_state_len(), 16);
+    }
+
+    #[test]
+    fn linear_attention_key_dim_uses_qwen35_default_only_for_known_shape() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":31,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+
+        let key_dim = infer_linear_attention_key_dim(
+            &config,
+            LINEAR_TOTAL_KEY,
+            LINEAR_TOTAL_VALUE,
+            LINEAR_VALUE_DIM,
+        )
+        .expect("exact Qwen3.5 linear-attention shape should allow the default key dim");
+        assert_eq!(key_dim, LINEAR_KEY_DIM);
+
+        let err = infer_linear_attention_key_dim(
+            &config,
+            LINEAR_TOTAL_KEY,
+            LINEAR_TOTAL_VALUE,
+            LINEAR_VALUE_DIM * 32,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not divisible by config head_dim"),
+            "{err:#}"
+        );
     }
 
     #[test]
