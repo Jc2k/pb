@@ -152,7 +152,6 @@ pub enum AgentProfile {
     Monitor,
 }
 
-
 impl fmt::Display for AgentProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -2969,9 +2968,10 @@ fn extract_json_objects(input: &str) -> Vec<String> {
             '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0
-                    && let Some(s) = start.take() {
-                        objects.push(input[s..=i].to_string());
-                    }
+                    && let Some(s) = start.take()
+                {
+                    objects.push(input[s..=i].to_string());
+                }
             }
             _ => {}
         }
@@ -3605,6 +3605,26 @@ fn task_with_attachments(args: &AgentRequest) -> String {
     )
 }
 
+fn ready_qwen3_vl_flashmoe_plan(
+    context: &ToolContext<'_>,
+) -> Option<crate::inference::flashmoe::FlashMoePlan> {
+    let requested_plan =
+        crate::inference::flashmoe::plan(&context.request.model, context.models_root)
+            .filter(|plan| crate::inference::flashmoe::is_qwen3_vl(&plan.model));
+    if let Some(plan) = requested_plan {
+        return Some(plan);
+    }
+
+    let plan = crate::inference::flashmoe::plan(
+        crate::inference::flashmoe::QWEN3_VL_MODEL,
+        context.models_root,
+    )?;
+    match plan.cache_status() {
+        Ok(status) if status.ready => Some(plan),
+        _ => None,
+    }
+}
+
 fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<String> {
     let attachment_id = arguments
         .get("attachment_id")
@@ -3648,28 +3668,25 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.top_k = 1;
 
     // ── FlashMoe Qwen3-VL path ────────────────────────────────────────────────
-    if context.text_backend == TextBackendKind::FlashMoe
-        && let Some(plan) =
-            crate::inference::flashmoe::plan(&context.request.model, context.models_root)
-            && crate::inference::flashmoe::is_qwen3_vl(&plan.model) {
-                let mut engine = crate::inference::flashmoe::load(&plan).with_context(|| {
-                    format!(
-                        "vision_describe: failed to load Qwen3-VL engine for {}",
-                        plan.model
-                    )
-                })?;
-                let output = engine
-                    .generate_with_image(&crate::inference::flashmoe::VisionGenerationRequest {
-                        prompt: structured_prompt,
-                        image_path: absolute,
-                        max_tokens: request.max_tokens,
-                        temperature: request.temperature,
-                        top_k: request.top_k,
-                        seed: request.seed,
-                    })
-                    .context("vision_describe Qwen3-VL model invocation failed")?;
-                return Ok(output.content.trim().to_string());
-            }
+    if let Some(plan) = ready_qwen3_vl_flashmoe_plan(context) {
+        let mut engine = crate::inference::flashmoe::load(&plan).with_context(|| {
+            format!(
+                "vision_describe: failed to load Qwen3-VL engine for {}",
+                plan.model
+            )
+        })?;
+        let output = engine
+            .generate_with_image(&crate::inference::flashmoe::VisionGenerationRequest {
+                prompt: structured_prompt,
+                image_path: absolute,
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+                top_k: request.top_k,
+                seed: request.seed,
+            })
+            .context("vision_describe Qwen3-VL model invocation failed")?;
+        return Ok(output.content.trim().to_string());
+    }
 
     // ── llama.cpp multimodal path ─────────────────────────────────────────────
     let lazy_loaded;
@@ -4394,28 +4411,29 @@ fn parse_repo_skill_file(
         .unwrap_or("");
 
     if file_name == "SKILL.md"
-        && let Some(provider) = agent_skill_provider(&components) {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
-            let (metadata, _) = parse_markdown_frontmatter(&text);
-            let fallback_name = path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .unwrap_or("skill")
-                .to_string();
-            return Ok(Some(SkillMetadata {
-                provider,
-                name: metadata.get("name").cloned().unwrap_or(fallback_name),
-                description: metadata
-                    .get("description")
-                    .or_else(|| metadata.get("summary"))
-                    .cloned()
-                    .unwrap_or_else(|| first_heading_or_default(&text, "Agent skill")),
-                relative_path: rel_string.to_string(),
-                kind: SkillKind::AgentSkill,
-            }));
-        }
+        && let Some(provider) = agent_skill_provider(&components)
+    {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
+        let (metadata, _) = parse_markdown_frontmatter(&text);
+        let fallback_name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("skill")
+            .to_string();
+        return Ok(Some(SkillMetadata {
+            provider,
+            name: metadata.get("name").cloned().unwrap_or(fallback_name),
+            description: metadata
+                .get("description")
+                .or_else(|| metadata.get("summary"))
+                .cloned()
+                .unwrap_or_else(|| first_heading_or_default(&text, "Agent skill")),
+            relative_path: rel_string.to_string(),
+            kind: SkillKind::AgentSkill,
+        }));
+    }
 
     if components == [".github", "copilot-instructions.md"] {
         let text = std::fs::read_to_string(path)
@@ -5165,9 +5183,10 @@ fn extract_diff_paths(diff_stat: &str, diff: &str) -> Vec<String> {
         if let Some(path) = line
             .strip_prefix("+++ b/")
             .or_else(|| line.strip_prefix("--- a/"))
-            && path != "/dev/null" {
-                paths.push(path.to_string());
-            }
+            && path != "/dev/null"
+        {
+            paths.push(path.to_string());
+        }
     }
     paths.sort();
     paths.dedup();

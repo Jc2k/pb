@@ -1184,12 +1184,23 @@ pub fn plan_unchecked_with_routing(
 
 impl FlashMoePlan {
     pub fn cache_status(&self) -> Result<CacheStatus> {
-        let required = [
+        let mut required = vec![
             self.non_expert_weights.clone(),
             self.tensor_manifest.clone(),
             self.model_config.clone(),
             self.tokenizer.clone(),
         ];
+        if is_qwen3_vl(&self.model) {
+            required.extend(
+                [
+                    self.vision_weights.clone(),
+                    self.vision_manifest.clone(),
+                    self.vision_config_path.clone(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
         let mut missing: Vec<PathBuf> = required
             .into_iter()
             .filter(|path| !path.is_file())
@@ -13623,6 +13634,60 @@ mod tests {
         assert!(plan.tokenizer.is_file());
         assert!(plan.runtime_dir.join("tokenizer_config.json").is_file());
         assert!(plan.tensor_manifest.is_file());
+    }
+
+    #[test]
+    fn qwen3vl_cache_status_requires_vision_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN3_VL_MODEL, tmp.path());
+        std::fs::create_dir_all(&plan.runtime_dir).unwrap();
+        std::fs::create_dir_all(&plan.experts_dir).unwrap();
+        std::fs::write(&plan.non_expert_weights, b"").unwrap();
+        std::fs::write(
+            &plan.tensor_manifest,
+            br#"{"model":"hf://Qwen/Qwen3-VL-MoE-Instruct","cache_version":"flashmoe-v1","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &plan.model_config,
+            br#"{
+                "model_type": "qwen3_vl",
+                "text_config": {
+                    "hidden_size": 8,
+                    "num_attention_heads": 2,
+                    "num_hidden_layers": 1,
+                    "num_key_value_heads": 1,
+                    "vocab_size": 16,
+                    "num_experts": 1,
+                    "num_experts_per_tok": 1,
+                    "moe_intermediate_size": 4
+                },
+                "vision_config": {
+                    "depth": 1,
+                    "hidden_size": 4,
+                    "num_heads": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(&plan.tokenizer, b"{}").unwrap();
+
+        let status = plan.cache_status().unwrap();
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_weights.as_ref().unwrap())
+        );
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_manifest.as_ref().unwrap())
+        );
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_config_path.as_ref().unwrap())
+        );
     }
 
     #[test]
