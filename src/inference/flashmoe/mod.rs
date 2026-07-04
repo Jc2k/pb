@@ -111,7 +111,7 @@ pub const VIT_SPATIAL_MERGE_SIZE: usize = VIT_PATCH_SIZE * VIT_MERGE_SIZE; // 28
 /// ImageNet pixel mean for ViT normalisation (RGB order).
 pub const VIT_IMAGE_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 /// ImageNet pixel std for ViT normalisation (RGB order).
-pub const VIT_IMAGE_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub const VIT_IMAGE_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 /// Upper pixel budget for an input image (~1 280 merged visual tokens).
 pub const VIT_MAX_PIXELS: usize = 1280 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
 /// Lower pixel budget for an input image (at least 4 merged visual tokens).
@@ -894,21 +894,20 @@ impl QwenModelConfig {
         {
             bail!("Qwen config contains zero-valued required dimensions");
         }
-        if self.hidden_size % self.num_attention_heads != 0 {
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
             bail!(
                 "hidden_size {} is not divisible by num_attention_heads {}",
                 self.hidden_size,
                 self.num_attention_heads
             );
         }
-        if let Some(kv_heads) = self.num_key_value_heads {
-            if kv_heads == 0 || self.num_attention_heads % kv_heads != 0 {
+        if let Some(kv_heads) = self.num_key_value_heads
+            && (kv_heads == 0 || !self.num_attention_heads.is_multiple_of(kv_heads)) {
                 bail!(
                     "num_key_value_heads {kv_heads} must divide num_attention_heads {}",
                     self.num_attention_heads
                 );
             }
-        }
         let experts = self.num_experts.unwrap_or(NUM_EXPERTS);
         let active = self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN);
         if experts == 0 || active == 0 || active > experts {
@@ -916,21 +915,18 @@ impl QwenModelConfig {
                 "invalid MoE routing config: num_experts={experts}, num_experts_per_tok={active}"
             );
         }
-        if let Some(theta) = self.rope_theta {
-            if !theta.is_finite() || theta <= 0.0 {
+        if let Some(theta) = self.rope_theta
+            && (!theta.is_finite() || theta <= 0.0) {
                 bail!("rope_theta must be positive and finite, got {theta}");
             }
-        }
-        if let Some(factor) = self.partial_rotary_factor {
-            if !factor.is_finite() || factor <= 0.0 || factor > 1.0 {
+        if let Some(factor) = self.partial_rotary_factor
+            && (!factor.is_finite() || factor <= 0.0 || factor > 1.0) {
                 bail!("partial_rotary_factor must be in (0, 1], got {factor}");
             }
-        }
-        if let Some(section) = self.mrope_section {
-            if section.contains(&0) {
+        if let Some(section) = self.mrope_section
+            && section.contains(&0) {
                 bail!("mrope_section entries must be positive, got {section:?}");
             }
-        }
         if let Some(vision) = &self.vision_config {
             if vision.depth == 0
                 || vision.embed_dim == 0
@@ -1398,7 +1394,7 @@ fn expand_multimodal_image_placeholders(
             expanded.push(vision_start_token);
         }
         let span_start = expanded.len();
-        expanded.extend(std::iter::repeat(image_pad_token).take(spec.token_count));
+        expanded.extend(std::iter::repeat_n(image_pad_token, spec.token_count));
         let span_end = expanded.len();
         image_spans.push(VisualTokenSpan {
             start: span_start,
@@ -1545,7 +1541,7 @@ impl MetalExecutor {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let route_top4_enabled = metal_route_top4_enabled();
-            return Ok(Some(Self {
+            Ok(Some(Self {
                 inner: Arc::new(MetalExecutorInner::new(
                     plan,
                     config,
@@ -1553,7 +1549,7 @@ impl MetalExecutor {
                     route_top4_enabled,
                 )?),
                 route_top4_enabled,
-            }));
+            }))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1570,7 +1566,7 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.project_q4_expert(expert, hidden, width);
+            self.inner.project_q4_expert(expert, hidden, width)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1589,10 +1585,10 @@ impl MetalExecutor {
     ) -> Result<Option<DeferredExpertPhase>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
+            self
                 .inner
                 .submit_expert_phase(experts, weights, normed, residual, shared, next_norm_weight)
-                .map(|pending| pending.map(DeferredExpertPhase::Metal));
+                .map(|pending| pending.map(DeferredExpertPhase::Metal))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1613,7 +1609,7 @@ impl MetalExecutor {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.route_top4(scores);
+            self.inner.route_top4(scores)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1624,7 +1620,7 @@ impl MetalExecutor {
     fn rms_norm(&self, input: &[f32], weight: Option<&[f32]>) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.rms_norm(input, weight);
+            self.inner.rms_norm(input, weight)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1643,7 +1639,7 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.dense_matvec(weights, input, rows, cols);
+            self.inner.dense_matvec(weights, input, rows, cols)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1660,7 +1656,7 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.apply_rope(values, position, head_dim, theta);
+            self.inner.apply_rope(values, position, head_dim, theta)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1680,13 +1676,13 @@ impl MetalExecutor {
     ) -> Result<Option<Vec<f32>>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.apply_rope_for_layout(
+            self.inner.apply_rope_for_layout(
                 values,
                 position,
                 theta,
                 layout,
                 mrope_section,
-            );
+            )
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1706,13 +1702,13 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.causal_attention(
+            self.inner.causal_attention(
                 query,
                 keys_values,
                 num_q_heads,
                 kv_heads,
                 head_dim,
-            );
+            )
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1736,7 +1732,7 @@ impl MetalExecutor {
     ) -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.record_kv(position, layer, layout, key, value);
+            self.inner.record_kv(position, layer, layout, key, value)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1754,9 +1750,9 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self
+            self
                 .inner
-                .causal_attention_cached(position, layer, query, layout);
+                .causal_attention_cached(position, layer, query, layout)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1768,7 +1764,7 @@ impl MetalExecutor {
     fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.attention_backend(tokens);
+            self.inner.attention_backend(tokens)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1956,12 +1952,11 @@ impl Drop for MetalExecutorInner {
             release(self.topk_vocab_pipeline);
             release(self.gqa_scores_pipeline);
             release(self.gqa_read_pipeline);
-            if let Ok(kv_cache) = self.kv_cache.get_mut() {
-                if let Some(kv_cache) = kv_cache.take() {
+            if let Ok(kv_cache) = self.kv_cache.get_mut()
+                && let Some(kv_cache) = kv_cache.take() {
                     release(kv_cache.keys);
                     release(kv_cache.values);
                 }
-            }
             release(self.command_queue);
             release(self.device);
             if let Ok(buffers) = self.reusable.get_mut() {
@@ -2220,7 +2215,7 @@ impl MetalExecutorInner {
         if layout.rotary_pairing != RotaryPairing::SplitHalf || layout.rotary_dim == 0 {
             return Ok(None);
         }
-        if values.len() % layout.head_dim != 0 {
+        if !values.len().is_multiple_of(layout.head_dim) {
             bail!(
                 "Metal RoPE input len {} is not divisible by head_dim {}",
                 values.len(),
@@ -2293,11 +2288,10 @@ impl MetalExecutorInner {
         if width == 0 || normed.len() < width || weights.len() != experts.len() {
             return Ok(None);
         }
-        if let Some(weight) = next_norm_weight {
-            if weight.len() < width {
+        if let Some(weight) = next_norm_weight
+            && weight.len() < width {
                 return Ok(None);
             }
-        }
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts {
             let Some(payload) = expert_phase_mlp_payload(expert.as_ref(), normed, width) else {
@@ -2557,7 +2551,7 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         output_offset: u64,
         buffers: &mut Vec<ObjcId>,
-    ) -> Result<()> {
+    ) -> Result<()> { unsafe {
         let packed_buffer = self.buffer_with_bytes(&payload.packed)?;
         buffers.push(packed_buffer);
         let scale_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.scales))?;
@@ -2588,7 +2582,7 @@ impl MetalExecutorInner {
         set_buffer(encoder, group_size_buffer, 8);
         dispatch_q4_threadgroups(encoder, payload.rows as u64);
         Ok(())
-    }
+    }}
 
     unsafe fn encode_dense_matvec(
         &self,
@@ -2598,7 +2592,7 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         cols_buffer: ObjcId,
         rows: usize,
-    ) {
+    ) { unsafe {
         msg_send_void1_id(
             encoder,
             sel("setComputePipelineState:"),
@@ -2609,7 +2603,7 @@ impl MetalExecutorInner {
         set_buffer(encoder, output_buffer, 2);
         set_buffer(encoder, cols_buffer, 3);
         dispatch_threads(encoder, rows as u64);
-    }
+    }}
 
     unsafe fn encode_fill_zero(
         &self,
@@ -2617,7 +2611,7 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         width_buffer: ObjcId,
         width: usize,
-    ) {
+    ) { unsafe {
         msg_send_void1_id(
             encoder,
             sel("setComputePipelineState:"),
@@ -2626,7 +2620,7 @@ impl MetalExecutorInner {
         set_buffer(encoder, output_buffer, 0);
         set_buffer(encoder, width_buffer, 1);
         dispatch_threads(encoder, width as u64);
-    }
+    }}
 
     fn route_top4(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
         if scores.is_empty() {
@@ -3014,7 +3008,7 @@ impl MetalExecutorInner {
         pipeline: ObjcId,
         buffers: &[ObjcId],
         threads: u64,
-    ) -> Result<()> {
+    ) -> Result<()> { unsafe {
         let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
         if command_buffer.is_null() {
             bail!("failed to create Flash-MoE Metal command buffer");
@@ -3035,16 +3029,16 @@ impl MetalExecutorInner {
         release(encoder);
         release(command_buffer);
         Ok(())
-    }
+    }}
 
-    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
+    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> { unsafe {
         let buffer = self.buffer_with_len(bytes.len())?;
         let contents = msg_send_ptr0(buffer, sel("contents"));
         ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
         Ok(buffer)
-    }
+    }}
 
-    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> {
+    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> { unsafe {
         {
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
             if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
@@ -3057,9 +3051,9 @@ impl MetalExecutorInner {
             bail!("failed to allocate Flash-MoE Metal output buffer");
         }
         Ok(buffer)
-    }
+    }}
 
-    unsafe fn recycle(&self, buffer: ObjcId) {
+    unsafe fn recycle(&self, buffer: ObjcId) { unsafe {
         // Keep a tiny reuse pool so repeated decode steps do not immediately
         // churn all buffers under memory pressure. Drop older buffers quickly
         // because expert data is streamed and can be very large.
@@ -3070,7 +3064,7 @@ impl MetalExecutorInner {
         } else {
             release(buffer);
         }
-    }
+    }}
 }
 
 impl FlashMoeEngine {
@@ -3132,9 +3126,9 @@ impl FlashMoeEngine {
     fn generate_structured_inner(
         &mut self,
         request: &StructuredGenerationRequest,
-        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<TimedGenerationOutput> {
-        self.generate_structured_inner_with_session(request, None, timing.as_deref_mut())
+        self.generate_structured_inner_with_session(request, None, timing)
     }
 
     fn generate_structured_inner_with_session(
@@ -3268,9 +3262,9 @@ impl FlashMoeEngine {
         &mut self,
         prompt_tokens: &[u32],
         kv_cache: &mut KvCache,
-        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<Vec<f32>> {
-        self.prefill_from(prompt_tokens, 0, kv_cache, timing.as_deref_mut())
+        self.prefill_from(prompt_tokens, 0, kv_cache, timing)
     }
 
     fn prefill_from(
@@ -3394,11 +3388,7 @@ impl FlashMoeEngine {
             } else {
                 None
             };
-            let override_emb = if let Some(idx) = visual_index {
-                Some(visual_embeddings[idx].clone())
-            } else {
-                None
-            };
+            let override_emb = visual_index.map(|idx| visual_embeddings[idx].clone());
             let deepstack = visual_index.map(|idx| DeepstackTokenContext {
                 features: deepstack_features,
                 visual_index: idx,
@@ -3586,7 +3576,7 @@ impl FlashMoeEngine {
                         visual_deepstack.len()
                     );
                 }
-                for (dst, mut src) in accumulated_deepstack.into_iter().zip(visual_deepstack) {
+                for (dst, mut src) in accumulated_deepstack.iter_mut().zip(visual_deepstack) {
                     dst.append(&mut src);
                 }
             } else {
@@ -3799,7 +3789,7 @@ impl FlashMoeEngine {
                     kv_cache,
                     position,
                     rope_position,
-                    &runtime,
+                    runtime,
                 )?
             };
             layer_timing.buckets.attention_projection += attention_started.elapsed();
@@ -3918,8 +3908,8 @@ impl FlashMoeEngine {
                 }
                 continue;
             }
-            if let Some(context) = deepstack {
-                if let Some(features_for_layer) = context.features.get(layer) {
+            if let Some(context) = deepstack
+                && let Some(features_for_layer) = context.features.get(layer) {
                     let feature =
                         features_for_layer
                             .get(context.visual_index)
@@ -3938,7 +3928,6 @@ impl FlashMoeEngine {
                     }
                     add_in_place(&mut hidden, feature);
                 }
-            }
             kv_cache.record_layer_state(position, layer, state)?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
@@ -3964,7 +3953,7 @@ impl FlashMoeEngine {
         if record_generated {
             kv_cache.record_generated_token(position, previous)?;
         }
-        if let Some(timing) = timing.as_deref_mut() {
+        if let Some(timing) = timing {
             timing.buckets.combine_norm += combine_started.elapsed();
             timing.buckets.total_wall = token_started.elapsed();
         }
@@ -4712,13 +4701,13 @@ fn infer_linear_attention_key_dim(
     value_dim: usize,
 ) -> Result<usize> {
     let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
-    if config_head_dim > 0 && total_key_width % config_head_dim == 0 {
+    if config_head_dim > 0 && total_key_width.is_multiple_of(config_head_dim) {
         return Ok(config_head_dim);
     }
     if is_known_qwen35_linear_attention_shape(total_key_width, total_value_width, value_dim) {
         return Ok(LINEAR_KEY_DIM);
     }
-    if total_key_width % value_dim == 0 {
+    if total_key_width.is_multiple_of(value_dim) {
         return Ok(value_dim);
     }
     bail!(
@@ -4910,11 +4899,10 @@ fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
     let scale = (mean_square + 1e-6).sqrt().recip();
     for (idx, value) in values.iter_mut().enumerate() {
         *value *= scale;
-        if let Some(weight) = weight {
-            if let Some(weight) = weight.get(idx) {
+        if let Some(weight) = weight
+            && let Some(weight) = weight.get(idx) {
                 *value *= *weight;
             }
-        }
     }
 }
 
@@ -4934,14 +4922,13 @@ fn apply_per_head_rms_norm(
             values.len()
         );
     }
-    if let Some(weight) = weight {
-        if weight.len() < head_dim {
+    if let Some(weight) = weight
+        && weight.len() < head_dim {
             bail!(
                 "per-head RMSNorm weight has len {}; expected at least head_dim {head_dim}",
                 weight.len()
             );
         }
-    }
     for head in values.chunks_mut(head_dim) {
         rms_norm_with_weight_in_place(head, weight.map(|w| &w[..head_dim]));
     }
@@ -5726,8 +5713,7 @@ impl QwenTokenizer {
                 .id_to_token
                 .get(token as usize)
                 .filter(|piece| !piece.is_empty())
-            {
-                if !piece.starts_with("<|") {
+                && !piece.starts_with("<|") {
                     if let Some(bytes) = byte_level_piece_to_bytes(piece) {
                         byte_buffer.extend(bytes);
                     } else {
@@ -5738,7 +5724,6 @@ impl QwenTokenizer {
                         out.push_str(&decode_token_piece(piece));
                     }
                 }
-            }
         }
         if !byte_buffer.is_empty() {
             out.push_str(&String::from_utf8_lossy(&byte_buffer));
@@ -6266,7 +6251,7 @@ fn parse_qwen_tool_arguments(value: &Value) -> Result<Value> {
 }
 
 fn decode_token_piece(piece: &str) -> String {
-    piece.replace('Ġ', " ").replace('▁', " ")
+    piece.replace(['Ġ', '▁'], " ")
 }
 
 fn byte_to_unicode(byte: u8) -> char {
@@ -7004,7 +6989,7 @@ fn is_full_attention_layer(layer: usize) -> bool {
     //
     // Flash-MoE schedules full attention every 4th layer when counted from 1.
     // In 0-indexed coordinates that is layers 3, 7, 11, ...
-    (layer + 1) % FULL_ATTN_INTERVAL == 0
+    (layer + 1).is_multiple_of(FULL_ATTN_INTERVAL)
 }
 
 fn router_tensor_name(layer: usize) -> String {
@@ -7157,8 +7142,8 @@ impl DenseStore {
         width: usize,
     ) -> Result<Vec<f32>> {
         let tensor_name = attention_tensor_name(layer, name);
-        if let Some(metal) = metal {
-            if let Some(entry) = self.registry.tensor(&tensor_name) {
+        if let Some(metal) = metal
+            && let Some(entry) = self.registry.tensor(&tensor_name) {
                 let cols = entry.shape.last().copied().unwrap_or(0);
                 let rows = entry.shape.first().copied().unwrap_or(width).min(width);
                 let used_cols = cols.min(input.len());
@@ -7166,7 +7151,6 @@ impl DenseStore {
                     return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
                 }
             }
-        }
         self.project(layer, name, input, width)
     }
 
@@ -7252,8 +7236,8 @@ impl DenseStore {
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
         let tensor_name = router_tensor_name(layer);
-        if let Some(metal) = metal {
-            if let Some(entry) = self.registry.tensor(&tensor_name) {
+        if let Some(metal) = metal
+            && let Some(entry) = self.registry.tensor(&tensor_name) {
                 let cols = entry.shape.last().copied().unwrap_or(0);
                 let rows = entry.shape.first().copied().unwrap_or(experts).min(experts);
                 if rows > 0 && cols > 0 && cols <= hidden.len() {
@@ -7262,7 +7246,6 @@ impl DenseStore {
                     return Ok(scores);
                 }
             }
-        }
 
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
@@ -7279,8 +7262,8 @@ impl DenseStore {
         tokenizer: &QwenTokenizer,
     ) -> Result<Vec<f32>> {
         let lm_head_name = self.lm_head_tensor_name()?;
-        if let Some(metal) = metal {
-            if let Some(entry) = self.registry.tensor(lm_head_name) {
+        if let Some(metal) = metal
+            && let Some(entry) = self.registry.tensor(lm_head_name) {
                 let cols = entry.shape.last().copied().unwrap_or(0);
                 let rows = entry
                     .shape
@@ -7302,7 +7285,6 @@ impl DenseStore {
                     return Ok(logits);
                 }
             }
-        }
 
         self.lm_head_logits(lm_head_name, hidden, tokenizer)
     }
@@ -7646,7 +7628,7 @@ fn dtype_size(dtype: &str) -> Option<usize> {
 fn decode_dense_tensor_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>> {
     match dtype.to_ascii_uppercase().as_str() {
         "F32" | "FLOAT32" | "FP32" => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 bail!(
                     "F32 tensor byte length {} is not divisible by 4",
                     bytes.len()
@@ -7658,7 +7640,7 @@ fn decode_dense_tensor_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>> {
                 .collect())
         }
         "BF16" | "BFLOAT16" => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 bail!(
                     "BF16 tensor byte length {} is not divisible by 2",
                     bytes.len()
@@ -7673,7 +7655,7 @@ fn decode_dense_tensor_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>> {
                 .collect())
         }
         "F16" | "FLOAT16" | "FP16" => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 bail!(
                     "F16 tensor byte length {} is not divisible by 2",
                     bytes.len()
@@ -9032,7 +9014,7 @@ fn class(name: &str) -> ObjcId {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn ns_string(value: &str) -> ObjcId {
+unsafe fn ns_string(value: &str) -> ObjcId { unsafe {
     let alloc = msg_send_id0(class("NSString"), sel("alloc"));
     msg_send_id3_ptr_usize_u64(
         alloc,
@@ -9041,10 +9023,10 @@ unsafe fn ns_string(value: &str) -> ObjcId {
         value.len(),
         4,
     )
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> {
+unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> { unsafe {
     let function_name = ns_string(name);
     let function = msg_send_id1_id(library, sel("newFunctionWithName:"), function_name);
     release(function_name);
@@ -9052,19 +9034,19 @@ unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> {
         bail!("compiled Flash-MoE Metal library is missing kernel `{name}`");
     }
     Ok(function)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn compile_pipeline(device: ObjcId, library: ObjcId, name: &str) -> Result<ObjcId> {
+unsafe fn compile_pipeline(device: ObjcId, library: ObjcId, name: &str) -> Result<ObjcId> { unsafe {
     let function = new_function(library, name)?;
     let pipeline = new_compute_pipeline(device, function)
         .with_context(|| format!("failed to create {name} Metal pipeline"))?;
     release(function);
     Ok(pipeline)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcId> {
+unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcId> { unsafe {
     let pipeline = msg_send_id3(
         device,
         sel("newComputePipelineStateWithFunction:error:"),
@@ -9074,15 +9056,15 @@ unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcI
         bail!("failed to create Flash-MoE Metal compute pipeline");
     }
     Ok(pipeline)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) {
+unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) { unsafe {
     set_buffer_with_offset(encoder, buffer, 0, index);
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, index: u64) {
+unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, index: u64) { unsafe {
     msg_send_void4(
         encoder,
         sel("setBuffer:offset:atIndex:"),
@@ -9090,18 +9072,18 @@ unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, i
         offset,
         index,
     );
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> {
+unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> { unsafe {
     let contents = msg_send_ptr0(buffer, sel("contents"));
     let mut output = vec![0.0f32; len];
     ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), len);
     output
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
+unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) { unsafe {
     let grid = MtlSize {
         width: threads,
         height: 1,
@@ -9118,10 +9100,10 @@ unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
         grid,
         threadgroup,
     );
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
+unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) { unsafe {
     const Q4_ROWS_PER_THREADGROUP: u64 = 8;
     let grid = MtlSize {
         width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
@@ -9139,7 +9121,7 @@ unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
         grid,
         threadgroup,
     );
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn f32_as_bytes(values: &[f32]) -> &[u8] {
@@ -9185,32 +9167,32 @@ struct MtlSize {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn release(receiver: ObjcId) {
+unsafe fn release(receiver: ObjcId) { unsafe {
     if !receiver.is_null() {
         msg_send_void0(receiver, sel("release"));
     }
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id0(receiver: ObjcId, selector: Sel) -> ObjcId {
+unsafe fn msg_send_id0(receiver: ObjcId, selector: Sel) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+unsafe fn msg_send_id1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, arg)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, *mut ObjcId) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, arg, ptr::null_mut())
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id4(
@@ -9219,11 +9201,11 @@ unsafe fn msg_send_id4(
     arg1: ObjcId,
     arg2: ObjcId,
     arg3: ObjcId,
-) -> ObjcId {
+) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, ObjcId) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, arg1, arg2, arg3)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id2_usize_u64(
@@ -9231,11 +9213,11 @@ unsafe fn msg_send_id2_usize_u64(
     selector: Sel,
     len: usize,
     options: u64,
-) -> ObjcId {
+) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, usize, u64) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, len, options)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id3_ptr_usize_u64(
@@ -9244,52 +9226,52 @@ unsafe fn msg_send_id3_ptr_usize_u64(
     bytes: *const c_void,
     len: usize,
     options: u64,
-) -> ObjcId {
+) -> ObjcId { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, *const c_void, usize, u64) -> ObjcId =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, bytes, len, options)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) {
+unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel) = std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector);
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) {
+unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, arg);
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) {
+unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, a, b);
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u64, arg3: u64) {
+unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u64, arg3: u64) { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, u64, u64) =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, arg1, arg2, arg3);
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void {
+unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector)
-}
+}}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_usize0(receiver: ObjcId, selector: Sel) -> usize {
+unsafe fn msg_send_usize0(receiver: ObjcId, selector: Sel) -> usize { unsafe {
     let f: unsafe extern "C" fn(ObjcId, Sel) -> usize =
         std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector)
-}
+}}
 
 fn expert_store_size(path: &Path) -> Result<(usize, u64)> {
     if !path.is_dir() {
@@ -9843,7 +9825,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
         )
     })?;
     fs::write(plan.runtime_dir.join("README.txt"), plan.describe())
-        .with_context(|| format!("failed to write Flash-MoE cache README"))?;
+        .with_context(|| "failed to write Flash-MoE cache README".to_string())?;
     Ok(plan)
 }
 
@@ -10247,16 +10229,16 @@ fn pack_aggregate_expert_layer(
     let layout = AggregateExpertLayout::new(config)?;
 
     let gate_up =
-        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?.clone();
+        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?;
     let down =
-        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?.clone();
+        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
     validate_aggregate_expert_tensor_shape(
-        &gate_up,
+        gate_up,
         &[layout.experts, layout.intermediate * 2, layout.hidden],
         "gate_up_proj",
     )?;
     validate_aggregate_expert_tensor_shape(
-        &down,
+        down,
         &[layout.experts, layout.hidden, layout.intermediate],
         "down_proj",
     )?;
@@ -10273,8 +10255,8 @@ fn pack_aggregate_expert_layer(
             &mut shard_cache,
             layer,
             expert,
-            &gate_up,
-            &down,
+            gate_up,
+            down,
             layout,
         )?;
         expected.push(ExpectedExpertPack {
@@ -10289,8 +10271,8 @@ fn pack_aggregate_expert_layer(
             &mut shard_cache,
             layer,
             expert,
-            &gate_up,
-            &down,
+            gate_up,
+            down,
             layout,
         )
     })?;
@@ -10707,7 +10689,7 @@ fn temp_pack_path(path: &Path) -> PathBuf {
 
 fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
     let path = expert_layer_path(root, layer);
-    let Ok(mut file) = fs::File::open(&path) else {
+    let Ok(file) = fs::File::open(&path) else {
         return false;
     };
     let Ok(Some(layer_metadata)) = read_expert_layer_pack_metadata(root, layer) else {
@@ -11522,7 +11504,7 @@ impl ImagePreprocessor {
 }
 
 fn round_up_to_stride(value: u32, stride: u32) -> u32 {
-    ((value + stride - 1) / stride) * stride
+    value.div_ceil(stride) * stride
 }
 
 fn round_to_stride(value: f64, stride: u32) -> u32 {
@@ -11777,13 +11759,12 @@ impl VisionEncoder {
         let side = perfect_square_side(entries).with_context(|| {
             format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
         })?;
-        if let Some(config_entries) = self.config.num_position_embeddings {
-            if config_entries != entries {
+        if let Some(config_entries) = self.config.num_position_embeddings
+            && config_entries != entries {
                 bail!(
                     "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
                 );
             }
-        }
 
         let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
         if coords.len() != hidden.len() {
@@ -11793,7 +11774,7 @@ impl VisionEncoder {
                 hidden.len()
             );
         }
-        for (patch, (row, col)) in hidden.iter_mut().zip(coords.into_iter()) {
+        for (patch, (row, col)) in hidden.iter_mut().zip(coords) {
             for (idx, weight) in bilinear_position_corners(row, col, grid_h, grid_w, side) {
                 let start = idx * embed_dim;
                 for (value, pos) in patch

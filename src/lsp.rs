@@ -438,8 +438,8 @@ impl LspClient {
         }
     }
     fn handle_notification(&mut self, method: &str, params: Value) {
-        if method == "textDocument/publishDiagnostics" {
-            if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+        if method == "textDocument/publishDiagnostics"
+            && let Some(uri) = params.get("uri").and_then(Value::as_str) {
                 self.diagnostics.insert(
                     uri.to_string(),
                     params
@@ -448,7 +448,6 @@ impl LspClient {
                         .unwrap_or_else(|| json!([])),
                 );
             }
-        }
     }
 }
 

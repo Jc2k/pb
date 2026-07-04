@@ -119,28 +119,24 @@ impl ParamMatcher {
                 regex,
                 exists,
             } => {
-                if let Some(expected_exists) = exists {
-                    if value.is_some() != *expected_exists {
+                if let Some(expected_exists) = exists
+                    && value.is_some() != *expected_exists {
                         return false;
                     }
-                }
-                if let Some(expected) = equals {
-                    if !value.is_some_and(|actual| actual == expected) {
+                if let Some(expected) = equals
+                    && !value.is_some_and(|actual| actual == expected) {
                         return false;
                     }
-                }
-                if let Some(needle) = contains {
-                    if !value_to_match_text(value).is_some_and(|actual| actual.contains(needle)) {
+                if let Some(needle) = contains
+                    && !value_to_match_text(value).is_some_and(|actual| actual.contains(needle)) {
                         return false;
                     }
-                }
-                if let Some(pattern) = glob {
-                    if !value_to_match_text(value)
+                if let Some(pattern) = glob
+                    && !value_to_match_text(value)
                         .is_some_and(|actual| wildcard_match(pattern, &actual))
                     {
                         return false;
                     }
-                }
                 if let Some(pattern) = regex {
                     let Ok(re) = Regex::new(pattern) else {
                         return false;

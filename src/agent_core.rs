@@ -139,7 +139,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentProfile {
+    #[default]
     Build,
     Scout,
     Review,
@@ -150,11 +152,6 @@ pub enum AgentProfile {
     Monitor,
 }
 
-impl Default for AgentProfile {
-    fn default() -> Self {
-        Self::Build
-    }
-}
 
 impl fmt::Display for AgentProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2971,11 +2968,10 @@ fn extract_json_objects(input: &str) -> Vec<String> {
             '{' => depth += 1,
             '}' => {
                 depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    if let Some(s) = start.take() {
+                if depth == 0
+                    && let Some(s) = start.take() {
                         objects.push(input[s..=i].to_string());
                     }
-                }
             }
             _ => {}
         }
@@ -3652,11 +3648,10 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
     request.top_k = 1;
 
     // ── FlashMoe Qwen3-VL path ────────────────────────────────────────────────
-    if context.text_backend == TextBackendKind::FlashMoe {
-        if let Some(plan) =
+    if context.text_backend == TextBackendKind::FlashMoe
+        && let Some(plan) =
             crate::inference::flashmoe::plan(&context.request.model, context.models_root)
-        {
-            if crate::inference::flashmoe::is_qwen3_vl(&plan.model) {
+            && crate::inference::flashmoe::is_qwen3_vl(&plan.model) {
                 let mut engine = crate::inference::flashmoe::load(&plan).with_context(|| {
                     format!(
                         "vision_describe: failed to load Qwen3-VL engine for {}",
@@ -3675,8 +3670,6 @@ fn run_vision_describe(arguments: &Value, context: &ToolContext<'_>) -> Result<S
                     .context("vision_describe Qwen3-VL model invocation failed")?;
                 return Ok(output.content.trim().to_string());
             }
-        }
-    }
 
     // ── llama.cpp multimodal path ─────────────────────────────────────────────
     let lazy_loaded;
@@ -4400,8 +4393,8 @@ fn parse_repo_skill_file(
         .and_then(|name| name.to_str())
         .unwrap_or("");
 
-    if file_name == "SKILL.md" {
-        if let Some(provider) = agent_skill_provider(&components) {
+    if file_name == "SKILL.md"
+        && let Some(provider) = agent_skill_provider(&components) {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read skill metadata {}", path.display()))?;
             let (metadata, _) = parse_markdown_frontmatter(&text);
@@ -4423,7 +4416,6 @@ fn parse_repo_skill_file(
                 kind: SkillKind::AgentSkill,
             }));
         }
-    }
 
     if components == [".github", "copilot-instructions.md"] {
         let text = std::fs::read_to_string(path)
@@ -4438,7 +4430,7 @@ fn parse_repo_skill_file(
     }
 
     if components.first().is_some_and(|part| *part == ".github")
-        && components.iter().any(|part| *part == "instructions")
+        && components.contains(&"instructions")
         && file_name.ends_with(".instructions.md")
     {
         return parse_copilot_markdown_skill(
@@ -4451,7 +4443,7 @@ fn parse_repo_skill_file(
     }
 
     if components.first().is_some_and(|part| *part == ".github")
-        && components.iter().any(|part| *part == "prompts")
+        && components.contains(&"prompts")
         && file_name.ends_with(".prompt.md")
     {
         return parse_copilot_markdown_skill(
@@ -5173,11 +5165,9 @@ fn extract_diff_paths(diff_stat: &str, diff: &str) -> Vec<String> {
         if let Some(path) = line
             .strip_prefix("+++ b/")
             .or_else(|| line.strip_prefix("--- a/"))
-        {
-            if path != "/dev/null" {
+            && path != "/dev/null" {
                 paths.push(path.to_string());
             }
-        }
     }
     paths.sort();
     paths.dedup();

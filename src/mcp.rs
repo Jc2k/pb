@@ -404,8 +404,8 @@ impl StdioMcpClient {
             if trimmed.is_empty() {
                 break;
             }
-            if let Some((name, value)) = trimmed.split_once(':') {
-                if name.eq_ignore_ascii_case("Content-Length") {
+            if let Some((name, value)) = trimmed.split_once(':')
+                && name.eq_ignore_ascii_case("Content-Length") {
                     let length = value
                         .trim()
                         .parse::<usize>()
@@ -415,7 +415,6 @@ impl StdioMcpClient {
                     }
                     content_length = Some(length);
                 }
-            }
         }
         let length = content_length.context("MCP response missing Content-Length header")?;
         let mut body = vec![0; length];

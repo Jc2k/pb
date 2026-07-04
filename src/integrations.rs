@@ -354,15 +354,14 @@ fn fetch_registry_json(
             .get(WWW_AUTHENTICATE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        if let Some(challenge) = challenge {
-            if let Some(token) = fetch_bearer_token(client, &challenge, image)? {
+        if let Some(challenge) = challenge
+            && let Some(token) = fetch_bearer_token(client, &challenge, image)? {
                 response = client
                     .get(url)
                     .header(ACCEPT, accept)
                     .header(AUTHORIZATION, format!("Bearer {token}"))
                     .send()?;
             }
-        }
     }
     let response = response.error_for_status()?;
     response

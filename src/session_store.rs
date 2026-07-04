@@ -130,7 +130,7 @@ pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSe
         match read_note(workspace_root, note_ref).and_then(|payload| parse_session(&payload)) {
             Ok(mut session) => {
                 session.status = Some(
-                    match session.status.unwrap_or_else(|| {
+                    match session.status.unwrap_or({
                         if session.running {
                             SessionStatus::Running
                         } else {
