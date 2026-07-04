@@ -43,6 +43,7 @@ pub const CACHE_VERSION: &str = "flashmoe-v1";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
+const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
 const FLASHMOE_METAL_ROUTING_ENV: &str = "PB_FLASHMOE_METAL_ROUTING";
 const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
 const METAL_ATTENTION_BENCH_SAMPLES: usize = 3;
@@ -138,6 +139,77 @@ fn env_flag_enabled(value: &OsString) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlashMoeRoutingPolicy {
+    pub active_experts_override: Option<usize>,
+    pub force_active_experts: bool,
+}
+
+impl FlashMoeRoutingPolicy {
+    pub fn new(active_experts_override: Option<usize>, force_active_experts: bool) -> Self {
+        Self {
+            active_experts_override,
+            force_active_experts,
+        }
+    }
+
+    fn resolve(&self, model: &str, config: &QwenModelConfig) -> Result<ResolvedRoutingPolicy> {
+        let qwen35_profile = is_qwen35_or_legacy_alias(model);
+        let (source, active_experts) = if let Some(active_experts) = self.active_experts_override {
+            (ActiveExpertsSource::UserOverride, active_experts)
+        } else if qwen35_profile {
+            (
+                ActiveExpertsSource::Qwen35FlashMoeProfile,
+                ACTIVE_EXPERTS_PER_TOKEN,
+            )
+        } else {
+            (
+                ActiveExpertsSource::ModelConfig,
+                config.config_active_experts(),
+            )
+        };
+        let experts = config.experts();
+        if experts == 0 || active_experts == 0 || active_experts > experts {
+            bail!(
+                "invalid MoE routing policy: num_experts={experts}, active_experts={active_experts}"
+            );
+        }
+        if qwen35_profile && active_experts < QWEN35_MIN_ACTIVE_EXPERTS {
+            if self.force_active_experts {
+                tracing::warn!(
+                    model,
+                    active_experts,
+                    minimum = QWEN35_MIN_ACTIVE_EXPERTS,
+                    "forcing Qwen3.5 Flash-MoE active-expert count below the quality guard"
+                );
+            } else {
+                bail!(
+                    "Qwen3.5 Flash-MoE routing requires K >= {QWEN35_MIN_ACTIVE_EXPERTS}; got K={active_experts}. Set model.flashmoe_force_active_experts=true or pass --flashmoe-force-active-experts to force this experimental routing."
+                );
+            }
+        }
+        Ok(ResolvedRoutingPolicy {
+            active_experts,
+            source,
+            force_active_experts: self.force_active_experts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveExpertsSource {
+    ModelConfig,
+    Qwen35FlashMoeProfile,
+    UserOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRoutingPolicy {
+    active_experts: usize,
+    source: ActiveExpertsSource,
+    force_active_experts: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlashMoePlan {
     pub model: String,
@@ -151,6 +223,7 @@ pub struct FlashMoePlan {
     pub uses_metal: bool,
     pub streams_experts_from_nand: bool,
     pub quantization: ExpertQuantization,
+    pub routing_policy: FlashMoeRoutingPolicy,
     /// Packed vision-encoder weights (present only for Qwen3-VL MoE plans).
     pub vision_weights: Option<PathBuf>,
     /// Vision-encoder tensor manifest JSON (present only for Qwen3-VL MoE plans).
@@ -902,31 +975,35 @@ impl QwenModelConfig {
             );
         }
         if let Some(kv_heads) = self.num_key_value_heads
-            && (kv_heads == 0 || !self.num_attention_heads.is_multiple_of(kv_heads)) {
-                bail!(
-                    "num_key_value_heads {kv_heads} must divide num_attention_heads {}",
-                    self.num_attention_heads
-                );
-            }
-        let experts = self.num_experts.unwrap_or(NUM_EXPERTS);
-        let active = self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN);
+            && (kv_heads == 0 || !self.num_attention_heads.is_multiple_of(kv_heads))
+        {
+            bail!(
+                "num_key_value_heads {kv_heads} must divide num_attention_heads {}",
+                self.num_attention_heads
+            );
+        }
+        let experts = self.experts();
+        let active = self.config_active_experts();
         if experts == 0 || active == 0 || active > experts {
             bail!(
                 "invalid MoE routing config: num_experts={experts}, num_experts_per_tok={active}"
             );
         }
         if let Some(theta) = self.rope_theta
-            && (!theta.is_finite() || theta <= 0.0) {
-                bail!("rope_theta must be positive and finite, got {theta}");
-            }
+            && (!theta.is_finite() || theta <= 0.0)
+        {
+            bail!("rope_theta must be positive and finite, got {theta}");
+        }
         if let Some(factor) = self.partial_rotary_factor
-            && (!factor.is_finite() || factor <= 0.0 || factor > 1.0) {
-                bail!("partial_rotary_factor must be in (0, 1], got {factor}");
-            }
+            && (!factor.is_finite() || factor <= 0.0 || factor > 1.0)
+        {
+            bail!("partial_rotary_factor must be in (0, 1], got {factor}");
+        }
         if let Some(section) = self.mrope_section
-            && section.contains(&0) {
-                bail!("mrope_section entries must be positive, got {section:?}");
-            }
+            && section.contains(&0)
+        {
+            bail!("mrope_section entries must be positive, got {section:?}");
+        }
         if let Some(vision) = &self.vision_config {
             if vision.depth == 0
                 || vision.embed_dim == 0
@@ -977,7 +1054,7 @@ impl QwenModelConfig {
         self.num_experts.unwrap_or(NUM_EXPERTS)
     }
 
-    fn active_experts(&self) -> usize {
+    fn config_active_experts(&self) -> usize {
         self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN)
     }
 
@@ -1058,10 +1135,27 @@ pub fn canonical_model(model: &str) -> String {
 }
 
 pub fn plan(model: &str, models_root: &Path) -> Option<FlashMoePlan> {
-    supports_flashmoe(model).then(|| plan_unchecked(model, models_root))
+    plan_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
 }
 
 pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
+    plan_unchecked_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
+}
+
+pub fn plan_with_routing(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+) -> Option<FlashMoePlan> {
+    supports_flashmoe(model)
+        .then(|| plan_unchecked_with_routing(model, models_root, routing_policy))
+}
+
+pub fn plan_unchecked_with_routing(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+) -> FlashMoePlan {
     let model = canonical_model(model);
     let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
     let runtime_dir = model_cache_dir.join(CACHE_VERSION);
@@ -1081,6 +1175,7 @@ pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
         uses_metal: true,
         streams_experts_from_nand: true,
         quantization: ExpertQuantization::FourBitProduction,
+        routing_policy,
     }
 }
 
@@ -1146,6 +1241,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         );
     }
     let config = QwenModelConfig::from_file(&plan.model_config)?;
+    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
     let dense = DenseStore::open(
         plan.non_expert_weights.clone(),
         plan.tensor_manifest.clone(),
@@ -1162,6 +1258,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         metal: MetalExecutor::new(plan, &config, &runtime)?,
         vision_encoder,
         config,
+        routing_policy,
         runtime,
         session_cache: BTreeMap::new(),
     })
@@ -1176,6 +1273,7 @@ pub struct FlashMoeEngine {
     tokenizer: QwenTokenizer,
     metal: Option<MetalExecutor>,
     config: QwenModelConfig,
+    routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
@@ -1585,8 +1683,7 @@ impl MetalExecutor {
     ) -> Result<Option<DeferredExpertPhase>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self
-                .inner
+            self.inner
                 .submit_expert_phase(experts, weights, normed, residual, shared, next_norm_weight)
                 .map(|pending| pending.map(DeferredExpertPhase::Metal))
         }
@@ -1676,13 +1773,8 @@ impl MetalExecutor {
     ) -> Result<Option<Vec<f32>>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.apply_rope_for_layout(
-                values,
-                position,
-                theta,
-                layout,
-                mrope_section,
-            )
+            self.inner
+                .apply_rope_for_layout(values, position, theta, layout, mrope_section)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1702,13 +1794,8 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.causal_attention(
-                query,
-                keys_values,
-                num_q_heads,
-                kv_heads,
-                head_dim,
-            )
+            self.inner
+                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1750,8 +1837,7 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self
-                .inner
+            self.inner
                 .causal_attention_cached(position, layer, query, layout)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1953,10 +2039,11 @@ impl Drop for MetalExecutorInner {
             release(self.gqa_scores_pipeline);
             release(self.gqa_read_pipeline);
             if let Ok(kv_cache) = self.kv_cache.get_mut()
-                && let Some(kv_cache) = kv_cache.take() {
-                    release(kv_cache.keys);
-                    release(kv_cache.values);
-                }
+                && let Some(kv_cache) = kv_cache.take()
+            {
+                release(kv_cache.keys);
+                release(kv_cache.values);
+            }
             release(self.command_queue);
             release(self.device);
             if let Ok(buffers) = self.reusable.get_mut() {
@@ -2289,9 +2376,10 @@ impl MetalExecutorInner {
             return Ok(None);
         }
         if let Some(weight) = next_norm_weight
-            && weight.len() < width {
-                return Ok(None);
-            }
+            && weight.len() < width
+        {
+            return Ok(None);
+        }
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts {
             let Some(payload) = expert_phase_mlp_payload(expert.as_ref(), normed, width) else {
@@ -2551,38 +2639,40 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         output_offset: u64,
         buffers: &mut Vec<ObjcId>,
-    ) -> Result<()> { unsafe {
-        let packed_buffer = self.buffer_with_bytes(&payload.packed)?;
-        buffers.push(packed_buffer);
-        let scale_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.scales))?;
-        buffers.push(scale_buffer);
-        let bias_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.biases))?;
-        buffers.push(bias_buffer);
-        let rows_u32 = payload.rows as u32;
-        let cols_u32 = payload.cols as u32;
-        let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
-        let group_size_u32 = payload.group_size as u32;
-        let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-        buffers.push(rows_buffer);
-        let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-        buffers.push(cols_buffer);
-        let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-        buffers.push(groups_buffer);
-        let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
-        buffers.push(group_size_buffer);
-        msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
-        set_buffer(encoder, packed_buffer, 0);
-        set_buffer(encoder, input_buffer, 1);
-        set_buffer(encoder, scale_buffer, 2);
-        set_buffer(encoder, bias_buffer, 3);
-        set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
-        set_buffer(encoder, rows_buffer, 5);
-        set_buffer(encoder, cols_buffer, 6);
-        set_buffer(encoder, groups_buffer, 7);
-        set_buffer(encoder, group_size_buffer, 8);
-        dispatch_q4_threadgroups(encoder, payload.rows as u64);
-        Ok(())
-    }}
+    ) -> Result<()> {
+        unsafe {
+            let packed_buffer = self.buffer_with_bytes(&payload.packed)?;
+            buffers.push(packed_buffer);
+            let scale_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.scales))?;
+            buffers.push(scale_buffer);
+            let bias_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.biases))?;
+            buffers.push(bias_buffer);
+            let rows_u32 = payload.rows as u32;
+            let cols_u32 = payload.cols as u32;
+            let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
+            let group_size_u32 = payload.group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            buffers.push(rows_buffer);
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            buffers.push(cols_buffer);
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+            buffers.push(groups_buffer);
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+            buffers.push(group_size_buffer);
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
+            set_buffer(encoder, packed_buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, scale_buffer, 2);
+            set_buffer(encoder, bias_buffer, 3);
+            set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
+            set_buffer(encoder, rows_buffer, 5);
+            set_buffer(encoder, cols_buffer, 6);
+            set_buffer(encoder, groups_buffer, 7);
+            set_buffer(encoder, group_size_buffer, 8);
+            dispatch_q4_threadgroups(encoder, payload.rows as u64);
+            Ok(())
+        }
+    }
 
     unsafe fn encode_dense_matvec(
         &self,
@@ -2592,18 +2682,20 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         cols_buffer: ObjcId,
         rows: usize,
-    ) { unsafe {
-        msg_send_void1_id(
-            encoder,
-            sel("setComputePipelineState:"),
-            self.dense_matvec_pipeline,
-        );
-        set_buffer(encoder, weights_buffer, 0);
-        set_buffer(encoder, input_buffer, 1);
-        set_buffer(encoder, output_buffer, 2);
-        set_buffer(encoder, cols_buffer, 3);
-        dispatch_threads(encoder, rows as u64);
-    }}
+    ) {
+        unsafe {
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.dense_matvec_pipeline,
+            );
+            set_buffer(encoder, weights_buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, cols_buffer, 3);
+            dispatch_threads(encoder, rows as u64);
+        }
+    }
 
     unsafe fn encode_fill_zero(
         &self,
@@ -2611,16 +2703,18 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         width_buffer: ObjcId,
         width: usize,
-    ) { unsafe {
-        msg_send_void1_id(
-            encoder,
-            sel("setComputePipelineState:"),
-            self.fill_zero_pipeline,
-        );
-        set_buffer(encoder, output_buffer, 0);
-        set_buffer(encoder, width_buffer, 1);
-        dispatch_threads(encoder, width as u64);
-    }}
+    ) {
+        unsafe {
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.fill_zero_pipeline,
+            );
+            set_buffer(encoder, output_buffer, 0);
+            set_buffer(encoder, width_buffer, 1);
+            dispatch_threads(encoder, width as u64);
+        }
+    }
 
     fn route_top4(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
         if scores.is_empty() {
@@ -3008,63 +3102,71 @@ impl MetalExecutorInner {
         pipeline: ObjcId,
         buffers: &[ObjcId],
         threads: u64,
-    ) -> Result<()> { unsafe {
-        let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
-        if command_buffer.is_null() {
-            bail!("failed to create Flash-MoE Metal command buffer");
-        }
-        let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
-        if encoder.is_null() {
+    ) -> Result<()> {
+        unsafe {
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE Metal compute encoder");
+            }
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            for (idx, buffer) in buffers.iter().copied().enumerate() {
+                set_buffer(encoder, buffer, idx as u64);
+            }
+            dispatch_threads(encoder, threads);
+            msg_send_void0(encoder, sel("endEncoding"));
+            msg_send_void0(command_buffer, sel("commit"));
+            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            release(encoder);
             release(command_buffer);
-            bail!("failed to create Flash-MoE Metal compute encoder");
+            Ok(())
         }
-        msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-        for (idx, buffer) in buffers.iter().copied().enumerate() {
-            set_buffer(encoder, buffer, idx as u64);
+    }
+
+    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
+        unsafe {
+            let buffer = self.buffer_with_len(bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
         }
-        dispatch_threads(encoder, threads);
-        msg_send_void0(encoder, sel("endEncoding"));
-        msg_send_void0(command_buffer, sel("commit"));
-        msg_send_void0(command_buffer, sel("waitUntilCompleted"));
-        release(encoder);
-        release(command_buffer);
-        Ok(())
-    }}
+    }
 
-    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> { unsafe {
-        let buffer = self.buffer_with_len(bytes.len())?;
-        let contents = msg_send_ptr0(buffer, sel("contents"));
-        ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
-        Ok(buffer)
-    }}
+    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> {
+        unsafe {
+            {
+                let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+                if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
+                    return Ok(reusable.swap_remove(index).id);
+                }
+            }
+            let buffer =
+                msg_send_id2_usize_u64(self.device, sel("newBufferWithLength:options:"), len, 0);
+            if buffer.is_null() {
+                bail!("failed to allocate Flash-MoE Metal output buffer");
+            }
+            Ok(buffer)
+        }
+    }
 
-    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> { unsafe {
-        {
+    unsafe fn recycle(&self, buffer: ObjcId) {
+        unsafe {
+            // Keep a tiny reuse pool so repeated decode steps do not immediately
+            // churn all buffers under memory pressure. Drop older buffers quickly
+            // because expert data is streamed and can be very large.
+            let len = msg_send_usize0(buffer, sel("length"));
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-            if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
-                return Ok(reusable.swap_remove(index).id);
+            if reusable.len() < 8 {
+                reusable.push(MetalReusableBuffer { id: buffer, len });
+            } else {
+                release(buffer);
             }
         }
-        let buffer =
-            msg_send_id2_usize_u64(self.device, sel("newBufferWithLength:options:"), len, 0);
-        if buffer.is_null() {
-            bail!("failed to allocate Flash-MoE Metal output buffer");
-        }
-        Ok(buffer)
-    }}
-
-    unsafe fn recycle(&self, buffer: ObjcId) { unsafe {
-        // Keep a tiny reuse pool so repeated decode steps do not immediately
-        // churn all buffers under memory pressure. Drop older buffers quickly
-        // because expert data is streamed and can be very large.
-        let len = msg_send_usize0(buffer, sel("length"));
-        let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-        if reusable.len() < 8 {
-            reusable.push(MetalReusableBuffer { id: buffer, len });
-        } else {
-            release(buffer);
-        }
-    }}
+    }
 }
 
 impl FlashMoeEngine {
@@ -3814,9 +3916,9 @@ impl FlashMoeEngine {
                 &normed,
             )?;
             let active = if let Some(metal) = &self.metal {
-                metal.route_topk(&router_scores, self.config.active_experts())?
+                metal.route_topk(&router_scores, self.routing_policy.active_experts)?
             } else {
-                top_k(&router_scores, self.config.active_experts())
+                top_k(&router_scores, self.routing_policy.active_experts)
             };
             layer_timing.buckets.routing += routing_started.elapsed();
             layer_timing.active_experts = active.len();
@@ -3909,25 +4011,25 @@ impl FlashMoeEngine {
                 continue;
             }
             if let Some(context) = deepstack
-                && let Some(features_for_layer) = context.features.get(layer) {
-                    let feature =
-                        features_for_layer
-                            .get(context.visual_index)
-                            .with_context(|| {
-                                format!(
-                                    "deepstack layer {layer} has no feature for visual token {}",
-                                    context.visual_index
-                                )
-                            })?;
-                    if feature.len() != hidden.len() {
-                        bail!(
-                            "deepstack feature for layer {layer} has len {}; expected {}",
-                            feature.len(),
-                            hidden.len()
-                        );
-                    }
-                    add_in_place(&mut hidden, feature);
+                && let Some(features_for_layer) = context.features.get(layer)
+            {
+                let feature = features_for_layer
+                    .get(context.visual_index)
+                    .with_context(|| {
+                        format!(
+                            "deepstack layer {layer} has no feature for visual token {}",
+                            context.visual_index
+                        )
+                    })?;
+                if feature.len() != hidden.len() {
+                    bail!(
+                        "deepstack feature for layer {layer} has len {}; expected {}",
+                        feature.len(),
+                        hidden.len()
+                    );
                 }
+                add_in_place(&mut hidden, feature);
+            }
             kv_cache.record_layer_state(position, layer, state)?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
@@ -4394,7 +4496,7 @@ impl FlashMoeEngine {
             kv_heads: self.config.kv_heads(),
             vocab_size: self.config.vocab_size,
             experts_per_layer: self.config.num_experts,
-            active_experts_per_token: self.config.num_experts_per_tok,
+            active_experts_per_token: Some(self.routing_policy.active_experts),
             moe_intermediate_size: self
                 .config
                 .moe_intermediate_size
@@ -4900,9 +5002,10 @@ fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
     for (idx, value) in values.iter_mut().enumerate() {
         *value *= scale;
         if let Some(weight) = weight
-            && let Some(weight) = weight.get(idx) {
-                *value *= *weight;
-            }
+            && let Some(weight) = weight.get(idx)
+        {
+            *value *= *weight;
+        }
     }
 }
 
@@ -4923,12 +5026,13 @@ fn apply_per_head_rms_norm(
         );
     }
     if let Some(weight) = weight
-        && weight.len() < head_dim {
-            bail!(
-                "per-head RMSNorm weight has len {}; expected at least head_dim {head_dim}",
-                weight.len()
-            );
-        }
+        && weight.len() < head_dim
+    {
+        bail!(
+            "per-head RMSNorm weight has len {}; expected at least head_dim {head_dim}",
+            weight.len()
+        );
+    }
     for head in values.chunks_mut(head_dim) {
         rms_norm_with_weight_in_place(head, weight.map(|w| &w[..head_dim]));
     }
@@ -5713,17 +5817,18 @@ impl QwenTokenizer {
                 .id_to_token
                 .get(token as usize)
                 .filter(|piece| !piece.is_empty())
-                && !piece.starts_with("<|") {
-                    if let Some(bytes) = byte_level_piece_to_bytes(piece) {
-                        byte_buffer.extend(bytes);
-                    } else {
-                        if !byte_buffer.is_empty() {
-                            out.push_str(&String::from_utf8_lossy(&byte_buffer));
-                            byte_buffer.clear();
-                        }
-                        out.push_str(&decode_token_piece(piece));
+                && !piece.starts_with("<|")
+            {
+                if let Some(bytes) = byte_level_piece_to_bytes(piece) {
+                    byte_buffer.extend(bytes);
+                } else {
+                    if !byte_buffer.is_empty() {
+                        out.push_str(&String::from_utf8_lossy(&byte_buffer));
+                        byte_buffer.clear();
                     }
+                    out.push_str(&decode_token_piece(piece));
                 }
+            }
         }
         if !byte_buffer.is_empty() {
             out.push_str(&String::from_utf8_lossy(&byte_buffer));
@@ -7143,14 +7248,15 @@ impl DenseStore {
     ) -> Result<Vec<f32>> {
         let tensor_name = attention_tensor_name(layer, name);
         if let Some(metal) = metal
-            && let Some(entry) = self.registry.tensor(&tensor_name) {
-                let cols = entry.shape.last().copied().unwrap_or(0);
-                let rows = entry.shape.first().copied().unwrap_or(width).min(width);
-                let used_cols = cols.min(input.len());
-                if rows > 0 && used_cols > 0 && used_cols == cols {
-                    return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
-                }
+            && let Some(entry) = self.registry.tensor(&tensor_name)
+        {
+            let cols = entry.shape.last().copied().unwrap_or(0);
+            let rows = entry.shape.first().copied().unwrap_or(width).min(width);
+            let used_cols = cols.min(input.len());
+            if rows > 0 && used_cols > 0 && used_cols == cols {
+                return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
             }
+        }
         self.project(layer, name, input, width)
     }
 
@@ -7237,15 +7343,16 @@ impl DenseStore {
     ) -> Result<Vec<f32>> {
         let tensor_name = router_tensor_name(layer);
         if let Some(metal) = metal
-            && let Some(entry) = self.registry.tensor(&tensor_name) {
-                let cols = entry.shape.last().copied().unwrap_or(0);
-                let rows = entry.shape.first().copied().unwrap_or(experts).min(experts);
-                if rows > 0 && cols > 0 && cols <= hidden.len() {
-                    let scores =
-                        self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
-                    return Ok(scores);
-                }
+            && let Some(entry) = self.registry.tensor(&tensor_name)
+        {
+            let cols = entry.shape.last().copied().unwrap_or(0);
+            let rows = entry.shape.first().copied().unwrap_or(experts).min(experts);
+            if rows > 0 && cols > 0 && cols <= hidden.len() {
+                let scores =
+                    self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
+                return Ok(scores);
             }
+        }
 
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
@@ -7263,28 +7370,29 @@ impl DenseStore {
     ) -> Result<Vec<f32>> {
         let lm_head_name = self.lm_head_tensor_name()?;
         if let Some(metal) = metal
-            && let Some(entry) = self.registry.tensor(lm_head_name) {
-                let cols = entry.shape.last().copied().unwrap_or(0);
-                let rows = entry
-                    .shape
-                    .first()
-                    .copied()
-                    .unwrap_or(tokenizer.vocab_size())
-                    .min(tokenizer.vocab_size());
-                if rows > 0 && cols > 0 && cols <= hidden.len() {
-                    let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
-                    let tile_rows = dense_projection_tile_rows(cols, rows);
-                    for start in (0..rows).step_by(tile_rows) {
-                        let end = (start + tile_rows).min(rows);
-                        let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-                        let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
-                        for (offset, value) in projected.into_iter().enumerate() {
-                            logits[start + offset] = value;
-                        }
+            && let Some(entry) = self.registry.tensor(lm_head_name)
+        {
+            let cols = entry.shape.last().copied().unwrap_or(0);
+            let rows = entry
+                .shape
+                .first()
+                .copied()
+                .unwrap_or(tokenizer.vocab_size())
+                .min(tokenizer.vocab_size());
+            if rows > 0 && cols > 0 && cols <= hidden.len() {
+                let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+                let tile_rows = dense_projection_tile_rows(cols, rows);
+                for start in (0..rows).step_by(tile_rows) {
+                    let end = (start + tile_rows).min(rows);
+                    let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
+                    let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+                    for (offset, value) in projected.into_iter().enumerate() {
+                        logits[start + offset] = value;
                     }
-                    return Ok(logits);
                 }
+                return Ok(logits);
             }
+        }
 
         self.lm_head_logits(lm_head_name, hidden, tokenizer)
     }
@@ -9014,114 +9122,132 @@ fn class(name: &str) -> ObjcId {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn ns_string(value: &str) -> ObjcId { unsafe {
-    let alloc = msg_send_id0(class("NSString"), sel("alloc"));
-    msg_send_id3_ptr_usize_u64(
-        alloc,
-        sel("initWithBytes:length:encoding:"),
-        value.as_ptr().cast(),
-        value.len(),
-        4,
-    )
-}}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> { unsafe {
-    let function_name = ns_string(name);
-    let function = msg_send_id1_id(library, sel("newFunctionWithName:"), function_name);
-    release(function_name);
-    if function.is_null() {
-        bail!("compiled Flash-MoE Metal library is missing kernel `{name}`");
+unsafe fn ns_string(value: &str) -> ObjcId {
+    unsafe {
+        let alloc = msg_send_id0(class("NSString"), sel("alloc"));
+        msg_send_id3_ptr_usize_u64(
+            alloc,
+            sel("initWithBytes:length:encoding:"),
+            value.as_ptr().cast(),
+            value.len(),
+            4,
+        )
     }
-    Ok(function)
-}}
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn compile_pipeline(device: ObjcId, library: ObjcId, name: &str) -> Result<ObjcId> { unsafe {
-    let function = new_function(library, name)?;
-    let pipeline = new_compute_pipeline(device, function)
-        .with_context(|| format!("failed to create {name} Metal pipeline"))?;
-    release(function);
-    Ok(pipeline)
-}}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcId> { unsafe {
-    let pipeline = msg_send_id3(
-        device,
-        sel("newComputePipelineStateWithFunction:error:"),
-        function,
-    );
-    if pipeline.is_null() {
-        bail!("failed to create Flash-MoE Metal compute pipeline");
+unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> {
+    unsafe {
+        let function_name = ns_string(name);
+        let function = msg_send_id1_id(library, sel("newFunctionWithName:"), function_name);
+        release(function_name);
+        if function.is_null() {
+            bail!("compiled Flash-MoE Metal library is missing kernel `{name}`");
+        }
+        Ok(function)
     }
-    Ok(pipeline)
-}}
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) { unsafe {
-    set_buffer_with_offset(encoder, buffer, 0, index);
-}}
+unsafe fn compile_pipeline(device: ObjcId, library: ObjcId, name: &str) -> Result<ObjcId> {
+    unsafe {
+        let function = new_function(library, name)?;
+        let pipeline = new_compute_pipeline(device, function)
+            .with_context(|| format!("failed to create {name} Metal pipeline"))?;
+        release(function);
+        Ok(pipeline)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, index: u64) { unsafe {
-    msg_send_void4(
-        encoder,
-        sel("setBuffer:offset:atIndex:"),
-        buffer,
-        offset,
-        index,
-    );
-}}
+unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcId> {
+    unsafe {
+        let pipeline = msg_send_id3(
+            device,
+            sel("newComputePipelineStateWithFunction:error:"),
+            function,
+        );
+        if pipeline.is_null() {
+            bail!("failed to create Flash-MoE Metal compute pipeline");
+        }
+        Ok(pipeline)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> { unsafe {
-    let contents = msg_send_ptr0(buffer, sel("contents"));
-    let mut output = vec![0.0f32; len];
-    ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), len);
-    output
-}}
+unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) {
+    unsafe {
+        set_buffer_with_offset(encoder, buffer, 0, index);
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) { unsafe {
-    let grid = MtlSize {
-        width: threads,
-        height: 1,
-        depth: 1,
-    };
-    let threadgroup = MtlSize {
-        width: threads.clamp(1, 64),
-        height: 1,
-        depth: 1,
-    };
-    msg_send_void2_size(
-        encoder,
-        sel("dispatchThreads:threadsPerThreadgroup:"),
-        grid,
-        threadgroup,
-    );
-}}
+unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, index: u64) {
+    unsafe {
+        msg_send_void4(
+            encoder,
+            sel("setBuffer:offset:atIndex:"),
+            buffer,
+            offset,
+            index,
+        );
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) { unsafe {
-    const Q4_ROWS_PER_THREADGROUP: u64 = 8;
-    let grid = MtlSize {
-        width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
-        height: 1,
-        depth: 1,
-    };
-    let threadgroup = MtlSize {
-        width: 256,
-        height: 1,
-        depth: 1,
-    };
-    msg_send_void2_size(
-        encoder,
-        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-        grid,
-        threadgroup,
-    );
-}}
+unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        let mut output = vec![0.0f32; len];
+        ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), len);
+        output
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
+    unsafe {
+        let grid = MtlSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: threads.clamp(1, 64),
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreads:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
+    unsafe {
+        const Q4_ROWS_PER_THREADGROUP: u64 = 8;
+        let grid = MtlSize {
+            width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn f32_as_bytes(values: &[f32]) -> &[u8] {
@@ -9167,32 +9293,40 @@ struct MtlSize {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn release(receiver: ObjcId) { unsafe {
-    if !receiver.is_null() {
-        msg_send_void0(receiver, sel("release"));
+unsafe fn release(receiver: ObjcId) {
+    unsafe {
+        if !receiver.is_null() {
+            msg_send_void0(receiver, sel("release"));
+        }
     }
-}}
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id0(receiver: ObjcId, selector: Sel) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector)
-}}
+unsafe fn msg_send_id0(receiver: ObjcId, selector: Sel) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, arg)
-}}
+unsafe fn msg_send_id1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, *mut ObjcId) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, arg, ptr::null_mut())
-}}
+unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, *mut ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg, ptr::null_mut())
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id4(
@@ -9201,11 +9335,13 @@ unsafe fn msg_send_id4(
     arg1: ObjcId,
     arg2: ObjcId,
     arg3: ObjcId,
-) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, ObjcId) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, arg1, arg2, arg3)
-}}
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, arg3)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id2_usize_u64(
@@ -9213,11 +9349,13 @@ unsafe fn msg_send_id2_usize_u64(
     selector: Sel,
     len: usize,
     options: u64,
-) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, usize, u64) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, len, options)
-}}
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, usize, u64) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, len, options)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_id3_ptr_usize_u64(
@@ -9226,52 +9364,66 @@ unsafe fn msg_send_id3_ptr_usize_u64(
     bytes: *const c_void,
     len: usize,
     options: u64,
-) -> ObjcId { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, *const c_void, usize, u64) -> ObjcId =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, bytes, len, options)
-}}
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, *const c_void, usize, u64) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel) = std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector);
-}}
+unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector);
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, arg);
-}}
+unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg);
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, a, b);
-}}
+unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, a, b);
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u64, arg3: u64) { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, u64, u64) =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector, arg1, arg2, arg3);
-}}
+unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u64, arg3: u64) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, u64, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, arg3);
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel) -> *mut c_void =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector)
-}}
+unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_usize0(receiver: ObjcId, selector: Sel) -> usize { unsafe {
-    let f: unsafe extern "C" fn(ObjcId, Sel) -> usize =
-        std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector)
-}}
+unsafe fn msg_send_usize0(receiver: ObjcId, selector: Sel) -> usize {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
 
 fn expert_store_size(path: &Path) -> Result<(usize, u64)> {
     if !path.is_dir() {
@@ -9708,13 +9860,15 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
                 plan.model_config.display()
             )
         })?;
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
         tracing::debug!(
             layers = config.num_hidden_layers,
             hidden_size = config.hidden_size,
             attention_heads = config.num_attention_heads,
             kv_heads = config.kv_heads(),
             experts = config.experts(),
-            active_experts = config.active_experts(),
+            active_experts = routing_policy.active_experts,
+            active_experts_source = ?routing_policy.source,
             vocab_size = config.vocab_size,
             "validated Qwen Flash-MoE model config"
         );
@@ -10230,8 +10384,7 @@ fn pack_aggregate_expert_layer(
 
     let gate_up =
         single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?;
-    let down =
-        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
+    let down = single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
     validate_aggregate_expert_tensor_shape(
         gate_up,
         &[layout.experts, layout.intermediate * 2, layout.hidden],
@@ -11760,11 +11913,12 @@ impl VisionEncoder {
             format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
         })?;
         if let Some(config_entries) = self.config.num_position_embeddings
-            && config_entries != entries {
-                bail!(
-                    "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
-                );
-            }
+            && config_entries != entries
+        {
+            bail!(
+                "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
+            );
+        }
 
         let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
         if coords.len() != hidden.len() {
@@ -12800,7 +12954,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.kv_heads(), 8);
         assert_eq!(config.experts(), 512);
-        assert_eq!(config.active_experts(), 4);
+        assert_eq!(config.config_active_experts(), 4);
     }
 
     #[test]
@@ -12810,7 +12964,71 @@ mod tests {
         )
         .unwrap();
         config.validate().unwrap();
-        assert_eq!(config.active_experts(), 10);
+        assert_eq!(config.config_active_experts(), 10);
+    }
+
+    #[test]
+    fn routing_policy_defaults_qwen35_flashmoe_profile_to_k4() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"rope_theta":10000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::default()
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 4);
+        assert_eq!(policy.source, ActiveExpertsSource::Qwen35FlashMoeProfile);
+    }
+
+    #[test]
+    fn routing_policy_defaults_other_qwen_moe_to_model_config_k() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::default()
+            .resolve("hf://Qwen/Qwen3-30B-A3B", &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 2);
+        assert_eq!(policy.source, ActiveExpertsSource::ModelConfig);
+    }
+
+    #[test]
+    fn routing_policy_honors_explicit_active_expert_override() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::new(Some(6), false)
+            .resolve("hf://Qwen/Qwen3-30B-A3B", &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 6);
+        assert_eq!(policy.source, ActiveExpertsSource::UserOverride);
+    }
+
+    #[test]
+    fn routing_policy_guards_qwen35_k_below_four_unless_forced() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"rope_theta":10000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+
+        let err = FlashMoeRoutingPolicy::new(Some(3), false)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap_err();
+        assert!(err.to_string().contains("requires K >= 4"), "{err:#}");
+
+        let forced = FlashMoeRoutingPolicy::new(Some(3), true)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap();
+        assert_eq!(forced.active_experts, 3);
+        assert!(forced.force_active_experts);
     }
 
     #[test]
@@ -15023,7 +15241,8 @@ mod tests {
             br#"{"weight_map":{"model.embed_tokens.weight":"dense.safetensors"}}"#,
         )
         .unwrap();
-        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        let mut plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        plan.routing_policy = FlashMoeRoutingPolicy::new(Some(1), true);
         let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
         let dense = DenseStore::open(
             plan.non_expert_weights.clone(),
@@ -15032,6 +15251,7 @@ mod tests {
         .unwrap();
         let tokenizer = QwenTokenizer::from_file(&plan.tokenizer).unwrap();
         let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
         let mut engine = FlashMoeEngine {
             plan,
@@ -15041,6 +15261,7 @@ mod tests {
             tokenizer,
             metal: None,
             config,
+            routing_policy,
             runtime,
             vision_encoder: None,
             session_cache: BTreeMap::new(),
