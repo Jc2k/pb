@@ -189,6 +189,23 @@ pub struct GenerationRequest {
     pub seed: u32,
 }
 
+/// Ordered content for multimodal (Qwen3-VL) generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultimodalContent {
+    Text { text: String },
+    Image { image_path: PathBuf },
+}
+
+/// A structured multimodal request for Qwen3-VL inference.
+#[derive(Debug, Clone)]
+pub struct MultimodalGenerationRequest {
+    pub content: Vec<MultimodalContent>,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
@@ -1219,44 +1236,76 @@ impl MropePosition {
     }
 }
 
-fn qwen3vl_single_image_mrope_positions(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePlaceholderSpec {
+    token_count: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualTokenSpan {
+    start: usize,
+    end: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedVisionPrompt {
+    tokens: Vec<u32>,
+    image_spans: Vec<VisualTokenSpan>,
+}
+
+fn qwen3vl_multimodal_mrope_positions(
     prompt_tokens: &[u32],
     image_pad_token: u32,
-    image_grid_h: usize,
-    image_grid_w: usize,
+    image_spans: &[VisualTokenSpan],
 ) -> Result<(Vec<MropePosition>, usize)> {
-    let expected_image_tokens = image_grid_h.saturating_mul(image_grid_w);
     let actual_image_tokens = prompt_tokens
         .iter()
         .filter(|&&token| token == image_pad_token)
         .count();
+    let expected_image_tokens = image_spans
+        .iter()
+        .map(|span| span.end.saturating_sub(span.start))
+        .sum::<usize>();
     if actual_image_tokens != expected_image_tokens {
         bail!(
-            "image placeholder count {actual_image_tokens} does not match merged image grid {image_grid_h}x{image_grid_w}"
-        );
-    }
-    let image_runs = count_token_runs(prompt_tokens, image_pad_token);
-    if image_runs > 1 {
-        bail!(
-            "single-image prompt contains {image_runs} separate image placeholder runs; placeholders for one image must be contiguous"
+            "image placeholder count {actual_image_tokens} does not match expected visual token count {expected_image_tokens}"
         );
     }
 
     let mut positions = Vec::with_capacity(prompt_tokens.len());
     let mut current_pos = 0usize;
     let mut i = 0usize;
+    let mut span_index = 0usize;
     while i < prompt_tokens.len() {
-        if prompt_tokens[i] == image_pad_token {
+        if span_index < image_spans.len() && i == image_spans[span_index].start {
+            let span = image_spans[span_index];
+            let expected_span_tokens = span.grid_h.saturating_mul(span.grid_w);
+            let actual_span_tokens = span.end.saturating_sub(span.start);
+            if actual_span_tokens != expected_span_tokens {
+                bail!(
+                    "image span {} has {actual_span_tokens} tokens but grid is {}x{}",
+                    span_index,
+                    span.grid_h,
+                    span.grid_w
+                );
+            }
             let start_position = current_pos;
             let mut image_idx = 0usize;
-            while i < prompt_tokens.len() && prompt_tokens[i] == image_pad_token {
-                let row = if image_grid_w > 0 {
-                    image_idx / image_grid_w
+            while i < span.end {
+                if prompt_tokens.get(i).copied() != Some(image_pad_token) {
+                    bail!("image span {span_index} contains a non-placeholder token");
+                }
+                let row = if span.grid_w > 0 {
+                    image_idx / span.grid_w
                 } else {
                     0
                 };
-                let col = if image_grid_w > 0 {
-                    image_idx % image_grid_w
+                let col = if span.grid_w > 0 {
+                    image_idx % span.grid_w
                 } else {
                     0
                 };
@@ -1268,14 +1317,105 @@ fn qwen3vl_single_image_mrope_positions(
                 image_idx += 1;
                 i += 1;
             }
-            current_pos += image_grid_h.max(image_grid_w);
+            current_pos += span.grid_h.max(span.grid_w);
+            span_index += 1;
+        } else if prompt_tokens[i] == image_pad_token {
+            bail!("image placeholder at token {i} is not part of a visual span");
         } else {
             positions.push(MropePosition::text(current_pos));
             current_pos += 1;
             i += 1;
         }
     }
+    if span_index != image_spans.len() {
+        bail!(
+            "only matched {span_index} image spans in prompt but {} were expected",
+            image_spans.len()
+        );
+    }
     Ok((positions, current_pos))
+}
+
+fn qwen3vl_single_image_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    image_grid_h: usize,
+    image_grid_w: usize,
+) -> Result<(Vec<MropePosition>, usize)> {
+    let (run_start, run_end, _) = single_token_run_bounds(prompt_tokens, image_pad_token)
+        .context("single-image prompt contains no image placeholder run")?;
+    qwen3vl_multimodal_mrope_positions(
+        prompt_tokens,
+        image_pad_token,
+        &[VisualTokenSpan {
+            start: run_start,
+            end: run_end,
+            grid_h: image_grid_h,
+            grid_w: image_grid_w,
+        }],
+    )
+}
+
+fn expand_multimodal_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
+    image_pad_token: u32,
+    image_specs: &[ImagePlaceholderSpec],
+) -> Result<ExpandedVisionPrompt> {
+    let image_runs = token_run_bounds(&prompt_tokens, image_pad_token);
+    if image_runs.len() != image_specs.len() {
+        bail!(
+            "prompt contains {} image placeholder runs but {} images were provided",
+            image_runs.len(),
+            image_specs.len()
+        );
+    }
+
+    let mut expanded = Vec::with_capacity(prompt_tokens.len());
+    let mut image_spans = Vec::with_capacity(image_specs.len());
+    let mut cursor = 0usize;
+    for ((run_start, run_end, image_pad_count), spec) in
+        image_runs.into_iter().zip(image_specs.iter().copied())
+    {
+        if spec.token_count == 0 {
+            bail!("image produced zero visual tokens");
+        }
+        if image_pad_count != 1 && image_pad_count != spec.token_count {
+            bail!(
+                "prompt contains {image_pad_count} image placeholders but the encoded image produced {} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token",
+                spec.token_count
+            );
+        }
+        let has_start = run_start > 0 && prompt_tokens[run_start - 1] == vision_start_token;
+        let has_end = run_end < prompt_tokens.len() && prompt_tokens[run_end] == vision_end_token;
+        if has_start != has_end {
+            bail!("image placeholders must be wrapped by both <|vision_start|> and <|vision_end|>");
+        }
+
+        expanded.extend_from_slice(&prompt_tokens[cursor..run_start]);
+        if !has_start {
+            expanded.push(vision_start_token);
+        }
+        let span_start = expanded.len();
+        expanded.extend(std::iter::repeat(image_pad_token).take(spec.token_count));
+        let span_end = expanded.len();
+        image_spans.push(VisualTokenSpan {
+            start: span_start,
+            end: span_end,
+            grid_h: spec.grid_h,
+            grid_w: spec.grid_w,
+        });
+        if !has_end {
+            expanded.push(vision_end_token);
+        }
+        cursor = run_end;
+    }
+    expanded.extend_from_slice(&prompt_tokens[cursor..]);
+    Ok(ExpandedVisionPrompt {
+        tokens: expanded,
+        image_spans,
+    })
 }
 
 fn expand_single_image_placeholders(
@@ -1285,62 +1425,37 @@ fn expand_single_image_placeholders(
     image_pad_token: u32,
     expected_image_tokens: usize,
 ) -> Result<Vec<u32>> {
-    let image_runs = count_token_runs(&prompt_tokens, image_pad_token);
-    if image_runs == 0 {
-        bail!(
-            "prompt contains no image placeholders but the encoded image produced {expected_image_tokens} visual tokens"
-        );
-    }
-    if image_runs > 1 {
-        bail!(
-            "single-image prompt contains {image_runs} separate image placeholder runs; use one contiguous <|image_pad|> span per image"
-        );
-    }
-    let Some((run_start, run_end, image_pad_count)) =
-        single_token_run_bounds(&prompt_tokens, image_pad_token)
-    else {
-        bail!("failed to locate image placeholder run");
-    };
-    if image_pad_count != 1 && image_pad_count != expected_image_tokens {
-        bail!(
-            "prompt contains {image_pad_count} image placeholders but the encoded image produced {expected_image_tokens} visual tokens; use one <|image_pad|> placeholder or exactly one per visual token"
-        );
-    }
-    let has_start = run_start > 0 && prompt_tokens[run_start - 1] == vision_start_token;
-    let has_end = run_end < prompt_tokens.len() && prompt_tokens[run_end] == vision_end_token;
-    if has_start != has_end {
-        bail!("image placeholders must be wrapped by both <|vision_start|> and <|vision_end|>");
-    }
-
-    let mut expanded = Vec::with_capacity(
-        prompt_tokens.len()
-            + expected_image_tokens.saturating_sub(image_pad_count)
-            + if has_start { 0 } else { 2 },
-    );
-    expanded.extend_from_slice(&prompt_tokens[..run_start]);
-    if !has_start {
-        expanded.push(vision_start_token);
-    }
-    expanded.extend(std::iter::repeat(image_pad_token).take(expected_image_tokens));
-    if !has_end {
-        expanded.push(vision_end_token);
-    }
-    expanded.extend_from_slice(&prompt_tokens[run_end..]);
-    Ok(expanded)
+    Ok(expand_multimodal_image_placeholders(
+        prompt_tokens,
+        vision_start_token,
+        vision_end_token,
+        image_pad_token,
+        &[ImagePlaceholderSpec {
+            token_count: expected_image_tokens,
+            grid_h: 1,
+            grid_w: expected_image_tokens,
+        }],
+    )?
+    .tokens)
 }
 
-fn count_token_runs(tokens: &[u32], needle: u32) -> usize {
-    let mut runs = 0usize;
-    let mut in_run = false;
-    for &token in tokens {
+fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    let mut count = 0usize;
+    for (idx, &token) in tokens.iter().enumerate() {
         if token == needle {
-            if !in_run {
-                runs += 1;
-                in_run = true;
+            if start.is_none() {
+                start = Some(idx);
             }
-        } else {
-            in_run = false;
+            count += 1;
+        } else if let Some(run_start) = start.take() {
+            runs.push((run_start, idx, count));
+            count = 0;
         }
+    }
+    if let Some(run_start) = start {
+        runs.push((run_start, tokens.len(), count));
     }
     runs
 }
@@ -3309,33 +3424,123 @@ impl FlashMoeEngine {
         last_hidden.context("cannot generate from an empty vision prompt")
     }
 
-    /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
+    /// Generate text from ordered text and image content using the Qwen3-VL vision encoder.
     ///
     /// Returns an error when the engine was not loaded from a Qwen3-VL plan
     /// (i.e. `plan.vision_weights` is `None`).
-    pub fn generate_with_image(
+    pub fn generate_multimodal(
         &mut self,
-        request: &VisionGenerationRequest,
+        request: &MultimodalGenerationRequest,
     ) -> Result<GenerationOutput> {
-        // ── 1. Encode the image ───────────────────────────────────────────────
+        let image_count = request
+            .content
+            .iter()
+            .filter(|part| matches!(part, MultimodalContent::Image { .. }))
+            .count();
+        if image_count == 0 {
+            bail!("generate_multimodal requires at least one image block");
+        }
+
         let vision_config = self
             .config
             .vision_config
             .as_ref()
-            .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
-        let encoder = self.vision_encoder.as_ref().context(
-            "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
-        )?;
+            .context("generate_multimodal requires a Qwen3-VL plan with a vision_config")?;
         let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
-        let visual = encoder.encode(&preprocessor, &request.image_path)?;
-        let num_visual_tokens = visual.embeddings.len();
+        let (parts, visual_encodings) = {
+            let encoder = self.vision_encoder.as_ref().context(
+                "generate_multimodal requires a loaded VisionEncoder; this plan has no vision weights",
+            )?;
+            let mut parts = Vec::with_capacity(request.content.len());
+            let mut visual_encodings = Vec::with_capacity(image_count);
+            for part in &request.content {
+                match part {
+                    MultimodalContent::Text { text } => {
+                        parts.push(ChatContentPart::Text { text: text.clone() });
+                    }
+                    MultimodalContent::Image { image_path } => {
+                        let visual = encoder.encode(&preprocessor, image_path)?;
+                        let num_visual_tokens = visual.embeddings.len();
+                        parts.push(ChatContentPart::Image {
+                            image: Some(image_path.display().to_string()),
+                            placeholder_tokens: Some(num_visual_tokens),
+                        });
+                        visual_encodings.push(visual);
+                    }
+                }
+            }
+            (parts, visual_encodings)
+        };
 
-        // ── 2. Build the prompt with vision-pad placeholders ──────────────────
+        self.generate_with_encoded_visual_prompt(
+            ChatMessageContent::Parts(parts),
+            visual_encodings,
+            request.max_tokens,
+            request.temperature,
+            request.top_k,
+            request.seed,
+        )
+    }
+
+    /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
+    ///
+    /// Compatibility wrapper around the structured multimodal path.
+    pub fn generate_with_image(
+        &mut self,
+        request: &VisionGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        if request.prompt.contains("<|image_pad|>") {
+            let vision_config = self
+                .config
+                .vision_config
+                .as_ref()
+                .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
+            let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
+            let visual = {
+                let encoder = self.vision_encoder.as_ref().context(
+                    "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
+                )?;
+                encoder.encode(&preprocessor, &request.image_path)?
+            };
+            return self.generate_with_encoded_visual_prompt(
+                ChatMessageContent::Text(request.prompt.clone()),
+                vec![visual],
+                request.max_tokens,
+                request.temperature,
+                request.top_k,
+                request.seed,
+            );
+        }
+
+        self.generate_multimodal(&MultimodalGenerationRequest {
+            content: vec![
+                MultimodalContent::Image {
+                    image_path: request.image_path.clone(),
+                },
+                MultimodalContent::Text {
+                    text: request.prompt.clone(),
+                },
+            ],
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_k: request.top_k,
+            seed: request.seed,
+        })
+    }
+
+    fn generate_with_encoded_visual_prompt(
+        &mut self,
+        content: ChatMessageContent,
+        visual_encodings: Vec<VisionEncoding>,
+        max_tokens: i32,
+        temperature: f32,
+        top_k: i32,
+        seed: u32,
+    ) -> Result<GenerationOutput> {
         // Qwen3-VL chat template: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
         let vision_start = self.tokenizer.token_id("<|vision_start|>");
         let vision_end = self.tokenizer.token_id("<|vision_end|>");
         let image_pad = self.tokenizer.token_id("<|image_pad|>");
-
         let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
             (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
             _ => bail!(
@@ -3345,19 +3550,6 @@ impl FlashMoeEngine {
             ),
         };
 
-        let content = if request.prompt.contains("<|image_pad|>") {
-            ChatMessageContent::Text(request.prompt.clone())
-        } else {
-            ChatMessageContent::Parts(vec![
-                ChatContentPart::Image {
-                    image: Some(request.image_path.display().to_string()),
-                    placeholder_tokens: Some(num_visual_tokens),
-                },
-                ChatContentPart::Text {
-                    text: request.prompt.clone(),
-                },
-            ])
-        };
         let chat_text = self.tokenizer.apply_chat_template_to_messages(
             &[ChatMessage {
                 role: ChatRole::User,
@@ -3370,38 +3562,65 @@ impl FlashMoeEngine {
             true,
         )?;
         let mut prompt_tokens = self.tokenizer.encode(&chat_text)?;
-        prompt_tokens = expand_single_image_placeholders(
+        let mut image_specs = Vec::with_capacity(visual_encodings.len());
+        let mut visual_embeddings = Vec::new();
+        let mut deepstack_features = None::<Vec<Vec<Vec<f32>>>>;
+        for visual in visual_encodings {
+            let VisionEncoding {
+                embeddings,
+                deepstack_features: visual_deepstack,
+                merged_grid_h,
+                merged_grid_w,
+            } = visual;
+            image_specs.push(ImagePlaceholderSpec {
+                token_count: embeddings.len(),
+                grid_h: merged_grid_h,
+                grid_w: merged_grid_w,
+            });
+            visual_embeddings.extend(embeddings);
+            if let Some(accumulated_deepstack) = deepstack_features.as_mut() {
+                if accumulated_deepstack.len() != visual_deepstack.len() {
+                    bail!(
+                        "vision images produced incompatible DeepStack feature depths: {} vs {}",
+                        accumulated_deepstack.len(),
+                        visual_deepstack.len()
+                    );
+                }
+                for (dst, mut src) in accumulated_deepstack.into_iter().zip(visual_deepstack) {
+                    dst.append(&mut src);
+                }
+            } else {
+                deepstack_features = Some(visual_deepstack);
+            }
+        }
+        let deepstack_features = deepstack_features.unwrap_or_default();
+        let expanded = expand_multimodal_image_placeholders(
             prompt_tokens,
             vs_tok,
             ve_tok,
             pad_tok,
-            num_visual_tokens,
+            &image_specs,
         )?;
-        let (mrope_positions, next_mrope_position) = qwen3vl_single_image_mrope_positions(
-            &prompt_tokens,
-            pad_tok,
-            visual.merged_grid_h,
-            visual.merged_grid_w,
-        )?;
+        prompt_tokens = expanded.tokens;
+        let (mrope_positions, next_mrope_position) =
+            qwen3vl_multimodal_mrope_positions(&prompt_tokens, pad_tok, &expanded.image_spans)?;
 
-        // ── 3. Prefill with visual embeddings injected ────────────────────────
         let mut kv_cache = KvCache::new(
             self.config.num_hidden_layers,
-            prompt_tokens.len() + request.max_tokens.max(0) as usize,
+            prompt_tokens.len() + max_tokens.max(0) as usize,
         );
         let prefill_hidden = self.prefill_with_vision(
             &prompt_tokens,
-            &visual.embeddings,
-            &visual.deepstack_features,
+            &visual_embeddings,
+            &deepstack_features,
             pad_tok,
             &mrope_positions,
             &mut kv_cache,
         )?;
 
-        // ── 4. Decode ─────────────────────────────────────────────────────────
-        let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
+        let mut sampler = TokenSampler::new(temperature, top_k, seed);
         let mut generated = Vec::new();
-        let max_tokens = request.max_tokens.max(0) as usize;
+        let max_tokens = max_tokens.max(0) as usize;
         let mut stopped = false;
         if max_tokens > 0 {
             let token =
@@ -13512,6 +13731,214 @@ mod tests {
         assert!(expand_single_image_placeholders(vec![1, 9, 2, 9], 7, 8, 9, 2).is_err());
         assert!(expand_single_image_placeholders(vec![1, 7, 9, 2], 7, 8, 9, 2).is_err());
         assert!(qwen3vl_single_image_mrope_positions(&[1, 9, 2, 9], 9, 1, 2).is_err());
+    }
+
+    fn expand_and_position_for_test(
+        tokens: Vec<u32>,
+        image_specs: &[ImagePlaceholderSpec],
+    ) -> (ExpandedVisionPrompt, Vec<MropePosition>, usize) {
+        let expanded = expand_multimodal_image_placeholders(tokens, 7, 8, 9, image_specs).unwrap();
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, 9, &expanded.image_spans).unwrap();
+        (expanded, positions, next_position)
+    }
+
+    #[test]
+    fn qwen3vl_text_before_image_gets_own_visual_span() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9],
+            &[ImagePlaceholderSpec {
+                token_count: 4,
+                grid_h: 2,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 9, 9, 8]);
+        assert_eq!(
+            expanded.image_spans,
+            vec![VisualTokenSpan {
+                start: 2,
+                end: 6,
+                grid_h: 2,
+                grid_w: 2,
+            }]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(
+            &positions[2..6],
+            &[
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 3,
+                },
+            ]
+        );
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(next_position, 5);
+    }
+
+    #[test]
+    fn qwen3vl_image_before_text_gets_own_visual_span() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![9, 2],
+            &[ImagePlaceholderSpec {
+                token_count: 2,
+                grid_h: 1,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![7, 9, 9, 8, 2]);
+        assert_eq!(
+            expanded.image_spans,
+            vec![VisualTokenSpan {
+                start: 1,
+                end: 3,
+                grid_h: 1,
+                grid_w: 2,
+            }]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(
+            &positions[1..3],
+            &[
+                MropePosition {
+                    temporal: 1,
+                    height: 1,
+                    width: 1,
+                },
+                MropePosition {
+                    temporal: 1,
+                    height: 1,
+                    width: 2,
+                },
+            ]
+        );
+        assert_eq!(positions[3], MropePosition::text(3));
+        assert_eq!(positions[4], MropePosition::text(4));
+        assert_eq!(next_position, 5);
+    }
+
+    #[test]
+    fn qwen3vl_text_image_text_advances_after_visual_grid() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9, 2],
+            &[ImagePlaceholderSpec {
+                token_count: 4,
+                grid_h: 2,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 9, 9, 8, 2]);
+        assert_eq!(
+            expanded.image_spans,
+            vec![VisualTokenSpan {
+                start: 2,
+                end: 6,
+                grid_h: 2,
+                grid_w: 2,
+            }]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(positions[7], MropePosition::text(5));
+        assert_eq!(next_position, 6);
+    }
+
+    #[test]
+    fn qwen3vl_two_images_get_separate_visual_spans() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9, 2, 9, 3],
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 2,
+                    grid_w: 1,
+                },
+            ],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 8, 2, 7, 9, 9, 8, 3]);
+        assert_eq!(
+            expanded.image_spans,
+            vec![
+                VisualTokenSpan {
+                    start: 2,
+                    end: 4,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+                VisualTokenSpan {
+                    start: 7,
+                    end: 9,
+                    grid_h: 2,
+                    grid_w: 1,
+                },
+            ]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(
+            &positions[2..4],
+            &[
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 3,
+                },
+            ]
+        );
+        assert_eq!(positions[4], MropePosition::text(4));
+        assert_eq!(positions[5], MropePosition::text(5));
+        assert_eq!(positions[6], MropePosition::text(6));
+        assert_eq!(
+            &positions[7..9],
+            &[
+                MropePosition {
+                    temporal: 7,
+                    height: 7,
+                    width: 7,
+                },
+                MropePosition {
+                    temporal: 7,
+                    height: 8,
+                    width: 7,
+                },
+            ]
+        );
+        assert_eq!(positions[9], MropePosition::text(9));
+        assert_eq!(positions[10], MropePosition::text(10));
+        assert_eq!(next_position, 11);
     }
 
     #[test]
