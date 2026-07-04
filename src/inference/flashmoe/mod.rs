@@ -1021,6 +1021,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         vision_encoder,
         config,
         runtime,
+        session_cache: BTreeMap::new(),
     })
 }
 
@@ -1036,6 +1037,26 @@ pub struct FlashMoeEngine {
     runtime: DenseTransformerRuntime,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
+    session_cache: BTreeMap<String, FlashMoeSessionState>,
+}
+
+#[derive(Debug, Clone)]
+struct FlashMoeSessionState {
+    tokens: Vec<u32>,
+    kv_cache: KvCache,
+    last_hidden: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertExecution {
+    Normal,
+    Skip,
+}
+
+#[derive(Debug)]
+struct SampledDecode {
+    token: u32,
+    hidden: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2813,6 +2834,19 @@ impl FlashMoeEngine {
         Ok(self.generate_inner(request, None)?.output)
     }
 
+    pub fn generate_in_session(
+        &mut self,
+        session_id: &str,
+        request: &GenerationRequest,
+    ) -> Result<GenerationOutput> {
+        if session_id.is_empty() {
+            return self.generate(request);
+        }
+        Ok(self
+            .generate_inner_with_session(request, Some(session_id), None)?
+            .output)
+    }
+
     pub fn generate_timed(&mut self, request: &GenerationRequest) -> Result<TimedGenerationOutput> {
         let mut timing = FlashMoeGenerationTiming {
             model: self.plan.model.clone(),
@@ -2820,7 +2854,7 @@ impl FlashMoeEngine {
             tokens: Vec::new(),
             total_wall: Duration::ZERO,
         };
-        self.generate_inner(request, Some(&mut timing))
+        self.generate_inner_with_session(request, None, Some(&mut timing))
     }
 
     fn generate_inner(
@@ -2828,19 +2862,57 @@ impl FlashMoeEngine {
         request: &GenerationRequest,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<TimedGenerationOutput> {
+        self.generate_inner_with_session(request, None, timing.as_deref_mut())
+    }
+
+    fn generate_inner_with_session(
+        &mut self,
+        request: &GenerationRequest,
+        session_id: Option<&str>,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<TimedGenerationOutput> {
         let generation_started = Instant::now();
         let prompt = self.tokenizer.apply_chat_template(&request.prompt);
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
-        let mut kv_cache = KvCache::new(
-            self.config.num_hidden_layers,
-            prompt_tokens.len() + request.max_tokens.max(0) as usize,
-        );
-        let prefill_hidden = self.prefill(&prompt_tokens, &mut kv_cache, timing.as_deref_mut())?;
+        let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
+        let cached = session_id.and_then(|id| self.session_cache_prefix(id, &prompt_tokens));
+        let (mut kv_cache, prefill_start, mut last_cache_hidden) =
+            if let Some((prefix_len, state)) = cached {
+                let mut kv_cache = state.kv_cache.clone();
+                kv_cache.resize_capacity(cache_capacity);
+                let last_hidden = if prefix_len == prompt_tokens.len() {
+                    Some(state.last_hidden.clone())
+                } else {
+                    None
+                };
+                (kv_cache, prefix_len, last_hidden)
+            } else {
+                (
+                    KvCache::new(self.config.num_hidden_layers, cache_capacity),
+                    0,
+                    None,
+                )
+            };
+        let prefill_hidden = if prefill_start == prompt_tokens.len() {
+            last_cache_hidden
+                .clone()
+                .context("session cache entry is missing the final hidden state")?
+        } else {
+            let hidden = self.prefill_from(
+                &prompt_tokens,
+                prefill_start,
+                &mut kv_cache,
+                timing.as_deref_mut(),
+            )?;
+            last_cache_hidden = Some(hidden.clone());
+            hidden
+        };
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
         let max_tokens = request.max_tokens.max(0) as usize;
         let mut stopped = false;
+        let mut processed_generated = 0usize;
         if max_tokens > 0 {
             let sample_started = Instant::now();
             let token =
@@ -2861,7 +2933,7 @@ impl FlashMoeEngine {
         }
         while !stopped && generated.len() < max_tokens {
             let position = prompt_tokens.len() + generated.len() - 1;
-            let token = self.sample_next_token(
+            let sampled = self.sample_next_token(
                 &mut sampler,
                 &prompt_tokens,
                 &generated,
@@ -2870,10 +2942,24 @@ impl FlashMoeEngine {
                 MropePosition::text(position),
                 timing.as_deref_mut(),
             )?;
+            let token = sampled.token;
+            last_cache_hidden = Some(sampled.hidden);
+            processed_generated = processed_generated.saturating_add(1);
             if self.tokenizer.is_eos(token) {
                 break;
             }
             generated.push(token);
+        }
+
+        if let Some(session_id) = session_id {
+            self.store_session_cache(
+                session_id,
+                &prompt_tokens,
+                &generated,
+                processed_generated,
+                kv_cache.clone(),
+                last_cache_hidden.as_deref().unwrap_or(&prefill_hidden),
+            );
         }
 
         let output = GenerationOutput {
@@ -2905,11 +2991,39 @@ impl FlashMoeEngine {
         kv_cache: &mut KvCache,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<Vec<f32>> {
+        self.prefill_from(prompt_tokens, 0, kv_cache, timing.as_deref_mut())
+    }
+
+    fn prefill_from(
+        &mut self,
+        prompt_tokens: &[u32],
+        start_position: usize,
+        kv_cache: &mut KvCache,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<Vec<f32>> {
+        if start_position > prompt_tokens.len() {
+            bail!(
+                "prefill start position {start_position} exceeds prompt length {}",
+                prompt_tokens.len()
+            );
+        }
         let mut last_hidden = None;
-        for (position, token) in prompt_tokens.iter().copied().enumerate() {
+        for (position, token) in prompt_tokens
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(start_position)
+        {
             kv_cache.record_prompt_token(position, token)?;
             let mut token_timing =
                 FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
+            let expert_execution = if self.can_skip_intermediate_prefill_experts()
+                && position + 1 < prompt_tokens.len()
+            {
+                ExpertExecution::Skip
+            } else {
+                ExpertExecution::Normal
+            };
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
@@ -2921,6 +3035,7 @@ impl FlashMoeEngine {
                 MropePosition::text(position),
                 None,
                 false,
+                expert_execution,
                 if timing.is_some() {
                     Some(&mut token_timing)
                 } else {
@@ -2932,6 +3047,43 @@ impl FlashMoeEngine {
             }
         }
         last_hidden.context("cannot generate from an empty prompt")
+    }
+
+    fn session_cache_prefix(
+        &self,
+        session_id: &str,
+        prompt_tokens: &[u32],
+    ) -> Option<(usize, &FlashMoeSessionState)> {
+        let state = self.session_cache.get(session_id)?;
+        let prefix_len = reusable_session_prefix_len(&state.tokens, prompt_tokens)?;
+        Some((prefix_len, state))
+    }
+
+    fn store_session_cache(
+        &mut self,
+        session_id: &str,
+        prompt_tokens: &[u32],
+        generated: &[u32],
+        processed_generated: usize,
+        kv_cache: KvCache,
+        last_hidden: &[f32],
+    ) {
+        let generated_prefix_len = processed_generated.min(generated.len());
+        let mut tokens = Vec::with_capacity(prompt_tokens.len() + generated_prefix_len);
+        tokens.extend_from_slice(prompt_tokens);
+        tokens.extend_from_slice(&generated[..generated_prefix_len]);
+        self.session_cache.insert(
+            session_id.to_string(),
+            FlashMoeSessionState {
+                tokens,
+                kv_cache,
+                last_hidden: last_hidden.to_vec(),
+            },
+        );
+    }
+
+    fn can_skip_intermediate_prefill_experts(&self) -> bool {
+        prefill_expert_skip_is_safe(&self.config, self.vision_encoder.is_some())
     }
 
     /// Prefill the KV cache for a vision prompt, substituting visual embeddings
@@ -2980,6 +3132,7 @@ impl FlashMoeEngine {
                 mrope_positions[position],
                 deepstack,
                 false,
+                ExpertExecution::Normal,
                 None,
             )?);
         }
@@ -3083,7 +3236,7 @@ impl FlashMoeEngine {
         }
         while !stopped && generated.len() < max_tokens {
             let position = prompt_tokens.len() + generated.len() - 1;
-            let token = self.sample_next_token(
+            let sampled = self.sample_next_token(
                 &mut sampler,
                 &prompt_tokens,
                 &generated,
@@ -3092,6 +3245,7 @@ impl FlashMoeEngine {
                 MropePosition::text(next_mrope_position + generated.len() - 1),
                 None,
             )?;
+            let token = sampled.token;
             if self.tokenizer.is_eos(token) {
                 break;
             }
@@ -3113,7 +3267,7 @@ impl FlashMoeEngine {
         position: usize,
         rope_position: MropePosition,
         timing: Option<&mut FlashMoeGenerationTiming>,
-    ) -> Result<u32> {
+    ) -> Result<SampledDecode> {
         let previous = generated
             .last()
             .copied()
@@ -3133,6 +3287,7 @@ impl FlashMoeEngine {
             rope_position,
             None,
             true,
+            ExpertExecution::Normal,
             if timing.is_some() {
                 Some(&mut token_timing)
             } else {
@@ -3148,7 +3303,7 @@ impl FlashMoeEngine {
         if let Some(timing) = timing {
             timing.tokens.push(token_timing);
         }
-        Ok(token)
+        Ok(SampledDecode { token, hidden })
     }
 
     fn sample_from_hidden(
@@ -3186,6 +3341,7 @@ impl FlashMoeEngine {
         rope_position: MropePosition,
         deepstack: Option<DeepstackTokenContext<'_>>,
         record_generated: bool,
+        expert_execution: ExpertExecution,
         mut timing: Option<&mut FlashMoeTokenTiming>,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
@@ -3277,6 +3433,15 @@ impl FlashMoeEngine {
             layer_timing.buckets.routing += routing_started.elapsed();
             layer_timing.active_experts = active.len();
             let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
+            if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
+                kv_cache.record_layer_state(position, layer, state)?;
+                layer_timing.buckets.total_wall = layer_started.elapsed();
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.add(layer_timing.buckets);
+                    timing.layers.push(layer_timing);
+                }
+                continue;
+            }
             let expert_metrics_before = self.scheduler.snapshot();
             let expert_io_started = Instant::now();
             let pending_experts = self.scheduler.issue(layer, &active_ids)?;
@@ -5527,6 +5692,16 @@ impl KvCache {
         Ok(())
     }
 
+    fn resize_capacity(&mut self, capacity: usize) {
+        if capacity <= self.capacity {
+            return;
+        }
+        for layer in &mut self.kv {
+            layer.resize_with(capacity, || None);
+        }
+        self.capacity = capacity;
+    }
+
     fn record_generated_token(&mut self, position: usize, token: u32) -> Result<()> {
         self.ensure_position(position)?;
         self.generated_tokens.push((position, token));
@@ -5632,6 +5807,25 @@ impl KvCache {
         }
         Ok(())
     }
+}
+
+fn common_token_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> Option<usize> {
+    let prefix_len = common_token_prefix_len(cached_tokens, prompt_tokens);
+    (prefix_len == cached_tokens.len()).then_some(prefix_len)
+}
+
+fn prefill_expert_skip_is_safe(config: &QwenModelConfig, has_vision_encoder: bool) -> bool {
+    config.vision_config.is_none()
+        && !has_vision_encoder
+        && config.num_hidden_layers == 1
+        && config.num_experts.unwrap_or(0) > 0
 }
 
 #[derive(Debug, Clone)]
@@ -12068,6 +12262,34 @@ mod tests {
     }
 
     #[test]
+    fn prefill_expert_skip_is_only_enabled_for_single_layer_text_moe() {
+        let (single_layer, _) = minimal_dense_manifest(true);
+        assert!(prefill_expert_skip_is_safe(&single_layer, false));
+
+        let mut multi_layer = single_layer.clone();
+        multi_layer.num_hidden_layers = 2;
+        assert!(!prefill_expert_skip_is_safe(&multi_layer, false));
+
+        let mut vision = single_layer.clone();
+        vision.vision_config = Some(
+            serde_json::from_slice(br#"{"depth":1,"hidden_size":8,"num_heads":2,"mlp_ratio":4.0}"#)
+                .unwrap(),
+        );
+        assert!(!prefill_expert_skip_is_safe(&vision, false));
+        assert!(!prefill_expert_skip_is_safe(&single_layer, true));
+    }
+
+    #[test]
+    fn session_cache_reuse_requires_entire_cached_token_prefix() {
+        assert_eq!(
+            reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+            Some(3)
+        );
+        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 9]), None);
+        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2]), None);
+    }
+
+    #[test]
     fn validate_accepts_hybrid_gated_deltanet_manifest() {
         let config: QwenModelConfig = serde_json::from_slice(
             br#"{"model_type":"qwen3_moe","num_hidden_layers":4,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
@@ -13556,6 +13778,7 @@ mod tests {
             config,
             runtime,
             vision_encoder: None,
+            session_cache: BTreeMap::new(),
         };
         let output = engine
             .generate(&GenerationRequest {

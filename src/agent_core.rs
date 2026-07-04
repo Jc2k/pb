@@ -2788,15 +2788,16 @@ impl CompletionEngine for FlashMoeCompletionEngine {
     fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
         let energy_start = energy::sample();
         let started = Instant::now();
-        let output = self
-            .engine
-            .generate(&crate::inference::flashmoe::GenerationRequest {
+        let output = self.engine.generate_in_session(
+            &args.session_id,
+            &crate::inference::flashmoe::GenerationRequest {
                 prompt: prompt.to_string(),
                 max_tokens: args.max_tokens,
                 temperature: args.temperature,
                 top_k: args.top_k,
                 seed: args.seed,
-            })?;
+            },
+        )?;
         let energy =
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
         Ok(CompletionOutput {
