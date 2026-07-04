@@ -43,6 +43,8 @@ pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
 const FLASHMOE_METAL_ROUTING_ENV: &str = "PB_FLASHMOE_METAL_ROUTING";
+const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
+const METAL_ATTENTION_BENCH_SAMPLES: usize = 3;
 pub const HIDDEN_DIM: usize = 4096;
 pub const GROUP_SIZE: usize = 64;
 pub const FULL_ATTN_INTERVAL: usize = 4;
@@ -1015,7 +1017,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         scheduler: ExpertScheduler::new(ExpertStore::open(plan.experts_dir.clone())?),
         dense,
         tokenizer: QwenTokenizer::from_file(&plan.tokenizer)?,
-        metal: MetalExecutor::new(plan, &config)?,
+        metal: MetalExecutor::new(plan, &config, &runtime)?,
         vision_encoder,
         config,
         runtime,
@@ -1267,7 +1269,11 @@ impl DeferredExpertPhase {
 }
 
 impl MetalExecutor {
-    fn new(plan: &FlashMoePlan, config: &QwenModelConfig) -> Result<Option<Self>> {
+    fn new(
+        plan: &FlashMoePlan,
+        config: &QwenModelConfig,
+        runtime: &DenseTransformerRuntime,
+    ) -> Result<Option<Self>> {
         if !plan.uses_metal {
             return Ok(None);
         }
@@ -1275,13 +1281,18 @@ impl MetalExecutor {
         {
             let route_top4_enabled = metal_route_top4_enabled();
             return Ok(Some(Self {
-                inner: Arc::new(MetalExecutorInner::new(plan, config, route_top4_enabled)?),
+                inner: Arc::new(MetalExecutorInner::new(
+                    plan,
+                    config,
+                    runtime,
+                    route_top4_enabled,
+                )?),
                 route_top4_enabled,
             }));
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = config;
+            let _ = (config, runtime);
             Ok(None)
         }
     }
@@ -1394,6 +1405,31 @@ impl MetalExecutor {
         }
     }
 
+    fn apply_rope_for_layout(
+        &self,
+        values: &[f32],
+        position: MropePosition,
+        theta: f64,
+        layout: FullAttentionLayout,
+        mrope_section: Option<[usize; 3]>,
+    ) -> Result<Option<Vec<f32>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return self.inner.apply_rope_for_layout(
+                values,
+                position,
+                theta,
+                layout,
+                mrope_section,
+            );
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (values, position, theta, layout, mrope_section);
+            Ok(None)
+        }
+    }
+
     #[allow(dead_code)]
     fn causal_attention(
         &self,
@@ -1425,14 +1461,21 @@ impl MetalExecutor {
         }
     }
 
-    fn record_kv(&self, position: usize, layer: usize, key: &[f32], value: &[f32]) -> Result<()> {
+    fn record_kv(
+        &self,
+        position: usize,
+        layer: usize,
+        layout: FullAttentionLayout,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.record_kv(position, layer, key, value);
+            return self.inner.record_kv(position, layer, layout, key, value);
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (position, layer, key, value);
+            let _ = (position, layer, layout, key, value);
             Ok(())
         }
     }
@@ -1442,25 +1485,94 @@ impl MetalExecutor {
         position: usize,
         layer: usize,
         query: &[f32],
-        num_q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
+        layout: FullAttentionLayout,
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            return self.inner.causal_attention_cached(
-                position,
-                layer,
-                query,
-                num_q_heads,
-                kv_heads,
-                head_dim,
-            );
+            return self
+                .inner
+                .causal_attention_cached(position, layer, query, layout);
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (position, layer, num_q_heads, kv_heads, head_dim);
+            let _ = (position, layer, layout);
             Ok(vec![0.0; query.len()])
+        }
+    }
+
+    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return self.inner.attention_backend(tokens);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = tokens;
+            MetalAttentionBackend::Cpu
+        }
+    }
+
+    fn observe_attention_benchmark(
+        &self,
+        tokens: usize,
+        cpu_elapsed: Duration,
+        gpu_elapsed: Option<Duration>,
+    ) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .observe_attention_benchmark(tokens, cpu_elapsed, gpu_elapsed);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (tokens, cpu_elapsed, gpu_elapsed);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalAttentionBackend {
+    Cpu,
+    Benchmark,
+    Gpu,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct MetalAttentionPolicy {
+    short_context_samples: usize,
+    short_context_cpu: Duration,
+    short_context_gpu: Duration,
+    short_context_backend: Option<MetalAttentionBackend>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalAttentionPolicy {
+    fn backend(&self, tokens: usize) -> MetalAttentionBackend {
+        if tokens > METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS {
+            return MetalAttentionBackend::Gpu;
+        }
+        self.short_context_backend
+            .unwrap_or(MetalAttentionBackend::Benchmark)
+    }
+
+    fn observe(&mut self, tokens: usize, cpu_elapsed: Duration, gpu_elapsed: Option<Duration>) {
+        if tokens > METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS
+            || self.short_context_backend.is_some()
+        {
+            return;
+        }
+        self.short_context_samples += 1;
+        self.short_context_cpu = self.short_context_cpu.saturating_add(cpu_elapsed);
+        self.short_context_gpu = self
+            .short_context_gpu
+            .saturating_add(gpu_elapsed.unwrap_or(Duration::from_secs(u64::MAX / 4)));
+        if self.short_context_samples >= METAL_ATTENTION_BENCH_SAMPLES {
+            self.short_context_backend = Some(if self.short_context_gpu < self.short_context_cpu {
+                MetalAttentionBackend::Gpu
+            } else {
+                MetalAttentionBackend::Cpu
+            });
         }
     }
 }
@@ -1475,6 +1587,7 @@ struct MetalExecutorInner {
     dense_matvec_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
     rope_pipeline: ObjcId,
+    rope_split_half_pipeline: ObjcId,
     attention_pipeline: ObjcId,
     kv_write_pipeline: ObjcId,
     kv_read_attention_pipeline: ObjcId,
@@ -1488,6 +1601,7 @@ struct MetalExecutorInner {
     gqa_scores_pipeline: ObjcId,
     gqa_read_pipeline: ObjcId,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
+    attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
 }
 
@@ -1503,8 +1617,15 @@ struct MetalReusableBuffer {
 struct MetalKvCacheInner {
     keys: ObjcId,
     values: ObjcId,
-    layers: usize,
+    layers: Vec<MetalKvLayer>,
     max_context: usize,
+    total_items: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalKvLayer {
+    offset: usize,
     width: usize,
 }
 
@@ -1557,6 +1678,7 @@ impl Drop for MetalExecutorInner {
             release(self.dense_matvec_pipeline);
             release(self.rms_norm_pipeline);
             release(self.rope_pipeline);
+            release(self.rope_split_half_pipeline);
             release(self.attention_pipeline);
             release(self.kv_write_pipeline);
             release(self.kv_read_attention_pipeline);
@@ -1591,6 +1713,7 @@ impl MetalExecutorInner {
     fn new(
         plan: &FlashMoePlan,
         config: &QwenModelConfig,
+        runtime: &DenseTransformerRuntime,
         route_top4_enabled: bool,
     ) -> Result<Self> {
         unsafe {
@@ -1623,6 +1746,8 @@ impl MetalExecutorInner {
             let dense_matvec_pipeline = compile_pipeline(device, library, "dense_matvec")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
+            let rope_split_half_pipeline =
+                compile_pipeline(device, library, "rope_split_half_apply")?;
             let attention_pipeline = compile_pipeline(device, library, "attention_scores")?;
             let kv_write_pipeline = compile_pipeline(device, library, "kv_cache_write")?;
             let kv_read_attention_pipeline =
@@ -1649,6 +1774,7 @@ impl MetalExecutorInner {
                 release(dense_matvec_pipeline);
                 release(rms_norm_pipeline);
                 release(rope_pipeline);
+                release(rope_split_half_pipeline);
                 release(attention_pipeline);
                 release(kv_write_pipeline);
                 release(kv_read_attention_pipeline);
@@ -1665,24 +1791,19 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE Metal command queue");
             }
 
-            let runtime = DenseTransformerRuntime::new(config);
-            let max_context = metal_kv_max_context(
+            let max_context = metal_kv_max_context_for_layouts(
                 config,
-                runtime.kv_width,
+                &runtime.full_attention,
                 system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
             );
-            let kv_cache = allocate_metal_kv_cache(
-                device,
-                config.num_hidden_layers,
-                max_context,
-                runtime.kv_width,
-            )?;
+            let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
+            let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
 
             tracing::info!(
                 model = %plan.model,
                 layers = config.num_hidden_layers,
                 max_context,
-                kv_cache_mib = (metal_kv_cache_bytes(config.num_hidden_layers, max_context, runtime.kv_width) / (1024 * 1024)),
+                kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
                 experts = config.experts(),
                 route_top4 = route_top4_enabled,
                 "Flash-MoE Metal executor initialized"
@@ -1696,6 +1817,7 @@ impl MetalExecutorInner {
                 dense_matvec_pipeline,
                 rms_norm_pipeline,
                 rope_pipeline,
+                rope_split_half_pipeline,
                 attention_pipeline,
                 kv_write_pipeline,
                 kv_read_attention_pipeline,
@@ -1709,6 +1831,7 @@ impl MetalExecutorInner {
                 gqa_scores_pipeline,
                 gqa_read_pipeline,
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
+                attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
                 reusable: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -1815,6 +1938,80 @@ impl MetalExecutorInner {
             self.recycle(groups_buffer);
             self.recycle(group_size_buffer);
             Ok(output)
+        }
+    }
+
+    fn apply_rope_for_layout(
+        &self,
+        values: &[f32],
+        position: MropePosition,
+        theta: f64,
+        layout: FullAttentionLayout,
+        mrope_section: Option<[usize; 3]>,
+    ) -> Result<Option<Vec<f32>>> {
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if layout.rotary_pairing != RotaryPairing::SplitHalf || layout.rotary_dim == 0 {
+            return Ok(None);
+        }
+        if values.len() % layout.head_dim != 0 {
+            bail!(
+                "Metal RoPE input len {} is not divisible by head_dim {}",
+                values.len(),
+                layout.head_dim
+            );
+        }
+        let heads = values.len() / layout.head_dim;
+        let rotary_pairs = layout.rotary_dim.min(layout.head_dim) / 2;
+        if rotary_pairs == 0 {
+            return Ok(Some(values.to_vec()));
+        }
+        let section = mrope_section.unwrap_or([0, 0, 0]);
+        unsafe {
+            let values_buffer = self.buffer_with_bytes(f32_as_bytes(values))?;
+            let temporal = position.temporal as u32;
+            let height = position.height as u32;
+            let width_pos = position.width as u32;
+            let head_dim = layout.head_dim as u32;
+            let rotary_dim = layout.rotary_dim as u32;
+            let theta = theta as f32;
+            let use_mrope = u32::from(mrope_section.is_some());
+            let section_u32 = [section[0] as u32, section[1] as u32, section[2] as u32];
+            let temporal_buffer = self.buffer_with_bytes(u32_as_bytes(&temporal))?;
+            let height_buffer = self.buffer_with_bytes(u32_as_bytes(&height))?;
+            let width_pos_buffer = self.buffer_with_bytes(u32_as_bytes(&width_pos))?;
+            let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim))?;
+            let rotary_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&rotary_dim))?;
+            let theta_buffer = self.buffer_with_bytes(f32_as_bytes(&[theta]))?;
+            let use_mrope_buffer = self.buffer_with_bytes(u32_as_bytes(&use_mrope))?;
+            let section_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&section_u32))?;
+            self.dispatch_unary(
+                self.rope_split_half_pipeline,
+                &[
+                    values_buffer,
+                    temporal_buffer,
+                    height_buffer,
+                    width_pos_buffer,
+                    head_dim_buffer,
+                    rotary_dim_buffer,
+                    theta_buffer,
+                    use_mrope_buffer,
+                    section_buffer,
+                ],
+                (heads * rotary_pairs) as u64,
+            )?;
+            let output = read_f32_buffer(values_buffer, values.len());
+            self.recycle(values_buffer);
+            self.recycle(temporal_buffer);
+            self.recycle(height_buffer);
+            self.recycle(width_pos_buffer);
+            self.recycle(head_dim_buffer);
+            self.recycle(rotary_dim_buffer);
+            self.recycle(theta_buffer);
+            self.recycle(use_mrope_buffer);
+            self.recycle(section_buffer);
+            Ok(Some(output))
         }
     }
 
@@ -2336,34 +2533,49 @@ impl MetalExecutorInner {
         ))
     }
 
-    fn record_kv(&self, position: usize, layer: usize, key: &[f32], value: &[f32]) -> Result<()> {
+    fn record_kv(
+        &self,
+        position: usize,
+        layer: usize,
+        layout: FullAttentionLayout,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
         let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
         let kv_cache = kv_cache
             .as_ref()
             .context("Flash-MoE Metal KV cache is not allocated")?;
-        if layer >= kv_cache.layers || position >= kv_cache.max_context {
+        let layer_info = kv_cache.layer(layer)?;
+        if layer_info.width != layout.kv_width {
             bail!(
-                "Metal KV write layer {layer} position {position} exceeds cache {} layers x {} tokens",
-                kv_cache.layers,
+                "Metal KV write layer {layer} layout width {} does not match cache width {}",
+                layout.kv_width,
+                layer_info.width
+            );
+        }
+        if position >= kv_cache.max_context {
+            bail!(
+                "Metal KV write layer {layer} position {position} exceeds cache {} tokens",
                 kv_cache.max_context
             );
         }
-        if key.len() < kv_cache.width || value.len() < kv_cache.width {
+        if key.len() < layer_info.width || value.len() < layer_info.width {
             bail!(
                 "Metal KV write width mismatch: key {}, value {}, cache width {}",
                 key.len(),
                 value.len(),
-                kv_cache.width
+                layer_info.width
             );
         }
         unsafe {
-            let key_buffer = self.buffer_with_bytes(f32_as_bytes(&key[..kv_cache.width]))?;
-            let value_buffer = self.buffer_with_bytes(f32_as_bytes(&value[..kv_cache.width]))?;
-            let offset = (layer * kv_cache.max_context + position)
-                .checked_mul(kv_cache.width)
-                .context("Metal KV cache offset overflow")? as u32;
-            let width = kv_cache.width as u32;
-            let offset_buffer = self.buffer_with_bytes(u32_as_bytes(&offset))?;
+            let key_buffer = self.buffer_with_bytes(f32_as_bytes(&key[..layer_info.width]))?;
+            let value_buffer = self.buffer_with_bytes(f32_as_bytes(&value[..layer_info.width]))?;
+            let offset = layer_info
+                .offset
+                .checked_add(position.saturating_mul(layer_info.width))
+                .context("Metal KV cache offset overflow")? as u64;
+            let width = layer_info.width as u32;
+            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&offset))?;
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
             self.dispatch_unary(
                 self.kv_write_pipeline,
@@ -2375,7 +2587,7 @@ impl MetalExecutorInner {
                     offset_buffer,
                     width_buffer,
                 ],
-                kv_cache.width as u64,
+                layer_info.width as u64,
             )?;
             self.recycle(key_buffer);
             self.recycle(value_buffer);
@@ -2390,22 +2602,27 @@ impl MetalExecutorInner {
         position: usize,
         layer: usize,
         query: &[f32],
-        num_q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
+        layout: FullAttentionLayout,
     ) -> Result<Vec<f32>> {
         let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
         let kv_cache = kv_cache
             .as_ref()
             .context("Flash-MoE Metal KV cache is not allocated")?;
-        if layer >= kv_cache.layers || position >= kv_cache.max_context {
+        let layer_info = kv_cache.layer(layer)?;
+        if layer_info.width != layout.kv_width {
             bail!(
-                "Metal KV read layer {layer} position {position} exceeds cache {} layers x {} tokens",
-                kv_cache.layers,
+                "Metal KV read layer {layer} layout width {} does not match cache width {}",
+                layout.kv_width,
+                layer_info.width
+            );
+        }
+        if position >= kv_cache.max_context {
+            bail!(
+                "Metal KV read layer {layer} position {position} exceeds cache {} tokens",
                 kv_cache.max_context
             );
         }
-        let q_width = num_q_heads * head_dim;
+        let q_width = layout.q_width;
         if query.len() < q_width {
             bail!(
                 "Metal GQA attention query len {} is smaller than q_width {}",
@@ -2414,20 +2631,17 @@ impl MetalExecutorInner {
             );
         }
         let tokens = position + 1;
-        let groups_per_kv = num_q_heads / kv_heads.max(1);
-        let layer_offset_items = layer
-            .checked_mul(kv_cache.max_context)
-            .and_then(|items| items.checked_mul(kv_cache.width))
-            .context("Metal KV layer offset overflow")?;
+        let groups_per_kv = layout.num_q_heads / layout.kv_heads.max(1);
+        let layer_offset_items = layer_info.offset;
         let layer_offset_bytes = (layer_offset_items * std::mem::size_of::<f32>()) as u64;
         unsafe {
             let query_buffer = self.buffer_with_bytes(f32_as_bytes(&query[..q_width]))?;
             let scores_buffer =
-                self.buffer_with_len(num_q_heads * tokens * std::mem::size_of::<f32>())?;
-            let head_dim_u32 = head_dim as u32;
+                self.buffer_with_len(layout.num_q_heads * tokens * std::mem::size_of::<f32>())?;
+            let head_dim_u32 = layout.head_dim as u32;
             let groups_per_kv_u32 = groups_per_kv as u32;
             let tokens_u32 = tokens as u32;
-            let kv_width_u32 = kv_cache.width as u32;
+            let kv_width_u32 = layer_info.width as u32;
             let head_dim_buf = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
             let gpk_buf = self.buffer_with_bytes(u32_as_bytes(&groups_per_kv_u32))?;
             let tokens_buf = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
@@ -2455,7 +2669,7 @@ impl MetalExecutorInner {
             set_buffer(encoder, gpk_buf, 4);
             set_buffer(encoder, tokens_buf, 5);
             set_buffer(encoder, kv_width_buf, 6);
-            dispatch_threads(encoder, (num_q_heads * tokens) as u64);
+            dispatch_threads(encoder, (layout.num_q_heads * tokens) as u64);
             msg_send_void0(encoder, sel("endEncoding"));
             msg_send_void0(command_buffer, sel("commit"));
             msg_send_void0(command_buffer, sel("waitUntilCompleted"));
@@ -2463,8 +2677,8 @@ impl MetalExecutorInner {
             release(command_buffer);
 
             // Step 2: softmax per Q-head independently (CPU)
-            let mut scores = read_f32_buffer(scores_buffer, num_q_heads * tokens);
-            for qh in 0..num_q_heads {
+            let mut scores = read_f32_buffer(scores_buffer, layout.num_q_heads * tokens);
+            for qh in 0..layout.num_q_heads {
                 softmax_in_place(&mut scores[qh * tokens..(qh + 1) * tokens]);
             }
 
@@ -2509,6 +2723,25 @@ impl MetalExecutorInner {
             self.recycle(output_buffer);
             Ok(output)
         }
+    }
+
+    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
+        self.attention_policy
+            .lock()
+            .expect("metal attention policy poisoned")
+            .backend(tokens)
+    }
+
+    fn observe_attention_benchmark(
+        &self,
+        tokens: usize,
+        cpu_elapsed: Duration,
+        gpu_elapsed: Option<Duration>,
+    ) {
+        self.attention_policy
+            .lock()
+            .expect("metal attention policy poisoned")
+            .observe(tokens, cpu_elapsed, gpu_elapsed);
     }
 
     unsafe fn dispatch_unary(
@@ -3237,7 +3470,8 @@ impl FlashMoeEngine {
                 1_000_000.0
             }
         });
-        apply_rotary_for_layout(
+        apply_rotary_for_layout_with_metal(
+            self.metal.as_ref(),
             &mut q,
             &mut k,
             rope_position,
@@ -3246,20 +3480,25 @@ impl FlashMoeEngine {
             self.config.text_mrope_section(),
         );
 
-        // Soundness-first path:
-        // The existing Metal KV cache has a single global width derived from config.
-        // That is not safe for gated-Q/full-attention layouts whose K/V width is
-        // inferred from the manifest.  Use the CPU-side KvCache here until the Metal
-        // KV cache is made layout-aware.
+        let metal_kv_ready = if let Some(metal) = &self.metal {
+            match metal.record_kv(position, layer, layout, &k, &v) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(
+                        layer,
+                        position,
+                        error = %err,
+                        "falling back to CPU full-attention KV cache"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
         kv_cache.record_kv(position, layer, k, v)?;
-        let mut attended = kv_cache.causal_attention(
-            position,
-            layer,
-            &q,
-            layout.num_q_heads,
-            layout.kv_heads,
-            layout.head_dim,
-        )?;
+        let mut attended =
+            self.full_attention_cached(kv_cache, position, layer, &q, layout, metal_kv_ready)?;
 
         if let Some(q_gate) = q_gate {
             for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
@@ -3274,6 +3513,92 @@ impl FlashMoeEngine {
             &attended,
             runtime.width,
         )
+    }
+
+    fn full_attention_cached(
+        &self,
+        kv_cache: &KvCache,
+        position: usize,
+        layer: usize,
+        q: &[f32],
+        layout: FullAttentionLayout,
+        metal_kv_ready: bool,
+    ) -> Result<Vec<f32>> {
+        let cpu_attention = |kv_cache: &KvCache| {
+            kv_cache.causal_attention(
+                position,
+                layer,
+                q,
+                layout.num_q_heads,
+                layout.kv_heads,
+                layout.head_dim,
+            )
+        };
+
+        let Some(metal) = &self.metal else {
+            return cpu_attention(kv_cache);
+        };
+        if !metal_kv_ready {
+            return cpu_attention(kv_cache);
+        }
+
+        let tokens = position + 1;
+        match metal.attention_backend(tokens) {
+            MetalAttentionBackend::Cpu => cpu_attention(kv_cache),
+            MetalAttentionBackend::Gpu => {
+                match metal.causal_attention_cached(position, layer, q, layout) {
+                    Ok(output) => Ok(output),
+                    Err(err) => {
+                        tracing::warn!(
+                            layer,
+                            position,
+                            error = %err,
+                            "falling back to CPU full-attention after Metal attention failure"
+                        );
+                        cpu_attention(kv_cache)
+                    }
+                }
+            }
+            MetalAttentionBackend::Benchmark => {
+                let cpu_started = Instant::now();
+                let cpu = cpu_attention(kv_cache)?;
+                let cpu_elapsed = cpu_started.elapsed();
+
+                let gpu_started = Instant::now();
+                let gpu = metal.causal_attention_cached(position, layer, q, layout);
+                let gpu_elapsed = gpu_started.elapsed();
+
+                match gpu {
+                    Ok(gpu) if attention_close(&cpu, &gpu) => {
+                        metal.observe_attention_benchmark(tokens, cpu_elapsed, Some(gpu_elapsed));
+                        if gpu_elapsed < cpu_elapsed {
+                            Ok(gpu)
+                        } else {
+                            Ok(cpu)
+                        }
+                    }
+                    Ok(_) => {
+                        metal.observe_attention_benchmark(tokens, cpu_elapsed, None);
+                        tracing::warn!(
+                            layer,
+                            position,
+                            "falling back to CPU full-attention after Metal attention mismatch"
+                        );
+                        Ok(cpu)
+                    }
+                    Err(err) => {
+                        metal.observe_attention_benchmark(tokens, cpu_elapsed, None);
+                        tracing::warn!(
+                            layer,
+                            position,
+                            error = %err,
+                            "falling back to CPU full-attention during Metal attention benchmark"
+                        );
+                        Ok(cpu)
+                    }
+                }
+            }
+        }
     }
 
     fn linear_attention_projected(
@@ -4138,6 +4463,46 @@ fn apply_rotary_for_layout(
     }
 }
 
+fn apply_rotary_for_layout_with_metal(
+    metal: Option<&MetalExecutor>,
+    q: &mut [f32],
+    k: &mut [f32],
+    position: MropePosition,
+    theta: f64,
+    layout: FullAttentionLayout,
+    mrope_section: Option<[usize; 3]>,
+) {
+    if let Some(metal) = metal {
+        match (
+            metal.apply_rope_for_layout(q, position, theta, layout, mrope_section),
+            metal.apply_rope_for_layout(k, position, theta, layout, mrope_section),
+        ) {
+            (Ok(Some(q_rotated)), Ok(Some(k_rotated))) => {
+                q.copy_from_slice(&q_rotated);
+                k.copy_from_slice(&k_rotated);
+                return;
+            }
+            (Ok(None), _) | (_, Ok(None)) => {}
+            (Err(err), _) | (_, Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "falling back to CPU RoPE for full-attention layout"
+                );
+            }
+        }
+    }
+
+    apply_rotary_for_layout(q, k, position, theta, layout, mrope_section);
+}
+
+fn attention_close(cpu: &[f32], gpu: &[f32]) -> bool {
+    cpu.len() == gpu.len()
+        && cpu.iter().zip(gpu.iter()).all(|(left, right)| {
+            let diff = (left - right).abs();
+            diff <= 1e-3 || diff <= 1e-3 * left.abs().max(right.abs()).max(1.0)
+        })
+}
+
 fn apply_rotary_adjacent(
     values: &mut [f32],
     position: usize,
@@ -4309,6 +4674,23 @@ fn metal_kv_cache_bytes(layers: usize, max_context: usize, width: usize) -> usiz
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
+fn metal_kv_layer_widths(layouts: &[Option<FullAttentionLayout>]) -> Vec<usize> {
+    layouts
+        .iter()
+        .map(|layout| layout.map(|layout| layout.kv_width).unwrap_or(0))
+        .collect()
+}
+
+fn metal_kv_cache_bytes_for_widths(widths: &[usize], max_context: usize) -> usize {
+    widths
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(max_context)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
 #[allow(dead_code)]
 fn metal_kv_max_context(config: &QwenModelConfig, width: usize, total_ram_bytes: usize) -> usize {
     let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
@@ -4322,31 +4704,87 @@ fn metal_kv_max_context(config: &QwenModelConfig, width: usize, total_ram_bytes:
     requested.min((budget / bytes_per_token).max(1))
 }
 
+fn metal_kv_max_context_for_layouts(
+    config: &QwenModelConfig,
+    layouts: &[Option<FullAttentionLayout>],
+    total_ram_bytes: usize,
+) -> usize {
+    let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
+    let bytes_per_token = metal_kv_layer_widths(layouts)
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .max(1);
+    let budget = (total_ram_bytes / 4).max(256 * 1024 * 1024);
+    requested.min((budget / bytes_per_token).max(1))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn allocate_metal_kv_cache(
     device: ObjcId,
-    layers: usize,
     max_context: usize,
-    width: usize,
+    widths: &[usize],
 ) -> Result<MetalKvCacheInner> {
-    let bytes = metal_kv_cache_bytes(layers, max_context, width);
+    let bytes = metal_kv_cache_bytes_for_widths(widths, max_context);
     unsafe {
-        let keys = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), bytes, 0);
+        let keys = msg_send_id2_usize_u64(
+            device,
+            sel("newBufferWithLength:options:"),
+            bytes.max(std::mem::size_of::<f32>()),
+            0,
+        );
         if keys.is_null() {
             bail!("failed to allocate Flash-MoE Metal KV key buffer ({bytes} bytes)");
         }
-        let values = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), bytes, 0);
+        let values = msg_send_id2_usize_u64(
+            device,
+            sel("newBufferWithLength:options:"),
+            bytes.max(std::mem::size_of::<f32>()),
+            0,
+        );
         if values.is_null() {
             release(keys);
             bail!("failed to allocate Flash-MoE Metal KV value buffer ({bytes} bytes)");
+        }
+        let mut offset = 0usize;
+        let mut layers = Vec::with_capacity(widths.len());
+        for width in widths.iter().copied() {
+            layers.push(MetalKvLayer { offset, width });
+            offset = offset
+                .checked_add(width.saturating_mul(max_context))
+                .context("Metal KV layer offset overflow")?;
         }
         Ok(MetalKvCacheInner {
             keys,
             values,
             layers,
             max_context,
-            width,
+            total_items: offset,
         })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalKvCacheInner {
+    fn layer(&self, layer: usize) -> Result<MetalKvLayer> {
+        let layer = self
+            .layers
+            .get(layer)
+            .copied()
+            .with_context(|| format!("Metal KV cache has no layer {layer}"))?;
+        if layer.width == 0 {
+            bail!("Metal KV cache layer is not a full-attention layer");
+        }
+        if layer
+            .offset
+            .saturating_add(layer.width.saturating_mul(self.max_context))
+            > self.total_items
+        {
+            bail!("Metal KV cache layer range exceeds allocation");
+        }
+        Ok(layer)
     }
 }
 
@@ -7829,6 +8267,23 @@ fn u32_as_bytes(value: &u32) -> &[u8] {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u32_as_bytes_slice(values: &[u32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u64_as_bytes(value: &u64) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (value as *const u64).cast::<u8>(),
+            std::mem::size_of::<u64>(),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct MtlSize {
@@ -8121,6 +8576,49 @@ kernel void rope_apply(
     values[pair + 1u] = x * s + y * c;
 }
 
+kernel void rope_split_half_apply(
+    device float* values [[buffer(0)]],
+    constant uint& temporal_position [[buffer(1)]],
+    constant uint& height_position [[buffer(2)]],
+    constant uint& width_position [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& rotary_dim [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    constant uint& use_mrope [[buffer(7)]],
+    device const uint* mrope_section [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint safe_head_dim = max(head_dim, 1u);
+    uint safe_rotary = min(rotary_dim, safe_head_dim);
+    safe_rotary -= safe_rotary % 2u;
+    uint half = max(safe_rotary / 2u, 1u);
+    uint head = idx / half;
+    uint i = idx % half;
+    if (i >= half) { return; }
+
+    uint position = temporal_position;
+    if (use_mrope != 0u) {
+        uint height = mrope_section[1];
+        uint width = mrope_section[2];
+        if ((i % 3u) == 1u && i < height * 3u) {
+            position = height_position;
+        } else if ((i % 3u) == 2u && i < width * 3u) {
+            position = width_position;
+        }
+    }
+
+    float inv_freq = pow(max(theta, 1.0f), -float(2u * i) / float(max(safe_rotary, 1u)));
+    float angle = float(position) * inv_freq;
+    float s = sin(angle);
+    float c = cos(angle);
+    uint base = head * safe_head_dim;
+    uint lo = base + i;
+    uint hi = base + i + half;
+    float x0 = values[lo];
+    float x1 = values[hi];
+    values[lo] = x0 * c - x1 * s;
+    values[hi] = x0 * s + x1 * c;
+}
+
 kernel void attention_scores(
     device const float* query [[buffer(0)]],
     device const float* keys [[buffer(1)]],
@@ -8140,7 +8638,7 @@ kernel void kv_cache_write(
     device const float* value [[buffer(1)]],
     device float* keys [[buffer(2)]],
     device float* values [[buffer(3)]],
-    constant uint& offset [[buffer(4)]],
+    constant ulong& offset [[buffer(4)]],
     constant uint& width [[buffer(5)]],
     uint idx [[thread_position_in_grid]]) {
     if (idx >= width) { return; }
@@ -10953,7 +11451,8 @@ mod tests {
                 br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
             )
             .unwrap();
-            let _executor = MetalExecutorInner::new(&plan, &config, false).unwrap();
+            let runtime = DenseTransformerRuntime::new(&config);
+            let _executor = MetalExecutorInner::new(&plan, &config, &runtime, false).unwrap();
         }
 
         #[test]
@@ -11228,6 +11727,7 @@ mod tests {
             "dense_matvec",
             "rms_norm",
             "rope_apply",
+            "rope_split_half_apply",
             "attention_scores",
             "kv_cache_write",
             "kv_cache_read_attention",
@@ -11251,6 +11751,45 @@ mod tests {
         assert!(METAL_SHADERS.contains("thread_index_in_simdgroup"));
         assert!(METAL_SHADERS.contains("constant uint& group_size"));
         assert!(METAL_SHADERS.contains("fma(float(byte & 0x0f), scale0 * x0, bias0 * x0)"));
+    }
+
+    #[test]
+    fn metal_kv_cache_uses_full_attention_layout_widths() {
+        let standard = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 8,
+            q_width: 8,
+            kv_width: 4,
+            head_dim: 4,
+            rotary_dim: 4,
+            num_q_heads: 2,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let gated = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Gated,
+            q_projection_width: 16,
+            q_width: 8,
+            kv_width: 6,
+            head_dim: 3,
+            rotary_dim: 2,
+            num_q_heads: 2,
+            kv_heads: 2,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let layouts = vec![Some(standard), None, Some(gated)];
+        let widths = metal_kv_layer_widths(&layouts);
+        assert_eq!(widths, vec![4, 0, 6]);
+        assert_eq!(
+            metal_kv_cache_bytes_for_widths(&widths, 5),
+            (4 + 6) * 5 * 2 * std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn attention_output_closeness_allows_small_metal_roundoff_only() {
+        assert!(attention_close(&[1.0, -2.0], &[1.0005, -2.0005]));
+        assert!(!attention_close(&[1.0, -2.0], &[1.1, -2.0]));
     }
 
     #[test]
