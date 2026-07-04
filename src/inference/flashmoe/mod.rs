@@ -12441,6 +12441,346 @@ mod tests {
 }"#
     }
 
+    fn test_qwen3vl_tokenizer_json() -> &'static [u8] {
+        br#"{
+  "version": "1.0",
+  "added_tokens": [
+    {"id": 100, "content": "<|im_start|>", "special": true},
+    {"id": 101, "content": "<|im_end|>", "special": true},
+    {"id": 102, "content": "<|endoftext|>", "special": true},
+    {"id": 200, "content": "<|vision_start|>", "special": true},
+    {"id": 201, "content": "<|vision_end|>", "special": true},
+    {"id": 202, "content": "<|image_pad|>", "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "user": 5,
+      "assistant": 6,
+      "describe": 7,
+      "now": 8,
+      "<|im_start|>": 100,
+      "<|im_end|>": 101,
+      "<|endoftext|>": 102,
+      "<|vision_start|>": 200,
+      "<|vision_end|>": 201,
+      "<|image_pad|>": 202
+    },
+    "unk_token": "<unk>"
+  }
+}"#
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "{actual:.8} != {expected:.8}"
+        );
+    }
+
+    fn tiny_q4_expert_pack() -> (Vec<u8>, ExpertPackMetadata) {
+        let prefix = "model.layers.0.mlp.experts.1";
+        build_expert_pack(
+            0,
+            1,
+            vec![
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.gate_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, 16],
+                    source_hash: Some("fixture-gate".to_string()),
+                    values: vec![0.0, 15.0, 15.0, 0.0],
+                },
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.up_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [16, 32],
+                    source_hash: Some("fixture-up".to_string()),
+                    values: vec![15.0, 15.0, 15.0, 15.0],
+                },
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.down_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [32, 48],
+                    source_hash: Some("fixture-down".to_string()),
+                    values: vec![15.0, 0.0, 0.0, 15.0],
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn flashmoe_parity_tokenizer_chat_template_and_routing_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(tokenizer.encode("hi<|im_end|>").unwrap(), vec![3, 101]);
+        assert_eq!(tokenizer.decode(&[3, 101, 4]).unwrap(), "hi");
+
+        let routed = top_k(&[0.0, 2.0, 2.0, -1.0, 1.0], 3);
+        assert_eq!(routed, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
+        let mut weights: Vec<f32> = routed.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        for (actual, expected) in weights.iter().zip([0.42231882, 0.42231882, 0.15536241]) {
+            assert_close(*actual, expected);
+        }
+    }
+
+    #[test]
+    fn flashmoe_parity_q4_expert_pack_and_mlp_goldens() {
+        let (pack, metadata) = tiny_q4_expert_pack();
+        let records = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].shape, vec![2, 2]);
+        assert_eq!(records[0].group_size, GROUP_SIZE);
+        assert_eq!(records[0].packed, vec![0xf0, 0x0f]);
+        assert_eq!(records[0].scales, vec![1.0, 1.0]);
+        assert_eq!(records[0].biases, vec![0.0, 0.0]);
+        assert_eq!(records[1].packed, vec![0x00, 0x00]);
+        assert_eq!(records[1].biases, vec![15.0, 15.0]);
+
+        let expert = ExpertWeights {
+            layer: 0,
+            expert: 1,
+            packed: pack,
+            records,
+        };
+        let hidden = [1.0, 2.0];
+        let gate = expert
+            .project_record(
+                expert.record_suffix("gate_proj.weight").unwrap(),
+                &hidden,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let up = expert
+            .project_record(expert.record_suffix("up_proj.weight").unwrap(), &hidden, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate, vec![30.0, 15.0]);
+        assert_eq!(up, vec![45.0, 45.0]);
+
+        let intermediate = [silu(gate[0]) * up[0], silu(gate[1]) * up[1]];
+        let out = expert.mlp(&hidden, 2).unwrap();
+        assert_close(out[0], 15.0 * intermediate[0]);
+        assert_close(out[1], 15.0 * intermediate[1]);
+    }
+
+    #[test]
+    fn flashmoe_parity_attention_layout_and_prefix_reuse_goldens() {
+        let (mut config, mut manifest) =
+            tiny_attention_manifest(&[AttentionLayerType::Full, AttentionLayerType::Linear]);
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = Some(1);
+
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry).unwrap();
+        let full = runtime.full_attention_layout(0).unwrap();
+        assert_eq!(full.q_layout, FullAttentionQLayout::Standard);
+        assert_eq!(full.q_projection_width, 8);
+        assert_eq!(full.q_width, 8);
+        assert_eq!(full.kv_width, 4);
+        assert_eq!(full.head_dim, 4);
+        assert_eq!(full.rotary_dim, 4);
+        assert_eq!(full.num_q_heads, 2);
+        assert_eq!(full.kv_heads, 1);
+
+        let linear = runtime.linear_attention_layout(1).unwrap();
+        assert_eq!(
+            linear,
+            LinearAttentionLayout {
+                num_value_heads: 2,
+                num_key_heads: 1,
+                key_dim: 4,
+                value_dim: 2,
+                total_key_width: 4,
+                total_value_width: 4,
+                conv_dim: 12,
+                conv_kernel_size: 3,
+            }
+        );
+        assert_eq!(linear.conv_state_len(), 24);
+        assert_eq!(linear.ssm_state_len(), 16);
+
+        let q_name = attention_tensor_name(0, "q_proj");
+        manifest
+            .dense_tensors
+            .iter_mut()
+            .find(|tensor| tensor.tensor == q_name)
+            .unwrap()
+            .shape = vec![16, 8];
+        let gated = DenseTransformerRuntime::from_registry(
+            &config,
+            &TensorRegistry::from_manifest(&manifest),
+        )
+        .unwrap()
+        .full_attention_layout(0)
+        .unwrap();
+        assert_eq!(gated.q_layout, FullAttentionQLayout::Gated);
+        assert_eq!(gated.q_projection_width, 16);
+        assert_eq!(gated.rotary_dim, 2);
+
+        assert_eq!(
+            reusable_session_prefix_len(&[10, 20, 30], &[10, 20, 30, 40]),
+            Some(3)
+        );
+        assert_eq!(reusable_session_prefix_len(&[10, 20, 30], &[10, 20]), None);
+        assert_eq!(
+            reusable_session_prefix_len(&[10, 20, 30], &[10, 20, 99, 40]),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen3vl_parity_multimodal_prompt_image_tokens_and_mrope_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes(test_qwen3vl_tokenizer_json()).unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![ChatContentPart::Image {
+                        image: Some("fixture.png".to_string()),
+                        placeholder_tokens: None,
+                    }]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_file = temp.path().join("qwen3vl_fixture.png");
+        let image = image::RgbImage::from_fn(84, 56, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8])
+        });
+        image.save(&image_file).unwrap();
+
+        let preprocessor = ImagePreprocessor::default_qwen3_vl();
+        let (patch_grid_h, patch_grid_w, patches) = preprocessor.preprocess(&image_file).unwrap();
+        assert_eq!((patch_grid_h, patch_grid_w), (4, 6));
+        assert_eq!(
+            patches.len(),
+            patch_grid_h * patch_grid_w * preprocessor.patch_flat_dim()
+        );
+        let visual_grid_h = patch_grid_h / preprocessor.merge_size;
+        let visual_grid_w = patch_grid_w / preprocessor.merge_size;
+        let visual_tokens = visual_grid_h * visual_grid_w;
+        assert_eq!((visual_grid_h, visual_grid_w, visual_tokens), (2, 3, 6));
+
+        let vision_start = tokenizer.token_id("<|vision_start|>").unwrap();
+        let vision_end = tokenizer.token_id("<|vision_end|>").unwrap();
+        let image_pad = tokenizer.token_id("<|image_pad|>").unwrap();
+        let prompt_tokens = tokenizer.encode(&rendered).unwrap();
+        assert_eq!(token_run_bounds(&prompt_tokens, image_pad), vec![(3, 4, 1)]);
+
+        let expanded = expand_multimodal_image_placeholders(
+            prompt_tokens,
+            vision_start,
+            vision_end,
+            image_pad,
+            &[ImagePlaceholderSpec {
+                token_count: visual_tokens,
+                grid_h: visual_grid_h,
+                grid_w: visual_grid_w,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.tokens,
+            vec![100, 5, 200, 202, 202, 202, 202, 202, 202, 201, 101, 100, 6]
+        );
+        assert_eq!(
+            expanded.image_spans,
+            vec![VisualTokenSpan {
+                start: 3,
+                end: 9,
+                grid_h: 2,
+                grid_w: 3,
+            }]
+        );
+
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, image_pad, &expanded.image_spans)
+                .unwrap();
+        assert_eq!(
+            &positions[..3],
+            &[
+                MropePosition::text(0),
+                MropePosition::text(1),
+                MropePosition::text(2)
+            ]
+        );
+        assert_eq!(
+            &positions[3..9],
+            &[
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 5,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 5,
+                },
+            ]
+        );
+        assert_eq!(
+            &positions[9..],
+            &[
+                MropePosition::text(6),
+                MropePosition::text(7),
+                MropePosition::text(8),
+                MropePosition::text(9)
+            ]
+        );
+        assert_eq!(next_position, 10);
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod arm_macos_integration {
         use super::*;
