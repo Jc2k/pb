@@ -1193,6 +1193,40 @@ struct MetalExecutor {
     route_top4_enabled: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SharedExpertPhaseWeights {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    router: Vec<f32>,
+    shared_experts: usize,
+    intermediate: usize,
+    width: usize,
+}
+
+#[derive(Debug)]
+struct ExpertPhaseOutput {
+    hidden: Vec<f32>,
+    next_normed: Option<Vec<f32>>,
+}
+
+#[derive(Debug)]
+enum DeferredExpertPhase {
+    Ready(ExpertPhaseOutput),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Metal(MetalDeferredExpertPhase),
+}
+
+impl DeferredExpertPhase {
+    fn wait(self) -> Result<ExpertPhaseOutput> {
+        match self {
+            Self::Ready(output) => Ok(output),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::Metal(output) => output.wait(),
+        }
+    }
+}
+
 impl MetalExecutor {
     fn new(plan: &FlashMoePlan, config: &QwenModelConfig) -> Result<Option<Self>> {
         if !plan.uses_metal {
@@ -1226,6 +1260,35 @@ impl MetalExecutor {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             expert.project(hidden, width)
+        }
+    }
+
+    fn submit_expert_phase(
+        &self,
+        experts: &[ExpertWeights],
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<DeferredExpertPhase>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return self
+                .inner
+                .submit_expert_phase(experts, weights, normed, residual, shared, next_norm_weight)
+                .map(|pending| pending.map(DeferredExpertPhase::Metal));
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Ok(Some(DeferredExpertPhase::Ready(compute_expert_phase_cpu(
+                experts,
+                weights,
+                normed,
+                residual,
+                shared,
+                next_norm_weight,
+            )?)))
         }
     }
 
@@ -1377,6 +1440,10 @@ struct MetalExecutorInner {
     kv_write_pipeline: ObjcId,
     kv_read_attention_pipeline: ObjcId,
     expert_mlp_pipeline: ObjcId,
+    silu_product_pipeline: ObjcId,
+    shared_expert_activation_pipeline: ObjcId,
+    combine_expert_phase_pipeline: ObjcId,
+    fill_zero_pipeline: ObjcId,
     lm_head_pipeline: ObjcId,
     topk_vocab_pipeline: ObjcId,
     gqa_scores_pipeline: ObjcId,
@@ -1403,6 +1470,38 @@ struct MetalKvCacheInner {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalDeferredExpertPhase {
+    inner: Arc<MetalExecutorInner>,
+    command_buffer: ObjcId,
+    buffers: Vec<ObjcId>,
+    hidden_buffer: ObjcId,
+    next_normed_buffer: Option<ObjcId>,
+    width: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalDeferredExpertPhase {
+    fn wait(self) -> Result<ExpertPhaseOutput> {
+        unsafe {
+            msg_send_void0(self.command_buffer, sel("waitUntilCompleted"));
+            let hidden = read_f32_buffer(self.hidden_buffer, self.width);
+            let next_normed = self
+                .next_normed_buffer
+                .map(|buffer| read_f32_buffer(buffer, self.width));
+            release(self.command_buffer);
+            for buffer in self.buffers {
+                self.inner.recycle(buffer);
+            }
+            Ok(ExpertPhaseOutput {
+                hidden,
+                next_normed,
+            })
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for MetalExecutorInner {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1423,6 +1522,10 @@ impl Drop for MetalExecutorInner {
             release(self.kv_write_pipeline);
             release(self.kv_read_attention_pipeline);
             release(self.expert_mlp_pipeline);
+            release(self.silu_product_pipeline);
+            release(self.shared_expert_activation_pipeline);
+            release(self.combine_expert_phase_pipeline);
+            release(self.fill_zero_pipeline);
             release(self.lm_head_pipeline);
             release(self.topk_vocab_pipeline);
             release(self.gqa_scores_pipeline);
@@ -1486,6 +1589,12 @@ impl MetalExecutorInner {
             let kv_read_attention_pipeline =
                 compile_pipeline(device, library, "kv_cache_read_attention")?;
             let expert_mlp_pipeline = compile_pipeline(device, library, "expert_mlp_fused")?;
+            let silu_product_pipeline = compile_pipeline(device, library, "silu_product")?;
+            let shared_expert_activation_pipeline =
+                compile_pipeline(device, library, "shared_expert_activation")?;
+            let combine_expert_phase_pipeline =
+                compile_pipeline(device, library, "combine_expert_phase")?;
+            let fill_zero_pipeline = compile_pipeline(device, library, "fill_zero")?;
             let lm_head_pipeline = compile_pipeline(device, library, "lm_head_logits")?;
             let topk_vocab_pipeline = compile_pipeline(device, library, "topk_vocab")?;
             let gqa_scores_pipeline = compile_pipeline(device, library, "gqa_attention_scores")?;
@@ -1505,6 +1614,10 @@ impl MetalExecutorInner {
                 release(kv_write_pipeline);
                 release(kv_read_attention_pipeline);
                 release(expert_mlp_pipeline);
+                release(silu_product_pipeline);
+                release(shared_expert_activation_pipeline);
+                release(combine_expert_phase_pipeline);
+                release(fill_zero_pipeline);
                 release(lm_head_pipeline);
                 release(topk_vocab_pipeline);
                 release(gqa_scores_pipeline);
@@ -1548,6 +1661,10 @@ impl MetalExecutorInner {
                 kv_write_pipeline,
                 kv_read_attention_pipeline,
                 expert_mlp_pipeline,
+                silu_product_pipeline,
+                shared_expert_activation_pipeline,
+                combine_expert_phase_pipeline,
+                fill_zero_pipeline,
                 lm_head_pipeline,
                 topk_vocab_pipeline,
                 gqa_scores_pipeline,
@@ -1647,6 +1764,346 @@ impl MetalExecutorInner {
             self.recycle(groups_buffer);
             Ok(output)
         }
+    }
+
+    fn submit_expert_phase(
+        self: &Arc<Self>,
+        experts: &[ExpertWeights],
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        let width = residual.len();
+        if width == 0 || normed.len() < width || weights.len() != experts.len() {
+            return Ok(None);
+        }
+        if let Some(weight) = next_norm_weight {
+            if weight.len() < width {
+                return Ok(None);
+            }
+        }
+        let mut payloads = Vec::with_capacity(experts.len());
+        for expert in experts {
+            let Some(payload) = expert_phase_mlp_payload(expert, normed, width) else {
+                return Ok(None);
+            };
+            payloads.push(payload);
+        }
+        let shared_total_intermediate = if let Some(shared) = shared {
+            let total = shared
+                .shared_experts
+                .checked_mul(shared.intermediate)
+                .context("shared expert intermediate width overflow")?;
+            if shared.width != width
+                || shared.gate.len() != total * width
+                || shared.up.len() != total * width
+                || shared.down.len() != width * total
+                || shared.router.len() != shared.shared_experts * width
+            {
+                return Ok(None);
+            }
+            total
+        } else {
+            0
+        };
+
+        unsafe {
+            let mut buffers = Vec::new();
+            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
+            buffers.push(normed_buffer);
+            let residual_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+            buffers.push(residual_buffer);
+            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
+            buffers.push(weights_buffer);
+            let expert_outputs_buffer = self.buffer_with_len(
+                experts
+                    .len()
+                    .max(1)
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer size overflow")?,
+            )?;
+            buffers.push(expert_outputs_buffer);
+            let shared_output_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(shared_output_buffer);
+            let hidden_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(hidden_buffer);
+            let next_normed_buffer = if next_norm_weight.is_some() {
+                let buffer = self
+                    .buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+                buffers.push(buffer);
+                Some(buffer)
+            } else {
+                None
+            };
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE deferred expert command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE deferred expert compute encoder");
+            }
+
+            let width_u32 = width as u32;
+            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
+            buffers.push(width_buffer);
+
+            if let Some(shared) = shared {
+                let total_u32 = shared_total_intermediate as u32;
+                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_gate_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.gate))?;
+                buffers.push(shared_gate_buffer);
+                let shared_up_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.up))?;
+                buffers.push(shared_up_buffer);
+                let shared_down_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.down))?;
+                buffers.push(shared_down_buffer);
+                let shared_router_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.router))?;
+                buffers.push(shared_router_buffer);
+                let shared_gate_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(shared_gate_out);
+                let shared_up_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(shared_up_out);
+                let shared_router_out =
+                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                buffers.push(shared_router_out);
+                let shared_activated =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(shared_activated);
+                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
+                buffers.push(total_buffer);
+                let shared_intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
+                buffers.push(shared_intermediate_buffer);
+
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_gate_buffer,
+                    normed_buffer,
+                    shared_gate_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_up_buffer,
+                    normed_buffer,
+                    shared_up_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_router_buffer,
+                    normed_buffer,
+                    shared_router_out,
+                    width_buffer,
+                    shared.shared_experts,
+                );
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.shared_expert_activation_pipeline,
+                );
+                set_buffer(encoder, shared_gate_out, 0);
+                set_buffer(encoder, shared_up_out, 1);
+                set_buffer(encoder, shared_router_out, 2);
+                set_buffer(encoder, shared_activated, 3);
+                set_buffer(encoder, shared_intermediate_buffer, 4);
+                set_buffer(encoder, total_buffer, 5);
+                dispatch_threads(encoder, shared_total_intermediate as u64);
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_down_buffer,
+                    shared_activated,
+                    shared_output_buffer,
+                    total_buffer,
+                    width,
+                );
+            } else {
+                self.encode_fill_zero(encoder, shared_output_buffer, width_buffer, width);
+            }
+
+            for (idx, payload) in payloads.iter().enumerate() {
+                let gate_out =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(gate_out);
+                let up_out = self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                buffers.push(up_out);
+                let activated =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(activated);
+
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.gate,
+                    normed_buffer,
+                    gate_out,
+                    0,
+                    &mut buffers,
+                )?;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.up,
+                    normed_buffer,
+                    up_out,
+                    0,
+                    &mut buffers,
+                )?;
+                let intermediate_u32 = payload.gate.rows as u32;
+                let intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
+                buffers.push(intermediate_buffer);
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.silu_product_pipeline,
+                );
+                set_buffer(encoder, gate_out, 0);
+                set_buffer(encoder, up_out, 1);
+                set_buffer(encoder, activated, 2);
+                set_buffer(encoder, intermediate_buffer, 3);
+                dispatch_threads(encoder, payload.gate.rows as u64);
+                let expert_offset = idx
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer offset overflow")?
+                    as u64;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.down,
+                    activated,
+                    expert_outputs_buffer,
+                    expert_offset,
+                    &mut buffers,
+                )?;
+            }
+
+            let active_u32 = experts.len() as u32;
+            let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
+            buffers.push(active_buffer);
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.combine_expert_phase_pipeline,
+            );
+            set_buffer(encoder, residual_buffer, 0);
+            set_buffer(encoder, shared_output_buffer, 1);
+            set_buffer(encoder, expert_outputs_buffer, 2);
+            set_buffer(encoder, weights_buffer, 3);
+            set_buffer(encoder, hidden_buffer, 4);
+            set_buffer(encoder, width_buffer, 5);
+            set_buffer(encoder, active_buffer, 6);
+            dispatch_threads(encoder, width as u64);
+
+            if let (Some(weight), Some(next_normed_buffer)) = (next_norm_weight, next_normed_buffer)
+            {
+                let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(&weight[..width]))?;
+                buffers.push(norm_weight_buffer);
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.rms_norm_pipeline,
+                );
+                set_buffer(encoder, hidden_buffer, 0);
+                set_buffer(encoder, norm_weight_buffer, 1);
+                set_buffer(encoder, next_normed_buffer, 2);
+                set_buffer(encoder, width_buffer, 3);
+                dispatch_threads(encoder, width as u64);
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+            msg_send_void0(command_buffer, sel("commit"));
+            release(encoder);
+
+            Ok(Some(MetalDeferredExpertPhase {
+                inner: self.clone(),
+                command_buffer,
+                buffers,
+                hidden_buffer,
+                next_normed_buffer,
+                width,
+            }))
+        }
+    }
+
+    unsafe fn encode_q4_matvec(
+        &self,
+        encoder: ObjcId,
+        payload: &Q4MatvecPayload,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        output_offset: u64,
+        buffers: &mut Vec<ObjcId>,
+    ) -> Result<()> {
+        let packed_buffer = self.buffer_with_bytes(&payload.packed)?;
+        buffers.push(packed_buffer);
+        let scale_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.scales))?;
+        buffers.push(scale_buffer);
+        let bias_buffer = self.buffer_with_bytes(f32_as_bytes(&payload.biases))?;
+        buffers.push(bias_buffer);
+        let cols_u32 = payload.cols as u32;
+        let groups_u32 = payload.cols.div_ceil(GROUP_SIZE).max(1) as u32;
+        let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+        buffers.push(cols_buffer);
+        let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+        buffers.push(groups_buffer);
+        msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
+        set_buffer(encoder, packed_buffer, 0);
+        set_buffer(encoder, input_buffer, 1);
+        set_buffer(encoder, scale_buffer, 2);
+        set_buffer(encoder, bias_buffer, 3);
+        set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
+        set_buffer(encoder, cols_buffer, 5);
+        set_buffer(encoder, groups_buffer, 6);
+        dispatch_threads(encoder, payload.rows as u64);
+        Ok(())
+    }
+
+    unsafe fn encode_dense_matvec(
+        &self,
+        encoder: ObjcId,
+        weights_buffer: ObjcId,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        cols_buffer: ObjcId,
+        rows: usize,
+    ) {
+        msg_send_void1_id(
+            encoder,
+            sel("setComputePipelineState:"),
+            self.dense_matvec_pipeline,
+        );
+        set_buffer(encoder, weights_buffer, 0);
+        set_buffer(encoder, input_buffer, 1);
+        set_buffer(encoder, output_buffer, 2);
+        set_buffer(encoder, cols_buffer, 3);
+        dispatch_threads(encoder, rows as u64);
+    }
+
+    unsafe fn encode_fill_zero(
+        &self,
+        encoder: ObjcId,
+        output_buffer: ObjcId,
+        width_buffer: ObjcId,
+        width: usize,
+    ) {
+        msg_send_void1_id(
+            encoder,
+            sel("setComputePipelineState:"),
+            self.fill_zero_pipeline,
+        );
+        set_buffer(encoder, output_buffer, 0);
+        set_buffer(encoder, width_buffer, 1);
+        dispatch_threads(encoder, width as u64);
     }
 
     fn route_top4(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
@@ -2454,8 +2911,15 @@ impl FlashMoeEngine {
             self.dense.embedding(previous, runtime.width)?
         };
         let mut state = self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64);
+        let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
+        let mut next_layer_normed: Option<Vec<f32>> = None;
 
         for layer in 0..self.config.num_hidden_layers {
+            if let Some(pending) = deferred_expert_phase.take() {
+                let output = pending.wait()?;
+                hidden = output.hidden;
+                next_layer_normed = output.next_normed;
+            }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
                 layer,
@@ -2468,7 +2932,9 @@ impl FlashMoeEngine {
             let combine_started = Instant::now();
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
             let input_norm_weight = self.dense.norm_weight(&input_norm_name, hidden.len())?;
-            let mut normed = if let Some(metal) = &self.metal {
+            let mut normed = if let Some(normed) = next_layer_normed.take() {
+                normed
+            } else if let Some(metal) = &self.metal {
                 metal.rms_norm(&hidden, input_norm_weight.as_deref())?
             } else {
                 self.dense.rms_norm(input_norm_name.as_str(), &hidden)?
@@ -2524,10 +2990,10 @@ impl FlashMoeEngine {
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
             let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
             softmax_in_place(&mut weights);
-            // Deferred CMD3-style overlap: while expert reads are still pending, compute
-            // the always-active shared-expert branch on CPU or Metal.
+            // While expert reads are still pending, prepare the always-active
+            // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
-            let mut moe = self.shared_expert_contribution(layer, &normed, runtime.width)?;
+            let shared_phase = self.shared_expert_phase_weights(layer, runtime.width)?;
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let expert_io_started = Instant::now();
             let experts = self.scheduler.finish(pending_experts)?;
@@ -2537,23 +3003,65 @@ impl FlashMoeEngine {
                 expert_metrics_after.saturating_delta(expert_metrics_before),
             );
             let expert_compute_started = Instant::now();
-            for (expert, weight) in experts.iter().zip(weights) {
+            for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
                 state = state.wrapping_add(
                     expert
                         .mix_hash()
                         .wrapping_mul((weight.to_bits() as u64).max(1)),
                 );
-                let contribution = if let Some(metal) = &self.metal {
-                    metal.project_q4_expert(expert, &normed, runtime.width)?
+            }
+            let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
+                .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
+            let next_norm_weight = if let Some(name) = next_norm_name.as_deref() {
+                self.dense.norm_weight(name, runtime.width)?
+            } else {
+                None
+            };
+            let mut submitted_deferred = false;
+            if let Some(metal) = &self.metal
+                && let Some(pending) = metal.submit_expert_phase(
+                    &experts,
+                    &weights,
+                    &normed,
+                    &mlp_residual,
+                    shared_phase.as_ref(),
+                    next_norm_weight.as_deref(),
+                )?
+            {
+                if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
+                    deferred_expert_phase = Some(pending);
+                    submitted_deferred = true;
                 } else {
-                    expert.mlp(&normed, runtime.width)?
-                };
-                add_scaled_in_place(&mut moe, &contribution, weight);
+                    let output = pending.wait()?;
+                    hidden = output.hidden;
+                    next_layer_normed = output.next_normed;
+                    submitted_deferred = true;
+                }
+            }
+            if !submitted_deferred {
+                let output = compute_expert_phase_cpu(
+                    &experts,
+                    &weights,
+                    &normed,
+                    &mlp_residual,
+                    shared_phase.as_ref(),
+                    next_norm_weight.as_deref(),
+                )?;
+                hidden = output.hidden;
+                next_layer_normed = output.next_normed;
             }
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
             let combine_started = Instant::now();
-            hidden = mlp_residual;
-            add_in_place(&mut hidden, &moe);
+            if deferred_expert_phase.is_some() {
+                kv_cache.record_layer_state(position, layer, state)?;
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                layer_timing.buckets.total_wall = layer_started.elapsed();
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.add(layer_timing.buckets);
+                    timing.layers.push(layer_timing);
+                }
+                continue;
+            }
             if let Some(context) = deepstack {
                 if let Some(features_for_layer) = context.features.get(layer) {
                     let feature =
@@ -2583,6 +3091,12 @@ impl FlashMoeEngine {
                 timing.layers.push(layer_timing);
             }
         }
+        if let Some(pending) = deferred_expert_phase.take() {
+            let output = pending.wait()?;
+            hidden = output.hidden;
+            next_layer_normed = output.next_normed;
+        }
+        drop(next_layer_normed);
 
         let combine_started = Instant::now();
         let final_norm_weight = self.dense.norm_weight("model.norm.weight", hidden.len())?;
@@ -2866,47 +3380,80 @@ impl FlashMoeEngine {
         normed: &[f32],
         width: usize,
     ) -> Result<Vec<f32>> {
-        let mut moe = vec![0.0f32; width];
+        let Some(shared) = self.shared_expert_phase_weights(layer, width)? else {
+            return Ok(vec![0.0f32; width]);
+        };
+        let residual = vec![0.0f32; width];
+        Ok(compute_expert_phase_cpu(&[], &[], normed, &residual, Some(&shared), None)?.hidden)
+    }
+
+    fn shared_expert_phase_weights(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<SharedExpertPhaseWeights>> {
         let num_shared = self.config.num_shared_experts.unwrap_or(0);
         let shared_inter = self.config.shared_expert_intermediate_size();
         if num_shared == 0 || shared_inter == 0 {
-            return Ok(moe);
+            return Ok(None);
         }
+        let total_intermediate = num_shared
+            .checked_mul(shared_inter)
+            .context("shared expert intermediate width overflow")?;
         let gate_name = shared_expert_tensor_name(layer, "gate_proj");
         let up_name = shared_expert_tensor_name(layer, "up_proj");
         let down_name = shared_expert_tensor_name(layer, "down_proj");
         let shared_gate_name = shared_expert_gate_tensor_name(layer);
         let gate = self
             .dense
-            .project_dense_tensor_with_metal(self.metal.as_ref(), &gate_name, normed, shared_inter)?
+            .read_full_tensor_f32(&gate_name)?
             .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
         let up = self
             .dense
-            .project_dense_tensor_with_metal(self.metal.as_ref(), &up_name, normed, shared_inter)?
+            .read_full_tensor_f32(&up_name)?
             .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
-        let shared_gate = self
+        let down = self
             .dense
-            .project_dense_tensor_with_metal(
-                self.metal.as_ref(),
-                &shared_gate_name,
-                normed,
-                num_shared,
-            )?
+            .read_full_tensor_f32(&down_name)?
+            .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
+        let router = self
+            .dense
+            .read_full_tensor_f32(&shared_gate_name)?
             .with_context(|| {
                 format!("missing configured shared expert gate tensor {shared_gate_name}")
             })?;
-        let activated: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(g, u)| silu(*g) * u)
-            .collect();
-        let shared_out = self
-            .dense
-            .project_dense_tensor_with_metal(self.metal.as_ref(), &down_name, &activated, width)?
-            .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
-        let shared_weight = sigmoid(shared_gate.first().copied().unwrap_or(0.0));
-        add_scaled_in_place(&mut moe, &shared_out, shared_weight);
-        Ok(moe)
+        let expected_gate = total_intermediate
+            .checked_mul(width)
+            .context("shared expert gate/up tensor size overflow")?;
+        let expected_down = width
+            .checked_mul(total_intermediate)
+            .context("shared expert down tensor size overflow")?;
+        let expected_router = num_shared
+            .checked_mul(width)
+            .context("shared expert router tensor size overflow")?;
+        if gate.len() != expected_gate || up.len() != expected_gate || down.len() != expected_down {
+            bail!(
+                "shared expert tensors for layer {layer} do not match config: gate {}, up {}, down {}, expected gate/up {expected_gate}, down {expected_down}",
+                gate.len(),
+                up.len(),
+                down.len()
+            );
+        }
+        if router.len() != expected_router {
+            bail!(
+                "shared expert gate tensor for layer {layer} has {} values; expected {expected_router}",
+                router.len()
+            );
+        }
+        Ok(Some(SharedExpertPhaseWeights {
+            gate,
+            up,
+            down,
+            router,
+            shared_experts: num_shared,
+            intermediate: shared_inter,
+            width,
+        }))
     }
 
     pub fn read_active_experts(
@@ -3646,6 +4193,71 @@ fn add_scaled_in_place(target: &mut [f32], update: &[f32], scale: f32) {
     for (target, update) in target.iter_mut().zip(update) {
         *target += *update * scale;
     }
+}
+
+fn compute_expert_phase_cpu(
+    experts: &[ExpertWeights],
+    weights: &[f32],
+    normed: &[f32],
+    residual: &[f32],
+    shared: Option<&SharedExpertPhaseWeights>,
+    next_norm_weight: Option<&[f32]>,
+) -> Result<ExpertPhaseOutput> {
+    let width = residual.len();
+    if weights.len() != experts.len() {
+        bail!(
+            "expert phase got {} expert weights for {} active experts",
+            weights.len(),
+            experts.len()
+        );
+    }
+    if normed.len() < width {
+        bail!(
+            "expert phase normalized input has len {}; expected at least {width}",
+            normed.len()
+        );
+    }
+    let mut moe = vec![0.0f32; width];
+    if let Some(shared) = shared {
+        let total_intermediate = shared
+            .shared_experts
+            .checked_mul(shared.intermediate)
+            .context("shared expert intermediate width overflow")?;
+        if shared.width != width
+            || shared.gate.len() != total_intermediate * width
+            || shared.up.len() != total_intermediate * width
+            || shared.down.len() != width * total_intermediate
+            || shared.router.len() != shared.shared_experts * width
+        {
+            bail!("shared expert tensors do not match the deferred expert phase dimensions");
+        }
+        let gate = cpu_dense_matvec(&shared.gate, normed, total_intermediate, width);
+        let up = cpu_dense_matvec(&shared.up, normed, total_intermediate, width);
+        let router = cpu_dense_matvec(&shared.router, normed, shared.shared_experts, width);
+        let mut activated = vec![0.0f32; total_intermediate];
+        for idx in 0..total_intermediate {
+            let shared_idx = idx / shared.intermediate.max(1);
+            let shared_weight = sigmoid(router.get(shared_idx).copied().unwrap_or(0.0));
+            activated[idx] = silu(gate[idx]) * up[idx] * shared_weight;
+        }
+        let shared_out = cpu_dense_matvec(&shared.down, &activated, width, total_intermediate);
+        add_in_place(&mut moe, &shared_out);
+    }
+    for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
+        let contribution = expert.mlp(normed, width)?;
+        add_scaled_in_place(&mut moe, &contribution, weight);
+    }
+    let mut hidden = residual.to_vec();
+    add_in_place(&mut hidden, &moe);
+    let next_normed = next_norm_weight.map(|weight| {
+        let mut normed = hidden.clone();
+        rms_norm_with_weight_in_place(&mut normed, Some(weight));
+        normed
+    });
+    Ok(ExpertPhaseOutput {
+        hidden,
+        next_normed,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4729,31 +5341,29 @@ fn validate_required_tensor_manifest(
         )?;
         let shared_experts = config.num_shared_experts.unwrap_or(0);
         if shared_experts > 0 {
-            if shared_experts != 1 {
-                bail!(
-                    "Flash-MoE currently supports exactly one shared expert per layer, found {shared_experts}"
-                );
-            }
             let shared_inter = config.shared_expert_intermediate_size();
             if shared_inter == 0 {
                 bail!(
                     "Qwen config declares {shared_experts} shared expert(s) but no shared expert intermediate size"
                 );
             }
+            let total_shared_inter = shared_experts
+                .checked_mul(shared_inter)
+                .context("shared expert intermediate size overflow")?;
             require_tensor_shape(
                 registry,
                 &shared_expert_tensor_name(layer, "gate_proj"),
-                &[shared_inter, config.hidden_size],
+                &[total_shared_inter, config.hidden_size],
             )?;
             require_tensor_shape(
                 registry,
                 &shared_expert_tensor_name(layer, "up_proj"),
-                &[shared_inter, config.hidden_size],
+                &[total_shared_inter, config.hidden_size],
             )?;
             require_tensor_shape(
                 registry,
                 &shared_expert_tensor_name(layer, "down_proj"),
-                &[config.hidden_size, shared_inter],
+                &[config.hidden_size, total_shared_inter],
             )?;
             require_tensor_shape(
                 registry,
@@ -6254,6 +6864,40 @@ struct Q4MatvecPayload {
     biases: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct ExpertPhaseMlpPayload {
+    gate: Q4MatvecPayload,
+    up: Q4MatvecPayload,
+    down: Q4MatvecPayload,
+}
+
+fn expert_phase_mlp_payload(
+    expert: &ExpertWeights,
+    hidden: &[f32],
+    width: usize,
+) -> Option<ExpertPhaseMlpPayload> {
+    let gate_tensor = expert.record_suffix("gate_proj.weight")?;
+    let up_tensor = expert.record_suffix("up_proj.weight")?;
+    let down_tensor = expert.record_suffix("down_proj.weight")?;
+    let intermediate = gate_tensor
+        .shape
+        .first()
+        .copied()
+        .or_else(|| up_tensor.shape.first().copied())
+        .unwrap_or(width);
+    let gate = gate_tensor.matvec_payload(hidden, intermediate)?;
+    let up = up_tensor.matvec_payload(hidden, intermediate)?;
+    if gate.rows != up.rows {
+        return None;
+    }
+    let fake_intermediate = vec![0.0f32; gate.rows];
+    let down = down_tensor.matvec_payload(&fake_intermediate, width)?;
+    if down.cols != gate.rows {
+        return None;
+    }
+    Some(ExpertPhaseMlpPayload { gate, up, down })
+}
+
 fn fold_rows_to_width(rows: &[f32], width: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; width];
     if width == 0 {
@@ -7069,6 +7713,58 @@ kernel void expert_mlp_fused(
         acc = fma(down[row * intermediate + i], g * up[i], acc);
     }
     output[row] = acc * rsqrt(float(max(intermediate, 1u)));
+}
+
+kernel void silu_product(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float g = gate[idx];
+    output[idx] = (g / (1.0f + exp(-g))) * up[idx];
+}
+
+kernel void shared_expert_activation(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device const float* router [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& intermediate [[buffer(4)]],
+    constant uint& total_intermediate [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= total_intermediate) { return; }
+    uint shared_idx = intermediate == 0 ? 0 : idx / intermediate;
+    float route = router[shared_idx];
+    float route_weight = 1.0f / (1.0f + exp(-route));
+    float g = gate[idx];
+    output[idx] = (g / (1.0f + exp(-g))) * up[idx] * route_weight;
+}
+
+kernel void combine_expert_phase(
+    device const float* residual [[buffer(0)]],
+    device const float* shared [[buffer(1)]],
+    device const float* expert_outputs [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device float* hidden [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    constant uint& active_experts [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float acc = residual[idx] + shared[idx];
+    for (uint expert = 0; expert < active_experts; ++expert) {
+        acc = fma(expert_outputs[expert * width + idx], weights[expert], acc);
+    }
+    hidden[idx] = acc;
+}
+
+kernel void fill_zero(
+    device float* output [[buffer(0)]],
+    constant uint& width [[buffer(1)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    output[idx] = 0.0f;
 }
 
 kernel void lm_head_logits(
@@ -10073,6 +10769,10 @@ mod tests {
             "kv_cache_write",
             "kv_cache_read_attention",
             "expert_mlp_fused",
+            "silu_product",
+            "shared_expert_activation",
+            "combine_expert_phase",
+            "fill_zero",
             "lm_head_logits",
             "topk_vocab",
             "gqa_attention_scores",
@@ -10082,6 +10782,50 @@ mod tests {
                 METAL_SHADERS.contains(&format!("kernel void {kernel}")),
                 "missing Metal kernel {kernel}"
             );
+        }
+    }
+
+    #[test]
+    fn expert_phase_cpu_combines_shared_experts_and_next_norm() {
+        let shared = SharedExpertPhaseWeights {
+            // Two shared experts, one intermediate channel each, hidden width two.
+            gate: vec![1.0, 0.0, 0.0, 1.0],
+            up: vec![0.0, 2.0, 3.0, 0.0],
+            down: vec![1.0, 2.0, -1.0, 0.5],
+            router: vec![1.0, 0.0, 0.0, -1.0],
+            shared_experts: 2,
+            intermediate: 1,
+            width: 2,
+        };
+        let residual = vec![0.5, -1.0];
+        let normed = vec![2.0, 4.0];
+        let out = compute_expert_phase_cpu(
+            &[],
+            &[],
+            &normed,
+            &residual,
+            Some(&shared),
+            Some(&[1.0, 0.5]),
+        )
+        .unwrap();
+        let shared_gate: [f32; 2] = [2.0, 4.0];
+        let shared_up: [f32; 2] = [8.0, 6.0];
+        let shared_router: [f32; 2] = [2.0, -4.0];
+        let activated = [
+            silu(shared_gate[0]) * shared_up[0] * sigmoid(shared_router[0]),
+            silu(shared_gate[1]) * shared_up[1] * sigmoid(shared_router[1]),
+        ];
+        let expected_hidden = vec![
+            residual[0] + activated[0] + 2.0 * activated[1],
+            residual[1] - activated[0] + 0.5 * activated[1],
+        ];
+        for (actual, expected) in out.hidden.iter().zip(expected_hidden.iter()) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+        let mut expected_normed = expected_hidden;
+        rms_norm_with_weight_in_place(&mut expected_normed, Some(&[1.0, 0.5]));
+        for (actual, expected) in out.next_normed.unwrap().iter().zip(expected_normed.iter()) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
     }
 
