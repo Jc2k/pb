@@ -127,6 +127,9 @@ pub enum BackendSelection {
 }
 
 fn metal_route_top4_enabled() -> bool {
+    // The Metal route-top4 path stays opt-in. Flash-MoE's own experiment log
+    // includes several fast-but-wrong routing experiments, so pb defaults to
+    // CPU routing unless the developer explicitly asks for this path.
     std::env::var_os(FLASHMOE_METAL_ROUTING_ENV)
         .as_ref()
         .is_some_and(env_flag_enabled)
@@ -7884,6 +7887,40 @@ pub struct ExpertStore {
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertReadPath {
+    PositionedRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpertIoPolicy {
+    expert_read_path: ExpertReadPath,
+    application_expert_cache: bool,
+    lz4_expert_compression: bool,
+    speculative_routing: bool,
+    broad_ssd_gpu_overlap: bool,
+}
+
+// Expert scheduler policy guardrails:
+// - read packed experts with positioned reads, not mmap;
+// - do not add an application-level expert LRU/cache;
+// - do not add LZ4 expert compression;
+// - do not speculate future expert routes;
+// - avoid broad SSD/GPU overlap beyond the existing narrow deferred expert phase.
+//
+// These choices follow Flash-MoE's "Trust the OS" result: the OS page cache plus
+// parallel pread won over custom expert caches, mmap expert files, LZ4, prefetch
+// hints, speculative routing, dispatch_io, and aggressive SSD/GPU overlap.
+// See https://github.com/danveloper/flash-moe, especially the README "Trust the
+// OS" notes and docs/optimization-experiments-q4.md.
+const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
+    expert_read_path: ExpertReadPath::PositionedRead,
+    application_expert_cache: false,
+    lz4_expert_compression: false,
+    speculative_routing: false,
+    broad_ssd_gpu_overlap: false,
+};
+
 impl ExpertStore {
     pub fn open(root: PathBuf) -> Result<Self> {
         if !root.is_dir() {
@@ -7901,7 +7938,7 @@ impl ExpertStore {
         let mut out = Vec::with_capacity(experts.len());
         for &expert in experts {
             let plan = reader.prepare_read(expert)?;
-            let (weights, _) = reader.read_prepared_into(
+            let result = reader.read_prepared_into(
                 expert,
                 plan.metadata,
                 plan.offset,
@@ -7909,7 +7946,7 @@ impl ExpertStore {
                 plan.slot_capacity,
                 &mut scratch,
             )?;
-            out.push(weights);
+            out.push(result.weights);
         }
         Ok(out)
     }
@@ -8003,7 +8040,7 @@ impl ExpertLayerReader {
         packed_len: usize,
         slot_capacity: usize,
         scratch: &mut Vec<u8>,
-    ) -> Result<(ExpertWeights, Duration)> {
+    ) -> Result<ExpertReadResult> {
         if scratch.capacity() < slot_capacity {
             scratch.reserve_exact(slot_capacity - scratch.capacity());
         }
@@ -8026,15 +8063,16 @@ impl ExpertLayerReader {
             Vec::new()
         };
         let packed_prefix = scratch[..scratch.len().min(4096)].to_vec();
-        Ok((
-            ExpertWeights {
+        Ok(ExpertReadResult {
+            weights: ExpertWeights {
                 layer: self.metadata.layer,
                 expert,
                 packed: packed_prefix,
                 records,
             },
             read_latency,
-        ))
+            read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+        })
     }
 }
 
@@ -8046,9 +8084,17 @@ struct ExpertReadPlan {
     slot_capacity: usize,
 }
 
+#[derive(Debug)]
+struct ExpertReadResult {
+    weights: ExpertWeights,
+    read_latency: Duration,
+    read_path: ExpertReadPath,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ExpertSchedulerMetrics {
     issued_reads: u64,
+    positioned_reads: u64,
     read_failures: u64,
     total_queue_latency: Duration,
     max_queue_latency: Duration,
@@ -8064,6 +8110,7 @@ struct ExpertSchedulerMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExpertSchedulerSnapshot {
     pub issued_reads: u64,
+    pub positioned_reads: u64,
     pub read_failures: u64,
     pub total_queue_latency: Duration,
     pub max_queue_latency: Duration,
@@ -8080,6 +8127,9 @@ impl ExpertSchedulerSnapshot {
     fn saturating_delta(self, before: Self) -> Self {
         Self {
             issued_reads: self.issued_reads.saturating_sub(before.issued_reads),
+            positioned_reads: self
+                .positioned_reads
+                .saturating_sub(before.positioned_reads),
             read_failures: self.read_failures.saturating_sub(before.read_failures),
             total_queue_latency: self
                 .total_queue_latency
@@ -8111,6 +8161,27 @@ struct ExpertScheduler {
 
 impl ExpertScheduler {
     fn new(store: ExpertStore) -> Self {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead,
+            "expert files must be read with positioned reads"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.application_expert_cache,
+            "do not add an application-level expert cache; trust the OS page cache"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression,
+            "do not add LZ4 expert compression"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.speculative_routing,
+            "do not add speculative expert routing"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap,
+            "do not broadly overlap SSD expert reads with GPU compute"
+        );
         Self {
             store,
             pool: ExpertIoWorkerPool::default(),
@@ -8178,6 +8249,11 @@ impl ExpertScheduler {
             self.metrics.total_queue_latency += response.queue_latency;
             self.metrics.max_queue_latency =
                 self.metrics.max_queue_latency.max(response.queue_latency);
+            match response.read_path {
+                ExpertReadPath::PositionedRead => {
+                    self.metrics.positioned_reads = self.metrics.positioned_reads.saturating_add(1);
+                }
+            }
             self.metrics.total_read_latency += response.read_latency;
             self.metrics.max_read_latency =
                 self.metrics.max_read_latency.max(response.read_latency);
@@ -8208,6 +8284,7 @@ impl ExpertScheduler {
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
         ExpertSchedulerSnapshot {
             issued_reads: self.metrics.issued_reads,
+            positioned_reads: self.metrics.positioned_reads,
             read_failures: self.metrics.read_failures,
             total_queue_latency: self.metrics.total_queue_latency,
             max_queue_latency: self.metrics.max_queue_latency,
@@ -8260,13 +8337,18 @@ impl ExpertIoWorkerPool {
                         job.slot_capacity,
                         &mut scratch,
                     );
-                    let (result, read_latency) = match result {
-                        Ok((expert, read_latency)) => (Ok(expert), read_latency),
-                        Err(error) => (Err(error), started_at.elapsed()),
+                    let (result, read_latency, read_path) = match result {
+                        Ok(result) => (Ok(result.weights), result.read_latency, result.read_path),
+                        Err(error) => (
+                            Err(error),
+                            started_at.elapsed(),
+                            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+                        ),
                     };
                     let _ = job.tx.send(ExpertReadResponse {
                         id: job.id,
                         queue_latency,
+                        read_path,
                         read_latency,
                         bytes_read: job.packed_len as u64,
                         warm: job.warm,
@@ -8321,6 +8403,7 @@ struct ExpertReadJob {
 struct ExpertReadResponse {
     id: u64,
     queue_latency: Duration,
+    read_path: ExpertReadPath,
     read_latency: Duration,
     bytes_read: u64,
     warm: bool,
@@ -15235,6 +15318,7 @@ mod tests {
         assert_eq!(experts[1].expert, 3);
         let first = scheduler.snapshot();
         assert_eq!(first.issued_reads, 2);
+        assert_eq!(first.positioned_reads, 2);
         assert_eq!(first.read_failures, 0);
         assert_eq!(first.warm_reads, 0);
         assert!(first.bytes_read > 0);
@@ -15249,6 +15333,7 @@ mod tests {
         assert_eq!(experts[1].expert, 7);
         let second = scheduler.snapshot();
         assert_eq!(second.issued_reads, 4);
+        assert_eq!(second.positioned_reads, 4);
         assert_eq!(second.read_failures, 0);
         assert_eq!(second.warm_reads, 1);
         assert!(second.warm_bytes_read > 0);
@@ -15262,9 +15347,22 @@ mod tests {
         assert_eq!(experts[0].expert, 3);
         let third = scheduler.snapshot();
         assert_eq!(third.issued_reads, 5);
+        assert_eq!(third.positioned_reads, 5);
         assert_eq!(third.read_failures, 0);
         assert_eq!(third.warm_reads, 2);
         assert!(third.warm_bytes_read >= second.warm_bytes_read);
+    }
+
+    #[test]
+    fn expert_scheduler_guardrails_keep_flashmoe_discarded_experiments_disabled() {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead
+        );
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.application_expert_cache);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.speculative_routing);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap);
     }
 
     #[test]
@@ -15291,6 +15389,7 @@ mod tests {
         assert_eq!(order, vec![7, 1, 3]);
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.issued_reads, 3);
+        assert_eq!(snapshot.positioned_reads, 3);
         assert_eq!(snapshot.read_failures, 0);
     }
 
@@ -15319,6 +15418,7 @@ mod tests {
         );
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.issued_reads, 1);
+        assert_eq!(snapshot.positioned_reads, 1);
         assert_eq!(snapshot.read_failures, 1);
         assert!(snapshot.total_read_latency >= snapshot.max_read_latency);
     }
