@@ -1293,6 +1293,37 @@ enum ExpertExecution {
     Skip,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillInputKind {
+    Text,
+    Visual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillExpertStrategy {
+    ComputeAllExperts,
+    SkipIntermediateExpertsForTinySingleLayerTextFixture,
+}
+
+impl PrefillExpertStrategy {
+    fn expert_execution_for_position(
+        self,
+        position: usize,
+        prompt_tokens: usize,
+    ) -> ExpertExecution {
+        match self {
+            Self::ComputeAllExperts => ExpertExecution::Normal,
+            Self::SkipIntermediateExpertsForTinySingleLayerTextFixture => {
+                if position + 1 < prompt_tokens {
+                    ExpertExecution::Skip
+                } else {
+                    ExpertExecution::Normal
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SampledDecode {
     token: u32,
@@ -3382,6 +3413,7 @@ impl FlashMoeEngine {
                 prompt_tokens.len()
             );
         }
+        let prefill_strategy = self.text_prefill_expert_strategy();
         let mut last_hidden = None;
         for (position, token) in prompt_tokens
             .iter()
@@ -3392,13 +3424,8 @@ impl FlashMoeEngine {
             kv_cache.record_prompt_token(position, token)?;
             let mut token_timing =
                 FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
-            let expert_execution = if self.can_skip_intermediate_prefill_experts()
-                && position + 1 < prompt_tokens.len()
-            {
-                ExpertExecution::Skip
-            } else {
-                ExpertExecution::Normal
-            };
+            let expert_execution =
+                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len());
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
@@ -3457,8 +3484,20 @@ impl FlashMoeEngine {
         );
     }
 
-    fn can_skip_intermediate_prefill_experts(&self) -> bool {
-        prefill_expert_skip_is_safe(&self.config, self.vision_encoder.is_some())
+    fn text_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
+        prefill_expert_strategy(
+            &self.config,
+            self.vision_encoder.is_some(),
+            PrefillInputKind::Text,
+        )
+    }
+
+    fn visual_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
+        prefill_expert_strategy(
+            &self.config,
+            self.vision_encoder.is_some(),
+            PrefillInputKind::Visual,
+        )
     }
 
     /// Prefill the KV cache for a vision prompt, substituting visual embeddings
@@ -3478,6 +3517,10 @@ impl FlashMoeEngine {
                 mrope_positions.len(),
                 prompt_tokens.len()
             );
+        }
+        let prefill_strategy = self.visual_prefill_expert_strategy();
+        if prefill_strategy != PrefillExpertStrategy::ComputeAllExperts {
+            bail!("Qwen3-VL visual prefill must compute intermediate experts");
         }
         let mut vis_idx = 0usize;
         let mut last_hidden = None;
@@ -3503,7 +3546,7 @@ impl FlashMoeEngine {
                 mrope_positions[position],
                 deepstack,
                 false,
-                ExpertExecution::Normal,
+                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len()),
                 None,
             )?);
         }
@@ -6581,8 +6624,38 @@ fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> 
     (prefix_len == cached_tokens.len()).then_some(prefix_len)
 }
 
-fn prefill_expert_skip_is_safe(config: &QwenModelConfig, has_vision_encoder: bool) -> bool {
-    config.vision_config.is_none()
+fn prefill_expert_strategy(
+    config: &QwenModelConfig,
+    has_vision_encoder: bool,
+    input_kind: PrefillInputKind,
+) -> PrefillExpertStrategy {
+    if prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
+        config,
+        has_vision_encoder,
+        input_kind,
+    ) {
+        PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
+    } else {
+        PrefillExpertStrategy::ComputeAllExperts
+    }
+}
+
+fn prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
+    config: &QwenModelConfig,
+    has_vision_encoder: bool,
+    input_kind: PrefillInputKind,
+) -> bool {
+    // Upstream flash-moe can skip intermediate prefill experts for its narrow
+    // Qwen3.5 target because those hidden states are not sampled. pb supports
+    // other Qwen MoE variants and Qwen3-VL: in real multi-layer models, skipped
+    // expert output changes the hidden state that feeds later layers at the same
+    // token, poisoning full-attention KV writes and linear-attention recurrent
+    // state. Visual prefill is even more fragile because image embeddings,
+    // DeepStack features, and M-RoPE positions all participate in those states.
+    // Keep the optimization limited to intentionally tiny single-layer text
+    // fixtures where there is no later layer state to corrupt.
+    input_kind == PrefillInputKind::Text
+        && config.vision_config.is_none()
         && !has_vision_encoder
         && config.num_hidden_layers == 1
         && config.num_experts.unwrap_or(0) > 0
@@ -13683,21 +13756,56 @@ mod tests {
     }
 
     #[test]
-    fn prefill_expert_skip_is_only_enabled_for_single_layer_text_moe() {
+    fn prefill_strategy_skips_only_for_tiny_single_layer_text_fixture() {
         let (single_layer, _) = minimal_dense_manifest(true);
-        assert!(prefill_expert_skip_is_safe(&single_layer, false));
+        let fixture_strategy =
+            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Text);
+        assert_eq!(
+            fixture_strategy,
+            PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
+        );
+        assert_eq!(
+            fixture_strategy.expert_execution_for_position(0, 3),
+            ExpertExecution::Skip
+        );
+        assert_eq!(
+            fixture_strategy.expert_execution_for_position(2, 3),
+            ExpertExecution::Normal
+        );
 
         let mut multi_layer = single_layer.clone();
         multi_layer.num_hidden_layers = 2;
-        assert!(!prefill_expert_skip_is_safe(&multi_layer, false));
+        assert_eq!(
+            prefill_expert_strategy(&multi_layer, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+
+        let real_qwen: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            prefill_expert_strategy(&real_qwen, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
 
         let mut vision = single_layer.clone();
         vision.vision_config = Some(
             serde_json::from_slice(br#"{"depth":1,"hidden_size":8,"num_heads":2,"mlp_ratio":4.0}"#)
                 .unwrap(),
         );
-        assert!(!prefill_expert_skip_is_safe(&vision, false));
-        assert!(!prefill_expert_skip_is_safe(&single_layer, true));
+        assert_eq!(
+            prefill_expert_strategy(&vision, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+        assert_eq!(
+            prefill_expert_strategy(&single_layer, true, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+        assert_eq!(
+            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Visual),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
     }
 
     #[test]
@@ -13708,6 +13816,73 @@ mod tests {
         );
         assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 9]), None);
         assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2]), None);
+    }
+
+    #[test]
+    fn session_prefix_reuse_preserves_kv_and_linear_attention_state_boundaries() {
+        let cached_tokens = vec![10, 20];
+        let mut cache = KvCache::new(2, 2);
+        for (position, token) in cached_tokens.iter().copied().enumerate() {
+            cache.record_prompt_token(position, token).unwrap();
+        }
+        cache
+            .record_kv(0, 0, vec![1.0, 1.1], vec![2.0, 2.1])
+            .unwrap();
+        cache
+            .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
+            .unwrap();
+
+        let linear_layout = LinearAttentionLayout {
+            num_value_heads: 1,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 2,
+            conv_dim: 6,
+            conv_kernel_size: 3,
+        };
+        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
+            .map(|idx| idx as f32 + 0.25)
+            .collect();
+        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
+            .map(|idx| idx as f32 + 10.5)
+            .collect();
+        {
+            let state = cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state.clone_from(&expected_conv_state);
+            state.ssm_state.clone_from(&expected_ssm_state);
+        }
+
+        let session_state = FlashMoeSessionState {
+            tokens: cached_tokens,
+            kv_cache: cache,
+            last_hidden: vec![9.0, 9.1],
+        };
+        let next_prompt = [10, 20, 30];
+        let prefix_len = reusable_session_prefix_len(&session_state.tokens, &next_prompt).unwrap();
+        assert_eq!(prefix_len, session_state.tokens.len());
+
+        let mut reused = session_state.kv_cache.clone();
+        reused.resize_capacity(next_prompt.len());
+        assert_eq!(reused.keys_values(1, 0).unwrap().len(), prefix_len);
+        assert_eq!(reused.keys_values(2, 0).unwrap().len(), prefix_len);
+        assert_eq!(reused.kv[0][2], None);
+        assert!(reused.linear_states.get(&0).is_none());
+
+        let linear_state = reused.linear_states.get(&1).unwrap();
+        assert_eq!(linear_state.conv_state, expected_conv_state);
+        assert_eq!(linear_state.ssm_state, expected_ssm_state);
+        assert_eq!(session_state.last_hidden, vec![9.0, 9.1]);
+
+        assert_eq!(
+            reusable_session_prefix_len(&session_state.tokens, &[10]),
+            None
+        );
+        assert_eq!(
+            reusable_session_prefix_len(&session_state.tokens, &[10, 99, 30]),
+            None
+        );
     }
 
     #[test]
