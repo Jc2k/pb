@@ -61,6 +61,7 @@ pub const LINEAR_TOTAL_VALUE: usize = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM;
 pub const LINEAR_CONV_DIM: usize = LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE;
 pub const CONV_KERNEL_SIZE: usize = 4;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
+const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
 pub const EXPECTED_EXPERT_BYTES: u64 =
     FOUR_BIT_EXPERT_SIZE * NUM_LAYERS as u64 * NUM_EXPERTS as u64;
@@ -1879,6 +1880,59 @@ impl MetalExecutor {
         }
     }
 
+    fn lm_head_top_candidates_from_cached_buffer(
+        &self,
+        key: &str,
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .lm_head_top_candidates_from_cached_buffer(key, hidden, rows, cols, top_k)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (key, hidden, rows, cols, top_k);
+            Ok(None)
+        }
+    }
+
+    fn cache_lm_head_and_top_candidates(
+        &self,
+        key: &str,
+        weights: &[f32],
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .cache_lm_head_and_top_candidates(key, weights, hidden, rows, cols, top_k)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (key, weights, hidden, rows, cols, top_k);
+            Ok(None)
+        }
+    }
+
+    fn can_cache_lm_head_bytes(&self, bytes: usize) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.can_cache_lm_head_bytes(bytes)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = bytes;
+            false
+        }
+    }
+
     fn apply_rope(
         &self,
         values: &[f32],
@@ -2083,6 +2137,7 @@ struct MetalExecutorInner {
     gqa_scores_pipeline: ObjcId,
     gqa_read_pipeline: ObjcId,
     shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
+    lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
@@ -2099,6 +2154,66 @@ struct MetalSharedExpertBuffers {
     shared_experts: usize,
     intermediate: usize,
     total_intermediate: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalLmHeadBuffer {
+    weights: ObjcId,
+    rows: usize,
+    cols: usize,
+    bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalLmHeadBufferCache {
+    buffers: BTreeMap<String, MetalLmHeadBuffer>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLmHeadBufferCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            buffers: BTreeMap::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&self, key: &str, rows: usize, cols: usize) -> Option<MetalLmHeadBuffer> {
+        let buffer = self.buffers.get(key).copied()?;
+        (buffer.rows == rows && buffer.cols == cols).then_some(buffer)
+    }
+
+    unsafe fn insert(
+        &mut self,
+        key: String,
+        buffer: MetalLmHeadBuffer,
+    ) -> Option<MetalLmHeadBuffer> {
+        if buffer.bytes > self.max_bytes {
+            return Some(buffer);
+        }
+        while self.bytes.saturating_add(buffer.bytes) > self.max_bytes && !self.buffers.is_empty() {
+            let Some(victim) = self.buffers.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.buffers.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(previous.bytes);
+                unsafe {
+                    release(previous.weights);
+                }
+            }
+        }
+        let previous = self.buffers.insert(key, buffer);
+        if let Some(previous_buffer) = previous.as_ref() {
+            self.bytes = self.bytes.saturating_sub(previous_buffer.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(buffer.bytes);
+        previous
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2195,6 +2310,13 @@ impl Drop for MetalExecutorInner {
                     release(buffers.router);
                 }
                 shared_buffers.clear();
+            }
+            if let Ok(lm_head_buffers) = self.lm_head_buffers.get_mut() {
+                for buffer in lm_head_buffers.buffers.values() {
+                    release(buffer.weights);
+                }
+                lm_head_buffers.buffers.clear();
+                lm_head_buffers.bytes = 0;
             }
             if let Ok(kv_cache) = self.kv_cache.get_mut()
                 && let Some(kv_cache) = kv_cache.take()
@@ -2339,6 +2461,9 @@ impl MetalExecutorInner {
                 gqa_scores_pipeline,
                 gqa_read_pipeline,
                 shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
+                lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
+                    metal_lm_head_buffer_budget_bytes(),
+                )),
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
                 attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
                 reusable: std::sync::Mutex::new(Vec::new()),
@@ -2986,6 +3111,173 @@ impl MetalExecutorInner {
             self.recycle(output_buffer);
             self.recycle(cols_buffer);
             Ok(output)
+        }
+    }
+
+    fn lm_head_top_candidates_from_cached_buffer(
+        &self,
+        key: &str,
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let buffer = {
+            self.lm_head_buffers
+                .lock()
+                .expect("metal LM-head buffer cache poisoned")
+                .get(key, rows, cols)
+        };
+        let Some(buffer) = buffer else {
+            return Ok(None);
+        };
+        self.dispatch_lm_head_topk(buffer, hidden, top_k).map(Some)
+    }
+
+    fn cache_lm_head_and_top_candidates(
+        &self,
+        key: &str,
+        weights: &[f32],
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let expected_len = rows
+            .checked_mul(cols)
+            .context("LM-head Metal buffer shape overflow")?;
+        if weights.len() < expected_len {
+            return Ok(None);
+        }
+        {
+            let bytes = expected_len
+                .checked_mul(std::mem::size_of::<f32>())
+                .context("LM-head Metal buffer byte length overflow")?;
+            let cache = self
+                .lm_head_buffers
+                .lock()
+                .expect("metal LM-head buffer cache poisoned");
+            if bytes > cache.max_bytes {
+                return Ok(None);
+            }
+            if let Some(buffer) = cache.get(key, rows, cols) {
+                drop(cache);
+                return self.dispatch_lm_head_topk(buffer, hidden, top_k).map(Some);
+            }
+        }
+
+        unsafe {
+            let weights_buffer =
+                self.persistent_buffer_with_bytes(f32_as_bytes(&weights[..expected_len]))?;
+            let new_buffer = MetalLmHeadBuffer {
+                weights: weights_buffer,
+                rows,
+                cols,
+                bytes: expected_len * std::mem::size_of::<f32>(),
+            };
+            let buffer = {
+                let mut cache = self
+                    .lm_head_buffers
+                    .lock()
+                    .expect("metal LM-head buffer cache poisoned");
+                if let Some(existing) = cache.get(key, rows, cols) {
+                    release(weights_buffer);
+                    existing
+                } else {
+                    if let Some(previous) = cache.insert(key.to_string(), new_buffer) {
+                        release(previous.weights);
+                    }
+                    new_buffer
+                }
+            };
+            self.dispatch_lm_head_topk(buffer, hidden, top_k).map(Some)
+        }
+    }
+
+    fn can_cache_lm_head_bytes(&self, bytes: usize) -> bool {
+        self.lm_head_buffers
+            .lock()
+            .expect("metal LM-head buffer cache poisoned")
+            .max_bytes
+            >= bytes
+    }
+
+    fn dispatch_lm_head_topk(
+        &self,
+        lm_head: MetalLmHeadBuffer,
+        hidden: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        if lm_head.rows == 0 || lm_head.cols == 0 || top_k == 0 || lm_head.cols > hidden.len() {
+            return Ok(Vec::new());
+        }
+        let top_k = top_k.min(lm_head.rows).max(1);
+        unsafe {
+            let hidden_buffer = self.buffer_with_bytes(f32_as_bytes(&hidden[..lm_head.cols]))?;
+            let logits_buffer = self.buffer_with_len(lm_head.rows * std::mem::size_of::<f32>())?;
+            let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
+            let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
+            let cols_u32 = lm_head.cols as u32;
+            let rows_u32 = lm_head.rows as u32;
+            let top_k_u32 = top_k as u32;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let top_k_buffer = self.buffer_with_bytes(u32_as_bytes(&top_k_u32))?;
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE LM-head Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE LM-head Metal compute encoder");
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.lm_head_pipeline,
+            );
+            set_buffer(encoder, lm_head.weights, 0);
+            set_buffer(encoder, hidden_buffer, 1);
+            set_buffer(encoder, logits_buffer, 2);
+            set_buffer(encoder, cols_buffer, 3);
+            dispatch_threads(encoder, lm_head.rows as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.topk_vocab_pipeline,
+            );
+            set_buffer(encoder, logits_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, values_buffer, 2);
+            set_buffer(encoder, rows_buffer, 3);
+            set_buffer(encoder, top_k_buffer, 4);
+            dispatch_threads(encoder, 1);
+
+            msg_send_void0(encoder, sel("endEncoding"));
+            msg_send_void0(command_buffer, sel("commit"));
+            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
+            let mut candidates = Vec::with_capacity(top_k);
+            for idx in 0..top_k {
+                candidates.push((*indices_ptr.add(idx) as usize, *values_ptr.add(idx)));
+            }
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(hidden_buffer);
+            self.recycle(logits_buffer);
+            self.recycle(indices_buffer);
+            self.recycle(values_buffer);
+            self.recycle(cols_buffer);
+            self.recycle(rows_buffer);
+            self.recycle(top_k_buffer);
+            Ok(candidates)
         }
     }
 
@@ -5792,6 +6084,15 @@ fn system_memory_bytes() -> Option<usize> {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_lm_head_buffer_budget_bytes() -> usize {
+    const MIN: usize = 512 * 1024 * 1024;
+    const MAX: usize = 4 * 1024 * 1024 * 1024;
+    system_memory_bytes()
+        .map(|bytes| (bytes / 8).clamp(MIN, MAX))
+        .unwrap_or(MIN)
+}
+
 fn causal_attention(
     q: &[f32],
     keys_values: &[(&[f32], &[f32])],
@@ -7629,8 +7930,11 @@ pub struct DenseStore {
     mmap: Arc<memmap2::Mmap>,
     registry: TensorRegistry,
     resident: Arc<std::sync::Mutex<DenseTensorCache>>,
+    decoded_tiles: Arc<std::sync::Mutex<DenseTensorTileCache>>,
     #[cfg(test)]
     decoded_full_tensors: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    decoded_tensor_tiles: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Default)]
@@ -7638,6 +7942,56 @@ struct DenseTensorCache {
     tensors: BTreeMap<String, Arc<Vec<f32>>>,
     bytes: usize,
     max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseTensorTileKey {
+    name: String,
+    start_row: usize,
+    row_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct DenseTensorTileCache {
+    tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<f32>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl DenseTensorTileCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, key: &DenseTensorTileKey) -> Option<Arc<Vec<f32>>> {
+        self.tiles.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: DenseTensorTileKey, tile: Arc<Vec<f32>>) {
+        let bytes = tile.len() * std::mem::size_of::<f32>();
+        if bytes > self.max_bytes {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tiles.is_empty() {
+            let Some(victim) = self.tiles.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.tiles.remove(&victim) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+            }
+        }
+        if let Some(previous) = self.tiles.insert(key, tile) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
 }
 
 impl DenseTensorCache {
@@ -7698,8 +8052,13 @@ impl DenseStore {
             resident: Arc::new(std::sync::Mutex::new(DenseTensorCache::with_budget(
                 512 * 1024 * 1024,
             ))),
+            decoded_tiles: Arc::new(std::sync::Mutex::new(DenseTensorTileCache::with_budget(
+                DENSE_DECODED_TILE_CACHE_BYTES,
+            ))),
             #[cfg(test)]
             decoded_full_tensors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            decoded_tensor_tiles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -7890,8 +8249,10 @@ impl DenseStore {
                 let tile_rows = dense_projection_tile_rows(cols, rows);
                 for start in (0..rows).step_by(tile_rows) {
                     let end = (start + tile_rows).min(rows);
-                    let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-                    let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+                    let tensor =
+                        self.read_tensor_rows_f32_cached(lm_head_name, start, end - start)?;
+                    let projected =
+                        metal.dense_matvec(tensor.as_slice(), hidden, end - start, cols)?;
                     for (offset, value) in projected.into_iter().enumerate() {
                         logits[start + offset] = value;
                     }
@@ -7930,13 +8291,52 @@ impl DenseStore {
             return Ok(None);
         }
 
+        let top_k = sampler.top_k.min(rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
-        let mut candidates = TopKCandidates::new(sampler.top_k.min(rows).max(1));
+        if repeated.is_empty() {
+            let lm_head_bytes = rows
+                .checked_mul(cols)
+                .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                .context("LM-head decoded byte length overflow")?;
+            if let Some(candidates) = metal.lm_head_top_candidates_from_cached_buffer(
+                lm_head_name,
+                hidden,
+                rows,
+                cols,
+                top_k,
+            )? {
+                return Ok(Some(candidates));
+            }
+            if metal.can_cache_lm_head_bytes(lm_head_bytes) {
+                if let Some(weights) = self.read_full_tensor_f32(lm_head_name)? {
+                    match metal.cache_lm_head_and_top_candidates(
+                        lm_head_name,
+                        &weights,
+                        hidden,
+                        rows,
+                        cols,
+                        top_k,
+                    ) {
+                        Ok(Some(candidates)) => return Ok(Some(candidates)),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                tensor = lm_head_name,
+                                "falling back to tiled LM-head sampling after Metal top-k cache failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidates = TopKCandidates::new(top_k);
         let tile_rows = dense_projection_tile_rows(cols, rows);
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
-            let tensor = self.read_tensor_rows_f32(lm_head_name, start, end - start)?;
-            let projected = metal.dense_matvec(&tensor, hidden, end - start, cols)?;
+            let tensor = self.read_tensor_rows_f32_cached(lm_head_name, start, end - start)?;
+            let projected = metal.dense_matvec(tensor.as_slice(), hidden, end - start, cols)?;
             for (offset, value) in projected.into_iter().enumerate() {
                 let token = start + offset;
                 candidates.push(token, sampler.process_logit(token, value, &repeated));
@@ -8044,8 +8444,8 @@ impl DenseStore {
         let tile_rows = dense_projection_tile_rows(cols, rows);
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
-            let tensor = self.read_tensor_rows_f32(canonical_name, start, end - start)?;
-            let projected = metal.dense_matvec(&tensor, input, end - start, cols)?;
+            let tensor = self.read_tensor_rows_f32_cached(canonical_name, start, end - start)?;
+            let projected = metal.dense_matvec(tensor.as_slice(), input, end - start, cols)?;
             for (offset, value) in projected.into_iter().enumerate() {
                 output[start + offset] = value;
             }
@@ -8075,6 +8475,33 @@ impl DenseStore {
             .expect("dense tensor cache poisoned")
             .insert(canonical_name.to_string(), tensor.clone());
         Ok(Some(tensor))
+    }
+
+    fn read_tensor_rows_f32_cached(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<Arc<Vec<f32>>> {
+        let key = DenseTensorTileKey {
+            name: canonical_name.to_string(),
+            start_row,
+            row_count,
+        };
+        if let Some(tile) = self
+            .decoded_tiles
+            .lock()
+            .expect("dense decoded tile cache poisoned")
+            .get(&key)
+        {
+            return Ok(tile);
+        }
+        let tile = Arc::new(self.read_tensor_rows_f32(canonical_name, start_row, row_count)?);
+        self.decoded_tiles
+            .lock()
+            .expect("dense decoded tile cache poisoned")
+            .insert(key, tile.clone());
+        Ok(tile)
     }
 
     fn read_tensor_rows_f32(
@@ -8125,6 +8552,9 @@ impl DenseStore {
             .checked_mul(row_bytes)
             .context("dense tensor tile byte length overflow")?;
         let bytes = self.read_range(entry.byte_offset + byte_offset as u64, byte_len)?;
+        #[cfg(test)]
+        self.decoded_tensor_tiles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         decode_dense_tensor_f32(&entry.dtype, &bytes)
     }
 
@@ -8239,6 +8669,12 @@ impl DenseStore {
     #[cfg(test)]
     fn decoded_full_tensor_count(&self) -> usize {
         self.decoded_full_tensors
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn decoded_tensor_tile_count(&self) -> usize {
+        self.decoded_tensor_tiles
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -10398,22 +10834,30 @@ kernel void topk_vocab(
     device uint* indices [[buffer(1)]],
     device float* values [[buffer(2)]],
     constant uint& vocab [[buffer(3)]],
+    constant uint& top_k [[buffer(4)]],
     uint slot [[thread_position_in_grid]]) {
-    float best = -INFINITY;
-    uint best_i = 0;
-    for (uint i = 0; i < vocab; ++i) {
-        float value = logits[i];
-        bool already_used = false;
-        for (uint prev = 0; prev < slot; ++prev) {
-            already_used = already_used || (indices[prev] == i);
+    if (slot != 0) { return; }
+    uint limit = min(top_k, vocab);
+    for (uint out = 0; out < limit; ++out) {
+        float best = -INFINITY;
+        uint best_i = 0;
+        bool found = false;
+        for (uint i = 0; i < vocab; ++i) {
+            float raw_value = logits[i];
+            float value = isfinite(raw_value) ? raw_value : -INFINITY;
+            bool already_used = false;
+            for (uint prev = 0; prev < out; ++prev) {
+                already_used = already_used || (indices[prev] == i);
+            }
+            if (!already_used && (!found || value > best)) {
+                best = value;
+                best_i = i;
+                found = true;
+            }
         }
-        if (!already_used && value > best) {
-            best = value;
-            best_i = i;
-        }
+        indices[out] = best_i;
+        values[out] = best;
     }
-    indices[slot] = best_i;
-    values[slot] = best;
 }
 
 // Multi-head GQA attention scores.
@@ -13888,6 +14332,7 @@ mod tests {
         assert!(METAL_SHADERS.contains("simd_sum(acc)"));
         assert!(METAL_SHADERS.contains("thread_index_in_simdgroup"));
         assert!(METAL_SHADERS.contains("constant uint& group_size"));
+        assert!(METAL_SHADERS.contains("constant uint& top_k"));
         assert!(METAL_SHADERS.contains("fma(float(byte & 0x0f), scale0 * x0, bias0 * x0)"));
         assert!(
             !METAL_SHADERS.contains("uint half"),
@@ -16385,6 +16830,57 @@ mod tests {
             .expect("registered dense projection should decode F32 weights");
         assert_eq!(projected.len(), 2);
         assert!(projected[1] > projected[0]);
+    }
+
+    #[test]
+    fn dense_store_reuses_decoded_tiles_for_repeated_lm_head_sampling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "lm_head.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![4, 2],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+
+        let first = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(first.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(store.decoded_tensor_tile_count(), 1);
+
+        let second = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 0, 2)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            store.decoded_tensor_tile_count(),
+            1,
+            "cached LM-head tile should not be decoded again for the next token"
+        );
+
+        let other = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 2, 2)
+            .unwrap();
+        assert_eq!(other.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(store.decoded_tensor_tile_count(), 2);
     }
 
     #[test]
