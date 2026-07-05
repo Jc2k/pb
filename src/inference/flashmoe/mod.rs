@@ -3374,7 +3374,7 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
         let cached = session_id.and_then(|id| self.session_cache_prefix(id, &prompt_tokens));
-        let (mut kv_cache, prefill_start, mut last_cache_hidden) =
+        let (mut kv_cache, prefill_start, cached_last_hidden) =
             if let Some((prefix_len, state)) = cached {
                 let mut kv_cache = state.kv_cache.clone();
                 kv_cache.resize_capacity(cache_capacity);
@@ -3392,25 +3392,23 @@ impl FlashMoeEngine {
                 )
             };
         let prefill_hidden = if prefill_start == prompt_tokens.len() {
-            last_cache_hidden
-                .clone()
-                .context("session cache entry is missing the final hidden state")?
+            cached_last_hidden.context("session cache entry is missing the final hidden state")?
         } else {
-            let hidden = self.prefill_from(
+            self.prefill_from(
                 &prompt_tokens,
                 prefill_start,
                 &mut kv_cache,
                 timing.as_deref_mut(),
-            )?;
-            last_cache_hidden = Some(hidden.clone());
-            hidden
+            )?
         };
+        let prompt_cache = session_id
+            .is_some()
+            .then(|| (kv_cache.clone(), prefill_hidden.clone()));
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
         let max_tokens = request.max_tokens.max(0) as usize;
         let mut stopped = false;
-        let mut processed_generated = 0usize;
         if max_tokens > 0 {
             let sample_started = Instant::now();
             let token =
@@ -3441,8 +3439,6 @@ impl FlashMoeEngine {
                 timing.as_deref_mut(),
             )?;
             let token = sampled.token;
-            last_cache_hidden = Some(sampled.hidden);
-            processed_generated = processed_generated.saturating_add(1);
             if self.tokenizer.is_eos(token) {
                 break;
             }
@@ -3450,14 +3446,9 @@ impl FlashMoeEngine {
         }
 
         if let Some(session_id) = session_id {
-            self.store_session_cache(
-                session_id,
-                &prompt_tokens,
-                &generated,
-                processed_generated,
-                kv_cache.clone(),
-                last_cache_hidden.as_deref().unwrap_or(&prefill_hidden),
-            );
+            let (prompt_kv_cache, prompt_hidden) =
+                prompt_cache.context("session cache prompt snapshot is missing")?;
+            self.store_session_cache(session_id, &prompt_tokens, prompt_kv_cache, &prompt_hidden);
         }
 
         let decoded = self.tokenizer.decode(&generated)?;
@@ -3560,19 +3551,13 @@ impl FlashMoeEngine {
         &mut self,
         session_id: &str,
         prompt_tokens: &[u32],
-        generated: &[u32],
-        processed_generated: usize,
         kv_cache: KvCache,
         last_hidden: &[f32],
     ) {
-        let generated_prefix_len = processed_generated.min(generated.len());
-        let mut tokens = Vec::with_capacity(prompt_tokens.len() + generated_prefix_len);
-        tokens.extend_from_slice(prompt_tokens);
-        tokens.extend_from_slice(&generated[..generated_prefix_len]);
         self.session_cache.insert(
             session_id.to_string(),
             FlashMoeSessionState {
-                tokens,
+                tokens: stable_session_cache_tokens(prompt_tokens),
                 kv_cache,
                 last_hidden: last_hidden.to_vec(),
             },
@@ -6822,6 +6807,13 @@ fn common_token_prefix_len(left: &[u32], right: &[u32]) -> usize {
 fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> Option<usize> {
     let prefix_len = common_token_prefix_len(cached_tokens, prompt_tokens);
     (prefix_len == cached_tokens.len()).then_some(prefix_len)
+}
+
+fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
+    // Assistant generations can be parsed into structured tool calls and then
+    // re-rendered canonically on the next turn. Cache only rendered prompt
+    // tokens whose exact bytes are already part of the transcript contract.
+    prompt_tokens.to_vec()
 }
 
 fn prefill_expert_strategy(
@@ -14295,6 +14287,109 @@ mod tests {
         );
         assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 9]), None);
         assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2]), None);
+    }
+
+    fn byte_tokens(text: &str) -> Vec<u32> {
+        text.bytes().map(u32::from).collect()
+    }
+
+    fn weather_tool() -> ChatTool {
+        ChatTool {
+            name: "get_weather".to_string(),
+            description: Some("Get weather.".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        }
+    }
+
+    fn assistant_weather_tool_call(content: &str) -> ChatMessage {
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, content);
+        assistant.tool_calls.push(ChatToolCall {
+            id: None,
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "London"}),
+        });
+        assistant
+    }
+
+    fn weather_tool_result() -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: ChatMessageContent::Text("{\"temp\":12}".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: Some("get_weather".to_string()),
+        }
+    }
+
+    fn rendered_tool_prompt_pair(assistant: ChatMessage) -> (String, String) {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let tool = weather_tool();
+        let initial_messages = vec![
+            ChatMessage::text(ChatRole::System, "be precise"),
+            ChatMessage::text(ChatRole::User, "weather?"),
+        ];
+        let first_prompt = tokenizer
+            .apply_chat_template_to_messages(&initial_messages, std::slice::from_ref(&tool), true)
+            .unwrap();
+        let mut next_messages = initial_messages;
+        next_messages.push(assistant);
+        next_messages.push(weather_tool_result());
+        let next_prompt = tokenizer
+            .apply_chat_template_to_messages(&next_messages, &[tool], true)
+            .unwrap();
+        (first_prompt, next_prompt)
+    }
+
+    #[test]
+    fn session_cache_reuses_prompt_prefix_after_json_compat_tool_call() {
+        let (first_prompt, next_prompt) =
+            rendered_tool_prompt_pair(assistant_weather_tool_call(""));
+        let first_prompt_tokens = byte_tokens(&first_prompt);
+        let next_prompt_tokens = byte_tokens(&next_prompt);
+        let mut old_cached_tokens = first_prompt_tokens.clone();
+        old_cached_tokens.extend(byte_tokens(
+            r#"{"type":"tool_call","tool":"get_weather","arguments":{"city":"London"},"thinking":"checking"}"#,
+        ));
+
+        assert_eq!(
+            reusable_session_prefix_len(&old_cached_tokens, &next_prompt_tokens),
+            None
+        );
+        let stable_cached_tokens = stable_session_cache_tokens(&first_prompt_tokens);
+        assert_eq!(
+            reusable_session_prefix_len(&stable_cached_tokens, &next_prompt_tokens),
+            Some(first_prompt_tokens.len())
+        );
+    }
+
+    #[test]
+    fn session_cache_reuses_prompt_prefix_after_native_tool_call_rerender() {
+        let (first_prompt, next_prompt) =
+            rendered_tool_prompt_pair(assistant_weather_tool_call("checking"));
+        let first_prompt_tokens = byte_tokens(&first_prompt);
+        let next_prompt_tokens = byte_tokens(&next_prompt);
+        let mut old_cached_tokens = first_prompt_tokens.clone();
+        old_cached_tokens.extend(byte_tokens(
+            "checking\n<tool_call>\n{\"arguments\":{\"city\":\"London\"},\"name\":\"get_weather\"}\n</tool_call>\n",
+        ));
+
+        assert_eq!(
+            reusable_session_prefix_len(&old_cached_tokens, &next_prompt_tokens),
+            None
+        );
+        let stable_cached_tokens = stable_session_cache_tokens(&first_prompt_tokens);
+        assert_eq!(
+            reusable_session_prefix_len(&stable_cached_tokens, &next_prompt_tokens),
+            Some(first_prompt_tokens.len())
+        );
     }
 
     #[test]
