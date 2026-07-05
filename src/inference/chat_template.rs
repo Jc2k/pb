@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use minijinja::value::Value as MiniJinjaValue;
 use minijinja::{Environment, Error as MiniJinjaError, ErrorKind as MiniJinjaErrorKind};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -71,7 +72,10 @@ impl TokenizerChatTemplate {
         let template = self.template_for_tools(&tools)?;
         let mut env = Environment::new();
         env.add_function("raise_exception", raise_exception);
-        Ok(env.render_str(
+        env.set_unknown_method_callback(|_, value, method, args| {
+            tokenizer_chat_template_unknown_method(value, method, args)
+        });
+        env.render_str(
             template,
             json!({
                 "messages": messages,
@@ -83,7 +87,8 @@ impl TokenizerChatTemplate {
                 "eos_token": self.eos_token.as_deref(),
                 "pad_token": self.pad_token.as_deref(),
             }),
-        )?)
+        )
+        .context("failed to render tokenizer chat_template")
     }
 
     fn template_for_tools(&self, tools: &Value) -> Result<&str> {
@@ -137,6 +142,122 @@ fn raise_exception(message: String) -> std::result::Result<String, MiniJinjaErro
         MiniJinjaErrorKind::InvalidOperation,
         message,
     ))
+}
+
+fn tokenizer_chat_template_unknown_method(
+    value: &MiniJinjaValue,
+    method: &str,
+    args: &[MiniJinjaValue],
+) -> std::result::Result<MiniJinjaValue, MiniJinjaError> {
+    let Some(value) = value.as_str() else {
+        return Err(MiniJinjaError::from(MiniJinjaErrorKind::UnknownMethod));
+    };
+    match method {
+        "startswith" => string_predicate_method(
+            value,
+            args,
+            |value, prefix| value.starts_with(prefix),
+            "prefix",
+        ),
+        "endswith" => string_predicate_method(
+            value,
+            args,
+            |value, suffix| value.ends_with(suffix),
+            "suffix",
+        ),
+        "split" => string_split_method(value, args),
+        "strip" => string_trim_method(value, args, TrimSide::Both),
+        "lstrip" => string_trim_method(value, args, TrimSide::Left),
+        "rstrip" => string_trim_method(value, args, TrimSide::Right),
+        _ => Err(MiniJinjaError::from(MiniJinjaErrorKind::UnknownMethod)),
+    }
+}
+
+fn string_predicate_method(
+    value: &str,
+    args: &[MiniJinjaValue],
+    predicate: impl FnOnce(&str, &str) -> bool,
+    argument_name: &str,
+) -> std::result::Result<MiniJinjaValue, MiniJinjaError> {
+    let [needle] = args else {
+        return Err(MiniJinjaError::new(
+            MiniJinjaErrorKind::InvalidOperation,
+            format!("string predicate expects exactly one {argument_name} argument"),
+        ));
+    };
+    let Some(needle) = needle.as_str() else {
+        return Err(MiniJinjaError::new(
+            MiniJinjaErrorKind::InvalidOperation,
+            format!("string predicate {argument_name} must be a string"),
+        ));
+    };
+    Ok(MiniJinjaValue::from(predicate(value, needle)))
+}
+
+fn string_split_method(
+    value: &str,
+    args: &[MiniJinjaValue],
+) -> std::result::Result<MiniJinjaValue, MiniJinjaError> {
+    let parts = match args {
+        [] => value
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        [separator] => {
+            let Some(separator) = separator.as_str() else {
+                return Err(MiniJinjaError::new(
+                    MiniJinjaErrorKind::InvalidOperation,
+                    "split separator must be a string",
+                ));
+            };
+            value.split(separator).map(str::to_string).collect()
+        }
+        _ => {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "split expects zero or one argument",
+            ));
+        }
+    };
+    Ok(MiniJinjaValue::from(parts))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrimSide {
+    Both,
+    Left,
+    Right,
+}
+
+fn string_trim_method(
+    value: &str,
+    args: &[MiniJinjaValue],
+    side: TrimSide,
+) -> std::result::Result<MiniJinjaValue, MiniJinjaError> {
+    let chars = match args {
+        [] => None,
+        [chars] => Some(chars.as_str().ok_or_else(|| {
+            MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "strip characters must be a string",
+            )
+        })?),
+        _ => {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "strip expects zero or one argument",
+            ));
+        }
+    };
+    let trimmed = match (side, chars) {
+        (TrimSide::Both, Some(chars)) => value.trim_matches(|c| chars.contains(c)),
+        (TrimSide::Left, Some(chars)) => value.trim_start_matches(|c| chars.contains(c)),
+        (TrimSide::Right, Some(chars)) => value.trim_end_matches(|c| chars.contains(c)),
+        (TrimSide::Both, None) => value.trim(),
+        (TrimSide::Left, None) => value.trim_start(),
+        (TrimSide::Right, None) => value.trim_end(),
+    };
+    Ok(MiniJinjaValue::from(trimmed.to_string()))
 }
 
 #[cfg(test)]
@@ -193,6 +314,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rendered_with_tools, "tools:lookup:hi");
+    }
+
+    #[test]
+    fn renders_python_style_string_methods() {
+        let template = TokenizerChatTemplate {
+            default_template: Some(
+                concat!(
+                    "{% set content = messages[0].content %}",
+                    "{% if content.startswith('<think>') and content.endswith('</answer>') %}",
+                    "{{ content.split('</think>')[0].rstrip('\\n')",
+                    ".split('<think>')[-1].lstrip('\\n') }}",
+                    "|{{ content.split('</think>')[-1].strip('\\n') }}",
+                    "{% else %}plain{% endif %}"
+                )
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        let rendered = template
+            .render(
+                json!([{"role":"assistant","content":"<think>\nplan\n</think>\nanswer</answer>"}]),
+                json!([]),
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(rendered, "plan|answer</answer>");
     }
 
     #[test]
