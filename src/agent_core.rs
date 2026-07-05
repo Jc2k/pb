@@ -1,4 +1,11 @@
-use crate::inference::llamacpp::{self as llamacpp, LlamaCppBackend, LlamaCppRequest};
+use crate::inference::flashmoe::{
+    ChatMessage as ModelChatMessage, ChatMessageContent as ModelChatMessageContent,
+    ChatRole as ModelChatRole, ChatTool as ModelChatTool, ChatToolCall as ModelChatToolCall,
+    StructuredGenerationRequest,
+};
+use crate::inference::llamacpp::{
+    self as llamacpp, LlamaCppBackend, LlamaCppChatRequest, LlamaCppRequest,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use futures::StreamExt;
@@ -508,6 +515,47 @@ impl RunMetrics {
 struct ChatMessage {
     role: &'static str,
     content: String,
+    #[serde(default)]
+    tool_calls: Vec<AgentToolCall>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl ChatMessage {
+    fn text(role: &'static str, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<AgentToolCall>,
+    ) -> Self {
+        Self {
+            role: "assistant",
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn tool_result(tool: String, tool_call_id: Option<String>, content: String) -> Self {
+        Self {
+            role: "tool",
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id,
+            name: Some(tool),
+        }
+    }
 }
 
 fn correction_chat_message(summary: &str, message: &str) -> ChatMessage {
@@ -520,16 +568,39 @@ fn correction_chat_message(summary: &str, message: &str) -> ChatMessage {
     }
     content.push_str(message.trim());
     ChatMessage {
-        role: "system",
+        role: "user",
         content,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct AgentToolCall {
+    #[serde(default)]
+    id: Option<String>,
     tool: String,
     #[serde(default)]
     arguments: Value,
+}
+
+impl AgentToolCall {
+    fn from_model(call: ModelChatToolCall) -> Self {
+        Self {
+            id: call.id,
+            tool: call.name,
+            arguments: call.arguments,
+        }
+    }
+
+    fn to_model(&self) -> ModelChatToolCall {
+        ModelChatToolCall {
+            id: self.id.clone(),
+            name: self.tool.clone(),
+            arguments: self.arguments.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -944,14 +1015,8 @@ pub fn run_agent<S: EventSink>(
     let todo_memory = RefCell::new(TodoMemory::default());
 
     let mut messages = vec![
-        ChatMessage {
-            role: "system",
-            content: instructions,
-        },
-        ChatMessage {
-            role: "user",
-            content: task_with_attachments(&args),
-        },
+        ChatMessage::text("system", instructions),
+        ChatMessage::text("user", task_with_attachments(&args)),
     ];
 
     let mut llama_generator;
@@ -1052,16 +1117,16 @@ fn build_agent_instructions(
     lsp_registry: &LspToolRegistry,
 ) -> Result<String> {
     let mut instructions = String::from(
-        "You are pb, a local coding agent. Always respond with one JSON object and nothing else.\n",
+        "You are pb, a local coding agent. Use the provided tools when you need actions. When the task is complete, answer normally with the final user-visible summary.\n",
     );
     instructions.push_str(
-        "Use {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"} for actions, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"} when done.\n",
+        "If your model runtime exposes native tool calls, call tools through that native interface. If native tool calls are not available, pb also accepts one JSON compatibility action: {\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{...},\"thinking\":\"...\"}, {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}, or {\"type\":\"final\",\"content\":\"...\",\"thinking\":\"...\"}.\n",
     );
     instructions.push_str(
         "Near the start of each new task, call session_title with a concise 3-8 word summary suitable as a heading or session table row.\n",
     );
     instructions.push_str(
-        "Prefer batching independent work: when one LLM step needs multiple independent actions, use {\"type\":\"tool_calls\",\"calls\":[{\"tool\":\"...\",\"arguments\":{...}}],\"thinking\":\"...\"}; pb will run the batch and return all tool responses before the next LLM pass. Batch obvious discovery reads/searches, multiple independent file reads, and independent web/MCP lookups instead of spending separate steps. Do not batch dependent actions where a later call needs an earlier result.\n",
+        "Prefer batching independent work: when one LLM step needs multiple independent actions, emit multiple native tool calls in the same assistant turn, or use the JSON compatibility batch form. pb will run the batch and return all tool responses before the next LLM pass. Batch obvious discovery reads/searches, multiple independent file reads, and independent web/MCP lookups instead of spending separate steps. Do not batch dependent actions where a later call needs an earlier result.\n",
     );
     instructions.push_str(
         "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it. Do not finalize merely because an initial search, file listing, or tool batch returned no matches; treat that as a signal to broaden the query, inspect parent or sibling directories, list candidate files, or ask a targeted teammate while you still have tool steps available. Only finalize when the task is complete, a real external blocker prevents progress, a required user decision is needed, or the step budget is exhausted by pb.\n",
@@ -1252,6 +1317,61 @@ fn available_tool_specs(
         input_schema: tool.input_schema.clone(),
     }));
     tools
+}
+
+fn to_model_tools(tools: &[BuiltInToolSchema]) -> Vec<ModelChatTool> {
+    tools
+        .iter()
+        .map(|tool| ModelChatTool {
+            name: tool.name.clone(),
+            description: Some(tool.description.clone()),
+            input_schema: tool.input_schema.clone(),
+        })
+        .collect()
+}
+
+fn model_tools_value(tools: &[BuiltInToolSchema]) -> Value {
+    Value::Array(tools.iter().map(model_tool_schema_value).collect())
+}
+
+fn model_tool_schema_value(tool: &BuiltInToolSchema) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.name.clone(),
+            "description": tool.description.clone(),
+            "parameters": tool.input_schema.clone(),
+        }
+    })
+}
+
+fn model_messages_value(messages: &[ChatMessage]) -> Result<Value> {
+    serde_json::to_value(to_model_messages(messages)?).context("failed to serialize chat messages")
+}
+
+fn to_model_messages(messages: &[ChatMessage]) -> Result<Vec<ModelChatMessage>> {
+    messages.iter().map(to_model_message).collect()
+}
+
+fn to_model_message(message: &ChatMessage) -> Result<ModelChatMessage> {
+    let role = match message.role {
+        "system" => ModelChatRole::System,
+        "user" => ModelChatRole::User,
+        "assistant" => ModelChatRole::Assistant,
+        "tool" => ModelChatRole::Tool,
+        role => bail!("unsupported chat role in agent transcript: {role}"),
+    };
+    Ok(ModelChatMessage {
+        role,
+        content: ModelChatMessageContent::Text(message.content.clone()),
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(AgentToolCall::to_model)
+            .collect(),
+        tool_call_id: message.tool_call_id.clone(),
+        name: message.name.clone(),
+    })
 }
 
 fn available_tool_signatures(
@@ -2054,6 +2174,14 @@ fn run_agent_steps(
     let mut repeated_parse_failures = 0usize;
     let mut tool_loop_guard = ToolLoopGuard::default();
     let gate_state = RefCell::new(GateState::default());
+    let available_tools = available_tool_specs(
+        args.profile,
+        command_backend.map(CommandBackend::kind),
+        args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+        args.repository_less,
+        mcp_registry,
+        lsp_registry,
+    );
 
     while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -2063,11 +2191,11 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        let prompt = render_prompt(messages);
         let (output, action) = match generate_and_parse_action_with_retries(
             generator,
             args,
-            &prompt,
+            messages,
+            &available_tools,
             step,
             &mut metrics,
             sink,
@@ -2095,10 +2223,7 @@ fn run_agent_steps(
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
-                messages.push(ChatMessage {
-                    role: "assistant",
-                    content: output.clone(),
-                });
+                messages.push(ChatMessage::text("assistant", output.clone()));
 
                 let error_msg = parse_failure_feedback(
                     &error.to_string(),
@@ -2148,10 +2273,7 @@ fn run_agent_steps(
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
-                    messages.push(ChatMessage {
-                        role: "assistant",
-                        content: output.clone(),
-                    });
+                    messages.push(ChatMessage::text("assistant", output.clone()));
                     messages.push(correction_chat_message(
                         "Completion gate blocked final response",
                         &feedback,
@@ -2176,12 +2298,16 @@ fn run_agent_steps(
                 arguments,
                 thinking,
             } => {
-                let calls = vec![AgentToolCall { tool, arguments }];
+                let calls = vec![AgentToolCall {
+                    id: None,
+                    tool,
+                    arguments,
+                }];
                 let loop_feedback = tool_loop_guard.record_calls(&calls);
                 execute_tool_calls(
                     calls,
                     thinking,
-                    &output,
+                    assistant_content_for_tool_action(&output),
                     ToolExecutionEnv {
                         text_backend,
                         llamacpp,
@@ -2220,7 +2346,7 @@ fn run_agent_steps(
                 execute_tool_calls(
                     calls,
                     thinking,
-                    &output,
+                    assistant_content_for_tool_action(&output),
                     ToolExecutionEnv {
                         text_backend,
                         llamacpp,
@@ -2281,12 +2407,12 @@ fn run_agent_steps(
                     &mut metrics,
                 )?
             {
-                messages.push(ChatMessage {
-                    role: "tool",
-                    content: format!(
+                messages.push(ChatMessage::text(
+                    "user",
+                    format!(
                         "Trinity monitor checkpoint at step {step}/{original_max_steps}:\n{audit}"
                     ),
-                });
+                ));
                 if monitor_recommends_more_steps(&audit) {
                     effective_max_steps =
                         effective_max_steps.saturating_add(MONITOR_STEP_BUDGET.max(1));
@@ -2373,14 +2499,11 @@ fn run_step_limit_monitor(
     )?;
     let transcript = render_prompt(messages);
     let mut monitor_messages = vec![
-        ChatMessage {
-            role: "system",
-            content: instructions,
-        },
-        ChatMessage {
-            role: "user",
-            content: format!("{monitor_task}\n\nTranscript so far:\n{transcript}"),
-        },
+        ChatMessage::text("system", instructions),
+        ChatMessage::text(
+            "user",
+            format!("{monitor_task}\n\nTranscript so far:\n{transcript}"),
+        ),
     ];
     let mut monitor_request = args.clone();
     monitor_request.task = monitor_task;
@@ -2461,6 +2584,7 @@ fn execute_tool_calls(
         });
     }
 
+    let calls_for_transcript = calls.clone();
     let mut runnable = Vec::new();
     let mut results = Vec::new();
     for call in calls {
@@ -2479,6 +2603,7 @@ fn execute_tool_calls(
             PolicyOutcome::Deny => {
                 let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
                 results.push((
+                    call.id,
                     call.tool,
                     call.arguments,
                     format!("tool denied by policy rule '{rule}'"),
@@ -2503,6 +2628,7 @@ fn execute_tool_calls(
                     runnable.push(call);
                 } else {
                     results.push((
+                        call.id,
                         call.tool,
                         call.arguments,
                         format!("tool was not approved by the user for policy rule '{rule}'"),
@@ -2548,13 +2674,21 @@ fn execute_tool_calls(
                     let energy = energy_start
                         .and_then(|sample| sample.estimate_since(energy::sample(), started));
                     let duration_ms = duration_millis(started);
-                    (call.tool, call.arguments, result, duration_ms, energy)
+                    (
+                        call.id,
+                        call.tool,
+                        call.arguments,
+                        result,
+                        duration_ms,
+                        energy,
+                    )
                 })
             })
             .collect::<Vec<_>>();
         for handle in handles {
             results.push(handle.join().unwrap_or_else(|_| {
                 (
+                    None,
                     "unknown".to_string(),
                     Value::Null,
                     "tool thread panicked".to_string(),
@@ -2583,16 +2717,22 @@ fn execute_tool_calls(
             let energy =
                 energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
             let duration_ms = duration_millis(started);
-            results.push((call.tool, call.arguments, result, duration_ms, energy));
+            results.push((
+                call.id,
+                call.tool,
+                call.arguments,
+                result,
+                duration_ms,
+                energy,
+            ));
         }
     }
 
-    messages.push(ChatMessage {
-        role: "assistant",
-        content: assistant_output.to_string(),
-    });
-    let mut tool_message = String::new();
-    for (tool, arguments, result, duration_ms, energy) in results {
+    messages.push(ChatMessage::assistant_with_tool_calls(
+        assistant_output.to_string(),
+        calls_for_transcript,
+    ));
+    for (tool_call_id, tool, _arguments, result, duration_ms, energy) in results {
         metrics.tool_calls += 1;
         metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
         add_energy(
@@ -2610,14 +2750,8 @@ fn execute_tool_calls(
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
-        tool_message.push_str(&format!(
-            "tool={tool}\nargs={arguments}\nresult={result}\n\n"
-        ));
+        messages.push(ChatMessage::tool_result(tool, tool_call_id, result));
     }
-    messages.push(ChatMessage {
-        role: "tool",
-        content: tool_message.trim_end().to_string(),
-    });
     Ok(())
 }
 
@@ -2629,6 +2763,20 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str(message.role);
         prompt.push_str("]\n");
         prompt.push_str(&message.content);
+        if !message.tool_calls.is_empty() {
+            prompt.push_str("\nTool calls:\n");
+            for call in &message.tool_calls {
+                prompt.push_str(&format!("tool={} args={}\n", call.tool, call.arguments));
+            }
+        }
+        if message.role == "tool" {
+            if let Some(name) = &message.name {
+                prompt.push_str(&format!("\nTool name: {name}"));
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                prompt.push_str(&format!("\nTool call id: {tool_call_id}"));
+            }
+        }
         prompt.push_str("\n\n");
     }
     prompt.push_str("[assistant]\n");
@@ -2727,6 +2875,7 @@ fn repeated_tool_call_feedback(repeated: &[(&str, &Value, usize)]) -> Option<Str
 
 struct CompletionOutput {
     content: String,
+    tool_calls: Vec<AgentToolCall>,
     finish_reason: CompletionFinishReason,
     prompt_tokens: usize,
     generated_tokens: usize,
@@ -2741,7 +2890,12 @@ enum CompletionFinishReason {
 }
 
 trait CompletionEngine {
-    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput>;
+    fn generate(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+    ) -> Result<CompletionOutput>;
 }
 
 struct LlamaCompletionEngine<'a> {
@@ -2749,9 +2903,15 @@ struct LlamaCompletionEngine<'a> {
 }
 
 impl CompletionEngine for LlamaCompletionEngine<'_> {
-    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
-        let request = LlamaCppRequest {
-            prompt: prompt.to_string(),
+    fn generate(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+    ) -> Result<CompletionOutput> {
+        let request = LlamaCppChatRequest {
+            messages: model_messages_value(messages)?,
+            tools: model_tools_value(tools),
             ctx_size: args.ctx_size,
             threads: args.threads,
             threads_batch: args.threads_batch,
@@ -2761,9 +2921,11 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
             temperature: args.temperature,
             seed: args.seed,
         };
-        let output = self.llamacpp.generate(&request)?;
+        let mut output = self.llamacpp.generate_chat(&request)?;
+        let tool_calls = parse_model_tool_call_output(&mut output.content)?;
         Ok(CompletionOutput {
             content: output.content,
+            tool_calls,
             finish_reason: match output.finish_reason {
                 llamacpp::FinishReason::EndOfGeneration => CompletionFinishReason::EndOfGeneration,
                 llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
@@ -2781,13 +2943,20 @@ struct FlashMoeCompletionEngine {
 }
 
 impl CompletionEngine for FlashMoeCompletionEngine {
-    fn generate(&mut self, args: &AgentRequest, prompt: &str) -> Result<CompletionOutput> {
+    fn generate(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+    ) -> Result<CompletionOutput> {
         let energy_start = energy::sample();
         let started = Instant::now();
-        let output = self.engine.generate_in_session(
+        let output = self.engine.generate_structured_in_session(
             &args.session_id,
-            &crate::inference::flashmoe::GenerationRequest {
-                prompt: prompt.to_string(),
+            &StructuredGenerationRequest {
+                messages: to_model_messages(messages)?,
+                tools: to_model_tools(tools),
+                add_generation_prompt: true,
                 max_tokens: args.max_tokens,
                 temperature: args.temperature,
                 top_k: args.top_k,
@@ -2798,8 +2967,13 @@ impl CompletionEngine for FlashMoeCompletionEngine {
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
         Ok(CompletionOutput {
             content: output.content,
+            tool_calls: output
+                .tool_calls
+                .into_iter()
+                .map(AgentToolCall::from_model)
+                .collect(),
             finish_reason: CompletionFinishReason::EndOfGeneration,
-            prompt_tokens: prompt.split_whitespace().count(),
+            prompt_tokens: messages.iter().map(|message| message.content.len()).sum(),
             generated_tokens: output.generated_tokens,
             duration_ms: duration_millis(started),
             energy,
@@ -2810,7 +2984,8 @@ impl CompletionEngine for FlashMoeCompletionEngine {
 fn generate_and_parse_action_with_retries(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
-    prompt: &str,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
     step: usize,
     metrics: &mut RunMetrics,
     sink: &mut dyn EventSink,
@@ -2821,7 +2996,7 @@ fn generate_and_parse_action_with_retries(
     loop {
         let mut request = args.clone();
         request.max_tokens = max_tokens;
-        let completion = generator.generate(&request, prompt)?;
+        let completion = generator.generate(&request, messages, tools)?;
         metrics.llm_invocations += 1;
         metrics.llm_runtime_ms = metrics
             .llm_runtime_ms
@@ -2848,9 +3023,27 @@ fn generate_and_parse_action_with_retries(
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
+        if !completion.tool_calls.is_empty() {
+            return Ok(Ok((
+                completion.content.clone(),
+                AgentAction::ToolCalls {
+                    calls: completion.tool_calls,
+                    thinking: non_empty_string(completion.content),
+                },
+            )));
+        }
         match parse_action(&completion.content) {
             Ok(action) => return Ok(Ok((completion.content, action))),
             Err(error) => {
+                if completion.finish_reason != CompletionFinishReason::MaxTokens {
+                    return Ok(Ok((
+                        completion.content.clone(),
+                        AgentAction::Final {
+                            content: completion.content,
+                            thinking: None,
+                        },
+                    )));
+                }
                 let ran_out_of_tokens =
                     completion.finish_reason == CompletionFinishReason::MaxTokens;
                 let failure = ParseFailure {
@@ -2928,6 +3121,130 @@ fn parse_action(output: &str) -> Result<AgentAction> {
     let (json_candidate, error) =
         first_error.expect("non-empty candidates should record parse error");
     Err(error).with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
+}
+
+fn parse_model_tool_call_output(content: &mut String) -> Result<Vec<AgentToolCall>> {
+    let mut remaining = content.as_str();
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    while let Some(start) = remaining.find("<tool_call>") {
+        text.push_str(&remaining[..start]);
+        let block_start = start + "<tool_call>".len();
+        let Some(relative_end) = remaining[block_start..].find("</tool_call>") else {
+            text.push_str(&remaining[start..]);
+            *content = text.trim().to_string();
+            return Ok(tool_calls);
+        };
+        let block_end = block_start + relative_end;
+        let block = remaining[block_start..block_end].trim();
+        if !block.is_empty() {
+            tool_calls.push(parse_model_tool_call_block(block)?);
+        }
+        remaining = &remaining[block_end + "</tool_call>".len()..];
+    }
+    text.push_str(remaining);
+    *content = text.trim().to_string();
+    Ok(tool_calls)
+}
+
+fn parse_model_tool_call_block(block: &str) -> Result<AgentToolCall> {
+    if block.contains("<function=") {
+        return parse_model_function_tool_call_block(block);
+    }
+
+    let value: Value = serde_json::from_str(block)
+        .with_context(|| format!("failed to parse model tool call JSON: {block}"))?;
+    let name = value
+        .pointer("/function/name")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .context("model tool call is missing a function name")?
+        .to_string();
+    let arguments = value
+        .pointer("/function/arguments")
+        .or_else(|| value.get("arguments"))
+        .map(parse_model_tool_arguments)
+        .transpose()?
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let id = value
+        .get("id")
+        .or_else(|| value.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(AgentToolCall {
+        id,
+        tool: name,
+        arguments,
+    })
+}
+
+fn parse_model_function_tool_call_block(block: &str) -> Result<AgentToolCall> {
+    let start = block
+        .find("<function=")
+        .context("model function tool call is missing <function=...>")?;
+    let name_start = start + "<function=".len();
+    let name_end = block[name_start..]
+        .find('>')
+        .map(|end| name_start + end)
+        .context("model function tool call has an unterminated function tag")?;
+    let name = block[name_start..name_end].trim();
+    if name.is_empty() {
+        bail!("model function tool call is missing a function name");
+    }
+
+    let body_start = name_end + 1;
+    let body_end = block[body_start..]
+        .rfind("</function>")
+        .map(|end| body_start + end)
+        .context("model function tool call is missing </function>")?;
+    let mut rest = &block[body_start..body_end];
+    let mut arguments = Map::new();
+    while let Some(parameter_start) = rest.find("<parameter=") {
+        rest = &rest[parameter_start + "<parameter=".len()..];
+        let Some(parameter_name_end) = rest.find('>') else {
+            bail!("model function tool call has an unterminated parameter tag");
+        };
+        let parameter_name = rest[..parameter_name_end].trim();
+        if parameter_name.is_empty() {
+            bail!("model function tool call has an empty parameter name");
+        }
+        rest = &rest[parameter_name_end + 1..];
+        let Some(value_end) = rest.find("</parameter>") else {
+            bail!("model function tool call is missing </parameter>");
+        };
+        let value = rest[..value_end].trim_matches('\n');
+        arguments.insert(
+            parameter_name.to_string(),
+            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+        );
+        rest = &rest[value_end + "</parameter>".len()..];
+    }
+
+    Ok(AgentToolCall {
+        id: None,
+        tool: name.to_string(),
+        arguments: Value::Object(arguments),
+    })
+}
+
+fn parse_model_tool_arguments(value: &Value) -> Result<Value> {
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str(text)
+            .with_context(|| format!("failed to parse model tool call arguments JSON: {text}"));
+    }
+    Ok(value.clone())
+}
+
+fn assistant_content_for_tool_action(output: &str) -> &str {
+    if output.trim_start().starts_with('{') {
+        ""
+    } else {
+        output
+    }
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn extract_json_objects(input: &str) -> Vec<String> {
@@ -3801,14 +4118,8 @@ fn run_sub_agent(
         context.lsp_registry,
     )?;
     let mut messages = vec![
-        ChatMessage {
-            role: "system",
-            content: instructions,
-        },
-        ChatMessage {
-            role: "user",
-            content: task.to_string(),
-        },
+        ChatMessage::text("system", instructions),
+        ChatMessage::text("user", task.to_string()),
     ];
 
     let mut sub_request = context.request.clone();
@@ -5387,6 +5698,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_tool_call_output_extracts_json_call() {
+        let mut output = "checking\n<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"Cargo.toml\"}}\n</tool_call>".to_string();
+        let calls = parse_model_tool_call_output(&mut output).unwrap();
+
+        assert_eq!(output, "checking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn parse_model_tool_call_output_extracts_function_call() {
+        let mut output = "checking\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>".to_string();
+        let calls = parse_model_tool_call_output(&mut output).unwrap();
+
+        assert_eq!(output, "checking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
     fn parse_failure_feedback_warns_on_repeats_and_budget() {
         let feedback = parse_failure_feedback("bad json", 2, 2, 3);
         assert!(feedback.contains("attempt 2/3"));
@@ -5401,12 +5734,12 @@ mod tests {
             "Your previous response was not accepted as a pb action.",
         );
 
-        assert_eq!(message.role, "system");
+        assert_eq!(message.role, "user");
         assert!(message.content.contains("Agent framework correction"));
         assert!(message.content.contains("not a tool result"));
 
         let prompt = render_prompt(&[message]);
-        assert!(prompt.contains("[system]\nAgent framework correction"));
+        assert!(prompt.contains("[user]\nAgent framework correction"));
         assert!(!prompt.contains("[tool]\nAgent framework correction"));
     }
 
@@ -5414,6 +5747,7 @@ mod tests {
     fn tool_loop_guard_warns_on_exact_repeated_tool_call() {
         let mut guard = ToolLoopGuard::default();
         let call = AgentToolCall {
+            id: None,
             tool: "search".to_string(),
             arguments: json!({"pattern": "**/ProjectPage.*"}),
         };

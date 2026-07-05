@@ -22,6 +22,7 @@ use llama_cpp_2::mtmd::{
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use serde_json::Value;
 
 use crate::energy::{self, EnergyEstimate};
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
@@ -33,6 +34,21 @@ const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 #[derive(Debug, Clone)]
 pub struct LlamaCppRequest {
     pub prompt: String,
+    pub ctx_size: u32,
+    pub threads: Option<i32>,
+    pub threads_batch: Option<i32>,
+    pub gpu_layers: u32,
+    pub max_tokens: i32,
+    pub top_k: i32,
+    pub temperature: f32,
+    pub seed: u32,
+}
+
+/// Parameters for a structured chat generation call.
+#[derive(Debug, Clone)]
+pub struct LlamaCppChatRequest {
+    pub messages: Value,
+    pub tools: Value,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -100,14 +116,56 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
 impl LlamaCppBackend {
     /// Run text generation for the given request.
     pub fn generate(&self, request: &LlamaCppRequest) -> Result<Output> {
+        let (prompt, add_bos) = self.render_prompt(&request.prompt)?;
+        self.generate_rendered(
+            &prompt,
+            add_bos,
+            request.ctx_size,
+            request.threads,
+            request.threads_batch,
+            request.max_tokens,
+            request.top_k,
+            request.temperature,
+            request.seed,
+        )
+    }
+
+    /// Run text generation for a structured chat request.
+    pub fn generate_chat(&self, request: &LlamaCppChatRequest) -> Result<Output> {
+        let (prompt, add_bos) = self.render_chat_prompt(&request.messages, &request.tools)?;
+        self.generate_rendered(
+            &prompt,
+            add_bos,
+            request.ctx_size,
+            request.threads,
+            request.threads_batch,
+            request.max_tokens,
+            request.top_k,
+            request.temperature,
+            request.seed,
+        )
+    }
+
+    fn generate_rendered(
+        &self,
+        prompt: &str,
+        add_bos: AddBos,
+        ctx_size: u32,
+        threads: Option<i32>,
+        threads_batch: Option<i32>,
+        max_tokens: i32,
+        top_k: i32,
+        temperature: f32,
+        seed: u32,
+    ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
-        let n_ctx = NonZeroU32::new(request.ctx_size).context("ctx-size must be > 0")?;
+        let n_ctx = NonZeroU32::new(ctx_size).context("ctx-size must be > 0")?;
         let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
-        if let Some(threads) = request.threads {
+        if let Some(threads) = threads {
             ctx_params = ctx_params.with_n_threads(threads);
         }
-        if let Some(threads_batch) = request.threads_batch.or(request.threads) {
+        if let Some(threads_batch) = threads_batch.or(threads) {
             ctx_params = ctx_params.with_n_threads_batch(threads_batch);
         }
 
@@ -116,13 +174,12 @@ impl LlamaCppBackend {
             .new_context(&self.backend, ctx_params)
             .context("failed to create llama context")?;
 
-        let (prompt, add_bos) = self.render_prompt(&request.prompt)?;
         let tokens = self
             .model
-            .str_to_token(&prompt, add_bos)
+            .str_to_token(prompt, add_bos)
             .context("failed to tokenize prompt")?;
 
-        ensure_prompt_fits_context(tokens.len(), request.max_tokens, ctx.n_ctx())?;
+        ensure_prompt_fits_context(tokens.len(), max_tokens, ctx.n_ctx())?;
 
         let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
         for range in prompt_batch_ranges(tokens.len(), BATCH_SIZE) {
@@ -148,9 +205,9 @@ impl LlamaCppBackend {
         }
 
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::top_k(request.top_k),
-            LlamaSampler::temp(request.temperature),
-            LlamaSampler::dist(request.seed),
+            LlamaSampler::top_k(top_k),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(seed),
         ]);
 
         let mut decoder = UTF_8.new_decoder();
@@ -160,7 +217,7 @@ impl LlamaCppBackend {
         let mut generated_tokens: usize = 0;
         let mut finish_reason = FinishReason::MaxTokens;
 
-        while generated_tokens < usize::try_from(request.max_tokens).unwrap_or(0) {
+        while generated_tokens < usize::try_from(max_tokens).unwrap_or(0) {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
             if self.model.is_eog_token(token) {
@@ -318,6 +375,66 @@ impl LlamaCppBackend {
         )?;
         Ok((rendered, AddBos::Never))
     }
+
+    fn render_chat_prompt(&self, messages: &Value, tools: &Value) -> Result<(String, AddBos)> {
+        let Some(chat_template) = &self.chat_template else {
+            return Ok((render_plain_chat_prompt(messages), AddBos::Always));
+        };
+        let rendered = chat_template.render(
+            messages,
+            tools,
+            ChatTemplateOptions {
+                add_generation_prompt: true,
+                ..ChatTemplateOptions::default()
+            },
+        )?;
+        Ok((rendered, AddBos::Never))
+    }
+}
+
+fn render_plain_chat_prompt(messages: &Value) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("<conversation>\n");
+    if let Some(messages) = messages.as_array() {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            prompt.push('[');
+            prompt.push_str(role);
+            prompt.push_str("]\n");
+            prompt.push_str(content);
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
+                && !tool_calls.is_empty()
+            {
+                prompt.push_str("\nTool calls:\n");
+                for call in tool_calls {
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let arguments = call.get("arguments").unwrap_or(&Value::Null);
+                    prompt.push_str(&format!("tool={name} args={arguments}\n"));
+                }
+            }
+            if role == "tool" {
+                if let Some(name) = message.get("name").and_then(Value::as_str) {
+                    prompt.push_str(&format!("\nTool name: {name}"));
+                }
+                if let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+                    prompt.push_str(&format!("\nTool call id: {tool_call_id}"));
+                }
+            }
+            prompt.push_str("\n\n");
+        }
+    }
+    prompt.push_str("[assistant]\n");
+    prompt
 }
 
 fn load_sidecar_chat_template(model_path: &Path) -> Result<Option<TokenizerChatTemplate>> {
