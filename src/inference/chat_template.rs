@@ -71,7 +71,7 @@ impl TokenizerChatTemplate {
         let template = self.template_for_tools(&tools)?;
         let mut env = Environment::new();
         env.add_function("raise_exception", raise_exception);
-        env.render_str(
+        Ok(env.render_str(
             template,
             json!({
                 "messages": messages,
@@ -83,8 +83,7 @@ impl TokenizerChatTemplate {
                 "eos_token": self.eos_token.as_deref(),
                 "pad_token": self.pad_token.as_deref(),
             }),
-        )
-        .context("failed to render tokenizer chat_template")
+        )?)
     }
 
     fn template_for_tools(&self, tools: &Value) -> Result<&str> {

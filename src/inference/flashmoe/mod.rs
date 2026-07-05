@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
@@ -7694,11 +7694,7 @@ impl KvCache {
         let keys_values: Vec<(&[f32], &[f32])> = self.kv[layer]
             .iter()
             .take(position + 1)
-            .filter_map(|entry| {
-                entry
-                    .as_ref()
-                    .map(|(key, value)| (key.as_slice(), value.as_slice()))
-            })
+            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
             .collect();
         Ok(causal_attention(
             query,
@@ -7736,11 +7732,7 @@ impl KvCache {
         Ok(self.kv[layer]
             .iter()
             .take(position + 1)
-            .filter_map(|entry| {
-                entry
-                    .as_ref()
-                    .map(|(key, value)| (key.as_slice(), value.as_slice()))
-            })
+            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
             .collect())
     }
 
