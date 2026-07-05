@@ -62,6 +62,8 @@ pub const LINEAR_CONV_DIM: usize = LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE;
 pub const CONV_KERNEL_SIZE: usize = 4;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const FLASHMOE_METAL_COMMAND_TIMEOUT_ENV: &str = "PB_FLASHMOE_METAL_COMMAND_TIMEOUT_MS";
+const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
 pub const EXPECTED_EXPERT_BYTES: u64 =
     FOUR_BIT_EXPERT_SIZE * NUM_LAYERS as u64 * NUM_EXPERTS as u64;
@@ -143,6 +145,200 @@ fn env_flag_enabled(value: &OsString) -> bool {
         value.to_string_lossy().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | "metal" | "top4"
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalCommandContext {
+    operation: String,
+    details: Vec<(String, String)>,
+}
+
+impl MetalCommandContext {
+    fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with(mut self, key: impl Into<String>, value: impl ToString) -> Self {
+        self.details.push((key.into(), value.to_string()));
+        self
+    }
+
+    fn label(&self) -> String {
+        let mut label = format!("Flash-MoE {}", self.operation);
+        for (key, value) in &self.details {
+            label.push(' ');
+            label.push_str(key);
+            label.push('=');
+            label.push_str(value);
+        }
+        label
+    }
+
+    fn detail_summary(&self) -> String {
+        if self.details.is_empty() {
+            "none".to_string()
+        } else {
+            self.details
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalCommandStatus {
+    NotEnqueued,
+    Enqueued,
+    Committed,
+    Scheduled,
+    Completed,
+    Error,
+    Unknown(usize),
+}
+
+impl MetalCommandStatus {
+    fn from_raw(raw: usize) -> Self {
+        match raw {
+            0 => Self::NotEnqueued,
+            1 => Self::Enqueued,
+            2 => Self::Committed,
+            3 => Self::Scheduled,
+            4 => Self::Completed,
+            5 => Self::Error,
+            value => Self::Unknown(value),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEnqueued => "not_enqueued",
+            Self::Enqueued => "enqueued",
+            Self::Committed => "committed",
+            Self::Scheduled => "scheduled",
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Error)
+    }
+}
+
+impl std::fmt::Display for MetalCommandStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(raw) => write!(f, "unknown({raw})"),
+            status => f.write_str(status.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalCommandFailureKind {
+    Timeout,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalCommandBufferFailure {
+    kind: MetalCommandFailureKind,
+    message: String,
+}
+
+impl MetalCommandBufferFailure {
+    fn timeout(
+        context: &MetalCommandContext,
+        elapsed: Duration,
+        status: MetalCommandStatus,
+        metal_error: Option<String>,
+    ) -> Self {
+        Self {
+            kind: MetalCommandFailureKind::Timeout,
+            message: format_metal_command_failure(
+                MetalCommandFailureKind::Timeout,
+                context,
+                elapsed,
+                status,
+                metal_error.as_deref(),
+            ),
+        }
+    }
+
+    fn failed(
+        context: &MetalCommandContext,
+        elapsed: Duration,
+        status: MetalCommandStatus,
+        metal_error: Option<String>,
+    ) -> Self {
+        Self {
+            kind: MetalCommandFailureKind::Failed,
+            message: format_metal_command_failure(
+                MetalCommandFailureKind::Failed,
+                context,
+                elapsed,
+                status,
+                metal_error.as_deref(),
+            ),
+        }
+    }
+
+    fn should_release_buffers(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Display for MetalCommandBufferFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MetalCommandBufferFailure {}
+
+fn metal_command_failure_requires_release(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<MetalCommandBufferFailure>()
+        .is_some_and(MetalCommandBufferFailure::should_release_buffers)
+}
+
+fn format_metal_command_failure(
+    kind: MetalCommandFailureKind,
+    context: &MetalCommandContext,
+    elapsed: Duration,
+    status: MetalCommandStatus,
+    metal_error: Option<&str>,
+) -> String {
+    let action = match kind {
+        MetalCommandFailureKind::Timeout => "timed out",
+        MetalCommandFailureKind::Failed => "failed",
+    };
+    let error = metal_error
+        .filter(|error| !error.trim().is_empty())
+        .unwrap_or("none reported");
+    format!(
+        "Flash-MoE Metal command buffer {action}: label=\"{}\", elapsed={}ms, status={}, metal_error=\"{}\", details={}",
+        context.label(),
+        elapsed.as_millis(),
+        status,
+        error,
+        context.detail_summary()
+    )
+}
+
+fn metal_command_timeout() -> Duration {
+    std::env::var(FLASHMOE_METAL_COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1800,6 +1996,7 @@ impl MetalExecutor {
 
     fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         &self,
+        position: usize,
         layer: usize,
         experts: &[E],
         weights: &[f32],
@@ -1812,6 +2009,7 @@ impl MetalExecutor {
         {
             self.inner
                 .submit_expert_phase(
+                    position,
                     layer,
                     experts,
                     weights,
@@ -1824,7 +2022,7 @@ impl MetalExecutor {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = layer;
+            let _ = (position, layer);
             Ok(Some(DeferredExpertPhase::Ready(compute_expert_phase_cpu(
                 experts,
                 weights,
@@ -1836,16 +2034,23 @@ impl MetalExecutor {
         }
     }
 
-    fn route_topk(&self, scores: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
+    fn route_topk(
+        &self,
+        position: usize,
+        layer: usize,
+        scores: &[f32],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
         if !self.route_top4_enabled || k != ACTIVE_EXPERTS_PER_TOKEN {
             return Ok(top_k(scores, k));
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.route_top4(scores)
+            self.inner.route_top4(position, layer, scores)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
+            let _ = (position, layer);
             Ok(top_k(scores, k))
         }
     }
@@ -2248,6 +2453,7 @@ struct MetalDeferredExpertPhase {
     buffers: Vec<ObjcId>,
     hidden_buffer: ObjcId,
     next_normed_buffer: Option<ObjcId>,
+    context: MetalCommandContext,
     width: usize,
 }
 
@@ -2255,7 +2461,13 @@ struct MetalDeferredExpertPhase {
 impl MetalDeferredExpertPhase {
     fn wait(self) -> Result<ExpertPhaseOutput> {
         unsafe {
-            msg_send_void0(self.command_buffer, sel("waitUntilCompleted"));
+            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
+                release(self.command_buffer);
+                for buffer in self.buffers {
+                    release(buffer);
+                }
+                return Err(error.into());
+            }
             let hidden = read_f32_buffer(self.hidden_buffer, self.width);
             let next_normed = self
                 .next_normed_buffer
@@ -2553,8 +2765,30 @@ impl MetalExecutorInner {
             set_buffer(encoder, group_size_buffer, 8);
             dispatch_q4_threadgroups(encoder, rows as u64);
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let context = MetalCommandContext::new("q4_matvec")
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("groups", groups)
+                .with("group_size", group_size);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        packed_buffer,
+                        input_buffer,
+                        scale_buffer,
+                        bias_buffer,
+                        output_buffer,
+                        rows_buffer,
+                        cols_buffer,
+                        groups_buffer,
+                        group_size_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
 
             let contents = msg_send_ptr0(output_buffer, sel("contents"));
             let mut output = vec![0.0f32; rows];
@@ -2634,7 +2868,33 @@ impl MetalExecutorInner {
                     section_buffer,
                 ],
                 (heads * rotary_pairs) as u64,
-            )?;
+                &MetalCommandContext::new("rope_split_half")
+                    .with("temporal", position.temporal)
+                    .with("height", position.height)
+                    .with("width_pos", position.width)
+                    .with("heads", heads)
+                    .with("head_dim", layout.head_dim)
+                    .with("rotary_dim", layout.rotary_dim)
+                    .with("values", values.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[
+                        values_buffer,
+                        temporal_buffer,
+                        height_buffer,
+                        width_pos_buffer,
+                        head_dim_buffer,
+                        rotary_dim_buffer,
+                        theta_buffer,
+                        use_mrope_buffer,
+                        section_buffer,
+                    ],
+                    release_only,
+                );
+                error
+            })?;
             let output = read_f32_buffer(values_buffer, values.len());
             self.recycle(values_buffer);
             self.recycle(temporal_buffer);
@@ -2651,6 +2911,7 @@ impl MetalExecutorInner {
 
     fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         self: &Arc<Self>,
+        position: usize,
         layer: usize,
         experts: &[E],
         weights: &[f32],
@@ -2903,7 +3164,20 @@ impl MetalExecutorInner {
             }
 
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
+            let expert_ids = experts
+                .iter()
+                .map(|expert| expert.as_ref().expert.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("deferred_expert_phase")
+                .with("position", position)
+                .with("layer", layer)
+                .with("active_experts", experts.len())
+                .with("experts", expert_ids)
+                .with("width", width)
+                .with("shared", shared.is_some())
+                .with("next_norm", next_normed_buffer.is_some());
+            commit_metal_command_buffer(command_buffer, &context);
             release(encoder);
 
             Ok(Some(MetalDeferredExpertPhase {
@@ -2912,6 +3186,7 @@ impl MetalExecutorInner {
                 buffers,
                 hidden_buffer,
                 next_normed_buffer,
+                context,
                 width,
             }))
         }
@@ -3002,7 +3277,12 @@ impl MetalExecutorInner {
         }
     }
 
-    fn route_top4(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
+    fn route_top4(
+        &self,
+        position: usize,
+        layer: usize,
+        scores: &[f32],
+    ) -> Result<Vec<(usize, f32)>> {
         if scores.is_empty() {
             return Ok(Vec::new());
         }
@@ -3033,8 +3313,24 @@ impl MetalExecutorInner {
             set_buffer(encoder, experts_buffer, 3);
             dispatch_threads(encoder, 1);
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let context = MetalCommandContext::new("route_top4")
+                .with("position", position)
+                .with("layer", layer)
+                .with("experts", scores.len());
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        scores_buffer,
+                        indices_buffer,
+                        weights_buffer,
+                        experts_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
 
             let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
             let weights_ptr = msg_send_ptr0(weights_buffer, sel("contents")).cast::<f32>();
@@ -3074,7 +3370,16 @@ impl MetalExecutorInner {
                 self.rms_norm_pipeline,
                 &[input_buffer, weight_buffer, output_buffer, width_buffer],
                 input.len() as u64,
-            )?;
+                &MetalCommandContext::new("rms_norm").with("width", input.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[input_buffer, weight_buffer, output_buffer, width_buffer],
+                    release_only,
+                );
+                error
+            })?;
             let output = read_f32_buffer(output_buffer, input.len());
             self.recycle(input_buffer);
             self.recycle(weight_buffer);
@@ -3104,7 +3409,18 @@ impl MetalExecutorInner {
                 self.dense_matvec_pipeline,
                 &[weights_buffer, input_buffer, output_buffer, cols_buffer],
                 rows as u64,
-            )?;
+                &MetalCommandContext::new("dense_matvec")
+                    .with("rows", rows)
+                    .with("cols", cols),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                    release_only,
+                );
+                error
+            })?;
             let output = read_f32_buffer(output_buffer, rows);
             self.recycle(weights_buffer);
             self.recycle(input_buffer);
@@ -3258,8 +3574,27 @@ impl MetalExecutorInner {
             dispatch_threads(encoder, 1);
 
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let context = MetalCommandContext::new("lm_head_topk")
+                .with("rows", lm_head.rows)
+                .with("cols", lm_head.cols)
+                .with("top_k", top_k);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        hidden_buffer,
+                        logits_buffer,
+                        indices_buffer,
+                        values_buffer,
+                        cols_buffer,
+                        rows_buffer,
+                        top_k_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
 
             let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
             let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
@@ -3308,7 +3643,24 @@ impl MetalExecutorInner {
                     theta_buffer,
                 ],
                 (values.len() / 2) as u64,
-            )?;
+                &MetalCommandContext::new("rope")
+                    .with("position", position)
+                    .with("head_dim", head_dim)
+                    .with("values", values.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[
+                        values_buffer,
+                        position_buffer,
+                        head_dim_buffer,
+                        theta_buffer,
+                    ],
+                    release_only,
+                );
+                error
+            })?;
             let output = read_f32_buffer(values_buffer, values.len());
             self.recycle(values_buffer);
             self.recycle(position_buffer);
@@ -3394,7 +3746,20 @@ impl MetalExecutorInner {
                     width_buffer,
                 ],
                 layer_info.width as u64,
-            )?;
+                &MetalCommandContext::new("kv_write")
+                    .with("layer", layer)
+                    .with("position", position)
+                    .with("width", layer_info.width)
+                    .with("offset_items", offset),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[key_buffer, value_buffer, offset_buffer, width_buffer],
+                    release_only,
+                );
+                error
+            })?;
             self.recycle(key_buffer);
             self.recycle(value_buffer);
             self.recycle(offset_buffer);
@@ -3477,8 +3842,31 @@ impl MetalExecutorInner {
             set_buffer(encoder, kv_width_buf, 6);
             dispatch_threads(encoder, (layout.num_q_heads * tokens) as u64);
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let score_context = MetalCommandContext::new("gqa_attention_scores")
+                .with("layer", layer)
+                .with("position", position)
+                .with("tokens", tokens)
+                .with("q_heads", layout.num_q_heads)
+                .with("kv_heads", layout.kv_heads)
+                .with("head_dim", layout.head_dim)
+                .with("kv_width", layer_info.width);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &score_context)
+            {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        query_buffer,
+                        scores_buffer,
+                        head_dim_buf,
+                        gpk_buf,
+                        tokens_buf,
+                        kv_width_buf,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
             release(encoder);
             release(command_buffer);
 
@@ -3514,8 +3902,34 @@ impl MetalExecutorInner {
             set_buffer(encoder, kv_width_buf, 6);
             dispatch_threads(encoder, q_width as u64);
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let read_context = MetalCommandContext::new("gqa_kv_read_attention")
+                .with("layer", layer)
+                .with("position", position)
+                .with("tokens", tokens)
+                .with("q_width", q_width)
+                .with("q_heads", layout.num_q_heads)
+                .with("kv_heads", layout.kv_heads)
+                .with("head_dim", layout.head_dim)
+                .with("kv_width", layer_info.width);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &read_context)
+            {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        query_buffer,
+                        scores_buffer,
+                        head_dim_buf,
+                        gpk_buf,
+                        tokens_buf,
+                        kv_width_buf,
+                        scores_buffer_2,
+                        output_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
             let output = read_f32_buffer(output_buffer, q_width);
             release(encoder);
             release(command_buffer);
@@ -3555,6 +3969,7 @@ impl MetalExecutorInner {
         pipeline: ObjcId,
         buffers: &[ObjcId],
         threads: u64,
+        context: &MetalCommandContext,
     ) -> Result<()> {
         unsafe {
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
@@ -3572,10 +3987,10 @@ impl MetalExecutorInner {
             }
             dispatch_threads(encoder, threads);
             msg_send_void0(encoder, sel("endEncoding"));
-            msg_send_void0(command_buffer, sel("commit"));
-            msg_send_void0(command_buffer, sel("waitUntilCompleted"));
+            let wait_result = commit_and_wait_metal_command_buffer(command_buffer, context);
             release(encoder);
             release(command_buffer);
+            wait_result?;
             Ok(())
         }
     }
@@ -3728,6 +4143,18 @@ impl MetalExecutorInner {
                 reusable.push(MetalReusableBuffer { id: buffer, len });
             } else {
                 release(buffer);
+            }
+        }
+    }
+
+    fn recycle_or_release_buffers(&self, buffers: &[ObjcId], release_only: bool) {
+        unsafe {
+            for buffer in buffers.iter().copied() {
+                if release_only {
+                    release(buffer);
+                } else {
+                    self.recycle(buffer);
+                }
             }
         }
     }
@@ -4488,7 +4915,12 @@ impl FlashMoeEngine {
                 &normed,
             )?;
             let active = if let Some(metal) = &self.metal {
-                metal.route_topk(&router_scores, self.routing_policy.active_experts)?
+                metal.route_topk(
+                    position,
+                    layer,
+                    &router_scores,
+                    self.routing_policy.active_experts,
+                )?
             } else {
                 top_k(&router_scores, self.routing_policy.active_experts)
             };
@@ -4540,6 +4972,7 @@ impl FlashMoeEngine {
             let mut submitted_deferred = false;
             if let Some(metal) = &self.metal
                 && let Some(pending) = metal.submit_expert_phase(
+                    position,
                     layer,
                     &experts,
                     &weights,
@@ -10346,6 +10779,84 @@ struct MtlSize {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn commit_metal_command_buffer(command_buffer: ObjcId, context: &MetalCommandContext) {
+    unsafe {
+        set_metal_command_buffer_label(command_buffer, context);
+        msg_send_void0(command_buffer, sel("commit"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn commit_and_wait_metal_command_buffer(
+    command_buffer: ObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    unsafe {
+        commit_metal_command_buffer(command_buffer, context);
+        wait_for_metal_command_buffer(command_buffer, context)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_metal_command_buffer_label(command_buffer: ObjcId, context: &MetalCommandContext) {
+    unsafe {
+        let label = ns_string(&context.label());
+        msg_send_void1_id(command_buffer, sel("setLabel:"), label);
+        release(label);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn wait_for_metal_command_buffer(
+    command_buffer: ObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    let started = Instant::now();
+    let timeout = metal_command_timeout();
+    let poll_interval = Duration::from_millis(2);
+    loop {
+        let status = unsafe { metal_command_buffer_status(command_buffer) };
+        if status.is_terminal() {
+            let elapsed = started.elapsed();
+            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
+            return match status {
+                MetalCommandStatus::Completed if metal_error.is_none() => Ok(()),
+                _ => Err(MetalCommandBufferFailure::failed(
+                    context,
+                    elapsed,
+                    status,
+                    metal_error,
+                )),
+            };
+        }
+        if started.elapsed() >= timeout {
+            let elapsed = started.elapsed();
+            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
+            return Err(MetalCommandBufferFailure::timeout(
+                context,
+                elapsed,
+                status,
+                metal_error,
+            ));
+        }
+        thread::sleep(poll_interval);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_status(command_buffer: ObjcId) -> MetalCommandStatus {
+    unsafe { MetalCommandStatus::from_raw(msg_send_usize0(command_buffer, sel("status"))) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_error(command_buffer: ObjcId) -> Option<String> {
+    unsafe {
+        let error = msg_send_id0(command_buffer, sel("error"));
+        ns_error_localized_description(error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn release(receiver: ObjcId) {
     unsafe {
         if !receiver.is_null() {
@@ -13985,6 +14496,23 @@ mod tests {
 
         #[test]
         #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
+        fn arm_macos_command_buffer_helper_completes_rms_norm() {
+            let temp = tempfile::tempdir().unwrap();
+            let plan = plan_unchecked(QWEN35_MODEL, temp.path());
+            let config: QwenModelConfig = serde_json::from_slice(
+                br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+            )
+            .unwrap();
+            let runtime = DenseTransformerRuntime::new(&config);
+            let executor = MetalExecutorInner::new(&plan, &config, &runtime, false).unwrap();
+            let output = executor.rms_norm(&[3.0, 4.0], Some(&[1.0, 1.0])).unwrap();
+
+            assert_eq!(output.len(), 2);
+            assert!(output.iter().all(|value| value.is_finite()));
+        }
+
+        #[test]
+        #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
         fn arm_macos_tiny_flashmoe_cache_builds_loads_and_generates() {
             let tmp = tiny_snapshot();
             let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
@@ -14221,6 +14749,79 @@ mod tests {
         for disabled in ["", "0", "false", "cpu", "off", "route"] {
             assert!(!env_flag_enabled(&OsString::from(disabled)));
         }
+    }
+
+    #[test]
+    fn metal_command_context_label_includes_actionable_details() {
+        let context = MetalCommandContext::new("deferred_expert_phase")
+            .with("position", 17)
+            .with("layer", 3)
+            .with("experts", "1,7,9,11")
+            .with("width", 4096);
+
+        assert_eq!(
+            context.label(),
+            "Flash-MoE deferred_expert_phase position=17 layer=3 experts=1,7,9,11 width=4096"
+        );
+        assert_eq!(
+            context.detail_summary(),
+            "position=17, layer=3, experts=1,7,9,11, width=4096"
+        );
+    }
+
+    #[test]
+    fn metal_command_status_names_known_and_unknown_values() {
+        assert_eq!(MetalCommandStatus::from_raw(0).to_string(), "not_enqueued");
+        assert_eq!(MetalCommandStatus::from_raw(3).to_string(), "scheduled");
+        assert_eq!(MetalCommandStatus::from_raw(4).to_string(), "completed");
+        assert_eq!(MetalCommandStatus::from_raw(5).to_string(), "error");
+        assert_eq!(MetalCommandStatus::from_raw(99).to_string(), "unknown(99)");
+        assert!(MetalCommandStatus::Completed.is_terminal());
+        assert!(MetalCommandStatus::Error.is_terminal());
+        assert!(!MetalCommandStatus::Scheduled.is_terminal());
+    }
+
+    #[test]
+    fn metal_command_failure_diagnostic_is_actionable() {
+        let context = MetalCommandContext::new("gqa_attention_scores")
+            .with("layer", 12)
+            .with("position", 128)
+            .with("tokens", 129)
+            .with("q_heads", 32)
+            .with("kv_heads", 8);
+
+        let message = format_metal_command_failure(
+            MetalCommandFailureKind::Timeout,
+            &context,
+            Duration::from_millis(1234),
+            MetalCommandStatus::Scheduled,
+            Some("GPU timeout"),
+        );
+
+        assert!(message.contains("timed out"));
+        assert!(message.contains("label=\"Flash-MoE gqa_attention_scores"));
+        assert!(message.contains("elapsed=1234ms"));
+        assert!(message.contains("status=scheduled"));
+        assert!(message.contains("metal_error=\"GPU timeout\""));
+        assert!(message.contains("layer=12"));
+        assert!(message.contains("position=128"));
+        assert!(message.contains("tokens=129"));
+    }
+
+    #[test]
+    fn metal_command_failure_marks_buffers_for_release() {
+        let context = MetalCommandContext::new("lm_head_topk").with("rows", 42);
+        let error = MetalCommandBufferFailure::failed(
+            &context,
+            Duration::from_millis(7),
+            MetalCommandStatus::Error,
+            None,
+        );
+        let anyhow_error = anyhow::Error::from(error.clone());
+
+        assert!(error.should_release_buffers());
+        assert!(metal_command_failure_requires_release(&anyhow_error));
+        assert!(error.to_string().contains("none reported"));
     }
 
     #[test]
