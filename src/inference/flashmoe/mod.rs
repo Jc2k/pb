@@ -10105,10 +10105,10 @@ kernel void rope_split_half_apply(
     uint safe_head_dim = max(head_dim, 1u);
     uint safe_rotary = min(rotary_dim, safe_head_dim);
     safe_rotary -= safe_rotary % 2u;
-    uint half = max(safe_rotary / 2u, 1u);
-    uint head = idx / half;
-    uint i = idx % half;
-    if (i >= half) { return; }
+    uint rotary_half = max(safe_rotary / 2u, 1u);
+    uint head = idx / rotary_half;
+    uint i = idx % rotary_half;
+    if (i >= rotary_half) { return; }
 
     uint position = temporal_position;
     if (use_mrope != 0u) {
@@ -10127,7 +10127,7 @@ kernel void rope_split_half_apply(
     float c = cos(angle);
     uint base = head * safe_head_dim;
     uint lo = base + i;
-    uint hi = base + i + half;
+    uint hi = base + i + rotary_half;
     float x0 = values[lo];
     float x1 = values[hi];
     values[lo] = x0 * c - x1 * s;
@@ -13752,6 +13752,10 @@ mod tests {
         assert!(METAL_SHADERS.contains("thread_index_in_simdgroup"));
         assert!(METAL_SHADERS.contains("constant uint& group_size"));
         assert!(METAL_SHADERS.contains("fma(float(byte & 0x0f), scale0 * x0, bias0 * x0)"));
+        assert!(
+            !METAL_SHADERS.contains("uint half"),
+            "`half` is a Metal scalar type and cannot be reused as a variable name"
+        );
     }
 
     #[test]
