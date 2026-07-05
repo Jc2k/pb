@@ -3373,13 +3373,19 @@ impl FlashMoeEngine {
         )?;
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
-        let cached = session_id.and_then(|id| self.session_cache_prefix(id, &prompt_tokens));
+        let cached = session_id.and_then(|id| {
+            take_reusable_session_cache_entry(&mut self.session_cache, id, &prompt_tokens)
+        });
         let (mut kv_cache, prefill_start, cached_last_hidden) =
             if let Some((prefix_len, state)) = cached {
-                let mut kv_cache = state.kv_cache.clone();
+                let FlashMoeSessionState {
+                    tokens: _,
+                    mut kv_cache,
+                    last_hidden,
+                } = state;
                 kv_cache.resize_capacity(cache_capacity);
                 let last_hidden = if prefix_len == prompt_tokens.len() {
-                    Some(state.last_hidden.clone())
+                    Some(last_hidden)
                 } else {
                     None
                 };
@@ -3403,7 +3409,7 @@ impl FlashMoeEngine {
         };
         let prompt_cache = session_id
             .is_some()
-            .then(|| (kv_cache.clone(), prefill_hidden.clone()));
+            .then(|| (kv_cache.shallow_snapshot(), prefill_hidden.clone()));
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         let mut generated = Vec::new();
@@ -3448,7 +3454,7 @@ impl FlashMoeEngine {
         if let Some(session_id) = session_id {
             let (prompt_kv_cache, prompt_hidden) =
                 prompt_cache.context("session cache prompt snapshot is missing")?;
-            self.store_session_cache(session_id, &prompt_tokens, prompt_kv_cache, &prompt_hidden);
+            self.store_session_cache(session_id, &prompt_tokens, prompt_kv_cache, prompt_hidden);
         }
 
         let decoded = self.tokenizer.decode(&generated)?;
@@ -3537,29 +3543,19 @@ impl FlashMoeEngine {
         last_hidden.context("cannot generate from an empty prompt")
     }
 
-    fn session_cache_prefix(
-        &self,
-        session_id: &str,
-        prompt_tokens: &[u32],
-    ) -> Option<(usize, &FlashMoeSessionState)> {
-        let state = self.session_cache.get(session_id)?;
-        let prefix_len = reusable_session_prefix_len(&state.tokens, prompt_tokens)?;
-        Some((prefix_len, state))
-    }
-
     fn store_session_cache(
         &mut self,
         session_id: &str,
         prompt_tokens: &[u32],
         kv_cache: KvCache,
-        last_hidden: &[f32],
+        last_hidden: Vec<f32>,
     ) {
         self.session_cache.insert(
             session_id.to_string(),
             FlashMoeSessionState {
                 tokens: stable_session_cache_tokens(prompt_tokens),
                 kv_cache,
-                last_hidden: last_hidden.to_vec(),
+                last_hidden,
             },
         );
     }
@@ -6631,16 +6627,23 @@ fn byte_level_piece_to_bytes(piece: &str) -> Option<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
-struct LinearAttentionState {
+struct LinearAttentionStateData {
     conv_state: Vec<f32>,
     ssm_state: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct LinearAttentionState {
+    inner: Arc<LinearAttentionStateData>,
 }
 
 impl LinearAttentionState {
     fn new(layout: LinearAttentionLayout) -> Self {
         Self {
-            conv_state: vec![0.0; layout.conv_state_len()],
-            ssm_state: vec![0.0; layout.ssm_state_len()],
+            inner: Arc::new(LinearAttentionStateData {
+                conv_state: vec![0.0; layout.conv_state_len()],
+                ssm_state: vec![0.0; layout.ssm_state_len()],
+            }),
         }
     }
 
@@ -6650,6 +6653,22 @@ impl LinearAttentionState {
     }
 }
 
+impl std::ops::Deref for LinearAttentionState {
+    type Target = LinearAttentionStateData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for LinearAttentionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.inner)
+    }
+}
+
+type KvEntry = (Arc<[f32]>, Arc<[f32]>);
+
 #[derive(Debug, Clone)]
 struct KvCache {
     layers: usize,
@@ -6657,7 +6676,7 @@ struct KvCache {
     prompt_tokens: Vec<(usize, u32)>,
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
-    kv: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
+    kv: Vec<Vec<Option<KvEntry>>>,
     linear_states: BTreeMap<usize, LinearAttentionState>,
 }
 
@@ -6672,6 +6691,10 @@ impl KvCache {
             kv: vec![vec![None; capacity]; layers],
             linear_states: BTreeMap::new(),
         }
+    }
+
+    fn shallow_snapshot(&self) -> Self {
+        self.clone()
     }
 
     fn record_prompt_token(&mut self, position: usize, token: u32) -> Result<()> {
@@ -6716,7 +6739,7 @@ impl KvCache {
         if layer >= self.layers {
             bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
         }
-        self.kv[layer][position] = Some((key, value));
+        self.kv[layer][position] = Some((Arc::from(key), Arc::from(value)));
         Ok(())
     }
 
@@ -6807,6 +6830,19 @@ fn common_token_prefix_len(left: &[u32], right: &[u32]) -> usize {
 fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> Option<usize> {
     let prefix_len = common_token_prefix_len(cached_tokens, prompt_tokens);
     (prefix_len == cached_tokens.len()).then_some(prefix_len)
+}
+
+fn take_reusable_session_cache_entry(
+    session_cache: &mut BTreeMap<String, FlashMoeSessionState>,
+    session_id: &str,
+    prompt_tokens: &[u32],
+) -> Option<(usize, FlashMoeSessionState)> {
+    let prefix_len = session_cache
+        .get(session_id)
+        .and_then(|state| reusable_session_prefix_len(&state.tokens, prompt_tokens))?;
+    session_cache
+        .remove(session_id)
+        .map(|state| (prefix_len, state))
 }
 
 fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
@@ -14393,6 +14429,91 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_reuse_moves_state_and_shallow_snapshots_prompt_cache() {
+        let cached_tokens = vec![10, 20];
+        let mut cache = KvCache::new(2, 2);
+        for (position, token) in cached_tokens.iter().copied().enumerate() {
+            cache.record_prompt_token(position, token).unwrap();
+        }
+        cache
+            .record_kv(0, 0, vec![1.0, 1.1], vec![2.0, 2.1])
+            .unwrap();
+        cache
+            .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
+            .unwrap();
+
+        let linear_layout = LinearAttentionLayout {
+            num_value_heads: 1,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 2,
+            conv_dim: 6,
+            conv_kernel_size: 3,
+        };
+        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
+            .map(|idx| idx as f32 + 0.25)
+            .collect();
+        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
+            .map(|idx| idx as f32 + 10.5)
+            .collect();
+        {
+            let state = cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state.clone_from(&expected_conv_state);
+            state.ssm_state.clone_from(&expected_ssm_state);
+        }
+
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "chat".to_string(),
+            FlashMoeSessionState {
+                tokens: cached_tokens,
+                kv_cache: cache,
+                last_hidden: vec![9.0, 9.1],
+            },
+        );
+
+        let next_prompt = [10, 20, 30];
+        let (prefix_len, state) =
+            take_reusable_session_cache_entry(&mut sessions, "chat", &next_prompt).unwrap();
+        assert!(sessions.is_empty());
+        let FlashMoeSessionState {
+            tokens,
+            mut kv_cache,
+            last_hidden,
+        } = state;
+        assert_eq!(prefix_len, tokens.len());
+        assert_eq!(last_hidden, vec![9.0, 9.1]);
+
+        kv_cache.resize_capacity(next_prompt.len());
+        let snapshot = kv_cache.shallow_snapshot();
+        let (live_key, live_value) = kv_cache.kv[0][1].as_ref().unwrap();
+        let (snapshot_key, snapshot_value) = snapshot.kv[0][1].as_ref().unwrap();
+        assert!(Arc::ptr_eq(live_key, snapshot_key));
+        assert!(Arc::ptr_eq(live_value, snapshot_value));
+        assert!(Arc::ptr_eq(
+            &kv_cache.linear_states.get(&1).unwrap().inner,
+            &snapshot.linear_states.get(&1).unwrap().inner
+        ));
+
+        kv_cache
+            .record_kv(2, 0, vec![5.0, 5.1], vec![6.0, 6.1])
+            .unwrap();
+        assert!(snapshot.kv[0][2].is_none());
+
+        {
+            let state = kv_cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state[0] = -99.0;
+        }
+        let live_linear = kv_cache.linear_states.get(&1).unwrap();
+        let snapshot_linear = snapshot.linear_states.get(&1).unwrap();
+        assert!(!Arc::ptr_eq(&live_linear.inner, &snapshot_linear.inner));
+        assert_eq!(snapshot_linear.conv_state, expected_conv_state);
+        assert_eq!(snapshot_linear.ssm_state, expected_ssm_state);
+    }
+
+    #[test]
     fn session_prefix_reuse_preserves_kv_and_linear_attention_state_boundaries() {
         let cached_tokens = vec![10, 20];
         let mut cache = KvCache::new(2, 2);
@@ -14437,7 +14558,7 @@ mod tests {
         let prefix_len = reusable_session_prefix_len(&session_state.tokens, &next_prompt).unwrap();
         assert_eq!(prefix_len, session_state.tokens.len());
 
-        let mut reused = session_state.kv_cache.clone();
+        let mut reused = session_state.kv_cache.shallow_snapshot();
         reused.resize_capacity(next_prompt.len());
         assert_eq!(reused.keys_values(1, 0).unwrap().len(), prefix_len);
         assert_eq!(reused.keys_values(2, 0).unwrap().len(), prefix_len);
