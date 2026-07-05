@@ -10,7 +10,7 @@ use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -2192,17 +2192,20 @@ impl MetalExecutorInner {
                 );
             }
             let source = ns_string(METAL_SHADERS);
-            let library = msg_send_id4(
+            let mut compile_error = ptr::null_mut();
+            let library = msg_send_id2_id_error(
                 device,
                 sel("newLibraryWithSource:options:error:"),
                 source,
                 ptr::null_mut(),
-                ptr::null_mut(),
+                &mut compile_error,
             );
             release(source);
             if library.is_null() {
+                let error = ns_error_localized_description(compile_error)
+                    .unwrap_or_else(|| "unknown Metal compiler error".to_string());
                 release(device);
-                bail!("failed to compile Flash-MoE Metal shader library");
+                bail!("failed to compile Flash-MoE Metal shader library: {error}");
             }
 
             let q4_pipeline = compile_pipeline(device, library, "q4_fma_matvec")?;
@@ -9595,6 +9598,24 @@ unsafe fn ns_string(value: &str) -> ObjcId {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn ns_error_localized_description(error: ObjcId) -> Option<String> {
+    unsafe {
+        if error.is_null() {
+            return None;
+        }
+        let description = msg_send_id0(error, sel("localizedDescription"));
+        if description.is_null() {
+            return None;
+        }
+        let bytes = msg_send_const_char_ptr0(description, sel("UTF8String"));
+        if bytes.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(bytes).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> {
     unsafe {
         let function_name = ns_string(name);
@@ -9788,17 +9809,17 @@ unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_id4(
+unsafe fn msg_send_id2_id_error(
     receiver: ObjcId,
     selector: Sel,
     arg1: ObjcId,
     arg2: ObjcId,
-    arg3: ObjcId,
+    error: *mut ObjcId,
 ) -> ObjcId {
     unsafe {
-        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, ObjcId) -> ObjcId =
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, *mut ObjcId) -> ObjcId =
             std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector, arg1, arg2, arg3)
+        f(receiver, selector, arg1, arg2, error)
     }
 }
 
@@ -9870,6 +9891,15 @@ unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u6
 unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void {
     unsafe {
         let f: unsafe extern "C" fn(ObjcId, Sel) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_const_char_ptr0(receiver: ObjcId, selector: Sel) -> *const c_char {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> *const c_char =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector)
     }
