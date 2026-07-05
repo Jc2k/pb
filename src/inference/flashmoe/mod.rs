@@ -1276,6 +1276,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         config,
         routing_policy,
         runtime,
+        shared_expert_cache: Mutex::new(BTreeMap::new()),
         session_cache: BTreeMap::new(),
     })
 }
@@ -1291,6 +1292,7 @@ pub struct FlashMoeEngine {
     config: QwenModelConfig,
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
+    shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
     session_cache: BTreeMap<String, FlashMoeSessionState>,
@@ -1718,10 +1720,10 @@ struct MetalExecutor {
 
 #[derive(Debug, Clone)]
 struct SharedExpertPhaseWeights {
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    down: Vec<f32>,
-    router: Vec<f32>,
+    gate: Arc<Vec<f32>>,
+    up: Arc<Vec<f32>>,
+    down: Arc<Vec<f32>>,
+    router: Arc<Vec<f32>>,
     shared_experts: usize,
     intermediate: usize,
     width: usize,
@@ -1797,6 +1799,7 @@ impl MetalExecutor {
 
     fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         &self,
+        layer: usize,
         experts: &[E],
         weights: &[f32],
         normed: &[f32],
@@ -1807,11 +1810,20 @@ impl MetalExecutor {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             self.inner
-                .submit_expert_phase(experts, weights, normed, residual, shared, next_norm_weight)
+                .submit_expert_phase(
+                    layer,
+                    experts,
+                    weights,
+                    normed,
+                    residual,
+                    shared,
+                    next_norm_weight,
+                )
                 .map(|pending| pending.map(DeferredExpertPhase::Metal))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
+            let _ = layer;
             Ok(Some(DeferredExpertPhase::Ready(compute_expert_phase_cpu(
                 experts,
                 weights,
@@ -2070,9 +2082,23 @@ struct MetalExecutorInner {
     topk_vocab_pipeline: ObjcId,
     gqa_scores_pipeline: ObjcId,
     gqa_read_pipeline: ObjcId,
+    shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalSharedExpertBuffers {
+    gate: ObjcId,
+    up: ObjcId,
+    down: ObjcId,
+    router: ObjcId,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    total_intermediate: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2161,6 +2187,15 @@ impl Drop for MetalExecutorInner {
             release(self.topk_vocab_pipeline);
             release(self.gqa_scores_pipeline);
             release(self.gqa_read_pipeline);
+            if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
+                for buffers in shared_buffers.values() {
+                    release(buffers.gate);
+                    release(buffers.up);
+                    release(buffers.down);
+                    release(buffers.router);
+                }
+                shared_buffers.clear();
+            }
             if let Ok(kv_cache) = self.kv_cache.get_mut()
                 && let Some(kv_cache) = kv_cache.take()
             {
@@ -2303,6 +2338,7 @@ impl MetalExecutorInner {
                 topk_vocab_pipeline,
                 gqa_scores_pipeline,
                 gqa_read_pipeline,
+                shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
                 attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
                 reusable: std::sync::Mutex::new(Vec::new()),
@@ -2490,6 +2526,7 @@ impl MetalExecutorInner {
 
     fn submit_expert_phase<E: AsRef<ExpertWeights>>(
         self: &Arc<Self>,
+        layer: usize,
         experts: &[E],
         weights: &[f32],
         normed: &[f32],
@@ -2529,6 +2566,11 @@ impl MetalExecutorInner {
             total
         } else {
             0
+        };
+        let shared_metal = if let Some(shared) = shared {
+            Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
+        } else {
+            None
         };
 
         unsafe {
@@ -2578,16 +2620,9 @@ impl MetalExecutorInner {
             buffers.push(width_buffer);
 
             if let Some(shared) = shared {
+                let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let total_u32 = shared_total_intermediate as u32;
                 let shared_intermediate_u32 = shared.intermediate as u32;
-                let shared_gate_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.gate))?;
-                buffers.push(shared_gate_buffer);
-                let shared_up_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.up))?;
-                buffers.push(shared_up_buffer);
-                let shared_down_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.down))?;
-                buffers.push(shared_down_buffer);
-                let shared_router_buffer = self.buffer_with_bytes(f32_as_bytes(&shared.router))?;
-                buffers.push(shared_router_buffer);
                 let shared_gate_out =
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
                 buffers.push(shared_gate_out);
@@ -2608,7 +2643,7 @@ impl MetalExecutorInner {
 
                 self.encode_dense_matvec(
                     encoder,
-                    shared_gate_buffer,
+                    shared_metal.gate,
                     normed_buffer,
                     shared_gate_out,
                     width_buffer,
@@ -2616,7 +2651,7 @@ impl MetalExecutorInner {
                 );
                 self.encode_dense_matvec(
                     encoder,
-                    shared_up_buffer,
+                    shared_metal.up,
                     normed_buffer,
                     shared_up_out,
                     width_buffer,
@@ -2624,7 +2659,7 @@ impl MetalExecutorInner {
                 );
                 self.encode_dense_matvec(
                     encoder,
-                    shared_router_buffer,
+                    shared_metal.router,
                     normed_buffer,
                     shared_router_out,
                     width_buffer,
@@ -2644,7 +2679,7 @@ impl MetalExecutorInner {
                 dispatch_threads(encoder, shared_total_intermediate as u64);
                 self.encode_dense_matvec(
                     encoder,
-                    shared_down_buffer,
+                    shared_metal.down,
                     shared_activated,
                     shared_output_buffer,
                     total_buffer,
@@ -3256,6 +3291,117 @@ impl MetalExecutorInner {
     unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
         unsafe {
             let buffer = self.buffer_with_len(bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    fn shared_expert_buffers(
+        &self,
+        layer: usize,
+        shared: &SharedExpertPhaseWeights,
+        total_intermediate: usize,
+    ) -> Result<MetalSharedExpertBuffers> {
+        {
+            let cache = self
+                .shared_expert_buffers
+                .lock()
+                .expect("metal shared expert buffer cache poisoned");
+            if let Some(buffers) = cache.get(&layer).copied() {
+                if buffers.width == shared.width
+                    && buffers.shared_experts == shared.shared_experts
+                    && buffers.intermediate == shared.intermediate
+                    && buffers.total_intermediate == total_intermediate
+                {
+                    return Ok(buffers);
+                }
+                bail!(
+                    "cached Metal shared expert buffers for layer {layer} have dimensions {}x{}x{}, requested {}x{}x{}",
+                    buffers.shared_experts,
+                    buffers.intermediate,
+                    buffers.width,
+                    shared.shared_experts,
+                    shared.intermediate,
+                    shared.width
+                );
+            }
+        }
+
+        unsafe {
+            let gate = self.persistent_buffer_with_bytes(f32_as_bytes(shared.gate.as_slice()))?;
+            let up = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.up.as_slice())) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    release(gate);
+                    return Err(err);
+                }
+            };
+            let down = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.down.as_slice()))
+            {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    release(gate);
+                    release(up);
+                    return Err(err);
+                }
+            };
+            let router =
+                match self.persistent_buffer_with_bytes(f32_as_bytes(shared.router.as_slice())) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        release(gate);
+                        release(up);
+                        release(down);
+                        return Err(err);
+                    }
+                };
+            let buffers = MetalSharedExpertBuffers {
+                gate,
+                up,
+                down,
+                router,
+                width: shared.width,
+                shared_experts: shared.shared_experts,
+                intermediate: shared.intermediate,
+                total_intermediate,
+            };
+            let mut cache = self
+                .shared_expert_buffers
+                .lock()
+                .expect("metal shared expert buffer cache poisoned");
+            if let Some(existing) = cache.get(&layer).copied() {
+                release(buffers.gate);
+                release(buffers.up);
+                release(buffers.down);
+                release(buffers.router);
+                if existing.width != shared.width
+                    || existing.shared_experts != shared.shared_experts
+                    || existing.intermediate != shared.intermediate
+                    || existing.total_intermediate != total_intermediate
+                {
+                    bail!(
+                        "cached Metal shared expert buffers for layer {layer} changed dimensions while loading"
+                    );
+                }
+                return Ok(existing);
+            }
+            cache.insert(layer, buffers);
+            Ok(buffers)
+        }
+    }
+
+    unsafe fn persistent_buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
+        unsafe {
+            let buffer = msg_send_id2_usize_u64(
+                self.device,
+                sel("newBufferWithLength:options:"),
+                bytes.len(),
+                0,
+            );
+            if buffer.is_null() {
+                bail!("failed to allocate persistent Flash-MoE Metal shared expert buffer");
+            }
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
             Ok(buffer)
@@ -4102,11 +4248,12 @@ impl FlashMoeEngine {
             let mut submitted_deferred = false;
             if let Some(metal) = &self.metal
                 && let Some(pending) = metal.submit_expert_phase(
+                    layer,
                     &experts,
                     &weights,
                     &normed,
                     &mlp_residual,
-                    shared_phase.as_ref(),
+                    shared_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?
             {
@@ -4126,7 +4273,7 @@ impl FlashMoeEngine {
                     &weights,
                     &normed,
                     &mlp_residual,
-                    shared_phase.as_ref(),
+                    shared_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
                 hidden = output.hidden;
@@ -4538,19 +4685,63 @@ impl FlashMoeEngine {
         };
         let residual = vec![0.0f32; width];
         let experts: &[ExpertWeights] = &[];
-        Ok(compute_expert_phase_cpu(experts, &[], normed, &residual, Some(&shared), None)?.hidden)
+        Ok(
+            compute_expert_phase_cpu(experts, &[], normed, &residual, Some(shared.as_ref()), None)?
+                .hidden,
+        )
     }
 
     fn shared_expert_phase_weights(
         &self,
         layer: usize,
         width: usize,
-    ) -> Result<Option<SharedExpertPhaseWeights>> {
+    ) -> Result<Option<Arc<SharedExpertPhaseWeights>>> {
         let num_shared = self.config.num_shared_experts.unwrap_or(0);
         let shared_inter = self.config.shared_expert_intermediate_size();
         if num_shared == 0 || shared_inter == 0 {
             return Ok(None);
         }
+        {
+            let cache = self
+                .shared_expert_cache
+                .lock()
+                .expect("shared expert cache poisoned");
+            if let Some(shared) = cache.get(&layer).cloned() {
+                if shared.width != width {
+                    bail!(
+                        "cached shared expert tensors for layer {layer} have width {}, requested {width}",
+                        shared.width
+                    );
+                }
+                return Ok(Some(shared));
+            }
+        }
+        let shared = Arc::new(self.load_shared_expert_phase_weights(layer, width)?);
+        let mut cache = self
+            .shared_expert_cache
+            .lock()
+            .expect("shared expert cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            if existing.width != width {
+                bail!(
+                    "cached shared expert tensors for layer {layer} have width {}, requested {width}",
+                    existing.width
+                );
+            }
+            Ok(Some(existing))
+        } else {
+            cache.insert(layer, shared.clone());
+            Ok(Some(shared))
+        }
+    }
+
+    fn load_shared_expert_phase_weights(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<SharedExpertPhaseWeights> {
+        let num_shared = self.config.num_shared_experts.unwrap_or(0);
+        let shared_inter = self.config.shared_expert_intermediate_size();
         let total_intermediate = num_shared
             .checked_mul(shared_inter)
             .context("shared expert intermediate width overflow")?;
@@ -4560,19 +4751,19 @@ impl FlashMoeEngine {
         let shared_gate_name = shared_expert_gate_tensor_name(layer);
         let gate = self
             .dense
-            .read_full_tensor_f32(&gate_name)?
+            .read_full_tensor_f32_cached(&gate_name)?
             .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
         let up = self
             .dense
-            .read_full_tensor_f32(&up_name)?
+            .read_full_tensor_f32_cached(&up_name)?
             .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
         let down = self
             .dense
-            .read_full_tensor_f32(&down_name)?
+            .read_full_tensor_f32_cached(&down_name)?
             .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
         let router = self
             .dense
-            .read_full_tensor_f32(&shared_gate_name)?
+            .read_full_tensor_f32_cached(&shared_gate_name)?
             .with_context(|| {
                 format!("missing configured shared expert gate tensor {shared_gate_name}")
             })?;
@@ -4599,7 +4790,7 @@ impl FlashMoeEngine {
                 router.len()
             );
         }
-        Ok(Some(SharedExpertPhaseWeights {
+        Ok(SharedExpertPhaseWeights {
             gate,
             up,
             down,
@@ -4607,7 +4798,7 @@ impl FlashMoeEngine {
             shared_experts: num_shared,
             intermediate: shared_inter,
             width,
-        }))
+        })
     }
 
     pub fn read_active_experts(
@@ -5705,16 +5896,26 @@ fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
         {
             bail!("shared expert tensors do not match the deferred expert phase dimensions");
         }
-        let gate = cpu_dense_matvec(&shared.gate, normed, total_intermediate, width);
-        let up = cpu_dense_matvec(&shared.up, normed, total_intermediate, width);
-        let router = cpu_dense_matvec(&shared.router, normed, shared.shared_experts, width);
+        let gate = cpu_dense_matvec(shared.gate.as_slice(), normed, total_intermediate, width);
+        let up = cpu_dense_matvec(shared.up.as_slice(), normed, total_intermediate, width);
+        let router = cpu_dense_matvec(
+            shared.router.as_slice(),
+            normed,
+            shared.shared_experts,
+            width,
+        );
         let mut activated = vec![0.0f32; total_intermediate];
         for idx in 0..total_intermediate {
             let shared_idx = idx / shared.intermediate.max(1);
             let shared_weight = sigmoid(router.get(shared_idx).copied().unwrap_or(0.0));
             activated[idx] = silu(gate[idx]) * up[idx] * shared_weight;
         }
-        let shared_out = cpu_dense_matvec(&shared.down, &activated, width, total_intermediate);
+        let shared_out = cpu_dense_matvec(
+            shared.down.as_slice(),
+            &activated,
+            width,
+            total_intermediate,
+        );
         add_in_place(&mut moe, &shared_out);
     }
     for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
@@ -7428,6 +7629,8 @@ pub struct DenseStore {
     mmap: Arc<memmap2::Mmap>,
     registry: TensorRegistry,
     resident: Arc<std::sync::Mutex<DenseTensorCache>>,
+    #[cfg(test)]
+    decoded_full_tensors: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Default)]
@@ -7495,6 +7698,8 @@ impl DenseStore {
             resident: Arc::new(std::sync::Mutex::new(DenseTensorCache::with_budget(
                 512 * 1024 * 1024,
             ))),
+            #[cfg(test)]
+            decoded_full_tensors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -7862,6 +8067,9 @@ impl DenseStore {
         }
         let bytes = self.read_range(entry.byte_offset, entry.byte_len as usize)?;
         let tensor = Arc::new(decode_dense_tensor_f32(&entry.dtype, &bytes)?);
+        #[cfg(test)]
+        self.decoded_full_tensors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.resident
             .lock()
             .expect("dense tensor cache poisoned")
@@ -8022,6 +8230,16 @@ impl DenseStore {
         let byte_len = entry.byte_len as usize;
         let bytes = self.read_range(entry.byte_offset, byte_len)?;
         Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
+    }
+
+    fn read_full_tensor_f32_cached(&self, canonical_name: &str) -> Result<Option<Arc<Vec<f32>>>> {
+        self.dense_tensor_f32(canonical_name)
+    }
+
+    #[cfg(test)]
+    fn decoded_full_tensor_count(&self) -> usize {
+        self.decoded_full_tensors
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -13720,10 +13938,10 @@ mod tests {
     fn expert_phase_cpu_combines_shared_experts_and_next_norm() {
         let shared = SharedExpertPhaseWeights {
             // Two shared experts, one intermediate channel each, hidden width two.
-            gate: vec![1.0, 0.0, 0.0, 1.0],
-            up: vec![0.0, 2.0, 3.0, 0.0],
-            down: vec![1.0, 2.0, -1.0, 0.5],
-            router: vec![1.0, 0.0, 0.0, -1.0],
+            gate: Arc::new(vec![1.0, 0.0, 0.0, 1.0]),
+            up: Arc::new(vec![0.0, 2.0, 3.0, 0.0]),
+            down: Arc::new(vec![1.0, 2.0, -1.0, 0.5]),
+            router: Arc::new(vec![1.0, 0.0, 0.0, -1.0]),
             shared_experts: 2,
             intermediate: 1,
             width: 2,
@@ -16170,6 +16388,131 @@ mod tests {
     }
 
     #[test]
+    fn shared_expert_phase_weights_are_cached_per_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let experts_dir = tmp.path().join("experts");
+        fs::create_dir_all(&experts_dir).unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{
+                "model_type":"qwen3_moe",
+                "num_hidden_layers":1,
+                "hidden_size":2,
+                "num_attention_heads":1,
+                "num_key_value_heads":1,
+                "vocab_size":8,
+                "torch_dtype":"float32",
+                "num_experts":1,
+                "num_experts_per_tok":1,
+                "num_shared_experts":2,
+                "shared_expert_intermediate_size":1
+            }"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        let mut dense_tensors = Vec::new();
+        let mut append_tensor = |name: String, shape: Vec<usize>, values: &[f32]| {
+            let offset = bytes.len() as u64;
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let byte_len = bytes.len() as u64 - offset;
+            dense_tensors.push(DenseTensorRef {
+                tensor: name,
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape,
+                source_offsets: [0, byte_len],
+                runtime_offset: offset,
+                byte_len,
+            });
+        };
+        append_tensor(
+            shared_expert_tensor_name(0, "gate_proj"),
+            vec![2, 2],
+            &[1.0, 0.0, 0.0, 1.0],
+        );
+        append_tensor(
+            shared_expert_tensor_name(0, "up_proj"),
+            vec![2, 2],
+            &[0.0, 2.0, 3.0, 0.0],
+        );
+        append_tensor(
+            shared_expert_tensor_name(0, "down_proj"),
+            vec![2, 2],
+            &[1.0, 2.0, -1.0, 0.5],
+        );
+        append_tensor(
+            shared_expert_gate_tensor_name(0),
+            vec![2, 2],
+            &[1.0, 0.0, 0.0, -1.0],
+        );
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut plan = plan_unchecked_with_routing(
+            QWEN35_MODEL,
+            tmp.path(),
+            FlashMoeRoutingPolicy::new(Some(1), true),
+        );
+        plan.uses_metal = false;
+        plan.non_expert_weights = dense_path;
+        plan.tensor_manifest = manifest_path;
+        plan.experts_dir = experts_dir;
+
+        let dense = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        let engine = FlashMoeEngine {
+            plan,
+            experts: experts.clone(),
+            scheduler: ExpertScheduler::new(experts),
+            dense,
+            tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
+            metal: None,
+            config,
+            routing_policy,
+            runtime,
+            shared_expert_cache: Mutex::new(BTreeMap::new()),
+            vision_encoder: None,
+            session_cache: BTreeMap::new(),
+        };
+
+        let first = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+
+        let second = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.gate, &second.gate));
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+
+        let contribution = engine
+            .shared_expert_contribution(0, &[2.0, 4.0], 2)
+            .unwrap();
+        assert_eq!(contribution.len(), 2);
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+    }
+
+    #[test]
     fn dense_transformer_runtime_runs_core_blocks() {
         let config: QwenModelConfig = serde_json::from_slice(
             br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2}"#,
@@ -17030,6 +17373,7 @@ mod tests {
             config,
             routing_policy,
             runtime,
+            shared_expert_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
         };
