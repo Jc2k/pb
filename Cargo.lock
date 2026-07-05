@@ -1332,6 +1332,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja"
+version = "2.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9f264d75233323f4b7d2f03aefe8a990690cdebfbfe26ea86bcbaec5e9ac990"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1496,6 +1506,7 @@ dependencies = [
  "macpow",
  "memmap2",
  "mime_guess",
+ "minijinja",
  "objc2",
  "objc2-foundation",
  "objc2-open-directory",

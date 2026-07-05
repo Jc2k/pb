@@ -22,6 +22,7 @@ libc = "0.2.186"
 llama-cpp-2 = { version = "0.1.146", features = ["mtmd"] }
 mime_guess = "2.0.5"
 memmap2 = "0.9.10"
+minijinja = { version = "=2.12.0", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "macros", "multi_template", "serde", "std_collections"] }
 regex = "1.12.4"
 reqwest = { version = "0.12.5", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rust-embed = "8.9.0"

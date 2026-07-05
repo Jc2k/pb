@@ -29,6 +29,8 @@ use std::io::{Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
+use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
+
 pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
 pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
@@ -5759,7 +5761,7 @@ struct QwenTokenizer {
     unk_token: Option<String>,
     model_kind: TokenizerModelKind,
     special_tokens: Vec<(String, u32)>,
-    chat_template: Option<String>,
+    chat_template: Option<TokenizerChatTemplate>,
     eos_token: u32,
     im_start: Option<u32>,
     im_end: Option<u32>,
@@ -5799,7 +5801,7 @@ impl QwenTokenizer {
     fn from_json_bytes_with_config(bytes: &[u8], config_bytes: Option<&[u8]>) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("tokenizer JSON is invalid")?;
-        let chat_template = parse_tokenizer_chat_template(config_bytes)?;
+        let chat_template = TokenizerChatTemplate::from_tokenizer_config_bytes(config_bytes)?;
         let model_kind = match value
             .pointer("/model/type")
             .and_then(serde_json::Value::as_str)
@@ -5908,7 +5910,7 @@ impl QwenTokenizer {
             return prompt.to_string();
         }
         if let Some(template) = &self.chat_template {
-            return render_qwen_chat_template(
+            return render_tokenizer_chat_template(
                 template,
                 &[ChatMessage::text(ChatRole::User, prompt)],
                 &[],
@@ -5942,7 +5944,12 @@ impl QwenTokenizer {
             return Ok(prompt.clone());
         }
         if let Some(template) = &self.chat_template {
-            return render_qwen_chat_template(template, messages, tools, add_generation_prompt);
+            return render_tokenizer_chat_template(
+                template,
+                messages,
+                tools,
+                add_generation_prompt,
+            );
         }
         render_qwen_chatml(messages, tools, add_generation_prompt)
     }
@@ -6191,136 +6198,21 @@ fn parse_tokenizer_merges(value: &serde_json::Value) -> Result<BTreeMap<(String,
     Ok(out)
 }
 
-fn parse_tokenizer_chat_template(config_bytes: Option<&[u8]>) -> Result<Option<String>> {
-    let Some(bytes) = config_bytes else {
-        return Ok(None);
-    };
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).context("tokenizer_config.json is invalid")?;
-    Ok(value
-        .get("chat_template")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
-}
-
-fn render_qwen_chat_template(
-    template: &str,
+fn render_tokenizer_chat_template(
+    template: &TokenizerChatTemplate,
     messages: &[ChatMessage],
     tools: &[ChatTool],
     add_generation_prompt: bool,
 ) -> Result<String> {
-    match QwenChatTemplateKind::detect(template) {
-        Some(QwenChatTemplateKind::SimpleMessageLoop) => {
-            if qwen_requires_structured_template(messages, tools) {
-                tracing::warn!(
-                    "tokenizer chat_template has only a simple message loop; using explicit Qwen XML structured-chat fallback"
-                );
-                render_qwen_xml_tool_template(messages, tools, add_generation_prompt, true)
-            } else {
-                Ok(render_simple_message_loop_jinja_chat_template(
-                    template,
-                    messages,
-                    add_generation_prompt,
-                ))
-            }
-        }
-        Some(QwenChatTemplateKind::XmlToolUse) => {
-            render_qwen_xml_tool_template(messages, tools, add_generation_prompt, false)
-        }
-        Some(QwenChatTemplateKind::VisionXmlToolUse) => {
-            render_qwen_xml_tool_template(messages, tools, add_generation_prompt, true)
-        }
-        Some(QwenChatTemplateKind::PromptVariable) => {
-            if messages.len() == 1
-                && tools.is_empty()
-                && let ChatMessageContent::Text(prompt) = &messages[0].content
-            {
-                Ok(template
-                    .replace("{{ prompt }}", prompt)
-                    .replace("{{prompt}}", prompt))
-            } else {
-                bail!(
-                    "tokenizer chat_template only supports a single prompt variable; structured chat rendering is unavailable"
-                )
-            }
-        }
-        None => bail!(
-            "unsupported tokenizer chat_template; exact structured chat rendering is unavailable and ChatML fallback is disabled when tokenizer_config.json provides a template"
-        ),
-    }
-}
-
-fn qwen_requires_structured_template(messages: &[ChatMessage], tools: &[ChatTool]) -> bool {
-    !tools.is_empty()
-        || messages
-            .iter()
-            .any(|message| message.role == ChatRole::Tool || !message.tool_calls.is_empty())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QwenChatTemplateKind {
-    SimpleMessageLoop,
-    XmlToolUse,
-    VisionXmlToolUse,
-    PromptVariable,
-}
-
-impl QwenChatTemplateKind {
-    fn detect(template: &str) -> Option<Self> {
-        if template.contains("image_count = namespace")
-            && template.contains("<|image_pad|>")
-            && template.contains("content.type == 'image'")
-        {
-            return Some(Self::VisionXmlToolUse);
-        }
-        if template.contains("{%- if tools %}")
-            && template.contains("<tools>")
-            && template.contains("<tool_call>")
-            && template.contains("<tool_response>")
-        {
-            return Some(Self::XmlToolUse);
-        }
-        if template.contains("{% for message in messages %}")
-            && template.contains("{% endfor %}")
-            && !template.contains("message['tool_calls']")
-            && !template.contains("message.tool_calls")
-            && !template.contains("{% if tools %}")
-        {
-            return Some(Self::SimpleMessageLoop);
-        }
-        if template.contains("{{ prompt }}") || template.contains("{{prompt}}") {
-            return Some(Self::PromptVariable);
-        }
-        None
-    }
-}
-
-fn render_simple_message_loop_jinja_chat_template(
-    template: &str,
-    messages: &[ChatMessage],
-    add_generation_prompt: bool,
-) -> String {
-    let mut rendered = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("{% for message in messages %}") {
-        rendered.push_str(&rest[..start]);
-        let block_start = start + "{% for message in messages %}".len();
-        let Some(relative_end) = rest[block_start..].find("{% endfor %}") else {
-            rendered.push_str(&rest[start..]);
-            return render_generation_prompt_blocks(&rendered, add_generation_prompt);
-        };
-        let block_end = block_start + relative_end;
-        for message in messages {
-            rendered.push_str(&render_message_template_block(
-                &rest[block_start..block_end],
-                message.role.as_qwen_role(),
-                &render_message_content(&message.content),
-            ));
-        }
-        rest = &rest[block_end + "{% endfor %}".len()..];
-    }
-    rendered.push_str(rest);
-    render_generation_prompt_blocks(&rendered, add_generation_prompt)
+    let tools: Vec<Value> = tools.iter().map(qwen_tool_schema_value).collect();
+    template.render(
+        messages,
+        &tools,
+        ChatTemplateOptions {
+            add_generation_prompt,
+            ..ChatTemplateOptions::default()
+        },
+    )
 }
 
 fn render_qwen_chatml(
@@ -6592,64 +6484,6 @@ fn render_qwen_tool_call_json(tool_call: &ChatToolCall) -> Result<String> {
     Ok(format!("{{\"name\": {name}, \"arguments\": {arguments}}}"))
 }
 
-fn render_message_content(content: &ChatMessageContent) -> String {
-    match content {
-        ChatMessageContent::Text(text) => text.clone(),
-        ChatMessageContent::Parts(parts) => {
-            let mut out = String::new();
-            for part in parts {
-                match part {
-                    ChatContentPart::Text { text } => out.push_str(text),
-                    ChatContentPart::Image {
-                        placeholder_tokens, ..
-                    } => {
-                        out.push_str("<|vision_start|>");
-                        out.push_str(&"<|image_pad|>".repeat((*placeholder_tokens).unwrap_or(1)));
-                        out.push_str("<|vision_end|>");
-                    }
-                }
-            }
-            out
-        }
-    }
-}
-
-fn render_message_template_block(block: &str, role: &str, content: &str) -> String {
-    block
-        .replace("{{ message['role'] }}", role)
-        .replace("{{message['role']}}", role)
-        .replace("{{ message[\"role\"] }}", role)
-        .replace("{{message[\"role\"]}}", role)
-        .replace("{{ message.role }}", role)
-        .replace("{{message.role}}", role)
-        .replace("{{ message['content'] }}", content)
-        .replace("{{message['content']}}", content)
-        .replace("{{ message[\"content\"] }}", content)
-        .replace("{{message[\"content\"]}}", content)
-        .replace("{{ message.content }}", content)
-        .replace("{{message.content}}", content)
-}
-
-fn render_generation_prompt_blocks(template: &str, add_generation_prompt: bool) -> String {
-    let mut rendered = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("{% if add_generation_prompt %}") {
-        rendered.push_str(&rest[..start]);
-        let block_start = start + "{% if add_generation_prompt %}".len();
-        let Some(relative_end) = rest[block_start..].find("{% endif %}") else {
-            rendered.push_str(&rest[start..]);
-            return rendered;
-        };
-        let block_end = block_start + relative_end;
-        if add_generation_prompt {
-            rendered.push_str(&rest[block_start..block_end]);
-        }
-        rest = &rest[block_end + "{% endif %}".len()..];
-    }
-    rendered.push_str(rest);
-    rendered
-}
-
 fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCall>)> {
     let mut remaining = content;
     let mut text = String::new();
@@ -6673,6 +6507,10 @@ fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCal
 }
 
 fn parse_qwen_tool_call_block(block: &str) -> Result<ChatToolCall> {
+    if block.contains("<function=") {
+        return parse_qwen_function_tool_call_block(block);
+    }
+
     let value: Value = serde_json::from_str(block)
         .with_context(|| format!("failed to parse Qwen tool call JSON: {block}"))?;
     let name = value
@@ -6697,6 +6535,59 @@ fn parse_qwen_tool_call_block(block: &str) -> Result<ChatToolCall> {
         name,
         arguments,
     })
+}
+
+fn parse_qwen_function_tool_call_block(block: &str) -> Result<ChatToolCall> {
+    let start = block
+        .find("<function=")
+        .context("Qwen function tool call is missing <function=...>")?;
+    let name_start = start + "<function=".len();
+    let name_end = block[name_start..]
+        .find('>')
+        .map(|end| name_start + end)
+        .context("Qwen function tool call has an unterminated function tag")?;
+    let name = block[name_start..name_end].trim();
+    if name.is_empty() {
+        bail!("Qwen function tool call is missing a function name");
+    }
+
+    let body_start = name_end + 1;
+    let body_end = block[body_start..]
+        .rfind("</function>")
+        .map(|end| body_start + end)
+        .context("Qwen function tool call is missing </function>")?;
+    let mut rest = &block[body_start..body_end];
+    let mut arguments = serde_json::Map::new();
+    while let Some(parameter_start) = rest.find("<parameter=") {
+        rest = &rest[parameter_start + "<parameter=".len()..];
+        let Some(name_end) = rest.find('>') else {
+            bail!("Qwen function tool call has an unterminated parameter tag");
+        };
+        let parameter_name = rest[..name_end].trim();
+        if parameter_name.is_empty() {
+            bail!("Qwen function tool call has an empty parameter name");
+        }
+        rest = &rest[name_end + 1..];
+        let Some(value_end) = rest.find("</parameter>") else {
+            bail!("Qwen function tool call is missing </parameter>");
+        };
+        let value = rest[..value_end].trim_matches('\n');
+        arguments.insert(
+            parameter_name.to_string(),
+            parse_qwen_function_parameter_output(value),
+        );
+        rest = &rest[value_end + "</parameter>".len()..];
+    }
+
+    Ok(ChatToolCall {
+        id: None,
+        name: name.to_string(),
+        arguments: Value::Object(arguments),
+    })
+}
+
+fn parse_qwen_function_parameter_output(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
 
 fn parse_qwen_tool_arguments(value: &Value) -> Result<Value> {
@@ -12893,15 +12784,15 @@ mod tests {
     }
 
     fn test_qwen3_tool_tokenizer_config_json() -> &'static [u8] {
-        br#"{
-  "chat_template": "{%- if tools %}\n{{- '<|im_start|>system\\n' }}\n{{- '<tools>' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if message.tool_calls %}<tool_call>{%- endif %}\n{%- if message.role == 'tool' %}<tool_response>{%- endif %}\n{%- endfor %}"
-}"#
+        br##"{
+  "chat_template": "{%- if tools %}\n{{- '<|im_start|>system\\n' }}\n{%- if messages and messages[0].role == 'system' %}{{- messages[0].content + '\\n\\n' }}{%- endif %}\n{{- '<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if not (tools and loop.first and message.role == 'system') %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- message.content }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+}"##
     }
 
     fn test_qwen3vl_tool_tokenizer_config_json() -> &'static [u8] {
-        br#"{
-  "chat_template": "{%- if tools %}\n{{- '<|im_start|>system\\n<tools>' }}\n{%- endif %}\n{%- set image_count = namespace(value=0) %}\n{%- for message in messages %}\n{%- for content in message.content %}\n{%- if content.type == 'image' %}<|image_pad|>{%- endif %}\n{%- endfor %}\n{%- if message.tool_calls %}<tool_call>{%- endif %}\n{%- if message.role == 'tool' %}<tool_response>{%- endif %}\n{%- endfor %}"
-}"#
+        br##"{
+  "chat_template": "{%- macro render_content(content) %}{%- if content is string %}{{- content }}{%- else %}{%- for item in content %}{%- if item.type == 'text' %}{{- item.text }}{%- elif item.type == 'image' %}{{- '<|vision_start|><|image_pad|><|vision_end|>' }}{%- endif %}{%- endfor %}{%- endif %}{%- endmacro %}\n{%- if tools %}\n{{- '<|im_start|>system\\n<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' }}{{- render_content(message.content) }}{{- '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- render_content(message.content) }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+}"##
     }
 
     fn test_byte_bpe_tokenizer_json() -> &'static [u8] {
@@ -16394,7 +16285,7 @@ mod tests {
     fn qwen_structured_renderer_injects_tool_schema() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
-            Some(test_tokenizer_config_json()),
+            Some(test_qwen3_tool_tokenizer_config_json()),
         )
         .unwrap();
         let rendered = tokenizer
@@ -16412,7 +16303,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(rendered.starts_with("<|im_start|>system\n# Tools\n\n"));
+        assert!(rendered.starts_with("<|im_start|>system\n<tools>\n"));
         assert!(rendered.contains("<tools>\n"));
         assert!(rendered.contains("\"name\":\"get_weather\""));
         assert!(rendered.contains("\"description\":\"Get weather.\""));
@@ -16470,12 +16361,15 @@ mod tests {
             )
             .unwrap();
         let tool_json = serde_json::to_string(&qwen_tool_schema_value(&tool)).unwrap();
-        assert_eq!(
-            rendered,
-            format!(
-                "<|im_start|>system\nbe precise\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tool_json}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\nchecking\n<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{\"city\":\"London\"}}}}\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\n{{\"temp\":12}}\n</tool_response>\n<tool_response>\n{{\"wind\":\"calm\"}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
-            )
-        );
+        assert!(rendered.starts_with("<|im_start|>system\nbe precise\n\n<tools>\n"));
+        assert!(rendered.contains(&tool_json));
+        assert!(rendered.contains("<|im_start|>user\nweather?<|im_end|>\n"));
+        assert!(rendered.contains("<|im_start|>assistant\nchecking\n<tool_call>\n"));
+        assert!(rendered.contains("\"name\": \"get_weather\""));
+        assert!(rendered.contains("\"arguments\": {\"city\":\"London\"}"));
+        assert!(rendered.contains("<tool_response>\n{\"temp\":12}\n</tool_response>"));
+        assert!(rendered.contains("<tool_response>\n{\"wind\":\"calm\"}\n</tool_response>"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
@@ -16532,13 +16426,13 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_template_renderer_rejects_image_parts_without_vision_support() {
+    fn qwen3_template_renderer_defers_image_parts_to_tokenizer_template() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
             Some(test_qwen3_tool_tokenizer_config_json()),
         )
         .unwrap();
-        let err = tokenizer
+        let rendered = tokenizer
             .apply_chat_template_to_messages(
                 &[ChatMessage {
                     role: ChatRole::User,
@@ -16553,15 +16447,16 @@ mod tests {
                 &[],
                 true,
             )
-            .unwrap_err();
-        assert!(err.to_string().contains("does not support image content"));
+            .unwrap();
+        assert!(rendered.contains("<|im_start|>user\n"));
+        assert!(rendered.contains("<|im_start|>assistant\n"));
     }
 
     #[test]
-    fn unsupported_tokenizer_chat_template_errors_instead_of_falling_back() {
+    fn invalid_tokenizer_chat_template_errors_instead_of_falling_back() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
-            Some(br#"{"chat_template":"{% macro render(messages) %}{{ messages|length }}{% endmacro %}"}"#),
+            Some(br#"{"chat_template":"{% if messages %}"}"#),
         )
         .unwrap();
         let err = tokenizer
@@ -16569,7 +16464,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("unsupported tokenizer chat_template")
+                .contains("failed to render tokenizer chat_template")
         );
     }
 
@@ -16577,7 +16472,7 @@ mod tests {
     fn qwen_structured_renderer_formats_assistant_tool_call() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
-            Some(test_tokenizer_config_json()),
+            Some(test_qwen3_tool_tokenizer_config_json()),
         )
         .unwrap();
         let mut assistant = ChatMessage::text(ChatRole::Assistant, "checking");
@@ -16599,7 +16494,7 @@ mod tests {
     fn qwen_structured_renderer_formats_tool_result_as_user_response() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
-            Some(test_tokenizer_config_json()),
+            Some(test_qwen3_tool_tokenizer_config_json()),
         )
         .unwrap();
         let rendered = tokenizer
@@ -16624,8 +16519,8 @@ mod tests {
     #[test]
     fn qwen_structured_renderer_formats_vl_text_with_image_placeholder() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
-            test_tokenizer_json(),
-            Some(test_tokenizer_config_json()),
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
         )
         .unwrap();
         let rendered = tokenizer
@@ -16673,10 +16568,30 @@ mod tests {
     }
 
     #[test]
+    fn qwen_tool_call_output_parser_extracts_function_calls() {
+        let (content, calls) = parse_qwen_tool_call_output(
+            "checking\n<tool_call>\n<function=get_weather>\n<parameter=city>\nLondon\n</parameter>\n<parameter=options>\n{\"unit\":\"c\"}\n</parameter>\n</function>\n</tool_call>\n",
+        )
+        .unwrap();
+        assert_eq!(content, "checking");
+        assert_eq!(
+            calls,
+            vec![ChatToolCall {
+                id: None,
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({
+                    "city": "London",
+                    "options": {"unit": "c"}
+                }),
+            }]
+        );
+    }
+
+    #[test]
     fn flashmoe_parity_qwen_tool_call_serialization_and_parsing_goldens() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
             test_tokenizer_json(),
-            Some(test_tokenizer_config_json()),
+            Some(test_qwen3_tool_tokenizer_config_json()),
         )
         .unwrap();
         let mut assistant = ChatMessage::text(ChatRole::Assistant, "");

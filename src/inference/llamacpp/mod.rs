@@ -4,6 +4,7 @@
 //! handles text and multimodal (vision) generation through llama.cpp.  This
 //! module is the sibling of `flashmoe` inside `crate::inference`.
 
+use std::fs;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 
 use crate::energy::{self, EnergyEstimate};
+use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
 const BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
@@ -63,6 +65,7 @@ pub struct Output {
 pub struct LlamaCppBackend {
     backend: LlamaBackend,
     model: LlamaModel,
+    chat_template: Option<TokenizerChatTemplate>,
     /// Path to the primary model GGUF file.
     pub model_path: PathBuf,
 }
@@ -85,9 +88,11 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
     let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
     let loaded_model = LlamaModel::load_from_file(&backend, path, &model_params)
         .with_context(|| format!("failed to load model {}", path.display()))?;
+    let chat_template = load_sidecar_chat_template(path)?;
     Ok(LlamaCppBackend {
         backend,
         model: loaded_model,
+        chat_template,
         model_path: path.to_owned(),
     })
 }
@@ -111,9 +116,10 @@ impl LlamaCppBackend {
             .new_context(&self.backend, ctx_params)
             .context("failed to create llama context")?;
 
+        let (prompt, add_bos) = self.render_prompt(&request.prompt)?;
         let tokens = self
             .model
-            .str_to_token(&request.prompt, AddBos::Always)
+            .str_to_token(&prompt, add_bos)
             .context("failed to tokenize prompt")?;
 
         ensure_prompt_fits_context(tokens.len(), request.max_tokens, ctx.n_ctx())?;
@@ -295,6 +301,36 @@ impl LlamaCppBackend {
             energy,
         })
     }
+}
+
+impl LlamaCppBackend {
+    fn render_prompt(&self, prompt: &str) -> Result<(String, AddBos)> {
+        if prompt.contains("<|im_start|>") {
+            return Ok((prompt.to_string(), AddBos::Never));
+        }
+        let Some(chat_template) = &self.chat_template else {
+            return Ok((prompt.to_string(), AddBos::Always));
+        };
+        let rendered = chat_template.render(
+            serde_json::json!([{"role": "user", "content": prompt}]),
+            serde_json::json!([]),
+            ChatTemplateOptions::default(),
+        )?;
+        Ok((rendered, AddBos::Never))
+    }
+}
+
+fn load_sidecar_chat_template(model_path: &Path) -> Result<Option<TokenizerChatTemplate>> {
+    let Some(model_dir) = model_path.parent() else {
+        return Ok(None);
+    };
+    let config_path = model_dir.join("tokenizer_config.json");
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&config_path)
+        .with_context(|| format!("failed to read tokenizer config {}", config_path.display()))?;
+    TokenizerChatTemplate::from_tokenizer_config_bytes(Some(&bytes))
 }
 
 fn find_multimodal_projector(model_path: &Path) -> Result<PathBuf> {
