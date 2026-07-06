@@ -1464,13 +1464,14 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
     validate_required_tensor_manifest(&config, dense.registry())?;
     let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
     let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
+    let metal = MetalExecutor::new(plan, &config, &runtime, &dense)?;
     Ok(FlashMoeEngine {
         plan: plan.clone(),
         experts: ExpertStore::open(plan.experts_dir.clone())?,
         scheduler: ExpertScheduler::new(ExpertStore::open(plan.experts_dir.clone())?),
         dense,
         tokenizer: QwenTokenizer::from_file(&plan.tokenizer)?,
-        metal: MetalExecutor::new(plan, &config, &runtime)?,
+        metal,
         vision_encoder,
         config,
         routing_policy,
@@ -1956,6 +1957,7 @@ impl MetalExecutor {
         plan: &FlashMoePlan,
         config: &QwenModelConfig,
         runtime: &DenseTransformerRuntime,
+        dense: &DenseStore,
     ) -> Result<Option<Self>> {
         if !plan.uses_metal {
             return Ok(None);
@@ -1968,6 +1970,7 @@ impl MetalExecutor {
                     plan,
                     config,
                     runtime,
+                    dense,
                     route_top4_enabled,
                 )?),
                 route_top4_enabled,
@@ -1975,7 +1978,7 @@ impl MetalExecutor {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (config, runtime);
+            let _ = (config, runtime, dense);
             Ok(None)
         }
     }
@@ -2105,6 +2108,39 @@ impl MetalExecutor {
                 cpu_dense_matvec(&decoded, input, rows, cols),
                 MetalMatvecTiming::default(),
             ))
+        }
+    }
+
+
+    fn has_resident_dense_weights(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.has_resident_dense_weights()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    fn dense_mmap_matvec(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .dense_mmap_matvec(byte_offset, dtype, input, rows, cols, stride)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (byte_offset, dtype, input, rows, cols, stride);
+            Ok(None)
         }
     }
 
@@ -2350,6 +2386,8 @@ struct MetalExecutorInner {
     route_pipeline: Option<ObjcId>,
     dense_matvec_pipeline: ObjcId,
     dense_matvec_bf16_pipeline: ObjcId,
+    dense_mmap_matvec_pipeline: ObjcId,
+    dense_mmap_matvec_bf16_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
     rope_pipeline: ObjcId,
     rope_split_half_pipeline: ObjcId,
@@ -2366,10 +2404,19 @@ struct MetalExecutorInner {
     gqa_scores_pipeline: ObjcId,
     gqa_read_pipeline: ObjcId,
     shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
+    dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalDenseWeights {
+    buffer: ObjcId,
+    _mmap: Arc<memmap2::Mmap>,
+    len: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2524,6 +2571,8 @@ impl Drop for MetalExecutorInner {
             }
             release(self.dense_matvec_pipeline);
             release(self.dense_matvec_bf16_pipeline);
+            release(self.dense_mmap_matvec_pipeline);
+            release(self.dense_mmap_matvec_bf16_pipeline);
             release(self.rms_norm_pipeline);
             release(self.rope_pipeline);
             release(self.rope_split_half_pipeline);
@@ -2547,6 +2596,9 @@ impl Drop for MetalExecutorInner {
                     release(buffers.router);
                 }
                 shared_buffers.clear();
+            }
+            if let Some(dense_weights) = self.dense_weights.take() {
+                release(dense_weights.buffer);
             }
             if let Ok(lm_head_buffers) = self.lm_head_buffers.get_mut() {
                 for buffer in lm_head_buffers.buffers.values() {
@@ -2578,6 +2630,7 @@ impl MetalExecutorInner {
         plan: &FlashMoePlan,
         config: &QwenModelConfig,
         runtime: &DenseTransformerRuntime,
+        dense: &DenseStore,
         route_top4_enabled: bool,
     ) -> Result<Self> {
         unsafe {
@@ -2613,6 +2666,10 @@ impl MetalExecutorInner {
             let dense_matvec_pipeline = compile_pipeline(device, library, "dense_matvec")?;
             let dense_matvec_bf16_pipeline =
                 compile_pipeline(device, library, "dense_matvec_bf16")?;
+            let dense_mmap_matvec_pipeline =
+                compile_pipeline(device, library, "dense_mmap_matvec_f32")?;
+            let dense_mmap_matvec_bf16_pipeline =
+                compile_pipeline(device, library, "dense_mmap_matvec_bf16")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
             let rope_split_half_pipeline =
@@ -2642,6 +2699,8 @@ impl MetalExecutorInner {
                 }
                 release(dense_matvec_pipeline);
                 release(dense_matvec_bf16_pipeline);
+                release(dense_mmap_matvec_pipeline);
+                release(dense_mmap_matvec_bf16_pipeline);
                 release(rms_norm_pipeline);
                 release(rope_pipeline);
                 release(rope_split_half_pipeline);
@@ -2661,6 +2720,9 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE Metal command queue");
             }
 
+            let dense_weights =
+                wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
+
             let max_context = metal_kv_max_context_for_layouts(
                 config,
                 &runtime.full_attention,
@@ -2676,6 +2738,7 @@ impl MetalExecutorInner {
                 kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
                 experts = config.experts(),
                 route_top4 = route_top4_enabled,
+                dense_resident = dense_weights.is_some(),
                 "Flash-MoE Metal executor initialized"
             );
 
@@ -2686,6 +2749,8 @@ impl MetalExecutorInner {
                 route_pipeline,
                 dense_matvec_pipeline,
                 dense_matvec_bf16_pipeline,
+                dense_mmap_matvec_pipeline,
+                dense_mmap_matvec_bf16_pipeline,
                 rms_norm_pipeline,
                 rope_pipeline,
                 rope_split_half_pipeline,
@@ -2702,6 +2767,7 @@ impl MetalExecutorInner {
                 gqa_scores_pipeline,
                 gqa_read_pipeline,
                 shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
+                dense_weights,
                 lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
                     metal_lm_head_buffer_budget_bytes(),
                 )),
@@ -3507,6 +3573,135 @@ impl MetalExecutorInner {
             self.recycle(output_buffer);
             self.recycle(cols_buffer);
             Ok((output, timing))
+        }
+    }
+
+
+    fn has_resident_dense_weights(&self) -> bool {
+        self.dense_weights.is_some()
+    }
+
+    fn dense_mmap_matvec(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        if rows == 0 || cols == 0 {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default())));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let dtype = dtype.to_ascii_uppercase();
+        let (element_size, pipeline) = match dtype.as_str() {
+            "F32" | "FLOAT32" | "FP32" => {
+                (std::mem::size_of::<f32>(), self.dense_mmap_matvec_pipeline)
+            }
+            "BF16" | "BFLOAT16" => (
+                std::mem::size_of::<u16>(),
+                self.dense_mmap_matvec_bf16_pipeline,
+            ),
+            _ => return Ok(None),
+        };
+        if stride < cols {
+            bail!("dense mmap matvec stride {stride} is smaller than cols {cols}");
+        }
+        let last_row = rows.saturating_sub(1);
+        let values = last_row
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(cols))
+            .context("dense mmap matvec value range overflow")?;
+        let byte_len = values
+            .checked_mul(element_size)
+            .context("dense mmap matvec byte length overflow")?;
+        let byte_offset_usize =
+            usize::try_from(byte_offset).context("dense mmap matvec offset does not fit usize")?;
+        if byte_offset_usize
+            .checked_add(byte_len)
+            .map_or(true, |end| end > dense_weights.len)
+        {
+            return Ok(None);
+        }
+        if byte_offset_usize % element_size != 0 {
+            return Ok(None);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&byte_offset))?;
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let stride_u32 = stride as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let stride_buffer = self.buffer_with_bytes(u32_as_bytes(&stride_u32))?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE dense mmap Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE dense mmap Metal compute encoder");
+            }
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, offset_buffer, 3);
+            set_buffer(encoder, rows_buffer, 4);
+            set_buffer(encoder, cols_buffer, 5);
+            set_buffer(encoder, stride_buffer, 6);
+            dispatch_threads(encoder, rows as u64);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let context = MetalCommandContext::new("dense_mmap_matvec")
+                .with("dtype", dtype)
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("stride", stride)
+                .with("offset", byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        input_buffer,
+                        output_buffer,
+                        offset_buffer,
+                        rows_buffer,
+                        cols_buffer,
+                        stride_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let output = read_f32_buffer(output_buffer, rows);
+            timing.readback += readback_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(offset_buffer);
+            self.recycle(rows_buffer);
+            self.recycle(cols_buffer);
+            self.recycle(stride_buffer);
+            Ok(Some((output, timing)))
         }
     }
 
@@ -9022,16 +9217,10 @@ impl DenseStore {
                 .min(tokenizer.vocab_size());
             if rows > 0 && cols > 0 && cols <= hidden.len() {
                 let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
-                let tile_rows = dense_projection_tile_rows(cols, rows);
-                for start in (0..rows).step_by(tile_rows) {
-                    let end = (start + tile_rows).min(rows);
-                    let tensor =
-                        self.read_tensor_rows_f32_cached(lm_head_name, start, end - start)?;
-                    let projected =
-                        metal.dense_matvec(tensor.as_slice(), hidden, end - start, cols)?;
-                    for (offset, value) in projected.into_iter().enumerate() {
-                        logits[start + offset] = value;
-                    }
+                let projected =
+                    self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
+                for (token, value) in projected.into_iter().enumerate() {
+                    logits[token] = value;
                 }
                 return Ok(logits);
             }
@@ -9069,6 +9258,15 @@ impl DenseStore {
 
         let top_k = sampler.top_k.min(rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
+        if metal.has_resident_dense_weights() {
+            let projected = self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
+            let mut candidates = TopKCandidates::new(top_k);
+            for (token, value) in projected.into_iter().enumerate() {
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
+            }
+            return Ok(Some(candidates.into_sorted_vec()));
+        }
+
         if repeated.is_empty() {
             let lm_head_bytes = rows
                 .checked_mul(cols)
@@ -9226,13 +9424,47 @@ impl DenseStore {
         let mut raw_read_timing = DenseTileReadTiming::default();
         let mut metal_timing = MetalMatvecTiming::default();
         let mut output = vec![0.0f32; output_width];
+        let mut resident_tiles = 0usize;
+        let mut resident_bytes = 0u64;
         let tile_rows = dense_projection_tile_rows(cols, rows);
         let mut tiles = 0usize;
+        let element_size = dtype_size(&dtype);
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
-            let projected = if use_raw_bf16 {
+            let tile_rows = end - start;
+            let resident = if let Some(element_size) = element_size {
+                let row_bytes = cols
+                    .checked_mul(element_size)
+                    .context("dense tensor resident row byte length overflow")?;
+                let tile_byte_offset = start
+                    .checked_mul(row_bytes)
+                    .context("dense tensor resident tile byte offset overflow")?;
+                let tile_byte_offset = u64::try_from(tile_byte_offset)
+                    .context("dense tensor resident tile offset does not fit u64")?;
+                let resident_byte_offset = entry
+                    .byte_offset
+                    .checked_add(tile_byte_offset)
+                    .context("dense tensor resident byte offset overflow")?;
+                metal.dense_mmap_matvec(
+                    resident_byte_offset,
+                    &dtype,
+                    input,
+                    tile_rows,
+                    cols,
+                    cols,
+                )?
+                .map(|result| (result, row_bytes))
+            } else {
+                None
+            };
+            let projected = if let Some(((projected, timing), row_bytes)) = resident {
+                metal_timing.add(timing);
+                resident_tiles += 1;
+                resident_bytes = resident_bytes.saturating_add((tile_rows * row_bytes) as u64);
+                projected
+            } else if use_raw_bf16 {
                 let (tensor, tile_dtype, timing) =
-                    self.read_tensor_rows_raw_cached_profiled(canonical_name, start, end - start)?;
+                    self.read_tensor_rows_raw_cached_profiled(canonical_name, start, tile_rows)?;
                 raw_read_timing.add(timing);
                 if !is_bf16_dtype(&tile_dtype) {
                     bail!(
@@ -9242,14 +9474,14 @@ impl DenseStore {
                     );
                 }
                 let (projected, timing) =
-                    metal.dense_matvec_bf16(tensor.as_slice(), input, end - start, cols)?;
+                    metal.dense_matvec_bf16(tensor.as_slice(), input, tile_rows, cols)?;
                 metal_timing.add(timing);
                 projected
             } else {
                 let (tensor, timing) =
-                    self.read_tensor_rows_f32_cached_profiled(canonical_name, start, end - start)?;
+                    self.read_tensor_rows_f32_cached_profiled(canonical_name, start, tile_rows)?;
                 decoded_read_timing.add(timing);
-                metal.dense_matvec(tensor.as_slice(), input, end - start, cols)?
+                metal.dense_matvec(tensor.as_slice(), input, tile_rows, cols)?
             };
             for (offset, value) in projected.into_iter().enumerate() {
                 output[start + offset] = value;
@@ -9267,6 +9499,8 @@ impl DenseStore {
                 input_len = input.len(),
                 output_width,
                 tile_mb = DENSE_PROJECTION_TILE_BYTES / (1024 * 1024),
+                resident_mmap_tiles = resident_tiles,
+                resident_mmap_bytes = resident_bytes,
                 dtype = %dtype,
                 raw_read_ms = duration_ms(raw_read_timing.total),
                 metal_buffer_upload_ms = duration_ms(metal_timing.buffer_upload),
@@ -11240,6 +11474,59 @@ unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcI
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_page_size() -> usize {
+    unsafe {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if page_size > 0 {
+            page_size as usize
+        } else {
+            16 * 1024
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn wrap_dense_mmap_as_metal_buffer(
+    device: ObjcId,
+    mmap: Arc<memmap2::Mmap>,
+    len: u64,
+) -> Result<Option<MetalDenseWeights>> {
+    let len = usize::try_from(len).context("dense mmap length does not fit usize")?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let ptr = mmap.as_ptr() as *mut c_void;
+    let page_size = metal_page_size();
+    if (ptr as usize) % page_size != 0 {
+        tracing::debug!(
+            ptr = ?ptr,
+            page_size,
+            "dense mmap is not page-aligned; resident Metal dense buffer disabled"
+        );
+        return Ok(None);
+    }
+    unsafe {
+        let buffer = msg_send_id4_ptr_usize_u64_ptr(
+            device,
+            sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            ptr,
+            len,
+            0,
+            ptr::null_mut(),
+        );
+        if buffer.is_null() {
+            tracing::debug!(len, "failed to wrap dense mmap as resident Metal buffer");
+            return Ok(None);
+        }
+        Ok(Some(MetalDenseWeights {
+            buffer,
+            _mmap: mmap,
+            len,
+        }))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) {
     unsafe {
         set_buffer_with_offset(encoder, buffer, 0, index);
@@ -11516,6 +11803,22 @@ unsafe fn msg_send_id3_ptr_usize_u64(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id4_ptr_usize_u64_ptr(
+    receiver: ObjcId,
+    selector: Sel,
+    bytes: *mut c_void,
+    len: usize,
+    options: u64,
+    deallocator: *mut c_void,
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, *mut c_void, usize, u64, *mut c_void) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options, deallocator)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) {
     unsafe {
         let f: unsafe extern "C" fn(ObjcId, Sel) = std::mem::transmute(objc_msgSend as *const ());
@@ -11733,6 +12036,45 @@ kernel void dense_matvec_bf16(
         uint bits = uint(weights[row_offset + col]) << 16u;
         float weight = as_type<float>(bits);
         acc = fma(weight, input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_mmap_matvec_f32(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& stride [[buffer(6)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) { return; }
+    device const float* weights = reinterpret_cast<device const float*>(weight_bytes + byte_offset);
+    float acc = 0.0f;
+    uint row_offset = row * stride;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(weights[row_offset + col], input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_mmap_matvec_bf16(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& stride [[buffer(6)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) { return; }
+    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + byte_offset);
+    float acc = 0.0f;
+    uint row_offset = row * stride;
+    for (uint col = 0; col < cols; ++col) {
+        uint bits = uint(weights[row_offset + col]) << 16u;
+        acc = fma(as_type<float>(bits), input[col], acc);
     }
     output[row] = acc;
 }
