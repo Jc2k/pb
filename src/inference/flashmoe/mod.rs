@@ -9250,6 +9250,24 @@ fn validate_dense_matvec_shape(
     }
 }
 
+
+fn validate_lm_head_matvec_shape(
+    entry: &RuntimeTensorEntry,
+    canonical_name: &str,
+    vocab_size: usize,
+    input_len: usize,
+) -> Result<(usize, usize)> {
+    let expected_shape = [vocab_size, input_len];
+    match entry.shape.as_slice() {
+        [rows, cols] if *rows >= vocab_size && *cols == input_len => Ok((*rows, *cols)),
+        _ => bail!(
+            "Flash-MoE dense tensor {canonical_name} shape mismatch: expected at least {:?}, actual shape {:?}, input length {input_len}",
+            expected_shape,
+            entry.shape
+        ),
+    }
+}
+
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
@@ -9788,7 +9806,7 @@ impl DenseStore {
         if let Some(metal) = metal
             && let Some(entry) = self.registry.tensor(lm_head_name)
         {
-            let (rows, cols) = validate_dense_matvec_shape(
+            let (rows, cols) = validate_lm_head_matvec_shape(
                 entry,
                 lm_head_name,
                 tokenizer.vocab_size(),
@@ -9797,7 +9815,7 @@ impl DenseStore {
             let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
             let projected =
                 self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
-            for (token, value) in projected.into_iter().enumerate() {
+            for (token, value) in projected.into_iter().take(tokenizer.vocab_size()).enumerate() {
                 logits[token] = value;
             }
             return Ok(logits);
@@ -9822,33 +9840,34 @@ impl DenseStore {
         let Some(entry) = self.registry.tensor(lm_head_name) else {
             return Ok(None);
         };
-        let (rows, cols) = validate_dense_matvec_shape(
+        let (rows, cols) = validate_lm_head_matvec_shape(
             entry,
             lm_head_name,
             tokenizer.vocab_size(),
             hidden.len(),
         )?;
 
-        let top_k = sampler.top_k.min(rows).max(1);
+        let vocab_rows = tokenizer.vocab_size();
+        let top_k = sampler.top_k.min(vocab_rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
         if metal.has_resident_dense_weights() {
             let projected = self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
             let mut candidates = TopKCandidates::new(top_k);
-            for (token, value) in projected.into_iter().enumerate() {
+            for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
                 candidates.push(token, sampler.process_logit(token, value, &repeated));
             }
             return Ok(Some(candidates.into_sorted_vec()));
         }
 
         if repeated.is_empty() {
-            let lm_head_bytes = rows
+            let lm_head_bytes = vocab_rows
                 .checked_mul(cols)
                 .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
                 .context("LM-head decoded byte length overflow")?;
             if let Some(candidates) = metal.lm_head_top_candidates_from_cached_buffer(
                 lm_head_name,
                 hidden,
-                rows,
+                vocab_rows,
                 cols,
                 top_k,
             )? {
@@ -9860,7 +9879,7 @@ impl DenseStore {
                         lm_head_name,
                         &weights,
                         hidden,
-                        rows,
+                        vocab_rows,
                         cols,
                         top_k,
                     ) {
@@ -9899,7 +9918,7 @@ impl DenseStore {
         tokenizer: &QwenTokenizer,
     ) -> Result<Vec<f32>> {
         let entry = self.registry.require(lm_head_name)?;
-        validate_dense_matvec_shape(entry, lm_head_name, tokenizer.vocab_size(), hidden.len())?;
+        validate_lm_head_matvec_shape(entry, lm_head_name, tokenizer.vocab_size(), hidden.len())?;
         let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
         for idx in 0..tokenizer.vocab_size() {
             let Some(row) = self.read_tensor_row_f32(lm_head_name, idx, hidden.len())? else {
@@ -20011,6 +20030,64 @@ mod tests {
 
         assert_eq!(logits.len(), 3);
         assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn lm_head_logits_accepts_padded_vocab_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        for row_idx in 0..5usize {
+            let value = (row_idx as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![5, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let logits = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap();
+
+        assert_eq!(logits, vec![2.0, 4.0, 6.0]);
     }
 
 
