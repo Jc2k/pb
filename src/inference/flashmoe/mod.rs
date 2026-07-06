@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+use tokenizers::Tokenizer;
 use tracing::info;
 
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
@@ -423,6 +424,7 @@ pub struct FlashMoePlan {
     pub tensor_manifest: PathBuf,
     pub model_config: PathBuf,
     pub tokenizer: PathBuf,
+    pub tokenizer_config: PathBuf,
     pub experts_dir: PathBuf,
     pub uses_metal: bool,
     pub streams_experts_from_nand: bool,
@@ -1371,7 +1373,8 @@ pub fn plan_unchecked_with_routing(
         non_expert_weights: runtime_dir.join("model_weights.bin"),
         tensor_manifest: runtime_dir.join("model_weights.json"),
         model_config: runtime_dir.join("config.json"),
-        tokenizer: runtime_dir.join("tokenizer.bin"),
+        tokenizer: model_cache_dir.join("tokenizer.json"),
+        tokenizer_config: model_cache_dir.join("tokenizer_config.json"),
         experts_dir: runtime_dir.join("packed_experts"),
         runtime_dir,
         model,
@@ -1470,7 +1473,7 @@ pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
         experts: ExpertStore::open(plan.experts_dir.clone())?,
         scheduler: ExpertScheduler::new(ExpertStore::open(plan.experts_dir.clone())?),
         dense,
-        tokenizer: QwenTokenizer::from_file(&plan.tokenizer)?,
+        tokenizer: QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?,
         metal,
         vision_encoder,
         config,
@@ -7316,6 +7319,10 @@ fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
 
 #[derive(Debug, Clone)]
 struct QwenTokenizer {
+    tokenizer: Tokenizer,
+    config: QwenTokenizerConfig,
+    eos_tokens: BTreeSet<u32>,
+    primary_eos_token: u32,
     id_to_token: Vec<String>,
     token_to_id: BTreeMap<String, u32>,
     merge_ranks: BTreeMap<(String, String), usize>,
@@ -7338,31 +7345,104 @@ enum TokenizerModelKind {
     Other,
 }
 
+#[derive(Debug, Clone, Default)]
+struct QwenTokenizerConfig {
+    bos_token: Option<String>,
+    eos_tokens: Vec<String>,
+    pad_token: Option<String>,
+    add_bos_token: bool,
+    added_tokens_decoder: BTreeMap<u32, TokenizerConfigAddedToken>,
+    additional_special_tokens: Vec<String>,
+    split_special_tokens: bool,
+    model_max_length: Option<u64>,
+    chat_template: Option<TokenizerChatTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenizerConfigAddedToken {
+    content: String,
+    special: bool,
+}
+
 impl QwenTokenizer {
     fn from_file(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read tokenizer {}", path.display()))?;
         let config_path = path.with_file_name("tokenizer_config.json");
-        let config_bytes = if config_path.is_file() {
-            Some(fs::read(&config_path).with_context(|| {
-                format!("failed to read tokenizer config {}", config_path.display())
-            })?)
-        } else {
-            None
-        };
-        Self::from_json_bytes_with_config(&bytes, config_bytes.as_deref())
-            .with_context(|| format!("failed to parse tokenizer {}", path.display()))
+        if config_path.is_file() {
+            return Self::from_files(path, &config_path);
+        }
+        #[cfg(test)]
+        {
+            let tokenizer = Tokenizer::from_file(path)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .with_context(|| format!("failed to load tokenizer {}", path.display()))?;
+            let bytes = fs::read(path)
+                .with_context(|| format!("failed to read tokenizer {}", path.display()))?;
+            return Self::from_json_bytes_with_tokenizer(
+                &bytes,
+                tokenizer,
+                test_default_tokenizer_config_json(),
+            )
+            .with_context(|| format!("failed to parse tokenizer {}", path.display()));
+        }
+        #[cfg(not(test))]
+        Self::from_files(path, &config_path)
+    }
+
+    fn from_files(tokenizer_path: &Path, config_path: &Path) -> Result<Self> {
+        if !config_path.is_file() {
+            bail!(
+                "Flash-MoE tokenizer config is required for chat generation: missing {}",
+                config_path.display()
+            );
+        }
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+        let bytes = fs::read(tokenizer_path)
+            .with_context(|| format!("failed to read tokenizer {}", tokenizer_path.display()))?;
+        let config_bytes = fs::read(config_path).with_context(|| {
+            format!(
+                "failed to read tokenizer config {}",
+                config_path.display()
+            )
+        })?;
+        Self::from_json_bytes_with_tokenizer(&bytes, tokenizer, &config_bytes).with_context(|| {
+            format!(
+                "failed to load Flash-MoE tokenizer metadata from {} and {}",
+                tokenizer_path.display(),
+                config_path.display()
+            )
+        })
     }
 
     #[cfg(test)]
     fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_json_bytes_with_config(bytes, None)
+        Self::from_json_bytes_with_config(bytes, Some(test_default_tokenizer_config_json()))
     }
 
+    #[cfg(test)]
     fn from_json_bytes_with_config(bytes: &[u8], config_bytes: Option<&[u8]>) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(bytes)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("tokenizer JSON is invalid")?;
+        let config_bytes = config_bytes.context("test tokenizer config is required")?;
+        Self::from_json_bytes_with_tokenizer(bytes, tokenizer, config_bytes)
+    }
+
+    fn from_json_bytes_with_tokenizer(
+        bytes: &[u8],
+        tokenizer: Tokenizer,
+        config_bytes: &[u8],
+    ) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("tokenizer JSON is invalid")?;
-        let chat_template = TokenizerChatTemplate::from_tokenizer_config_bytes(config_bytes)?;
+        let config = QwenTokenizerConfig::from_bytes(config_bytes)?;
+        if config.split_special_tokens {
+            bail!(
+                "tokenizer_config.json sets split_special_tokens=true, which is unsupported for Flash-MoE because generation stop tokens must remain atomic"
+            );
+        }
+        let chat_template = config.chat_template.clone();
         let model_kind = match value
             .pointer("/model/type")
             .and_then(serde_json::Value::as_str)
@@ -7419,12 +7499,39 @@ impl QwenTokenizer {
             .pointer("/model/unk_token")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let eos_token = ["<|im_end|>", "<|endoftext|>", "</s>"]
+        let mut eos_tokens = BTreeSet::new();
+        for token in &config.eos_tokens {
+            let id = tokenizer.token_to_id(token).with_context(|| {
+                format!("tokenizer_config.json eos_token {token:?} is not present in tokenizer.json")
+            })?;
+            eos_tokens.insert(id);
+        }
+        let primary_eos_token = eos_tokens
             .iter()
-            .find_map(|token| token_to_id.get(*token).copied())
-            .with_context(
-                || "Qwen tokenizer is missing an EOS token (<|im_end|>, <|endoftext|>, or </s>)",
-            )?;
+            .next()
+            .copied()
+            .context("tokenizer_config.json must define eos_token for Flash-MoE")?;
+        if let Some(token) = &config.bos_token
+            && tokenizer.token_to_id(token).is_none()
+        {
+            bail!("tokenizer_config.json bos_token {token:?} is not present in tokenizer.json");
+        }
+        if let Some(token) = &config.pad_token
+            && tokenizer.token_to_id(token).is_none()
+        {
+            bail!("tokenizer_config.json pad_token {token:?} is not present in tokenizer.json");
+        }
+        // Qwen-family tokenizer_config.json files may include modality tokens in
+        // added_tokens_decoder/additional_special_tokens that are not exposed by
+        // the active tokenizer.json. Keep EOS/BOS/PAD strict, but let optional
+        // decoder metadata be advisory so text-only model artifacts still load.
+        for token in &config.additional_special_tokens {
+            let _ = tokenizer.token_to_id(token);
+        }
+        for token in config.added_tokens_decoder.values() {
+            let _ = tokenizer.token_to_id(&token.content);
+        }
+        let eos_token = primary_eos_token;
         let im_start = token_to_id.get("<|im_start|>").copied();
         let im_end = token_to_id.get("<|im_end|>").copied();
         let max_id = token_to_id.values().copied().max().unwrap_or(eos_token) as usize;
@@ -7450,6 +7557,10 @@ impl QwenTokenizer {
             ids
         };
         Ok(Self {
+            tokenizer,
+            config,
+            eos_tokens,
+            primary_eos_token,
             id_to_token,
             token_to_id,
             merge_ranks,
@@ -7504,68 +7615,60 @@ impl QwenTokenizer {
         {
             return Ok(prompt.clone());
         }
-        if let Some(template) = &self.chat_template {
-            return render_tokenizer_chat_template(
-                template,
-                messages,
-                tools,
-                add_generation_prompt,
-            );
-        }
-        render_qwen_chatml(messages, tools, add_generation_prompt)
+        let template = self.config.chat_template.as_ref().context(
+            "tokenizer_config.json is missing chat_template; Flash-MoE chat generation requires the active model tokenizer_config.json",
+        )?;
+        render_tokenizer_chat_template(
+            template,
+            messages,
+            tools,
+            add_generation_prompt,
+        )
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(match self.model_kind {
-            TokenizerModelKind::Bpe => self.encode_byte_level_bpe(text),
-            TokenizerModelKind::WordLevel | TokenizerModelKind::Other => {
-                self.encode_wordlevel_compatible(text)
-            }
-        })
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("failed to encode text with tokenizer.json"))?;
+        let mut ids = encoding.get_ids().to_vec();
+        if self.config.add_bos_token
+            && let Some(bos) = self
+                .config
+                .bos_token
+                .as_deref()
+                .and_then(|token| self.tokenizer.token_to_id(token))
+            && ids.first().copied() != Some(bos)
+        {
+            ids.insert(0, bos);
+        }
+        Ok(ids)
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String> {
-        let mut out = String::new();
-        let mut byte_buffer = Vec::new();
-        for token in tokens
+        let tokens: Vec<u32> = tokens
             .iter()
             .copied()
             .take_while(|token| !self.is_eos(*token))
-        {
-            if let Some(piece) = self
-                .id_to_token
-                .get(token as usize)
-                .filter(|piece| !piece.is_empty())
-                && !piece.starts_with("<|")
-            {
-                if let Some(bytes) = byte_level_piece_to_bytes(piece) {
-                    byte_buffer.extend(bytes);
-                } else {
-                    if !byte_buffer.is_empty() {
-                        out.push_str(&String::from_utf8_lossy(&byte_buffer));
-                        byte_buffer.clear();
-                    }
-                    out.push_str(&decode_token_piece(piece));
-                }
-            }
-        }
-        if !byte_buffer.is_empty() {
-            out.push_str(&String::from_utf8_lossy(&byte_buffer));
-        }
-        Ok(out)
+            .collect();
+        self.tokenizer
+            .decode(&tokens, true)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("failed to decode tokens with tokenizer.json")
     }
 
     fn is_eos(&self, token: u32) -> bool {
-        token == self.eos_token
+        self.eos_tokens.contains(&token)
     }
 
     fn eos_token_id(&self) -> u32 {
-        self.eos_token
+        self.primary_eos_token
     }
 
     /// Look up a token string and return its ID, or `None` if not present.
     fn token_id(&self, token: &str) -> Option<u32> {
-        self.token_to_id.get(token).copied()
+        self.tokenizer.token_to_id(token)
     }
 
     fn vocab_size(&self) -> usize {
@@ -7755,6 +7858,121 @@ fn parse_tokenizer_merges(value: &serde_json::Value) -> Result<BTreeMap<(String,
         if let Some(pair) = pair {
             out.insert(pair, rank);
         }
+    }
+    Ok(out)
+}
+
+impl QwenTokenizerConfig {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let value: Value = serde_json::from_slice(bytes).context("tokenizer_config.json is invalid")?;
+        let bos_token = config_token_string(value.get("bos_token"), "bos_token")?;
+        let eos_tokens = config_token_strings(value.get("eos_token"), "eos_token")?;
+        let pad_token = config_token_string(value.get("pad_token"), "pad_token")?;
+        let add_bos_token = value
+            .get("add_bos_token")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let split_special_tokens = value
+            .get("split_special_tokens")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let model_max_length = value
+            .get("model_max_length")
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_u64(),
+                Value::String(text) => text.parse::<u64>().ok(),
+                _ => None,
+            });
+        let added_tokens_decoder = parse_added_tokens_decoder(value.get("added_tokens_decoder"))?;
+        let additional_special_tokens = parse_config_token_list(
+            value.get("additional_special_tokens"),
+            "additional_special_tokens",
+        )?;
+        let chat_template = TokenizerChatTemplate::from_tokenizer_config_value(&value)?;
+        if eos_tokens.is_empty() {
+            bail!("tokenizer_config.json must define eos_token for Flash-MoE");
+        }
+        Ok(Self {
+            bos_token,
+            eos_tokens,
+            pad_token,
+            add_bos_token,
+            added_tokens_decoder,
+            additional_special_tokens,
+            split_special_tokens,
+            model_max_length,
+            chat_template,
+        })
+    }
+}
+
+fn config_token_strings(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| config_token_string(Some(item), field)?.with_context(|| {
+                format!("tokenizer_config.json {field} entries must not be null")
+            }))
+            .collect(),
+        _ => Ok(config_token_string(value, field)?.into_iter().collect()),
+    }
+}
+
+fn config_token_string(value: Option<&Value>, field: &str) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(token)) => Ok(Some(token.clone())),
+        Some(Value::Object(object)) => object
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|content| Some(content.to_string()))
+            .with_context(|| {
+                format!("tokenizer_config.json {field} object must contain string content")
+            }),
+        Some(_) => bail!(
+            "tokenizer_config.json {field} must be a string, object, array, or null"
+        ),
+    }
+}
+
+fn parse_config_token_list(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        bail!("tokenizer_config.json {field} must be an array");
+    };
+    let mut tokens = Vec::new();
+    for item in items {
+        if let Some(token) = config_token_string(Some(item), field)? {
+            tokens.push(token);
+        }
+    }
+    Ok(tokens)
+}
+
+fn parse_added_tokens_decoder(
+    value: Option<&Value>,
+) -> Result<BTreeMap<u32, TokenizerConfigAddedToken>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        bail!("tokenizer_config.json added_tokens_decoder must be an object");
+    };
+    let mut out = BTreeMap::new();
+    for (id, value) in object {
+        let id = id
+            .parse::<u32>()
+            .with_context(|| format!("invalid added_tokens_decoder id {id:?}"))?;
+        let content = config_token_string(Some(value), "added_tokens_decoder")?
+            .context("added_tokens_decoder entries must contain token content")?;
+        let special = value
+            .as_object()
+            .and_then(|object| object.get("special"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.insert(id, TokenizerConfigAddedToken { content, special });
     }
     Ok(out)
 }
@@ -12731,30 +12949,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
         None
     };
 
-    let tokenizer_json = snapshot_dir.join("tokenizer.json");
-    if tokenizer_json.is_file() {
-        fs::copy(&tokenizer_json, &plan.tokenizer).with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                tokenizer_json.display(),
-                plan.tokenizer.display()
-            )
-        })?;
-    }
-    let tokenizer_config_json = snapshot_dir.join("tokenizer_config.json");
-    if tokenizer_config_json.is_file() {
-        fs::copy(
-            &tokenizer_config_json,
-            plan.runtime_dir.join("tokenizer_config.json"),
-        )
-        .with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                tokenizer_config_json.display(),
-                plan.runtime_dir.join("tokenizer_config.json").display()
-            )
-        })?;
-    }
+    prepare_tokenizer_artifacts(snapshot_dir, &plan)?;
 
     let index_json = snapshot_dir.join("model.safetensors.index.json");
     let (manifest, visual_tensor_refs) = if index_json.is_file() {
@@ -12835,6 +13030,34 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     fs::write(plan.runtime_dir.join("README.txt"), plan.describe())
         .with_context(|| "failed to write Flash-MoE cache README".to_string())?;
     Ok(plan)
+}
+
+fn prepare_tokenizer_artifacts(snapshot_dir: &Path, plan: &FlashMoePlan) -> Result<()> {
+    let tokenizer_json = snapshot_dir.join("tokenizer.json");
+    let tokenizer_config_json = snapshot_dir.join("tokenizer_config.json");
+    if !tokenizer_json.is_file() {
+        bail!(
+            "Flash-MoE requires tokenizer.json from the active model directory; missing {}",
+            tokenizer_json.display()
+        );
+    }
+    fs::create_dir_all(&plan.model_cache_dir)
+        .with_context(|| format!("failed to create {}", plan.model_cache_dir.display()))?;
+    if tokenizer_json != plan.tokenizer {
+        fs::copy(&tokenizer_json, &plan.tokenizer).with_context(|| {
+            format!("failed to copy {} to {}", tokenizer_json.display(), plan.tokenizer.display())
+        })?;
+    }
+    if tokenizer_config_json.is_file() && tokenizer_config_json != plan.tokenizer_config {
+        fs::copy(&tokenizer_config_json, &plan.tokenizer_config).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                tokenizer_config_json.display(),
+                plan.tokenizer_config.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn build_manifest(
@@ -15252,31 +15475,94 @@ mod tests {
     }
 
     fn test_tokenizer_config_json() -> &'static [u8] {
+        br##"{
+  "bos_token": null,
+  "eos_token": "<|im_end|>",
+  "pad_token": "<|endoftext|>",
+  "add_bos_token": false,
+  "added_tokens_decoder": {
+    "100": {"content": "<|im_start|>", "special": true},
+    "101": {"content": "<|im_end|>", "special": true},
+    "102": {"content": "<|endoftext|>", "special": true}
+  },
+  "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+  "split_special_tokens": false,
+  "model_max_length": 32768,
+  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+}"##
+    }
+
+    fn test_default_tokenizer_config_json() -> &'static [u8] {
         br#"{
+  "eos_token": "<|im_end|>",
+  "add_bos_token": false,
+  "split_special_tokens": false,
   "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
 }"#
     }
 
+    fn test_tokenizer_config_json_with_template(template: &str) -> Vec<u8> {
+        serde_json::json!({
+            "bos_token": null,
+            "eos_token": "<|im_end|>",
+            "pad_token": "<|endoftext|>",
+            "add_bos_token": false,
+            "added_tokens_decoder": {
+                "100": {"content": "<|im_start|>", "special": true},
+                "101": {"content": "<|im_end|>", "special": true},
+                "102": {"content": "<|endoftext|>", "special": true}
+            },
+            "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+            "split_special_tokens": false,
+            "model_max_length": 32768u64,
+            "chat_template": template
+        }).to_string().into_bytes()
+    }
+
+
+    #[test]
+    fn non_flashmoe_models_still_select_llamacpp_backend() {
+        for model in [
+            "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf",
+            "qwen-vision.gguf",
+            "/models/local-model.gguf",
+        ] {
+            assert_eq!(select_backend(model), BackendSelection::LlamaCpp);
+            assert!(plan(model, Path::new("/models")).is_none());
+        }
+    }
+
+    #[test]
+    fn flashmoe_tokenizer_loads_metadata_from_active_model_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        std::fs::write(snapshot.join("tokenizer_config.json"), test_tokenizer_config_json()).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config).unwrap();
+        assert_eq!(tokenizer.eos_token_id(), 101);
+        assert_eq!(tokenizer.encode("<|im_end|>").unwrap(), vec![101]);
+    }
+
     fn test_qwen3_tool_tokenizer_config_json() -> &'static [u8] {
-        br##"{
-  "chat_template": "{%- if tools %}\n{{- '<|im_start|>system\\n' }}\n{%- if messages and messages[0].role == 'system' %}{{- messages[0].content + '\\n\\n' }}{%- endif %}\n{{- '<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if not (tools and loop.first and message.role == 'system') %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- message.content }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
-}"##
+        br##"{"bos_token":null,"eos_token":"<|im_end|>","pad_token":"<|endoftext|>","add_bos_token":false,"added_tokens_decoder":{"100":{"content":"<|im_start|>","special":true},"101":{"content":"<|im_end|>","special":true},"102":{"content":"<|endoftext|>","special":true}},"additional_special_tokens":["<|im_start|>","<|im_end|>"],"split_special_tokens":false,"model_max_length":32768,"chat_template":"{%- if tools %}\n{{- '<|im_start|>system\\n' }}\n{%- if messages and messages[0].role == 'system' %}{{- messages[0].content + '\\n\\n' }}{%- endif %}\n{{- '<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if not (tools and loop.first and message.role == 'system') %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- message.content }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"}"##
     }
 
     fn test_qwen3vl_tool_tokenizer_config_json() -> &'static [u8] {
-        br##"{
-  "chat_template": "{%- macro render_content(content) %}{%- if content is string %}{{- content }}{%- else %}{%- for item in content %}{%- if item.type == 'text' %}{{- item.text }}{%- elif item.type == 'image' %}{{- '<|vision_start|><|image_pad|><|vision_end|>' }}{%- endif %}{%- endfor %}{%- endif %}{%- endmacro %}\n{%- if tools %}\n{{- '<|im_start|>system\\n<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' }}{{- render_content(message.content) }}{{- '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- render_content(message.content) }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
-}"##
+        br##"{"bos_token":null,"eos_token":"<|im_end|>","pad_token":"<|endoftext|>","add_bos_token":false,"added_tokens_decoder":{"100":{"content":"<|im_start|>","special":true},"101":{"content":"<|im_end|>","special":true},"102":{"content":"<|endoftext|>","special":true},"200":{"content":"<|vision_start|>","special":true},"201":{"content":"<|vision_end|>","special":true},"202":{"content":"<|image_pad|>","special":true}},"additional_special_tokens":["<|im_start|>","<|im_end|>","<|vision_start|>","<|vision_end|>","<|image_pad|>"],"split_special_tokens":false,"model_max_length":32768,"chat_template":"{%- macro render_content(content) %}{%- if content is string %}{{- content }}{%- else %}{%- for item in content %}{%- if item.type == 'text' %}{{- item.text }}{%- elif item.type == 'image' %}{{- '<|vision_start|><|image_pad|><|vision_end|>' }}{%- endif %}{%- endfor %}{%- endif %}{%- endmacro %}\n{%- if tools %}\n{{- '<|im_start|>system\\n<tools>\\n' }}\n{%- for tool in tools %}{{- tool | tojson }}{{- '\\n' }}{%- endfor %}\n{{- '</tools><|im_end|>\\n' }}\n{%- endif %}\n{%- for message in messages %}\n{%- if message.role == 'tool' %}\n{{- '<|im_start|>user\\n<tool_response>\\n' }}{{- render_content(message.content) }}{{- '\\n</tool_response><|im_end|>\\n' }}\n{%- else %}\n{{- '<|im_start|>' + message.role + '\\n' }}{{- render_content(message.content) }}\n{%- for tool_call in message.tool_calls %}{{- '\\n<tool_call>\\n{\"name\": ' }}{{- tool_call.name | tojson }}{{- ', \"arguments\": ' }}{{- tool_call.arguments | tojson }}{{- '}\\n</tool_call>' }}{%- endfor %}\n{{- '<|im_end|>\\n' }}\n{%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"}"##
     }
 
     fn test_byte_bpe_tokenizer_json() -> &'static [u8] {
         br#"{
   "version": "1.0",
   "added_tokens": [
-    {"id": 100, "content": "<|im_start|>", "special": true},
-    {"id": 101, "content": "<|im_end|>", "special": true},
-    {"id": 102, "content": "<|endoftext|>", "special": true}
+    {"id": 100, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 101, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 102, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
   ],
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+  "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
   "model": {
     "type": "BPE",
     "vocab": {
@@ -15600,7 +15886,11 @@ mod tests {
 
     #[test]
     fn qwen3vl_parity_multimodal_prompt_image_tokens_and_mrope_goldens() {
-        let tokenizer = QwenTokenizer::from_json_bytes(test_qwen3vl_tokenizer_json()).unwrap();
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
+        )
+        .unwrap();
         let rendered = tokenizer
             .apply_chat_template_to_messages(
                 &[ChatMessage {

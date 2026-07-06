@@ -33,6 +33,7 @@ tempfile = "3.10.1"
 sha2 = "0.10.9"
 similar = "2.7.0"
 thiserror = "2.0.18"
+tokenizers = "0.22"
 tokio = { version = "1.38.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 toml = "0.8"
