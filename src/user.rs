@@ -234,11 +234,12 @@ fn encode_png(source: &[u8]) -> Result<Vec<u8>, MacOsUserError> {
 #[cfg(target_os = "macos")]
 fn path_or_file_url_to_pathbuf(s: &str) -> Result<PathBuf, MacOsUserError> {
     if let Ok(url) = url::Url::parse(s)
-        && url.scheme() == "file" {
-            return url
-                .to_file_path()
-                .map_err(|_| MacOsUserError::BadPicturePath(s.to_owned()));
-        }
+        && url.scheme() == "file"
+    {
+        return url
+            .to_file_path()
+            .map_err(|_| MacOsUserError::BadPicturePath(s.to_owned()));
+    }
 
     Ok(PathBuf::from(s))
 }

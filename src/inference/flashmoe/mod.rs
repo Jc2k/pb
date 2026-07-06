@@ -9217,10 +9217,9 @@ impl DenseStore {
         output_width: usize,
     ) -> Result<Vec<f32>> {
         let projection_started = Instant::now();
-        let entry = self
-            .registry
-            .tensor(canonical_name)
-            .with_context(|| format!("Flash-MoE dense tensor registry is missing {canonical_name}"))?;
+        let entry = self.registry.tensor(canonical_name).with_context(|| {
+            format!("Flash-MoE dense tensor registry is missing {canonical_name}")
+        })?;
         let dtype = entry.dtype.clone();
         let use_raw_bf16 = is_bf16_dtype(&dtype);
         let mut decoded_read_timing = DenseTileReadTiming::default();
@@ -9399,7 +9398,9 @@ impl DenseStore {
                 .registry
                 .tensor(canonical_name)
                 .map(|entry| entry.dtype.clone())
-                .with_context(|| format!("Flash-MoE dense tensor registry is missing {canonical_name}"))?;
+                .with_context(|| {
+                    format!("Flash-MoE dense tensor registry is missing {canonical_name}")
+                })?;
             return Ok((tile, dtype, timing));
         }
 

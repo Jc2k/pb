@@ -405,16 +405,17 @@ impl StdioMcpClient {
                 break;
             }
             if let Some((name, value)) = trimmed.split_once(':')
-                && name.eq_ignore_ascii_case("Content-Length") {
-                    let length = value
-                        .trim()
-                        .parse::<usize>()
-                        .context("invalid MCP Content-Length header")?;
-                    if length > MAX_MCP_RESPONSE_BYTES {
-                        bail!("MCP response is too large: {length} bytes");
-                    }
-                    content_length = Some(length);
+                && name.eq_ignore_ascii_case("Content-Length")
+            {
+                let length = value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid MCP Content-Length header")?;
+                if length > MAX_MCP_RESPONSE_BYTES {
+                    bail!("MCP response is too large: {length} bytes");
                 }
+                content_length = Some(length);
+            }
         }
         let length = content_length.context("MCP response missing Content-Length header")?;
         let mut body = vec![0; length];

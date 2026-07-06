@@ -1632,8 +1632,7 @@ fn push_tsv_row(out: &mut String, fields: &[&str]) {
         if idx > 0 {
             out.push('\t');
         }
-        let sanitized = field
-            .replace(['\t', '\n', '\r'], " ");
+        let sanitized = field.replace(['\t', '\n', '\r'], " ");
         out.push_str(&sanitized);
     }
     out.push('\n');

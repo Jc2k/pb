@@ -355,13 +355,14 @@ fn fetch_registry_json(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         if let Some(challenge) = challenge
-            && let Some(token) = fetch_bearer_token(client, &challenge, image)? {
-                response = client
-                    .get(url)
-                    .header(ACCEPT, accept)
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
-                    .send()?;
-            }
+            && let Some(token) = fetch_bearer_token(client, &challenge, image)?
+        {
+            response = client
+                .get(url)
+                .header(ACCEPT, accept)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .send()?;
+        }
     }
     let response = response.error_for_status()?;
     response

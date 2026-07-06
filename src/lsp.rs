@@ -439,15 +439,16 @@ impl LspClient {
     }
     fn handle_notification(&mut self, method: &str, params: Value) {
         if method == "textDocument/publishDiagnostics"
-            && let Some(uri) = params.get("uri").and_then(Value::as_str) {
-                self.diagnostics.insert(
-                    uri.to_string(),
-                    params
-                        .get("diagnostics")
-                        .cloned()
-                        .unwrap_or_else(|| json!([])),
-                );
-            }
+            && let Some(uri) = params.get("uri").and_then(Value::as_str)
+        {
+            self.diagnostics.insert(
+                uri.to_string(),
+                params
+                    .get("diagnostics")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            );
+        }
     }
 }
 

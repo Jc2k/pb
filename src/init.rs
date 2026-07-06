@@ -767,9 +767,10 @@ fn normalize_command(root: &Path, source: &Path, command: &str) -> String {
         return command.to_string();
     }
     if let Ok(rel) = parent.strip_prefix(root)
-        && !rel.as_os_str().is_empty() {
-            return format!("cd {} && {command}", shell_escape_path(rel));
-        }
+        && !rel.as_os_str().is_empty()
+    {
+        return format!("cd {} && {command}", shell_escape_path(rel));
+    }
     command.to_string()
 }
 
