@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+use tracing::info;
 
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -4231,12 +4232,25 @@ impl FlashMoeEngine {
         mut timing: Option<&mut FlashMoeGenerationTiming>,
     ) -> Result<TimedGenerationOutput> {
         let generation_started = Instant::now();
+        let render_started = Instant::now();
         let prompt = self.tokenizer.apply_chat_template_to_messages(
             &request.messages,
             &request.tools,
             request.add_generation_prompt,
         )?;
+        let render_elapsed = render_started.elapsed();
+        let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
+        let encode_elapsed = encode_started.elapsed();
+        info!(
+            "flashmoe: rendered prompt chars={} tokens={} render_ms={} encode_ms={} tools={} session={}",
+            prompt.len(),
+            prompt_tokens.len(),
+            render_elapsed.as_millis(),
+            encode_elapsed.as_millis(),
+            request.tools.len(),
+            session_id.unwrap_or("<none>")
+        );
         let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
         let cached = session_id.and_then(|id| {
             take_reusable_session_cache_entry(&mut self.session_cache, id, &prompt_tokens)
@@ -4254,6 +4268,11 @@ impl FlashMoeEngine {
                 } else {
                     None
                 };
+                info!(
+                    "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
+                    prefix_len,
+                    prompt_tokens.len()
+                );
                 (kv_cache, prefix_len, last_hidden)
             } else {
                 (
@@ -4263,14 +4282,30 @@ impl FlashMoeEngine {
                 )
             };
         let prefill_hidden = if prefill_start == prompt_tokens.len() {
+            info!(
+                "flashmoe: prompt prefill fully cached tokens={}",
+                prompt_tokens.len()
+            );
             cached_last_hidden.context("session cache entry is missing the final hidden state")?
         } else {
-            self.prefill_from(
+            let prefill_started = Instant::now();
+            info!(
+                "flashmoe: prefill begin start_token={} remaining_tokens={}",
+                prefill_start,
+                prompt_tokens.len().saturating_sub(prefill_start)
+            );
+            let hidden = self.prefill_from(
                 &prompt_tokens,
                 prefill_start,
                 &mut kv_cache,
                 timing.as_deref_mut(),
-            )?
+            )?;
+            info!(
+                "flashmoe: prefill complete tokens={} elapsed_ms={}",
+                prompt_tokens.len().saturating_sub(prefill_start),
+                prefill_started.elapsed().as_millis()
+            );
+            hidden
         };
         let prompt_cache = session_id
             .is_some()
@@ -4282,8 +4317,14 @@ impl FlashMoeEngine {
         let mut stopped = false;
         if max_tokens > 0 {
             let sample_started = Instant::now();
+            info!("flashmoe: first-token sampling begin");
             let token =
                 self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            info!(
+                "flashmoe: first-token sampling complete token={} elapsed_ms={}",
+                token,
+                sample_started.elapsed().as_millis()
+            );
             if let Some(timing) = timing.as_deref_mut()
                 && let Some(last) = timing.tokens.last_mut()
             {
@@ -4300,6 +4341,13 @@ impl FlashMoeEngine {
         }
         while !stopped && generated.len() < max_tokens {
             let position = prompt_tokens.len() + generated.len() - 1;
+            info!(
+                "flashmoe: decode begin generated={}/{} position={}",
+                generated.len(),
+                max_tokens,
+                position
+            );
+            let decode_started = Instant::now();
             let sampled = self.sample_next_token(
                 &mut sampler,
                 &prompt_tokens,
@@ -4310,6 +4358,13 @@ impl FlashMoeEngine {
                 timing.as_deref_mut(),
             )?;
             let token = sampled.token;
+            info!(
+                "flashmoe: decode complete generated={}/{} token={} elapsed_ms={}",
+                generated.len() + 1,
+                max_tokens,
+                token,
+                decode_started.elapsed().as_millis()
+            );
             if self.tokenizer.is_eos(token) {
                 break;
             }
@@ -4330,6 +4385,11 @@ impl FlashMoeEngine {
             generated_tokens: generated.len(),
         };
         let total_wall = generation_started.elapsed();
+        info!(
+            "flashmoe: generation complete generated_tokens={} total_ms={}",
+            generated.len(),
+            total_wall.as_millis()
+        );
         if let Some(timing) = timing {
             timing.total_wall = total_wall;
             return Ok(TimedGenerationOutput {
@@ -4372,6 +4432,8 @@ impl FlashMoeEngine {
         }
         let prefill_strategy = self.text_prefill_expert_strategy();
         let mut last_hidden = None;
+        let progress_started = Instant::now();
+        let mut last_progress = Instant::now();
         for (position, token) in prompt_tokens
             .iter()
             .copied()
@@ -4403,6 +4465,22 @@ impl FlashMoeEngine {
             )?);
             if let Some(timing) = timing.as_deref_mut() {
                 timing.tokens.push(token_timing);
+            }
+            let processed = position.saturating_sub(start_position) + 1;
+            let remaining = prompt_tokens.len().saturating_sub(position + 1);
+            let should_report = processed == 1
+                || remaining == 0
+                || processed % 16 == 0
+                || last_progress.elapsed() >= Duration::from_secs(10);
+            if should_report {
+                info!(
+                    "flashmoe: prefill progress processed={} remaining={} position={} elapsed_ms={}",
+                    processed,
+                    remaining,
+                    position,
+                    progress_started.elapsed().as_millis()
+                );
+                last_progress = Instant::now();
             }
         }
         last_hidden.context("cannot generate from an empty prompt")
