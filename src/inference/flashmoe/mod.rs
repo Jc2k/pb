@@ -3761,12 +3761,20 @@ impl MetalExecutorInner {
         let mut total_rows = 0usize;
         let mut dispatches = Vec::with_capacity(projections.len());
         for projection in projections {
-            if projection.rows == 0 || projection.cols == 0 || projection.cols > input.len() {
+            if projection.rows == 0 || projection.cols == 0 {
                 return Ok(None);
             }
-            if projection.output_width < projection.rows {
+            if projection.cols != input.len() {
                 bail!(
-                    "dense mmap batch projection {} output width {} is smaller than rows {}",
+                    "dense mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input.len(),
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense mmap batch projection {} output width {} does not match rows {}",
                     projection.tensor_name,
                     projection.output_width,
                     projection.rows
@@ -4010,12 +4018,19 @@ impl MetalExecutorInner {
         hidden: &[f32],
         top_k: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        if lm_head.rows == 0 || lm_head.cols == 0 || top_k == 0 || lm_head.cols > hidden.len() {
+        if lm_head.rows == 0 || lm_head.cols == 0 || top_k == 0 {
             return Ok(Vec::new());
+        }
+        if lm_head.cols != hidden.len() {
+            bail!(
+                "Metal LM-head hidden length {} does not match cols {}",
+                hidden.len(),
+                lm_head.cols
+            );
         }
         let top_k = top_k.min(lm_head.rows).max(1);
         unsafe {
-            let hidden_buffer = self.buffer_with_bytes(f32_as_bytes(&hidden[..lm_head.cols]))?;
+            let hidden_buffer = self.buffer_with_bytes(f32_as_bytes(hidden))?;
             let logits_buffer = self.buffer_with_len(lm_head.rows * std::mem::size_of::<f32>())?;
             let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
             let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
@@ -9217,6 +9232,24 @@ fn dense_projection_trace_enabled() -> bool {
         .is_some_and(env_flag_enabled)
 }
 
+
+fn validate_dense_matvec_shape(
+    entry: &RuntimeTensorEntry,
+    canonical_name: &str,
+    expected_rows: usize,
+    input_len: usize,
+) -> Result<(usize, usize)> {
+    let expected_shape = [expected_rows, input_len];
+    match entry.shape.as_slice() {
+        [rows, cols] if *rows == expected_rows && *cols == input_len => Ok((*rows, *cols)),
+        _ => bail!(
+            "Flash-MoE dense tensor {canonical_name} shape mismatch: expected shape {:?}, actual shape {:?}, input length {input_len}",
+            expected_shape,
+            entry.shape
+        ),
+    }
+}
+
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
@@ -9552,12 +9585,9 @@ impl DenseStore {
         if let Some(metal) = metal
             && let Some(entry) = self.registry.tensor(&tensor_name)
         {
-            let cols = entry.shape.last().copied().unwrap_or(0);
-            let rows = entry.shape.first().copied().unwrap_or(width).min(width);
-            let used_cols = cols.min(input.len());
-            if rows > 0 && used_cols > 0 && used_cols == cols {
-                return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
-            }
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, &tensor_name, width, input.len())?;
+            return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
         }
         self.project(layer, name, input, width)
     }
@@ -9582,18 +9612,18 @@ impl DenseStore {
             let Some(entry) = self.registry.tensor(spec.tensor_name) else {
                 return Ok(None);
             };
-            let cols = entry.shape.last().copied().unwrap_or(0);
-            let rows = entry
-                .shape
-                .first()
-                .copied()
-                .unwrap_or(spec.output_width)
-                .min(spec.output_width);
-            if rows == 0 || cols == 0 || cols > input.len() {
-                return Ok(None);
-            }
+            let (rows, cols) = validate_dense_matvec_shape(
+                entry,
+                spec.tensor_name,
+                spec.output_width,
+                input.len(),
+            )?;
             let Some(element_size) = dtype_size(&entry.dtype) else {
-                return Ok(None);
+                bail!(
+                    "Flash-MoE dense tensor {} has unsupported dtype {}",
+                    spec.tensor_name,
+                    entry.dtype
+                );
             };
             let row_bytes = cols
                 .checked_mul(element_size)
@@ -9605,7 +9635,13 @@ impl DenseStore {
                 .checked_add(byte_len as u64)
                 .map_or(true, |end| end > self.len)
             {
-                return Ok(None);
+                bail!(
+                    "Flash-MoE dense tensor {} byte range {}..{} exceeds dense store length {}",
+                    spec.tensor_name,
+                    entry.byte_offset,
+                    entry.byte_offset.saturating_add(byte_len as u64),
+                    self.len
+                );
             }
             total_rows = total_rows
                 .checked_add(rows)
@@ -9665,23 +9701,12 @@ impl DenseStore {
             Some(e) => e,
             None => return Ok(None),
         };
-        let cols = entry.shape.last().copied().unwrap_or(0);
-        let rows = entry
-            .shape
-            .first()
-            .copied()
-            .unwrap_or(output_width)
-            .min(output_width);
-        if rows == 0 || cols == 0 {
-            return Ok(None);
-        }
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, tensor_name, output_width, input.len())?;
         if let Some(metal) = metal {
-            let used_cols = cols.min(input.len());
-            if used_cols > 0 && used_cols == cols {
-                return self
-                    .metal_matvec_tiled(metal, tensor_name, input, rows, cols, output_width)
-                    .map(Some);
-            }
+            return self
+                .metal_matvec_tiled(metal, tensor_name, input, rows, cols, output_width)
+                .map(Some);
         }
         if let Some(projected) = self.matvec_tensor_prefix(tensor_name, input, output_width)? {
             return Ok(Some(projected));
@@ -9735,13 +9760,14 @@ impl DenseStore {
         if let Some(metal) = metal
             && let Some(entry) = self.registry.tensor(&tensor_name)
         {
-            let cols = entry.shape.last().copied().unwrap_or(0);
-            let rows = entry.shape.first().copied().unwrap_or(experts).min(experts);
-            if rows > 0 && cols > 0 && cols <= hidden.len() {
-                let scores =
-                    self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
-                return Ok(scores);
-            }
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, &tensor_name, experts, hidden.len())?;
+            let scores =
+                self.metal_matvec_tiled(metal, &tensor_name, hidden, rows, cols, experts)?;
+            return Ok(scores);
+        }
+        if let Some(entry) = self.registry.tensor(&tensor_name) {
+            validate_dense_matvec_shape(entry, &tensor_name, experts, hidden.len())?;
         }
 
         let mut router_scores = vec![0.0f32; experts];
@@ -9762,22 +9788,19 @@ impl DenseStore {
         if let Some(metal) = metal
             && let Some(entry) = self.registry.tensor(lm_head_name)
         {
-            let cols = entry.shape.last().copied().unwrap_or(0);
-            let rows = entry
-                .shape
-                .first()
-                .copied()
-                .unwrap_or(tokenizer.vocab_size())
-                .min(tokenizer.vocab_size());
-            if rows > 0 && cols > 0 && cols <= hidden.len() {
-                let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
-                let projected =
-                    self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
-                for (token, value) in projected.into_iter().enumerate() {
-                    logits[token] = value;
-                }
-                return Ok(logits);
+            let (rows, cols) = validate_dense_matvec_shape(
+                entry,
+                lm_head_name,
+                tokenizer.vocab_size(),
+                hidden.len(),
+            )?;
+            let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+            let projected =
+                self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
+            for (token, value) in projected.into_iter().enumerate() {
+                logits[token] = value;
             }
+            return Ok(logits);
         }
 
         self.lm_head_logits(lm_head_name, hidden, tokenizer)
@@ -9799,16 +9822,12 @@ impl DenseStore {
         let Some(entry) = self.registry.tensor(lm_head_name) else {
             return Ok(None);
         };
-        let cols = entry.shape.last().copied().unwrap_or(0);
-        let rows = entry
-            .shape
-            .first()
-            .copied()
-            .unwrap_or(tokenizer.vocab_size())
-            .min(tokenizer.vocab_size());
-        if rows == 0 || cols == 0 || cols > hidden.len() {
-            return Ok(None);
-        }
+        let (rows, cols) = validate_dense_matvec_shape(
+            entry,
+            lm_head_name,
+            tokenizer.vocab_size(),
+            hidden.len(),
+        )?;
 
         let top_k = sampler.top_k.min(rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
@@ -9879,6 +9898,8 @@ impl DenseStore {
         hidden: &[f32],
         tokenizer: &QwenTokenizer,
     ) -> Result<Vec<f32>> {
+        let entry = self.registry.require(lm_head_name)?;
+        validate_dense_matvec_shape(entry, lm_head_name, tokenizer.vocab_size(), hidden.len())?;
         let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
         for idx in 0..tokenizer.vocab_size() {
             let Some(row) = self.read_tensor_row_f32(lm_head_name, idx, hidden.len())? else {
@@ -9916,27 +9937,32 @@ impl DenseStore {
         let Some(entry) = self.registry.tensor(canonical_name) else {
             return Ok(None);
         };
-        let cols = entry.shape.last().copied().unwrap_or(0);
-        if cols == 0 {
-            return Ok(None);
-        }
-        let rows = entry.shape.first().copied().unwrap_or(width).min(width);
-        let used_cols = input.len().min(cols);
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, canonical_name, width, input.len())?;
         if let Some(tensor) = self.dense_tensor_f32(canonical_name)? {
+            let expected_len = rows
+                .checked_mul(cols)
+                .context("dense resident tensor value count overflow")?;
+            if tensor.len() != expected_len {
+                bail!(
+                    "Flash-MoE dense tensor {canonical_name} has {} decoded values; expected {expected_len} for shape {:?} and input length {}",
+                    tensor.len(),
+                    entry.shape,
+                    input.len()
+                );
+            }
             let mut out = vec![0.0f32; width];
             for (row, slot) in out.iter_mut().take(rows).enumerate() {
                 let start = row
                     .checked_mul(cols)
                     .context("dense resident tensor row offset overflow")?;
                 let end = start
-                    .checked_add(used_cols)
+                    .checked_add(cols)
                     .context("dense resident tensor row length overflow")?;
-                let Some(weights) = tensor.get(start..end) else {
-                    return Ok(None);
-                };
+                let weights = &tensor[start..end];
                 let acc = weights
                     .iter()
-                    .zip(input.iter().take(used_cols))
+                    .zip(input.iter())
                     .map(|(weight, value)| weight * value)
                     .sum::<f32>();
                 *slot = acc;
@@ -9945,13 +9971,13 @@ impl DenseStore {
         }
         let mut out = vec![0.0f32; width];
         for (row, slot) in out.iter_mut().take(rows).enumerate() {
-            let weights = self.read_tensor_row_f32(canonical_name, row, used_cols)?;
+            let weights = self.read_tensor_row_f32(canonical_name, row, cols)?;
             let Some(weights) = weights else {
                 return Ok(None);
             };
             let acc = weights
                 .iter()
-                .zip(input.iter().take(used_cols))
+                .zip(input.iter())
                 .map(|(weight, value)| weight * value)
                 .sum::<f32>();
             *slot = acc;
@@ -9972,6 +9998,14 @@ impl DenseStore {
         let entry = self.registry.tensor(canonical_name).with_context(|| {
             format!("Flash-MoE dense tensor registry is missing {canonical_name}")
         })?;
+        validate_dense_matvec_shape(entry, canonical_name, output_width, input.len())?;
+        if rows != output_width || cols != input.len() {
+            bail!(
+                "Flash-MoE dense tensor {canonical_name} matvec dimensions mismatch: expected shape [{output_width}, {}], actual requested rows={rows}, cols={cols}, input length {}",
+                input.len(),
+                input.len()
+            );
+        }
         let dtype = entry.dtype.clone();
         let use_raw_bf16 = is_bf16_dtype(&dtype);
         let mut decoded_read_timing = DenseTileReadTiming::default();
@@ -19979,6 +20013,90 @@ mod tests {
         assert!(logits.iter().all(|value| value.is_finite()));
     }
 
+
+    #[test]
+    fn dense_projection_rejects_input_width_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let mut bytes = Vec::new();
+        for value in 0..6u32 {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "proj.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 3],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .matvec_tensor_prefix("proj.weight", &[1.0, 1.0], 2)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("proj.weight"), "{err:#}");
+        assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [2, 3]"), "{err:#}");
+        assert!(message.contains("input length 2"), "{err:#}");
+    }
+
+    #[test]
+    fn dense_projection_rejects_output_width_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let mut bytes = Vec::new();
+        for value in 0..2u32 {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "proj.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![1, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .project_dense_tensor_with_metal(None, "proj.weight", &[1.0, 1.0], 2)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("proj.weight"), "{err:#}");
+        assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [1, 2]"), "{err:#}");
+    }
+
     #[test]
     fn lm_head_logits_rejects_missing_vocab_rows() {
         let tmp = tempfile::tempdir().unwrap();
@@ -20034,8 +20152,9 @@ mod tests {
             .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
             .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("cannot provide row"), "{err:#}");
-        assert!(message.contains("token 2"), "{err:#}");
+        assert!(message.contains("lm_head.weight"), "{err:#}");
+        assert!(message.contains("expected shape [3, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [2, 2]"), "{err:#}");
     }
 
     #[test]
