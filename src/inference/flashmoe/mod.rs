@@ -63,6 +63,7 @@ pub const LINEAR_CONV_DIM: usize = LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE;
 pub const CONV_KERNEL_SIZE: usize = 4;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DENSE_PROJECTION_TRACE_ENV: &str = "PB_FLASHMOE_DENSE_PROJECTION_TRACE";
 const FLASHMOE_METAL_COMMAND_TIMEOUT_ENV: &str = "PB_FLASHMOE_METAL_COMMAND_TIMEOUT_MS";
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
@@ -5037,7 +5038,9 @@ impl FlashMoeEngine {
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
             let expert_metrics_after = self.scheduler.snapshot();
             let expert_delta = expert_metrics_after.saturating_delta(expert_metrics_before);
-            layer_timing.buckets.add_expert_scheduler_delta(expert_delta);
+            layer_timing
+                .buckets
+                .add_expert_scheduler_delta(expert_delta);
             let expert_compute_started = Instant::now();
             for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
                 state = state.wrapping_add(
@@ -8469,6 +8472,16 @@ fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {
         .min(rows.max(1))
 }
 
+fn dense_projection_trace_enabled() -> bool {
+    std::env::var_os(DENSE_PROJECTION_TRACE_ENV)
+        .as_ref()
+        .is_some_and(env_flag_enabled)
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 #[derive(Debug, Clone)]
 pub struct DenseStore {
     manifest_path: PathBuf,
@@ -8497,6 +8510,45 @@ struct DenseTensorTileKey {
     row_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct DenseTileReadTiming {
+    total: Duration,
+    read_range: Duration,
+    decode: Duration,
+    cache_insert: Duration,
+    cache_evict: Duration,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_inserts: u64,
+    cache_evictions: u64,
+    bytes_read: u64,
+    decoded_bytes: u64,
+}
+
+impl DenseTileReadTiming {
+    fn add(&mut self, other: Self) {
+        self.total += other.total;
+        self.read_range += other.read_range;
+        self.decode += other.decode;
+        self.cache_insert += other.cache_insert;
+        self.cache_evict += other.cache_evict;
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.cache_inserts = self.cache_inserts.saturating_add(other.cache_inserts);
+        self.cache_evictions = self.cache_evictions.saturating_add(other.cache_evictions);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.decoded_bytes = self.decoded_bytes.saturating_add(other.decoded_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DenseTensorTileCacheInsertStats {
+    inserts: u64,
+    evictions: u64,
+    insert_time: Duration,
+    evict_time: Duration,
+}
+
 #[derive(Debug, Default)]
 struct DenseTensorTileCache {
     tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<f32>>>,
@@ -8516,11 +8568,22 @@ impl DenseTensorTileCache {
         self.tiles.get(key).cloned()
     }
 
-    fn insert(&mut self, key: DenseTensorTileKey, tile: Arc<Vec<f32>>) {
+    fn insert(
+        &mut self,
+        key: DenseTensorTileKey,
+        tile: Arc<Vec<f32>>,
+    ) -> DenseTensorTileCacheInsertStats {
         let bytes = tile.len() * std::mem::size_of::<f32>();
-        if bytes > self.max_bytes {
-            return;
+        if bytes == 0 || bytes > self.max_bytes {
+            return DenseTensorTileCacheInsertStats::default();
         }
+        if let Some(previous) = self.tiles.remove(&key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+        }
+        let evict_started = Instant::now();
+        let mut evictions = 0u64;
         while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tiles.is_empty() {
             let Some(victim) = self.tiles.keys().next().cloned() else {
                 break;
@@ -8529,14 +8592,24 @@ impl DenseTensorTileCache {
                 self.bytes = self
                     .bytes
                     .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+                evictions = evictions.saturating_add(1);
             }
         }
-        if let Some(previous) = self.tiles.insert(key, tile) {
-            self.bytes = self
-                .bytes
-                .saturating_sub(previous.len() * std::mem::size_of::<f32>());
-        }
+        let evict_time = if evictions > 0 {
+            evict_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
+        let insert_started = Instant::now();
+        self.tiles.insert(key, tile);
         self.bytes = self.bytes.saturating_add(bytes);
+        DenseTensorTileCacheInsertStats {
+            inserts: 1,
+            evictions,
+            insert_time: insert_started.elapsed(),
+            evict_time,
+        }
     }
 }
 
@@ -8986,15 +9059,47 @@ impl DenseStore {
         cols: usize,
         output_width: usize,
     ) -> Result<Vec<f32>> {
+        let projection_started = Instant::now();
+        let mut read_timing = DenseTileReadTiming::default();
         let mut output = vec![0.0f32; output_width];
         let tile_rows = dense_projection_tile_rows(cols, rows);
+        let mut tiles = 0usize;
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
-            let tensor = self.read_tensor_rows_f32_cached(canonical_name, start, end - start)?;
+            let (tensor, timing) =
+                self.read_tensor_rows_f32_cached_profiled(canonical_name, start, end - start)?;
+            read_timing.add(timing);
             let projected = metal.dense_matvec(tensor.as_slice(), input, end - start, cols)?;
             for (offset, value) in projected.into_iter().enumerate() {
                 output[start + offset] = value;
             }
+            tiles += 1;
+        }
+        let total = projection_started.elapsed();
+        if dense_projection_trace_enabled() || total >= Duration::from_millis(100) {
+            info!(
+                projection = %canonical_name,
+                rows,
+                cols,
+                tile_rows,
+                tiles,
+                input_len = input.len(),
+                output_width,
+                tile_mb = DENSE_PROJECTION_TILE_BYTES / (1024 * 1024),
+                read_decode_ms = duration_ms(read_timing.total),
+                read_range_ms = duration_ms(read_timing.read_range),
+                dtype_decode_ms = duration_ms(read_timing.decode),
+                decoded_tile_cache_hits = read_timing.cache_hits,
+                decoded_tile_cache_misses = read_timing.cache_misses,
+                decoded_tile_cache_inserts = read_timing.cache_inserts,
+                decoded_tile_cache_evictions = read_timing.cache_evictions,
+                decoded_tile_cache_insert_ms = duration_ms(read_timing.cache_insert),
+                decoded_tile_cache_evict_ms = duration_ms(read_timing.cache_evict),
+                dense_bytes_read = read_timing.bytes_read,
+                dense_decoded_bytes = read_timing.decoded_bytes,
+                total_ms = duration_ms(total),
+                "flashmoe dense projection complete"
+            );
         }
         Ok(output)
     }
@@ -9029,6 +9134,18 @@ impl DenseStore {
         start_row: usize,
         row_count: usize,
     ) -> Result<Arc<Vec<f32>>> {
+        let (tile, _) =
+            self.read_tensor_rows_f32_cached_profiled(canonical_name, start_row, row_count)?;
+        Ok(tile)
+    }
+
+    fn read_tensor_rows_f32_cached_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Arc<Vec<f32>>, DenseTileReadTiming)> {
+        let started = Instant::now();
         let key = DenseTensorTileKey {
             name: canonical_name.to_string(),
             start_row,
@@ -9040,14 +9157,32 @@ impl DenseStore {
             .expect("dense decoded tile cache poisoned")
             .get(&key)
         {
-            return Ok(tile);
+            let mut timing = DenseTileReadTiming {
+                cache_hits: 1,
+                ..DenseTileReadTiming::default()
+            };
+            timing.total = started.elapsed();
+            return Ok((tile, timing));
         }
-        let tile = Arc::new(self.read_tensor_rows_f32(canonical_name, start_row, row_count)?);
-        self.decoded_tiles
+        let mut timing = DenseTileReadTiming {
+            cache_misses: 1,
+            ..DenseTileReadTiming::default()
+        };
+        let (decoded, uncached_timing) =
+            self.read_tensor_rows_f32_profiled(canonical_name, start_row, row_count)?;
+        timing.add(uncached_timing);
+        let tile = Arc::new(decoded);
+        let stats = self
+            .decoded_tiles
             .lock()
             .expect("dense decoded tile cache poisoned")
             .insert(key, tile.clone());
-        Ok(tile)
+        timing.cache_inserts = timing.cache_inserts.saturating_add(stats.inserts);
+        timing.cache_evictions = timing.cache_evictions.saturating_add(stats.evictions);
+        timing.cache_insert += stats.insert_time;
+        timing.cache_evict += stats.evict_time;
+        timing.total = started.elapsed();
+        Ok((tile, timing))
     }
 
     fn read_tensor_rows_f32(
@@ -9056,6 +9191,19 @@ impl DenseStore {
         start_row: usize,
         row_count: usize,
     ) -> Result<Vec<f32>> {
+        let (tensor, _) =
+            self.read_tensor_rows_f32_profiled(canonical_name, start_row, row_count)?;
+        Ok(tensor)
+    }
+
+    fn read_tensor_rows_f32_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Vec<f32>, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let mut timing = DenseTileReadTiming::default();
         let Some(entry) = self.registry.tensor(canonical_name) else {
             bail!("Flash-MoE dense tensor registry is missing {canonical_name}");
         };
@@ -9068,7 +9216,7 @@ impl DenseStore {
         };
         let cols = entry.shape.last().copied().unwrap_or(0);
         if entry.shape.is_empty() || cols == 0 || row_count == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), timing));
         }
         let rows = entry
             .shape
@@ -9097,11 +9245,21 @@ impl DenseStore {
         let byte_len = row_count
             .checked_mul(row_bytes)
             .context("dense tensor tile byte length overflow")?;
-        let bytes = self.read_range(entry.byte_offset + byte_offset as u64, byte_len)?;
+        let (bytes, read_range) =
+            self.read_range_profiled(entry.byte_offset + byte_offset as u64, byte_len)?;
+        timing.read_range += read_range;
+        timing.bytes_read = timing.bytes_read.saturating_add(byte_len as u64);
         #[cfg(test)]
         self.decoded_tensor_tiles
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        decode_dense_tensor_f32(&entry.dtype, &bytes)
+        let decode_started = Instant::now();
+        let tensor = decode_dense_tensor_f32(&entry.dtype, &bytes)?;
+        timing.decode += decode_started.elapsed();
+        timing.decoded_bytes = timing
+            .decoded_bytes
+            .saturating_add((tensor.len() * std::mem::size_of::<f32>()) as u64);
+        timing.total = started.elapsed();
+        Ok((tensor, timing))
     }
 
     fn read_tensor_row_f32(
@@ -9149,6 +9307,11 @@ impl DenseStore {
     }
 
     fn read_range(&self, offset: u64, byte_len: usize) -> Result<Vec<u8>> {
+        let (bytes, _) = self.read_range_profiled(offset, byte_len)?;
+        Ok(bytes)
+    }
+
+    fn read_range_profiled(&self, offset: u64, byte_len: usize) -> Result<(Vec<u8>, Duration)> {
         if offset.saturating_add(byte_len as u64) > self.len {
             bail!(
                 "dense tensor read {}..{} exceeds store length {}",
@@ -9157,7 +9320,9 @@ impl DenseStore {
                 self.len
             );
         }
-        Ok(self.mmap[offset as usize..offset as usize + byte_len].to_vec())
+        let started = Instant::now();
+        let bytes = self.mmap[offset as usize..offset as usize + byte_len].to_vec();
+        Ok((bytes, started.elapsed()))
     }
 
     fn tensor_seed(&self, canonical_name: &str, fallback: u64) -> u64 {
@@ -17595,6 +17760,55 @@ mod tests {
             .unwrap();
         assert_eq!(other.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(store.decoded_tensor_tile_count(), 2);
+    }
+
+    #[test]
+    fn dense_store_reports_decoded_tile_cache_hit_and_miss_timing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let (_, miss) = store
+            .read_tensor_rows_f32_cached_profiled("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(miss.cache_misses, 1);
+        assert_eq!(miss.cache_hits, 0);
+        assert_eq!(miss.cache_inserts, 1);
+        assert_eq!(miss.bytes_read, bytes.len() as u64);
+        assert_eq!(miss.decoded_bytes, bytes.len() as u64);
+
+        let (_, hit) = store
+            .read_tensor_rows_f32_cached_profiled("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(hit.cache_hits, 1);
+        assert_eq!(hit.cache_misses, 0);
+        assert_eq!(hit.bytes_read, 0);
+        assert_eq!(hit.decoded_bytes, 0);
     }
 
     #[test]
