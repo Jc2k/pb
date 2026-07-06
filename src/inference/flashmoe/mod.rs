@@ -2087,6 +2087,27 @@ impl MetalExecutor {
         }
     }
 
+    fn dense_matvec_bf16(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, MetalMatvecTiming)> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.dense_matvec_bf16(weights, input, rows, cols)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let decoded = decode_dense_tensor_f32("BF16", weights)?;
+            Ok((
+                cpu_dense_matvec(&decoded, input, rows, cols),
+                MetalMatvecTiming::default(),
+            ))
+        }
+    }
+
     fn lm_head_top_candidates_from_cached_buffer(
         &self,
         key: &str,
@@ -2328,6 +2349,7 @@ struct MetalExecutorInner {
     q4_pipeline: ObjcId,
     route_pipeline: Option<ObjcId>,
     dense_matvec_pipeline: ObjcId,
+    dense_matvec_bf16_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
     rope_pipeline: ObjcId,
     rope_split_half_pipeline: ObjcId,
@@ -2501,6 +2523,7 @@ impl Drop for MetalExecutorInner {
                 release(route_pipeline);
             }
             release(self.dense_matvec_pipeline);
+            release(self.dense_matvec_bf16_pipeline);
             release(self.rms_norm_pipeline);
             release(self.rope_pipeline);
             release(self.rope_split_half_pipeline);
@@ -2588,6 +2611,8 @@ impl MetalExecutorInner {
                 None
             };
             let dense_matvec_pipeline = compile_pipeline(device, library, "dense_matvec")?;
+            let dense_matvec_bf16_pipeline =
+                compile_pipeline(device, library, "dense_matvec_bf16")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
             let rope_split_half_pipeline =
@@ -2616,6 +2641,7 @@ impl MetalExecutorInner {
                     release(route_pipeline);
                 }
                 release(dense_matvec_pipeline);
+                release(dense_matvec_bf16_pipeline);
                 release(rms_norm_pipeline);
                 release(rope_pipeline);
                 release(rope_split_half_pipeline);
@@ -2659,6 +2685,7 @@ impl MetalExecutorInner {
                 q4_pipeline,
                 route_pipeline,
                 dense_matvec_pipeline,
+                dense_matvec_bf16_pipeline,
                 rms_norm_pipeline,
                 rope_pipeline,
                 rope_split_half_pipeline,
@@ -3429,6 +3456,57 @@ impl MetalExecutorInner {
             self.recycle(output_buffer);
             self.recycle(cols_buffer);
             Ok(output)
+        }
+    }
+
+    fn dense_matvec_bf16(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, MetalMatvecTiming)> {
+        if rows == 0 || cols == 0 {
+            return Ok((Vec::new(), MetalMatvecTiming::default()));
+        }
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let weights_buffer = self.buffer_with_bytes(weights)?;
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let cols_u32 = cols as u32;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let dispatch_started = Instant::now();
+            self.dispatch_unary(
+                self.dense_matvec_bf16_pipeline,
+                &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                rows as u64,
+                &MetalCommandContext::new("dense_matvec_bf16")
+                    .with("rows", rows)
+                    .with("cols", cols),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                    release_only,
+                );
+                error
+            })?;
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let output = read_f32_buffer(output_buffer, rows);
+            timing.readback += readback_started.elapsed();
+
+            self.recycle(weights_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(cols_buffer);
+            Ok((output, timing))
         }
     }
 
@@ -8490,6 +8568,7 @@ pub struct DenseStore {
     registry: TensorRegistry,
     resident: Arc<std::sync::Mutex<DenseTensorCache>>,
     decoded_tiles: Arc<std::sync::Mutex<DenseTensorTileCache>>,
+    raw_tiles: Arc<std::sync::Mutex<DenseRawTensorTileCache>>,
     #[cfg(test)]
     decoded_full_tensors: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -8542,6 +8621,21 @@ impl DenseTileReadTiming {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+struct MetalMatvecTiming {
+    buffer_upload: Duration,
+    dispatch: Duration,
+    readback: Duration,
+}
+
+impl MetalMatvecTiming {
+    fn add(&mut self, other: Self) {
+        self.buffer_upload += other.buffer_upload;
+        self.dispatch += other.dispatch;
+        self.readback += other.readback;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct DenseTensorTileCacheInsertStats {
     inserts: u64,
     evictions: u64,
@@ -8552,6 +8646,13 @@ struct DenseTensorTileCacheInsertStats {
 #[derive(Debug, Default)]
 struct DenseTensorTileCache {
     tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<f32>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct DenseRawTensorTileCache {
+    tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<u8>>>,
     bytes: usize,
     max_bytes: usize,
 }
@@ -8592,6 +8693,59 @@ impl DenseTensorTileCache {
                 self.bytes = self
                     .bytes
                     .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+                evictions = evictions.saturating_add(1);
+            }
+        }
+        let evict_time = if evictions > 0 {
+            evict_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
+        let insert_started = Instant::now();
+        self.tiles.insert(key, tile);
+        self.bytes = self.bytes.saturating_add(bytes);
+        DenseTensorTileCacheInsertStats {
+            inserts: 1,
+            evictions,
+            insert_time: insert_started.elapsed(),
+            evict_time,
+        }
+    }
+}
+
+impl DenseRawTensorTileCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, key: &DenseTensorTileKey) -> Option<Arc<Vec<u8>>> {
+        self.tiles.get(key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        key: DenseTensorTileKey,
+        tile: Arc<Vec<u8>>,
+    ) -> DenseTensorTileCacheInsertStats {
+        let bytes = tile.len();
+        if bytes == 0 || bytes > self.max_bytes {
+            return DenseTensorTileCacheInsertStats::default();
+        }
+        if let Some(previous) = self.tiles.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.len());
+        }
+        let evict_started = Instant::now();
+        let mut evictions = 0u64;
+        while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tiles.is_empty() {
+            let Some(victim) = self.tiles.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.tiles.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(previous.len());
                 evictions = evictions.saturating_add(1);
             }
         }
@@ -8672,6 +8826,9 @@ impl DenseStore {
                 512 * 1024 * 1024,
             ))),
             decoded_tiles: Arc::new(std::sync::Mutex::new(DenseTensorTileCache::with_budget(
+                DENSE_DECODED_TILE_CACHE_BYTES,
+            ))),
+            raw_tiles: Arc::new(std::sync::Mutex::new(DenseRawTensorTileCache::with_budget(
                 DENSE_DECODED_TILE_CACHE_BYTES,
             ))),
             #[cfg(test)]
@@ -9060,16 +9217,41 @@ impl DenseStore {
         output_width: usize,
     ) -> Result<Vec<f32>> {
         let projection_started = Instant::now();
-        let mut read_timing = DenseTileReadTiming::default();
+        let entry = self
+            .registry
+            .tensor(canonical_name)
+            .with_context(|| format!("Flash-MoE dense tensor registry is missing {canonical_name}"))?;
+        let dtype = entry.dtype.clone();
+        let use_raw_bf16 = is_bf16_dtype(&dtype);
+        let mut decoded_read_timing = DenseTileReadTiming::default();
+        let mut raw_read_timing = DenseTileReadTiming::default();
+        let mut metal_timing = MetalMatvecTiming::default();
         let mut output = vec![0.0f32; output_width];
         let tile_rows = dense_projection_tile_rows(cols, rows);
         let mut tiles = 0usize;
         for start in (0..rows).step_by(tile_rows) {
             let end = (start + tile_rows).min(rows);
-            let (tensor, timing) =
-                self.read_tensor_rows_f32_cached_profiled(canonical_name, start, end - start)?;
-            read_timing.add(timing);
-            let projected = metal.dense_matvec(tensor.as_slice(), input, end - start, cols)?;
+            let projected = if use_raw_bf16 {
+                let (tensor, tile_dtype, timing) =
+                    self.read_tensor_rows_raw_cached_profiled(canonical_name, start, end - start)?;
+                raw_read_timing.add(timing);
+                if !is_bf16_dtype(&tile_dtype) {
+                    bail!(
+                        "Flash-MoE raw dense tensor {} has dtype {}; expected BF16",
+                        canonical_name,
+                        tile_dtype
+                    );
+                }
+                let (projected, timing) =
+                    metal.dense_matvec_bf16(tensor.as_slice(), input, end - start, cols)?;
+                metal_timing.add(timing);
+                projected
+            } else {
+                let (tensor, timing) =
+                    self.read_tensor_rows_f32_cached_profiled(canonical_name, start, end - start)?;
+                decoded_read_timing.add(timing);
+                metal.dense_matvec(tensor.as_slice(), input, end - start, cols)?
+            };
             for (offset, value) in projected.into_iter().enumerate() {
                 output[start + offset] = value;
             }
@@ -9086,17 +9268,22 @@ impl DenseStore {
                 input_len = input.len(),
                 output_width,
                 tile_mb = DENSE_PROJECTION_TILE_BYTES / (1024 * 1024),
-                read_decode_ms = duration_ms(read_timing.total),
-                read_range_ms = duration_ms(read_timing.read_range),
-                dtype_decode_ms = duration_ms(read_timing.decode),
-                decoded_tile_cache_hits = read_timing.cache_hits,
-                decoded_tile_cache_misses = read_timing.cache_misses,
-                decoded_tile_cache_inserts = read_timing.cache_inserts,
-                decoded_tile_cache_evictions = read_timing.cache_evictions,
-                decoded_tile_cache_insert_ms = duration_ms(read_timing.cache_insert),
-                decoded_tile_cache_evict_ms = duration_ms(read_timing.cache_evict),
-                dense_bytes_read = read_timing.bytes_read,
-                dense_decoded_bytes = read_timing.decoded_bytes,
+                dtype = %dtype,
+                raw_read_ms = duration_ms(raw_read_timing.total),
+                metal_buffer_upload_ms = duration_ms(metal_timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(metal_timing.dispatch),
+                metal_readback_ms = duration_ms(metal_timing.readback),
+                read_decode_ms = duration_ms(decoded_read_timing.total),
+                read_range_ms = duration_ms(decoded_read_timing.read_range),
+                dtype_decode_ms = duration_ms(decoded_read_timing.decode),
+                decoded_tile_cache_hits = decoded_read_timing.cache_hits,
+                decoded_tile_cache_misses = decoded_read_timing.cache_misses,
+                decoded_tile_cache_inserts = decoded_read_timing.cache_inserts,
+                decoded_tile_cache_evictions = decoded_read_timing.cache_evictions,
+                decoded_tile_cache_insert_ms = duration_ms(decoded_read_timing.cache_insert),
+                decoded_tile_cache_evict_ms = duration_ms(decoded_read_timing.cache_evict),
+                dense_bytes_read = decoded_read_timing.bytes_read.saturating_add(raw_read_timing.bytes_read),
+                dense_decoded_bytes = decoded_read_timing.decoded_bytes,
                 total_ms = duration_ms(total),
                 "flashmoe dense projection complete"
             );
@@ -9183,6 +9370,115 @@ impl DenseStore {
         timing.cache_evict += stats.evict_time;
         timing.total = started.elapsed();
         Ok((tile, timing))
+    }
+
+    fn read_tensor_rows_raw_cached_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Arc<Vec<u8>>, String, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let key = DenseTensorTileKey {
+            name: canonical_name.to_string(),
+            start_row,
+            row_count,
+        };
+        if let Some(tile) = self
+            .raw_tiles
+            .lock()
+            .expect("dense raw tile cache poisoned")
+            .get(&key)
+        {
+            let mut timing = DenseTileReadTiming {
+                cache_hits: 1,
+                ..DenseTileReadTiming::default()
+            };
+            timing.total = started.elapsed();
+            let dtype = self
+                .registry
+                .tensor(canonical_name)
+                .map(|entry| entry.dtype.clone())
+                .with_context(|| format!("Flash-MoE dense tensor registry is missing {canonical_name}"))?;
+            return Ok((tile, dtype, timing));
+        }
+
+        let mut timing = DenseTileReadTiming {
+            cache_misses: 1,
+            ..DenseTileReadTiming::default()
+        };
+        let (bytes, dtype, uncached_timing) =
+            self.read_tensor_rows_raw_profiled(canonical_name, start_row, row_count)?;
+        timing.add(uncached_timing);
+        let tile = Arc::new(bytes);
+        let stats = self
+            .raw_tiles
+            .lock()
+            .expect("dense raw tile cache poisoned")
+            .insert(key, tile.clone());
+        timing.cache_inserts = timing.cache_inserts.saturating_add(stats.inserts);
+        timing.cache_evictions = timing.cache_evictions.saturating_add(stats.evictions);
+        timing.cache_insert += stats.insert_time;
+        timing.cache_evict += stats.evict_time;
+        timing.total = started.elapsed();
+        Ok((tile, dtype, timing))
+    }
+
+    fn read_tensor_rows_raw_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Vec<u8>, String, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let mut timing = DenseTileReadTiming::default();
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            bail!("Flash-MoE dense tensor registry is missing {canonical_name}");
+        };
+        let Some(element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        if entry.shape.is_empty() || cols == 0 || row_count == 0 {
+            return Ok((Vec::new(), entry.dtype.clone(), timing));
+        }
+        let rows = entry
+            .shape
+            .iter()
+            .take(entry.shape.len() - 1)
+            .product::<usize>()
+            .max(1);
+        let end_row = start_row
+            .checked_add(row_count)
+            .context("dense tensor raw tile row range overflow")?;
+        if end_row > rows {
+            bail!(
+                "Flash-MoE dense tensor {} raw tile rows {}..{} exceed row count {}",
+                entry.name,
+                start_row,
+                end_row,
+                rows
+            );
+        }
+        let row_bytes = cols
+            .checked_mul(element_size)
+            .context("dense tensor raw tile row byte length overflow")?;
+        let byte_offset = start_row
+            .checked_mul(row_bytes)
+            .context("dense tensor raw tile byte offset overflow")?;
+        let byte_len = row_count
+            .checked_mul(row_bytes)
+            .context("dense tensor raw tile byte length overflow")?;
+        let (bytes, read_range) =
+            self.read_range_profiled(entry.byte_offset + byte_offset as u64, byte_len)?;
+        timing.read_range += read_range;
+        timing.bytes_read = timing.bytes_read.saturating_add(byte_len as u64);
+        timing.total = started.elapsed();
+        Ok((bytes, entry.dtype.clone(), timing))
     }
 
     fn read_tensor_rows_f32(
@@ -9397,6 +9693,10 @@ fn dtype_size(dtype: &str) -> Option<usize> {
         "U8" | "I8" => Some(1),
         _ => None,
     }
+}
+
+fn is_bf16_dtype(dtype: &str) -> bool {
+    matches!(dtype.to_ascii_uppercase().as_str(), "BF16" | "BFLOAT16")
 }
 
 fn decode_dense_tensor_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>> {
@@ -11416,6 +11716,22 @@ kernel void dense_matvec(
     float acc = 0.0f;
     for (uint col = 0; col < cols; ++col) {
         acc = fma(weights[row * cols + col], input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_matvec_bf16(
+    device const ushort* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    uint row_offset = row * cols;
+    for (uint col = 0; col < cols; ++col) {
+        uint bits = uint(weights[row_offset + col]) << 16u;
+        float weight = as_type<float>(bits);
+        acc = fma(weight, input[col], acc);
     }
     output[row] = acc;
 }
@@ -15186,6 +15502,7 @@ mod tests {
             "q4_fma_matvec",
             "route_top4",
             "dense_matvec",
+            "dense_matvec_bf16",
             "rms_norm",
             "rope_apply",
             "rope_split_half_apply",
