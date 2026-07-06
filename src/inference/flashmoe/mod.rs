@@ -4934,7 +4934,14 @@ impl FlashMoeEngine {
 
         for layer in 0..self.config.num_hidden_layers {
             if let Some(pending) = deferred_expert_phase.take() {
+                let wait_started = Instant::now();
                 let output = pending.wait()?;
+                info!(
+                    token_position = position,
+                    completed_layer = layer.saturating_sub(1),
+                    wait_ms = wait_started.elapsed().as_millis(),
+                    "flashmoe deferred expert wait complete"
+                );
                 hidden = output.hidden;
                 next_layer_normed = output.next_normed;
             }
@@ -5029,9 +5036,8 @@ impl FlashMoeEngine {
             let experts = self.scheduler.finish(pending_experts)?;
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
             let expert_metrics_after = self.scheduler.snapshot();
-            layer_timing.buckets.add_expert_scheduler_delta(
-                expert_metrics_after.saturating_delta(expert_metrics_before),
-            );
+            let expert_delta = expert_metrics_after.saturating_delta(expert_metrics_before);
+            layer_timing.buckets.add_expert_scheduler_delta(expert_delta);
             let expert_compute_started = Instant::now();
             for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
                 state = state.wrapping_add(
@@ -5088,6 +5094,21 @@ impl FlashMoeEngine {
                 kv_cache.record_layer_state(position, layer, state)?;
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 layer_timing.buckets.total_wall = layer_started.elapsed();
+                info!(
+                    token_position = position,
+                    layer,
+                    layer_kind = layer_timing.layer_kind.as_str(),
+                    active_experts = layer_timing.active_experts,
+                    expert_deferred = true,
+                    attention_ms = layer_timing.buckets.attention_projection.as_millis(),
+                    routing_ms = layer_timing.buckets.routing.as_millis(),
+                    expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
+                    expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
+                    expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
+                    total_ms = layer_timing.buckets.total_wall.as_millis(),
+                    bytes_read = expert_delta.bytes_read,
+                    "flashmoe layer complete"
+                );
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.buckets.add(layer_timing.buckets);
                     timing.layers.push(layer_timing);
@@ -5117,13 +5138,35 @@ impl FlashMoeEngine {
             kv_cache.record_layer_state(position, layer, state)?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
+            info!(
+                token_position = position,
+                layer,
+                layer_kind = layer_timing.layer_kind.as_str(),
+                active_experts = layer_timing.active_experts,
+                expert_deferred = false,
+                attention_ms = layer_timing.buckets.attention_projection.as_millis(),
+                routing_ms = layer_timing.buckets.routing.as_millis(),
+                expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
+                expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
+                expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
+                total_ms = layer_timing.buckets.total_wall.as_millis(),
+                bytes_read = expert_delta.bytes_read,
+                "flashmoe layer complete"
+            );
             if let Some(timing) = timing.as_deref_mut() {
                 timing.buckets.add(layer_timing.buckets);
                 timing.layers.push(layer_timing);
             }
         }
         if let Some(pending) = deferred_expert_phase.take() {
+            let wait_started = Instant::now();
             let output = pending.wait()?;
+            info!(
+                token_position = position,
+                completed_layer = self.config.num_hidden_layers.saturating_sub(1),
+                wait_ms = wait_started.elapsed().as_millis(),
+                "flashmoe deferred expert wait complete"
+            );
             hidden = output.hidden;
             next_layer_normed = output.next_normed;
         }
