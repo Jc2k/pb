@@ -16080,6 +16080,8 @@ fn dense_tensor_quantization(
 fn canonical_hf_tensor_name(name: &str) -> String {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         format!("model.{rest}")
+    } else if let Some(rest) = name.strip_prefix("language_model.") {
+        rest.to_string()
     } else if let Some(rest) = name.strip_prefix("model.visual.") {
         format!("visual.{rest}")
     } else {
@@ -16469,6 +16471,8 @@ fn build_direct_expert_pack(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregateExpertTensorKind {
     GateUp,
+    Gate,
+    Up,
     Down,
 }
 
@@ -16477,8 +16481,18 @@ fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind>
         || name.ends_with(".mlp.experts.gate_up_proj.weight")
     {
         Some(AggregateExpertTensorKind::GateUp)
+    } else if name.ends_with(".mlp.switch_mlp.gate_proj")
+        || name.ends_with(".mlp.switch_mlp.gate_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Gate)
+    } else if name.ends_with(".mlp.switch_mlp.up_proj")
+        || name.ends_with(".mlp.switch_mlp.up_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Up)
     } else if name.ends_with(".mlp.experts.down_proj")
         || name.ends_with(".mlp.experts.down_proj.weight")
+        || name.ends_with(".mlp.switch_mlp.down_proj")
+        || name.ends_with(".mlp.switch_mlp.down_proj.weight")
     {
         Some(AggregateExpertTensorKind::Down)
     } else {
@@ -16522,14 +16536,8 @@ fn pack_aggregate_expert_layer(
     let config = config.context("Qwen config is required to split aggregate expert tensors")?;
     let layout = AggregateExpertLayout::new(config)?;
 
-    let gate_up =
-        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?;
+    let aggregate_tensors = aggregate_expert_tensors(tensors, layer, layout)?;
     let down = single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
-    validate_aggregate_expert_tensor_shape(
-        gate_up,
-        &[layout.experts, layout.intermediate * 2, layout.hidden],
-        "gate_up_proj",
-    )?;
     validate_aggregate_expert_tensor_shape(
         down,
         &[layout.experts, layout.hidden, layout.intermediate],
@@ -16548,7 +16556,7 @@ fn pack_aggregate_expert_layer(
             &mut shard_cache,
             layer,
             expert,
-            gate_up,
+            aggregate_tensors,
             down,
             layout,
         )?;
@@ -16564,7 +16572,7 @@ fn pack_aggregate_expert_layer(
             &mut shard_cache,
             layer,
             expert,
-            gate_up,
+            aggregate_tensors,
             down,
             layout,
         )
@@ -16584,6 +16592,28 @@ struct AggregateExpertLayout {
     gate_up_expert_values: usize,
     single_projection_values: usize,
     down_expert_values: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AggregateExpertTensors<'a> {
+    gate: AggregateExpertSlice<'a>,
+    up: AggregateExpertSlice<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AggregateExpertSlice<'a> {
+    tensor: &'a ExpertTensorRef,
+    expert_stride_values: usize,
+    expert_offset_values: usize,
+}
+
+impl AggregateExpertSlice<'_> {
+    fn start(self, expert: usize) -> Result<usize> {
+        expert
+            .checked_mul(self.expert_stride_values)
+            .and_then(|base| base.checked_add(self.expert_offset_values))
+            .context("aggregate expert slice offset overflow")
+    }
 }
 
 impl AggregateExpertLayout {
@@ -16616,29 +16646,86 @@ impl AggregateExpertLayout {
     }
 }
 
+fn aggregate_expert_tensors<'a>(
+    tensors: &[&'a ExpertTensorRef],
+    layer: usize,
+    layout: AggregateExpertLayout,
+) -> Result<AggregateExpertTensors<'a>> {
+    let gate_up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp);
+    let gate = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Gate);
+    let up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Up);
+    match (gate_up, gate, up) {
+        (Some(gate_up), None, None) => {
+            validate_aggregate_expert_tensor_shape(
+                gate_up,
+                &[layout.experts, layout.intermediate * 2, layout.hidden],
+                "gate_up_proj",
+            )?;
+            Ok(AggregateExpertTensors {
+                gate: AggregateExpertSlice {
+                    tensor: gate_up,
+                    expert_stride_values: layout.gate_up_expert_values,
+                    expert_offset_values: 0,
+                },
+                up: AggregateExpertSlice {
+                    tensor: gate_up,
+                    expert_stride_values: layout.gate_up_expert_values,
+                    expert_offset_values: layout.single_projection_values,
+                },
+            })
+        }
+        (None, Some(gate), Some(up)) => {
+            validate_aggregate_expert_tensor_shape(
+                gate,
+                &[layout.experts, layout.intermediate, layout.hidden],
+                "switch_mlp.gate_proj",
+            )?;
+            validate_aggregate_expert_tensor_shape(
+                up,
+                &[layout.experts, layout.intermediate, layout.hidden],
+                "switch_mlp.up_proj",
+            )?;
+            Ok(AggregateExpertTensors {
+                gate: AggregateExpertSlice {
+                    tensor: gate,
+                    expert_stride_values: layout.single_projection_values,
+                    expert_offset_values: 0,
+                },
+                up: AggregateExpertSlice {
+                    tensor: up,
+                    expert_stride_values: layout.single_projection_values,
+                    expert_offset_values: 0,
+                },
+            })
+        }
+        _ => bail!(
+            "aggregate expert layer {layer} must contain either combined gate_up_proj or separate switch_mlp gate_proj/up_proj tensors"
+        ),
+    }
+}
+
 fn build_aggregate_expert_pack(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    gate_up: &ExpertTensorRef,
+    aggregate_tensors: AggregateExpertTensors<'_>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
     let mut inputs = Vec::with_capacity(3);
-    let gate_up_base = expert
-        .checked_mul(layout.gate_up_expert_values)
-        .context("aggregate gate_up expert offset overflow")?;
     let (gate_values, gate_offsets, gate_hash) = decode_expert_tensor_range(
         snapshot_dir,
         shard_cache,
-        gate_up,
-        gate_up_base,
+        aggregate_tensors.gate.tensor,
+        aggregate_tensors.gate.start(expert)?,
         layout.single_projection_values,
     )?;
     inputs.push(ExpertRecordInput {
         tensor: format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
-        dtype: gate_up
+        dtype: aggregate_tensors
+            .gate
+            .tensor
             .dtype
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
@@ -16651,13 +16738,15 @@ fn build_aggregate_expert_pack(
     let (up_values, up_offsets, up_hash) = decode_expert_tensor_range(
         snapshot_dir,
         shard_cache,
-        gate_up,
-        gate_up_base + layout.single_projection_values,
+        aggregate_tensors.up.tensor,
+        aggregate_tensors.up.start(expert)?,
         layout.single_projection_values,
     )?;
     inputs.push(ExpertRecordInput {
         tensor: format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
-        dtype: gate_up
+        dtype: aggregate_tensors
+            .up
+            .tensor
             .dtype
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
@@ -16693,29 +16782,26 @@ fn expected_aggregate_expert_records(
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    gate_up: &ExpertTensorRef,
+    aggregate_tensors: AggregateExpertTensors<'_>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
-    let gate_up_base = expert
-        .checked_mul(layout.gate_up_expert_values)
-        .context("aggregate gate_up expert offset overflow")?;
     let gate = expected_expert_pack_record(
         snapshot_dir,
         shard_cache,
-        gate_up,
+        aggregate_tensors.gate.tensor,
         format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
         vec![layout.intermediate, layout.hidden],
-        gate_up_base,
+        aggregate_tensors.gate.start(expert)?,
         layout.single_projection_values,
     )?;
     let up = expected_expert_pack_record(
         snapshot_dir,
         shard_cache,
-        gate_up,
+        aggregate_tensors.up.tensor,
         format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
         vec![layout.intermediate, layout.hidden],
-        gate_up_base + layout.single_projection_values,
+        aggregate_tensors.up.start(expert)?,
         layout.single_projection_values,
     )?;
     let down_base = expert
@@ -17076,16 +17162,34 @@ fn single_aggregate_expert_tensor<'a>(
     kind: AggregateExpertTensorKind,
     layer: usize,
 ) -> Result<&'a ExpertTensorRef> {
-    let matches: Vec<&ExpertTensorRef> = tensors
-        .iter()
-        .copied()
-        .filter(|tensor| aggregate_expert_tensor_kind(&tensor.tensor) == Some(kind))
-        .collect();
+    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
     match matches.as_slice() {
         [tensor] => Ok(*tensor),
         [] => bail!("aggregate expert layer {layer} is missing {kind:?} tensor"),
         _ => bail!("aggregate expert layer {layer} has duplicate {kind:?} tensors"),
     }
+}
+
+fn optional_aggregate_expert_tensor<'a>(
+    tensors: &[&'a ExpertTensorRef],
+    kind: AggregateExpertTensorKind,
+) -> Option<&'a ExpertTensorRef> {
+    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
+    match matches.as_slice() {
+        [tensor] => Some(*tensor),
+        _ => None,
+    }
+}
+
+fn tensors_matching_aggregate_expert_kind<'a>(
+    tensors: &[&'a ExpertTensorRef],
+    kind: AggregateExpertTensorKind,
+) -> Vec<&'a ExpertTensorRef> {
+    tensors
+        .iter()
+        .copied()
+        .filter(|tensor| aggregate_expert_tensor_kind(&tensor.tensor) == Some(kind))
+        .collect()
 }
 
 fn validate_aggregate_expert_tensor_shape(
@@ -17763,7 +17867,9 @@ fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<
 
 fn is_expert_tensor_name(name: &str) -> bool {
     name.starts_with("model.layers.")
-        && (name.contains(".experts.") || name.contains(".mlp.experts"))
+        && (name.contains(".experts.")
+            || name.contains(".mlp.experts")
+            || name.contains(".mlp.switch_mlp."))
 }
 
 fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
@@ -20390,6 +20496,9 @@ mod tests {
         assert!(is_expert_tensor_name(
             "model.layers.0.mlp.experts.7.gate_proj.weight"
         ));
+        assert!(is_expert_tensor_name(
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        ));
         assert!(!is_expert_tensor_name(
             "mtp.layers.0.mlp.experts.7.gate_proj.weight"
         ));
@@ -21722,6 +21831,18 @@ mod tests {
             "model.layers.7.self_attn.q_proj.weight"
         );
         assert_eq!(
+            canonical_hf_tensor_name("language_model.model.embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("language_model.model.layers.3.self_attn.q_proj.weight"),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("language_model.lm_head.weight"),
+            "lm_head.weight"
+        );
+        assert_eq!(
             canonical_hf_tensor_name("model.visual.patch_embed.proj.weight"),
             "visual.patch_embed.proj.weight"
         );
@@ -22846,6 +22967,134 @@ mod tests {
     }
 
     #[test]
+    fn packer_splits_mlx_switch_mlp_aggregate_expert_tensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        fs::create_dir_all(&snapshot).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+
+        let gate_bytes: Vec<u8> = (0u8..8).collect();
+        let up_bytes: Vec<u8> = (8u8..16).collect();
+        let down_bytes: Vec<u8> = (16u8..24).collect();
+        fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&[
+                (
+                    "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+                    "U8",
+                    vec![2, 2, 2],
+                    &gate_bytes,
+                ),
+                (
+                    "model.layers.1.mlp.switch_mlp.up_proj.weight",
+                    "U8",
+                    vec![2, 2, 2],
+                    &up_bytes,
+                ),
+                (
+                    "model.layers.1.mlp.switch_mlp.down_proj.weight",
+                    "U8",
+                    vec![2, 2, 2],
+                    &down_bytes,
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+        let tensors = vec![
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.switch_mlp.gate_proj.weight".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([0, 8]),
+            },
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([8, 16]),
+            },
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([16, 24]),
+            },
+        ];
+
+        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+
+        let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.experts, 2);
+        assert_eq!(metadata.packs.len(), 2);
+        let expert0 = read_one_expert(&plan.experts_dir, 1, 0).unwrap();
+        let expert1 = read_one_expert(&plan.experts_dir, 1, 1).unwrap();
+        for expert in [&expert0, &expert1] {
+            assert_eq!(expert.records.len(), 3);
+            assert!(expert.record_suffix("gate_proj.weight").is_some());
+            assert!(expert.record_suffix("up_proj.weight").is_some());
+            assert!(expert.record_suffix("down_proj.weight").is_some());
+        }
+        let input = [1.0, 1.0];
+        let expert0_gate = expert0
+            .project_record(
+                expert0.record_suffix("gate_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let expert0_up = expert0
+            .project_record(expert0.record_suffix("up_proj.weight").unwrap(), &input, 2)
+            .unwrap()
+            .unwrap();
+        let expert1_gate = expert1
+            .project_record(
+                expert1.record_suffix("gate_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let expert1_down = expert1
+            .project_record(
+                expert1.record_suffix("down_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        for (actual, expected) in expert0_gate.iter().zip([1.0, 5.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert0_up.iter().zip([17.0, 21.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert1_gate.iter().zip([9.0, 13.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert1_down.iter().zip([41.0, 45.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+    }
+
+    #[test]
     fn aggregate_expert_reuse_rejects_changed_source_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
@@ -23605,15 +23854,16 @@ mod tests {
     fn dense_manifest_imports_native_mlx_q4_triples() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path();
-        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
-        let scales_name = "model.layers.0.self_attn.q_proj.scales";
-        let biases_name = "model.layers.0.self_attn.q_proj.biases";
+        let source_tensor_name = "language_model.model.layers.0.self_attn.q_proj.weight";
+        let scales_name = "language_model.model.layers.0.self_attn.q_proj.scales";
+        let biases_name = "language_model.model.layers.0.self_attn.q_proj.biases";
+        let runtime_tensor_name = "model.layers.0.self_attn.q_proj.weight";
         let packed_word = 0x7654_3210u32.to_le_bytes().to_vec();
         let scales = bf16_tensor_bytes(&[0.5]);
         let biases = bf16_tensor_bytes(&[1.0]);
         let tensors = vec![
             (
-                tensor_name.to_string(),
+                source_tensor_name.to_string(),
                 "U32".to_string(),
                 vec![1, 1],
                 packed_word.clone(),
@@ -23656,7 +23906,7 @@ mod tests {
         assert!(manifest.expert_tensors.is_empty());
         assert_eq!(manifest.dense_tensors.len(), 1);
         let dense_ref = &manifest.dense_tensors[0];
-        assert_eq!(dense_ref.tensor, tensor_name);
+        assert_eq!(dense_ref.tensor, runtime_tensor_name);
         assert_eq!(dense_ref.dtype, "U32");
         assert_eq!(dense_ref.shape, vec![1, 8]);
         assert_eq!(
@@ -23688,7 +23938,7 @@ mod tests {
         let manifest_path = snapshot.join("model_weights.json");
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let store = DenseStore::open(dense_path, manifest_path).unwrap();
-        let entry = store.registry().tensor(tensor_name).unwrap();
+        let entry = store.registry().tensor(runtime_tensor_name).unwrap();
         let (packed, decoded_scales, decoded_biases, timing) =
             store.read_dense_q4_rows(entry, 0, 1, GROUP_SIZE).unwrap();
         assert_eq!(packed, packed_word);
@@ -23701,10 +23951,75 @@ mod tests {
 
         let input = vec![1.0; 8];
         let projected = store
-            .project_dense_tensor_with_metal(None, tensor_name, &input, 1)
+            .project_dense_tensor_with_metal(None, runtime_tensor_name, &input, 1)
             .unwrap()
             .unwrap();
         assert_eq!(projected, vec![22.0]);
+    }
+
+    #[test]
+    fn manifest_classifies_mlx_switch_mlp_tensors_as_aggregate_experts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path();
+        let tensors = vec![
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 2, 1],
+                0x7654_3210u32.to_le_bytes().to_vec(),
+            ),
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 2, 1],
+                0x7654_3210u32.to_le_bytes().to_vec(),
+            ),
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 1, 2],
+                0x7654_3210u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let fixture_refs = typed_fixture_refs(&tensors);
+        fs::write(
+            snapshot.join("experts.safetensors"),
+            make_typed_safetensors(&fixture_refs),
+        )
+        .unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (name, _, _, _) in &tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("experts.safetensors".to_string()),
+            );
+        }
+        let index = serde_json::Value::Object(serde_json::Map::from_iter([(
+            "weight_map".to_string(),
+            serde_json::Value::Object(weight_map),
+        )]));
+        let index_path = snapshot.join("model.safetensors.index.json");
+        fs::write(&index_path, index.to_string()).unwrap();
+
+        let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+
+        assert!(visual_refs.is_empty());
+        assert!(manifest.dense_tensors.is_empty());
+        assert_eq!(manifest.expert_tensors.len(), 3);
+        let names = manifest
+            .expert_tensors
+            .iter()
+            .map(|tensor| tensor.tensor.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"model.layers.0.mlp.switch_mlp.gate_proj.weight"));
+        assert!(names.contains(&"model.layers.0.mlp.switch_mlp.up_proj.weight"));
+        assert!(names.contains(&"model.layers.0.mlp.switch_mlp.down_proj.weight"));
+        assert!(
+            manifest
+                .expert_tensors
+                .iter()
+                .all(|tensor| tensor.layer == Some(0) && tensor.expert.is_none())
+        );
     }
 
     #[test]
