@@ -1,0 +1,24754 @@
+//! Flash-MoE inspired inference backend for Qwen3.5-397B-A17B on Apple Silicon.
+//!
+//! The upstream flash-moe design is very different from llama.cpp: non-expert
+//! tensors are mmap'd, routed expert tensors stay on SSD, and each token reads
+//! only the active MoE experts with parallel `pread` before dispatching fused
+//! Metal kernels.  This module captures that runtime contract in pb instead of
+//! pretending a GGUF file is required for Qwen3.5.
+
+#![allow(
+    dead_code,
+    clippy::assertions_on_constants,
+    clippy::collapsible_if,
+    clippy::default_constructed_unit_structs,
+    clippy::derivable_impls,
+    clippy::enum_variant_names,
+    clippy::explicit_counter_loop,
+    clippy::manual_checked_ops,
+    clippy::manual_inspect,
+    clippy::manual_is_multiple_of,
+    clippy::manual_saturating_arithmetic,
+    clippy::manual_slice_size_calculation,
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::needless_option_as_deref,
+    clippy::ptr_arg,
+    clippy::type_complexity,
+    clippy::unnecessary_get_then_check,
+    clippy::unnecessary_map_or,
+    clippy::useless_format,
+    clippy::useless_vec
+)]
+
+use std::cell::RefCell;
+use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+use std::ffi::c_int;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ptr;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+use tokenizers::Tokenizer;
+use tracing::info;
+
+use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
+
+type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
+
+pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
+pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
+pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
+/// Lowercase substring used to identify Qwen3 MoE checkpoints with active
+/// parameter counts in their HF repository names, e.g. Qwen3-30B-A3B.
+pub const QWEN3_ACTIVE_PARAMS_MARKER: &str = "-a";
+/// Hugging Face model URI for the Qwen3-VL multimodal MoE model.
+pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
+/// Lowercase substring used to identify Qwen3-VL MoE model strings.
+pub const QWEN3_VL_MODEL_MARKER: &str = "qwen3-vl-moe";
+pub const CACHE_VERSION: &str = "flashmoe-v1-densebf16";
+#[cfg(test)]
+const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
+pub const NUM_LAYERS: usize = 60;
+pub const NUM_EXPERTS: usize = 512;
+pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
+const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
+const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
+pub const HIDDEN_DIM: usize = 4096;
+pub const GROUP_SIZE: usize = 64;
+#[cfg(test)]
+const DENSE_Q4_GROUP_SIZE: usize = 16;
+pub const FULL_ATTN_INTERVAL: usize = 4;
+pub const LINEAR_NUM_V_HEADS: usize = 64;
+pub const LINEAR_NUM_K_HEADS: usize = 16;
+pub const LINEAR_KEY_DIM: usize = 128;
+pub const LINEAR_VALUE_DIM: usize = 128;
+pub const LINEAR_TOTAL_KEY: usize = LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM;
+pub const LINEAR_TOTAL_VALUE: usize = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM;
+pub const LINEAR_CONV_DIM: usize = LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE;
+pub const CONV_KERNEL_SIZE: usize = 4;
+const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
+const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+pub const FOUR_BIT_EXPERT_SIZE: u64 = 7_077_888;
+pub const EXPECTED_EXPERT_BYTES: u64 =
+    FOUR_BIT_EXPERT_SIZE * NUM_LAYERS as u64 * NUM_EXPERTS as u64;
+const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
+const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
+const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
+const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
+const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
+const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
+
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: c_int = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: c_int = 111;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sscal(n: c_int, alpha: f32, x: *mut f32, inc_x: c_int);
+    fn cblas_sgemv(
+        order: c_int,
+        trans_a: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: f32,
+        a: *const f32,
+        lda: c_int,
+        x: *const f32,
+        inc_x: c_int,
+        beta: f32,
+        y: *mut f32,
+        inc_y: c_int,
+    );
+    fn cblas_sger(
+        order: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: f32,
+        x: *const f32,
+        inc_x: c_int,
+        y: *const f32,
+        inc_y: c_int,
+        a: *mut f32,
+        lda: c_int,
+    );
+}
+
+// ── Vision constants (Qwen3-VL image preprocessor) ───────────────────────────
+
+/// Pixels per spatial patch edge (14 px for Qwen3-VL ViT).
+pub const VIT_PATCH_SIZE: usize = 14;
+/// Spatial patches merged into one visual language-model token (2×2 = 4).
+pub const VIT_MERGE_SIZE: usize = 2;
+/// Pixel stride per merged visual token: `VIT_PATCH_SIZE * VIT_MERGE_SIZE`.
+pub const VIT_SPATIAL_MERGE_SIZE: usize = VIT_PATCH_SIZE * VIT_MERGE_SIZE; // 28
+/// ImageNet pixel mean for ViT normalisation (RGB order).
+pub const VIT_IMAGE_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+/// ImageNet pixel std for ViT normalisation (RGB order).
+pub const VIT_IMAGE_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
+/// Upper pixel budget for an input image (~1 280 merged visual tokens).
+pub const VIT_MAX_PIXELS: usize = 1280 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
+/// Lower pixel budget for an input image (at least 4 merged visual tokens).
+pub const VIT_MIN_PIXELS: usize = 4 * VIT_SPATIAL_MERGE_SIZE * VIT_SPATIAL_MERGE_SIZE;
+/// Default Qwen3-VL text M-RoPE frequency allocation: temporal, height, width.
+pub const DEFAULT_MROPE_SECTION: [usize; 3] = [24, 20, 20];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendSelection {
+    FlashMoePreferred,
+    LlamaCpp,
+}
+
+fn metal_route_top4_enabled() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalCommandContext {
+    operation: String,
+    details: Vec<(String, String)>,
+}
+
+impl MetalCommandContext {
+    fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with(mut self, key: impl Into<String>, value: impl ToString) -> Self {
+        self.details.push((key.into(), value.to_string()));
+        self
+    }
+
+    fn label(&self) -> String {
+        let mut label = format!("Flash-MoE {}", self.operation);
+        for (key, value) in &self.details {
+            label.push(' ');
+            label.push_str(key);
+            label.push('=');
+            label.push_str(value);
+        }
+        label
+    }
+
+    fn detail_summary(&self) -> String {
+        if self.details.is_empty() {
+            "none".to_string()
+        } else {
+            self.details
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalCommandStatus {
+    NotEnqueued,
+    Enqueued,
+    Committed,
+    Scheduled,
+    Completed,
+    Error,
+    Unknown(usize),
+}
+
+impl MetalCommandStatus {
+    fn from_raw(raw: usize) -> Self {
+        match raw {
+            0 => Self::NotEnqueued,
+            1 => Self::Enqueued,
+            2 => Self::Committed,
+            3 => Self::Scheduled,
+            4 => Self::Completed,
+            5 => Self::Error,
+            value => Self::Unknown(value),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEnqueued => "not_enqueued",
+            Self::Enqueued => "enqueued",
+            Self::Committed => "committed",
+            Self::Scheduled => "scheduled",
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Error)
+    }
+}
+
+impl std::fmt::Display for MetalCommandStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(raw) => write!(f, "unknown({raw})"),
+            status => f.write_str(status.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalCommandFailureKind {
+    Timeout,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalCommandBufferFailure {
+    kind: MetalCommandFailureKind,
+    message: String,
+}
+
+impl MetalCommandBufferFailure {
+    fn timeout(
+        context: &MetalCommandContext,
+        elapsed: Duration,
+        status: MetalCommandStatus,
+        metal_error: Option<String>,
+    ) -> Self {
+        Self {
+            kind: MetalCommandFailureKind::Timeout,
+            message: format_metal_command_failure(
+                MetalCommandFailureKind::Timeout,
+                context,
+                elapsed,
+                status,
+                metal_error.as_deref(),
+            ),
+        }
+    }
+
+    fn failed(
+        context: &MetalCommandContext,
+        elapsed: Duration,
+        status: MetalCommandStatus,
+        metal_error: Option<String>,
+    ) -> Self {
+        Self {
+            kind: MetalCommandFailureKind::Failed,
+            message: format_metal_command_failure(
+                MetalCommandFailureKind::Failed,
+                context,
+                elapsed,
+                status,
+                metal_error.as_deref(),
+            ),
+        }
+    }
+
+    fn should_release_buffers(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Display for MetalCommandBufferFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MetalCommandBufferFailure {}
+
+fn metal_command_failure_requires_release(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<MetalCommandBufferFailure>()
+        .is_some_and(MetalCommandBufferFailure::should_release_buffers)
+}
+
+fn format_metal_command_failure(
+    kind: MetalCommandFailureKind,
+    context: &MetalCommandContext,
+    elapsed: Duration,
+    status: MetalCommandStatus,
+    metal_error: Option<&str>,
+) -> String {
+    let action = match kind {
+        MetalCommandFailureKind::Timeout => "timed out",
+        MetalCommandFailureKind::Failed => "failed",
+    };
+    let error = metal_error
+        .filter(|error| !error.trim().is_empty())
+        .unwrap_or("none reported");
+    format!(
+        "Flash-MoE Metal command buffer {action}: label=\"{}\", elapsed={}ms, status={}, metal_error=\"{}\", details={}",
+        context.label(),
+        elapsed.as_millis(),
+        status,
+        error,
+        context.detail_summary()
+    )
+}
+
+fn metal_command_timeout() -> Duration {
+    DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlashMoeRoutingPolicy {
+    pub active_experts_override: Option<usize>,
+    pub force_active_experts: bool,
+}
+
+impl FlashMoeRoutingPolicy {
+    pub fn new(active_experts_override: Option<usize>, force_active_experts: bool) -> Self {
+        Self {
+            active_experts_override,
+            force_active_experts,
+        }
+    }
+
+    fn resolve(&self, model: &str, config: &QwenModelConfig) -> Result<ResolvedRoutingPolicy> {
+        let qwen35_profile = is_qwen35_or_legacy_alias(model);
+        let (source, active_experts) = if let Some(active_experts) = self.active_experts_override {
+            (ActiveExpertsSource::UserOverride, active_experts)
+        } else if qwen35_profile {
+            (
+                ActiveExpertsSource::Qwen35FlashMoeProfile,
+                ACTIVE_EXPERTS_PER_TOKEN,
+            )
+        } else {
+            (
+                ActiveExpertsSource::ModelConfig,
+                config.config_active_experts(),
+            )
+        };
+        let experts = config.experts();
+        if experts == 0 || active_experts == 0 || active_experts > experts {
+            bail!(
+                "invalid MoE routing policy: num_experts={experts}, active_experts={active_experts}"
+            );
+        }
+        if qwen35_profile && active_experts < QWEN35_MIN_ACTIVE_EXPERTS {
+            if self.force_active_experts {
+                tracing::warn!(
+                    model,
+                    active_experts,
+                    minimum = QWEN35_MIN_ACTIVE_EXPERTS,
+                    "forcing Qwen3.5 Flash-MoE active-expert count below the quality guard"
+                );
+            } else {
+                bail!(
+                    "Qwen3.5 Flash-MoE routing requires K >= {QWEN35_MIN_ACTIVE_EXPERTS}; got K={active_experts}. Set model.flashmoe_force_active_experts=true or pass --flashmoe-force-active-experts to force this experimental routing."
+                );
+            }
+        }
+        Ok(ResolvedRoutingPolicy {
+            active_experts,
+            source,
+            force_active_experts: self.force_active_experts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveExpertsSource {
+    ModelConfig,
+    Qwen35FlashMoeProfile,
+    UserOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRoutingPolicy {
+    active_experts: usize,
+    source: ActiveExpertsSource,
+    force_active_experts: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoePlan {
+    pub model: String,
+    pub model_cache_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub non_expert_weights: PathBuf,
+    pub tensor_manifest: PathBuf,
+    pub model_config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub tokenizer_config: PathBuf,
+    pub experts_dir: PathBuf,
+    pub uses_metal: bool,
+    pub streams_experts_from_nand: bool,
+    pub quantization: ExpertQuantization,
+    pub routing_policy: FlashMoeRoutingPolicy,
+    /// Packed vision-encoder weights (present only for Qwen3-VL MoE plans).
+    pub vision_weights: Option<PathBuf>,
+    /// Vision-encoder tensor manifest JSON (present only for Qwen3-VL MoE plans).
+    pub vision_manifest: Option<PathBuf>,
+    /// Persisted vision-encoder config JSON (present only for Qwen3-VL MoE plans).
+    pub vision_config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertQuantization {
+    FourBitProduction,
+}
+
+impl ExpertQuantization {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FourBitProduction => "4-bit expert weights",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStatus {
+    pub ready: bool,
+    pub missing: Vec<PathBuf>,
+    pub expert_files: usize,
+    pub expert_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationRequest {
+    pub prompt: String,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+/// Ordered content for multimodal (Qwen3-VL) generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultimodalContent {
+    Text { text: String },
+    Image { image_path: PathBuf },
+}
+
+/// A structured multimodal request for Qwen3-VL inference.
+#[derive(Debug, Clone)]
+pub struct MultimodalGenerationRequest {
+    pub content: Vec<MultimodalContent>,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl ChatRole {
+    fn as_qwen_role(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl Default for ChatMessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for ChatMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder_tokens: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    #[serde(default)]
+    pub content: ChatMessageContent,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: ChatMessageContent::Text(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredGenerationRequest {
+    pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ChatTool>,
+    pub add_generation_prompt: bool,
+    pub raw_prompt: bool,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+impl StructuredGenerationRequest {
+    pub fn from_prompt(request: &GenerationRequest) -> Self {
+        Self {
+            messages: vec![ChatMessage::text(ChatRole::User, request.prompt.clone())],
+            tools: Vec::new(),
+            add_generation_prompt: true,
+            raw_prompt: false,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_k: request.top_k,
+            seed: request.seed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationOutput {
+    pub content: String,
+    pub tool_calls: Vec<ChatToolCall>,
+    pub generated_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimedGenerationOutput {
+    pub output: GenerationOutput,
+    pub timing: FlashMoeGenerationTiming,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeGenerationTiming {
+    pub model: String,
+    pub dimensions: FlashMoeModelDimensions,
+    pub tokens: Vec<FlashMoeTokenTiming>,
+    pub total_wall: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeModelDimensions {
+    pub layers: usize,
+    pub hidden_size: usize,
+    pub attention_heads: usize,
+    pub kv_heads: usize,
+    pub vocab_size: usize,
+    pub experts_per_layer: Option<usize>,
+    pub active_experts_per_token: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub shared_experts: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeTokenTiming {
+    pub token_index: usize,
+    pub position: usize,
+    pub phase: FlashMoeTokenPhase,
+    pub input_token: u32,
+    pub sampled_token: Option<u32>,
+    pub layers: Vec<FlashMoeLayerTiming>,
+    pub buckets: FlashMoeTimingBuckets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashMoeTokenPhase {
+    Prefill,
+    Decode,
+}
+
+impl FlashMoeTokenPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashMoeLayerTiming {
+    pub layer: usize,
+    pub layer_kind: FlashMoeLayerKind,
+    pub active_experts: usize,
+    pub dimensions: FlashMoeLayerDimensions,
+    pub buckets: FlashMoeTimingBuckets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashMoeLayerKind {
+    FullAttention,
+    LinearAttention,
+    Unknown,
+}
+
+impl FlashMoeLayerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAttention => "full_attention",
+            Self::LinearAttention => "linear_attention",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeLayerDimensions {
+    pub hidden_size: usize,
+    pub q_width: Option<usize>,
+    pub kv_width: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub experts_per_layer: Option<usize>,
+    pub active_experts_per_token: Option<usize>,
+    pub shared_experts: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlashMoeTimingBuckets {
+    pub attention_projection: Duration,
+    pub attention_input_projection: Duration,
+    pub attention_kernel: Duration,
+    pub attention_output_projection: Duration,
+    pub attention_misc: Duration,
+    pub routing: Duration,
+    pub expert_io: Duration,
+    pub expert_queue: Duration,
+    pub expert_read: Duration,
+    pub expert_compute: Duration,
+    pub combine_norm: Duration,
+    pub sampling: Duration,
+    pub total_wall: Duration,
+    pub expert_bytes_read: u64,
+    pub expert_warm_reads: u64,
+    pub expert_warm_read: Duration,
+    pub expert_warm_bytes_read: u64,
+}
+
+impl FlashMoeTimingBuckets {
+    fn add(&mut self, other: Self) {
+        self.attention_projection += other.attention_projection;
+        self.attention_input_projection += other.attention_input_projection;
+        self.attention_kernel += other.attention_kernel;
+        self.attention_output_projection += other.attention_output_projection;
+        self.attention_misc += other.attention_misc;
+        self.routing += other.routing;
+        self.expert_io += other.expert_io;
+        self.expert_queue += other.expert_queue;
+        self.expert_read += other.expert_read;
+        self.expert_compute += other.expert_compute;
+        self.combine_norm += other.combine_norm;
+        self.sampling += other.sampling;
+        self.expert_bytes_read = self
+            .expert_bytes_read
+            .saturating_add(other.expert_bytes_read);
+        self.expert_warm_reads = self
+            .expert_warm_reads
+            .saturating_add(other.expert_warm_reads);
+        self.expert_warm_read += other.expert_warm_read;
+        self.expert_warm_bytes_read = self
+            .expert_warm_bytes_read
+            .saturating_add(other.expert_warm_bytes_read);
+    }
+
+    fn add_expert_scheduler_delta(&mut self, delta: ExpertSchedulerSnapshot) {
+        self.expert_queue += delta.total_queue_latency;
+        self.expert_read += delta.total_read_latency;
+        self.expert_bytes_read = self.expert_bytes_read.saturating_add(delta.bytes_read);
+        self.expert_warm_reads = self.expert_warm_reads.saturating_add(delta.warm_reads);
+        self.expert_warm_read += delta.total_warm_read_latency;
+        self.expert_warm_bytes_read = self
+            .expert_warm_bytes_read
+            .saturating_add(delta.warm_bytes_read);
+    }
+}
+
+impl FlashMoeTokenTiming {
+    fn new(
+        token_index: usize,
+        position: usize,
+        phase: FlashMoeTokenPhase,
+        input_token: u32,
+    ) -> Self {
+        Self {
+            token_index,
+            position,
+            phase,
+            input_token,
+            sampled_token: None,
+            layers: Vec::new(),
+            buckets: FlashMoeTimingBuckets::default(),
+        }
+    }
+}
+
+/// A generation request that includes an image for multimodal (Qwen3-VL) inference.
+#[derive(Debug, Clone)]
+pub struct VisionGenerationRequest {
+    /// Text prompt (will be wrapped in the model's chat template).
+    pub prompt: String,
+    /// Path to the image to encode.
+    pub image_path: PathBuf,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafetensorsIndex {
+    weight_map: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlashMoeManifest {
+    pub model: String,
+    pub cache_version: String,
+    pub dense_shards: Vec<String>,
+    pub expert_tensors: Vec<ExpertTensorRef>,
+    pub dense_tensors: Vec<DenseTensorRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpertTensorRef {
+    pub tensor: String,
+    pub shard: String,
+    pub layer: Option<usize>,
+    pub expert: Option<usize>,
+    pub dtype: Option<String>,
+    pub shape: Vec<usize>,
+    pub source_offsets: Option<[u64; 2]>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseTensorRef {
+    pub tensor: String,
+    pub shard: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub source_offsets: [u64; 2],
+    pub runtime_offset: u64,
+    pub byte_len: u64,
+    #[serde(default)]
+    pub quantization: TensorQuantization,
+}
+
+#[derive(Debug, Clone)]
+struct SafetensorShard {
+    data_start: u64,
+    tensors: BTreeMap<String, SafetensorTensorInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SafetensorTensorInfo {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [u64; 2],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QwenModelConfig {
+    pub model_type: Option<String>,
+    pub architectures: Option<Vec<String>>,
+    pub num_hidden_layers: usize,
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: Option<usize>,
+    pub vocab_size: usize,
+    pub rope_theta: Option<f64>,
+    /// Optional Qwen-family partial rotary factor. Standard Qwen attention normally
+    /// uses full-head RoPE when absent. Gated-Q Flash-MoE attention defaults to 0.25.
+    pub partial_rotary_factor: Option<f64>,
+    pub torch_dtype: Option<String>,
+    pub num_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub intermediate_size: Option<usize>,
+    pub max_position_embeddings: Option<usize>,
+    /// Qwen3-VL Interleaved-MRoPE frequency allocation for text attention.
+    pub mrope_section: Option<[usize; 3]>,
+    /// Whether the output projection (lm_head) shares weights with the input embedding
+    /// (model.embed_tokens).  When true or absent, lm_head.weight is optional in the manifest.
+    pub tie_word_embeddings: Option<bool>,
+    /// Number of always-active shared experts per MoE layer (Qwen3 MoE architecture).
+    /// These are dense and live in the dense store rather than the per-expert pack files.
+    pub num_shared_experts: Option<usize>,
+    /// Intermediate size for the shared expert MLPs.  Falls back to moe_intermediate_size
+    /// then intermediate_size when absent.
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// Vision encoder configuration; present only for Qwen3-VL multimodal models.
+    pub vision_config: Option<Qwen3VLVisionConfig>,
+}
+
+/// Vision-encoder (ViT) configuration for Qwen3-VL MoE models.
+///
+/// Mirrors the `vision_config` sub-object found in the HuggingFace `config.json`
+/// for `Qwen/Qwen3-VL-MoE-Instruct` and related checkpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Qwen3VLVisionConfig {
+    /// Number of transformer layers in the ViT encoder.
+    pub depth: usize,
+    /// Hidden dimension of the ViT (equals `hidden_size` in the HF config).
+    #[serde(alias = "hidden_size")]
+    pub embed_dim: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// Explicit ViT MLP hidden size used by Qwen3.5 vision configs.
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
+    /// FFN hidden-size ratio (defaults to 4.0).
+    #[serde(default = "default_vit_mlp_ratio")]
+    pub mlp_ratio: f64,
+    /// Pixel edge-length of each square patch (defaults to 14).
+    #[serde(default = "default_vit_patch_size")]
+    pub patch_size: usize,
+    /// How many patches are spatially merged into one language-model token
+    /// along each axis (defaults to 2, giving 2×2 = 4 patches per token).
+    #[serde(alias = "spatial_merge_size")]
+    #[serde(default = "default_vit_merge_size")]
+    pub merge_size: usize,
+    /// Temporal frames folded into each Conv3d patch (2 for Qwen3-VL images,
+    /// where the still image is duplicated across the temporal window).
+    #[serde(default = "default_vit_temporal_patch_size")]
+    pub temporal_patch_size: usize,
+    /// Size of the learned square absolute-position table used by the ViT.
+    #[serde(default)]
+    pub num_position_embeddings: Option<usize>,
+    /// Vision layers whose merged features are injected into early decoder layers.
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+    /// Output hidden size of the vision merger.  Defaults to the text hidden size
+    /// when omitted by older configs.
+    #[serde(default)]
+    pub out_hidden_size: Option<usize>,
+    /// Input channels (defaults to 3 for RGB).
+    #[serde(alias = "in_channels")]
+    #[serde(default = "default_vit_in_chans")]
+    pub in_chans: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenModelConfig {
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    vocab_size: Option<usize>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    torch_dtype: Option<String>,
+    dtype: Option<String>,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
+    num_shared_experts: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    vision_config: Option<Qwen3VLVisionConfig>,
+    text_config: Option<RawQwenTextConfig>,
+    rope_parameters: Option<RawQwenRopeParameters>,
+    rope_scaling: Option<RawQwenRopeParameters>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenTextConfig {
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    vocab_size: Option<usize>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    torch_dtype: Option<String>,
+    dtype: Option<String>,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
+    num_shared_experts: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    rope_parameters: Option<RawQwenRopeParameters>,
+    rope_scaling: Option<RawQwenRopeParameters>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawQwenRopeParameters {
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    mrope_section: Option<[usize; 3]>,
+}
+
+impl<'de> Deserialize<'de> for QwenModelConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let raw = RawQwenModelConfig::deserialize(deserializer)?;
+        let text = raw.text_config.unwrap_or_default();
+
+        let required = |field: &'static str,
+                        top: Option<usize>,
+                        nested: Option<usize>|
+         -> std::result::Result<usize, D::Error> {
+            top.or(nested)
+                .ok_or_else(|| de::Error::missing_field(field))
+        };
+
+        Ok(Self {
+            model_type: raw.model_type.or(text.model_type),
+            architectures: raw.architectures.or(text.architectures),
+            num_hidden_layers: required(
+                "num_hidden_layers",
+                raw.num_hidden_layers,
+                text.num_hidden_layers,
+            )?,
+            hidden_size: required("hidden_size", raw.hidden_size, text.hidden_size)?,
+            num_attention_heads: required(
+                "num_attention_heads",
+                raw.num_attention_heads,
+                text.num_attention_heads,
+            )?,
+            num_key_value_heads: raw.num_key_value_heads.or(text.num_key_value_heads),
+            vocab_size: required("vocab_size", raw.vocab_size, text.vocab_size)?,
+            rope_theta: raw
+                .rope_theta
+                .or_else(|| {
+                    raw.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .or(text.rope_theta)
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                })
+                .or_else(|| {
+                    text.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.rope_theta)
+                }),
+            partial_rotary_factor: raw
+                .partial_rotary_factor
+                .or_else(|| {
+                    raw.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
+                .or(text.partial_rotary_factor)
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                })
+                .or_else(|| {
+                    text.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.partial_rotary_factor)
+                }),
+            torch_dtype: raw
+                .torch_dtype
+                .or(raw.dtype)
+                .or(text.torch_dtype)
+                .or(text.dtype),
+            num_experts: raw.num_experts.or(text.num_experts),
+            num_experts_per_tok: raw.num_experts_per_tok.or(text.num_experts_per_tok),
+            moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
+            intermediate_size: raw.intermediate_size.or(text.intermediate_size),
+            max_position_embeddings: raw.max_position_embeddings.or(text.max_position_embeddings),
+            mrope_section: raw
+                .rope_parameters
+                .as_ref()
+                .and_then(|params| params.mrope_section)
+                .or_else(|| {
+                    raw.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                })
+                .or_else(|| {
+                    text.rope_parameters
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                })
+                .or_else(|| {
+                    text.rope_scaling
+                        .as_ref()
+                        .and_then(|params| params.mrope_section)
+                }),
+            tie_word_embeddings: raw.tie_word_embeddings.or(text.tie_word_embeddings),
+            num_shared_experts: raw.num_shared_experts.or(text.num_shared_experts),
+            shared_expert_intermediate_size: raw
+                .shared_expert_intermediate_size
+                .or(text.shared_expert_intermediate_size),
+            vision_config: raw.vision_config,
+        })
+    }
+}
+
+fn default_vit_mlp_ratio() -> f64 {
+    4.0
+}
+fn default_vit_patch_size() -> usize {
+    VIT_PATCH_SIZE
+}
+fn default_vit_merge_size() -> usize {
+    VIT_MERGE_SIZE
+}
+fn default_vit_temporal_patch_size() -> usize {
+    2
+}
+fn default_vit_in_chans() -> usize {
+    3
+}
+
+impl Qwen3VLVisionConfig {
+    /// Pixel stride per merged visual token (`patch_size * merge_size`).
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    /// Number of patches that form one merged visual token (`merge_size ^ 2`).
+    pub fn patches_per_token(&self) -> usize {
+        self.merge_size * self.merge_size
+    }
+
+    /// Flattened input dimension for the patch-embedding linear layer.
+    pub fn patch_flat_dim(&self) -> usize {
+        self.in_chans * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    /// Intermediate size of each ViT MLP layer.
+    pub fn mlp_hidden_size(&self) -> usize {
+        self.intermediate_size
+            .unwrap_or_else(|| (self.embed_dim as f64 * self.mlp_ratio).round() as usize)
+    }
+}
+
+impl QwenModelConfig {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read model config {}", path.display()))?;
+        let config: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse model config {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let model_type = self
+            .model_type
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !(model_type.contains("qwen")
+            || self.architectures.as_ref().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.to_ascii_lowercase().contains("qwen"))
+            }))
+        {
+            bail!(
+                "Flash-MoE only supports Qwen-family configs, found model_type={:?} architectures={:?}",
+                self.model_type,
+                self.architectures
+            );
+        }
+        if self.num_hidden_layers == 0
+            || self.hidden_size == 0
+            || self.num_attention_heads == 0
+            || self.vocab_size == 0
+        {
+            bail!("Qwen config contains zero-valued required dimensions");
+        }
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
+            bail!(
+                "hidden_size {} is not divisible by num_attention_heads {}",
+                self.hidden_size,
+                self.num_attention_heads
+            );
+        }
+        if let Some(kv_heads) = self.num_key_value_heads
+            && (kv_heads == 0 || !self.num_attention_heads.is_multiple_of(kv_heads))
+        {
+            bail!(
+                "num_key_value_heads {kv_heads} must divide num_attention_heads {}",
+                self.num_attention_heads
+            );
+        }
+        let experts = self.experts();
+        let active = self.config_active_experts();
+        if experts == 0 || active == 0 || active > experts {
+            bail!(
+                "invalid MoE routing config: num_experts={experts}, num_experts_per_tok={active}"
+            );
+        }
+        if let Some(theta) = self.rope_theta
+            && (!theta.is_finite() || theta <= 0.0)
+        {
+            bail!("rope_theta must be positive and finite, got {theta}");
+        }
+        if let Some(factor) = self.partial_rotary_factor
+            && (!factor.is_finite() || factor <= 0.0 || factor > 1.0)
+        {
+            bail!("partial_rotary_factor must be in (0, 1], got {factor}");
+        }
+        if let Some(section) = self.mrope_section
+            && section.contains(&0)
+        {
+            bail!("mrope_section entries must be positive, got {section:?}");
+        }
+        if let Some(vision) = &self.vision_config {
+            if vision.depth == 0
+                || vision.embed_dim == 0
+                || vision.num_heads == 0
+                || vision.patch_size == 0
+                || vision.merge_size == 0
+                || vision.temporal_patch_size == 0
+                || vision.in_chans == 0
+            {
+                bail!("Qwen3-VL vision_config contains zero-valued required dimensions");
+            }
+            if vision.embed_dim % vision.num_heads != 0 {
+                bail!(
+                    "vision hidden_size {} is not divisible by num_heads {}",
+                    vision.embed_dim,
+                    vision.num_heads
+                );
+            }
+            if let Some(idx) = vision
+                .deepstack_visual_indexes
+                .iter()
+                .copied()
+                .find(|idx| *idx >= vision.depth)
+            {
+                bail!(
+                    "vision deepstack_visual_indexes contains {idx}, but depth is {}",
+                    vision.depth
+                );
+            }
+        }
+        if let Some(dtype) = &self.torch_dtype {
+            let dtype = dtype.to_ascii_lowercase();
+            if !matches!(
+                dtype.as_str(),
+                "bfloat16" | "float16" | "float32" | "bf16" | "fp16" | "fp32"
+            ) {
+                bail!("unsupported Qwen dtype {dtype}; expected bf16/fp16/fp32 compatible weights");
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_heads(&self) -> usize {
+        self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    fn experts(&self) -> usize {
+        self.num_experts.unwrap_or(NUM_EXPERTS)
+    }
+
+    fn config_active_experts(&self) -> usize {
+        self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN)
+    }
+
+    fn shared_experts(&self) -> usize {
+        self.num_shared_experts
+            .unwrap_or_else(|| usize::from(self.shared_expert_intermediate_size.unwrap_or(0) > 0))
+    }
+
+    fn uses_qwen3next_norm_offsets(&self) -> bool {
+        self.model_type.as_deref().is_some_and(|model_type| {
+            model_type.contains("qwen3_5_moe") || model_type.contains("qwen3_next")
+        }) || self.architectures.as_ref().is_some_and(|architectures| {
+            architectures
+                .iter()
+                .any(|architecture| architecture.contains("Qwen3Next"))
+        })
+    }
+
+    fn linear_attention_qkv_projection_requires_reorder(&self) -> bool {
+        let is_qwen35 = self
+            .model_type
+            .as_deref()
+            .is_some_and(|model_type| model_type.contains("qwen3_5"))
+            || self.architectures.as_ref().is_some_and(|architectures| {
+                architectures
+                    .iter()
+                    .any(|architecture| architecture.contains("Qwen3_5"))
+            });
+        !is_qwen35
+    }
+
+    fn text_mrope_section(&self) -> Option<[usize; 3]> {
+        self.mrope_section
+            .or_else(|| self.vision_config.as_ref().map(|_| DEFAULT_MROPE_SECTION))
+    }
+
+    /// Returns the intermediate hidden size used by each shared expert MLP.
+    fn shared_expert_intermediate_size(&self) -> usize {
+        self.shared_expert_intermediate_size
+            .or(self.moe_intermediate_size)
+            .or(self.intermediate_size)
+            .unwrap_or(0)
+    }
+}
+
+pub fn select_backend(model: &str) -> BackendSelection {
+    if supports_flashmoe(model) {
+        BackendSelection::FlashMoePreferred
+    } else {
+        BackendSelection::LlamaCpp
+    }
+}
+
+pub fn supports_flashmoe(model: &str) -> bool {
+    is_arm_macos() && is_flashmoe_model_name(model)
+}
+
+pub fn is_arm_macos() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+fn is_flashmoe_model_name(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("gguf") {
+        return false;
+    }
+    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model)
+}
+
+pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains(QWEN35_MODEL_MARKER) || normalized.contains(LEGACY_QWEN_CODER_MARKER)
+}
+
+/// Returns `true` when `model` identifies a Qwen3-VL MoE multimodal model.
+pub fn is_qwen3_vl(model: &str) -> bool {
+    model.to_ascii_lowercase().contains(QWEN3_VL_MODEL_MARKER)
+}
+
+/// Returns `true` for HuggingFace-style Qwen3 MoE checkpoint names such as
+/// `Qwen3-30B-A3B` and `Qwen3-235B-A22B-Instruct`.
+pub fn is_qwen3_moe(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains("qwen3")
+        && (normalized.contains("moe") || contains_active_parameter_marker(&normalized))
+}
+
+fn contains_active_parameter_marker(model: &str) -> bool {
+    let mut remainder = model;
+    while let Some(start) = remainder.find(QWEN3_ACTIVE_PARAMS_MARKER) {
+        let rest = &remainder[start + QWEN3_ACTIVE_PARAMS_MARKER.len()..];
+        let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digits > 0 && rest[digits..].starts_with('b') {
+            return true;
+        }
+        remainder = rest;
+    }
+    false
+}
+
+pub fn canonical_model(model: &str) -> String {
+    if model
+        .to_ascii_lowercase()
+        .contains(LEGACY_QWEN_CODER_MARKER)
+    {
+        QWEN35_MODEL.to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+pub fn plan(model: &str, models_root: &Path) -> Option<FlashMoePlan> {
+    plan_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
+}
+
+pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
+    plan_unchecked_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
+}
+
+pub fn plan_with_routing(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+) -> Option<FlashMoePlan> {
+    supports_flashmoe(model)
+        .then(|| plan_unchecked_with_routing(model, models_root, routing_policy))
+}
+
+pub fn plan_unchecked_with_routing(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+) -> FlashMoePlan {
+    plan_unchecked_with_cache_version(model, models_root, routing_policy, CACHE_VERSION)
+}
+
+pub fn plan_unchecked_with_cache_version(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+    cache_version: &str,
+) -> FlashMoePlan {
+    let model = canonical_model(model);
+    let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
+    let runtime_dir = model_cache_dir.join(cache_version);
+    let vl = is_qwen3_vl(&model);
+    FlashMoePlan {
+        vision_weights: vl.then(|| runtime_dir.join("vision_weights.bin")),
+        vision_manifest: vl.then(|| runtime_dir.join("vision_weights.json")),
+        vision_config_path: vl.then(|| runtime_dir.join("vision_config.json")),
+        non_expert_weights: runtime_dir.join("model_weights.bin"),
+        tensor_manifest: runtime_dir.join("model_weights.json"),
+        model_config: runtime_dir.join("config.json"),
+        tokenizer: model_cache_dir.join("tokenizer.json"),
+        tokenizer_config: model_cache_dir.join("tokenizer_config.json"),
+        experts_dir: runtime_dir.join("packed_experts"),
+        runtime_dir,
+        model,
+        model_cache_dir,
+        uses_metal: true,
+        streams_experts_from_nand: true,
+        quantization: ExpertQuantization::FourBitProduction,
+        routing_policy,
+    }
+}
+
+impl FlashMoePlan {
+    pub fn cache_status(&self) -> Result<CacheStatus> {
+        let mut required = vec![
+            self.non_expert_weights.clone(),
+            self.tensor_manifest.clone(),
+            self.model_config.clone(),
+            self.tokenizer.clone(),
+        ];
+        if is_qwen3_vl(&self.model) {
+            required.extend(
+                [
+                    self.vision_weights.clone(),
+                    self.vision_manifest.clone(),
+                    self.vision_config_path.clone(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+        let mut missing: Vec<PathBuf> = required
+            .into_iter()
+            .filter(|path| !path.is_file())
+            .collect();
+        if !self.experts_dir.is_dir() {
+            missing.push(self.experts_dir.clone());
+        }
+
+        let (expert_files, expert_bytes) = expert_store_size(&self.experts_dir)?;
+        if self.experts_dir.is_dir()
+            && let Some(missing_expert) =
+                first_missing_expert_pack(&self.experts_dir, &self.model_config)?
+        {
+            missing.push(missing_expert);
+        }
+        let ready = missing.is_empty() && expert_bytes > 0;
+
+        Ok(CacheStatus {
+            ready,
+            missing,
+            expert_files,
+            expert_bytes,
+        })
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
+            CACHE_VERSION,
+            self.model,
+            NUM_LAYERS,
+            NUM_EXPERTS,
+            ACTIVE_EXPERTS_PER_TOKEN,
+            HIDDEN_DIM,
+            self.runtime_dir.display(),
+            self.experts_dir.display(),
+            EXPECTED_EXPERT_BYTES / (1024 * 1024 * 1024)
+        )
+    }
+}
+
+pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
+    load_with_progress(plan, |_, _| {})
+}
+
+pub fn load_with_progress<F>(plan: &FlashMoePlan, mut progress: F) -> Result<FlashMoeEngine>
+where
+    F: FnMut(&'static str, Duration),
+{
+    let mut phase_started = Instant::now();
+    let status = plan.cache_status()?;
+    progress("cache_status", phase_started.elapsed());
+    if !status.ready {
+        bail!(
+            "Flash-MoE cache is not ready for {}. Missing: {}. Found {} expert files totaling {} bytes. Run `pb pull {}` on ARM macOS to download and prepare the Qwen3.5 cache.",
+            plan.model,
+            format_missing(&status.missing),
+            status.expert_files,
+            status.expert_bytes,
+            plan.model
+        );
+    }
+    phase_started = Instant::now();
+    let config = QwenModelConfig::from_file(&plan.model_config)?;
+    progress("config", phase_started.elapsed());
+    phase_started = Instant::now();
+    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
+    progress("routing_policy", phase_started.elapsed());
+    phase_started = Instant::now();
+    let dense = DenseStore::open(
+        plan.non_expert_weights.clone(),
+        plan.tensor_manifest.clone(),
+    )?;
+    progress("dense_store", phase_started.elapsed());
+    phase_started = Instant::now();
+    validate_required_tensor_manifest(&config, dense.registry())?;
+    progress("manifest_validation", phase_started.elapsed());
+    phase_started = Instant::now();
+    let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
+    progress("runtime_layout", phase_started.elapsed());
+    phase_started = Instant::now();
+    let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
+    progress("vision_encoder", phase_started.elapsed());
+    phase_started = Instant::now();
+    let metal = MetalExecutor::new(plan, &config, &runtime, &dense)?;
+    progress("metal_executor", phase_started.elapsed());
+    phase_started = Instant::now();
+    let experts = ExpertStore::open(plan.experts_dir.clone())?;
+    let scheduler = ExpertScheduler::new(ExpertStore::open(plan.experts_dir.clone())?);
+    progress("expert_store", phase_started.elapsed());
+    phase_started = Instant::now();
+    let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
+    progress("tokenizer", phase_started.elapsed());
+    Ok(FlashMoeEngine {
+        plan: plan.clone(),
+        experts,
+        scheduler,
+        dense,
+        tokenizer,
+        metal,
+        vision_encoder,
+        config,
+        routing_policy,
+        runtime,
+        shared_expert_cache: Mutex::new(BTreeMap::new()),
+        linear_attention_cache: Mutex::new(BTreeMap::new()),
+        session_cache: BTreeMap::new(),
+    })
+}
+
+#[derive(Debug)]
+pub struct FlashMoeEngine {
+    plan: FlashMoePlan,
+    experts: ExpertStore,
+    scheduler: ExpertScheduler,
+    dense: DenseStore,
+    tokenizer: QwenTokenizer,
+    metal: Option<MetalExecutor>,
+    config: QwenModelConfig,
+    routing_policy: ResolvedRoutingPolicy,
+    runtime: DenseTransformerRuntime,
+    shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
+    linear_attention_cache: Mutex<BTreeMap<usize, Arc<LinearAttentionStaticWeights>>>,
+    /// Vision encoder, present only for Qwen3-VL plans.
+    vision_encoder: Option<VisionEncoder>,
+    session_cache: BTreeMap<String, FlashMoeSessionState>,
+}
+
+#[derive(Debug, Clone)]
+struct FlashMoeSessionState {
+    tokens: Vec<u32>,
+    kv_cache: KvCache,
+    last_hidden: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertExecution {
+    Normal,
+    Skip,
+}
+
+impl ExpertExecution {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillInputKind {
+    Text,
+    Visual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillExpertStrategy {
+    ComputeAllExperts,
+    SkipIntermediateExpertsForTinySingleLayerTextFixture,
+}
+
+impl PrefillExpertStrategy {
+    fn expert_execution_for_position(
+        self,
+        position: usize,
+        prompt_tokens: usize,
+    ) -> ExpertExecution {
+        match self {
+            Self::ComputeAllExperts => ExpertExecution::Normal,
+            Self::SkipIntermediateExpertsForTinySingleLayerTextFixture => {
+                if position + 1 < prompt_tokens {
+                    ExpertExecution::Skip
+                } else {
+                    ExpertExecution::Normal
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SampledDecode {
+    token: u32,
+    hidden: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeepstackTokenContext<'a> {
+    features: &'a [Vec<Vec<f32>>],
+    visual_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MropePosition {
+    temporal: usize,
+    height: usize,
+    width: usize,
+}
+
+impl MropePosition {
+    fn text(position: usize) -> Self {
+        Self {
+            temporal: position,
+            height: position,
+            width: position,
+        }
+    }
+
+    fn axis(self, axis: MropeAxis) -> usize {
+        match axis {
+            MropeAxis::Temporal => self.temporal,
+            MropeAxis::Height => self.height,
+            MropeAxis::Width => self.width,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePlaceholderSpec {
+    token_count: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+impl ImagePlaceholderSpec {
+    fn validate(self, image_index: usize) -> Result<()> {
+        if self.token_count == 0 {
+            bail!("image {image_index} produced zero visual tokens");
+        }
+        if self.grid_h == 0 || self.grid_w == 0 {
+            bail!(
+                "image {image_index} has invalid merged grid {}x{}; both dimensions must be positive",
+                self.grid_h,
+                self.grid_w
+            );
+        }
+        let expected = self.grid_h.saturating_mul(self.grid_w);
+        if self.token_count != expected {
+            bail!(
+                "image {image_index} visual token count {} does not match merged grid {}x{} ({expected} tokens)",
+                self.token_count,
+                self.grid_h,
+                self.grid_w
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualModality {
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualTokenSpan {
+    modality: VisualModality,
+    start: usize,
+    end: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+impl VisualTokenSpan {
+    fn image(start: usize, end: usize, grid_h: usize, grid_w: usize) -> Self {
+        Self {
+            modality: VisualModality::Image,
+            start,
+            end,
+            grid_h,
+            grid_w,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn expected_token_count(self) -> usize {
+        match self.modality {
+            VisualModality::Image => self.grid_h.saturating_mul(self.grid_w),
+        }
+    }
+
+    fn position_advance(self) -> usize {
+        match self.modality {
+            VisualModality::Image => self.grid_h.max(self.grid_w),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedVisionPrompt {
+    tokens: Vec<u32>,
+    visual_spans: Vec<VisualTokenSpan>,
+}
+
+fn qwen3vl_multimodal_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    visual_spans: &[VisualTokenSpan],
+) -> Result<(Vec<MropePosition>, usize)> {
+    let actual_image_tokens = prompt_tokens
+        .iter()
+        .filter(|&&token| token == image_pad_token)
+        .count();
+    let expected_image_tokens = visual_spans
+        .iter()
+        .map(|span| span.end.saturating_sub(span.start))
+        .sum::<usize>();
+    if actual_image_tokens != expected_image_tokens {
+        bail!(
+            "image placeholder count {actual_image_tokens} does not match expected visual token count {expected_image_tokens}"
+        );
+    }
+
+    let mut positions = Vec::with_capacity(prompt_tokens.len());
+    let mut current_pos = 0usize;
+    let mut i = 0usize;
+    let mut span_index = 0usize;
+    while i < prompt_tokens.len() {
+        if span_index < visual_spans.len() && i == visual_spans[span_index].start {
+            let span = visual_spans[span_index];
+            if span.end < span.start || span.end > prompt_tokens.len() {
+                bail!(
+                    "image span {span_index} has invalid bounds {}..{} for prompt length {}",
+                    span.start,
+                    span.end,
+                    prompt_tokens.len()
+                );
+            }
+            if span.grid_h == 0 || span.grid_w == 0 {
+                bail!(
+                    "image span {span_index} has invalid merged grid {}x{}; both dimensions must be positive",
+                    span.grid_h,
+                    span.grid_w
+                );
+            }
+            let expected_span_tokens = span.expected_token_count();
+            let actual_span_tokens = span.len();
+            if actual_span_tokens != expected_span_tokens {
+                bail!(
+                    "image span {} has {actual_span_tokens} placeholder tokens but grid {}x{} requires {expected_span_tokens}",
+                    span_index,
+                    span.grid_h,
+                    span.grid_w
+                );
+            }
+            let start_position = current_pos;
+            let mut image_idx = 0usize;
+            while i < span.end {
+                if prompt_tokens.get(i).copied() != Some(image_pad_token) {
+                    bail!("image span {span_index} contains a non-placeholder token");
+                }
+                let row = if span.grid_w > 0 {
+                    image_idx / span.grid_w
+                } else {
+                    0
+                };
+                let col = if span.grid_w > 0 {
+                    image_idx % span.grid_w
+                } else {
+                    0
+                };
+                positions.push(MropePosition {
+                    temporal: start_position,
+                    height: start_position + row,
+                    width: start_position + col,
+                });
+                image_idx += 1;
+                i += 1;
+            }
+            current_pos += span.position_advance();
+            span_index += 1;
+        } else if prompt_tokens[i] == image_pad_token {
+            bail!("image placeholder at token {i} is not part of a visual span");
+        } else {
+            positions.push(MropePosition::text(current_pos));
+            current_pos += 1;
+            i += 1;
+        }
+    }
+    if span_index != visual_spans.len() {
+        bail!(
+            "only matched {span_index} visual spans in prompt but {} were expected",
+            visual_spans.len()
+        );
+    }
+    Ok((positions, current_pos))
+}
+
+fn qwen3vl_single_image_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    image_grid_h: usize,
+    image_grid_w: usize,
+) -> Result<(Vec<MropePosition>, usize)> {
+    let (run_start, run_end, _) = single_token_run_bounds(prompt_tokens, image_pad_token)
+        .context("single-image prompt contains no image placeholder run")?;
+    qwen3vl_multimodal_mrope_positions(
+        prompt_tokens,
+        image_pad_token,
+        &[VisualTokenSpan::image(
+            run_start,
+            run_end,
+            image_grid_h,
+            image_grid_w,
+        )],
+    )
+}
+
+fn expand_multimodal_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
+    image_pad_token: u32,
+    image_specs: &[ImagePlaceholderSpec],
+) -> Result<ExpandedVisionPrompt> {
+    let image_runs = token_run_bounds(&prompt_tokens, image_pad_token);
+    if image_runs.len() != image_specs.len() {
+        bail!(
+            "prompt contains {} image placeholder runs but {} images were provided",
+            image_runs.len(),
+            image_specs.len()
+        );
+    }
+
+    let mut expanded = Vec::with_capacity(prompt_tokens.len());
+    let mut visual_spans = Vec::with_capacity(image_specs.len());
+    let mut cursor = 0usize;
+    for (image_index, ((run_start, run_end, image_pad_count), spec)) in image_runs
+        .into_iter()
+        .zip(image_specs.iter().copied())
+        .enumerate()
+    {
+        spec.validate(image_index)?;
+        if image_pad_count != 1 && image_pad_count != spec.token_count {
+            bail!(
+                "image {image_index} placeholder span contains {image_pad_count} <|image_pad|> tokens but the encoded image produced {} visual tokens; use one placeholder for implicit expansion or exactly one per visual token",
+                spec.token_count
+            );
+        }
+        let has_start = run_start > 0 && prompt_tokens[run_start - 1] == vision_start_token;
+        let has_end = run_end < prompt_tokens.len() && prompt_tokens[run_end] == vision_end_token;
+        if has_start != has_end {
+            bail!(
+                "image {image_index} placeholders at token range {run_start}..{run_end} must be wrapped by both <|vision_start|> and <|vision_end|>"
+            );
+        }
+
+        expanded.extend_from_slice(&prompt_tokens[cursor..run_start]);
+        if !has_start {
+            expanded.push(vision_start_token);
+        }
+        let span_start = expanded.len();
+        expanded.extend(std::iter::repeat_n(image_pad_token, spec.token_count));
+        let span_end = expanded.len();
+        visual_spans.push(VisualTokenSpan::image(
+            span_start,
+            span_end,
+            spec.grid_h,
+            spec.grid_w,
+        ));
+        if !has_end {
+            expanded.push(vision_end_token);
+        }
+        cursor = run_end;
+    }
+    expanded.extend_from_slice(&prompt_tokens[cursor..]);
+    Ok(ExpandedVisionPrompt {
+        tokens: expanded,
+        visual_spans,
+    })
+}
+
+fn expand_single_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
+    image_pad_token: u32,
+    expected_image_tokens: usize,
+) -> Result<Vec<u32>> {
+    Ok(expand_multimodal_image_placeholders(
+        prompt_tokens,
+        vision_start_token,
+        vision_end_token,
+        image_pad_token,
+        &[ImagePlaceholderSpec {
+            token_count: expected_image_tokens,
+            grid_h: 1,
+            grid_w: expected_image_tokens,
+        }],
+    )?
+    .tokens)
+}
+
+fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    let mut count = 0usize;
+    for (idx, &token) in tokens.iter().enumerate() {
+        if token == needle {
+            if start.is_none() {
+                start = Some(idx);
+            }
+            count += 1;
+        } else if let Some(run_start) = start.take() {
+            runs.push((run_start, idx, count));
+            count = 0;
+        }
+    }
+    if let Some(run_start) = start {
+        runs.push((run_start, tokens.len(), count));
+    }
+    runs
+}
+
+fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize, usize)> {
+    let mut start = None;
+    let mut end = None;
+    let mut count = 0usize;
+    let mut in_run = false;
+    let mut runs = 0usize;
+    for (idx, &token) in tokens.iter().enumerate() {
+        if token == needle {
+            count += 1;
+            if !in_run {
+                runs += 1;
+                if runs > 1 {
+                    return None;
+                }
+                start = Some(idx);
+                in_run = true;
+            }
+            end = Some(idx + 1);
+        } else {
+            in_run = false;
+        }
+    }
+    Some((start?, end?, count))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MropeAxis {
+    Temporal,
+    Height,
+    Width,
+}
+
+#[derive(Debug, Clone)]
+struct MetalExecutor {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    inner: Arc<MetalExecutorInner>,
+    route_top4_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SharedExpertPhaseWeights {
+    gate: Arc<Vec<f32>>,
+    up: Arc<Vec<f32>>,
+    down: Arc<Vec<f32>>,
+    router: Arc<Vec<f32>>,
+    shared_experts: usize,
+    intermediate: usize,
+    width: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LinearAttentionStaticWeights {
+    conv_weight: Arc<Vec<f32>>,
+    a_log: Arc<Vec<f32>>,
+    dt_bias: Arc<Vec<f32>>,
+    norm_weight: Option<Arc<Vec<f32>>>,
+    layout: LinearAttentionLayout,
+}
+
+#[derive(Debug)]
+struct ExpertPhaseOutput {
+    hidden: Vec<f32>,
+    next_normed: Option<Vec<f32>>,
+}
+
+#[derive(Debug)]
+enum DeferredExpertPhase {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    Ready(ExpertPhaseOutput),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Metal(MetalDeferredExpertPhase),
+}
+
+impl DeferredExpertPhase {
+    fn wait(self) -> Result<ExpertPhaseOutput> {
+        match self {
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            Self::Ready(output) => Ok(output),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::Metal(output) => output.wait(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenseProjectionRequest<'a> {
+    tensor_name: &'a str,
+    output_width: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DenseMmapMatvecProjection {
+    tensor_name: String,
+    byte_offset: u64,
+    dtype: String,
+    rows: usize,
+    cols: usize,
+    output_width: usize,
+}
+
+impl DenseMmapMatvecProjection {
+    fn stride(&self) -> usize {
+        self.cols
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DenseQ4MmapMatvecProjection {
+    tensor_name: String,
+    packed_byte_offset: u64,
+    scales_byte_offset: u64,
+    biases_byte_offset: u64,
+    rows: usize,
+    cols: usize,
+    output_width: usize,
+    row_packed_bytes: usize,
+    groups_per_row: usize,
+    group_size: usize,
+}
+
+impl MetalExecutor {
+    fn new(
+        plan: &FlashMoePlan,
+        config: &QwenModelConfig,
+        runtime: &DenseTransformerRuntime,
+        dense: &DenseStore,
+    ) -> Result<Option<Self>> {
+        if !plan.uses_metal {
+            return Ok(None);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let route_top4_enabled = metal_route_top4_enabled();
+            Ok(Some(Self {
+                inner: Arc::new(MetalExecutorInner::new(
+                    plan,
+                    config,
+                    runtime,
+                    dense,
+                    route_top4_enabled,
+                )?),
+                route_top4_enabled,
+            }))
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (config, runtime, dense);
+            Ok(None)
+        }
+    }
+
+    fn project_q4_expert(
+        &self,
+        expert: &ExpertWeights,
+        hidden: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.project_q4_expert(expert, hidden, width)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            expert.project(hidden, width)
+        }
+    }
+
+    fn submit_expert_phase(
+        &self,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<DeferredExpertPhase>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .submit_expert_phase(
+                    position,
+                    layer,
+                    experts,
+                    weights,
+                    normed,
+                    residual,
+                    shared,
+                    next_norm_weight,
+                )
+                .map(|pending| pending.map(DeferredExpertPhase::Metal))
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (position, layer);
+            Ok(Some(DeferredExpertPhase::Ready(compute_expert_phase_cpu(
+                experts.as_ref(),
+                weights,
+                normed,
+                residual,
+                shared,
+                next_norm_weight,
+            )?)))
+        }
+    }
+
+    fn route_topk(
+        &self,
+        position: usize,
+        layer: usize,
+        scores: &[f32],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        if !self.route_top4_enabled || k != ACTIVE_EXPERTS_PER_TOKEN {
+            return Ok(top_k(scores, k));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.route_top4(position, layer, scores)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (position, layer);
+            Ok(top_k(scores, k))
+        }
+    }
+
+    fn rms_norm(&self, input: &[f32], weight: Option<&[f32]>) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.rms_norm(input, weight)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let mut out = input.to_vec();
+            rms_norm_with_weight_in_place(&mut out, weight);
+            Ok(out)
+        }
+    }
+
+    fn dense_matvec(
+        &self,
+        weights: &[f32],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.dense_matvec(weights, input, rows, cols)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Ok(cpu_dense_matvec(weights, input, rows, cols))
+        }
+    }
+
+    fn dense_matvec_bf16(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, MetalMatvecTiming)> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.dense_matvec_bf16(weights, input, rows, cols)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let decoded = decode_dense_tensor_f32("BF16", weights)?;
+            Ok((
+                cpu_dense_matvec(&decoded, input, rows, cols),
+                MetalMatvecTiming::default(),
+            ))
+        }
+    }
+
+    fn q4_matvec(
+        &self,
+        packed: &[u8],
+        input: &[f32],
+        scales: &[f32],
+        biases: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .dispatch_q4_matvec(packed, input, scales, biases, rows, cols, group_size)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            q4_fma_matvec_with_group_size(packed, input, scales, biases, rows, cols, group_size)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q4_mmap_matvec(
+        &self,
+        packed_byte_offset: u64,
+        scales_byte_offset: u64,
+        biases_byte_offset: u64,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        row_packed_bytes: usize,
+        groups_per_row: usize,
+        group_size: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.q4_mmap_matvec(
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                input,
+                rows,
+                cols,
+                row_packed_bytes,
+                groups_per_row,
+                group_size,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                input,
+                rows,
+                cols,
+                row_packed_bytes,
+                groups_per_row,
+                group_size,
+            );
+            Ok(None)
+        }
+    }
+
+    fn has_resident_dense_weights(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.has_resident_dense_weights()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    fn dense_mmap_matvec(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .dense_mmap_matvec(byte_offset, dtype, input, rows, cols, stride)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (byte_offset, dtype, input, rows, cols, stride);
+            Ok(None)
+        }
+    }
+
+    fn dense_mmap_matvec_batch(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.dense_mmap_matvec_batch(projections, input)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projections, input);
+            Ok(None)
+        }
+    }
+
+    fn q4_mmap_matvec_batch(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.q4_mmap_matvec_batch(projections, input)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projections, input);
+            Ok(None)
+        }
+    }
+
+    fn lm_head_top_candidates_from_cached_buffer(
+        &self,
+        key: &str,
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+        repeat_penalty: f32,
+        repeated: &BTreeSet<usize>,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.lm_head_top_candidates_from_cached_buffer(
+                key,
+                hidden,
+                rows,
+                cols,
+                top_k,
+                repeat_penalty,
+                repeated,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (key, hidden, rows, cols, top_k, repeat_penalty, repeated);
+            Ok(None)
+        }
+    }
+
+    fn cache_lm_head_and_top_candidates(
+        &self,
+        key: &str,
+        weights: &[f32],
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+        repeat_penalty: f32,
+        repeated: &BTreeSet<usize>,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.cache_lm_head_and_top_candidates(
+                key,
+                weights,
+                hidden,
+                rows,
+                cols,
+                top_k,
+                repeat_penalty,
+                repeated,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                key,
+                weights,
+                hidden,
+                rows,
+                cols,
+                top_k,
+                repeat_penalty,
+                repeated,
+            );
+            Ok(None)
+        }
+    }
+
+    fn can_cache_lm_head_bytes(&self, bytes: usize) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.can_cache_lm_head_bytes(bytes)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = bytes;
+            false
+        }
+    }
+
+    fn apply_rope(
+        &self,
+        values: &[f32],
+        position: usize,
+        head_dim: usize,
+        theta: f64,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.apply_rope(values, position, head_dim, theta)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let mut out = values.to_vec();
+            apply_rotary(&mut out, position, head_dim, theta);
+            Ok(out)
+        }
+    }
+
+    fn apply_rope_for_layout(
+        &self,
+        values: &[f32],
+        position: MropePosition,
+        theta: f64,
+        layout: FullAttentionLayout,
+        mrope_section: Option<[usize; 3]>,
+    ) -> Result<Option<Vec<f32>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .apply_rope_for_layout(values, position, theta, layout, mrope_section)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (values, position, theta, layout, mrope_section);
+            Ok(None)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn causal_attention(
+        &self,
+        query: &[f32],
+        keys_values: &[(&[f32], &[f32])],
+        num_q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Ok(causal_attention(
+                query,
+                keys_values,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+            ))
+        }
+    }
+
+    fn record_kv(
+        &self,
+        position: usize,
+        layer: usize,
+        layout: FullAttentionLayout,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.record_kv(position, layer, layout, key, value)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (position, layer, layout, key, value);
+            Ok(())
+        }
+    }
+
+    fn causal_attention_cached(
+        &self,
+        position: usize,
+        layer: usize,
+        query: &[f32],
+        layout: FullAttentionLayout,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .causal_attention_cached(position, layer, query, layout)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (position, layer, layout);
+            Ok(vec![0.0; query.len()])
+        }
+    }
+
+    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.attention_backend(tokens)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = tokens;
+            MetalAttentionBackend::Cpu
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalAttentionBackend {
+    Cpu,
+    Gpu,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct MetalAttentionPolicy;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalAttentionPolicy {
+    fn backend(&self, tokens: usize) -> MetalAttentionBackend {
+        if tokens > METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS {
+            MetalAttentionBackend::Gpu
+        } else {
+            MetalAttentionBackend::Cpu
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalExecutorInner {
+    device: ObjcId,
+    command_queue: ObjcId,
+    q4_pipeline: ObjcId,
+    q4_bf16_scale_bias_pipeline: ObjcId,
+    q4_mmap_pipeline: ObjcId,
+    route_pipeline: Option<ObjcId>,
+    dense_matvec_pipeline: ObjcId,
+    dense_matvec_bf16_pipeline: ObjcId,
+    dense_mmap_matvec_pipeline: ObjcId,
+    dense_mmap_matvec_bf16_pipeline: ObjcId,
+    dense_mmap_matvec_bf16_simd_pipeline: ObjcId,
+    rms_norm_pipeline: ObjcId,
+    rope_pipeline: ObjcId,
+    rope_split_half_pipeline: ObjcId,
+    attention_pipeline: ObjcId,
+    kv_write_pipeline: ObjcId,
+    kv_read_attention_pipeline: ObjcId,
+    expert_mlp_pipeline: ObjcId,
+    silu_product_pipeline: ObjcId,
+    shared_expert_activation_pipeline: ObjcId,
+    combine_expert_phase_pipeline: ObjcId,
+    fill_zero_pipeline: ObjcId,
+    lm_head_pipeline: ObjcId,
+    topk_vocab_pipeline: ObjcId,
+    gqa_scores_pipeline: ObjcId,
+    gqa_read_pipeline: ObjcId,
+    shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
+    dense_weights: Option<MetalDenseWeights>,
+    lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
+    kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
+    attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
+    reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalDenseWeights {
+    buffer: ObjcId,
+    _mmap: Arc<memmap2::Mmap>,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalSharedExpertBuffers {
+    gate: ObjcId,
+    up: ObjcId,
+    down: ObjcId,
+    router: ObjcId,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    total_intermediate: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalLmHeadBuffer {
+    weights: ObjcId,
+    rows: usize,
+    cols: usize,
+    bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalLmHeadBufferCache {
+    buffers: BTreeMap<String, MetalLmHeadBuffer>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLmHeadBufferCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            buffers: BTreeMap::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&self, key: &str, rows: usize, cols: usize) -> Option<MetalLmHeadBuffer> {
+        let buffer = self.buffers.get(key).copied()?;
+        (buffer.rows == rows && buffer.cols == cols).then_some(buffer)
+    }
+
+    unsafe fn insert(
+        &mut self,
+        key: String,
+        buffer: MetalLmHeadBuffer,
+    ) -> Option<MetalLmHeadBuffer> {
+        if buffer.bytes > self.max_bytes {
+            return Some(buffer);
+        }
+        while self.bytes.saturating_add(buffer.bytes) > self.max_bytes && !self.buffers.is_empty() {
+            let Some(victim) = self.buffers.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.buffers.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(previous.bytes);
+                unsafe {
+                    release(previous.weights);
+                }
+            }
+        }
+        let previous = self.buffers.insert(key, buffer);
+        if let Some(previous_buffer) = previous.as_ref() {
+            self.bytes = self.bytes.saturating_sub(previous_buffer.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(buffer.bytes);
+        previous
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalReusableBuffer {
+    id: ObjcId,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalKvCacheInner {
+    keys: ObjcId,
+    values: ObjcId,
+    layers: Vec<MetalKvLayer>,
+    max_context: usize,
+    total_items: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalKvLayer {
+    offset: usize,
+    width: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalPhaseBuffer {
+    id: ObjcId,
+    recycle: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalPhaseBuffer {
+    fn recyclable(id: ObjcId) -> Self {
+        Self { id, recycle: true }
+    }
+
+    fn borrowed(id: ObjcId) -> Self {
+        Self { id, recycle: false }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalDeferredExpertPhase {
+    inner: Arc<MetalExecutorInner>,
+    command_buffer: ObjcId,
+    buffers: Vec<MetalPhaseBuffer>,
+    retained_experts: Arc<[Arc<ExpertWeights>]>,
+    hidden_buffer: ObjcId,
+    next_normed_buffer: Option<ObjcId>,
+    context: MetalCommandContext,
+    width: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalDeferredExpertPhase {
+    fn wait(self) -> Result<ExpertPhaseOutput> {
+        unsafe {
+            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
+                release(self.command_buffer);
+                for buffer in self.buffers {
+                    release(buffer.id);
+                }
+                return Err(error.into());
+            }
+            let hidden = read_f32_buffer(self.hidden_buffer, self.width);
+            let next_normed = self
+                .next_normed_buffer
+                .map(|buffer| read_f32_buffer(buffer, self.width));
+            release(self.command_buffer);
+            for buffer in self.buffers {
+                if buffer.recycle {
+                    self.inner.recycle(buffer.id);
+                } else {
+                    release(buffer.id);
+                }
+            }
+            drop(self.retained_experts);
+            Ok(ExpertPhaseOutput {
+                hidden,
+                next_normed,
+            })
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for MetalExecutorInner {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for MetalExecutorInner {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalExecutorInner {
+    fn drop(&mut self) {
+        unsafe {
+            release(self.q4_pipeline);
+            release(self.q4_bf16_scale_bias_pipeline);
+            release(self.q4_mmap_pipeline);
+            if let Some(route_pipeline) = self.route_pipeline {
+                release(route_pipeline);
+            }
+            release(self.dense_matvec_pipeline);
+            release(self.dense_matvec_bf16_pipeline);
+            release(self.dense_mmap_matvec_pipeline);
+            release(self.dense_mmap_matvec_bf16_pipeline);
+            release(self.dense_mmap_matvec_bf16_simd_pipeline);
+            release(self.rms_norm_pipeline);
+            release(self.rope_pipeline);
+            release(self.rope_split_half_pipeline);
+            release(self.attention_pipeline);
+            release(self.kv_write_pipeline);
+            release(self.kv_read_attention_pipeline);
+            release(self.expert_mlp_pipeline);
+            release(self.silu_product_pipeline);
+            release(self.shared_expert_activation_pipeline);
+            release(self.combine_expert_phase_pipeline);
+            release(self.fill_zero_pipeline);
+            release(self.lm_head_pipeline);
+            release(self.topk_vocab_pipeline);
+            release(self.gqa_scores_pipeline);
+            release(self.gqa_read_pipeline);
+            if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
+                for buffers in shared_buffers.values() {
+                    release(buffers.gate);
+                    release(buffers.up);
+                    release(buffers.down);
+                    release(buffers.router);
+                }
+                shared_buffers.clear();
+            }
+            if let Some(dense_weights) = self.dense_weights.take() {
+                release(dense_weights.buffer);
+            }
+            if let Ok(lm_head_buffers) = self.lm_head_buffers.get_mut() {
+                for buffer in lm_head_buffers.buffers.values() {
+                    release(buffer.weights);
+                }
+                lm_head_buffers.buffers.clear();
+                lm_head_buffers.bytes = 0;
+            }
+            if let Ok(kv_cache) = self.kv_cache.get_mut()
+                && let Some(kv_cache) = kv_cache.take()
+            {
+                release(kv_cache.keys);
+                release(kv_cache.values);
+            }
+            release(self.command_queue);
+            release(self.device);
+            if let Ok(buffers) = self.reusable.get_mut() {
+                for buffer in buffers.drain(..) {
+                    release(buffer.id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalExecutorInner {
+    fn new(
+        plan: &FlashMoePlan,
+        config: &QwenModelConfig,
+        runtime: &DenseTransformerRuntime,
+        dense: &DenseStore,
+        route_top4_enabled: bool,
+    ) -> Result<Self> {
+        unsafe {
+            let device = MTLCreateSystemDefaultDevice();
+            if device.is_null() {
+                bail!(
+                    "Metal is required for Flash-MoE on ARM macOS, but no default Metal device is available"
+                );
+            }
+            let source = ns_string(METAL_SHADERS);
+            let mut compile_error = ptr::null_mut();
+            let library = msg_send_id2_id_error(
+                device,
+                sel("newLibraryWithSource:options:error:"),
+                source,
+                ptr::null_mut(),
+                &mut compile_error,
+            );
+            release(source);
+            if library.is_null() {
+                let error = ns_error_localized_description(compile_error)
+                    .unwrap_or_else(|| "unknown Metal compiler error".to_string());
+                release(device);
+                bail!("failed to compile Flash-MoE Metal shader library: {error}");
+            }
+
+            let q4_pipeline = compile_pipeline(device, library, "q4_fma_matvec")?;
+            let q4_bf16_scale_bias_pipeline =
+                compile_pipeline(device, library, "q4_fma_matvec_bf16_scale_bias")?;
+            let q4_mmap_pipeline = compile_pipeline(device, library, "q4_mmap_fma_matvec")?;
+            let route_pipeline = if route_top4_enabled {
+                Some(compile_pipeline(device, library, "route_top4")?)
+            } else {
+                None
+            };
+            let dense_matvec_pipeline = compile_pipeline(device, library, "dense_matvec")?;
+            let dense_matvec_bf16_pipeline =
+                compile_pipeline(device, library, "dense_matvec_bf16")?;
+            let dense_mmap_matvec_pipeline =
+                compile_pipeline(device, library, "dense_mmap_matvec_f32")?;
+            let dense_mmap_matvec_bf16_pipeline =
+                compile_pipeline(device, library, "dense_mmap_matvec_bf16")?;
+            let dense_mmap_matvec_bf16_simd_pipeline =
+                compile_pipeline(device, library, "dense_mmap_matvec_bf16_simd")?;
+            let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
+            let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
+            let rope_split_half_pipeline =
+                compile_pipeline(device, library, "rope_split_half_apply")?;
+            let attention_pipeline = compile_pipeline(device, library, "attention_scores")?;
+            let kv_write_pipeline = compile_pipeline(device, library, "kv_cache_write")?;
+            let kv_read_attention_pipeline =
+                compile_pipeline(device, library, "kv_cache_read_attention")?;
+            let expert_mlp_pipeline = compile_pipeline(device, library, "expert_mlp_fused")?;
+            let silu_product_pipeline = compile_pipeline(device, library, "silu_product")?;
+            let shared_expert_activation_pipeline =
+                compile_pipeline(device, library, "shared_expert_activation")?;
+            let combine_expert_phase_pipeline =
+                compile_pipeline(device, library, "combine_expert_phase")?;
+            let fill_zero_pipeline = compile_pipeline(device, library, "fill_zero")?;
+            let lm_head_pipeline = compile_pipeline(device, library, "lm_head_logits")?;
+            let topk_vocab_pipeline = compile_pipeline(device, library, "topk_vocab")?;
+            let gqa_scores_pipeline = compile_pipeline(device, library, "gqa_attention_scores")?;
+            let gqa_read_pipeline = compile_pipeline(device, library, "gqa_kv_read_attention")?;
+            release(library);
+
+            let command_queue = msg_send_id0(device, sel("newCommandQueue"));
+            if command_queue.is_null() {
+                release(q4_pipeline);
+                release(q4_bf16_scale_bias_pipeline);
+                release(q4_mmap_pipeline);
+                if let Some(route_pipeline) = route_pipeline {
+                    release(route_pipeline);
+                }
+                release(dense_matvec_pipeline);
+                release(dense_matvec_bf16_pipeline);
+                release(dense_mmap_matvec_pipeline);
+                release(dense_mmap_matvec_bf16_pipeline);
+                release(dense_mmap_matvec_bf16_simd_pipeline);
+                release(rms_norm_pipeline);
+                release(rope_pipeline);
+                release(rope_split_half_pipeline);
+                release(attention_pipeline);
+                release(kv_write_pipeline);
+                release(kv_read_attention_pipeline);
+                release(expert_mlp_pipeline);
+                release(silu_product_pipeline);
+                release(shared_expert_activation_pipeline);
+                release(combine_expert_phase_pipeline);
+                release(fill_zero_pipeline);
+                release(lm_head_pipeline);
+                release(topk_vocab_pipeline);
+                release(gqa_scores_pipeline);
+                release(gqa_read_pipeline);
+                release(device);
+                bail!("failed to create Flash-MoE Metal command queue");
+            }
+
+            let dense_weights =
+                wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
+
+            let max_context = metal_kv_max_context_for_layouts(
+                config,
+                &runtime.full_attention,
+                system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
+            );
+            let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
+            let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
+
+            tracing::info!(
+                model = %plan.model,
+                layers = config.num_hidden_layers,
+                max_context,
+                kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
+                experts = config.experts(),
+                route_top4 = route_top4_enabled,
+                dense_resident = dense_weights.is_some(),
+                "Flash-MoE Metal executor initialized"
+            );
+
+            Ok(Self {
+                device,
+                command_queue,
+                q4_pipeline,
+                q4_bf16_scale_bias_pipeline,
+                q4_mmap_pipeline,
+                route_pipeline,
+                dense_matvec_pipeline,
+                dense_matvec_bf16_pipeline,
+                dense_mmap_matvec_pipeline,
+                dense_mmap_matvec_bf16_pipeline,
+                dense_mmap_matvec_bf16_simd_pipeline,
+                rms_norm_pipeline,
+                rope_pipeline,
+                rope_split_half_pipeline,
+                attention_pipeline,
+                kv_write_pipeline,
+                kv_read_attention_pipeline,
+                expert_mlp_pipeline,
+                silu_product_pipeline,
+                shared_expert_activation_pipeline,
+                combine_expert_phase_pipeline,
+                fill_zero_pipeline,
+                lm_head_pipeline,
+                topk_vocab_pipeline,
+                gqa_scores_pipeline,
+                gqa_read_pipeline,
+                shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
+                dense_weights,
+                lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
+                    metal_lm_head_buffer_budget_bytes(),
+                )),
+                kv_cache: std::sync::Mutex::new(Some(kv_cache)),
+                attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
+                reusable: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    fn project_q4_expert(
+        &self,
+        expert: &ExpertWeights,
+        hidden: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        if hidden.is_empty() || width == 0 {
+            return Ok(vec![0.0; width]);
+        }
+        expert.mlp_with_projector(hidden, width, |tensor, input, output_width| {
+            let Some(payload) = tensor.matvec_payload(
+                input,
+                output_width.max(tensor.shape.first().copied().unwrap_or(output_width)),
+            ) else {
+                return Ok(None);
+            };
+            let output = self.dispatch_q4_matvec(
+                &payload.packed,
+                &input[..payload.cols],
+                &payload.scales,
+                &payload.biases,
+                payload.rows,
+                payload.cols,
+                payload.group_size,
+            )?;
+            Ok(Some(output))
+        })
+    }
+
+    fn dispatch_q4_matvec(
+        &self,
+        packed: &[u8],
+        input: &[f32],
+        scales: &[f32],
+        biases: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>> {
+        if group_size == 0 {
+            bail!("group_size must be positive");
+        }
+        unsafe {
+            let output_bytes = rows
+                .checked_mul(std::mem::size_of::<f32>())
+                .context("Metal output buffer size overflow")?;
+            let packed_buffer = self.buffer_with_bytes(packed)?;
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let scale_buffer = self.buffer_with_bytes(f32_as_bytes(scales))?;
+            let bias_buffer = self.buffer_with_bytes(f32_as_bytes(biases))?;
+            let output_buffer = self.buffer_with_len(output_bytes)?;
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let groups = cols.div_ceil(group_size).max(1) as u32;
+            let group_size_u32 = group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups))?;
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE Metal compute encoder");
+            }
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
+            set_buffer(encoder, packed_buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, scale_buffer, 2);
+            set_buffer(encoder, bias_buffer, 3);
+            set_buffer(encoder, output_buffer, 4);
+            set_buffer(encoder, rows_buffer, 5);
+            set_buffer(encoder, cols_buffer, 6);
+            set_buffer(encoder, groups_buffer, 7);
+            set_buffer(encoder, group_size_buffer, 8);
+            dispatch_q4_threadgroups(encoder, rows as u64);
+            msg_send_void0(encoder, sel("endEncoding"));
+            let context = MetalCommandContext::new("q4_matvec")
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("groups", groups)
+                .with("group_size", group_size);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        packed_buffer,
+                        input_buffer,
+                        scale_buffer,
+                        bias_buffer,
+                        output_buffer,
+                        rows_buffer,
+                        cols_buffer,
+                        groups_buffer,
+                        group_size_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+
+            let contents = msg_send_ptr0(output_buffer, sel("contents"));
+            let mut output = vec![0.0f32; rows];
+            ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), rows);
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(packed_buffer);
+            self.recycle(input_buffer);
+            self.recycle(scale_buffer);
+            self.recycle(bias_buffer);
+            self.recycle(output_buffer);
+            self.recycle(rows_buffer);
+            self.recycle(cols_buffer);
+            self.recycle(groups_buffer);
+            self.recycle(group_size_buffer);
+            Ok(output)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q4_mmap_matvec(
+        &self,
+        packed_byte_offset: u64,
+        scales_byte_offset: u64,
+        biases_byte_offset: u64,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        row_packed_bytes: usize,
+        groups_per_row: usize,
+        group_size: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        if rows == 0 || cols == 0 {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default())));
+        }
+        if group_size == 0 || groups_per_row == 0 || row_packed_bytes == 0 {
+            return Ok(None);
+        }
+        if scales_byte_offset % std::mem::size_of::<f32>() as u64 != 0
+            || biases_byte_offset % std::mem::size_of::<f32>() as u64 != 0
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let packed_len = rows
+            .checked_mul(row_packed_bytes)
+            .context("dense q4 mmap packed byte length overflow")?;
+        let groups_len = rows
+            .checked_mul(groups_per_row)
+            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .context("dense q4 mmap group byte length overflow")?;
+        for (offset, len) in [
+            (packed_byte_offset, packed_len),
+            (scales_byte_offset, groups_len),
+            (biases_byte_offset, groups_len),
+        ] {
+            let offset =
+                usize::try_from(offset).context("dense q4 mmap offset does not fit usize")?;
+            if offset
+                .checked_add(len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                return Ok(None);
+            }
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let packed_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&packed_byte_offset))?;
+            let scales_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&scales_byte_offset))?;
+            let biases_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&biases_byte_offset))?;
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let groups_u32 = groups_per_row as u32;
+            let group_size_u32 = group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE dense q4 mmap Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE dense q4 mmap Metal compute encoder");
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.q4_mmap_pipeline,
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, packed_offset_buffer, 3);
+            set_buffer(encoder, scales_offset_buffer, 4);
+            set_buffer(encoder, biases_offset_buffer, 5);
+            set_buffer(encoder, rows_buffer, 6);
+            set_buffer(encoder, cols_buffer, 7);
+            set_buffer(encoder, groups_buffer, 8);
+            set_buffer(encoder, group_size_buffer, 9);
+            dispatch_q4_threadgroups(encoder, rows as u64);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec")
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("groups_per_row", groups_per_row)
+                .with("group_size", group_size)
+                .with("packed_offset", packed_byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        input_buffer,
+                        output_buffer,
+                        packed_offset_buffer,
+                        scales_offset_buffer,
+                        biases_offset_buffer,
+                        rows_buffer,
+                        cols_buffer,
+                        groups_buffer,
+                        group_size_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let output = read_f32_buffer(output_buffer, rows);
+            timing.readback += readback_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(packed_offset_buffer);
+            self.recycle(scales_offset_buffer);
+            self.recycle(biases_offset_buffer);
+            self.recycle(rows_buffer);
+            self.recycle(cols_buffer);
+            self.recycle(groups_buffer);
+            self.recycle(group_size_buffer);
+            Ok(Some((output, timing)))
+        }
+    }
+
+    fn apply_rope_for_layout(
+        &self,
+        values: &[f32],
+        position: MropePosition,
+        theta: f64,
+        layout: FullAttentionLayout,
+        mrope_section: Option<[usize; 3]>,
+    ) -> Result<Option<Vec<f32>>> {
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if layout.rotary_pairing != RotaryPairing::SplitHalf || layout.rotary_dim == 0 {
+            return Ok(None);
+        }
+        if !values.len().is_multiple_of(layout.head_dim) {
+            bail!(
+                "Metal RoPE input len {} is not divisible by head_dim {}",
+                values.len(),
+                layout.head_dim
+            );
+        }
+        let heads = values.len() / layout.head_dim;
+        let rotary_pairs = layout.rotary_dim.min(layout.head_dim) / 2;
+        if rotary_pairs == 0 {
+            return Ok(Some(values.to_vec()));
+        }
+        let section = mrope_section.unwrap_or([0, 0, 0]);
+        unsafe {
+            let values_buffer = self.buffer_with_bytes(f32_as_bytes(values))?;
+            let temporal = position.temporal as u32;
+            let height = position.height as u32;
+            let width_pos = position.width as u32;
+            let head_dim = layout.head_dim as u32;
+            let rotary_dim = layout.rotary_dim as u32;
+            let theta = theta as f32;
+            let use_mrope = u32::from(mrope_section.is_some());
+            let section_u32 = [section[0] as u32, section[1] as u32, section[2] as u32];
+            let temporal_buffer = self.buffer_with_bytes(u32_as_bytes(&temporal))?;
+            let height_buffer = self.buffer_with_bytes(u32_as_bytes(&height))?;
+            let width_pos_buffer = self.buffer_with_bytes(u32_as_bytes(&width_pos))?;
+            let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim))?;
+            let rotary_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&rotary_dim))?;
+            let theta_buffer = self.buffer_with_bytes(f32_as_bytes(&[theta]))?;
+            let use_mrope_buffer = self.buffer_with_bytes(u32_as_bytes(&use_mrope))?;
+            let section_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&section_u32))?;
+            self.dispatch_unary(
+                self.rope_split_half_pipeline,
+                &[
+                    values_buffer,
+                    temporal_buffer,
+                    height_buffer,
+                    width_pos_buffer,
+                    head_dim_buffer,
+                    rotary_dim_buffer,
+                    theta_buffer,
+                    use_mrope_buffer,
+                    section_buffer,
+                ],
+                (heads * rotary_pairs) as u64,
+                &MetalCommandContext::new("rope_split_half")
+                    .with("temporal", position.temporal)
+                    .with("height", position.height)
+                    .with("width_pos", position.width)
+                    .with("heads", heads)
+                    .with("head_dim", layout.head_dim)
+                    .with("rotary_dim", layout.rotary_dim)
+                    .with("values", values.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[
+                        values_buffer,
+                        temporal_buffer,
+                        height_buffer,
+                        width_pos_buffer,
+                        head_dim_buffer,
+                        rotary_dim_buffer,
+                        theta_buffer,
+                        use_mrope_buffer,
+                        section_buffer,
+                    ],
+                    release_only,
+                );
+                error
+            })?;
+            let output = read_f32_buffer(values_buffer, values.len());
+            self.recycle(values_buffer);
+            self.recycle(temporal_buffer);
+            self.recycle(height_buffer);
+            self.recycle(width_pos_buffer);
+            self.recycle(head_dim_buffer);
+            self.recycle(rotary_dim_buffer);
+            self.recycle(theta_buffer);
+            self.recycle(use_mrope_buffer);
+            self.recycle(section_buffer);
+            Ok(Some(output))
+        }
+    }
+
+    fn submit_expert_phase(
+        self: &Arc<Self>,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        let width = residual.len();
+        if width == 0 || normed.len() < width || weights.len() != experts.len() {
+            return Ok(None);
+        }
+        if let Some(weight) = next_norm_weight
+            && weight.len() < width
+        {
+            return Ok(None);
+        }
+        let mut payloads = Vec::with_capacity(experts.len());
+        for expert in experts.iter() {
+            let Some(payload) = expert_phase_mlp_payload(expert, normed, width) else {
+                return Ok(None);
+            };
+            payloads.push(payload);
+        }
+        let shared_total_intermediate = if let Some(shared) = shared {
+            let total = shared
+                .shared_experts
+                .checked_mul(shared.intermediate)
+                .context("shared expert intermediate width overflow")?;
+            if shared.width != width
+                || shared.gate.len() != total * width
+                || shared.up.len() != total * width
+                || shared.down.len() != width * total
+                || shared.router.len() != shared.shared_experts * width
+            {
+                return Ok(None);
+            }
+            total
+        } else {
+            0
+        };
+        let shared_metal = if let Some(shared) = shared {
+            Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
+        } else {
+            None
+        };
+
+        unsafe {
+            let mut buffers: Vec<MetalPhaseBuffer> = Vec::new();
+            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
+            buffers.push(MetalPhaseBuffer::recyclable(normed_buffer));
+            let residual_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+            buffers.push(MetalPhaseBuffer::recyclable(residual_buffer));
+            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
+            buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
+            let expert_outputs_buffer = self.buffer_with_len(
+                experts
+                    .len()
+                    .max(1)
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer size overflow")?,
+            )?;
+            buffers.push(MetalPhaseBuffer::recyclable(expert_outputs_buffer));
+            let shared_output_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(MetalPhaseBuffer::recyclable(shared_output_buffer));
+            let hidden_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(MetalPhaseBuffer::recyclable(hidden_buffer));
+            let next_normed_buffer = if next_norm_weight.is_some() {
+                let buffer = self
+                    .buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+                buffers.push(MetalPhaseBuffer::recyclable(buffer));
+                Some(buffer)
+            } else {
+                None
+            };
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE deferred expert command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE deferred expert compute encoder");
+            }
+
+            let width_u32 = width as u32;
+            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
+
+            if let Some(shared) = shared {
+                let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
+                let total_u32 = shared_total_intermediate as u32;
+                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_gate_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
+                let shared_up_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
+                let shared_router_out =
+                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
+                let shared_activated =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
+                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
+                let shared_intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
+
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.gate,
+                    normed_buffer,
+                    shared_gate_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.up,
+                    normed_buffer,
+                    shared_up_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.router,
+                    normed_buffer,
+                    shared_router_out,
+                    width_buffer,
+                    shared.shared_experts,
+                );
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.shared_expert_activation_pipeline,
+                );
+                set_buffer(encoder, shared_gate_out, 0);
+                set_buffer(encoder, shared_up_out, 1);
+                set_buffer(encoder, shared_router_out, 2);
+                set_buffer(encoder, shared_activated, 3);
+                set_buffer(encoder, shared_intermediate_buffer, 4);
+                set_buffer(encoder, total_buffer, 5);
+                dispatch_threads(encoder, shared_total_intermediate as u64);
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.down,
+                    shared_activated,
+                    shared_output_buffer,
+                    total_buffer,
+                    width,
+                );
+            } else {
+                self.encode_fill_zero(encoder, shared_output_buffer, width_buffer, width);
+            }
+
+            for (idx, payload) in payloads.iter().enumerate() {
+                let gate_out =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+                let up_out = self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(up_out));
+                let activated =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(activated));
+
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.gate,
+                    normed_buffer,
+                    gate_out,
+                    0,
+                    &mut buffers,
+                )?;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.up,
+                    normed_buffer,
+                    up_out,
+                    0,
+                    &mut buffers,
+                )?;
+                let intermediate_u32 = payload.gate.rows as u32;
+                let intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.silu_product_pipeline,
+                );
+                set_buffer(encoder, gate_out, 0);
+                set_buffer(encoder, up_out, 1);
+                set_buffer(encoder, activated, 2);
+                set_buffer(encoder, intermediate_buffer, 3);
+                dispatch_threads(encoder, payload.gate.rows as u64);
+                let expert_offset = idx
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer offset overflow")?
+                    as u64;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.down,
+                    activated,
+                    expert_outputs_buffer,
+                    expert_offset,
+                    &mut buffers,
+                )?;
+            }
+
+            let active_u32 = experts.len() as u32;
+            let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.combine_expert_phase_pipeline,
+            );
+            set_buffer(encoder, residual_buffer, 0);
+            set_buffer(encoder, shared_output_buffer, 1);
+            set_buffer(encoder, expert_outputs_buffer, 2);
+            set_buffer(encoder, weights_buffer, 3);
+            set_buffer(encoder, hidden_buffer, 4);
+            set_buffer(encoder, width_buffer, 5);
+            set_buffer(encoder, active_buffer, 6);
+            dispatch_threads(encoder, width as u64);
+
+            if let (Some(weight), Some(next_normed_buffer)) = (next_norm_weight, next_normed_buffer)
+            {
+                let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(&weight[..width]))?;
+                buffers.push(MetalPhaseBuffer::recyclable(norm_weight_buffer));
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.rms_norm_pipeline,
+                );
+                set_buffer(encoder, hidden_buffer, 0);
+                set_buffer(encoder, norm_weight_buffer, 1);
+                set_buffer(encoder, next_normed_buffer, 2);
+                set_buffer(encoder, width_buffer, 3);
+                dispatch_threads(encoder, width as u64);
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+            let expert_ids = experts
+                .iter()
+                .map(|expert| expert.expert.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("deferred_expert_phase")
+                .with("position", position)
+                .with("layer", layer)
+                .with("active_experts", experts.len())
+                .with("experts", expert_ids)
+                .with("width", width)
+                .with("shared", shared.is_some())
+                .with("next_norm", next_normed_buffer.is_some());
+            commit_metal_command_buffer(command_buffer, &context);
+            release(encoder);
+
+            Ok(Some(MetalDeferredExpertPhase {
+                inner: self.clone(),
+                command_buffer,
+                buffers,
+                retained_experts: experts,
+                hidden_buffer,
+                next_normed_buffer,
+                context,
+                width,
+            }))
+        }
+    }
+
+    unsafe fn encode_q4_matvec(
+        &self,
+        encoder: ObjcId,
+        payload: &Q4MatvecPayload<'_>,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        output_offset: u64,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<()> {
+        unsafe {
+            let packed_phase_buffer =
+                self.phase_buffer_with_borrowed_bytes_aligned(payload.packed, 16)?;
+            let packed_buffer = packed_phase_buffer.id;
+            buffers.push(packed_phase_buffer);
+            let expected_bf16_bytes = payload.scales.len().checked_mul(2).unwrap_or(usize::MAX);
+            let use_bf16_scale_bias = payload
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                && payload.scale_bytes.len() == expected_bf16_bytes
+                && payload.bias_bytes.len() == expected_bf16_bytes;
+            let (pipeline, scale_bytes, bias_bytes) = if use_bf16_scale_bias {
+                (
+                    self.q4_bf16_scale_bias_pipeline,
+                    payload.scale_bytes,
+                    payload.bias_bytes,
+                )
+            } else {
+                (
+                    self.q4_pipeline,
+                    f32_as_bytes(payload.scales),
+                    f32_as_bytes(payload.biases),
+                )
+            };
+            let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
+            let scale_phase_buffer =
+                self.phase_buffer_with_borrowed_bytes_aligned(scale_bytes, scale_bias_alignment)?;
+            let scale_buffer = scale_phase_buffer.id;
+            buffers.push(scale_phase_buffer);
+            let bias_phase_buffer =
+                self.phase_buffer_with_borrowed_bytes_aligned(bias_bytes, scale_bias_alignment)?;
+            let bias_buffer = bias_phase_buffer.id;
+            buffers.push(bias_phase_buffer);
+            let rows_u32 = payload.rows as u32;
+            let cols_u32 = payload.cols as u32;
+            let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
+            let group_size_u32 = payload.group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(rows_buffer));
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(cols_buffer));
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(groups_buffer));
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(group_size_buffer));
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, packed_buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, scale_buffer, 2);
+            set_buffer(encoder, bias_buffer, 3);
+            set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
+            set_buffer(encoder, rows_buffer, 5);
+            set_buffer(encoder, cols_buffer, 6);
+            set_buffer(encoder, groups_buffer, 7);
+            set_buffer(encoder, group_size_buffer, 8);
+            dispatch_q4_threadgroups(encoder, payload.rows as u64);
+            Ok(())
+        }
+    }
+
+    unsafe fn encode_dense_matvec(
+        &self,
+        encoder: ObjcId,
+        weights_buffer: ObjcId,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        cols_buffer: ObjcId,
+        rows: usize,
+    ) {
+        unsafe {
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.dense_matvec_pipeline,
+            );
+            set_buffer(encoder, weights_buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, cols_buffer, 3);
+            dispatch_threads(encoder, rows as u64);
+        }
+    }
+
+    unsafe fn encode_fill_zero(
+        &self,
+        encoder: ObjcId,
+        output_buffer: ObjcId,
+        width_buffer: ObjcId,
+        width: usize,
+    ) {
+        unsafe {
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.fill_zero_pipeline,
+            );
+            set_buffer(encoder, output_buffer, 0);
+            set_buffer(encoder, width_buffer, 1);
+            dispatch_threads(encoder, width as u64);
+        }
+    }
+
+    fn route_top4(
+        &self,
+        position: usize,
+        layer: usize,
+        scores: &[f32],
+    ) -> Result<Vec<(usize, f32)>> {
+        if scores.is_empty() {
+            return Ok(Vec::new());
+        }
+        let route_pipeline = self
+            .route_pipeline
+            .context("Metal route_top4 requested but routing pipeline is disabled")?;
+        unsafe {
+            let scores_buffer = self.buffer_with_bytes(f32_as_bytes(scores))?;
+            let indices_buffer = self.buffer_with_len(4 * std::mem::size_of::<u32>())?;
+            let weights_buffer = self.buffer_with_len(4 * std::mem::size_of::<f32>())?;
+            let experts = scores.len() as u32;
+            let experts_buffer = self.buffer_with_bytes(u32_as_bytes(&experts))?;
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE routing command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE routing compute encoder");
+            }
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), route_pipeline);
+            set_buffer(encoder, scores_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, weights_buffer, 2);
+            set_buffer(encoder, experts_buffer, 3);
+            dispatch_threads(encoder, 1);
+            msg_send_void0(encoder, sel("endEncoding"));
+            let context = MetalCommandContext::new("route_top4")
+                .with("position", position)
+                .with("layer", layer)
+                .with("experts", scores.len());
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        scores_buffer,
+                        indices_buffer,
+                        weights_buffer,
+                        experts_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let weights_ptr = msg_send_ptr0(weights_buffer, sel("contents")).cast::<f32>();
+            let mut routed = Vec::with_capacity(ACTIVE_EXPERTS_PER_TOKEN);
+            for idx in 0..ACTIVE_EXPERTS_PER_TOKEN {
+                routed.push((*indices_ptr.add(idx) as usize, *weights_ptr.add(idx)));
+            }
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(scores_buffer);
+            self.recycle(indices_buffer);
+            self.recycle(weights_buffer);
+            self.recycle(experts_buffer);
+            Ok(routed)
+        }
+    }
+
+    fn rms_norm(&self, input: &[f32], weight: Option<&[f32]>) -> Result<Vec<f32>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let weights;
+        let weight = if let Some(weight) = weight {
+            weight
+        } else {
+            weights = vec![1.0f32; input.len()];
+            &weights
+        };
+        unsafe {
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let weight_buffer = self.buffer_with_bytes(f32_as_bytes(weight))?;
+            let output_buffer = self.buffer_with_len(std::mem::size_of_val(input))?;
+            let width = input.len() as u32;
+            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
+            self.dispatch_unary(
+                self.rms_norm_pipeline,
+                &[input_buffer, weight_buffer, output_buffer, width_buffer],
+                input.len() as u64,
+                &MetalCommandContext::new("rms_norm").with("width", input.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[input_buffer, weight_buffer, output_buffer, width_buffer],
+                    release_only,
+                );
+                error
+            })?;
+            let output = read_f32_buffer(output_buffer, input.len());
+            self.recycle(input_buffer);
+            self.recycle(weight_buffer);
+            self.recycle(output_buffer);
+            self.recycle(width_buffer);
+            Ok(output)
+        }
+    }
+
+    fn dense_matvec(
+        &self,
+        weights: &[f32],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        if rows == 0 || cols == 0 {
+            return Ok(Vec::new());
+        }
+        unsafe {
+            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let cols_u32 = cols as u32;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            self.dispatch_unary(
+                self.dense_matvec_pipeline,
+                &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                rows as u64,
+                &MetalCommandContext::new("dense_matvec")
+                    .with("rows", rows)
+                    .with("cols", cols),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                    release_only,
+                );
+                error
+            })?;
+            let output = read_f32_buffer(output_buffer, rows);
+            self.recycle(weights_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(cols_buffer);
+            Ok(output)
+        }
+    }
+
+    fn dense_matvec_bf16(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, MetalMatvecTiming)> {
+        if rows == 0 || cols == 0 {
+            return Ok((Vec::new(), MetalMatvecTiming::default()));
+        }
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let weights_buffer = self.buffer_with_bytes(weights)?;
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let cols_u32 = cols as u32;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let dispatch_started = Instant::now();
+            self.dispatch_unary(
+                self.dense_matvec_bf16_pipeline,
+                &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                rows as u64,
+                &MetalCommandContext::new("dense_matvec_bf16")
+                    .with("rows", rows)
+                    .with("cols", cols),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[weights_buffer, input_buffer, output_buffer, cols_buffer],
+                    release_only,
+                );
+                error
+            })?;
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let output = read_f32_buffer(output_buffer, rows);
+            timing.readback += readback_started.elapsed();
+
+            self.recycle(weights_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(cols_buffer);
+            Ok((output, timing))
+        }
+    }
+
+    fn has_resident_dense_weights(&self) -> bool {
+        self.dense_weights.is_some()
+    }
+
+    fn dense_mmap_matvec(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
+        if rows == 0 || cols == 0 {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default())));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let dtype = dtype.to_ascii_uppercase();
+        let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
+            "F32" | "FLOAT32" | "FP32" => (
+                std::mem::size_of::<f32>(),
+                self.dense_mmap_matvec_pipeline,
+                false,
+            ),
+            "BF16" | "BFLOAT16" => (
+                std::mem::size_of::<u16>(),
+                self.dense_mmap_matvec_bf16_simd_pipeline,
+                true,
+            ),
+            _ => return Ok(None),
+        };
+        if stride < cols {
+            bail!("dense mmap matvec stride {stride} is smaller than cols {cols}");
+        }
+        let last_row = rows.saturating_sub(1);
+        let values = last_row
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(cols))
+            .context("dense mmap matvec value range overflow")?;
+        let byte_len = values
+            .checked_mul(element_size)
+            .context("dense mmap matvec byte length overflow")?;
+        let byte_offset_usize =
+            usize::try_from(byte_offset).context("dense mmap matvec offset does not fit usize")?;
+        if byte_offset_usize
+            .checked_add(byte_len)
+            .map_or(true, |end| end > dense_weights.len)
+        {
+            return Ok(None);
+        }
+        if byte_offset_usize % element_size != 0 {
+            return Ok(None);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&byte_offset))?;
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let stride_u32 = stride as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let stride_buffer = self.buffer_with_bytes(u32_as_bytes(&stride_u32))?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE dense mmap Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE dense mmap Metal compute encoder");
+            }
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, offset_buffer, 3);
+            set_buffer(encoder, rows_buffer, 4);
+            set_buffer(encoder, cols_buffer, 5);
+            set_buffer(encoder, stride_buffer, 6);
+            if simd_reduced {
+                dispatch_q4_threadgroups(encoder, rows as u64);
+            } else {
+                dispatch_threads(encoder, rows as u64);
+            }
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let context = MetalCommandContext::new("dense_mmap_matvec")
+                .with("dtype", dtype)
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("stride", stride)
+                .with("offset", byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        input_buffer,
+                        output_buffer,
+                        offset_buffer,
+                        rows_buffer,
+                        cols_buffer,
+                        stride_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let output = read_f32_buffer(output_buffer, rows);
+            timing.readback += readback_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            self.recycle(offset_buffer);
+            self.recycle(rows_buffer);
+            self.recycle(cols_buffer);
+            self.recycle(stride_buffer);
+            Ok(Some((output, timing)))
+        }
+    }
+
+    fn dense_mmap_matvec_batch(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut dispatches = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input.len() {
+                bail!(
+                    "dense mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input.len(),
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            let dtype = projection.dtype.to_ascii_uppercase();
+            let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
+                "F32" | "FLOAT32" | "FP32" => (
+                    std::mem::size_of::<f32>(),
+                    self.dense_mmap_matvec_pipeline,
+                    false,
+                ),
+                "BF16" | "BFLOAT16" => (
+                    std::mem::size_of::<u16>(),
+                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    true,
+                ),
+                _ => return Ok(None),
+            };
+            let stride = projection.stride();
+            if stride < projection.cols {
+                bail!(
+                    "dense mmap batch projection {} stride {} is smaller than cols {}",
+                    projection.tensor_name,
+                    stride,
+                    projection.cols
+                );
+            }
+            let last_row = projection.rows.saturating_sub(1);
+            let values = last_row
+                .checked_mul(stride)
+                .and_then(|base| base.checked_add(projection.cols))
+                .context("dense mmap batch value range overflow")?;
+            let byte_len = values
+                .checked_mul(element_size)
+                .context("dense mmap batch byte length overflow")?;
+            let byte_offset = usize::try_from(projection.byte_offset)
+                .context("dense mmap batch offset does not fit usize")?;
+            if byte_offset
+                .checked_add(byte_len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                return Ok(None);
+            }
+            if byte_offset % element_size != 0 {
+                return Ok(None);
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense mmap batch output row count overflow")?;
+            dispatches.push((pipeline, output_offset, simd_reduced));
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![input_buffer, output_buffer];
+            let mut params = Vec::with_capacity(projections.len());
+            for projection in projections {
+                let offset_buffer =
+                    self.buffer_with_bytes(u64_as_bytes(&projection.byte_offset))?;
+                buffers.push(offset_buffer);
+                let rows_u32 = projection.rows as u32;
+                let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+                buffers.push(rows_buffer);
+                let cols_u32 = projection.cols as u32;
+                let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+                buffers.push(cols_buffer);
+                let stride_u32 = projection.stride() as u32;
+                let stride_buffer = self.buffer_with_bytes(u32_as_bytes(&stride_u32))?;
+                buffers.push(stride_buffer);
+                params.push((offset_buffer, rows_buffer, cols_buffer, stride_buffer));
+            }
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense mmap batch Metal compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let (pipeline, output_offset_rows, simd_reduced) = dispatches[idx];
+                let output_offset = output_offset_rows
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("dense mmap batch output byte offset overflow")?
+                    as u64;
+                let (offset_buffer, rows_buffer, cols_buffer, stride_buffer) = params[idx];
+                msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                set_buffer(encoder, offset_buffer, 3);
+                set_buffer(encoder, rows_buffer, 4);
+                set_buffer(encoder, cols_buffer, 5);
+                set_buffer(encoder, stride_buffer, 6);
+                if simd_reduced {
+                    dispatch_q4_threadgroups(encoder, projection.rows as u64);
+                } else {
+                    dispatch_threads(encoder, projection.rows as u64);
+                }
+            }
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_mmap_matvec_batch")
+                .with("projections", projections.len())
+                .with("dispatches", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input.len())
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            timing.readback += readback_started.elapsed();
+
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, (_, output_offset, _)) in projections.iter().zip(dispatches.iter()) {
+                let start = *output_offset;
+                let end = start + projection.rows;
+                let mut output = vec![0.0f32; projection.output_width];
+                output[..projection.rows].copy_from_slice(&packed_output[start..end]);
+                outputs.push(output);
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((outputs, timing, projections.len())))
+        }
+    }
+
+    fn q4_mmap_matvec_batch(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input.len() {
+                bail!(
+                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input.len(),
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                bail!(
+                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
+                    projection.tensor_name,
+                    projection.row_packed_bytes,
+                    projection.cols
+                );
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("dense q4 mmap batch packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+                .context("dense q4 mmap batch group byte length overflow")?;
+            for (offset, len, label) in [
+                (projection.packed_byte_offset, packed_len, "packed"),
+                (projection.scales_byte_offset, group_bytes, "scales"),
+                (projection.biases_byte_offset, group_bytes, "biases"),
+            ] {
+                let offset = usize::try_from(offset).with_context(|| {
+                    format!(
+                        "dense q4 mmap batch {label} offset for {} does not fit usize",
+                        projection.tensor_name
+                    )
+                })?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense q4 mmap batch output row count overflow")?;
+            output_offsets.push(output_offset);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![input_buffer, output_buffer];
+            let mut params = Vec::with_capacity(projections.len());
+            for projection in projections {
+                let packed_offset_buffer =
+                    self.buffer_with_bytes(u64_as_bytes(&projection.packed_byte_offset))?;
+                buffers.push(packed_offset_buffer);
+                let scales_offset_buffer =
+                    self.buffer_with_bytes(u64_as_bytes(&projection.scales_byte_offset))?;
+                buffers.push(scales_offset_buffer);
+                let biases_offset_buffer =
+                    self.buffer_with_bytes(u64_as_bytes(&projection.biases_byte_offset))?;
+                buffers.push(biases_offset_buffer);
+                let rows_u32 = projection.rows as u32;
+                let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+                buffers.push(rows_buffer);
+                let cols_u32 = projection.cols as u32;
+                let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+                buffers.push(cols_buffer);
+                let groups_u32 = projection.groups_per_row as u32;
+                let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+                buffers.push(groups_buffer);
+                let group_size_u32 = projection.group_size as u32;
+                let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+                buffers.push(group_size_buffer);
+                params.push((
+                    packed_offset_buffer,
+                    scales_offset_buffer,
+                    biases_offset_buffer,
+                    rows_buffer,
+                    cols_buffer,
+                    groups_buffer,
+                    group_size_buffer,
+                ));
+            }
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let output_offset = output_offsets[idx]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("dense q4 mmap batch output byte offset overflow")?
+                    as u64;
+                let (
+                    packed_offset_buffer,
+                    scales_offset_buffer,
+                    biases_offset_buffer,
+                    rows_buffer,
+                    cols_buffer,
+                    groups_buffer,
+                    group_size_buffer,
+                ) = params[idx];
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.q4_mmap_pipeline,
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                set_buffer(encoder, packed_offset_buffer, 3);
+                set_buffer(encoder, scales_offset_buffer, 4);
+                set_buffer(encoder, biases_offset_buffer, 5);
+                set_buffer(encoder, rows_buffer, 6);
+                set_buffer(encoder, cols_buffer, 7);
+                set_buffer(encoder, groups_buffer, 8);
+                set_buffer(encoder, group_size_buffer, 9);
+                dispatch_q4_threadgroups(encoder, projection.rows as u64);
+            }
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch")
+                .with("projections", projections.len())
+                .with("dispatches", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input.len())
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            timing.readback += readback_started.elapsed();
+
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, output_offset) in projections.iter().zip(output_offsets.iter()) {
+                let start = *output_offset;
+                let end = start + projection.rows;
+                let mut output = vec![0.0f32; projection.output_width];
+                output[..projection.rows].copy_from_slice(&packed_output[start..end]);
+                outputs.push(output);
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((outputs, timing, projections.len())))
+        }
+    }
+
+    fn lm_head_top_candidates_from_cached_buffer(
+        &self,
+        key: &str,
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+        repeat_penalty: f32,
+        repeated: &BTreeSet<usize>,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let buffer = {
+            self.lm_head_buffers
+                .lock()
+                .expect("metal LM-head buffer cache poisoned")
+                .get(key, rows, cols)
+        };
+        let Some(buffer) = buffer else {
+            return Ok(None);
+        };
+        self.dispatch_lm_head_topk(buffer, hidden, top_k, repeat_penalty, repeated)
+            .map(Some)
+    }
+
+    fn cache_lm_head_and_top_candidates(
+        &self,
+        key: &str,
+        weights: &[f32],
+        hidden: &[f32],
+        rows: usize,
+        cols: usize,
+        top_k: usize,
+        repeat_penalty: f32,
+        repeated: &BTreeSet<usize>,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let expected_len = rows
+            .checked_mul(cols)
+            .context("LM-head Metal buffer shape overflow")?;
+        if weights.len() < expected_len {
+            return Ok(None);
+        }
+        {
+            let bytes = expected_len
+                .checked_mul(std::mem::size_of::<f32>())
+                .context("LM-head Metal buffer byte length overflow")?;
+            let cache = self
+                .lm_head_buffers
+                .lock()
+                .expect("metal LM-head buffer cache poisoned");
+            if bytes > cache.max_bytes {
+                return Ok(None);
+            }
+            if let Some(buffer) = cache.get(key, rows, cols) {
+                drop(cache);
+                return self
+                    .dispatch_lm_head_topk(buffer, hidden, top_k, repeat_penalty, repeated)
+                    .map(Some);
+            }
+        }
+
+        unsafe {
+            let weights_buffer =
+                self.persistent_buffer_with_bytes(f32_as_bytes(&weights[..expected_len]))?;
+            let new_buffer = MetalLmHeadBuffer {
+                weights: weights_buffer,
+                rows,
+                cols,
+                bytes: expected_len * std::mem::size_of::<f32>(),
+            };
+            let buffer = {
+                let mut cache = self
+                    .lm_head_buffers
+                    .lock()
+                    .expect("metal LM-head buffer cache poisoned");
+                if let Some(existing) = cache.get(key, rows, cols) {
+                    release(weights_buffer);
+                    existing
+                } else {
+                    if let Some(previous) = cache.insert(key.to_string(), new_buffer) {
+                        release(previous.weights);
+                    }
+                    new_buffer
+                }
+            };
+            self.dispatch_lm_head_topk(buffer, hidden, top_k, repeat_penalty, repeated)
+                .map(Some)
+        }
+    }
+
+    fn can_cache_lm_head_bytes(&self, bytes: usize) -> bool {
+        self.lm_head_buffers
+            .lock()
+            .expect("metal LM-head buffer cache poisoned")
+            .max_bytes
+            >= bytes
+    }
+
+    fn dispatch_lm_head_topk(
+        &self,
+        lm_head: MetalLmHeadBuffer,
+        hidden: &[f32],
+        top_k: usize,
+        repeat_penalty: f32,
+        repeated: &BTreeSet<usize>,
+    ) -> Result<Vec<(usize, f32)>> {
+        if lm_head.rows == 0 || lm_head.cols == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if lm_head.cols != hidden.len() {
+            bail!(
+                "Metal LM-head hidden length {} does not match cols {}",
+                hidden.len(),
+                lm_head.cols
+            );
+        }
+        let top_k = top_k.min(lm_head.rows).max(1);
+        unsafe {
+            let hidden_buffer = self.buffer_with_bytes(f32_as_bytes(hidden))?;
+            let logits_buffer = self.buffer_with_len(lm_head.rows * std::mem::size_of::<f32>())?;
+            let cols_u32 = lm_head.cols as u32;
+            let rows_u32 = lm_head.rows as u32;
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            let transient_buffers = vec![hidden_buffer, logits_buffer, cols_buffer, rows_buffer];
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE LM-head Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE LM-head Metal compute encoder");
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.lm_head_pipeline,
+            );
+            set_buffer(encoder, lm_head.weights, 0);
+            set_buffer(encoder, hidden_buffer, 1);
+            set_buffer(encoder, logits_buffer, 2);
+            set_buffer(encoder, cols_buffer, 3);
+            set_buffer(encoder, rows_buffer, 4);
+            dispatch_q4_threadgroups(encoder, lm_head.rows as u64);
+
+            msg_send_void0(encoder, sel("endEncoding"));
+            let context = MetalCommandContext::new("lm_head_logits")
+                .with("rows", lm_head.rows)
+                .with("cols", lm_head.cols)
+                .with("top_k", top_k);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let logits = read_f32_buffer(logits_buffer, lm_head.rows);
+            let mut candidates = TopKCandidates::new(top_k);
+            for (token, raw_value) in logits.into_iter().enumerate() {
+                let value = process_sample_logit(token, raw_value, repeat_penalty, repeated);
+                candidates.push(token, value);
+            }
+            let candidates = candidates.into_sorted_vec();
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in transient_buffers {
+                self.recycle(buffer);
+            }
+            Ok(candidates)
+        }
+    }
+
+    fn apply_rope(
+        &self,
+        values: &[f32],
+        position: usize,
+        head_dim: usize,
+        theta: f64,
+    ) -> Result<Vec<f32>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        unsafe {
+            let values_buffer = self.buffer_with_bytes(f32_as_bytes(values))?;
+            let position = position as u32;
+            let head_dim = head_dim as u32;
+            let theta = theta as f32;
+            let position_buffer = self.buffer_with_bytes(u32_as_bytes(&position))?;
+            let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim))?;
+            let theta_buffer = self.buffer_with_bytes(f32_as_bytes(&[theta]))?;
+            self.dispatch_unary(
+                self.rope_pipeline,
+                &[
+                    values_buffer,
+                    position_buffer,
+                    head_dim_buffer,
+                    theta_buffer,
+                ],
+                (values.len() / 2) as u64,
+                &MetalCommandContext::new("rope")
+                    .with("position", position)
+                    .with("head_dim", head_dim)
+                    .with("values", values.len()),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[
+                        values_buffer,
+                        position_buffer,
+                        head_dim_buffer,
+                        theta_buffer,
+                    ],
+                    release_only,
+                );
+                error
+            })?;
+            let output = read_f32_buffer(values_buffer, values.len());
+            self.recycle(values_buffer);
+            self.recycle(position_buffer);
+            self.recycle(head_dim_buffer);
+            self.recycle(theta_buffer);
+            Ok(output)
+        }
+    }
+
+    fn causal_attention(
+        &self,
+        query: &[f32],
+        keys_values: &[(&[f32], &[f32])],
+        num_q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>> {
+        if query.is_empty() || keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
+            return Ok(vec![0.0; query.len()]);
+        }
+        // Fall back to CPU GQA for the non-cached path
+        Ok(causal_attention(
+            query,
+            keys_values,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+        ))
+    }
+
+    fn record_kv(
+        &self,
+        position: usize,
+        layer: usize,
+        layout: FullAttentionLayout,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
+        let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
+        let kv_cache = kv_cache
+            .as_ref()
+            .context("Flash-MoE Metal KV cache is not allocated")?;
+        let layer_info = kv_cache.layer(layer)?;
+        if layer_info.width != layout.kv_width {
+            bail!(
+                "Metal KV write layer {layer} layout width {} does not match cache width {}",
+                layout.kv_width,
+                layer_info.width
+            );
+        }
+        if position >= kv_cache.max_context {
+            bail!(
+                "Metal KV write layer {layer} position {position} exceeds cache {} tokens",
+                kv_cache.max_context
+            );
+        }
+        if key.len() < layer_info.width || value.len() < layer_info.width {
+            bail!(
+                "Metal KV write width mismatch: key {}, value {}, cache width {}",
+                key.len(),
+                value.len(),
+                layer_info.width
+            );
+        }
+        unsafe {
+            let key_buffer = self.buffer_with_bytes(f32_as_bytes(&key[..layer_info.width]))?;
+            let value_buffer = self.buffer_with_bytes(f32_as_bytes(&value[..layer_info.width]))?;
+            let offset = layer_info
+                .offset
+                .checked_add(position.saturating_mul(layer_info.width))
+                .context("Metal KV cache offset overflow")? as u64;
+            let width = layer_info.width as u32;
+            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&offset))?;
+            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
+            self.dispatch_unary(
+                self.kv_write_pipeline,
+                &[
+                    key_buffer,
+                    value_buffer,
+                    kv_cache.keys,
+                    kv_cache.values,
+                    offset_buffer,
+                    width_buffer,
+                ],
+                layer_info.width as u64,
+                &MetalCommandContext::new("kv_write")
+                    .with("layer", layer)
+                    .with("position", position)
+                    .with("width", layer_info.width)
+                    .with("offset_items", offset),
+            )
+            .map_err(|error| {
+                let release_only = metal_command_failure_requires_release(&error);
+                self.recycle_or_release_buffers(
+                    &[key_buffer, value_buffer, offset_buffer, width_buffer],
+                    release_only,
+                );
+                error
+            })?;
+            self.recycle(key_buffer);
+            self.recycle(value_buffer);
+            self.recycle(offset_buffer);
+            self.recycle(width_buffer);
+        }
+        Ok(())
+    }
+
+    fn causal_attention_cached(
+        &self,
+        position: usize,
+        layer: usize,
+        query: &[f32],
+        layout: FullAttentionLayout,
+    ) -> Result<Vec<f32>> {
+        let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
+        let kv_cache = kv_cache
+            .as_ref()
+            .context("Flash-MoE Metal KV cache is not allocated")?;
+        let layer_info = kv_cache.layer(layer)?;
+        if layer_info.width != layout.kv_width {
+            bail!(
+                "Metal KV read layer {layer} layout width {} does not match cache width {}",
+                layout.kv_width,
+                layer_info.width
+            );
+        }
+        if position >= kv_cache.max_context {
+            bail!(
+                "Metal KV read layer {layer} position {position} exceeds cache {} tokens",
+                kv_cache.max_context
+            );
+        }
+        let q_width = layout.q_width;
+        if query.len() < q_width {
+            bail!(
+                "Metal GQA attention query len {} is smaller than q_width {}",
+                query.len(),
+                q_width
+            );
+        }
+        let tokens = position + 1;
+        let groups_per_kv = layout.num_q_heads / layout.kv_heads.max(1);
+        let layer_offset_items = layer_info.offset;
+        let layer_offset_bytes = (layer_offset_items * std::mem::size_of::<f32>()) as u64;
+        unsafe {
+            let query_buffer = self.buffer_with_bytes(f32_as_bytes(&query[..q_width]))?;
+            let scores_buffer =
+                self.buffer_with_len(layout.num_q_heads * tokens * std::mem::size_of::<f32>())?;
+            let head_dim_u32 = layout.head_dim as u32;
+            let groups_per_kv_u32 = groups_per_kv as u32;
+            let tokens_u32 = tokens as u32;
+            let kv_width_u32 = layer_info.width as u32;
+            let head_dim_buf = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
+            let gpk_buf = self.buffer_with_bytes(u32_as_bytes(&groups_per_kv_u32))?;
+            let tokens_buf = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
+            let kv_width_buf = self.buffer_with_bytes(u32_as_bytes(&kv_width_u32))?;
+
+            // Step 1: compute raw dot-product scores for all (q_head, token) pairs
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE Metal compute encoder");
+            }
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.gqa_scores_pipeline,
+            );
+            set_buffer(encoder, query_buffer, 0);
+            set_buffer_with_offset(encoder, kv_cache.keys, layer_offset_bytes, 1);
+            set_buffer(encoder, scores_buffer, 2);
+            set_buffer(encoder, head_dim_buf, 3);
+            set_buffer(encoder, gpk_buf, 4);
+            set_buffer(encoder, tokens_buf, 5);
+            set_buffer(encoder, kv_width_buf, 6);
+            dispatch_threads(encoder, (layout.num_q_heads * tokens) as u64);
+            msg_send_void0(encoder, sel("endEncoding"));
+            let score_context = MetalCommandContext::new("gqa_attention_scores")
+                .with("layer", layer)
+                .with("position", position)
+                .with("tokens", tokens)
+                .with("q_heads", layout.num_q_heads)
+                .with("kv_heads", layout.kv_heads)
+                .with("head_dim", layout.head_dim)
+                .with("kv_width", layer_info.width);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &score_context)
+            {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        query_buffer,
+                        scores_buffer,
+                        head_dim_buf,
+                        gpk_buf,
+                        tokens_buf,
+                        kv_width_buf,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            release(encoder);
+            release(command_buffer);
+
+            // Step 2: softmax per Q-head independently (CPU)
+            let mut scores = read_f32_buffer(scores_buffer, layout.num_q_heads * tokens);
+            for qh in 0..layout.num_q_heads {
+                softmax_in_place(&mut scores[qh * tokens..(qh + 1) * tokens]);
+            }
+
+            // Step 3: weighted sum of values
+            let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
+            let output_buffer = self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE Metal compute encoder");
+            }
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.gqa_read_pipeline,
+            );
+            set_buffer(encoder, scores_buffer_2, 0);
+            set_buffer_with_offset(encoder, kv_cache.values, layer_offset_bytes, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, head_dim_buf, 3);
+            set_buffer(encoder, gpk_buf, 4);
+            set_buffer(encoder, tokens_buf, 5);
+            set_buffer(encoder, kv_width_buf, 6);
+            dispatch_threads(encoder, q_width as u64);
+            msg_send_void0(encoder, sel("endEncoding"));
+            let read_context = MetalCommandContext::new("gqa_kv_read_attention")
+                .with("layer", layer)
+                .with("position", position)
+                .with("tokens", tokens)
+                .with("q_width", q_width)
+                .with("q_heads", layout.num_q_heads)
+                .with("kv_heads", layout.kv_heads)
+                .with("head_dim", layout.head_dim)
+                .with("kv_width", layer_info.width);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &read_context)
+            {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(
+                    &[
+                        query_buffer,
+                        scores_buffer,
+                        head_dim_buf,
+                        gpk_buf,
+                        tokens_buf,
+                        kv_width_buf,
+                        scores_buffer_2,
+                        output_buffer,
+                    ],
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, q_width);
+            release(encoder);
+            release(command_buffer);
+            self.recycle(query_buffer);
+            self.recycle(scores_buffer);
+            self.recycle(head_dim_buf);
+            self.recycle(gpk_buf);
+            self.recycle(tokens_buf);
+            self.recycle(kv_width_buf);
+            self.recycle(scores_buffer_2);
+            self.recycle(output_buffer);
+            Ok(output)
+        }
+    }
+
+    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
+        self.attention_policy
+            .lock()
+            .expect("metal attention policy poisoned")
+            .backend(tokens)
+    }
+
+    unsafe fn dispatch_unary(
+        &self,
+        pipeline: ObjcId,
+        buffers: &[ObjcId],
+        threads: u64,
+        context: &MetalCommandContext,
+    ) -> Result<()> {
+        unsafe {
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                bail!("failed to create Flash-MoE Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                bail!("failed to create Flash-MoE Metal compute encoder");
+            }
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            for (idx, buffer) in buffers.iter().copied().enumerate() {
+                set_buffer(encoder, buffer, idx as u64);
+            }
+            dispatch_threads(encoder, threads);
+            msg_send_void0(encoder, sel("endEncoding"));
+            let wait_result = commit_and_wait_metal_command_buffer(command_buffer, context);
+            release(encoder);
+            release(command_buffer);
+            wait_result?;
+            Ok(())
+        }
+    }
+
+    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
+        unsafe {
+            let buffer = self.buffer_with_len(bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    unsafe fn borrowed_buffer_with_bytes(&self, bytes: &[u8]) -> Option<ObjcId> {
+        if bytes.is_empty() {
+            return None;
+        }
+        unsafe {
+            let buffer = msg_send_id4_ptr_usize_u64_ptr(
+                self.device,
+                sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+                bytes.as_ptr() as *mut c_void,
+                bytes.len(),
+                0,
+                ptr::null_mut(),
+            );
+            (!buffer.is_null()).then_some(buffer)
+        }
+    }
+
+    unsafe fn phase_buffer_with_bytes(&self, bytes: &[u8]) -> Result<MetalPhaseBuffer> {
+        unsafe {
+            self.buffer_with_bytes(bytes)
+                .map(MetalPhaseBuffer::recyclable)
+        }
+    }
+
+    unsafe fn phase_buffer_with_borrowed_bytes(&self, bytes: &[u8]) -> Result<MetalPhaseBuffer> {
+        unsafe {
+            if let Some(buffer) = self.borrowed_buffer_with_bytes(bytes) {
+                return Ok(MetalPhaseBuffer::borrowed(buffer));
+            }
+            self.phase_buffer_with_bytes(bytes)
+        }
+    }
+
+    unsafe fn phase_buffer_with_borrowed_bytes_aligned(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<MetalPhaseBuffer> {
+        if alignment > 1 && (bytes.as_ptr() as usize) % alignment != 0 {
+            return unsafe { self.phase_buffer_with_bytes(bytes) };
+        }
+        unsafe { self.phase_buffer_with_borrowed_bytes(bytes) }
+    }
+
+    fn shared_expert_buffers(
+        &self,
+        layer: usize,
+        shared: &SharedExpertPhaseWeights,
+        total_intermediate: usize,
+    ) -> Result<MetalSharedExpertBuffers> {
+        {
+            let cache = self
+                .shared_expert_buffers
+                .lock()
+                .expect("metal shared expert buffer cache poisoned");
+            if let Some(buffers) = cache.get(&layer).copied() {
+                if buffers.width == shared.width
+                    && buffers.shared_experts == shared.shared_experts
+                    && buffers.intermediate == shared.intermediate
+                    && buffers.total_intermediate == total_intermediate
+                {
+                    return Ok(buffers);
+                }
+                bail!(
+                    "cached Metal shared expert buffers for layer {layer} have dimensions {}x{}x{}, requested {}x{}x{}",
+                    buffers.shared_experts,
+                    buffers.intermediate,
+                    buffers.width,
+                    shared.shared_experts,
+                    shared.intermediate,
+                    shared.width
+                );
+            }
+        }
+
+        unsafe {
+            let gate = self.persistent_buffer_with_bytes(f32_as_bytes(shared.gate.as_slice()))?;
+            let up = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.up.as_slice())) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    release(gate);
+                    return Err(err);
+                }
+            };
+            let down = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.down.as_slice()))
+            {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    release(gate);
+                    release(up);
+                    return Err(err);
+                }
+            };
+            let router =
+                match self.persistent_buffer_with_bytes(f32_as_bytes(shared.router.as_slice())) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        release(gate);
+                        release(up);
+                        release(down);
+                        return Err(err);
+                    }
+                };
+            let buffers = MetalSharedExpertBuffers {
+                gate,
+                up,
+                down,
+                router,
+                width: shared.width,
+                shared_experts: shared.shared_experts,
+                intermediate: shared.intermediate,
+                total_intermediate,
+            };
+            let mut cache = self
+                .shared_expert_buffers
+                .lock()
+                .expect("metal shared expert buffer cache poisoned");
+            if let Some(existing) = cache.get(&layer).copied() {
+                release(buffers.gate);
+                release(buffers.up);
+                release(buffers.down);
+                release(buffers.router);
+                if existing.width != shared.width
+                    || existing.shared_experts != shared.shared_experts
+                    || existing.intermediate != shared.intermediate
+                    || existing.total_intermediate != total_intermediate
+                {
+                    bail!(
+                        "cached Metal shared expert buffers for layer {layer} changed dimensions while loading"
+                    );
+                }
+                return Ok(existing);
+            }
+            cache.insert(layer, buffers);
+            Ok(buffers)
+        }
+    }
+
+    unsafe fn persistent_buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
+        unsafe {
+            let buffer = msg_send_id2_usize_u64(
+                self.device,
+                sel("newBufferWithLength:options:"),
+                bytes.len(),
+                0,
+            );
+            if buffer.is_null() {
+                bail!("failed to allocate persistent Flash-MoE Metal shared expert buffer");
+            }
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> {
+        unsafe {
+            {
+                let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+                if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
+                    return Ok(reusable.swap_remove(index).id);
+                }
+            }
+            let buffer =
+                msg_send_id2_usize_u64(self.device, sel("newBufferWithLength:options:"), len, 0);
+            if buffer.is_null() {
+                bail!("failed to allocate Flash-MoE Metal output buffer");
+            }
+            Ok(buffer)
+        }
+    }
+
+    unsafe fn recycle(&self, buffer: ObjcId) {
+        unsafe {
+            // Keep a tiny reuse pool so repeated decode steps do not immediately
+            // churn all buffers under memory pressure. Drop older buffers quickly
+            // because expert data is streamed and can be very large.
+            let len = msg_send_usize0(buffer, sel("length"));
+            let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+            if reusable.len() < 8 {
+                reusable.push(MetalReusableBuffer { id: buffer, len });
+            } else {
+                release(buffer);
+            }
+        }
+    }
+
+    fn recycle_or_release_buffers(&self, buffers: &[ObjcId], release_only: bool) {
+        unsafe {
+            for buffer in buffers.iter().copied() {
+                if release_only {
+                    release(buffer);
+                } else {
+                    self.recycle(buffer);
+                }
+            }
+        }
+    }
+}
+
+impl FlashMoeEngine {
+    pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
+        let request = StructuredGenerationRequest::from_prompt(request);
+        self.generate_structured(&request)
+    }
+
+    pub fn generate_raw(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
+        let mut request = StructuredGenerationRequest::from_prompt(request);
+        request.raw_prompt = true;
+        request.add_generation_prompt = false;
+        self.generate_structured(&request)
+    }
+
+    pub fn generate_structured(
+        &mut self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        Ok(self.generate_structured_inner(request, None)?.output)
+    }
+
+    pub fn generate_in_session(
+        &mut self,
+        session_id: &str,
+        request: &GenerationRequest,
+    ) -> Result<GenerationOutput> {
+        if session_id.is_empty() {
+            return self.generate(request);
+        }
+        let request = StructuredGenerationRequest::from_prompt(request);
+        self.generate_structured_in_session(session_id, &request)
+    }
+
+    pub fn generate_structured_in_session(
+        &mut self,
+        session_id: &str,
+        request: &StructuredGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        if session_id.is_empty() {
+            return self.generate_structured(request);
+        }
+        Ok(self
+            .generate_structured_inner_with_session(request, Some(session_id), None)?
+            .output)
+    }
+
+    pub fn generate_timed(&mut self, request: &GenerationRequest) -> Result<TimedGenerationOutput> {
+        let request = StructuredGenerationRequest::from_prompt(request);
+        self.generate_structured_timed(&request)
+    }
+
+    pub fn generate_timed_with_progress<F>(
+        &mut self,
+        request: &GenerationRequest,
+        mut progress: F,
+    ) -> Result<TimedGenerationOutput>
+    where
+        F: FnMut(String),
+    {
+        let request = StructuredGenerationRequest::from_prompt(request);
+        self.generate_structured_timed_with_progress(&request, &mut progress)
+    }
+
+    pub fn generate_raw_timed_with_progress<F>(
+        &mut self,
+        request: &GenerationRequest,
+        mut progress: F,
+    ) -> Result<TimedGenerationOutput>
+    where
+        F: FnMut(String),
+    {
+        let mut request = StructuredGenerationRequest::from_prompt(request);
+        request.raw_prompt = true;
+        request.add_generation_prompt = false;
+        self.generate_structured_timed_with_progress(&request, &mut progress)
+    }
+
+    pub fn generate_structured_timed(
+        &mut self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = FlashMoeGenerationTiming {
+            model: self.plan.model.clone(),
+            dimensions: self.model_dimensions(),
+            tokens: Vec::new(),
+            total_wall: Duration::ZERO,
+        };
+        self.generate_structured_inner_with_session(request, None, Some(&mut timing))
+    }
+
+    fn generate_structured_timed_with_progress(
+        &mut self,
+        request: &StructuredGenerationRequest,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = FlashMoeGenerationTiming {
+            model: self.plan.model.clone(),
+            dimensions: self.model_dimensions(),
+            tokens: Vec::new(),
+            total_wall: Duration::ZERO,
+        };
+        let progress = Some(Rc::new(RefCell::new(progress)));
+        self.generate_structured_inner_with_session_progress(
+            request,
+            None,
+            Some(&mut timing),
+            progress,
+        )
+    }
+
+    fn generate_structured_inner(
+        &mut self,
+        request: &StructuredGenerationRequest,
+        timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<TimedGenerationOutput> {
+        self.generate_structured_inner_with_session_progress(request, None, timing, None)
+    }
+
+    fn generate_structured_inner_with_session(
+        &mut self,
+        request: &StructuredGenerationRequest,
+        session_id: Option<&str>,
+        timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<TimedGenerationOutput> {
+        self.generate_structured_inner_with_session_progress(request, session_id, timing, None)
+    }
+
+    fn generate_structured_inner_with_session_progress(
+        &mut self,
+        request: &StructuredGenerationRequest,
+        session_id: Option<&str>,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<TimedGenerationOutput> {
+        let generation_started = Instant::now();
+        let render_started = Instant::now();
+        let prompt = if request.raw_prompt {
+            if !request.tools.is_empty() {
+                bail!("raw Flash-MoE generation does not support tools");
+            }
+            match request.messages.as_slice() {
+                [
+                    ChatMessage {
+                        content: ChatMessageContent::Text(prompt),
+                        ..
+                    },
+                ] => prompt.clone(),
+                _ => bail!("raw Flash-MoE generation requires exactly one text prompt"),
+            }
+        } else {
+            self.tokenizer.apply_chat_template_to_messages(
+                &request.messages,
+                &request.tools,
+                request.add_generation_prompt,
+            )?
+        };
+        let render_elapsed = render_started.elapsed();
+        let encode_started = Instant::now();
+        let prompt_tokens = self.tokenizer.encode(&prompt)?;
+        let encode_elapsed = encode_started.elapsed();
+        report_generation_progress(
+            &progress,
+            format!(
+                "rendered prompt chars={} tokens={} render_ms={} encode_ms={}",
+                prompt.len(),
+                prompt_tokens.len(),
+                render_elapsed.as_millis(),
+                encode_elapsed.as_millis()
+            ),
+        );
+        info!(
+            "flashmoe: rendered prompt chars={} tokens={} render_ms={} encode_ms={} tools={} session={}",
+            prompt.len(),
+            prompt_tokens.len(),
+            render_elapsed.as_millis(),
+            encode_elapsed.as_millis(),
+            request.tools.len(),
+            session_id.unwrap_or("<none>")
+        );
+        let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
+        let cached = session_id.and_then(|id| {
+            take_reusable_session_cache_entry(&mut self.session_cache, id, &prompt_tokens)
+        });
+        let (mut kv_cache, prefill_start, cached_last_hidden) =
+            if let Some((prefix_len, state)) = cached {
+                let FlashMoeSessionState {
+                    tokens: _,
+                    mut kv_cache,
+                    last_hidden,
+                } = state;
+                kv_cache.resize_capacity(cache_capacity);
+                let last_hidden = if prefix_len == prompt_tokens.len() {
+                    Some(last_hidden)
+                } else {
+                    None
+                };
+                info!(
+                    "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
+                    prefix_len,
+                    prompt_tokens.len()
+                );
+                (kv_cache, prefix_len, last_hidden)
+            } else {
+                (
+                    KvCache::new(self.config.num_hidden_layers, cache_capacity),
+                    0,
+                    None,
+                )
+            };
+        let prefill_hidden = if prefill_start == prompt_tokens.len() {
+            info!(
+                "flashmoe: prompt prefill fully cached tokens={}",
+                prompt_tokens.len()
+            );
+            cached_last_hidden.context("session cache entry is missing the final hidden state")?
+        } else {
+            let prefill_started = Instant::now();
+            report_generation_progress(
+                &progress,
+                format!(
+                    "prefill begin start_token={} remaining_tokens={}",
+                    prefill_start,
+                    prompt_tokens.len().saturating_sub(prefill_start)
+                ),
+            );
+            info!(
+                "flashmoe: prefill begin start_token={} remaining_tokens={}",
+                prefill_start,
+                prompt_tokens.len().saturating_sub(prefill_start)
+            );
+            let hidden = self.prefill_from(
+                &prompt_tokens,
+                prefill_start,
+                &mut kv_cache,
+                timing.as_deref_mut(),
+                progress.clone(),
+            )?;
+            report_generation_progress(
+                &progress,
+                format!(
+                    "prefill complete tokens={} elapsed_ms={}",
+                    prompt_tokens.len().saturating_sub(prefill_start),
+                    prefill_started.elapsed().as_millis()
+                ),
+            );
+            info!(
+                "flashmoe: prefill complete tokens={} elapsed_ms={}",
+                prompt_tokens.len().saturating_sub(prefill_start),
+                prefill_started.elapsed().as_millis()
+            );
+            hidden
+        };
+        let prompt_cache = session_id
+            .is_some()
+            .then(|| (kv_cache.shallow_snapshot(), prefill_hidden.clone()));
+
+        let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
+        let mut generated = Vec::new();
+        let max_tokens = request.max_tokens.max(0) as usize;
+        let mut stopped = false;
+        if max_tokens > 0 {
+            let sample_started = Instant::now();
+            report_generation_progress(&progress, "first-token sampling begin".to_string());
+            info!("flashmoe: first-token sampling begin");
+            let token =
+                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            report_generation_progress(
+                &progress,
+                format!(
+                    "first-token sampling complete token={} elapsed_ms={}",
+                    token,
+                    sample_started.elapsed().as_millis()
+                ),
+            );
+            info!(
+                "flashmoe: first-token sampling complete token={} elapsed_ms={}",
+                token,
+                sample_started.elapsed().as_millis()
+            );
+            if let Some(timing) = timing.as_deref_mut()
+                && let Some(last) = timing.tokens.last_mut()
+            {
+                let elapsed = sample_started.elapsed();
+                last.buckets.sampling += elapsed;
+                last.buckets.total_wall += elapsed;
+                last.sampled_token = Some(token);
+            }
+            if !self.tokenizer.is_eos(token) {
+                generated.push(token);
+            } else {
+                stopped = true;
+            }
+        }
+        while !stopped && generated.len() < max_tokens {
+            let position = prompt_tokens.len() + generated.len() - 1;
+            report_generation_progress(
+                &progress,
+                format!(
+                    "decode begin generated={}/{} position={}",
+                    generated.len(),
+                    max_tokens,
+                    position
+                ),
+            );
+            info!(
+                "flashmoe: decode begin generated={}/{} position={}",
+                generated.len(),
+                max_tokens,
+                position
+            );
+            let decode_started = Instant::now();
+            let sampled = self.sample_next_token(
+                &mut sampler,
+                &prompt_tokens,
+                &generated,
+                &mut kv_cache,
+                position,
+                MropePosition::text(position),
+                timing.as_deref_mut(),
+                progress.clone(),
+            )?;
+            let token = sampled.token;
+            report_generation_progress(
+                &progress,
+                format!(
+                    "decode complete generated={}/{} token={} elapsed_ms={}",
+                    generated.len() + 1,
+                    max_tokens,
+                    token,
+                    decode_started.elapsed().as_millis()
+                ),
+            );
+            info!(
+                "flashmoe: decode complete generated={}/{} token={} elapsed_ms={}",
+                generated.len() + 1,
+                max_tokens,
+                token,
+                decode_started.elapsed().as_millis()
+            );
+            if self.tokenizer.is_eos(token) {
+                break;
+            }
+            generated.push(token);
+        }
+
+        if let Some(session_id) = session_id {
+            let (prompt_kv_cache, prompt_hidden) =
+                prompt_cache.context("session cache prompt snapshot is missing")?;
+            self.store_session_cache(session_id, &prompt_tokens, prompt_kv_cache, prompt_hidden);
+        }
+
+        let decoded = self.tokenizer.decode(&generated)?;
+        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
+        let output = GenerationOutput {
+            content,
+            tool_calls,
+            generated_tokens: generated.len(),
+        };
+        let total_wall = generation_started.elapsed();
+        info!(
+            "flashmoe: generation complete generated_tokens={} total_ms={}",
+            generated.len(),
+            total_wall.as_millis()
+        );
+        if let Some(timing) = timing {
+            timing.total_wall = total_wall;
+            return Ok(TimedGenerationOutput {
+                output,
+                timing: timing.clone(),
+            });
+        }
+        Ok(TimedGenerationOutput {
+            output,
+            timing: FlashMoeGenerationTiming {
+                model: self.plan.model.clone(),
+                dimensions: self.model_dimensions(),
+                tokens: Vec::new(),
+                total_wall,
+            },
+        })
+    }
+
+    fn prefill(
+        &mut self,
+        prompt_tokens: &[u32],
+        kv_cache: &mut KvCache,
+        timing: Option<&mut FlashMoeGenerationTiming>,
+    ) -> Result<Vec<f32>> {
+        self.prefill_from(prompt_tokens, 0, kv_cache, timing, None)
+    }
+
+    fn prefill_from(
+        &mut self,
+        prompt_tokens: &[u32],
+        start_position: usize,
+        kv_cache: &mut KvCache,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<Vec<f32>> {
+        if start_position > prompt_tokens.len() {
+            bail!(
+                "prefill start position {start_position} exceeds prompt length {}",
+                prompt_tokens.len()
+            );
+        }
+        let prefill_strategy = self.text_prefill_expert_strategy();
+        let mut last_hidden = None;
+        let progress_started = Instant::now();
+        let mut last_progress = Instant::now();
+        for (position, token) in prompt_tokens
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(start_position)
+        {
+            kv_cache.record_prompt_token(position, token)?;
+            let mut token_timing =
+                FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
+            let expert_execution =
+                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len());
+            report_generation_progress(
+                &progress,
+                format!(
+                    "prefill token begin processed={} remaining={} position={} expert_execution={}",
+                    position.saturating_sub(start_position) + 1,
+                    prompt_tokens.len().saturating_sub(position + 1),
+                    position,
+                    expert_execution.as_str()
+                ),
+            );
+            // Populate the causal KV cache with the prompt tokens so decode can
+            // attend to the full rendered prompt rather than only the latest
+            // generated token.
+            last_hidden = Some(self.forward_hidden(
+                token,
+                None,
+                kv_cache,
+                position,
+                MropePosition::text(position),
+                None,
+                false,
+                expert_execution,
+                if timing.is_some() {
+                    Some(&mut token_timing)
+                } else {
+                    None
+                },
+                progress.clone(),
+            )?);
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.tokens.push(token_timing);
+            }
+            let processed = position.saturating_sub(start_position) + 1;
+            let remaining = prompt_tokens.len().saturating_sub(position + 1);
+            let should_report = processed == 1
+                || remaining == 0
+                || processed % 16 == 0
+                || last_progress.elapsed() >= Duration::from_secs(10);
+            if should_report {
+                report_generation_progress(
+                    &progress,
+                    format!(
+                        "prefill progress processed={} remaining={} position={} elapsed_ms={}",
+                        processed,
+                        remaining,
+                        position,
+                        progress_started.elapsed().as_millis()
+                    ),
+                );
+                info!(
+                    "flashmoe: prefill progress processed={} remaining={} position={} elapsed_ms={}",
+                    processed,
+                    remaining,
+                    position,
+                    progress_started.elapsed().as_millis()
+                );
+                last_progress = Instant::now();
+            }
+        }
+        last_hidden.context("cannot generate from an empty prompt")
+    }
+
+    fn store_session_cache(
+        &mut self,
+        session_id: &str,
+        prompt_tokens: &[u32],
+        kv_cache: KvCache,
+        last_hidden: Vec<f32>,
+    ) {
+        self.session_cache.insert(
+            session_id.to_string(),
+            FlashMoeSessionState {
+                tokens: stable_session_cache_tokens(prompt_tokens),
+                kv_cache,
+                last_hidden,
+            },
+        );
+    }
+
+    fn text_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
+        prefill_expert_strategy(
+            &self.config,
+            self.vision_encoder.is_some(),
+            PrefillInputKind::Text,
+        )
+    }
+
+    fn visual_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
+        prefill_expert_strategy(
+            &self.config,
+            self.vision_encoder.is_some(),
+            PrefillInputKind::Visual,
+        )
+    }
+
+    /// Prefill the KV cache for a vision prompt, substituting visual embeddings
+    /// in place of `image_pad_token` positions.
+    fn prefill_with_vision(
+        &mut self,
+        prompt_tokens: &[u32],
+        visual_embeddings: &[Vec<f32>],
+        deepstack_features: &[Vec<Vec<f32>>],
+        image_pad_token: u32,
+        mrope_positions: &[MropePosition],
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        if mrope_positions.len() != prompt_tokens.len() {
+            bail!(
+                "vision M-RoPE positions length {} does not match prompt length {}",
+                mrope_positions.len(),
+                prompt_tokens.len()
+            );
+        }
+        let prefill_strategy = self.visual_prefill_expert_strategy();
+        if prefill_strategy != PrefillExpertStrategy::ComputeAllExperts {
+            bail!("Qwen3-VL visual prefill must compute intermediate experts");
+        }
+        let image_placeholder_tokens = prompt_tokens
+            .iter()
+            .filter(|&&token| token == image_pad_token)
+            .count();
+        if image_placeholder_tokens != visual_embeddings.len() {
+            bail!(
+                "image placeholder token count {image_placeholder_tokens} does not match visual embedding count {}; check placeholder expansion and image_grid_thw",
+                visual_embeddings.len()
+            );
+        }
+        let mut vis_idx = 0usize;
+        let mut last_hidden = None;
+        for (position, &token) in prompt_tokens.iter().enumerate() {
+            kv_cache.record_prompt_token(position, token)?;
+            let visual_index = if token == image_pad_token {
+                if vis_idx >= visual_embeddings.len() {
+                    bail!(
+                        "image placeholder at token {position} has no corresponding visual embedding"
+                    );
+                }
+                let idx = vis_idx;
+                vis_idx += 1;
+                Some(idx)
+            } else {
+                None
+            };
+            let override_emb = visual_index.map(|idx| visual_embeddings[idx].clone());
+            let deepstack = visual_index.map(|idx| DeepstackTokenContext {
+                features: deepstack_features,
+                visual_index: idx,
+            });
+            last_hidden = Some(self.forward_hidden(
+                token,
+                override_emb,
+                kv_cache,
+                position,
+                mrope_positions[position],
+                deepstack,
+                false,
+                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len()),
+                None,
+                None,
+            )?);
+        }
+        if vis_idx != visual_embeddings.len() {
+            bail!(
+                "consumed {vis_idx} visual embeddings but {} were provided",
+                visual_embeddings.len()
+            );
+        }
+        last_hidden.context("cannot generate from an empty vision prompt")
+    }
+
+    /// Generate text from ordered text and image content using the Qwen3-VL vision encoder.
+    ///
+    /// Returns an error when the engine was not loaded from a Qwen3-VL plan
+    /// (i.e. `plan.vision_weights` is `None`).
+    pub fn generate_multimodal(
+        &mut self,
+        request: &MultimodalGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        let image_count = request
+            .content
+            .iter()
+            .filter(|part| matches!(part, MultimodalContent::Image { .. }))
+            .count();
+        if image_count == 0 {
+            bail!("generate_multimodal requires at least one image block");
+        }
+
+        let vision_config = self
+            .config
+            .vision_config
+            .as_ref()
+            .context("generate_multimodal requires a Qwen3-VL plan with a vision_config")?;
+        let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
+        let (parts, visual_encodings) = {
+            let encoder = self.vision_encoder.as_ref().context(
+                "generate_multimodal requires a loaded VisionEncoder; this plan has no vision weights",
+            )?;
+            let mut parts = Vec::with_capacity(request.content.len());
+            let mut visual_encodings = Vec::with_capacity(image_count);
+            for part in &request.content {
+                match part {
+                    MultimodalContent::Text { text } => {
+                        parts.push(ChatContentPart::Text { text: text.clone() });
+                    }
+                    MultimodalContent::Image { image_path } => {
+                        let visual = encoder.encode(&preprocessor, image_path)?;
+                        let num_visual_tokens = visual.embeddings.len();
+                        parts.push(ChatContentPart::Image {
+                            image: Some(image_path.display().to_string()),
+                            placeholder_tokens: Some(num_visual_tokens),
+                        });
+                        visual_encodings.push(visual);
+                    }
+                }
+            }
+            (parts, visual_encodings)
+        };
+
+        self.generate_with_encoded_visual_prompt(
+            ChatMessageContent::Parts(parts),
+            visual_encodings,
+            request.max_tokens,
+            request.temperature,
+            request.top_k,
+            request.seed,
+        )
+    }
+
+    /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
+    ///
+    /// Compatibility wrapper around the structured multimodal path.
+    pub fn generate_with_image(
+        &mut self,
+        request: &VisionGenerationRequest,
+    ) -> Result<GenerationOutput> {
+        if request.prompt.contains("<|image_pad|>") {
+            let vision_config = self
+                .config
+                .vision_config
+                .as_ref()
+                .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
+            let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
+            let visual = {
+                let encoder = self.vision_encoder.as_ref().context(
+                    "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
+                )?;
+                encoder.encode(&preprocessor, &request.image_path)?
+            };
+            return self.generate_with_encoded_visual_prompt(
+                ChatMessageContent::Text(request.prompt.clone()),
+                vec![visual],
+                request.max_tokens,
+                request.temperature,
+                request.top_k,
+                request.seed,
+            );
+        }
+
+        self.generate_multimodal(&MultimodalGenerationRequest {
+            content: vec![
+                MultimodalContent::Image {
+                    image_path: request.image_path.clone(),
+                },
+                MultimodalContent::Text {
+                    text: request.prompt.clone(),
+                },
+            ],
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_k: request.top_k,
+            seed: request.seed,
+        })
+    }
+
+    fn generate_with_encoded_visual_prompt(
+        &mut self,
+        content: ChatMessageContent,
+        visual_encodings: Vec<VisionEncoding>,
+        max_tokens: i32,
+        temperature: f32,
+        top_k: i32,
+        seed: u32,
+    ) -> Result<GenerationOutput> {
+        // Qwen3-VL chat template: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
+        let vision_start = self.tokenizer.token_id("<|vision_start|>");
+        let vision_end = self.tokenizer.token_id("<|vision_end|>");
+        let image_pad = self.tokenizer.token_id("<|image_pad|>");
+        let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
+            (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
+            _ => bail!(
+                "Qwen3-VL tokenizer is missing required vision special tokens \
+                 (<|vision_start|>, <|vision_end|>, <|image_pad|>); \
+                 ensure the tokenizer.json is from a VL checkpoint"
+            ),
+        };
+
+        let chat_text = self.tokenizer.apply_chat_template_to_messages(
+            &[ChatMessage {
+                role: ChatRole::User,
+                content,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            }],
+            &[],
+            true,
+        )?;
+        let mut prompt_tokens = self.tokenizer.encode(&chat_text)?;
+        let mut image_specs = Vec::with_capacity(visual_encodings.len());
+        let mut visual_embeddings = Vec::new();
+        let mut deepstack_features = None::<Vec<Vec<Vec<f32>>>>;
+        for visual in visual_encodings {
+            let VisionEncoding {
+                embeddings,
+                deepstack_features: visual_deepstack,
+                merged_grid_h,
+                merged_grid_w,
+            } = visual;
+            image_specs.push(ImagePlaceholderSpec {
+                token_count: embeddings.len(),
+                grid_h: merged_grid_h,
+                grid_w: merged_grid_w,
+            });
+            visual_embeddings.extend(embeddings);
+            if let Some(accumulated_deepstack) = deepstack_features.as_mut() {
+                if accumulated_deepstack.len() != visual_deepstack.len() {
+                    bail!(
+                        "vision images produced incompatible DeepStack feature depths: {} vs {}",
+                        accumulated_deepstack.len(),
+                        visual_deepstack.len()
+                    );
+                }
+                for (dst, mut src) in accumulated_deepstack.iter_mut().zip(visual_deepstack) {
+                    dst.append(&mut src);
+                }
+            } else {
+                deepstack_features = Some(visual_deepstack);
+            }
+        }
+        let deepstack_features = deepstack_features.unwrap_or_default();
+        let expanded = expand_multimodal_image_placeholders(
+            prompt_tokens,
+            vs_tok,
+            ve_tok,
+            pad_tok,
+            &image_specs,
+        )?;
+        prompt_tokens = expanded.tokens;
+        let (mrope_positions, next_mrope_position) =
+            qwen3vl_multimodal_mrope_positions(&prompt_tokens, pad_tok, &expanded.visual_spans)?;
+
+        let mut kv_cache = KvCache::new(
+            self.config.num_hidden_layers,
+            prompt_tokens.len() + max_tokens.max(0) as usize,
+        );
+        let prefill_hidden = self.prefill_with_vision(
+            &prompt_tokens,
+            &visual_embeddings,
+            &deepstack_features,
+            pad_tok,
+            &mrope_positions,
+            &mut kv_cache,
+        )?;
+
+        let mut sampler = TokenSampler::new(temperature, top_k, seed);
+        let mut generated = Vec::new();
+        let max_tokens = max_tokens.max(0) as usize;
+        let mut stopped = false;
+        if max_tokens > 0 {
+            let token =
+                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            if !self.tokenizer.is_eos(token) {
+                generated.push(token);
+            } else {
+                stopped = true;
+            }
+        }
+        while !stopped && generated.len() < max_tokens {
+            let position = prompt_tokens.len() + generated.len() - 1;
+            let sampled = self.sample_next_token(
+                &mut sampler,
+                &prompt_tokens,
+                &generated,
+                &mut kv_cache,
+                position,
+                MropePosition::text(next_mrope_position + generated.len() - 1),
+                None,
+                None,
+            )?;
+            let token = sampled.token;
+            if self.tokenizer.is_eos(token) {
+                break;
+            }
+            generated.push(token);
+        }
+
+        let decoded = self.tokenizer.decode(&generated)?;
+        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
+        Ok(GenerationOutput {
+            content,
+            tool_calls,
+            generated_tokens: generated.len(),
+        })
+    }
+
+    fn model_norm_weight(&self, canonical_name: &str, width: usize) -> Result<Option<Vec<f32>>> {
+        let Some(mut weight) = self.dense.norm_weight(canonical_name, width)? else {
+            return Ok(None);
+        };
+        if self.uses_qwen3next_offset_norm(canonical_name) {
+            for value in &mut weight {
+                *value += 1.0;
+            }
+        }
+        Ok(Some(weight))
+    }
+
+    fn rms_norm_with_model_weight(&self, canonical_name: &str, input: &[f32]) -> Result<Vec<f32>> {
+        let weight = self.model_norm_weight(canonical_name, input.len())?;
+        let mut out = input.to_vec();
+        rms_norm_with_weight_in_place(&mut out, weight.as_deref());
+        Ok(out)
+    }
+
+    fn uses_qwen3next_offset_norm(&self, canonical_name: &str) -> bool {
+        qwen3next_norm_uses_offset(&self.config, canonical_name)
+    }
+
+    fn sample_next_token(
+        &mut self,
+        sampler: &mut TokenSampler,
+        prompt_tokens: &[u32],
+        generated: &[u32],
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        timing: Option<&mut FlashMoeGenerationTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<SampledDecode> {
+        let previous = generated
+            .last()
+            .copied()
+            .or_else(|| prompt_tokens.last().copied())
+            .unwrap_or_else(|| self.tokenizer.eos_token_id());
+        let mut token_timing = FlashMoeTokenTiming::new(
+            prompt_tokens.len() + generated.len(),
+            position,
+            FlashMoeTokenPhase::Decode,
+            previous,
+        );
+        let hidden = self.forward_hidden(
+            previous,
+            None,
+            kv_cache,
+            position,
+            rope_position,
+            None,
+            true,
+            ExpertExecution::Normal,
+            if timing.is_some() {
+                Some(&mut token_timing)
+            } else {
+                None
+            },
+            progress,
+        )?;
+        let sample_started = Instant::now();
+        let token = self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)?;
+        let elapsed = sample_started.elapsed();
+        token_timing.buckets.sampling += elapsed;
+        token_timing.buckets.total_wall += elapsed;
+        token_timing.sampled_token = Some(token);
+        if let Some(timing) = timing {
+            timing.tokens.push(token_timing);
+        }
+        Ok(SampledDecode { token, hidden })
+    }
+
+    fn sample_from_hidden(
+        &self,
+        sampler: &mut TokenSampler,
+        hidden: &[f32],
+        prompt_tokens: &[u32],
+        generated: &[u32],
+    ) -> Result<u32> {
+        if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
+            self.metal.as_ref(),
+            hidden,
+            &self.tokenizer,
+            sampler,
+            prompt_tokens,
+            generated,
+        )? {
+            trace_sampling_candidates(&self.tokenizer, prompt_tokens.len(), generated, &candidates);
+            return sampler.sample_candidates(candidates);
+        }
+        let logits = self.dense.lm_head_logits_with_metal(
+            self.metal.as_ref(),
+            0,
+            hidden,
+            &self.tokenizer,
+        )?;
+        let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+        trace_sampling_candidates(&self.tokenizer, prompt_tokens.len(), generated, &candidates);
+        sampler.sample_candidates(candidates)
+    }
+
+    fn forward_hidden(
+        &mut self,
+        previous: u32,
+        embedding_override: Option<Vec<f32>>,
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        deepstack: Option<DeepstackTokenContext<'_>>,
+        record_generated: bool,
+        expert_execution: ExpertExecution,
+        mut timing: Option<&mut FlashMoeTokenTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<Vec<f32>> {
+        let runtime = &self.runtime;
+        let token_started = Instant::now();
+        let mut hidden = if let Some(mut emb) = embedding_override {
+            if emb.len() != runtime.width {
+                tracing::warn!(
+                    got = emb.len(),
+                    expected = runtime.width,
+                    "vision embedding dimension mismatch; zero-padding to runtime width"
+                );
+                emb.resize(runtime.width, 0.0);
+            }
+            emb
+        } else {
+            self.dense.embedding(previous, runtime.width)?
+        };
+        let mut state = self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64);
+        let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
+        let mut next_layer_normed: Option<Vec<f32>> = None;
+
+        for layer in 0..self.config.num_hidden_layers {
+            let report_layer_progress = progress.is_some()
+                || layer == 0
+                || layer + 1 == self.config.num_hidden_layers
+                || layer % 10 == 0;
+            if report_layer_progress {
+                report_generation_progress(
+                    &progress,
+                    format!(
+                        "forward layer begin position={} layer={}/{}",
+                        position,
+                        layer + 1,
+                        self.config.num_hidden_layers
+                    ),
+                );
+            }
+            if let Some(pending) = deferred_expert_phase.take() {
+                let wait_started = Instant::now();
+                let output = pending.wait()?;
+                info!(
+                    token_position = position,
+                    completed_layer = layer.saturating_sub(1),
+                    wait_ms = wait_started.elapsed().as_millis(),
+                    "flashmoe deferred expert wait complete"
+                );
+                hidden = output.hidden;
+                next_layer_normed = output.next_normed;
+            }
+            let layer_started = Instant::now();
+            let mut layer_timing = FlashMoeLayerTiming {
+                layer,
+                layer_kind: self.layer_kind(layer),
+                active_experts: 0,
+                dimensions: self.layer_dimensions(layer),
+                buckets: FlashMoeTimingBuckets::default(),
+            };
+            let attention_residual = hidden.clone();
+            let combine_started = Instant::now();
+            let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
+            let mut normed = if let Some(normed) = next_layer_normed.take() {
+                normed
+            } else {
+                self.rms_norm_with_model_weight(input_norm_name.as_str(), &hidden)?
+            };
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            let attention_started = Instant::now();
+            let projected = if self.runtime.is_linear_attention_layer(layer) {
+                self.linear_attention_projected(
+                    layer,
+                    &normed,
+                    kv_cache,
+                    runtime,
+                    Some(&mut layer_timing.buckets),
+                )?
+            } else {
+                self.full_attention_projected(
+                    layer,
+                    &normed,
+                    kv_cache,
+                    position,
+                    rope_position,
+                    runtime,
+                    Some(&mut layer_timing.buckets),
+                )?
+            };
+            trace_layer_values(position, layer, "attention", &projected);
+            layer_timing.buckets.attention_projection += attention_started.elapsed();
+            let combine_started = Instant::now();
+            hidden = attention_residual;
+            add_in_place(&mut hidden, &projected);
+
+            let mlp_residual = hidden.clone();
+            let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
+            normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            let routing_started = Instant::now();
+            let router_scores = self.dense.router_scores_with_metal(
+                self.metal.as_ref(),
+                layer,
+                self.config.experts(),
+                &normed,
+            )?;
+            let active = if let Some(metal) = &self.metal {
+                metal.route_topk(
+                    position,
+                    layer,
+                    &router_scores,
+                    self.routing_policy.active_experts,
+                )?
+            } else {
+                top_k(&router_scores, self.routing_policy.active_experts)
+            };
+            layer_timing.buckets.routing += routing_started.elapsed();
+            layer_timing.active_experts = active.len();
+            let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
+            if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
+                kv_cache.record_layer_state(position, layer, state)?;
+                layer_timing.buckets.total_wall = layer_started.elapsed();
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.add(layer_timing.buckets);
+                    timing.layers.push(layer_timing);
+                }
+                continue;
+            }
+            let expert_metrics_before = self.scheduler.snapshot();
+            let expert_io_started = Instant::now();
+            let pending_experts = self.scheduler.issue(layer, &active_ids)?;
+            layer_timing.buckets.expert_io += expert_io_started.elapsed();
+            let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
+            softmax_in_place(&mut weights);
+            // While expert reads are still pending, prepare the always-active
+            // shared-expert branch for the deferred expert command buffer.
+            let shared_compute_started = Instant::now();
+            let shared_phase = self.shared_expert_phase_weights(layer, runtime.width)?;
+            layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
+            let expert_io_started = Instant::now();
+            let experts = self.scheduler.finish(pending_experts)?;
+            layer_timing.buckets.expert_io += expert_io_started.elapsed();
+            let expert_metrics_after = self.scheduler.snapshot();
+            let expert_delta = expert_metrics_after.saturating_delta(expert_metrics_before);
+            layer_timing
+                .buckets
+                .add_expert_scheduler_delta(expert_delta);
+            let expert_compute_started = Instant::now();
+            for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
+                state = state.wrapping_add(
+                    expert
+                        .mix_hash()
+                        .wrapping_mul((weight.to_bits() as u64).max(1)),
+                );
+            }
+            let experts: Arc<[Arc<ExpertWeights>]> = Arc::from(experts);
+            let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
+                .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
+            let next_norm_weight = if let Some(name) = next_norm_name.as_deref() {
+                self.model_norm_weight(name, runtime.width)?
+            } else {
+                None
+            };
+            let mut submitted_deferred = false;
+            if let Some(metal) = &self.metal
+                && let Some(pending) = metal.submit_expert_phase(
+                    position,
+                    layer,
+                    experts.clone(),
+                    &weights,
+                    &normed,
+                    &mlp_residual,
+                    shared_phase.as_deref(),
+                    next_norm_weight.as_deref(),
+                )?
+            {
+                if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
+                    deferred_expert_phase = Some(pending);
+                    submitted_deferred = true;
+                } else {
+                    let output = pending.wait()?;
+                    hidden = output.hidden;
+                    next_layer_normed = output.next_normed;
+                    submitted_deferred = true;
+                }
+            }
+            if !submitted_deferred {
+                let output = compute_expert_phase_cpu(
+                    experts.as_ref(),
+                    &weights,
+                    &normed,
+                    &mlp_residual,
+                    shared_phase.as_deref(),
+                    next_norm_weight.as_deref(),
+                )?;
+                hidden = output.hidden;
+                next_layer_normed = output.next_normed;
+            }
+            trace_layer_values(position, layer, "moe", &hidden);
+            layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
+            let combine_started = Instant::now();
+            if deferred_expert_phase.is_some() {
+                kv_cache.record_layer_state(position, layer, state)?;
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                layer_timing.buckets.total_wall = layer_started.elapsed();
+                info!(
+                    token_position = position,
+                    layer,
+                    layer_kind = layer_timing.layer_kind.as_str(),
+                    active_experts = layer_timing.active_experts,
+                    expert_deferred = true,
+                    attention_ms = layer_timing.buckets.attention_projection.as_millis(),
+                    routing_ms = layer_timing.buckets.routing.as_millis(),
+                    expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
+                    expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
+                    expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
+                    total_ms = layer_timing.buckets.total_wall.as_millis(),
+                    bytes_read = expert_delta.bytes_read,
+                    "flashmoe layer complete"
+                );
+                if report_layer_progress {
+                    report_generation_progress(
+                        &progress,
+                        format!(
+                            "forward layer complete position={} layer={}/{} attention_ms={} routing_ms={} expert_io_ms={} expert_read_ms={} expert_compute_ms={} combine_norm_ms={} total_ms={}",
+                            position,
+                            layer + 1,
+                            self.config.num_hidden_layers,
+                            layer_timing.buckets.attention_projection.as_millis(),
+                            layer_timing.buckets.routing.as_millis(),
+                            layer_timing.buckets.expert_io.as_millis(),
+                            layer_timing.buckets.expert_read.as_millis(),
+                            layer_timing.buckets.expert_compute.as_millis(),
+                            layer_timing.buckets.combine_norm.as_millis(),
+                            layer_started.elapsed().as_millis()
+                        ),
+                    );
+                }
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.add(layer_timing.buckets);
+                    timing.layers.push(layer_timing);
+                }
+                continue;
+            }
+            if let Some(context) = deepstack
+                && let Some(features_for_layer) = context.features.get(layer)
+            {
+                let feature = features_for_layer
+                    .get(context.visual_index)
+                    .with_context(|| {
+                        format!(
+                            "deepstack layer {layer} has no feature for visual token {}",
+                            context.visual_index
+                        )
+                    })?;
+                if feature.len() != hidden.len() {
+                    bail!(
+                        "deepstack feature for layer {layer} has len {}; expected {}",
+                        feature.len(),
+                        hidden.len()
+                    );
+                }
+                add_in_place(&mut hidden, feature);
+            }
+            kv_cache.record_layer_state(position, layer, state)?;
+            layer_timing.buckets.combine_norm += combine_started.elapsed();
+            layer_timing.buckets.total_wall = layer_started.elapsed();
+            info!(
+                token_position = position,
+                layer,
+                layer_kind = layer_timing.layer_kind.as_str(),
+                active_experts = layer_timing.active_experts,
+                expert_deferred = false,
+                attention_ms = layer_timing.buckets.attention_projection.as_millis(),
+                routing_ms = layer_timing.buckets.routing.as_millis(),
+                expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
+                expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
+                expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
+                total_ms = layer_timing.buckets.total_wall.as_millis(),
+                bytes_read = expert_delta.bytes_read,
+                "flashmoe layer complete"
+            );
+            if report_layer_progress {
+                report_generation_progress(
+                    &progress,
+                    format!(
+                        "forward layer complete position={} layer={}/{} attention_ms={} routing_ms={} expert_io_ms={} expert_read_ms={} expert_compute_ms={} combine_norm_ms={} total_ms={}",
+                        position,
+                        layer + 1,
+                        self.config.num_hidden_layers,
+                        layer_timing.buckets.attention_projection.as_millis(),
+                        layer_timing.buckets.routing.as_millis(),
+                        layer_timing.buckets.expert_io.as_millis(),
+                        layer_timing.buckets.expert_read.as_millis(),
+                        layer_timing.buckets.expert_compute.as_millis(),
+                        layer_timing.buckets.combine_norm.as_millis(),
+                        layer_started.elapsed().as_millis()
+                    ),
+                );
+            }
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.buckets.add(layer_timing.buckets);
+                timing.layers.push(layer_timing);
+            }
+        }
+        if let Some(pending) = deferred_expert_phase.take() {
+            let wait_started = Instant::now();
+            let output = pending.wait()?;
+            info!(
+                token_position = position,
+                completed_layer = self.config.num_hidden_layers.saturating_sub(1),
+                wait_ms = wait_started.elapsed().as_millis(),
+                "flashmoe deferred expert wait complete"
+            );
+            hidden = output.hidden;
+            next_layer_normed = output.next_normed;
+        }
+        drop(next_layer_normed);
+
+        let combine_started = Instant::now();
+        hidden = self.rms_norm_with_model_weight("model.norm.weight", &hidden)?;
+        if record_generated {
+            kv_cache.record_generated_token(position, previous)?;
+        }
+        if let Some(timing) = timing {
+            timing.buckets.combine_norm += combine_started.elapsed();
+            timing.buckets.total_wall = token_started.elapsed();
+        }
+        Ok(hidden)
+    }
+
+    fn full_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Vec<f32>> {
+        let layout = runtime.full_attention_layout(layer)?;
+        let q_name = attention_tensor_name(layer, "q_proj");
+        let k_name = attention_tensor_name(layer, "k_proj");
+        let v_name = attention_tensor_name(layer, "v_proj");
+
+        let subphase_started = Instant::now();
+        let batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
+            self.metal.as_ref(),
+            &[
+                DenseProjectionRequest {
+                    tensor_name: &q_name,
+                    output_width: layout.q_projection_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &k_name,
+                    output_width: layout.kv_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &v_name,
+                    output_width: layout.kv_width,
+                },
+            ],
+            normed,
+        )?;
+        let (q_projected, mut k, v) = if let Some(mut projections) = batched_input_projections {
+            let v = projections
+                .pop()
+                .context("missing batched self_attn.v_proj result")?;
+            let k = projections
+                .pop()
+                .context("missing batched self_attn.k_proj result")?;
+            let q_projected = projections
+                .pop()
+                .context("missing batched self_attn.q_proj result")?;
+            (q_projected, k, v)
+        } else {
+            let q_projected = self.dense.project_with_metal(
+                self.metal.as_ref(),
+                layer,
+                "q_proj",
+                normed,
+                layout.q_projection_width,
+            )?;
+            let k = self.dense.project_with_metal(
+                self.metal.as_ref(),
+                layer,
+                "k_proj",
+                normed,
+                layout.kv_width,
+            )?;
+            let v = self.dense.project_with_metal(
+                self.metal.as_ref(),
+                layer,
+                "v_proj",
+                normed,
+                layout.kv_width,
+            )?;
+            (q_projected, k, v)
+        };
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_input_projection += subphase_started.elapsed();
+        }
+
+        let subphase_started = Instant::now();
+        let (mut q, q_gate) = split_q_projection(q_projected, layout)?;
+
+        // Some Qwen full-attention variants apply Q/K RMSNorm before RoPE.
+        let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
+        let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
+
+        let q_norm_w = self.model_norm_weight(&q_norm_name, layout.head_dim)?;
+        let k_norm_w = self.model_norm_weight(&k_norm_name, layout.head_dim)?;
+        let theta = self.config.rope_theta.unwrap_or_else(|| {
+            if layout.q_layout == FullAttentionQLayout::Gated {
+                10_000_000.0
+            } else {
+                1_000_000.0
+            }
+        });
+        apply_full_attention_qk_norm_and_rotary(
+            &mut q,
+            &mut k,
+            layout,
+            rope_position,
+            theta,
+            self.config.text_mrope_section(),
+            q_norm_w.as_deref(),
+            k_norm_w.as_deref(),
+        )?;
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_misc += subphase_started.elapsed();
+        }
+
+        let subphase_started = Instant::now();
+        let metal_kv_ready = if let Some(metal) = &self.metal {
+            match metal.record_kv(position, layer, layout, &k, &v) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(
+                        layer,
+                        position,
+                        error = %err,
+                        "falling back to CPU full-attention KV cache"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        kv_cache.record_kv(position, layer, k, v)?;
+        let mut attended =
+            self.full_attention_cached(kv_cache, position, layer, &q, layout, metal_kv_ready)?;
+
+        if let Some(q_gate) = q_gate {
+            for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
+                *value *= sigmoid(*gate);
+            }
+        }
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_kernel += subphase_started.elapsed();
+        }
+
+        let subphase_started = Instant::now();
+        let projected = self.dense.project_with_metal(
+            self.metal.as_ref(),
+            layer,
+            "o_proj",
+            &attended,
+            runtime.width,
+        )?;
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_output_projection += subphase_started.elapsed();
+        }
+        Ok(projected)
+    }
+
+    fn full_attention_cached(
+        &self,
+        kv_cache: &KvCache,
+        position: usize,
+        layer: usize,
+        q: &[f32],
+        layout: FullAttentionLayout,
+        metal_kv_ready: bool,
+    ) -> Result<Vec<f32>> {
+        let cpu_attention = |kv_cache: &KvCache| {
+            kv_cache.causal_attention(
+                position,
+                layer,
+                q,
+                layout.num_q_heads,
+                layout.kv_heads,
+                layout.head_dim,
+            )
+        };
+
+        let Some(metal) = &self.metal else {
+            return cpu_attention(kv_cache);
+        };
+        if !metal_kv_ready {
+            return cpu_attention(kv_cache);
+        }
+
+        let tokens = position + 1;
+        match metal.attention_backend(tokens) {
+            MetalAttentionBackend::Cpu => cpu_attention(kv_cache),
+            MetalAttentionBackend::Gpu => {
+                match metal.causal_attention_cached(position, layer, q, layout) {
+                    Ok(output) => Ok(output),
+                    Err(err) => {
+                        tracing::warn!(
+                            layer,
+                            position,
+                            error = %err,
+                            "falling back to CPU full-attention after Metal attention failure"
+                        );
+                        cpu_attention(kv_cache)
+                    }
+                }
+            }
+        }
+    }
+
+    fn linear_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        kv_cache: &mut KvCache,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Vec<f32>> {
+        let layout = runtime.linear_attention_layout(layer)?;
+        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let static_weights = self.linear_attention_static_weights(layer, layout)?;
+
+        let subphase_started = Instant::now();
+        let batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
+            self.metal.as_ref(),
+            &[
+                DenseProjectionRequest {
+                    tensor_name: &qkv_name,
+                    output_width: layout.conv_dim,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &z_name,
+                    output_width: layout.total_value_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &b_name,
+                    output_width: layout.num_value_heads,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &a_name,
+                    output_width: layout.num_value_heads,
+                },
+            ],
+            normed,
+        )?;
+        let (mut qkv, z, beta, alpha) = if let Some(mut projections) = batched_input_projections {
+            let alpha = projections
+                .pop()
+                .context("missing batched linear_attn.in_proj_a result")?;
+            let beta = projections
+                .pop()
+                .context("missing batched linear_attn.in_proj_b result")?;
+            let z = projections
+                .pop()
+                .context("missing batched linear_attn.in_proj_z result")?;
+            let qkv = projections
+                .pop()
+                .context("missing batched linear_attn.in_proj_qkv result")?;
+            (qkv, z, beta, alpha)
+        } else {
+            let qkv = self
+                .dense
+                .project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &qkv_name,
+                    normed,
+                    layout.conv_dim,
+                )?
+                .context("missing linear_attn.in_proj_qkv tensor for GatedDeltaNet layer")?;
+            let z = self
+                .dense
+                .project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &z_name,
+                    normed,
+                    layout.total_value_width,
+                )?
+                .context("missing linear_attn.in_proj_z tensor for GatedDeltaNet layer")?;
+            let beta = self
+                .dense
+                .project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &b_name,
+                    normed,
+                    layout.num_value_heads,
+                )?
+                .context("missing linear_attn.in_proj_b tensor for GatedDeltaNet layer")?;
+            let alpha = self
+                .dense
+                .project_dense_tensor_with_metal(
+                    self.metal.as_ref(),
+                    &a_name,
+                    normed,
+                    layout.num_value_heads,
+                )?
+                .context("missing linear_attn.in_proj_a tensor for GatedDeltaNet layer")?;
+            (qkv, z, beta, alpha)
+        };
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_input_projection += subphase_started.elapsed();
+        }
+
+        let subphase_started = Instant::now();
+        if self
+            .config
+            .linear_attention_qkv_projection_requires_reorder()
+        {
+            reorder_grouped_linear_qkv_projection(&mut qkv, layout)?;
+        }
+        let state = kv_cache.linear_state_mut(layer, layout)?;
+        let state = &mut **state;
+        conv1d_step(
+            &state.conv_state,
+            &qkv,
+            &static_weights.conv_weight,
+            &mut state.conv_out,
+            layout.conv_dim,
+            layout.conv_kernel_size,
+        );
+        state.conv_state.copy_within(
+            layout.conv_dim..layout.conv_kernel_size.saturating_sub(1) * layout.conv_dim,
+            0,
+        );
+        state.conv_state[layout.conv_kernel_size.saturating_sub(2) * layout.conv_dim..]
+            .copy_from_slice(&qkv);
+        qkv.clear();
+
+        let (lin_q, rest) = state.conv_out.split_at_mut(layout.total_key_width);
+        let (lin_k, lin_v) = rest.split_at_mut(layout.total_key_width);
+        normalize_linear_attention_qk_in_place(layout, lin_q, lin_k)?;
+
+        apply_gated_delta_recurrence_with_scratch(
+            layout,
+            &mut state.ssm_state,
+            lin_q,
+            lin_k,
+            lin_v,
+            &alpha,
+            &beta,
+            &static_weights.a_log,
+            &static_weights.dt_bias,
+            &mut state.kv_mem,
+            &mut state.delta,
+            &mut state.out_values,
+        );
+
+        for vh in 0..layout.num_value_heads {
+            let start = vh * layout.value_dim;
+            let end = start + layout.value_dim;
+            let chunk = &mut state.out_values[start..end];
+            rms_norm_with_weight_in_place(
+                chunk,
+                static_weights
+                    .norm_weight
+                    .as_deref()
+                    .map(|weight| &weight[..]),
+            );
+            for (idx, value) in chunk.iter_mut().enumerate() {
+                let z_idx = start + idx;
+                *value *= silu(*z.get(z_idx).unwrap_or(&0.0));
+            }
+        }
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_kernel += subphase_started.elapsed();
+        }
+
+        let subphase_started = Instant::now();
+        let projected = self
+            .dense
+            .project_dense_tensor_with_metal(
+                self.metal.as_ref(),
+                &out_proj_name,
+                &state.out_values,
+                runtime.width,
+            )?
+            .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_output_projection += subphase_started.elapsed();
+        }
+        Ok(projected)
+    }
+
+    fn linear_attention_static_weights(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+    ) -> Result<Arc<LinearAttentionStaticWeights>> {
+        {
+            let cache = self
+                .linear_attention_cache
+                .lock()
+                .expect("linear attention cache poisoned");
+            if let Some(weights) = cache.get(&layer).cloned() {
+                if weights.layout != layout {
+                    bail!(
+                        "cached linear-attention weights for layer {layer} no longer match layout"
+                    );
+                }
+                return Ok(weights);
+            }
+        }
+
+        let conv_name = linear_attention_tensor_name(layer, "conv1d");
+        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+        let norm_name = linear_attention_tensor_name(layer, "norm");
+        let conv_weight = self
+            .dense
+            .read_full_tensor_f32_cached(&conv_name)?
+            .context("missing linear_attn.conv1d tensor for GatedDeltaNet layer")?;
+        let a_log = self
+            .dense
+            .read_full_tensor_f32_cached(&a_log_name)?
+            .context("missing linear_attn.A_log tensor for GatedDeltaNet layer")?;
+        let dt_bias = self
+            .dense
+            .read_full_tensor_f32_cached(&dt_bias_name)?
+            .context("missing linear_attn.dt_bias tensor for GatedDeltaNet layer")?;
+        let norm_weight = self
+            .model_norm_weight(&norm_name, layout.value_dim)?
+            .map(Arc::new);
+        if conv_weight.len() != layout.conv_dim * layout.conv_kernel_size {
+            bail!(
+                "linear_attn.conv1d tensor for layer {layer} has {} values; expected {}",
+                conv_weight.len(),
+                layout.conv_dim * layout.conv_kernel_size
+            );
+        }
+        if a_log.len() != layout.num_value_heads || dt_bias.len() != layout.num_value_heads {
+            bail!(
+                "linear-attention scalar tensors for layer {layer} do not match value heads {}: A_log {}, dt_bias {}",
+                layout.num_value_heads,
+                a_log.len(),
+                dt_bias.len()
+            );
+        }
+        let weights = Arc::new(LinearAttentionStaticWeights {
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            layout,
+        });
+        let mut cache = self
+            .linear_attention_cache
+            .lock()
+            .expect("linear attention cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            if existing.layout != layout {
+                bail!("cached linear-attention weights for layer {layer} changed while loading");
+            }
+            Ok(existing)
+        } else {
+            cache.insert(layer, weights.clone());
+            Ok(weights)
+        }
+    }
+
+    fn shared_expert_contribution(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let Some(shared) = self.shared_expert_phase_weights(layer, width)? else {
+            return Ok(vec![0.0f32; width]);
+        };
+        let residual = vec![0.0f32; width];
+        let experts: &[ExpertWeights] = &[];
+        Ok(
+            compute_expert_phase_cpu(experts, &[], normed, &residual, Some(shared.as_ref()), None)?
+                .hidden,
+        )
+    }
+
+    fn shared_expert_phase_weights(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<Arc<SharedExpertPhaseWeights>>> {
+        let num_shared = self.config.shared_experts();
+        let shared_inter = self.config.shared_expert_intermediate_size();
+        if num_shared == 0 || shared_inter == 0 {
+            return Ok(None);
+        }
+        {
+            let cache = self
+                .shared_expert_cache
+                .lock()
+                .expect("shared expert cache poisoned");
+            if let Some(shared) = cache.get(&layer).cloned() {
+                if shared.width != width {
+                    bail!(
+                        "cached shared expert tensors for layer {layer} have width {}, requested {width}",
+                        shared.width
+                    );
+                }
+                return Ok(Some(shared));
+            }
+        }
+        let shared = Arc::new(self.load_shared_expert_phase_weights(layer, width)?);
+        let mut cache = self
+            .shared_expert_cache
+            .lock()
+            .expect("shared expert cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            if existing.width != width {
+                bail!(
+                    "cached shared expert tensors for layer {layer} have width {}, requested {width}",
+                    existing.width
+                );
+            }
+            Ok(Some(existing))
+        } else {
+            cache.insert(layer, shared.clone());
+            Ok(Some(shared))
+        }
+    }
+
+    fn load_shared_expert_phase_weights(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<SharedExpertPhaseWeights> {
+        let num_shared = self.config.shared_experts();
+        let shared_inter = self.config.shared_expert_intermediate_size();
+        let total_intermediate = num_shared
+            .checked_mul(shared_inter)
+            .context("shared expert intermediate width overflow")?;
+        let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+        let up_name = shared_expert_tensor_name(layer, "up_proj");
+        let down_name = shared_expert_tensor_name(layer, "down_proj");
+        let shared_gate_name = shared_expert_gate_tensor_name(layer);
+        let gate = self
+            .dense
+            .read_full_tensor_f32_cached(&gate_name)?
+            .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
+        let up = self
+            .dense
+            .read_full_tensor_f32_cached(&up_name)?
+            .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
+        let down = self
+            .dense
+            .read_full_tensor_f32_cached(&down_name)?
+            .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
+        let router = self
+            .dense
+            .read_full_tensor_f32_cached(&shared_gate_name)?
+            .with_context(|| {
+                format!("missing configured shared expert gate tensor {shared_gate_name}")
+            })?;
+        let expected_gate = total_intermediate
+            .checked_mul(width)
+            .context("shared expert gate/up tensor size overflow")?;
+        let expected_down = width
+            .checked_mul(total_intermediate)
+            .context("shared expert down tensor size overflow")?;
+        let expected_router = num_shared
+            .checked_mul(width)
+            .context("shared expert router tensor size overflow")?;
+        if gate.len() != expected_gate || up.len() != expected_gate || down.len() != expected_down {
+            bail!(
+                "shared expert tensors for layer {layer} do not match config: gate {}, up {}, down {}, expected gate/up {expected_gate}, down {expected_down}",
+                gate.len(),
+                up.len(),
+                down.len()
+            );
+        }
+        if router.len() != expected_router {
+            bail!(
+                "shared expert gate tensor for layer {layer} has {} values; expected {expected_router}",
+                router.len()
+            );
+        }
+        Ok(SharedExpertPhaseWeights {
+            gate,
+            up,
+            down,
+            router,
+            shared_experts: num_shared,
+            intermediate: shared_inter,
+            width,
+        })
+    }
+
+    pub fn read_active_experts(
+        &self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<ExpertWeights>> {
+        self.experts.read_many(layer, experts)
+    }
+
+    pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
+        self.scheduler.snapshot()
+    }
+
+    fn model_dimensions(&self) -> FlashMoeModelDimensions {
+        FlashMoeModelDimensions {
+            layers: self.config.num_hidden_layers,
+            hidden_size: self.config.hidden_size,
+            attention_heads: self.config.num_attention_heads,
+            kv_heads: self.config.kv_heads(),
+            vocab_size: self.config.vocab_size,
+            experts_per_layer: self.config.num_experts,
+            active_experts_per_token: Some(self.routing_policy.active_experts),
+            moe_intermediate_size: self
+                .config
+                .moe_intermediate_size
+                .or(self.config.intermediate_size),
+            shared_experts: nonzero_usize(self.config.shared_experts()),
+        }
+    }
+
+    fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
+        self.runtime.layer_kind(layer)
+    }
+
+    fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
+        let full_layout = self
+            .runtime
+            .full_attention
+            .get(layer)
+            .and_then(|layout| *layout);
+        let linear_layout = self
+            .runtime
+            .linear_attention
+            .get(layer)
+            .and_then(|layout| *layout);
+        FlashMoeLayerDimensions {
+            hidden_size: self.config.hidden_size,
+            q_width: full_layout
+                .map(|layout| layout.q_width)
+                .or_else(|| linear_layout.map(|layout| layout.total_key_width)),
+            kv_width: full_layout
+                .map(|layout| layout.kv_width)
+                .or_else(|| linear_layout.map(|layout| layout.total_value_width)),
+            head_dim: full_layout
+                .map(|layout| layout.head_dim)
+                .or_else(|| linear_layout.map(|layout| layout.key_dim)),
+            experts_per_layer: self.config.num_experts,
+            active_experts_per_token: self.config.num_experts_per_tok,
+            shared_experts: nonzero_usize(self.config.shared_experts()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DenseTransformerRuntime {
+    width: usize,
+    head_dim: usize,
+    /// Config-derived default K/V width. This remains useful for legacy Metal
+    /// allocation, but full-attention execution should use per-layer layouts.
+    kv_width: usize,
+    num_q_heads: usize,
+    kv_heads: usize,
+    full_attention: Vec<Option<FullAttentionLayout>>,
+    linear_attention: Vec<Option<LinearAttentionLayout>>,
+}
+
+impl DenseTransformerRuntime {
+    fn new(config: &QwenModelConfig) -> Self {
+        let head_dim = config.hidden_size / config.num_attention_heads.max(1);
+        let kv_heads = config.kv_heads();
+        Self {
+            width: config.hidden_size,
+            head_dim,
+            kv_width: kv_heads * head_dim,
+            num_q_heads: config.num_attention_heads,
+            kv_heads,
+            full_attention: vec![None; config.num_hidden_layers],
+            linear_attention: vec![None; config.num_hidden_layers],
+        }
+    }
+
+    fn from_registry(config: &QwenModelConfig, registry: &TensorRegistry) -> Result<Self> {
+        let mut runtime = Self::new(config);
+        for layer in 0..config.num_hidden_layers {
+            match infer_attention_layer_type(registry, layer)? {
+                AttentionLayerType::Full => {
+                    runtime.full_attention[layer] =
+                        Some(infer_full_attention_layout(config, registry, layer)?);
+                }
+                AttentionLayerType::Linear => {
+                    runtime.linear_attention[layer] =
+                        Some(infer_linear_attention_layout(config, registry, layer)?);
+                }
+            }
+        }
+
+        Ok(runtime)
+    }
+
+    fn full_attention_layout(&self, layer: usize) -> Result<FullAttentionLayout> {
+        self.full_attention
+            .get(layer)
+            .copied()
+            .flatten()
+            .with_context(|| format!("missing full-attention runtime layout for layer {layer}"))
+    }
+
+    fn linear_attention_layout(&self, layer: usize) -> Result<LinearAttentionLayout> {
+        self.linear_attention
+            .get(layer)
+            .copied()
+            .flatten()
+            .with_context(|| format!("missing linear-attention runtime layout for layer {layer}"))
+    }
+
+    fn is_linear_attention_layer(&self, layer: usize) -> bool {
+        self.linear_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+    }
+
+    fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
+        if self
+            .linear_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+        {
+            FlashMoeLayerKind::LinearAttention
+        } else if self
+            .full_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+        {
+            FlashMoeLayerKind::FullAttention
+        } else {
+            FlashMoeLayerKind::Unknown
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionLayerType {
+    Full,
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAttentionQLayout {
+    Standard,
+    Gated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotaryPairing {
+    Adjacent,
+    SplitHalf,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionLayout {
+    q_layout: FullAttentionQLayout,
+    q_projection_width: usize,
+    q_width: usize,
+    kv_width: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    num_q_heads: usize,
+    kv_heads: usize,
+    rotary_pairing: RotaryPairing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinearAttentionLayout {
+    num_value_heads: usize,
+    num_key_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    total_key_width: usize,
+    total_value_width: usize,
+    conv_dim: usize,
+    conv_kernel_size: usize,
+}
+
+impl LinearAttentionLayout {
+    fn conv_state_len(self) -> usize {
+        self.conv_kernel_size.saturating_sub(1) * self.conv_dim
+    }
+
+    fn ssm_state_len(self) -> usize {
+        self.num_value_heads * self.value_dim * self.key_dim
+    }
+
+    fn value_heads_per_key_head(self) -> usize {
+        (self.num_value_heads / self.num_key_heads).max(1)
+    }
+}
+
+fn infer_linear_attention_layout(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<LinearAttentionLayout> {
+    let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+    let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+    let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+    let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+    let conv_name = linear_attention_tensor_name(layer, "conv1d");
+    let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+    let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+    let norm_name = linear_attention_tensor_name(layer, "norm");
+    let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+
+    let (qkv_rows, qkv_cols) = require_2d_tensor_shape(registry, &qkv_name)?;
+    let (z_rows, z_cols) = require_2d_tensor_shape(registry, &z_name)?;
+    let (b_rows, b_cols) = require_2d_tensor_shape(registry, &b_name)?;
+    let (a_rows, a_cols) = require_2d_tensor_shape(registry, &a_name)?;
+    let (out_rows, out_cols) = require_2d_tensor_shape(registry, &out_proj_name)?;
+    let a_log_len = require_1d_tensor_shape(registry, &a_log_name)?;
+    let dt_bias_len = require_1d_tensor_shape(registry, &dt_bias_name)?;
+    let value_dim = require_1d_tensor_shape(registry, &norm_name)?;
+    let (conv_channels, conv_kernel_size) = require_conv1d_tensor_shape(registry, &conv_name)?;
+    if conv_kernel_size < 2 {
+        bail!(
+            "linear-attention layer {layer} conv1d kernel size {conv_kernel_size} must be at least 2"
+        );
+    }
+
+    if qkv_cols != config.hidden_size
+        || z_cols != config.hidden_size
+        || b_cols != config.hidden_size
+        || a_cols != config.hidden_size
+    {
+        bail!(
+            "linear-attention layer {layer} projection input widths are qkv={qkv_cols}, z={z_cols}, b={b_cols}, a={a_cols}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if out_rows != config.hidden_size {
+        bail!(
+            "linear-attention layer {layer} out_proj output rows {out_rows}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if z_rows != out_cols {
+        bail!(
+            "linear-attention layer {layer} z width {z_rows} does not match out_proj input width {out_cols}"
+        );
+    }
+    if value_dim == 0 || z_rows % value_dim != 0 {
+        bail!(
+            "linear-attention layer {layer} value width {z_rows} is not divisible by norm/value dim {value_dim}"
+        );
+    }
+    let num_value_heads = z_rows / value_dim;
+    if b_rows != num_value_heads
+        || a_rows != num_value_heads
+        || a_log_len != num_value_heads
+        || dt_bias_len != num_value_heads
+    {
+        bail!(
+            "linear-attention layer {layer} value head counts disagree: inferred={num_value_heads}, b={b_rows}, a={a_rows}, A_log={a_log_len}, dt_bias={dt_bias_len}"
+        );
+    }
+    if qkv_rows < z_rows {
+        bail!(
+            "linear-attention layer {layer} qkv width {qkv_rows} is smaller than value width {z_rows}"
+        );
+    }
+    let paired_key_width = qkv_rows - z_rows;
+    if paired_key_width % 2 != 0 {
+        bail!(
+            "linear-attention layer {layer} qkv non-value width {paired_key_width} cannot split evenly into Q and K"
+        );
+    }
+    let total_key_width = paired_key_width / 2;
+    let key_dim = infer_linear_attention_key_dim(config, total_key_width, z_rows, value_dim)
+        .with_context(|| {
+            format!(
+                "linear-attention layer {layer} cannot infer key dimension from key width {total_key_width}, value width {z_rows}, value dim {value_dim}"
+            )
+        })?;
+    let num_key_heads = total_key_width / key_dim;
+    if num_key_heads == 0 {
+        bail!("linear-attention layer {layer} inferred zero key heads");
+    }
+    if num_value_heads % num_key_heads != 0 {
+        bail!(
+            "linear-attention layer {layer} value heads {num_value_heads} must be divisible by key heads {num_key_heads}"
+        );
+    }
+    if conv_channels != qkv_rows {
+        bail!(
+            "linear-attention layer {layer} conv1d channels {conv_channels} do not match qkv width {qkv_rows}"
+        );
+    }
+
+    Ok(LinearAttentionLayout {
+        num_value_heads,
+        num_key_heads,
+        key_dim,
+        value_dim,
+        total_key_width,
+        total_value_width: z_rows,
+        conv_dim: qkv_rows,
+        conv_kernel_size,
+    })
+}
+
+fn infer_linear_attention_key_dim(
+    config: &QwenModelConfig,
+    total_key_width: usize,
+    total_value_width: usize,
+    value_dim: usize,
+) -> Result<usize> {
+    let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
+    if config_head_dim > 0 && total_key_width.is_multiple_of(config_head_dim) {
+        return Ok(config_head_dim);
+    }
+    if is_known_qwen35_linear_attention_shape(total_key_width, total_value_width, value_dim) {
+        return Ok(LINEAR_KEY_DIM);
+    }
+    if total_key_width.is_multiple_of(value_dim) {
+        return Ok(value_dim);
+    }
+    bail!(
+        "key width is not divisible by config head_dim {config_head_dim} or manifest value_dim {value_dim}"
+    )
+}
+
+fn reorder_grouped_linear_qkv_projection(
+    qkv: &mut Vec<f32>,
+    layout: LinearAttentionLayout,
+) -> Result<()> {
+    if qkv.len() != layout.conv_dim {
+        bail!(
+            "linear-attention qkv projection produced {} values; expected {}",
+            qkv.len(),
+            layout.conv_dim
+        );
+    }
+    let value_heads_per_key = layout.value_heads_per_key_head();
+    let value_width_per_key = value_heads_per_key
+        .checked_mul(layout.value_dim)
+        .context("linear-attention grouped value width overflow")?;
+    let group_width = layout
+        .key_dim
+        .checked_mul(2)
+        .and_then(|width| width.checked_add(value_width_per_key))
+        .context("linear-attention grouped qkv width overflow")?;
+    if group_width
+        .checked_mul(layout.num_key_heads)
+        .context("linear-attention grouped qkv total width overflow")?
+        != layout.conv_dim
+    {
+        bail!(
+            "linear-attention grouped qkv width {group_width} * heads {} does not match conv width {}",
+            layout.num_key_heads,
+            layout.conv_dim
+        );
+    }
+
+    let mut reordered = vec![0.0f32; qkv.len()];
+    for head in 0..layout.num_key_heads {
+        let src = head * group_width;
+        let src_q = src;
+        let src_k = src_q + layout.key_dim;
+        let src_v = src_k + layout.key_dim;
+
+        let dst_q = head * layout.key_dim;
+        let dst_k = layout.total_key_width + head * layout.key_dim;
+        let dst_v = 2 * layout.total_key_width + head * value_width_per_key;
+
+        reordered[dst_q..dst_q + layout.key_dim]
+            .copy_from_slice(&qkv[src_q..src_q + layout.key_dim]);
+        reordered[dst_k..dst_k + layout.key_dim]
+            .copy_from_slice(&qkv[src_k..src_k + layout.key_dim]);
+        reordered[dst_v..dst_v + value_width_per_key]
+            .copy_from_slice(&qkv[src_v..src_v + value_width_per_key]);
+    }
+    *qkv = reordered;
+    Ok(())
+}
+
+fn normalize_linear_attention_qk_in_place(
+    layout: LinearAttentionLayout,
+    lin_q: &mut [f32],
+    lin_k: &mut [f32],
+) -> Result<()> {
+    if lin_q.len() < layout.total_key_width || lin_k.len() < layout.total_key_width {
+        bail!(
+            "linear-attention q/k widths are q={}, k={}, expected at least {}",
+            lin_q.len(),
+            lin_k.len(),
+            layout.total_key_width
+        );
+    }
+    let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+    for head in 0..layout.num_key_heads {
+        let start = head * layout.key_dim;
+        let end = start + layout.key_dim;
+        l2_norm_in_place(&mut lin_q[start..end]);
+        for value in &mut lin_q[start..end] {
+            *value *= inv_scale;
+        }
+        l2_norm_in_place(&mut lin_k[start..end]);
+    }
+    Ok(())
+}
+
+fn is_known_qwen35_linear_attention_shape(
+    total_key_width: usize,
+    total_value_width: usize,
+    value_dim: usize,
+) -> bool {
+    total_key_width == LINEAR_TOTAL_KEY
+        && total_value_width == LINEAR_TOTAL_VALUE
+        && value_dim == LINEAR_VALUE_DIM
+}
+
+fn infer_full_attention_layout(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<FullAttentionLayout> {
+    let q_name = attention_tensor_name(layer, "q_proj");
+    let k_name = attention_tensor_name(layer, "k_proj");
+    let v_name = attention_tensor_name(layer, "v_proj");
+    let o_name = attention_tensor_name(layer, "o_proj");
+
+    let (q_rows, q_cols) = require_2d_tensor_shape(registry, &q_name)?;
+    let (k_rows, k_cols) = require_2d_tensor_shape(registry, &k_name)?;
+    let (v_rows, v_cols) = require_2d_tensor_shape(registry, &v_name)?;
+    let (o_rows, o_cols) = require_2d_tensor_shape(registry, &o_name)?;
+
+    let num_q_heads = config.num_attention_heads;
+    let kv_heads = config.kv_heads();
+
+    if q_cols != config.hidden_size || k_cols != config.hidden_size || v_cols != config.hidden_size
+    {
+        bail!(
+            "full-attention layer {layer} projection input widths are q={q_cols}, k={k_cols}, v={v_cols}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if o_rows != config.hidden_size {
+        bail!(
+            "full-attention layer {layer} o_proj output rows {o_rows}; expected hidden_size {}",
+            config.hidden_size
+        );
+    }
+    if k_rows != v_rows {
+        bail!(
+            "full-attention layer {layer} k_proj rows {k_rows} do not match v_proj rows {v_rows}"
+        );
+    }
+    if k_rows == 0 || k_rows % kv_heads != 0 {
+        bail!(
+            "full-attention layer {layer} k/v width {k_rows} is not divisible by kv_heads {kv_heads}"
+        );
+    }
+
+    let head_dim = k_rows / kv_heads;
+    let q_width = num_q_heads
+        .checked_mul(head_dim)
+        .context("full-attention q_width overflow")?;
+    let gated_q_width = q_width
+        .checked_mul(2)
+        .context("gated full-attention q_width overflow")?;
+
+    if q_rows == q_width && o_cols == q_width {
+        return Ok(FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: q_width,
+            q_width,
+            kv_width: k_rows,
+            head_dim,
+            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Standard),
+            num_q_heads,
+            kv_heads,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        });
+    }
+
+    if q_rows == gated_q_width && o_cols == q_width {
+        return Ok(FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Gated,
+            q_projection_width: gated_q_width,
+            q_width,
+            kv_width: k_rows,
+            head_dim,
+            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Gated),
+            num_q_heads,
+            kv_heads,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        });
+    }
+
+    bail!(
+        "unsupported full-attention layer {layer} layout: q_proj rows={q_rows}, k/v rows={k_rows}, o_proj shape=[{o_rows},{o_cols}], num_q_heads={num_q_heads}, kv_heads={kv_heads}, inferred head_dim={head_dim}; expected standard q_rows={q_width}, o_cols={q_width}, or gated q_rows={gated_q_width}, o_cols={q_width}"
+    )
+}
+
+fn rotary_dim_for(
+    config: &QwenModelConfig,
+    head_dim: usize,
+    q_layout: FullAttentionQLayout,
+) -> usize {
+    let factor = config.partial_rotary_factor.unwrap_or_else(|| {
+        if q_layout == FullAttentionQLayout::Gated {
+            0.25
+        } else {
+            1.0
+        }
+    });
+
+    let mut rotary_dim = ((head_dim as f64) * factor).round() as usize;
+    rotary_dim = rotary_dim.clamp(2, head_dim);
+    rotary_dim - (rotary_dim % 2)
+}
+
+fn require_2d_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+) -> Result<(usize, usize)> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [rows, cols] if *rows > 0 && *cols > 0 => Ok((*rows, *cols)),
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 2-D matrix",
+            shape
+        ),
+    }
+}
+
+fn split_q_projection(
+    projected: Vec<f32>,
+    layout: FullAttentionLayout,
+) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+    match layout.q_layout {
+        FullAttentionQLayout::Standard => {
+            if projected.len() != layout.q_width {
+                bail!(
+                    "standard q_proj produced {} values; expected {}",
+                    projected.len(),
+                    layout.q_width
+                );
+            }
+            Ok((projected, None))
+        }
+        FullAttentionQLayout::Gated => {
+            if projected.len() != layout.q_projection_width {
+                bail!(
+                    "gated q_proj produced {} values; expected {}",
+                    projected.len(),
+                    layout.q_projection_width
+                );
+            }
+
+            let mut q = vec![0.0f32; layout.q_width];
+            let mut gate = vec![0.0f32; layout.q_width];
+
+            for head in 0..layout.num_q_heads {
+                let src = head * 2 * layout.head_dim;
+                let dst = head * layout.head_dim;
+
+                q[dst..dst + layout.head_dim]
+                    .copy_from_slice(&projected[src..src + layout.head_dim]);
+                gate[dst..dst + layout.head_dim]
+                    .copy_from_slice(&projected[src + layout.head_dim..src + 2 * layout.head_dim]);
+            }
+
+            Ok((q, Some(gate)))
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn rms_norm_in_place(values: &mut [f32]) {
+    rms_norm_with_weight_in_place(values, None)
+}
+
+fn qwen3next_norm_uses_offset(config: &QwenModelConfig, canonical_name: &str) -> bool {
+    config.uses_qwen3next_norm_offsets()
+        && (canonical_name == "model.norm.weight"
+            || canonical_name.contains(".input_layernorm.weight")
+            || canonical_name.contains(".post_attention_layernorm.weight")
+            || canonical_name.contains(".self_attn.q_norm.weight")
+            || canonical_name.contains(".self_attn.k_norm.weight"))
+}
+
+fn l2_norm_in_place(values: &mut [f32]) {
+    let sum_square = values.iter().map(|value| value * value).sum::<f32>();
+    let scale = (sum_square + 1e-6).sqrt().recip();
+    for value in values {
+        *value *= scale;
+    }
+}
+
+fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
+    let mean_square =
+        values.iter().map(|value| value * value).sum::<f32>() / values.len().max(1) as f32;
+    let scale = (mean_square + 1e-6).sqrt().recip();
+    for (idx, value) in values.iter_mut().enumerate() {
+        *value *= scale;
+        if let Some(weight) = weight
+            && let Some(weight) = weight.get(idx)
+        {
+            *value *= *weight;
+        }
+    }
+}
+
+fn apply_rotary(values: &mut [f32], position: usize, head_dim: usize, theta: f64) {
+    apply_rotary_split_half(values, position, head_dim, head_dim, theta);
+}
+
+fn apply_per_head_rms_norm(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    weight: Option<&[f32]>,
+) -> Result<()> {
+    if values.len() != heads.saturating_mul(head_dim) {
+        bail!(
+            "per-head RMSNorm got {} values; expected heads {heads} * head_dim {head_dim}",
+            values.len()
+        );
+    }
+    if let Some(weight) = weight
+        && weight.len() < head_dim
+    {
+        bail!(
+            "per-head RMSNorm weight has len {}; expected at least head_dim {head_dim}",
+            weight.len()
+        );
+    }
+    for head in values.chunks_mut(head_dim) {
+        rms_norm_with_weight_in_place(head, weight.map(|w| &w[..head_dim]));
+    }
+    Ok(())
+}
+
+fn apply_optional_per_head_rms_norm(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    weight: Option<&[f32]>,
+) -> Result<()> {
+    if let Some(weight) = weight {
+        apply_per_head_rms_norm(values, heads, head_dim, Some(weight))?;
+    }
+    Ok(())
+}
+
+fn apply_full_attention_qk_norm_and_rotary(
+    q: &mut [f32],
+    k: &mut [f32],
+    layout: FullAttentionLayout,
+    position: MropePosition,
+    theta: f64,
+    mrope_section: Option<[usize; 3]>,
+    q_weight: Option<&[f32]>,
+    k_weight: Option<&[f32]>,
+) -> Result<()> {
+    if layout.rotary_pairing == RotaryPairing::SplitHalf {
+        apply_optional_per_head_rms_norm_and_split_half_rope(
+            q,
+            layout.num_q_heads,
+            layout.head_dim,
+            q_weight,
+            position,
+            layout.rotary_dim,
+            theta,
+            mrope_section,
+        )?;
+        apply_optional_per_head_rms_norm_and_split_half_rope(
+            k,
+            layout.kv_heads,
+            layout.head_dim,
+            k_weight,
+            position,
+            layout.rotary_dim,
+            theta,
+            mrope_section,
+        )?;
+        return Ok(());
+    }
+
+    apply_optional_per_head_rms_norm(q, layout.num_q_heads, layout.head_dim, q_weight)?;
+    apply_optional_per_head_rms_norm(k, layout.kv_heads, layout.head_dim, k_weight)?;
+    apply_rotary_for_layout(q, k, position, theta, layout, mrope_section);
+    Ok(())
+}
+
+fn apply_optional_per_head_rms_norm_and_split_half_rope(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    weight: Option<&[f32]>,
+    position: MropePosition,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: Option<[usize; 3]>,
+) -> Result<()> {
+    if values.len() != heads.saturating_mul(head_dim) {
+        bail!(
+            "per-head RMSNorm/RoPE got {} values; expected heads {heads} * head_dim {head_dim}",
+            values.len()
+        );
+    }
+    if let Some(weight) = weight
+        && weight.len() < head_dim
+    {
+        bail!(
+            "per-head RMSNorm/RoPE weight has len {}; expected at least head_dim {head_dim}",
+            weight.len()
+        );
+    }
+    let rotations = split_half_rope_rotations(position, head_dim, rotary_dim, theta, mrope_section);
+    let rotary_dim = rotations.len().saturating_mul(2);
+    let half = rotations.len();
+    for head in values.chunks_mut(head_dim) {
+        let norm_scale = weight.map(|_| {
+            let mean_square =
+                head.iter().map(|value| value * value).sum::<f32>() / head.len().max(1) as f32;
+            (mean_square + 1e-6).sqrt().recip()
+        });
+        if let (Some(scale), Some(weight)) = (norm_scale, weight) {
+            for (idx, value) in head.iter_mut().enumerate() {
+                *value *= scale * weight[idx];
+            }
+        }
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for (idx, (sin, cos)) in rotations.iter().copied().enumerate() {
+            let x0 = head[idx];
+            let x1 = head[idx + half];
+            head[idx] = x0 * cos - x1 * sin;
+            head[idx + half] = x0 * sin + x1 * cos;
+        }
+    }
+    Ok(())
+}
+
+fn split_half_rope_rotations(
+    position: MropePosition,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: Option<[usize; 3]>,
+) -> Vec<(f32, f32)> {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+    let half = rotary_dim / 2;
+    (0..half)
+        .map(|idx| {
+            let axis_position = if let Some(section) = mrope_section {
+                position.axis(mrope_axis_for_frequency(idx, section))
+            } else {
+                position.temporal
+            };
+            let inv_freq = theta.powf(-((2 * idx) as f32) / rotary_dim.max(1) as f32);
+            let angle = (axis_position as f32) * inv_freq;
+            angle.sin_cos()
+        })
+        .collect()
+}
+
+fn apply_rotary_for_layout(
+    q: &mut [f32],
+    k: &mut [f32],
+    position: MropePosition,
+    theta: f64,
+    layout: FullAttentionLayout,
+    mrope_section: Option<[usize; 3]>,
+) {
+    match layout.rotary_pairing {
+        RotaryPairing::Adjacent => {
+            if let Some(section) = mrope_section {
+                apply_rotary_adjacent_mrope(
+                    q,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+                apply_rotary_adjacent_mrope(
+                    k,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+            } else {
+                apply_rotary_adjacent(
+                    q,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+                apply_rotary_adjacent(
+                    k,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+            }
+        }
+        RotaryPairing::SplitHalf => {
+            if let Some(section) = mrope_section {
+                apply_rotary_split_half_mrope(
+                    q,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+                apply_rotary_split_half_mrope(
+                    k,
+                    position,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                    section,
+                );
+            } else {
+                apply_rotary_split_half(
+                    q,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+                apply_rotary_split_half(
+                    k,
+                    position.temporal,
+                    layout.head_dim,
+                    layout.rotary_dim,
+                    theta,
+                );
+            }
+        }
+    }
+}
+
+fn apply_rotary_for_layout_with_metal(
+    metal: Option<&MetalExecutor>,
+    q: &mut [f32],
+    k: &mut [f32],
+    position: MropePosition,
+    theta: f64,
+    layout: FullAttentionLayout,
+    mrope_section: Option<[usize; 3]>,
+) {
+    if let Some(metal) = metal {
+        match (
+            metal.apply_rope_for_layout(q, position, theta, layout, mrope_section),
+            metal.apply_rope_for_layout(k, position, theta, layout, mrope_section),
+        ) {
+            (Ok(Some(q_rotated)), Ok(Some(k_rotated))) => {
+                q.copy_from_slice(&q_rotated);
+                k.copy_from_slice(&k_rotated);
+                return;
+            }
+            (Ok(None), _) | (_, Ok(None)) => {}
+            (Err(err), _) | (_, Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "falling back to CPU RoPE for full-attention layout"
+                );
+            }
+        }
+    }
+
+    apply_rotary_for_layout(q, k, position, theta, layout, mrope_section);
+}
+
+fn attention_close(cpu: &[f32], gpu: &[f32]) -> bool {
+    cpu.len() == gpu.len()
+        && cpu.iter().zip(gpu.iter()).all(|(left, right)| {
+            let diff = (left - right).abs();
+            diff <= 1e-3 || diff <= 1e-3 * left.abs().max(right.abs()).max(1.0)
+        })
+}
+
+fn apply_rotary_adjacent(
+    values: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+
+    for head in values.chunks_mut(head_dim) {
+        let rotary_dims = rotary_dim.min(head.len()) - (rotary_dim.min(head.len()) % 2);
+        for pair_idx in (0..rotary_dims).step_by(2) {
+            let inv_freq = theta.powf(-(pair_idx as f32) / head_dim as f32);
+            let angle = (position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x = head[pair_idx];
+            let y = head[pair_idx + 1];
+            head[pair_idx] = x * cos - y * sin;
+            head[pair_idx + 1] = x * sin + y * cos;
+        }
+    }
+}
+
+fn apply_rotary_adjacent_mrope(
+    values: &mut [f32],
+    position: MropePosition,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: [usize; 3],
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+
+    for head in values.chunks_mut(head_dim) {
+        let rotary_dims = rotary_dim.min(head.len()) - (rotary_dim.min(head.len()) % 2);
+        for pair_idx in (0..rotary_dims).step_by(2) {
+            let freq_idx = pair_idx / 2;
+            let axis = mrope_axis_for_frequency(freq_idx, mrope_section);
+            let inv_freq = theta.powf(-(pair_idx as f32) / head_dim as f32);
+            let angle = (position.axis(axis) as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x = head[pair_idx];
+            let y = head[pair_idx + 1];
+            head[pair_idx] = x * cos - y * sin;
+            head[pair_idx + 1] = x * sin + y * cos;
+        }
+    }
+}
+
+fn apply_rotary_split_half(
+    values: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+    let half = rotary_dim / 2;
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let inv_freq = theta.powf(-((2 * i) as f32) / rotary_dim as f32);
+            let angle = (position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn apply_rotary_split_half_mrope(
+    values: &mut [f32],
+    position: MropePosition,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f64,
+    mrope_section: [usize; 3],
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = rotary_dim.min(head_dim) - (rotary_dim.min(head_dim) % 2);
+    let half = rotary_dim / 2;
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let axis = mrope_axis_for_frequency(i, mrope_section);
+            let inv_freq = theta.powf(-((2 * i) as f32) / rotary_dim as f32);
+            let angle = (position.axis(axis) as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn apply_vision_spatial_rotary(
+    values: &mut [f32],
+    row: usize,
+    col: usize,
+    head_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = head_dim - (head_dim % 2);
+    let half = rotary_dim / 2;
+    let spatial_half = half / 2;
+    if spatial_half == 0 {
+        return;
+    }
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let (axis_position, axis_idx) = if i < spatial_half {
+                (row, i)
+            } else {
+                (col, i - spatial_half)
+            };
+            let inv_freq = theta.powf(-((2 * axis_idx) as f32) / half as f32);
+            let angle = (axis_position as f32) * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+fn mrope_axis_for_frequency(index: usize, section: [usize; 3]) -> MropeAxis {
+    if index % 3 == 1 && index < section[1].saturating_mul(3) {
+        MropeAxis::Height
+    } else if index % 3 == 2 && index < section[2].saturating_mul(3) {
+        MropeAxis::Width
+    } else {
+        MropeAxis::Temporal
+    }
+}
+
+fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+#[allow(dead_code)]
+fn metal_kv_cache_bytes(layers: usize, max_context: usize, width: usize) -> usize {
+    layers
+        .saturating_mul(max_context)
+        .saturating_mul(width)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn metal_kv_layer_widths(layouts: &[Option<FullAttentionLayout>]) -> Vec<usize> {
+    layouts
+        .iter()
+        .map(|layout| layout.map(|layout| layout.kv_width).unwrap_or(0))
+        .collect()
+}
+
+fn metal_kv_cache_bytes_for_widths(widths: &[usize], max_context: usize) -> usize {
+    widths
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(max_context)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+#[allow(dead_code)]
+fn metal_kv_max_context(config: &QwenModelConfig, width: usize, total_ram_bytes: usize) -> usize {
+    let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
+    let bytes_per_token = config
+        .num_hidden_layers
+        .saturating_mul(width)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .max(1);
+    let budget = (total_ram_bytes / 4).max(256 * 1024 * 1024);
+    requested.min((budget / bytes_per_token).max(1))
+}
+
+fn metal_kv_max_context_for_layouts(
+    config: &QwenModelConfig,
+    layouts: &[Option<FullAttentionLayout>],
+    total_ram_bytes: usize,
+) -> usize {
+    let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
+    let bytes_per_token = metal_kv_layer_widths(layouts)
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .max(1);
+    let budget = (total_ram_bytes / 4).max(256 * 1024 * 1024);
+    requested.min((budget / bytes_per_token).max(1))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn allocate_metal_kv_cache(
+    device: ObjcId,
+    max_context: usize,
+    widths: &[usize],
+) -> Result<MetalKvCacheInner> {
+    let bytes = metal_kv_cache_bytes_for_widths(widths, max_context);
+    unsafe {
+        let keys = msg_send_id2_usize_u64(
+            device,
+            sel("newBufferWithLength:options:"),
+            bytes.max(std::mem::size_of::<f32>()),
+            0,
+        );
+        if keys.is_null() {
+            bail!("failed to allocate Flash-MoE Metal KV key buffer ({bytes} bytes)");
+        }
+        let values = msg_send_id2_usize_u64(
+            device,
+            sel("newBufferWithLength:options:"),
+            bytes.max(std::mem::size_of::<f32>()),
+            0,
+        );
+        if values.is_null() {
+            release(keys);
+            bail!("failed to allocate Flash-MoE Metal KV value buffer ({bytes} bytes)");
+        }
+        let mut offset = 0usize;
+        let mut layers = Vec::with_capacity(widths.len());
+        for width in widths.iter().copied() {
+            layers.push(MetalKvLayer { offset, width });
+            offset = offset
+                .checked_add(width.saturating_mul(max_context))
+                .context("Metal KV layer offset overflow")?;
+        }
+        Ok(MetalKvCacheInner {
+            keys,
+            values,
+            layers,
+            max_context,
+            total_items: offset,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalKvCacheInner {
+    fn layer(&self, layer: usize) -> Result<MetalKvLayer> {
+        let layer = self
+            .layers
+            .get(layer)
+            .copied()
+            .with_context(|| format!("Metal KV cache has no layer {layer}"))?;
+        if layer.width == 0 {
+            bail!("Metal KV cache layer is not a full-attention layer");
+        }
+        if layer
+            .offset
+            .saturating_add(layer.width.saturating_mul(self.max_context))
+            > self.total_items
+        {
+            bail!("Metal KV cache layer range exceeds allocation");
+        }
+        Ok(layer)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn system_memory_bytes() -> Option<usize> {
+    unsafe {
+        let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        (pages > 0 && page_size > 0).then(|| pages as usize * page_size as usize)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_lm_head_buffer_budget_bytes() -> usize {
+    const MIN: usize = 512 * 1024 * 1024;
+    const MAX: usize = 4 * 1024 * 1024 * 1024;
+    system_memory_bytes()
+        .map(|bytes| (bytes / 8).clamp(MIN, MAX))
+        .unwrap_or(MIN)
+}
+
+fn causal_attention(
+    q: &[f32],
+    keys_values: &[(&[f32], &[f32])],
+    num_q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    if keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
+        return vec![0.0; q.len()];
+    }
+    let q_width = num_q_heads * head_dim;
+    let groups_per_kv = num_q_heads / kv_heads.max(1);
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut out = vec![0.0f32; q_width];
+    for qh in 0..num_q_heads {
+        let kv_head = qh / groups_per_kv.max(1);
+        let q_slice = &q[qh * head_dim..(qh + 1) * head_dim];
+        // score this Q head against every token's corresponding K head
+        let mut scores: Vec<f32> = keys_values
+            .iter()
+            .map(|(k, _)| {
+                let k_slice = &k[kv_head * head_dim..(kv_head + 1) * head_dim];
+                q_slice.iter().zip(k_slice).map(|(a, b)| a * b).sum::<f32>() * scale
+            })
+            .collect();
+        softmax_in_place(&mut scores);
+        // weighted sum of corresponding V head
+        let out_slice = &mut out[qh * head_dim..(qh + 1) * head_dim];
+        for (weight, (_, value)) in scores.into_iter().zip(keys_values.iter()) {
+            let v_slice = &value[kv_head * head_dim..(kv_head + 1) * head_dim];
+            for (o, v) in out_slice.iter_mut().zip(v_slice) {
+                *o += weight * v;
+            }
+        }
+    }
+    out
+}
+
+fn cpu_dense_matvec(weights: &[f32], input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let used_cols = cols.min(input.len());
+    let mut out = vec![0.0f32; rows];
+    for (row, slot) in out.iter_mut().enumerate() {
+        let start = row.saturating_mul(cols);
+        let end = start.saturating_add(used_cols).min(weights.len());
+        let acc = weights
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .zip(input.iter().take(used_cols))
+            .map(|(weight, value)| weight * value)
+            .sum::<f32>();
+        *slot = acc;
+    }
+    out
+}
+
+fn add_in_place(target: &mut [f32], update: &[f32]) {
+    for (target, update) in target.iter_mut().zip(update) {
+        *target += *update;
+    }
+}
+
+fn add_scaled_in_place(target: &mut [f32], update: &[f32], scale: f32) {
+    for (target, update) in target.iter_mut().zip(update) {
+        *target += *update * scale;
+    }
+}
+
+fn nonzero_usize(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
+fn trace_sampling_candidates(
+    tokenizer: &QwenTokenizer,
+    prompt_len: usize,
+    generated: &[u32],
+    candidates: &[(usize, f32)],
+) {
+    let _ = (tokenizer, prompt_len, generated, candidates);
+}
+
+fn trace_layer_values(position: usize, layer: usize, stage: &str, values: &[f32]) {
+    let _ = (position, layer, stage, values);
+}
+
+fn vector_rms_max_finite(values: &[f32]) -> (f32, f32, bool) {
+    if values.is_empty() {
+        return (0.0, 0.0, true);
+    }
+    let mut sum_square = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut finite = true;
+    for value in values {
+        finite &= value.is_finite();
+        sum_square += (*value as f64) * (*value as f64);
+        max_abs = max_abs.max(value.abs());
+    }
+    let rms = (sum_square / values.len() as f64).sqrt() as f32;
+    (rms, max_abs, finite)
+}
+
+fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
+    experts: &[E],
+    weights: &[f32],
+    normed: &[f32],
+    residual: &[f32],
+    shared: Option<&SharedExpertPhaseWeights>,
+    next_norm_weight: Option<&[f32]>,
+) -> Result<ExpertPhaseOutput> {
+    let width = residual.len();
+    if weights.len() != experts.len() {
+        bail!(
+            "expert phase got {} expert weights for {} active experts",
+            weights.len(),
+            experts.len()
+        );
+    }
+    if normed.len() < width {
+        bail!(
+            "expert phase normalized input has len {}; expected at least {width}",
+            normed.len()
+        );
+    }
+    let mut moe = vec![0.0f32; width];
+    if let Some(shared) = shared {
+        let total_intermediate = shared
+            .shared_experts
+            .checked_mul(shared.intermediate)
+            .context("shared expert intermediate width overflow")?;
+        if shared.width != width
+            || shared.gate.len() != total_intermediate * width
+            || shared.up.len() != total_intermediate * width
+            || shared.down.len() != width * total_intermediate
+            || shared.router.len() != shared.shared_experts * width
+        {
+            bail!("shared expert tensors do not match the deferred expert phase dimensions");
+        }
+        let gate = cpu_dense_matvec(shared.gate.as_slice(), normed, total_intermediate, width);
+        let up = cpu_dense_matvec(shared.up.as_slice(), normed, total_intermediate, width);
+        let router = cpu_dense_matvec(
+            shared.router.as_slice(),
+            normed,
+            shared.shared_experts,
+            width,
+        );
+        let mut activated = vec![0.0f32; total_intermediate];
+        for idx in 0..total_intermediate {
+            let shared_idx = idx / shared.intermediate.max(1);
+            let shared_weight = sigmoid(router.get(shared_idx).copied().unwrap_or(0.0));
+            activated[idx] = silu(gate[idx]) * up[idx] * shared_weight;
+        }
+        let shared_out = cpu_dense_matvec(
+            shared.down.as_slice(),
+            &activated,
+            width,
+            total_intermediate,
+        );
+        add_in_place(&mut moe, &shared_out);
+    }
+    for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
+        let contribution = expert.as_ref().mlp(normed, width)?;
+        add_scaled_in_place(&mut moe, &contribution, weight);
+    }
+    let mut hidden = residual.to_vec();
+    add_in_place(&mut hidden, &moe);
+    let next_normed = next_norm_weight.map(|weight| {
+        let mut normed = hidden.clone();
+        rms_norm_with_weight_in_place(&mut normed, Some(weight));
+        normed
+    });
+    Ok(ExpertPhaseOutput {
+        hidden,
+        next_normed,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct QwenTokenizer {
+    tokenizer: Tokenizer,
+    config: QwenTokenizerConfig,
+    eos_tokens: BTreeSet<u32>,
+    primary_eos_token: u32,
+    id_to_token: Vec<String>,
+    token_to_id: BTreeMap<String, u32>,
+    merge_ranks: BTreeMap<(String, String), usize>,
+    unk_token: Option<String>,
+    model_kind: TokenizerModelKind,
+    special_tokens: Vec<(String, u32)>,
+    chat_template: Option<TokenizerChatTemplate>,
+    eos_token: u32,
+    im_start: Option<u32>,
+    im_end: Option<u32>,
+    vocab_size: usize,
+    #[cfg(test)]
+    candidate_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerModelKind {
+    Bpe,
+    WordLevel,
+    Other,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QwenTokenizerConfig {
+    bos_token: Option<String>,
+    eos_tokens: Vec<String>,
+    pad_token: Option<String>,
+    add_bos_token: bool,
+    added_tokens_decoder: BTreeMap<u32, TokenizerConfigAddedToken>,
+    additional_special_tokens: Vec<String>,
+    split_special_tokens: bool,
+    model_max_length: Option<u64>,
+    chat_template: Option<TokenizerChatTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenizerConfigAddedToken {
+    content: String,
+    special: bool,
+}
+
+impl QwenTokenizer {
+    fn from_file(path: &Path) -> Result<Self> {
+        let config_path = path.with_file_name("tokenizer_config.json");
+        if config_path.is_file() {
+            return Self::from_files(path, &config_path);
+        }
+        #[cfg(test)]
+        {
+            let tokenizer = Tokenizer::from_file(path)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .with_context(|| format!("failed to load tokenizer {}", path.display()))?;
+            let bytes = fs::read(path)
+                .with_context(|| format!("failed to read tokenizer {}", path.display()))?;
+            return Self::from_json_bytes_with_tokenizer(
+                &bytes,
+                tokenizer,
+                test_default_tokenizer_config_json(),
+            )
+            .with_context(|| format!("failed to parse tokenizer {}", path.display()));
+        }
+        #[cfg(not(test))]
+        Self::from_files(path, &config_path)
+    }
+
+    fn from_files(tokenizer_path: &Path, config_path: &Path) -> Result<Self> {
+        if !config_path.is_file() {
+            bail!(
+                "Flash-MoE tokenizer config is required for chat generation: missing {}",
+                config_path.display()
+            );
+        }
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+        let bytes = fs::read(tokenizer_path)
+            .with_context(|| format!("failed to read tokenizer {}", tokenizer_path.display()))?;
+        let config_bytes = fs::read(config_path).with_context(|| {
+            format!("failed to read tokenizer config {}", config_path.display())
+        })?;
+        Self::from_json_bytes_with_tokenizer(&bytes, tokenizer, &config_bytes).with_context(|| {
+            format!(
+                "failed to load Flash-MoE tokenizer metadata from {} and {}",
+                tokenizer_path.display(),
+                config_path.display()
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_json_bytes_with_config(bytes, Some(test_default_tokenizer_config_json()))
+    }
+
+    #[cfg(test)]
+    fn from_json_bytes_with_config(bytes: &[u8], config_bytes: Option<&[u8]>) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(bytes)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("tokenizer JSON is invalid")?;
+        let config_bytes = config_bytes.context("test tokenizer config is required")?;
+        Self::from_json_bytes_with_tokenizer(bytes, tokenizer, config_bytes)
+    }
+
+    fn from_json_bytes_with_tokenizer(
+        bytes: &[u8],
+        tokenizer: Tokenizer,
+        config_bytes: &[u8],
+    ) -> Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).context("tokenizer JSON is invalid")?;
+        let config = QwenTokenizerConfig::from_bytes(config_bytes)?;
+        if config.split_special_tokens {
+            bail!(
+                "tokenizer_config.json sets split_special_tokens=true, which is unsupported for Flash-MoE because generation stop tokens must remain atomic"
+            );
+        }
+        let chat_template = config.chat_template.clone();
+        let model_kind = match value
+            .pointer("/model/type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "bpe" => TokenizerModelKind::Bpe,
+            "wordlevel" => TokenizerModelKind::WordLevel,
+            _ => TokenizerModelKind::Other,
+        };
+        let mut token_to_id = BTreeMap::new();
+        if let Some(vocab) = value
+            .pointer("/model/vocab")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (token, id) in vocab {
+                if let Some(id) = id.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                    token_to_id.insert(token.clone(), id);
+                }
+            }
+        }
+        if token_to_id.is_empty() {
+            bail!("Qwen tokenizer JSON does not contain model.vocab");
+        }
+        let mut special_tokens = Vec::new();
+        if let Some(added) = value
+            .get("added_tokens")
+            .and_then(serde_json::Value::as_array)
+        {
+            for token in added {
+                let content = token.get("content").and_then(serde_json::Value::as_str);
+                let id = token
+                    .get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| u32::try_from(id).ok());
+                if let (Some(content), Some(id)) = (content, id) {
+                    token_to_id.insert(content.to_string(), id);
+                    if token
+                        .get("special")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        special_tokens.push((content.to_string(), id));
+                    }
+                }
+            }
+        }
+        special_tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        let merge_ranks = parse_tokenizer_merges(&value)?;
+        let unk_token = value
+            .pointer("/model/unk_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let mut eos_tokens = BTreeSet::new();
+        for token in &config.eos_tokens {
+            let id = tokenizer.token_to_id(token).with_context(|| {
+                format!(
+                    "tokenizer_config.json eos_token {token:?} is not present in tokenizer.json"
+                )
+            })?;
+            eos_tokens.insert(id);
+        }
+        let primary_eos_token = eos_tokens
+            .iter()
+            .next()
+            .copied()
+            .context("tokenizer_config.json must define eos_token for Flash-MoE")?;
+        if let Some(token) = &config.bos_token
+            && tokenizer.token_to_id(token).is_none()
+        {
+            bail!("tokenizer_config.json bos_token {token:?} is not present in tokenizer.json");
+        }
+        if let Some(token) = &config.pad_token
+            && tokenizer.token_to_id(token).is_none()
+        {
+            bail!("tokenizer_config.json pad_token {token:?} is not present in tokenizer.json");
+        }
+        // Qwen-family tokenizer_config.json files may include modality tokens in
+        // added_tokens_decoder/additional_special_tokens that are not exposed by
+        // the active tokenizer.json. Keep EOS/BOS/PAD strict, but let optional
+        // decoder metadata be advisory so text-only model artifacts still load.
+        for token in &config.additional_special_tokens {
+            let _ = tokenizer.token_to_id(token);
+        }
+        for token in config.added_tokens_decoder.values() {
+            let _ = tokenizer.token_to_id(&token.content);
+        }
+        let eos_token = primary_eos_token;
+        let im_start = token_to_id.get("<|im_start|>").copied();
+        let im_end = token_to_id.get("<|im_end|>").copied();
+        let max_id = token_to_id.values().copied().max().unwrap_or(eos_token) as usize;
+        let vocab_size = max_id + 1;
+        let mut id_to_token = vec![String::new(); vocab_size];
+        for (token, id) in &token_to_id {
+            if let Some(slot) = id_to_token.get_mut(*id as usize) {
+                *slot = token.clone();
+            }
+        }
+        #[cfg(test)]
+        let candidate_ids = {
+            let mut ids: Vec<u32> = token_to_id
+                .values()
+                .copied()
+                .filter(|id| (*id as usize) < vocab_size)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                bail!("Qwen tokenizer vocabulary is empty");
+            }
+            ids
+        };
+        Ok(Self {
+            tokenizer,
+            config,
+            eos_tokens,
+            primary_eos_token,
+            id_to_token,
+            token_to_id,
+            merge_ranks,
+            unk_token,
+            model_kind,
+            special_tokens,
+            chat_template,
+            eos_token,
+            im_start,
+            im_end,
+            vocab_size,
+            #[cfg(test)]
+            candidate_ids,
+        })
+    }
+
+    fn apply_chat_template(&self, prompt: &str) -> String {
+        if prompt.contains("<|im_start|>") {
+            return prompt.to_string();
+        }
+        if let Some(template) = &self.chat_template {
+            return render_tokenizer_chat_template(
+                template,
+                &[ChatMessage::text(ChatRole::User, prompt)],
+                &[],
+                true,
+            )
+            .unwrap_or_else(|_| prompt.to_string());
+        }
+        if self.im_start.is_some() && self.im_end.is_some() && !prompt.contains("<|im_start|>") {
+            format!(
+                "<|im_start|>user
+{prompt}<|im_end|>
+<|im_start|>assistant
+"
+            )
+        } else {
+            prompt.to_string()
+        }
+    }
+
+    fn apply_chat_template_to_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        if messages.len() == 1
+            && tools.is_empty()
+            && let ChatMessageContent::Text(prompt) = &messages[0].content
+            && prompt.contains("<|im_start|>")
+        {
+            return Ok(prompt.clone());
+        }
+        let template = self.config.chat_template.as_ref().context(
+            "tokenizer_config.json is missing chat_template; Flash-MoE chat generation requires the active model tokenizer_config.json",
+        )?;
+        render_tokenizer_chat_template(template, messages, tools, add_generation_prompt)
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("failed to encode text with tokenizer.json"))?;
+        let mut ids = encoding.get_ids().to_vec();
+        if self.config.add_bos_token
+            && let Some(bos) = self
+                .config
+                .bos_token
+                .as_deref()
+                .and_then(|token| self.tokenizer.token_to_id(token))
+            && ids.first().copied() != Some(bos)
+        {
+            ids.insert(0, bos);
+        }
+        Ok(ids)
+    }
+
+    fn decode(&self, tokens: &[u32]) -> Result<String> {
+        let tokens: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .take_while(|token| !self.is_eos(*token))
+            .collect();
+        self.tokenizer
+            .decode(&tokens, true)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("failed to decode tokens with tokenizer.json")
+    }
+
+    fn is_eos(&self, token: u32) -> bool {
+        self.eos_tokens.contains(&token)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.primary_eos_token
+    }
+
+    /// Look up a token string and return its ID, or `None` if not present.
+    fn token_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(token)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    #[cfg(test)]
+    fn candidate_token_ids(&self) -> &[u32] {
+        &self.candidate_ids
+    }
+
+    fn encode_wordlevel_compatible(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < text.len() {
+            if let Some((special, id)) = self.special_tokens.iter().find_map(|(special, id)| {
+                text[cursor..]
+                    .starts_with(special)
+                    .then_some((special.as_str(), *id))
+            }) {
+                out.push(id);
+                cursor += special.len();
+                continue;
+            }
+
+            let ch = text[cursor..].chars().next().expect("cursor inside text");
+            let piece = ch.to_string();
+            if ch.is_whitespace() {
+                if let Some(id) = self.token_to_id.get(&piece).copied() {
+                    out.push(id);
+                }
+                cursor += ch.len_utf8();
+                continue;
+            }
+
+            let start = cursor;
+            cursor += ch.len_utf8();
+            while cursor < text.len() {
+                let next = text[cursor..].chars().next().expect("cursor inside text");
+                if next.is_whitespace()
+                    || self
+                        .special_tokens
+                        .iter()
+                        .any(|(special, _)| text[cursor..].starts_with(special))
+                {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+            out.extend(self.encode_piece(&text[start..cursor]));
+        }
+        out
+    }
+
+    fn encode_piece(&self, piece: &str) -> Vec<u32> {
+        if let Some(id) = self.token_to_id.get(piece).copied() {
+            return vec![id];
+        }
+        let mut parts: Vec<String> = piece.chars().map(|ch| ch.to_string()).collect();
+        while parts.len() > 1 {
+            let Some((idx, _)) = parts
+                .windows(2)
+                .enumerate()
+                .filter_map(|(idx, pair)| {
+                    self.merge_ranks
+                        .get(&(pair[0].clone(), pair[1].clone()))
+                        .copied()
+                        .map(|rank| (idx, rank))
+                })
+                .min_by_key(|(_, rank)| *rank)
+            else {
+                break;
+            };
+            let merged = format!("{}{}", parts[idx], parts[idx + 1]);
+            parts.splice(idx..=idx + 1, [merged]);
+        }
+        let unk = self
+            .unk_token
+            .as_ref()
+            .and_then(|token| self.token_to_id.get(token).copied());
+        parts
+            .into_iter()
+            .filter_map(|part| self.token_to_id.get(&part).copied().or(unk))
+            .collect()
+    }
+
+    fn encode_byte_level_bpe(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < text.len() {
+            if let Some((special, id)) = self.special_tokens.iter().find_map(|(special, id)| {
+                text[cursor..]
+                    .starts_with(special)
+                    .then_some((special.as_str(), *id))
+            }) {
+                out.push(id);
+                cursor += special.len();
+                continue;
+            }
+
+            let start = cursor;
+            cursor += text[cursor..]
+                .chars()
+                .next()
+                .expect("cursor inside text")
+                .len_utf8();
+            while cursor < text.len()
+                && !self
+                    .special_tokens
+                    .iter()
+                    .any(|(special, _)| text[cursor..].starts_with(special))
+            {
+                cursor += text[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor inside text")
+                    .len_utf8();
+            }
+            out.extend(self.encode_byte_level_piece(&text[start..cursor]));
+        }
+        out
+    }
+
+    fn encode_byte_level_piece(&self, piece: &str) -> Vec<u32> {
+        if let Some(id) = self.token_to_id.get(piece).copied() {
+            return vec![id];
+        }
+        let byte_piece: String = piece.bytes().map(byte_to_unicode).collect();
+        if let Some(id) = self.token_to_id.get(&byte_piece).copied() {
+            return vec![id];
+        }
+        let mut parts: Vec<String> = byte_piece.chars().map(|ch| ch.to_string()).collect();
+        while parts.len() > 1 {
+            let Some((idx, _)) = parts
+                .windows(2)
+                .enumerate()
+                .filter_map(|(idx, pair)| {
+                    self.merge_ranks
+                        .get(&(pair[0].clone(), pair[1].clone()))
+                        .copied()
+                        .map(|rank| (idx, rank))
+                })
+                .min_by_key(|(_, rank)| *rank)
+            else {
+                break;
+            };
+            let merged = format!("{}{}", parts[idx], parts[idx + 1]);
+            parts.splice(idx..=idx + 1, [merged]);
+        }
+        let unk = self
+            .unk_token
+            .as_ref()
+            .and_then(|token| self.token_to_id.get(token).copied());
+        parts
+            .into_iter()
+            .filter_map(|part| self.token_to_id.get(&part).copied().or(unk))
+            .collect()
+    }
+}
+
+fn parse_tokenizer_merges(value: &serde_json::Value) -> Result<BTreeMap<(String, String), usize>> {
+    let mut out = BTreeMap::new();
+    let Some(merges) = value
+        .pointer("/model/merges")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(out);
+    };
+    for (rank, merge) in merges.iter().enumerate() {
+        let pair = if let Some(text) = merge.as_str() {
+            let mut parts = text.split_whitespace();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(left), Some(right), None) => Some((left.to_string(), right.to_string())),
+                _ => None,
+            }
+        } else if let Some(parts) = merge.as_array() {
+            match (
+                parts.first().and_then(serde_json::Value::as_str),
+                parts.get(1).and_then(serde_json::Value::as_str),
+            ) {
+                (Some(left), Some(right)) => Some((left.to_string(), right.to_string())),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(pair) = pair {
+            out.insert(pair, rank);
+        }
+    }
+    Ok(out)
+}
+
+impl QwenTokenizerConfig {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let value: Value =
+            serde_json::from_slice(bytes).context("tokenizer_config.json is invalid")?;
+        let bos_token = config_token_string(value.get("bos_token"), "bos_token")?;
+        let eos_tokens = config_token_strings(value.get("eos_token"), "eos_token")?;
+        let pad_token = config_token_string(value.get("pad_token"), "pad_token")?;
+        let add_bos_token = value
+            .get("add_bos_token")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let split_special_tokens = value
+            .get("split_special_tokens")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let model_max_length = value.get("model_max_length").and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        });
+        let added_tokens_decoder = parse_added_tokens_decoder(value.get("added_tokens_decoder"))?;
+        let additional_special_tokens = parse_config_token_list(
+            value.get("additional_special_tokens"),
+            "additional_special_tokens",
+        )?;
+        let chat_template = TokenizerChatTemplate::from_tokenizer_config_value(&value)?;
+        if eos_tokens.is_empty() {
+            bail!("tokenizer_config.json must define eos_token for Flash-MoE");
+        }
+        Ok(Self {
+            bos_token,
+            eos_tokens,
+            pad_token,
+            add_bos_token,
+            added_tokens_decoder,
+            additional_special_tokens,
+            split_special_tokens,
+            model_max_length,
+            chat_template,
+        })
+    }
+}
+
+fn config_token_strings(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                config_token_string(Some(item), field)?.with_context(|| {
+                    format!("tokenizer_config.json {field} entries must not be null")
+                })
+            })
+            .collect(),
+        _ => Ok(config_token_string(value, field)?.into_iter().collect()),
+    }
+}
+
+fn config_token_string(value: Option<&Value>, field: &str) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(token)) => Ok(Some(token.clone())),
+        Some(Value::Object(object)) => object
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|content| Some(content.to_string()))
+            .with_context(|| {
+                format!("tokenizer_config.json {field} object must contain string content")
+            }),
+        Some(_) => bail!("tokenizer_config.json {field} must be a string, object, array, or null"),
+    }
+}
+
+fn parse_config_token_list(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        bail!("tokenizer_config.json {field} must be an array");
+    };
+    let mut tokens = Vec::new();
+    for item in items {
+        if let Some(token) = config_token_string(Some(item), field)? {
+            tokens.push(token);
+        }
+    }
+    Ok(tokens)
+}
+
+fn parse_added_tokens_decoder(
+    value: Option<&Value>,
+) -> Result<BTreeMap<u32, TokenizerConfigAddedToken>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        bail!("tokenizer_config.json added_tokens_decoder must be an object");
+    };
+    let mut out = BTreeMap::new();
+    for (id, value) in object {
+        let id = id
+            .parse::<u32>()
+            .with_context(|| format!("invalid added_tokens_decoder id {id:?}"))?;
+        let content = config_token_string(Some(value), "added_tokens_decoder")?
+            .context("added_tokens_decoder entries must contain token content")?;
+        let special = value
+            .as_object()
+            .and_then(|object| object.get("special"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.insert(id, TokenizerConfigAddedToken { content, special });
+    }
+    Ok(out)
+}
+
+fn render_tokenizer_chat_template(
+    template: &TokenizerChatTemplate,
+    messages: &[ChatMessage],
+    tools: &[ChatTool],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    let tools: Vec<Value> = tools.iter().map(qwen_tool_schema_value).collect();
+    template.render(
+        messages,
+        &tools,
+        ChatTemplateOptions {
+            add_generation_prompt,
+            ..ChatTemplateOptions::default()
+        },
+    )
+}
+
+fn render_qwen_chatml(
+    messages: &[ChatMessage],
+    tools: &[ChatTool],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    render_qwen_xml_tool_template(messages, tools, add_generation_prompt, true)
+}
+
+fn render_qwen_xml_tool_template(
+    messages: &[ChatMessage],
+    tools: &[ChatTool],
+    add_generation_prompt: bool,
+    supports_vision_parts: bool,
+) -> Result<String> {
+    let mut out = String::new();
+
+    if !tools.is_empty() {
+        out.push_str("<|im_start|>system\n");
+        if let Some(message) = messages
+            .first()
+            .filter(|message| message.role == ChatRole::System)
+        {
+            let content = render_qwen_template_content(&message.content, supports_vision_parts)?;
+            if !content.is_empty() {
+                out.push_str(&content);
+                out.push_str("\n\n");
+            }
+        }
+        out.push_str(&render_qwen_tool_instructions("", tools)?);
+        out.push_str("<|im_end|>\n");
+    } else if let Some(message) = messages
+        .first()
+        .filter(|message| message.role == ChatRole::System)
+    {
+        out.push_str("<|im_start|>system\n");
+        out.push_str(&render_qwen_template_content(
+            &message.content,
+            supports_vision_parts,
+        )?);
+        out.push_str("<|im_end|>\n");
+    }
+
+    let last_query_index = qwen_last_real_user_index(messages);
+    for (index, message) in messages.iter().enumerate() {
+        if index == 0 && message.role == ChatRole::System {
+            continue;
+        }
+        match message.role {
+            ChatRole::System | ChatRole::User => {
+                out.push_str("<|im_start|>");
+                out.push_str(message.role.as_qwen_role());
+                out.push('\n');
+                out.push_str(&render_qwen_template_content(
+                    &message.content,
+                    supports_vision_parts,
+                )?);
+                out.push_str("<|im_end|>\n");
+            }
+            ChatRole::Assistant => {
+                out.push_str("<|im_start|>assistant\n");
+                let content = render_qwen_assistant_content(
+                    &message.content,
+                    supports_vision_parts,
+                    index,
+                    last_query_index,
+                )?;
+                out.push_str(&content.rendered);
+                if !content.is_empty() && !message.tool_calls.is_empty() && !content.ends_with('\n')
+                {
+                    out.push('\n');
+                }
+                for tool_call in &message.tool_calls {
+                    out.push_str("<tool_call>\n");
+                    out.push_str(&render_qwen_tool_call_json(tool_call)?);
+                    out.push_str("\n</tool_call>\n");
+                }
+                out.push_str("<|im_end|>\n");
+            }
+            ChatRole::Tool => {
+                if index == 0
+                    || messages
+                        .get(index.saturating_sub(1))
+                        .map_or(true, |previous| previous.role != ChatRole::Tool)
+                {
+                    out.push_str("<|im_start|>user");
+                }
+                out.push_str("\n<tool_response>\n");
+                out.push_str(&render_qwen_template_content(
+                    &message.content,
+                    supports_vision_parts,
+                )?);
+                out.push_str("\n</tool_response>");
+                if index + 1 == messages.len()
+                    || messages
+                        .get(index + 1)
+                        .map_or(true, |next| next.role != ChatRole::Tool)
+                {
+                    out.push_str("<|im_end|>\n");
+                }
+            }
+        }
+    }
+
+    if add_generation_prompt {
+        out.push_str("<|im_start|>assistant\n");
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedAssistantContent {
+    rendered: String,
+    logical_content: String,
+}
+
+impl RenderedAssistantContent {
+    fn is_empty(&self) -> bool {
+        self.logical_content.is_empty()
+    }
+
+    fn ends_with(&self, ch: char) -> bool {
+        self.logical_content.ends_with(ch)
+    }
+}
+
+fn qwen_last_real_user_index(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| {
+            message.role == ChatRole::User
+                && match &message.content {
+                    ChatMessageContent::Text(content) => {
+                        !(content.starts_with("<tool_response>")
+                            && content.ends_with("</tool_response>"))
+                    }
+                    ChatMessageContent::Parts(_) => true,
+                }
+        })
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| messages.len().saturating_sub(1))
+}
+
+fn render_qwen_assistant_content(
+    content: &ChatMessageContent,
+    supports_vision_parts: bool,
+    index: usize,
+    last_query_index: usize,
+) -> Result<RenderedAssistantContent> {
+    let mut logical_content = render_qwen_template_content(content, supports_vision_parts)?;
+    if supports_vision_parts {
+        return Ok(RenderedAssistantContent {
+            rendered: logical_content.clone(),
+            logical_content,
+        });
+    }
+
+    let mut reasoning_content = String::new();
+    if let Some((before, after)) = logical_content.split_once("</think>") {
+        reasoning_content = before
+            .trim_end_matches('\n')
+            .rsplit_once("<think>")
+            .map(|(_, reasoning)| reasoning)
+            .unwrap_or(before)
+            .trim_start_matches('\n')
+            .to_string();
+        logical_content = after.trim_start_matches('\n').to_string();
+    }
+
+    let rendered = if index > last_query_index && !reasoning_content.is_empty() {
+        format!(
+            "<think>\n{}\n</think>\n\n{}",
+            reasoning_content.trim_matches('\n'),
+            logical_content.trim_start_matches('\n')
+        )
+    } else {
+        logical_content.clone()
+    };
+    Ok(RenderedAssistantContent {
+        rendered,
+        logical_content,
+    })
+}
+
+fn render_qwen_template_content(
+    content: &ChatMessageContent,
+    supports_vision_parts: bool,
+) -> Result<String> {
+    match content {
+        ChatMessageContent::Text(text) => Ok(text.clone()),
+        ChatMessageContent::Parts(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    ChatContentPart::Text { text } => out.push_str(text),
+                    ChatContentPart::Image {
+                        placeholder_tokens, ..
+                    } => {
+                        if !supports_vision_parts {
+                            bail!(
+                                "tokenizer chat_template does not support image content parts for this model family"
+                            );
+                        }
+                        out.push_str("<|vision_start|>");
+                        out.push_str(&"<|image_pad|>".repeat((*placeholder_tokens).unwrap_or(1)));
+                        out.push_str("<|vision_end|>");
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn render_qwen_tool_instructions(system_content: &str, tools: &[ChatTool]) -> Result<String> {
+    if tools.is_empty() {
+        return Ok(system_content.to_string());
+    }
+
+    let mut out = String::new();
+    if !system_content.is_empty() {
+        out.push_str(system_content);
+        if !system_content.ends_with('\n') {
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str("# Tools\n\n");
+    out.push_str("You may call one or more functions to assist with the user query.\n\n");
+    out.push_str("You are provided with function signatures within <tools></tools> XML tags:\n");
+    out.push_str("<tools>\n");
+    for tool in tools {
+        out.push_str(&serde_json::to_string(&qwen_tool_schema_value(tool))?);
+        out.push('\n');
+    }
+    out.push_str("</tools>\n\n");
+    out.push_str("For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n");
+    out.push_str("<tool_call>\n");
+    out.push_str("{\"name\": <function-name>, \"arguments\": <args-json-object>}\n");
+    out.push_str("</tool_call>");
+    Ok(out)
+}
+
+fn qwen_tool_schema_value(tool: &ChatTool) -> Value {
+    let mut function = serde_json::Map::new();
+    function.insert("name".to_string(), Value::String(tool.name.clone()));
+    if let Some(description) = &tool.description {
+        function.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
+    }
+    function.insert("parameters".to_string(), tool.input_schema.clone());
+
+    let mut root = serde_json::Map::new();
+    root.insert("type".to_string(), Value::String("function".to_string()));
+    root.insert("function".to_string(), Value::Object(function));
+    Value::Object(root)
+}
+
+fn render_qwen_tool_call_json(tool_call: &ChatToolCall) -> Result<String> {
+    let name = serde_json::to_string(&tool_call.name)?;
+    let arguments = match &tool_call.arguments {
+        Value::String(arguments) => arguments.clone(),
+        arguments => serde_json::to_string(arguments)?,
+    };
+    Ok(format!("{{\"name\": {name}, \"arguments\": {arguments}}}"))
+}
+
+fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCall>)> {
+    let mut remaining = content;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    while let Some(start) = remaining.find("<tool_call>") {
+        text.push_str(&remaining[..start]);
+        let block_start = start + "<tool_call>".len();
+        let Some(relative_end) = remaining[block_start..].find("</tool_call>") else {
+            text.push_str(&remaining[start..]);
+            return Ok((text.trim().to_string(), tool_calls));
+        };
+        let block_end = block_start + relative_end;
+        let block = remaining[block_start..block_end].trim();
+        if !block.is_empty() {
+            tool_calls.push(parse_qwen_tool_call_block(block)?);
+        }
+        remaining = &remaining[block_end + "</tool_call>".len()..];
+    }
+    text.push_str(remaining);
+    Ok((text.trim().to_string(), tool_calls))
+}
+
+fn parse_qwen_tool_call_block(block: &str) -> Result<ChatToolCall> {
+    if block.contains("<function=") {
+        return parse_qwen_function_tool_call_block(block);
+    }
+
+    let value: Value = serde_json::from_str(block)
+        .with_context(|| format!("failed to parse Qwen tool call JSON: {block}"))?;
+    let name = value
+        .get("name")
+        .or_else(|| value.pointer("/function/name"))
+        .and_then(Value::as_str)
+        .context("Qwen tool call is missing a string name")?
+        .to_string();
+    let arguments = value
+        .get("arguments")
+        .or_else(|| value.pointer("/function/arguments"))
+        .map(parse_qwen_tool_arguments)
+        .transpose()?
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let id = value
+        .get("id")
+        .or_else(|| value.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(ChatToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
+fn parse_qwen_function_tool_call_block(block: &str) -> Result<ChatToolCall> {
+    let start = block
+        .find("<function=")
+        .context("Qwen function tool call is missing <function=...>")?;
+    let name_start = start + "<function=".len();
+    let name_end = block[name_start..]
+        .find('>')
+        .map(|end| name_start + end)
+        .context("Qwen function tool call has an unterminated function tag")?;
+    let name = block[name_start..name_end].trim();
+    if name.is_empty() {
+        bail!("Qwen function tool call is missing a function name");
+    }
+
+    let body_start = name_end + 1;
+    let body_end = block[body_start..]
+        .rfind("</function>")
+        .map(|end| body_start + end)
+        .context("Qwen function tool call is missing </function>")?;
+    let mut rest = &block[body_start..body_end];
+    let mut arguments = serde_json::Map::new();
+    while let Some(parameter_start) = rest.find("<parameter=") {
+        rest = &rest[parameter_start + "<parameter=".len()..];
+        let Some(name_end) = rest.find('>') else {
+            bail!("Qwen function tool call has an unterminated parameter tag");
+        };
+        let parameter_name = rest[..name_end].trim();
+        if parameter_name.is_empty() {
+            bail!("Qwen function tool call has an empty parameter name");
+        }
+        rest = &rest[name_end + 1..];
+        let Some(value_end) = rest.find("</parameter>") else {
+            bail!("Qwen function tool call is missing </parameter>");
+        };
+        let value = rest[..value_end].trim_matches('\n');
+        arguments.insert(
+            parameter_name.to_string(),
+            parse_qwen_function_parameter_output(value),
+        );
+        rest = &rest[value_end + "</parameter>".len()..];
+    }
+
+    Ok(ChatToolCall {
+        id: None,
+        name: name.to_string(),
+        arguments: Value::Object(arguments),
+    })
+}
+
+fn parse_qwen_function_parameter_output(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+fn parse_qwen_tool_arguments(value: &Value) -> Result<Value> {
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str(text)
+            .with_context(|| format!("failed to parse Qwen tool call arguments JSON: {text}"));
+    }
+    Ok(value.clone())
+}
+
+fn decode_token_piece(piece: &str) -> String {
+    piece.replace(['Ġ', '▁'], " ")
+}
+
+fn byte_to_unicode(byte: u8) -> char {
+    match byte {
+        b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF => char::from(byte),
+        _ => {
+            let mut next = 256u32;
+            for candidate in 0u16..=u8::MAX as u16 {
+                let candidate = candidate as u8;
+                if matches!(candidate, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF) {
+                    continue;
+                }
+                if candidate == byte {
+                    return char::from_u32(next).expect("valid GPT-2 byte-level unicode scalar");
+                }
+                next += 1;
+            }
+            unreachable!("all bytes are covered by GPT-2 byte-level unicode mapping")
+        }
+    }
+}
+
+fn unicode_to_byte(ch: char) -> Option<u8> {
+    let codepoint = ch as u32;
+    if matches!(codepoint, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF) {
+        return u8::try_from(codepoint).ok();
+    }
+    let mut next = 256u32;
+    for candidate in 0u16..=u8::MAX as u16 {
+        let candidate = candidate as u8;
+        if matches!(candidate, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF) {
+            continue;
+        }
+        if codepoint == next {
+            return Some(candidate);
+        }
+        next += 1;
+    }
+    None
+}
+
+fn byte_level_piece_to_bytes(piece: &str) -> Option<Vec<u8>> {
+    piece.chars().map(unicode_to_byte).collect()
+}
+
+#[derive(Debug, Clone)]
+struct LinearAttentionStateData {
+    conv_state: Vec<f32>,
+    ssm_state: Vec<f32>,
+    conv_out: Vec<f32>,
+    out_values: Vec<f32>,
+    kv_mem: Vec<f32>,
+    delta: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct LinearAttentionState {
+    inner: Arc<LinearAttentionStateData>,
+}
+
+impl LinearAttentionState {
+    fn new(layout: LinearAttentionLayout) -> Self {
+        Self {
+            inner: Arc::new(LinearAttentionStateData {
+                conv_state: vec![0.0; layout.conv_state_len()],
+                ssm_state: vec![0.0; layout.ssm_state_len()],
+                conv_out: vec![0.0; layout.conv_dim],
+                out_values: vec![0.0; layout.total_value_width],
+                kv_mem: vec![0.0; layout.value_dim],
+                delta: vec![0.0; layout.value_dim],
+            }),
+        }
+    }
+
+    fn matches_layout(&self, layout: LinearAttentionLayout) -> bool {
+        self.conv_state.len() == layout.conv_state_len()
+            && self.ssm_state.len() == layout.ssm_state_len()
+            && self.conv_out.len() == layout.conv_dim
+            && self.out_values.len() == layout.total_value_width
+            && self.kv_mem.len() == layout.value_dim
+            && self.delta.len() == layout.value_dim
+    }
+}
+
+impl std::ops::Deref for LinearAttentionState {
+    type Target = LinearAttentionStateData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for LinearAttentionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.inner)
+    }
+}
+
+type KvEntry = (Arc<[f32]>, Arc<[f32]>);
+
+#[derive(Debug, Clone)]
+struct KvCache {
+    layers: usize,
+    capacity: usize,
+    prompt_tokens: Vec<(usize, u32)>,
+    generated_tokens: Vec<(usize, u32)>,
+    layer_states: Vec<(usize, usize, u64)>,
+    kv: Vec<Vec<Option<KvEntry>>>,
+    linear_states: BTreeMap<usize, LinearAttentionState>,
+}
+
+impl KvCache {
+    fn new(layers: usize, capacity: usize) -> Self {
+        Self {
+            layers,
+            capacity,
+            prompt_tokens: Vec::new(),
+            generated_tokens: Vec::new(),
+            layer_states: Vec::new(),
+            kv: vec![vec![None; capacity]; layers],
+            linear_states: BTreeMap::new(),
+        }
+    }
+
+    fn shallow_snapshot(&self) -> Self {
+        self.clone()
+    }
+
+    fn record_prompt_token(&mut self, position: usize, token: u32) -> Result<()> {
+        self.ensure_position(position)?;
+        self.prompt_tokens.push((position, token));
+        Ok(())
+    }
+
+    fn resize_capacity(&mut self, capacity: usize) {
+        if capacity <= self.capacity {
+            return;
+        }
+        for layer in &mut self.kv {
+            layer.resize_with(capacity, || None);
+        }
+        self.capacity = capacity;
+    }
+
+    fn record_generated_token(&mut self, position: usize, token: u32) -> Result<()> {
+        self.ensure_position(position)?;
+        self.generated_tokens.push((position, token));
+        Ok(())
+    }
+
+    fn record_layer_state(&mut self, position: usize, layer: usize, state: u64) -> Result<()> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        self.layer_states.push((position, layer, state));
+        Ok(())
+    }
+
+    fn record_kv(
+        &mut self,
+        position: usize,
+        layer: usize,
+        key: Vec<f32>,
+        value: Vec<f32>,
+    ) -> Result<()> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        self.kv[layer][position] = Some((Arc::from(key), Arc::from(value)));
+        Ok(())
+    }
+
+    fn causal_attention(
+        &self,
+        position: usize,
+        layer: usize,
+        query: &[f32],
+        num_q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        let keys_values: Vec<(&[f32], &[f32])> = self.kv[layer]
+            .iter()
+            .take(position + 1)
+            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
+            .collect();
+        Ok(causal_attention(
+            query,
+            &keys_values,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+        ))
+    }
+
+    fn linear_state_mut(
+        &mut self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+    ) -> Result<&mut LinearAttentionState> {
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        let state = self
+            .linear_states
+            .entry(layer)
+            .or_insert_with(|| LinearAttentionState::new(layout));
+        if !state.matches_layout(layout) {
+            *state = LinearAttentionState::new(layout);
+        }
+        Ok(state)
+    }
+
+    #[allow(dead_code)]
+    fn keys_values(&self, position: usize, layer: usize) -> Result<Vec<(&[f32], &[f32])>> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        Ok(self.kv[layer]
+            .iter()
+            .take(position + 1)
+            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
+            .collect())
+    }
+
+    fn ensure_position(&self, position: usize) -> Result<()> {
+        if position >= self.capacity {
+            bail!(
+                "KV cache position {position} exceeds capacity {}",
+                self.capacity
+            );
+        }
+        Ok(())
+    }
+}
+
+fn common_token_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> Option<usize> {
+    let prefix_len = common_token_prefix_len(cached_tokens, prompt_tokens);
+    (prefix_len == cached_tokens.len()).then_some(prefix_len)
+}
+
+fn take_reusable_session_cache_entry(
+    session_cache: &mut BTreeMap<String, FlashMoeSessionState>,
+    session_id: &str,
+    prompt_tokens: &[u32],
+) -> Option<(usize, FlashMoeSessionState)> {
+    let prefix_len = session_cache
+        .get(session_id)
+        .and_then(|state| reusable_session_prefix_len(&state.tokens, prompt_tokens))?;
+    session_cache
+        .remove(session_id)
+        .map(|state| (prefix_len, state))
+}
+
+fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
+    // Assistant generations can be parsed into structured tool calls and then
+    // re-rendered canonically on the next turn. Cache only rendered prompt
+    // tokens whose exact bytes are already part of the transcript contract.
+    prompt_tokens.to_vec()
+}
+
+fn prefill_expert_strategy(
+    config: &QwenModelConfig,
+    has_vision_encoder: bool,
+    input_kind: PrefillInputKind,
+) -> PrefillExpertStrategy {
+    if prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
+        config,
+        has_vision_encoder,
+        input_kind,
+    ) {
+        PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
+    } else {
+        PrefillExpertStrategy::ComputeAllExperts
+    }
+}
+
+fn prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
+    config: &QwenModelConfig,
+    has_vision_encoder: bool,
+    input_kind: PrefillInputKind,
+) -> bool {
+    // Upstream flash-moe can skip intermediate prefill experts for its narrow
+    // Qwen3.5 target because those hidden states are not sampled. pb supports
+    // other Qwen MoE variants and Qwen3-VL: in real multi-layer models, skipped
+    // expert output changes the hidden state that feeds later layers at the same
+    // token, poisoning full-attention KV writes and linear-attention recurrent
+    // state. Visual prefill is even more fragile because image embeddings,
+    // DeepStack features, and M-RoPE positions all participate in those states.
+    // Keep the optimization limited to intentionally tiny single-layer text
+    // fixtures where there is no later layer state to corrupt.
+    input_kind == PrefillInputKind::Text
+        && config.vision_config.is_none()
+        && !has_vision_encoder
+        && config.num_hidden_layers == 1
+        && config.num_experts.unwrap_or(0) > 0
+}
+
+#[derive(Debug, Clone)]
+struct TokenSampler {
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    state: u64,
+}
+
+impl TokenSampler {
+    fn new(temperature: f32, top_k: i32, seed: u32) -> Self {
+        let deterministic = temperature <= 0.0 || top_k <= 1;
+        Self {
+            temperature,
+            top_k: usize::try_from(top_k.max(1)).unwrap_or(1),
+            top_p: if deterministic { 1.0 } else { 0.95 },
+            repeat_penalty: if deterministic { 1.0 } else { 1.05 },
+            state: u64::from(seed).max(1),
+        }
+    }
+
+    fn sample(&mut self, logits: &[f32], prompt: &[u32], generated: &[u32]) -> Result<u32> {
+        if logits.is_empty() {
+            bail!("cannot sample from empty logits");
+        }
+        let candidates = self.top_candidates(logits, prompt, generated);
+        self.sample_candidates(candidates)
+    }
+
+    fn sample_candidates(&mut self, mut candidates: Vec<(usize, f32)>) -> Result<u32> {
+        if candidates.is_empty() {
+            bail!("no logits candidates available");
+        }
+        if self.temperature <= 0.0 || candidates.len() == 1 {
+            return u32::try_from(candidates[0].0).context("sampled token id does not fit u32");
+        }
+        let inv_temp = 1.0 / self.temperature.max(1e-6);
+        let mut probabilities: Vec<f32> = candidates
+            .iter()
+            .map(|(_, logit)| *logit * inv_temp)
+            .collect();
+        softmax_in_place(&mut probabilities);
+        self.apply_top_p(&mut candidates, &mut probabilities);
+        let draw = self.next_f32();
+        let mut cumulative = 0.0f32;
+        let mut fallback = candidates[0].0;
+        for ((token, _), weight) in candidates.into_iter().zip(probabilities) {
+            fallback = token;
+            cumulative += weight;
+            if draw <= cumulative {
+                return u32::try_from(token).context("sampled token id does not fit u32");
+            }
+        }
+        u32::try_from(fallback).context("sampled token id does not fit u32")
+    }
+
+    fn top_candidates(
+        &self,
+        logits: &[f32],
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Vec<(usize, f32)> {
+        let repeated = self.repeated_tokens(prompt, generated);
+        let mut candidates = TopKCandidates::new(self.top_k.min(logits.len()).max(1));
+        for (token, logit) in logits.iter().copied().enumerate() {
+            candidates.push(token, self.process_logit(token, logit, &repeated));
+        }
+        candidates.into_sorted_vec()
+    }
+
+    fn apply_top_p(&self, candidates: &mut Vec<(usize, f32)>, probabilities: &mut Vec<f32>) {
+        if self.top_p >= 1.0 || candidates.len() <= 1 {
+            return;
+        }
+        let mut cumulative = 0.0f32;
+        let mut keep = candidates.len();
+        for (idx, probability) in probabilities.iter().enumerate() {
+            cumulative += *probability;
+            if cumulative >= self.top_p {
+                keep = idx + 1;
+                break;
+            }
+        }
+        keep = keep.max(1);
+        candidates.truncate(keep);
+        probabilities.truncate(keep);
+        let total = probabilities.iter().sum::<f32>();
+        if total.is_finite() && total > 0.0 {
+            for probability in probabilities {
+                *probability /= total;
+            }
+        }
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.state >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+
+    fn repeated_tokens(&self, prompt: &[u32], generated: &[u32]) -> BTreeSet<usize> {
+        if self.repeat_penalty <= 1.0 {
+            return BTreeSet::new();
+        }
+        let window = generated.len().saturating_sub(256);
+        prompt
+            .iter()
+            .chain(generated[window..].iter())
+            .map(|token| *token as usize)
+            .collect()
+    }
+
+    fn process_logit(&self, token: usize, logit: f32, repeated: &BTreeSet<usize>) -> f32 {
+        process_sample_logit(token, logit, self.repeat_penalty, repeated)
+    }
+}
+
+fn process_sample_logit(
+    token: usize,
+    logit: f32,
+    repeat_penalty: f32,
+    repeated: &BTreeSet<usize>,
+) -> f32 {
+    let mut processed = if logit.is_finite() {
+        logit
+    } else {
+        f32::NEG_INFINITY
+    };
+    if repeat_penalty > 1.0 && repeated.contains(&token) {
+        if processed > 0.0 {
+            processed /= repeat_penalty;
+        } else {
+            processed *= repeat_penalty;
+        }
+    }
+    processed
+}
+
+#[derive(Debug, Clone)]
+struct TopKCandidates {
+    limit: usize,
+    values: Vec<(usize, f32)>,
+}
+
+impl TopKCandidates {
+    fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        Self {
+            limit,
+            values: Vec::with_capacity(limit),
+        }
+    }
+
+    fn push(&mut self, token: usize, score: f32) {
+        let entry = (token, score);
+        let insert_at = self
+            .values
+            .binary_search_by(|current| compare_scored_tokens(current, &entry))
+            .unwrap_or_else(|idx| idx);
+        if self.values.len() < self.limit {
+            self.values.insert(insert_at.min(self.values.len()), entry);
+        } else if insert_at < self.limit {
+            self.values.insert(insert_at, entry);
+            self.values.pop();
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<(usize, f32)> {
+        self.values
+    }
+}
+
+/// Sort by descending score, then ascending token id for stable tie-breaking.
+fn compare_scored_tokens(left: &(usize, f32), right: &(usize, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+fn report_generation_progress(progress: &GenerationProgress<'_>, message: String) {
+    if let Some(callback) = progress {
+        (callback.borrow_mut())(message);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TensorQuantization {
+    None,
+    Q4 { group_size: usize, format: String },
+}
+
+impl Default for TensorQuantization {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenseQ4Layout {
+    rows: usize,
+    cols: usize,
+    row_packed_bytes: usize,
+    groups_per_row: usize,
+    packed_bytes: usize,
+    scales_bytes: usize,
+    total_bytes: usize,
+}
+
+fn dense_q4_layout(shape: &[usize], group_size: usize) -> Result<DenseQ4Layout> {
+    if group_size == 0 {
+        bail!("dense q4 group_size must be positive");
+    }
+    let cols = shape.last().copied().unwrap_or(0);
+    if shape.len() < 2 || cols == 0 {
+        bail!(
+            "dense q4 tensor shape {:?} is not a non-empty matrix",
+            shape
+        );
+    }
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+                .context("dense q4 tensor row count overflow")
+        })?;
+    let row_packed_bytes = cols.div_ceil(2);
+    let groups_per_row = cols.div_ceil(group_size);
+    let packed_bytes = rows
+        .checked_mul(row_packed_bytes)
+        .context("dense q4 packed byte length overflow")?;
+    let groups = rows
+        .checked_mul(groups_per_row)
+        .context("dense q4 group count overflow")?;
+    let scales_bytes = groups
+        .checked_mul(std::mem::size_of::<f32>())
+        .context("dense q4 scale byte length overflow")?;
+    let total_bytes = packed_bytes
+        .checked_add(scales_bytes)
+        .and_then(|value| value.checked_add(scales_bytes))
+        .context("dense q4 total byte length overflow")?;
+    Ok(DenseQ4Layout {
+        rows,
+        cols,
+        row_packed_bytes,
+        groups_per_row,
+        packed_bytes,
+        scales_bytes,
+        total_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeTensorEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+    pub alignment: u64,
+    pub quantization: TensorQuantization,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TensorRegistry {
+    tensors: BTreeMap<String, RuntimeTensorEntry>,
+}
+
+impl TensorRegistry {
+    pub fn load(manifest_path: &Path) -> Result<Self> {
+        let manifest: FlashMoeManifest =
+            serde_json::from_slice(&fs::read(manifest_path).with_context(|| {
+                format!(
+                    "failed to read Flash-MoE tensor manifest {}",
+                    manifest_path.display()
+                )
+            })?)
+            .with_context(|| {
+                format!(
+                    "failed to parse Flash-MoE tensor manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+        Ok(Self::from_manifest(&manifest))
+    }
+
+    fn from_manifest(manifest: &FlashMoeManifest) -> Self {
+        let mut tensors = BTreeMap::new();
+        for tensor in &manifest.dense_tensors {
+            insert_tensor_entry_with_aliases(
+                &mut tensors,
+                &tensor.tensor,
+                RuntimeTensorEntry {
+                    name: tensor.tensor.clone(),
+                    dtype: tensor.dtype.clone(),
+                    shape: tensor.shape.clone(),
+                    byte_offset: tensor.runtime_offset,
+                    byte_len: tensor.byte_len,
+                    alignment: TENSOR_ALIGNMENT,
+                    quantization: tensor.quantization.clone(),
+                },
+            );
+        }
+        for tensor in &manifest.expert_tensors {
+            if let Some([start, end]) = tensor.source_offsets {
+                insert_tensor_entry_with_aliases(
+                    &mut tensors,
+                    &tensor.tensor,
+                    RuntimeTensorEntry {
+                        name: tensor.tensor.clone(),
+                        dtype: tensor
+                            .dtype
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        shape: tensor.shape.clone(),
+                        byte_offset: start,
+                        byte_len: end.saturating_sub(start),
+                        alignment: TENSOR_ALIGNMENT,
+                        quantization: TensorQuantization::Q4 {
+                            group_size: GROUP_SIZE,
+                            format: ExpertQuantization::FourBitProduction.as_str().to_string(),
+                        },
+                    },
+                );
+            }
+        }
+        Self { tensors }
+    }
+
+    pub fn tensor(&self, canonical_name: &str) -> Option<&RuntimeTensorEntry> {
+        self.tensors.get(canonical_name)
+    }
+
+    fn has_tensor_with_prefix(&self, prefix: &str) -> bool {
+        self.tensors.keys().any(|name| name.starts_with(prefix))
+    }
+
+    pub fn require(&self, canonical_name: &str) -> Result<&RuntimeTensorEntry> {
+        self.tensor(canonical_name)
+            .with_context(|| format!("Flash-MoE tensor registry is missing {canonical_name}"))
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+}
+
+fn insert_tensor_entry_with_aliases(
+    tensors: &mut BTreeMap<String, RuntimeTensorEntry>,
+    name: &str,
+    entry: RuntimeTensorEntry,
+) {
+    tensors
+        .entry(name.to_string())
+        .or_insert_with(|| entry.clone());
+    let canonical_name = canonical_hf_tensor_name(name);
+    if canonical_name != name {
+        tensors.entry(canonical_name).or_insert(entry);
+    }
+}
+
+fn validate_required_tensor_manifest(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+) -> Result<()> {
+    require_tensor_shape(
+        registry,
+        "model.embed_tokens.weight",
+        &[config.vocab_size, config.hidden_size],
+    )?;
+    require_tensor_shape(registry, "model.norm.weight", &[config.hidden_size])?;
+    // lm_head.weight is optional: when absent (or when tie_word_embeddings is true) the model
+    // uses tied embeddings and reuses model.embed_tokens.weight (already validated above) for
+    // the output projection.
+    if registry.tensor("lm_head.weight").is_some() {
+        require_tensor_shape(
+            registry,
+            "lm_head.weight",
+            &[config.vocab_size, config.hidden_size],
+        )?;
+    }
+    for layer in 0..config.num_hidden_layers {
+        match infer_attention_layer_type(registry, layer)? {
+            AttentionLayerType::Full => {
+                let _ = infer_full_attention_layout(config, registry, layer)?;
+            }
+            AttentionLayerType::Linear => {
+                let _ = infer_linear_attention_layout(config, registry, layer)?;
+            }
+        }
+        require_tensor_shape(
+            registry,
+            &layer_norm_tensor_name(layer, "input_layernorm"),
+            &[config.hidden_size],
+        )?;
+        require_tensor_shape(
+            registry,
+            &layer_norm_tensor_name(layer, "post_attention_layernorm"),
+            &[config.hidden_size],
+        )?;
+        require_tensor_shape(
+            registry,
+            &router_tensor_name(layer),
+            &[config.experts(), config.hidden_size],
+        )?;
+        let shared_experts = config.shared_experts();
+        if shared_experts > 0 {
+            let shared_inter = config.shared_expert_intermediate_size();
+            if shared_inter == 0 {
+                bail!(
+                    "Qwen config declares {shared_experts} shared expert(s) but no shared expert intermediate size"
+                );
+            }
+            let total_shared_inter = shared_experts
+                .checked_mul(shared_inter)
+                .context("shared expert intermediate size overflow")?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "gate_proj"),
+                &[total_shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "up_proj"),
+                &[total_shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "down_proj"),
+                &[config.hidden_size, total_shared_inter],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_gate_tensor_name(layer),
+                &[shared_experts, config.hidden_size],
+            )?;
+        }
+        // Per-expert tensor presence is intentionally not validated here.
+        //
+        // Reasons:
+        // 1. Expert MLP correctness (gate/up/down projection shapes) is enforced per-expert at
+        //    pack time by `validate_expert_tensor_group`.
+        // 2. At runtime the packed expert files are managed by `ExpertStore`; the registry records
+        //    their original source metadata but is not used for expert inference.
+        // 3. Real Qwen3 revision checkpoints may differ in expert naming (e.g. shared experts)
+        //    or use a naming scheme that doesn't match the exact pattern assumed here.
+        //    A rigid per-name loop would cause false rejections for such models.
+    }
+    Ok(())
+}
+
+fn require_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+    expected_shape: &[usize],
+) -> Result<()> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    if tensor.shape.as_slice() != expected_shape {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected {:?}",
+            tensor.shape,
+            expected_shape
+        );
+    }
+    Ok(())
+}
+
+fn require_1d_tensor_shape(registry: &TensorRegistry, canonical_name: &str) -> Result<usize> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [width] if *width > 0 => Ok(*width),
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 1-D vector",
+            shape
+        ),
+    }
+}
+
+fn require_conv1d_tensor_shape(
+    registry: &TensorRegistry,
+    canonical_name: &str,
+) -> Result<(usize, usize)> {
+    let tensor = registry.require(canonical_name)?;
+    if dtype_size(&tensor.dtype).is_none() {
+        bail!(
+            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+            tensor.dtype
+        );
+    }
+    match tensor.shape.as_slice() {
+        [channels, kernel_size] if *channels > 0 && *kernel_size > 0 => {
+            Ok((*channels, *kernel_size))
+        }
+        [channels, 1, kernel_size] if *channels > 0 && *kernel_size > 0 => {
+            Ok((*channels, *kernel_size))
+        }
+        shape => bail!(
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty [channels, kernel] or [channels, 1, kernel]",
+            shape
+        ),
+    }
+}
+
+fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
+    if cfg!(test) {
+        Ok(())
+    } else {
+        bail!(
+            "Flash-MoE tensor {tensor_name} is unavailable; synthetic runtime fallback is disabled outside tests"
+        )
+    }
+}
+
+fn attention_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.self_attn.{projection}.weight")
+}
+
+fn linear_attention_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{projection}.weight")
+}
+
+fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{name}")
+}
+
+fn infer_attention_layer_type(
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<AttentionLayerType> {
+    let linear_prefix = format!("model.layers.{layer}.linear_attn.");
+    let has_linear = registry.has_tensor_with_prefix(&linear_prefix);
+    let has_full = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        .iter()
+        .any(|projection| {
+            registry
+                .tensor(&attention_tensor_name(layer, projection))
+                .is_some()
+        });
+
+    match (has_linear, has_full) {
+        (true, true) => bail!(
+            "Flash-MoE tensor manifest has both linear-attention tensors ({linear_prefix}*) and full-attention self_attn projection tensors for layer {layer}"
+        ),
+        (true, false) => Ok(AttentionLayerType::Linear),
+        (false, true) => Ok(AttentionLayerType::Full),
+        (false, false) => bail!(
+            "Flash-MoE tensor manifest is missing attention tensors for layer {layer}; expected either model.layers.{layer}.linear_attn.* or model.layers.{layer}.self_attn.{{q,k,v,o}}_proj.weight"
+        ),
+    }
+}
+
+fn is_full_attention_layer(layer: usize) -> bool {
+    // Compatibility helper for Qwen3.5-397B-A17B's Flash-MoE schedule.
+    // Runtime layer type inference must use the tensor manifest instead.
+    //
+    // Flash-MoE schedules full attention every 4th layer when counted from 1.
+    // In 0-indexed coordinates that is layers 3, 7, 11, ...
+    (layer + 1).is_multiple_of(FULL_ATTN_INTERVAL)
+}
+
+fn router_tensor_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.gate.weight")
+}
+
+fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
+    format!("model.layers.{layer}.{name}.weight")
+}
+
+fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert.{projection}.weight")
+}
+
+fn shared_expert_gate_tensor_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
+}
+
+fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {
+    let bytes_per_row = cols.saturating_mul(std::mem::size_of::<f32>()).max(1);
+    (DENSE_PROJECTION_TILE_BYTES / bytes_per_row)
+        .max(1)
+        .min(rows.max(1))
+}
+
+fn validate_dense_matvec_shape(
+    entry: &RuntimeTensorEntry,
+    canonical_name: &str,
+    expected_rows: usize,
+    input_len: usize,
+) -> Result<(usize, usize)> {
+    let expected_shape = [expected_rows, input_len];
+    match entry.shape.as_slice() {
+        [rows, cols] if *rows == expected_rows && *cols == input_len => Ok((*rows, *cols)),
+        _ => bail!(
+            "Flash-MoE dense tensor {canonical_name} shape mismatch: expected shape {:?}, actual shape {:?}, input length {input_len}",
+            expected_shape,
+            entry.shape
+        ),
+    }
+}
+
+fn validate_lm_head_matvec_shape(
+    entry: &RuntimeTensorEntry,
+    canonical_name: &str,
+    vocab_size: usize,
+    input_len: usize,
+) -> Result<(usize, usize)> {
+    let expected_shape = [vocab_size, input_len];
+    match entry.shape.as_slice() {
+        [rows, cols] if *rows >= vocab_size && *cols == input_len => Ok((*rows, *cols)),
+        _ => bail!(
+            "Flash-MoE dense tensor {canonical_name} shape mismatch: expected at least {:?}, actual shape {:?}, input length {input_len}",
+            expected_shape,
+            entry.shape
+        ),
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+#[derive(Debug, Clone)]
+pub struct DenseStore {
+    manifest_path: PathBuf,
+    len: u64,
+    mmap: Arc<memmap2::Mmap>,
+    registry: TensorRegistry,
+    resident: Arc<std::sync::Mutex<DenseTensorCache>>,
+    norm_weights: Arc<std::sync::Mutex<BTreeMap<DenseNormWeightKey, Arc<Vec<f32>>>>>,
+    decoded_tiles: Arc<std::sync::Mutex<DenseTensorTileCache>>,
+    raw_tiles: Arc<std::sync::Mutex<DenseRawTensorTileCache>>,
+    #[cfg(test)]
+    decoded_full_tensors: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    decoded_tensor_tiles: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug, Default)]
+struct DenseTensorCache {
+    tensors: BTreeMap<String, Arc<Vec<f32>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseTensorTileKey {
+    name: String,
+    start_row: usize,
+    row_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseNormWeightKey {
+    name: String,
+    width: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DenseTileReadTiming {
+    total: Duration,
+    read_range: Duration,
+    decode: Duration,
+    cache_insert: Duration,
+    cache_evict: Duration,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_inserts: u64,
+    cache_evictions: u64,
+    bytes_read: u64,
+    decoded_bytes: u64,
+}
+
+impl DenseTileReadTiming {
+    fn add(&mut self, other: Self) {
+        self.total += other.total;
+        self.read_range += other.read_range;
+        self.decode += other.decode;
+        self.cache_insert += other.cache_insert;
+        self.cache_evict += other.cache_evict;
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.cache_inserts = self.cache_inserts.saturating_add(other.cache_inserts);
+        self.cache_evictions = self.cache_evictions.saturating_add(other.cache_evictions);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.decoded_bytes = self.decoded_bytes.saturating_add(other.decoded_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MetalMatvecTiming {
+    buffer_upload: Duration,
+    dispatch: Duration,
+    readback: Duration,
+}
+
+impl MetalMatvecTiming {
+    fn add(&mut self, other: Self) {
+        self.buffer_upload += other.buffer_upload;
+        self.dispatch += other.dispatch;
+        self.readback += other.readback;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DenseTensorTileCacheInsertStats {
+    inserts: u64,
+    evictions: u64,
+    insert_time: Duration,
+    evict_time: Duration,
+}
+
+#[derive(Debug, Default)]
+struct DenseTensorTileCache {
+    tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<f32>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct DenseRawTensorTileCache {
+    tiles: BTreeMap<DenseTensorTileKey, Arc<Vec<u8>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl DenseTensorTileCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, key: &DenseTensorTileKey) -> Option<Arc<Vec<f32>>> {
+        self.tiles.get(key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        key: DenseTensorTileKey,
+        tile: Arc<Vec<f32>>,
+    ) -> DenseTensorTileCacheInsertStats {
+        let bytes = tile.len() * std::mem::size_of::<f32>();
+        if bytes == 0 || bytes > self.max_bytes {
+            return DenseTensorTileCacheInsertStats::default();
+        }
+        if let Some(previous) = self.tiles.remove(&key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+        }
+        let evict_started = Instant::now();
+        let mut evictions = 0u64;
+        while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tiles.is_empty() {
+            let Some(victim) = self.tiles.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.tiles.remove(&victim) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+                evictions = evictions.saturating_add(1);
+            }
+        }
+        let evict_time = if evictions > 0 {
+            evict_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
+        let insert_started = Instant::now();
+        self.tiles.insert(key, tile);
+        self.bytes = self.bytes.saturating_add(bytes);
+        DenseTensorTileCacheInsertStats {
+            inserts: 1,
+            evictions,
+            insert_time: insert_started.elapsed(),
+            evict_time,
+        }
+    }
+}
+
+impl DenseRawTensorTileCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, key: &DenseTensorTileKey) -> Option<Arc<Vec<u8>>> {
+        self.tiles.get(key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        key: DenseTensorTileKey,
+        tile: Arc<Vec<u8>>,
+    ) -> DenseTensorTileCacheInsertStats {
+        let bytes = tile.len();
+        if bytes == 0 || bytes > self.max_bytes {
+            return DenseTensorTileCacheInsertStats::default();
+        }
+        if let Some(previous) = self.tiles.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.len());
+        }
+        let evict_started = Instant::now();
+        let mut evictions = 0u64;
+        while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tiles.is_empty() {
+            let Some(victim) = self.tiles.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.tiles.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(previous.len());
+                evictions = evictions.saturating_add(1);
+            }
+        }
+        let evict_time = if evictions > 0 {
+            evict_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
+        let insert_started = Instant::now();
+        self.tiles.insert(key, tile);
+        self.bytes = self.bytes.saturating_add(bytes);
+        DenseTensorTileCacheInsertStats {
+            inserts: 1,
+            evictions,
+            insert_time: insert_started.elapsed(),
+            evict_time,
+        }
+    }
+}
+
+impl DenseTensorCache {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<Arc<Vec<f32>>> {
+        self.tensors.get(name).cloned()
+    }
+
+    fn insert(&mut self, name: String, tensor: Arc<Vec<f32>>) {
+        let bytes = tensor.len() * std::mem::size_of::<f32>();
+        if bytes > self.max_bytes {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > self.max_bytes && !self.tensors.is_empty() {
+            let Some(victim) = self.tensors.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.tensors.remove(&victim) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+            }
+        }
+        if let Some(previous) = self.tensors.insert(name, tensor) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous.len() * std::mem::size_of::<f32>());
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+impl DenseStore {
+    pub fn open(path: PathBuf, manifest_path: PathBuf) -> Result<Self> {
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open dense store {}", path.display()))?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("failed to stat dense store {}", path.display()))?
+            .len();
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .with_context(|| format!("failed to memory-map dense store {}", path.display()))?
+        };
+        let registry = TensorRegistry::load(&manifest_path)?;
+        Ok(Self {
+            manifest_path,
+            len,
+            mmap: Arc::new(mmap),
+            registry,
+            resident: Arc::new(std::sync::Mutex::new(DenseTensorCache::with_budget(
+                512 * 1024 * 1024,
+            ))),
+            norm_weights: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            decoded_tiles: Arc::new(std::sync::Mutex::new(DenseTensorTileCache::with_budget(
+                DENSE_DECODED_TILE_CACHE_BYTES,
+            ))),
+            raw_tiles: Arc::new(std::sync::Mutex::new(DenseRawTensorTileCache::with_budget(
+                DENSE_DECODED_TILE_CACHE_BYTES,
+            ))),
+            #[cfg(test)]
+            decoded_full_tensors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            decoded_tensor_tiles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn registry(&self) -> &TensorRegistry {
+        &self.registry
+    }
+
+    fn seed(&self, position: usize, previous: u32) -> Result<u64> {
+        Ok(self
+            .read_u64(position as u64)?
+            .wrapping_add(u64::from(previous)))
+    }
+
+    fn embedding(&self, token: u32, width: usize) -> Result<Vec<f32>> {
+        if let Some(row) =
+            self.read_tensor_row_f32("model.embed_tokens.weight", token as usize, width)?
+        {
+            return Ok(row);
+        }
+        bail!(
+            "Flash-MoE dense tensor registry cannot provide model.embed_tokens.weight row for token {token}; refusing synthetic embeddings"
+        )
+    }
+
+    fn project(&self, layer: usize, name: &str, input: &[f32], width: usize) -> Result<Vec<f32>> {
+        let tensor_name = attention_tensor_name(layer, name);
+        if let Some(projected) = self.matvec_tensor_prefix(&tensor_name, input, width)? {
+            return Ok(projected);
+        }
+        ensure_synthetic_runtime_allowed(&tensor_name)?;
+        let salt = self.tensor_seed(&tensor_name, stable_hash(name) ^ ((layer as u64) << 32));
+        let mut out = vec![0.0f32; width];
+        for (row, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (col, value) in input.iter().enumerate() {
+                let bits = self.read_u64(salt ^ ((row as u64) << 20) ^ col as u64)?;
+                let weight = ((bits >> 40) as f32 / ((1u64 << 24) as f32)) * 2.0 - 1.0;
+                acc = value.mul_add(weight, acc);
+            }
+            *slot = acc / (input.len().max(1) as f32).sqrt();
+        }
+        Ok(out)
+    }
+
+    fn project_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        layer: usize,
+        name: &str,
+        input: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let tensor_name = attention_tensor_name(layer, name);
+        if let Some(entry) = self.registry.tensor(&tensor_name) {
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, &tensor_name, width, input.len())?;
+            if let Some(metal) = metal {
+                return self.metal_matvec_tiled(metal, &tensor_name, input, rows, cols, width);
+            }
+            if let TensorQuantization::Q4 { .. } = entry.quantization {
+                return self.q4_matvec_tiled(&tensor_name, input, rows, cols, width, None);
+            }
+        }
+        self.project(layer, name, input, width)
+    }
+
+    fn project_dense_tensors_batched_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        specs: &[DenseProjectionRequest<'_>],
+        input: &[f32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let Some(metal) = metal else {
+            return Ok(None);
+        };
+        if !metal.has_resident_dense_weights() || specs.is_empty() {
+            return Ok(None);
+        }
+        let projection_started = Instant::now();
+        let mut has_q4 = false;
+        let mut has_dense = false;
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            match entry.quantization {
+                TensorQuantization::None => has_dense = true,
+                TensorQuantization::Q4 { .. } => has_q4 = true,
+            }
+        }
+        if has_q4 {
+            if has_dense {
+                return Ok(None);
+            }
+            let mut q4_projections = Vec::with_capacity(specs.len());
+            let mut total_rows = 0usize;
+            for spec in specs {
+                let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                    return Ok(None);
+                };
+                let TensorQuantization::Q4 { group_size, .. } = &entry.quantization else {
+                    return Ok(None);
+                };
+                let (rows, cols) = validate_dense_matvec_shape(
+                    entry,
+                    spec.tensor_name,
+                    spec.output_width,
+                    input.len(),
+                )?;
+                let layout = dense_q4_layout(&entry.shape, *group_size)?;
+                if entry.byte_len as usize != layout.total_bytes {
+                    bail!(
+                        "dense q4 tensor {} byte length {} does not match computed layout {}",
+                        entry.name,
+                        entry.byte_len,
+                        layout.total_bytes
+                    );
+                }
+                if rows != layout.rows || cols != layout.cols {
+                    bail!(
+                        "dense q4 batch tensor {} shape mismatch: layout rows={}, cols={}, requested rows={rows}, cols={cols}",
+                        entry.name,
+                        layout.rows,
+                        layout.cols
+                    );
+                }
+                let packed_byte_offset = entry.byte_offset;
+                let scales_byte_offset = entry
+                    .byte_offset
+                    .checked_add(layout.packed_bytes as u64)
+                    .context("dense q4 batch scales offset overflow")?;
+                let biases_byte_offset = scales_byte_offset
+                    .checked_add(layout.scales_bytes as u64)
+                    .context("dense q4 batch biases offset overflow")?;
+                if entry
+                    .byte_offset
+                    .checked_add(entry.byte_len)
+                    .map_or(true, |end| end > self.len)
+                {
+                    bail!(
+                        "Flash-MoE dense q4 tensor {} byte range {}..{} exceeds dense store length {}",
+                        spec.tensor_name,
+                        entry.byte_offset,
+                        entry.byte_offset.saturating_add(entry.byte_len),
+                        self.len
+                    );
+                }
+                total_rows = total_rows
+                    .checked_add(rows)
+                    .context("dense q4 tensor batch total row count overflow")?;
+                q4_projections.push(DenseQ4MmapMatvecProjection {
+                    tensor_name: spec.tensor_name.to_string(),
+                    packed_byte_offset,
+                    scales_byte_offset,
+                    biases_byte_offset,
+                    rows,
+                    cols,
+                    output_width: spec.output_width,
+                    row_packed_bytes: layout.row_packed_bytes,
+                    groups_per_row: layout.groups_per_row,
+                    group_size: *group_size,
+                });
+            }
+
+            let Some((outputs, timing, dispatch_count)) =
+                metal.q4_mmap_matvec_batch(&q4_projections, input)?
+            else {
+                return Ok(None);
+            };
+
+            let total = projection_started.elapsed();
+            if total >= Duration::from_millis(100) {
+                let names = specs
+                    .iter()
+                    .map(|spec| spec.tensor_name)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                info!(
+                    projection_batch = %names,
+                    projection_count = specs.len(),
+                    dispatch_count,
+                    input_len = input.len(),
+                    total_rows,
+                    metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
+                    metal_dispatch_ms = duration_ms(timing.dispatch),
+                    metal_readback_ms = duration_ms(timing.readback),
+                    total_ms = duration_ms(total),
+                    "flashmoe dense q4 projection batch complete"
+                );
+            }
+
+            return Ok(Some(outputs));
+        }
+
+        let mut projections = Vec::with_capacity(specs.len());
+        let mut total_rows = 0usize;
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            if entry.quantization != TensorQuantization::None {
+                return Ok(None);
+            }
+            let (rows, cols) = validate_dense_matvec_shape(
+                entry,
+                spec.tensor_name,
+                spec.output_width,
+                input.len(),
+            )?;
+            let Some(element_size) = dtype_size(&entry.dtype) else {
+                bail!(
+                    "Flash-MoE dense tensor {} has unsupported dtype {}",
+                    spec.tensor_name,
+                    entry.dtype
+                );
+            };
+            let row_bytes = cols
+                .checked_mul(element_size)
+                .context("dense tensor batch resident row byte length overflow")?;
+            let byte_len = rows
+                .checked_mul(row_bytes)
+                .context("dense tensor batch resident byte length overflow")?;
+            if entry
+                .byte_offset
+                .checked_add(byte_len as u64)
+                .map_or(true, |end| end > self.len)
+            {
+                bail!(
+                    "Flash-MoE dense tensor {} byte range {}..{} exceeds dense store length {}",
+                    spec.tensor_name,
+                    entry.byte_offset,
+                    entry.byte_offset.saturating_add(byte_len as u64),
+                    self.len
+                );
+            }
+            total_rows = total_rows
+                .checked_add(rows)
+                .context("dense tensor batch total row count overflow")?;
+            projections.push(DenseMmapMatvecProjection {
+                tensor_name: spec.tensor_name.to_string(),
+                byte_offset: entry.byte_offset,
+                dtype: entry.dtype.clone(),
+                rows,
+                cols,
+                output_width: spec.output_width,
+            });
+        }
+
+        let Some((outputs, timing, dispatch_count)) =
+            metal.dense_mmap_matvec_batch(&projections, input)?
+        else {
+            return Ok(None);
+        };
+
+        let total = projection_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            let names = specs
+                .iter()
+                .map(|spec| spec.tensor_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
+                projection_batch = %names,
+                projection_count = specs.len(),
+                dispatch_count,
+                input_len = input.len(),
+                total_rows,
+                metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(timing.dispatch),
+                metal_readback_ms = duration_ms(timing.readback),
+                total_ms = duration_ms(total),
+                "flashmoe dense projection batch complete"
+            );
+        }
+
+        Ok(Some(outputs))
+    }
+
+    /// Project using a fully-qualified canonical tensor name (e.g. for shared
+    /// experts or any non-attention projection).  Falls back to a zero-vector
+    /// when the tensor is absent (tensor not present in this checkpoint means
+    /// the feature is disabled for this model variant).
+    fn project_dense_tensor_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        tensor_name: &str,
+        input: &[f32],
+        output_width: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let entry = match self.registry.tensor(tensor_name) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, tensor_name, output_width, input.len())?;
+        if let Some(metal) = metal {
+            return self
+                .metal_matvec_tiled(metal, tensor_name, input, rows, cols, output_width)
+                .map(Some);
+        }
+        if let TensorQuantization::Q4 { .. } = entry.quantization {
+            return self
+                .q4_matvec_tiled(tensor_name, input, rows, cols, output_width, None)
+                .map(Some);
+        }
+        if let Some(projected) = self.matvec_tensor_prefix(tensor_name, input, output_width)? {
+            return Ok(Some(projected));
+        }
+        Ok(None)
+    }
+
+    fn rms_norm(&self, canonical_name: &str, input: &[f32]) -> Result<Vec<f32>> {
+        let mut out = input.to_vec();
+        let weight = self.norm_weight(canonical_name, input.len())?;
+        if weight.is_none() {
+            ensure_synthetic_runtime_allowed(canonical_name)?;
+        }
+        rms_norm_with_weight_in_place(&mut out, weight.as_deref());
+        Ok(out)
+    }
+
+    fn norm_weight(&self, canonical_name: &str, width: usize) -> Result<Option<Vec<f32>>> {
+        let key = DenseNormWeightKey {
+            name: canonical_name.to_string(),
+            width,
+        };
+        if let Some(weight) = self
+            .norm_weights
+            .lock()
+            .expect("dense norm weight cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some((*weight).clone()));
+        }
+        let Some(weight) = self.read_tensor_row_f32(canonical_name, 0, width)? else {
+            return Ok(None);
+        };
+        self.norm_weights
+            .lock()
+            .expect("dense norm weight cache poisoned")
+            .insert(key, Arc::new(weight.clone()));
+        Ok(Some(weight))
+    }
+
+    fn router_projection(&self, layer: usize, expert: usize, hidden: &[f32]) -> Result<f32> {
+        let tensor_name = router_tensor_name(layer);
+        if let Some(row) = self.read_tensor_row_f32(&tensor_name, expert, hidden.len())? {
+            let acc = row
+                .iter()
+                .zip(hidden)
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+            return Ok(acc);
+        }
+        ensure_synthetic_runtime_allowed(&tensor_name)?;
+        let salt = self.tensor_seed(&tensor_name, ((layer as u64) << 32) ^ expert as u64);
+        let mut acc = 0.0f32;
+        for (idx, value) in hidden.iter().enumerate() {
+            let bits = self.read_u64(salt ^ idx as u64)?;
+            let weight = ((bits >> 40) as f32 / ((1u64 << 24) as f32)) * 2.0 - 1.0;
+            acc = value.mul_add(weight, acc);
+        }
+        Ok(acc)
+    }
+
+    fn router_scores_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        layer: usize,
+        experts: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
+        let tensor_name = router_tensor_name(layer);
+        let _ = metal;
+        if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
+            return Ok(scores);
+        }
+        let mut router_scores = vec![0.0f32; experts];
+        for (expert, score) in router_scores.iter_mut().enumerate() {
+            *score = self.router_projection(layer, expert, hidden)?;
+        }
+        Ok(router_scores)
+    }
+
+    fn router_scores_with_accelerate(
+        &self,
+        tensor_name: &str,
+        experts: usize,
+        hidden: &[f32],
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(entry) = self.registry.tensor(tensor_name) else {
+            return Ok(None);
+        };
+        if entry.quantization != TensorQuantization::None {
+            return Ok(None);
+        }
+        let (rows, cols) = validate_dense_matvec_shape(entry, tensor_name, experts, hidden.len())?;
+        if rows != experts || cols != hidden.len() {
+            return Ok(None);
+        }
+        let weights = self.read_tensor_rows_f32_cached(tensor_name, 0, experts)?;
+        dense_f32_matvec_rows(weights.as_slice(), hidden, rows, cols)
+    }
+
+    fn lm_head_logits_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        _state: u64,
+        hidden: &[f32],
+        tokenizer: &QwenTokenizer,
+    ) -> Result<Vec<f32>> {
+        let lm_head_name = self.lm_head_tensor_name()?;
+        if let Some(metal) = metal
+            && let Some(entry) = self.registry.tensor(lm_head_name)
+        {
+            let (rows, cols) = validate_lm_head_matvec_shape(
+                entry,
+                lm_head_name,
+                tokenizer.vocab_size(),
+                hidden.len(),
+            )?;
+            let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+            let projected =
+                self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
+            for (token, value) in projected
+                .into_iter()
+                .take(tokenizer.vocab_size())
+                .enumerate()
+            {
+                logits[token] = value;
+            }
+            return Ok(logits);
+        }
+
+        self.lm_head_logits(lm_head_name, hidden, tokenizer)
+    }
+
+    fn lm_head_top_candidates_with_metal(
+        &self,
+        metal: Option<&MetalExecutor>,
+        hidden: &[f32],
+        tokenizer: &QwenTokenizer,
+        sampler: &TokenSampler,
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        let Some(metal) = metal else {
+            return Ok(None);
+        };
+        let lm_head_name = self.lm_head_tensor_name()?;
+        let Some(entry) = self.registry.tensor(lm_head_name) else {
+            return Ok(None);
+        };
+        let (rows, cols) = validate_lm_head_matvec_shape(
+            entry,
+            lm_head_name,
+            tokenizer.vocab_size(),
+            hidden.len(),
+        )?;
+
+        let vocab_rows = tokenizer.vocab_size();
+        let top_k = sampler.top_k.min(vocab_rows).max(1);
+        let repeated = sampler.repeated_tokens(prompt, generated);
+        if metal.has_resident_dense_weights() && entry.quantization == TensorQuantization::None {
+            let projected =
+                self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
+            let mut candidates = TopKCandidates::new(top_k);
+            for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
+            }
+            return Ok(Some(candidates.into_sorted_vec()));
+        }
+
+        let lm_head_bytes = vocab_rows
+            .checked_mul(cols)
+            .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+            .context("LM-head decoded byte length overflow")?;
+        if let Some(candidates) = metal.lm_head_top_candidates_from_cached_buffer(
+            lm_head_name,
+            hidden,
+            vocab_rows,
+            cols,
+            top_k,
+            sampler.repeat_penalty,
+            &repeated,
+        )? {
+            return Ok(Some(candidates));
+        }
+        if metal.can_cache_lm_head_bytes(lm_head_bytes) {
+            if let Some(weights) = self.read_full_tensor_f32(lm_head_name)? {
+                match metal.cache_lm_head_and_top_candidates(
+                    lm_head_name,
+                    &weights,
+                    hidden,
+                    vocab_rows,
+                    cols,
+                    top_k,
+                    sampler.repeat_penalty,
+                    &repeated,
+                ) {
+                    Ok(Some(candidates)) => return Ok(Some(candidates)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            tensor = lm_head_name,
+                            "falling back to tiled LM-head sampling after Metal top-k cache failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut candidates = TopKCandidates::new(top_k);
+        let tile_rows = dense_projection_tile_rows(cols, rows);
+        for start in (0..rows).step_by(tile_rows) {
+            let end = (start + tile_rows).min(rows);
+            let tensor = self.read_tensor_rows_f32_cached(lm_head_name, start, end - start)?;
+            let projected = metal.dense_matvec(tensor.as_slice(), hidden, end - start, cols)?;
+            for (offset, value) in projected.into_iter().enumerate() {
+                let token = start + offset;
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
+            }
+        }
+        Ok(Some(candidates.into_sorted_vec()))
+    }
+
+    fn lm_head_logits(
+        &self,
+        lm_head_name: &str,
+        hidden: &[f32],
+        tokenizer: &QwenTokenizer,
+    ) -> Result<Vec<f32>> {
+        let entry = self.registry.require(lm_head_name)?;
+        validate_lm_head_matvec_shape(entry, lm_head_name, tokenizer.vocab_size(), hidden.len())?;
+        let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+        for idx in 0..tokenizer.vocab_size() {
+            let Some(row) = self.read_tensor_row_f32(lm_head_name, idx, hidden.len())? else {
+                bail!(
+                    "Flash-MoE LM head tensor {lm_head_name} cannot provide row for token {idx}; refusing synthetic logits"
+                );
+            };
+            logits[idx] = row
+                .iter()
+                .zip(hidden)
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+        }
+        Ok(logits)
+    }
+
+    fn lm_head_tensor_name(&self) -> Result<&'static str> {
+        if self.registry.tensor("lm_head.weight").is_some() {
+            Ok("lm_head.weight")
+        } else if self.registry.tensor("model.embed_tokens.weight").is_some() {
+            Ok("model.embed_tokens.weight")
+        } else {
+            bail!(
+                "Flash-MoE dense tensor registry is missing lm_head.weight and tied model.embed_tokens.weight"
+            )
+        }
+    }
+
+    fn matvec_tensor_prefix(
+        &self,
+        canonical_name: &str,
+        input: &[f32],
+        width: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            return Ok(None);
+        };
+        if entry.quantization != TensorQuantization::None {
+            bail!("dense q4 tensor {canonical_name} cannot be read as a full f32 tensor");
+        }
+        let (rows, cols) = validate_dense_matvec_shape(entry, canonical_name, width, input.len())?;
+        if let Some(tensor) = self.dense_tensor_f32(canonical_name)? {
+            let expected_len = rows
+                .checked_mul(cols)
+                .context("dense resident tensor value count overflow")?;
+            if tensor.len() != expected_len {
+                bail!(
+                    "Flash-MoE dense tensor {canonical_name} has {} decoded values; expected {expected_len} for shape {:?} and input length {}",
+                    tensor.len(),
+                    entry.shape,
+                    input.len()
+                );
+            }
+            let mut out = vec![0.0f32; width];
+            for (row, slot) in out.iter_mut().take(rows).enumerate() {
+                let start = row
+                    .checked_mul(cols)
+                    .context("dense resident tensor row offset overflow")?;
+                let end = start
+                    .checked_add(cols)
+                    .context("dense resident tensor row length overflow")?;
+                let weights = &tensor[start..end];
+                let acc = weights
+                    .iter()
+                    .zip(input.iter())
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f32>();
+                *slot = acc;
+            }
+            return Ok(Some(out));
+        }
+        let mut out = vec![0.0f32; width];
+        for (row, slot) in out.iter_mut().take(rows).enumerate() {
+            let weights = self.read_tensor_row_f32(canonical_name, row, cols)?;
+            let Some(weights) = weights else {
+                return Ok(None);
+            };
+            let acc = weights
+                .iter()
+                .zip(input.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+            *slot = acc;
+        }
+        Ok(Some(out))
+    }
+
+    fn metal_matvec_tiled(
+        &self,
+        metal: &MetalExecutor,
+        canonical_name: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        output_width: usize,
+    ) -> Result<Vec<f32>> {
+        let projection_started = Instant::now();
+        let entry = self.registry.tensor(canonical_name).with_context(|| {
+            format!("Flash-MoE dense tensor registry is missing {canonical_name}")
+        })?;
+        validate_dense_matvec_shape(entry, canonical_name, output_width, input.len())?;
+        if let TensorQuantization::Q4 { group_size, .. } = &entry.quantization {
+            return self.q4_matvec_tiled(
+                canonical_name,
+                input,
+                rows,
+                cols,
+                output_width,
+                Some((metal, *group_size, projection_started)),
+            );
+        }
+        if rows != output_width || cols != input.len() {
+            bail!(
+                "Flash-MoE dense tensor {canonical_name} matvec dimensions mismatch: expected shape [{output_width}, {}], actual requested rows={rows}, cols={cols}, input length {}",
+                input.len(),
+                input.len()
+            );
+        }
+        let dtype = entry.dtype.clone();
+        let use_raw_bf16 = is_bf16_dtype(&dtype);
+        let mut decoded_read_timing = DenseTileReadTiming::default();
+        let mut raw_read_timing = DenseTileReadTiming::default();
+        let mut metal_timing = MetalMatvecTiming::default();
+        let mut output = vec![0.0f32; output_width];
+        let mut resident_tiles = 0usize;
+        let mut resident_bytes = 0u64;
+        let tile_rows = dense_projection_tile_rows(cols, rows);
+        let mut tiles = 0usize;
+        let element_size = dtype_size(&dtype);
+        for start in (0..rows).step_by(tile_rows) {
+            let end = (start + tile_rows).min(rows);
+            let tile_rows = end - start;
+            let resident = if let Some(element_size) = element_size {
+                let row_bytes = cols
+                    .checked_mul(element_size)
+                    .context("dense tensor resident row byte length overflow")?;
+                let tile_byte_offset = start
+                    .checked_mul(row_bytes)
+                    .context("dense tensor resident tile byte offset overflow")?;
+                let tile_byte_offset = u64::try_from(tile_byte_offset)
+                    .context("dense tensor resident tile offset does not fit u64")?;
+                let resident_byte_offset = entry
+                    .byte_offset
+                    .checked_add(tile_byte_offset)
+                    .context("dense tensor resident byte offset overflow")?;
+                metal
+                    .dense_mmap_matvec(resident_byte_offset, &dtype, input, tile_rows, cols, cols)?
+                    .map(|result| (result, row_bytes))
+            } else {
+                None
+            };
+            let projected = if let Some(((projected, timing), row_bytes)) = resident {
+                metal_timing.add(timing);
+                resident_tiles += 1;
+                resident_bytes = resident_bytes.saturating_add((tile_rows * row_bytes) as u64);
+                projected
+            } else if use_raw_bf16 {
+                let (tensor, tile_dtype, timing) =
+                    self.read_tensor_rows_raw_cached_profiled(canonical_name, start, tile_rows)?;
+                raw_read_timing.add(timing);
+                if !is_bf16_dtype(&tile_dtype) {
+                    bail!(
+                        "Flash-MoE raw dense tensor {} has dtype {}; expected BF16",
+                        canonical_name,
+                        tile_dtype
+                    );
+                }
+                let (projected, timing) =
+                    metal.dense_matvec_bf16(tensor.as_slice(), input, tile_rows, cols)?;
+                metal_timing.add(timing);
+                projected
+            } else {
+                let (tensor, timing) =
+                    self.read_tensor_rows_f32_cached_profiled(canonical_name, start, tile_rows)?;
+                decoded_read_timing.add(timing);
+                metal.dense_matvec(tensor.as_slice(), input, tile_rows, cols)?
+            };
+            for (offset, value) in projected.into_iter().enumerate() {
+                output[start + offset] = value;
+            }
+            tiles += 1;
+        }
+        let total = projection_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            info!(
+                projection = %canonical_name,
+                rows,
+                cols,
+                tile_rows,
+                tiles,
+                input_len = input.len(),
+                output_width,
+                tile_mb = DENSE_PROJECTION_TILE_BYTES / (1024 * 1024),
+                resident_mmap_tiles = resident_tiles,
+                resident_mmap_bytes = resident_bytes,
+                dtype = %dtype,
+                raw_read_ms = duration_ms(raw_read_timing.total),
+                metal_buffer_upload_ms = duration_ms(metal_timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(metal_timing.dispatch),
+                metal_readback_ms = duration_ms(metal_timing.readback),
+                read_decode_ms = duration_ms(decoded_read_timing.total),
+                read_range_ms = duration_ms(decoded_read_timing.read_range),
+                dtype_decode_ms = duration_ms(decoded_read_timing.decode),
+                decoded_tile_cache_hits = decoded_read_timing.cache_hits,
+                decoded_tile_cache_misses = decoded_read_timing.cache_misses,
+                decoded_tile_cache_inserts = decoded_read_timing.cache_inserts,
+                decoded_tile_cache_evictions = decoded_read_timing.cache_evictions,
+                decoded_tile_cache_insert_ms = duration_ms(decoded_read_timing.cache_insert),
+                decoded_tile_cache_evict_ms = duration_ms(decoded_read_timing.cache_evict),
+                dense_bytes_read = decoded_read_timing.bytes_read.saturating_add(raw_read_timing.bytes_read),
+                dense_decoded_bytes = decoded_read_timing.decoded_bytes,
+                total_ms = duration_ms(total),
+                "flashmoe dense projection complete"
+            );
+        }
+        Ok(output)
+    }
+
+    fn q4_matvec_tiled(
+        &self,
+        canonical_name: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        output_width: usize,
+        metal: Option<(&MetalExecutor, usize, Instant)>,
+    ) -> Result<Vec<f32>> {
+        let projection_started = metal
+            .as_ref()
+            .map(|(_, _, started)| *started)
+            .unwrap_or_else(Instant::now);
+        let entry = self.registry.tensor(canonical_name).with_context(|| {
+            format!("Flash-MoE dense tensor registry is missing {canonical_name}")
+        })?;
+        let TensorQuantization::Q4 { group_size, .. } = &entry.quantization else {
+            bail!("Flash-MoE dense tensor {canonical_name} is not q4-quantized");
+        };
+        let group_size = metal
+            .as_ref()
+            .map(|(_, group_size, _)| *group_size)
+            .unwrap_or(*group_size);
+        let layout = dense_q4_layout(&entry.shape, group_size)?;
+        if rows != layout.rows || cols != layout.cols {
+            bail!(
+                "Flash-MoE dense q4 tensor {canonical_name} matvec dimensions mismatch: layout rows={}, cols={}, requested rows={rows}, cols={cols}",
+                layout.rows,
+                layout.cols
+            );
+        }
+        let mut output = vec![0.0f32; output_width];
+        let tile_rows = dense_projection_tile_rows(cols, rows);
+        let mut q4_timing = DenseTileReadTiming::default();
+        let mut metal_timing = MetalMatvecTiming::default();
+        let mut resident_tiles = 0usize;
+        let mut resident_bytes = 0u64;
+        let mut tiles = 0usize;
+        for start in (0..rows).step_by(tile_rows) {
+            let end = (start + tile_rows).min(rows);
+            let tile_rows = end - start;
+            let groups_offset = start
+                .checked_mul(layout.groups_per_row)
+                .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+                .context("dense q4 mmap groups tile offset overflow")?;
+            let resident = if let Some((metal, _, _)) = metal.as_ref() {
+                let packed_offset = entry
+                    .byte_offset
+                    .checked_add(
+                        (start * layout.row_packed_bytes)
+                            .try_into()
+                            .context("dense q4 mmap packed offset does not fit u64")?,
+                    )
+                    .context("dense q4 mmap packed offset overflow")?;
+                let scales_offset = entry
+                    .byte_offset
+                    .checked_add(layout.packed_bytes as u64)
+                    .and_then(|offset| offset.checked_add(groups_offset as u64))
+                    .context("dense q4 mmap scales offset overflow")?;
+                let biases_offset = entry
+                    .byte_offset
+                    .checked_add(layout.packed_bytes as u64)
+                    .and_then(|offset| offset.checked_add(layout.scales_bytes as u64))
+                    .and_then(|offset| offset.checked_add(groups_offset as u64))
+                    .context("dense q4 mmap biases offset overflow")?;
+                metal.q4_mmap_matvec(
+                    packed_offset,
+                    scales_offset,
+                    biases_offset,
+                    input,
+                    tile_rows,
+                    cols,
+                    layout.row_packed_bytes,
+                    layout.groups_per_row,
+                    group_size,
+                )?
+            } else {
+                None
+            };
+            let projected = if let Some((projected, timing)) = resident {
+                metal_timing.add(timing);
+                resident_tiles += 1;
+                resident_bytes = resident_bytes.saturating_add(
+                    (tile_rows * layout.row_packed_bytes
+                        + tile_rows * layout.groups_per_row * 2 * std::mem::size_of::<f32>())
+                        as u64,
+                );
+                projected
+            } else {
+                let (packed, scales, biases, timing) =
+                    self.read_dense_q4_rows(entry, start, tile_rows, group_size)?;
+                q4_timing.add(timing);
+                if let Some((metal, _, _)) = metal.as_ref() {
+                    metal.q4_matvec(
+                        &packed, input, &scales, &biases, tile_rows, cols, group_size,
+                    )?
+                } else {
+                    q4_fma_matvec_with_group_size(
+                        &packed, input, &scales, &biases, tile_rows, cols, group_size,
+                    )?
+                }
+            };
+            output[start..end].copy_from_slice(&projected[..tile_rows]);
+            tiles += 1;
+        }
+        let total = projection_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            info!(
+                projection = %canonical_name,
+                rows,
+                cols,
+                output_width,
+                group_size,
+                tiles,
+                backend = if metal.is_some() { "metal" } else { "cpu" },
+                resident_mmap_tiles = resident_tiles,
+                resident_mmap_bytes = resident_bytes,
+                q4_read_ms = duration_ms(q4_timing.total),
+                q4_read_range_ms = duration_ms(q4_timing.read_range),
+                q4_decode_ms = duration_ms(q4_timing.decode),
+                metal_buffer_upload_ms = duration_ms(metal_timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(metal_timing.dispatch),
+                metal_readback_ms = duration_ms(metal_timing.readback),
+                dense_bytes_read = q4_timing.bytes_read,
+                dense_decoded_bytes = q4_timing.decoded_bytes,
+                total_ms = duration_ms(total),
+                "flashmoe dense q4 projection complete"
+            );
+        }
+        Ok(output)
+    }
+
+    fn dense_tensor_f32(&self, canonical_name: &str) -> Result<Option<Arc<Vec<f32>>>> {
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            return Ok(None);
+        };
+        if let Some(tensor) = self
+            .resident
+            .lock()
+            .expect("dense tensor cache poisoned")
+            .get(canonical_name)
+        {
+            return Ok(Some(tensor));
+        }
+        let bytes = self.read_range(entry.byte_offset, entry.byte_len as usize)?;
+        let tensor = Arc::new(decode_dense_tensor_f32(&entry.dtype, &bytes)?);
+        #[cfg(test)]
+        self.decoded_full_tensors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.resident
+            .lock()
+            .expect("dense tensor cache poisoned")
+            .insert(canonical_name.to_string(), tensor.clone());
+        Ok(Some(tensor))
+    }
+
+    fn read_tensor_rows_f32_cached(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<Arc<Vec<f32>>> {
+        let (tile, _) =
+            self.read_tensor_rows_f32_cached_profiled(canonical_name, start_row, row_count)?;
+        Ok(tile)
+    }
+
+    fn read_tensor_rows_f32_cached_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Arc<Vec<f32>>, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let key = DenseTensorTileKey {
+            name: canonical_name.to_string(),
+            start_row,
+            row_count,
+        };
+        if let Some(tile) = self
+            .decoded_tiles
+            .lock()
+            .expect("dense decoded tile cache poisoned")
+            .get(&key)
+        {
+            let mut timing = DenseTileReadTiming {
+                cache_hits: 1,
+                ..DenseTileReadTiming::default()
+            };
+            timing.total = started.elapsed();
+            return Ok((tile, timing));
+        }
+        let mut timing = DenseTileReadTiming {
+            cache_misses: 1,
+            ..DenseTileReadTiming::default()
+        };
+        let (decoded, uncached_timing) =
+            self.read_tensor_rows_f32_profiled(canonical_name, start_row, row_count)?;
+        timing.add(uncached_timing);
+        let tile = Arc::new(decoded);
+        let stats = self
+            .decoded_tiles
+            .lock()
+            .expect("dense decoded tile cache poisoned")
+            .insert(key, tile.clone());
+        timing.cache_inserts = timing.cache_inserts.saturating_add(stats.inserts);
+        timing.cache_evictions = timing.cache_evictions.saturating_add(stats.evictions);
+        timing.cache_insert += stats.insert_time;
+        timing.cache_evict += stats.evict_time;
+        timing.total = started.elapsed();
+        Ok((tile, timing))
+    }
+
+    fn read_tensor_rows_raw_cached_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Arc<Vec<u8>>, String, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let key = DenseTensorTileKey {
+            name: canonical_name.to_string(),
+            start_row,
+            row_count,
+        };
+        if let Some(tile) = self
+            .raw_tiles
+            .lock()
+            .expect("dense raw tile cache poisoned")
+            .get(&key)
+        {
+            let mut timing = DenseTileReadTiming {
+                cache_hits: 1,
+                ..DenseTileReadTiming::default()
+            };
+            timing.total = started.elapsed();
+            let dtype = self
+                .registry
+                .tensor(canonical_name)
+                .map(|entry| entry.dtype.clone())
+                .with_context(|| {
+                    format!("Flash-MoE dense tensor registry is missing {canonical_name}")
+                })?;
+            return Ok((tile, dtype, timing));
+        }
+
+        let mut timing = DenseTileReadTiming {
+            cache_misses: 1,
+            ..DenseTileReadTiming::default()
+        };
+        let (bytes, dtype, uncached_timing) =
+            self.read_tensor_rows_raw_profiled(canonical_name, start_row, row_count)?;
+        timing.add(uncached_timing);
+        let tile = Arc::new(bytes);
+        let stats = self
+            .raw_tiles
+            .lock()
+            .expect("dense raw tile cache poisoned")
+            .insert(key, tile.clone());
+        timing.cache_inserts = timing.cache_inserts.saturating_add(stats.inserts);
+        timing.cache_evictions = timing.cache_evictions.saturating_add(stats.evictions);
+        timing.cache_insert += stats.insert_time;
+        timing.cache_evict += stats.evict_time;
+        timing.total = started.elapsed();
+        Ok((tile, dtype, timing))
+    }
+
+    fn read_dense_q4_rows(
+        &self,
+        entry: &RuntimeTensorEntry,
+        start_row: usize,
+        row_count: usize,
+        group_size: usize,
+    ) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let mut timing = DenseTileReadTiming::default();
+        let layout = dense_q4_layout(&entry.shape, group_size)?;
+        if entry.byte_len as usize != layout.total_bytes {
+            bail!(
+                "dense q4 tensor {} byte length {} does not match computed layout {}",
+                entry.name,
+                entry.byte_len,
+                layout.total_bytes
+            );
+        }
+        let end_row = start_row
+            .checked_add(row_count)
+            .context("dense q4 tile row range overflow")?;
+        if end_row > layout.rows {
+            bail!(
+                "dense q4 tensor {} rows {}..{} exceed row count {}",
+                entry.name,
+                start_row,
+                end_row,
+                layout.rows
+            );
+        }
+        if row_count == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new(), timing));
+        }
+        let packed_offset = start_row
+            .checked_mul(layout.row_packed_bytes)
+            .context("dense q4 packed tile offset overflow")?;
+        let packed_len = row_count
+            .checked_mul(layout.row_packed_bytes)
+            .context("dense q4 packed tile length overflow")?;
+        let groups_offset = start_row
+            .checked_mul(layout.groups_per_row)
+            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .context("dense q4 groups tile offset overflow")?;
+        let groups_len = row_count
+            .checked_mul(layout.groups_per_row)
+            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .context("dense q4 groups tile byte length overflow")?;
+
+        let (packed, read_packed) =
+            self.read_range_profiled(entry.byte_offset + packed_offset as u64, packed_len)?;
+        let (scale_bytes, read_scales) = self.read_range_profiled(
+            entry.byte_offset + layout.packed_bytes as u64 + groups_offset as u64,
+            groups_len,
+        )?;
+        let (bias_bytes, read_biases) = self.read_range_profiled(
+            entry.byte_offset
+                + layout.packed_bytes as u64
+                + layout.scales_bytes as u64
+                + groups_offset as u64,
+            groups_len,
+        )?;
+        timing.read_range += read_packed + read_scales + read_biases;
+        timing.bytes_read = timing
+            .bytes_read
+            .saturating_add((packed_len + groups_len + groups_len) as u64);
+        let decode_started = Instant::now();
+        let scales = decode_dense_tensor_f32("F32", &scale_bytes)?;
+        let biases = decode_dense_tensor_f32("F32", &bias_bytes)?;
+        timing.decode += decode_started.elapsed();
+        timing.decoded_bytes = timing
+            .decoded_bytes
+            .saturating_add(((scales.len() + biases.len()) * std::mem::size_of::<f32>()) as u64);
+        timing.total = started.elapsed();
+        Ok((packed, scales, biases, timing))
+    }
+
+    fn read_tensor_rows_raw_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Vec<u8>, String, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let mut timing = DenseTileReadTiming::default();
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            bail!("Flash-MoE dense tensor registry is missing {canonical_name}");
+        };
+        if entry.quantization != TensorQuantization::None {
+            bail!("dense q4 tensor {canonical_name} cannot be read as raw dense rows");
+        }
+        let Some(element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        if entry.shape.is_empty() || cols == 0 || row_count == 0 {
+            return Ok((Vec::new(), entry.dtype.clone(), timing));
+        }
+        let rows = entry
+            .shape
+            .iter()
+            .take(entry.shape.len() - 1)
+            .product::<usize>()
+            .max(1);
+        let end_row = start_row
+            .checked_add(row_count)
+            .context("dense tensor raw tile row range overflow")?;
+        if end_row > rows {
+            bail!(
+                "Flash-MoE dense tensor {} raw tile rows {}..{} exceed row count {}",
+                entry.name,
+                start_row,
+                end_row,
+                rows
+            );
+        }
+        let row_bytes = cols
+            .checked_mul(element_size)
+            .context("dense tensor raw tile row byte length overflow")?;
+        let byte_offset = start_row
+            .checked_mul(row_bytes)
+            .context("dense tensor raw tile byte offset overflow")?;
+        let byte_len = row_count
+            .checked_mul(row_bytes)
+            .context("dense tensor raw tile byte length overflow")?;
+        let (bytes, read_range) =
+            self.read_range_profiled(entry.byte_offset + byte_offset as u64, byte_len)?;
+        timing.read_range += read_range;
+        timing.bytes_read = timing.bytes_read.saturating_add(byte_len as u64);
+        timing.total = started.elapsed();
+        Ok((bytes, entry.dtype.clone(), timing))
+    }
+
+    fn read_tensor_rows_f32(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<Vec<f32>> {
+        let (tensor, _) =
+            self.read_tensor_rows_f32_profiled(canonical_name, start_row, row_count)?;
+        Ok(tensor)
+    }
+
+    fn read_tensor_rows_f32_profiled(
+        &self,
+        canonical_name: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(Vec<f32>, DenseTileReadTiming)> {
+        let started = Instant::now();
+        let mut timing = DenseTileReadTiming::default();
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            bail!("Flash-MoE dense tensor registry is missing {canonical_name}");
+        };
+        if entry.quantization != TensorQuantization::None {
+            bail!("dense q4 tensor {canonical_name} cannot be decoded as f32 rows");
+        }
+        let Some(element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        if entry.shape.is_empty() || cols == 0 || row_count == 0 {
+            return Ok((Vec::new(), timing));
+        }
+        let rows = entry
+            .shape
+            .iter()
+            .take(entry.shape.len() - 1)
+            .product::<usize>()
+            .max(1);
+        let end_row = start_row
+            .checked_add(row_count)
+            .context("dense tensor tile row range overflow")?;
+        if end_row > rows {
+            bail!(
+                "Flash-MoE dense tensor {} tile rows {}..{} exceed row count {}",
+                entry.name,
+                start_row,
+                end_row,
+                rows
+            );
+        }
+        let row_bytes = cols
+            .checked_mul(element_size)
+            .context("dense tensor tile row byte length overflow")?;
+        let byte_offset = start_row
+            .checked_mul(row_bytes)
+            .context("dense tensor tile byte offset overflow")?;
+        let byte_len = row_count
+            .checked_mul(row_bytes)
+            .context("dense tensor tile byte length overflow")?;
+        let (bytes, read_range) =
+            self.read_range_profiled(entry.byte_offset + byte_offset as u64, byte_len)?;
+        timing.read_range += read_range;
+        timing.bytes_read = timing.bytes_read.saturating_add(byte_len as u64);
+        #[cfg(test)]
+        self.decoded_tensor_tiles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let decode_started = Instant::now();
+        let tensor = decode_dense_tensor_f32(&entry.dtype, &bytes)?;
+        timing.decode += decode_started.elapsed();
+        timing.decoded_bytes = timing
+            .decoded_bytes
+            .saturating_add((tensor.len() * std::mem::size_of::<f32>()) as u64);
+        timing.total = started.elapsed();
+        Ok((tensor, timing))
+    }
+
+    fn read_tensor_row_f32(
+        &self,
+        canonical_name: &str,
+        row: usize,
+        requested_cols: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            return Ok(None);
+        };
+        if entry.quantization != TensorQuantization::None {
+            bail!("dense q4 tensor {canonical_name} cannot be read as a f32 row");
+        }
+        let Some(element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        if entry.shape.is_empty() || requested_cols == 0 {
+            return Ok(None);
+        }
+        let cols = entry.shape.last().copied().unwrap_or(0);
+        if cols == 0 {
+            return Ok(None);
+        }
+        let rows = entry
+            .shape
+            .iter()
+            .take(entry.shape.len() - 1)
+            .product::<usize>()
+            .max(1);
+        if row >= rows {
+            return Ok(None);
+        }
+        let used_cols = requested_cols.min(cols);
+        let row_offset = row
+            .checked_mul(cols)
+            .and_then(|items| items.checked_mul(element_size))
+            .context("dense tensor row offset overflow")? as u64;
+        let byte_len = used_cols
+            .checked_mul(element_size)
+            .context("dense tensor row byte length overflow")?;
+        let bytes = self.read_range(entry.byte_offset + row_offset, byte_len)?;
+        Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
+    }
+
+    fn read_range(&self, offset: u64, byte_len: usize) -> Result<Vec<u8>> {
+        let (bytes, _) = self.read_range_profiled(offset, byte_len)?;
+        Ok(bytes)
+    }
+
+    fn read_range_profiled(&self, offset: u64, byte_len: usize) -> Result<(Vec<u8>, Duration)> {
+        if offset.saturating_add(byte_len as u64) > self.len {
+            bail!(
+                "dense tensor read {}..{} exceeds store length {}",
+                offset,
+                offset.saturating_add(byte_len as u64),
+                self.len
+            );
+        }
+        let started = Instant::now();
+        let bytes = self.mmap[offset as usize..offset as usize + byte_len].to_vec();
+        Ok((bytes, started.elapsed()))
+    }
+
+    fn tensor_seed(&self, canonical_name: &str, fallback: u64) -> u64 {
+        if let Some(tensor) = self.registry.tensor(canonical_name) {
+            stable_hash(&tensor.name)
+                ^ stable_hash(&tensor.dtype)
+                ^ tensor.byte_offset
+                ^ tensor.byte_len.rotate_left(7)
+                ^ ((tensor.shape.iter().copied().product::<usize>() as u64) << 11)
+        } else {
+            tracing::trace!(
+                tensor = canonical_name,
+                manifest = %self.manifest_path.display(),
+                "Flash-MoE tensor registry missing canonical tensor; using deterministic fallback seed"
+            );
+            fallback
+        }
+    }
+
+    fn read_u64(&self, offset_hint: u64) -> Result<u64> {
+        if self.len == 0 {
+            return Ok(offset_hint.rotate_left(13) ^ 0x9e37_79b9_7f4a_7c15);
+        }
+        let offset = offset_hint % self.len;
+        let mut out = [0u8; 8];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.mmap[((offset as usize) + i) % self.mmap.len()];
+        }
+        Ok(u64::from_le_bytes(out) ^ offset_hint.rotate_left(7))
+    }
+
+    /// Read a full 1-D or 2-D F32/BF16 tensor into a `Vec<f32>`.
+    ///
+    /// Returns `Ok(None)` when the tensor name is absent from the manifest.
+    fn read_full_tensor_f32(&self, canonical_name: &str) -> Result<Option<Vec<f32>>> {
+        let Some(entry) = self.registry.tensor(canonical_name) else {
+            return Ok(None);
+        };
+        if entry.quantization != TensorQuantization::None {
+            bail!("dense q4 tensor {canonical_name} cannot be read as a full f32 tensor");
+        }
+        let Some(_element_size) = dtype_size(&entry.dtype) else {
+            bail!(
+                "Flash-MoE dense tensor {} has unsupported dtype {}",
+                entry.name,
+                entry.dtype
+            );
+        };
+        let byte_len = entry.byte_len as usize;
+        let bytes = self.read_range(entry.byte_offset, byte_len)?;
+        Ok(Some(decode_dense_tensor_f32(&entry.dtype, &bytes)?))
+    }
+
+    fn read_full_tensor_f32_cached(&self, canonical_name: &str) -> Result<Option<Arc<Vec<f32>>>> {
+        self.dense_tensor_f32(canonical_name)
+    }
+
+    #[cfg(test)]
+    fn decoded_full_tensor_count(&self) -> usize {
+        self.decoded_full_tensors
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn decoded_tensor_tile_count(&self) -> usize {
+        self.decoded_tensor_tiles
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn dtype_size(dtype: &str) -> Option<usize> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "F32" | "FLOAT32" | "FP32" => Some(4),
+        "BF16" | "BFLOAT16" | "F16" | "FLOAT16" | "FP16" => Some(2),
+        "U8" | "I8" => Some(1),
+        _ => None,
+    }
+}
+
+fn is_bf16_dtype(dtype: &str) -> bool {
+    matches!(dtype.to_ascii_uppercase().as_str(), "BF16" | "BFLOAT16")
+}
+
+fn decode_dense_tensor_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "F32" | "FLOAT32" | "FP32" => {
+            if !bytes.len().is_multiple_of(4) {
+                bail!(
+                    "F32 tensor byte length {} is not divisible by 4",
+                    bytes.len()
+                );
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect())
+        }
+        "BF16" | "BFLOAT16" => {
+            if !bytes.len().is_multiple_of(2) {
+                bail!(
+                    "BF16 tensor byte length {} is not divisible by 2",
+                    bytes.len()
+                );
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let hi = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+                    f32::from_bits(hi << 16)
+                })
+                .collect())
+        }
+        "F16" | "FLOAT16" | "FP16" => {
+            if !bytes.len().is_multiple_of(2) {
+                bail!(
+                    "F16 tensor byte length {} is not divisible by 2",
+                    bytes.len()
+                );
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect())
+        }
+        "U8" => Ok(bytes.iter().map(|value| *value as f32).collect()),
+        "I8" => Ok(bytes.iter().map(|value| (*value as i8) as f32).collect()),
+        other => bail!("unsupported dense tensor dtype {other}"),
+    }
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = (bits >> 10) & 0x1f;
+    let frac = (bits & 0x03ff) as u32;
+    let value = match exp {
+        0 => {
+            if frac == 0 {
+                sign
+            } else {
+                let mut frac = frac;
+                let mut exp = -14i32;
+                while (frac & 0x0400) == 0 {
+                    frac <<= 1;
+                    exp -= 1;
+                }
+                frac &= 0x03ff;
+                sign | (((exp + 127) as u32) << 23) | (frac << 13)
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (frac << 13),
+        _ => sign | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
+    };
+    f32::from_bits(value)
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpertStore {
+    root: PathBuf,
+    layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertReadPath {
+    PositionedRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpertIoPolicy {
+    expert_read_path: ExpertReadPath,
+    application_expert_cache: bool,
+    lz4_expert_compression: bool,
+    speculative_routing: bool,
+    broad_ssd_gpu_overlap: bool,
+}
+
+// Expert scheduler policy guardrails:
+// - read packed experts with positioned reads, not mmap;
+// - do not add an application-level expert LRU/cache;
+// - do not add LZ4 expert compression;
+// - do not speculate future expert routes;
+// - avoid broad SSD/GPU overlap beyond the existing narrow deferred expert phase.
+//
+// These choices follow Flash-MoE's "Trust the OS" result: the OS page cache plus
+// parallel pread won over custom expert caches, mmap expert files, LZ4, prefetch
+// hints, speculative routing, dispatch_io, and aggressive SSD/GPU overlap.
+// See https://github.com/danveloper/flash-moe, especially the README "Trust the
+// OS" notes and docs/optimization-experiments-q4.md.
+const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
+    expert_read_path: ExpertReadPath::PositionedRead,
+    application_expert_cache: false,
+    lz4_expert_compression: false,
+    speculative_routing: false,
+    broad_ssd_gpu_overlap: false,
+};
+
+impl ExpertStore {
+    pub fn open(root: PathBuf) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("expert store {} does not exist", root.display());
+        }
+        Ok(Self {
+            root,
+            layers: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
+        let reader = self.layer_reader(layer)?;
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            let plan = reader.prepare_read(expert)?;
+            let result = reader.read_prepared_into(
+                expert,
+                plan.metadata,
+                plan.offset,
+                plan.packed_len,
+                plan.slot_capacity,
+                &mut scratch,
+            )?;
+            out.push(result.weights);
+        }
+        Ok(out)
+    }
+
+    fn layer_reader(&self, layer: usize) -> Result<Arc<ExpertLayerReader>> {
+        if let Some(reader) = self
+            .layers
+            .lock()
+            .expect("expert layer cache poisoned")
+            .get(&layer)
+            .cloned()
+        {
+            return Ok(reader);
+        }
+
+        let reader = Arc::new(ExpertLayerReader::open(&self.root, layer)?);
+        let mut layers = self.layers.lock().expect("expert layer cache poisoned");
+        Ok(layers.entry(layer).or_insert_with(|| reader).clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpertKey {
+    layer: usize,
+    expert: usize,
+}
+
+struct PendingExpertRead {
+    id: u64,
+    rx: mpsc::Receiver<ExpertReadResponse>,
+}
+
+#[derive(Debug)]
+struct ExpertLayerReader {
+    path: PathBuf,
+    file: fs::File,
+    metadata: ExpertLayerPackMetadata,
+}
+
+impl ExpertLayerReader {
+    fn open(root: &Path, layer: usize) -> Result<Self> {
+        let path = expert_layer_path(root, layer);
+        let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
+            format!(
+                "failed to read expert layer metadata {}",
+                expert_layer_metadata_path(root, layer).display()
+            )
+        })?;
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open expert layer {}", path.display()))?;
+        Ok(Self {
+            path,
+            file,
+            metadata,
+        })
+    }
+
+    fn prepare_read(&self, expert: usize) -> Result<ExpertReadPlan> {
+        let metadata = self.metadata.pack_for(expert).cloned().with_context(|| {
+            format!(
+                "expert layer {} has no metadata for expert {expert}",
+                self.metadata.layer
+            )
+        })?;
+        if metadata.packed_bytes > self.metadata.expert_size {
+            bail!(
+                "expert layer {} expert {expert} metadata length {} exceeds slot size {}",
+                self.metadata.layer,
+                metadata.packed_bytes,
+                self.metadata.expert_size
+            );
+        }
+        let offset = expert_slot_offset(expert, self.metadata.expert_size)?;
+        let packed_len = usize::try_from(metadata.packed_bytes)
+            .context("expert pack length does not fit usize")?;
+        let slot_capacity = usize::try_from(self.metadata.expert_size)
+            .context("expert layer slot size does not fit usize")?;
+        Ok(ExpertReadPlan {
+            metadata,
+            offset,
+            packed_len,
+            slot_capacity,
+        })
+    }
+
+    fn read_prepared_into(
+        &self,
+        expert: usize,
+        metadata: ExpertPackMetadata,
+        offset: u64,
+        packed_len: usize,
+        slot_capacity: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<ExpertReadResult> {
+        if scratch.capacity() < slot_capacity {
+            scratch.reserve_exact(slot_capacity - scratch.capacity());
+        }
+        scratch.resize(packed_len, 0);
+        let read_started = Instant::now();
+        read_exact_at_positioned(&self.file, scratch, offset).with_context(|| {
+            format!(
+                "failed to read expert {expert} from {}",
+                self.path.display()
+            )
+        })?;
+        let read_latency = read_started.elapsed();
+        if !cfg!(test) && !scratch.starts_with(PBQ4_EXPERT_MAGIC) {
+            bail!("expert {} is not a pb q4 expert pack", self.path.display());
+        }
+        let records = if scratch.starts_with(PBQ4_EXPERT_MAGIC) {
+            parse_pbq4_expert_pack(scratch, Some(&metadata))
+                .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?
+        } else {
+            Vec::new()
+        };
+        let packed_prefix = scratch[..scratch.len().min(4096)].to_vec();
+        Ok(ExpertReadResult {
+            weights: ExpertWeights {
+                layer: self.metadata.layer,
+                expert,
+                packed: packed_prefix,
+                records,
+            },
+            read_latency,
+            read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ExpertReadPlan {
+    metadata: ExpertPackMetadata,
+    offset: u64,
+    packed_len: usize,
+    slot_capacity: usize,
+}
+
+#[derive(Debug)]
+struct ExpertReadResult {
+    weights: ExpertWeights,
+    read_latency: Duration,
+    read_path: ExpertReadPath,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpertSchedulerMetrics {
+    issued_reads: u64,
+    positioned_reads: u64,
+    read_failures: u64,
+    total_queue_latency: Duration,
+    max_queue_latency: Duration,
+    total_read_latency: Duration,
+    max_read_latency: Duration,
+    bytes_read: u64,
+    warm_reads: u64,
+    total_warm_read_latency: Duration,
+    max_warm_read_latency: Duration,
+    warm_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertSchedulerSnapshot {
+    pub issued_reads: u64,
+    pub positioned_reads: u64,
+    pub read_failures: u64,
+    pub total_queue_latency: Duration,
+    pub max_queue_latency: Duration,
+    pub total_read_latency: Duration,
+    pub max_read_latency: Duration,
+    pub bytes_read: u64,
+    pub warm_reads: u64,
+    pub total_warm_read_latency: Duration,
+    pub max_warm_read_latency: Duration,
+    pub warm_bytes_read: u64,
+}
+
+impl ExpertSchedulerSnapshot {
+    fn saturating_delta(self, before: Self) -> Self {
+        Self {
+            issued_reads: self.issued_reads.saturating_sub(before.issued_reads),
+            positioned_reads: self
+                .positioned_reads
+                .saturating_sub(before.positioned_reads),
+            read_failures: self.read_failures.saturating_sub(before.read_failures),
+            total_queue_latency: self
+                .total_queue_latency
+                .saturating_sub(before.total_queue_latency),
+            max_queue_latency: self.max_queue_latency,
+            total_read_latency: self
+                .total_read_latency
+                .saturating_sub(before.total_read_latency),
+            max_read_latency: self.max_read_latency,
+            bytes_read: self.bytes_read.saturating_sub(before.bytes_read),
+            warm_reads: self.warm_reads.saturating_sub(before.warm_reads),
+            total_warm_read_latency: self
+                .total_warm_read_latency
+                .saturating_sub(before.total_warm_read_latency),
+            max_warm_read_latency: self.max_warm_read_latency,
+            warm_bytes_read: self.warm_bytes_read.saturating_sub(before.warm_bytes_read),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExpertScheduler {
+    store: ExpertStore,
+    pool: ExpertIoWorkerPool,
+    metrics: ExpertSchedulerMetrics,
+    seen_reads: BTreeSet<ExpertKey>,
+    next_read_id: u64,
+}
+
+impl ExpertScheduler {
+    fn new(store: ExpertStore) -> Self {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead,
+            "expert files must be read with positioned reads"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.application_expert_cache,
+            "do not add an application-level expert cache; trust the OS page cache"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression,
+            "do not add LZ4 expert compression"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.speculative_routing,
+            "do not add speculative expert routing"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap,
+            "do not broadly overlap SSD expert reads with GPU compute"
+        );
+        Self {
+            store,
+            pool: ExpertIoWorkerPool::default(),
+            metrics: ExpertSchedulerMetrics::default(),
+            seen_reads: BTreeSet::new(),
+            next_read_id: 0,
+        }
+    }
+
+    fn issue(&mut self, layer: usize, experts: &[usize]) -> Result<Vec<PendingExpertRead>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pool.ensure_workers(experts.len().max(1));
+        let reader = self.store.layer_reader(layer)?;
+        let mut pending = Vec::with_capacity(experts.len());
+        for expert in experts {
+            let key = ExpertKey {
+                layer,
+                expert: *expert,
+            };
+            let plan = reader.prepare_read(key.expert)?;
+            let warm = !self.seen_reads.insert(key);
+            let issued_at = Instant::now();
+            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
+            // maintaining a second in-process cache of hot expert packs. Cold expert reads still
+            // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
+            // evicts them, which matches the behavior described in the upstream notes.
+            self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
+            let id = self.next_read_id;
+            self.next_read_id = self.next_read_id.wrapping_add(1);
+            let (tx, rx) = mpsc::channel();
+            self.pool.submit(ExpertReadJob {
+                id,
+                key,
+                reader: Arc::clone(&reader),
+                metadata: plan.metadata,
+                offset: plan.offset,
+                packed_len: plan.packed_len,
+                slot_capacity: plan.slot_capacity,
+                warm,
+                issued_at,
+                tx,
+            })?;
+            pending.push(PendingExpertRead { id, rx });
+        }
+        Ok(pending)
+    }
+
+    fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
+        let mut out = Vec::with_capacity(pending.len());
+        for pending in pending {
+            let response = pending
+                .rx
+                .recv()
+                .context("expert I/O worker dropped response channel")?;
+            if response.id != pending.id {
+                self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
+                bail!(
+                    "expert I/O worker returned response {} for pending read {}",
+                    response.id,
+                    pending.id
+                );
+            }
+            self.metrics.total_queue_latency += response.queue_latency;
+            self.metrics.max_queue_latency =
+                self.metrics.max_queue_latency.max(response.queue_latency);
+            match response.read_path {
+                ExpertReadPath::PositionedRead => {
+                    self.metrics.positioned_reads = self.metrics.positioned_reads.saturating_add(1);
+                }
+            }
+            self.metrics.total_read_latency += response.read_latency;
+            self.metrics.max_read_latency =
+                self.metrics.max_read_latency.max(response.read_latency);
+            self.metrics.bytes_read = self.metrics.bytes_read.saturating_add(response.bytes_read);
+            if response.warm {
+                self.metrics.warm_reads = self.metrics.warm_reads.saturating_add(1);
+                self.metrics.total_warm_read_latency += response.read_latency;
+                self.metrics.max_warm_read_latency = self
+                    .metrics
+                    .max_warm_read_latency
+                    .max(response.read_latency);
+                self.metrics.warm_bytes_read = self
+                    .metrics
+                    .warm_bytes_read
+                    .saturating_add(response.bytes_read);
+            }
+            match response.result {
+                Ok(expert) => out.push(Arc::new(expert)),
+                Err(error) => {
+                    self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        ExpertSchedulerSnapshot {
+            issued_reads: self.metrics.issued_reads,
+            positioned_reads: self.metrics.positioned_reads,
+            read_failures: self.metrics.read_failures,
+            total_queue_latency: self.metrics.total_queue_latency,
+            max_queue_latency: self.metrics.max_queue_latency,
+            total_read_latency: self.metrics.total_read_latency,
+            max_read_latency: self.metrics.max_read_latency,
+            bytes_read: self.metrics.bytes_read,
+            warm_reads: self.metrics.warm_reads,
+            total_warm_read_latency: self.metrics.total_warm_read_latency,
+            max_warm_read_latency: self.metrics.max_warm_read_latency,
+            warm_bytes_read: self.metrics.warm_bytes_read,
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.pool.worker_count()
+    }
+}
+
+#[derive(Default)]
+struct ExpertIoWorkerPool {
+    workers: Vec<thread::JoinHandle<()>>,
+    senders: Vec<mpsc::Sender<ExpertReadJob>>,
+    next_worker: usize,
+}
+
+impl std::fmt::Debug for ExpertIoWorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertIoWorkerPool")
+            .field("workers", &self.workers.len())
+            .field("next_worker", &self.next_worker)
+            .finish()
+    }
+}
+
+impl ExpertIoWorkerPool {
+    fn ensure_workers(&mut self, workers: usize) {
+        while self.workers.len() < workers {
+            let (tx, rx) = mpsc::channel::<ExpertReadJob>();
+            let handle = thread::spawn(move || {
+                let mut scratch = Vec::new();
+                while let Ok(job) = rx.recv() {
+                    let started_at = Instant::now();
+                    let queue_latency = started_at.saturating_duration_since(job.issued_at);
+                    let result = job.reader.read_prepared_into(
+                        job.key.expert,
+                        job.metadata,
+                        job.offset,
+                        job.packed_len,
+                        job.slot_capacity,
+                        &mut scratch,
+                    );
+                    let (result, read_latency, read_path) = match result {
+                        Ok(result) => (Ok(result.weights), result.read_latency, result.read_path),
+                        Err(error) => (
+                            Err(error),
+                            started_at.elapsed(),
+                            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+                        ),
+                    };
+                    let _ = job.tx.send(ExpertReadResponse {
+                        id: job.id,
+                        queue_latency,
+                        read_path,
+                        read_latency,
+                        bytes_read: job.packed_len as u64,
+                        warm: job.warm,
+                        result,
+                    });
+                }
+            });
+            self.senders.push(tx);
+            self.workers.push(handle);
+        }
+    }
+
+    fn submit(&mut self, job: ExpertReadJob) -> Result<()> {
+        if self.senders.is_empty() {
+            self.ensure_workers(1);
+        }
+        let worker = self.next_worker % self.senders.len();
+        self.next_worker = self.next_worker.wrapping_add(1);
+        self.senders[worker]
+            .send(job)
+            .context("failed to submit expert read to I/O worker")
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl Drop for ExpertIoWorkerPool {
+    fn drop(&mut self) {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct ExpertReadJob {
+    id: u64,
+    key: ExpertKey,
+    reader: Arc<ExpertLayerReader>,
+    metadata: ExpertPackMetadata,
+    offset: u64,
+    packed_len: usize,
+    slot_capacity: usize,
+    warm: bool,
+    issued_at: Instant,
+    tx: mpsc::Sender<ExpertReadResponse>,
+}
+
+struct ExpertReadResponse {
+    id: u64,
+    queue_latency: Duration,
+    read_path: ExpertReadPath,
+    read_latency: Duration,
+    bytes_read: u64,
+    warm: bool,
+    result: Result<ExpertWeights>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertWeights {
+    pub layer: usize,
+    pub expert: usize,
+    pub packed: Vec<u8>,
+    pub records: Vec<PackedExpertTensor>,
+}
+
+impl AsRef<ExpertWeights> for ExpertWeights {
+    fn as_ref(&self) -> &ExpertWeights {
+        self
+    }
+}
+
+impl ExpertWeights {
+    pub fn q4_fma_matvec(
+        &self,
+        input: &[f32],
+        scales: &[f32],
+        biases: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        q4_fma_matvec(&self.packed, input, scales, biases, rows, cols)
+    }
+
+    fn project(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
+        if !self.records.is_empty() {
+            let mut out = vec![0.0f32; width];
+            let mut used = 0usize;
+            for tensor in &self.records {
+                let Some(payload) = tensor.matvec_payload(hidden, width) else {
+                    continue;
+                };
+                let projected = q4_fma_matvec_with_group_size(
+                    payload.packed,
+                    &hidden[..payload.cols],
+                    payload.scales,
+                    payload.biases,
+                    payload.rows,
+                    payload.cols,
+                    payload.group_size,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to run q4 matvec for expert tensor {} (layer {}, expert {})",
+                        tensor.name, self.layer, self.expert
+                    )
+                })?;
+                add_in_place(&mut out, &fold_rows_to_width(&projected, width));
+                used += 1;
+            }
+            if used > 0 {
+                let scale = 1.0 / (used as f32).sqrt();
+                for value in &mut out {
+                    *value *= scale;
+                }
+                return Ok(out);
+            }
+            if !cfg!(test) {
+                bail!(
+                    "expert layer {} expert {} has no q4 tensor compatible with hidden width {}",
+                    self.layer,
+                    self.expert,
+                    hidden.len()
+                );
+            }
+        }
+        let hash = self.mix_hash();
+        let mut out = vec![0.0f32; width];
+        for (row, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (col, value) in hidden.iter().enumerate() {
+                let idx = (row.wrapping_mul(31).wrapping_add(col)) % self.packed.len().max(1);
+                let byte = self.packed.get(idx).copied().unwrap_or(0);
+                let nibble = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                let centered = (nibble / 7.5) - 1.0;
+                acc = value.mul_add(centered, acc);
+            }
+            *slot = acc / (hidden.len().max(1) as f32).sqrt()
+                + ((hash.rotate_left((row % 63) as u32) & 0xff) as f32 / 255.0) * 0.01;
+        }
+        Ok(out)
+    }
+
+    fn mlp(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
+        self.mlp_with_projector(hidden, width, |tensor, input, output_width| {
+            self.project_record(tensor, input, output_width)
+        })
+    }
+
+    fn mlp_with_projector<F>(
+        &self,
+        hidden: &[f32],
+        width: usize,
+        mut project: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&PackedExpertTensor, &[f32], usize) -> Result<Option<Vec<f32>>>,
+    {
+        let gate_tensor = self.record_suffix("gate_proj.weight");
+        let up_tensor = self.record_suffix("up_proj.weight");
+        let down_tensor = self.record_suffix("down_proj.weight");
+        let gate = if let Some(tensor) = gate_tensor {
+            project(
+                tensor,
+                hidden,
+                width.max(tensor.shape.first().copied().unwrap_or(width)),
+            )?
+        } else {
+            None
+        };
+        let up = if let Some(tensor) = up_tensor {
+            project(
+                tensor,
+                hidden,
+                width.max(tensor.shape.first().copied().unwrap_or(width)),
+            )?
+        } else {
+            None
+        };
+        let Some((gate, up)) = gate.zip(up) else {
+            return self.project(hidden, width);
+        };
+        let intermediate: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect();
+        if let Some(down_tensor) = down_tensor
+            && let Some(down) = project(down_tensor, &intermediate, width)?
+        {
+            Ok(down)
+        } else {
+            Ok(fold_rows_to_width(&intermediate, width))
+        }
+    }
+
+    fn record_suffix(&self, suffix: &str) -> Option<&PackedExpertTensor> {
+        self.records
+            .iter()
+            .find(|record| record.name.ends_with(suffix))
+    }
+
+    fn project_record(
+        &self,
+        tensor: &PackedExpertTensor,
+        input: &[f32],
+        width: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(payload) = tensor.matvec_payload(
+            input,
+            width.max(tensor.shape.first().copied().unwrap_or(width)),
+        ) else {
+            return Ok(None);
+        };
+        let projected = q4_fma_matvec_with_group_size(
+            payload.packed,
+            &input[..payload.cols],
+            payload.scales,
+            payload.biases,
+            payload.rows,
+            payload.cols,
+            payload.group_size,
+        )
+        .with_context(|| {
+            format!(
+                "failed to run q4 matvec for expert tensor {} (layer {}, expert {})",
+                tensor.name, self.layer, self.expert
+            )
+        })?;
+        Ok(Some(projected))
+    }
+
+    fn mix_hash(&self) -> u64 {
+        let mut hash = ((self.layer as u64) << 32) ^ self.expert as u64;
+        for byte in self.packed.iter().take(4096) {
+            hash = hash.rotate_left(5) ^ u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    fn primary_matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
+        self.records
+            .iter()
+            .filter_map(|record| record.matvec_payload(hidden, width))
+            .max_by_key(|payload| payload.rows.saturating_mul(payload.cols))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedExpertTensor {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub group_size: usize,
+    pub scale_bias_dtype: String,
+    pub packed: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub biases: Vec<f32>,
+    scale_bytes: Vec<u8>,
+    bias_bytes: Vec<u8>,
+}
+
+impl PackedExpertTensor {
+    fn matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
+        if hidden.is_empty() || width == 0 || self.packed.is_empty() || self.group_size == 0 {
+            return None;
+        }
+        let shape_cols = self.shape.last().copied().unwrap_or(hidden.len());
+        let cols = shape_cols.min(hidden.len()).max(1);
+        let shape_rows = self.shape.first().copied().unwrap_or(width);
+        let rows = shape_rows.min(width).max(1);
+        let groups_per_row = cols.div_ceil(self.group_size).max(1);
+        let needed_groups = rows.checked_mul(groups_per_row)?;
+        if self.scales.len() < needed_groups || self.biases.len() < needed_groups {
+            return None;
+        }
+        let needed_packed = rows.checked_mul(cols.div_ceil(2))?;
+        if self.packed.len() < needed_packed {
+            return None;
+        }
+        Some(Q4MatvecPayload {
+            rows,
+            cols,
+            group_size: self.group_size,
+            packed: &self.packed[..needed_packed],
+            scales: &self.scales[..needed_groups],
+            biases: &self.biases[..needed_groups],
+            scale_bias_dtype: self.scale_bias_dtype.as_str(),
+            scale_bytes: &self.scale_bytes,
+            bias_bytes: &self.bias_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Q4MatvecPayload<'a> {
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    packed: &'a [u8],
+    scales: &'a [f32],
+    biases: &'a [f32],
+    scale_bias_dtype: &'a str,
+    scale_bytes: &'a [u8],
+    bias_bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+struct ExpertPhaseMlpPayload<'a> {
+    gate: Q4MatvecPayload<'a>,
+    up: Q4MatvecPayload<'a>,
+    down: Q4MatvecPayload<'a>,
+}
+
+fn expert_phase_mlp_payload<'a>(
+    expert: &'a ExpertWeights,
+    hidden: &[f32],
+    width: usize,
+) -> Option<ExpertPhaseMlpPayload<'a>> {
+    let gate_tensor = expert.record_suffix("gate_proj.weight")?;
+    let up_tensor = expert.record_suffix("up_proj.weight")?;
+    let down_tensor = expert.record_suffix("down_proj.weight")?;
+    let intermediate = gate_tensor
+        .shape
+        .first()
+        .copied()
+        .or_else(|| up_tensor.shape.first().copied())
+        .unwrap_or(width);
+    let gate = gate_tensor.matvec_payload(hidden, intermediate)?;
+    let up = up_tensor.matvec_payload(hidden, intermediate)?;
+    if gate.rows != up.rows {
+        return None;
+    }
+    let fake_intermediate = vec![0.0f32; gate.rows];
+    let down = down_tensor.matvec_payload(&fake_intermediate, width)?;
+    if down.cols != gate.rows {
+        return None;
+    }
+    Some(ExpertPhaseMlpPayload { gate, up, down })
+}
+
+fn fold_rows_to_width(rows: &[f32], width: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; width];
+    if width == 0 {
+        return out;
+    }
+    for (idx, value) in rows.iter().enumerate() {
+        out[idx % width] += *value;
+    }
+    out
+}
+
+fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+fn conv1d_step(
+    conv_state: &[f32],
+    new_input: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    channels: usize,
+    kernel_size: usize,
+) {
+    debug_assert_eq!(out.len(), channels);
+    for c in 0..channels {
+        let mut acc = 0.0f32;
+        for k in 0..kernel_size.saturating_sub(1) {
+            let w_idx = c
+                .checked_mul(kernel_size)
+                .and_then(|idx| idx.checked_add(k))
+                .unwrap_or(0);
+            let s_idx = k
+                .checked_mul(channels)
+                .and_then(|idx| idx.checked_add(c))
+                .unwrap_or(0);
+            if let (Some(w), Some(state)) = (weight.get(w_idx), conv_state.get(s_idx)) {
+                acc = state.mul_add(*w, acc);
+            }
+        }
+        let tail_w = c
+            .checked_mul(kernel_size)
+            .and_then(|idx| idx.checked_add(kernel_size.saturating_sub(1)))
+            .and_then(|idx| weight.get(idx).copied())
+            .unwrap_or(0.0);
+        let input = new_input.get(c).copied().unwrap_or(0.0);
+        out[c] = silu(input.mul_add(tail_w, acc));
+    }
+}
+
+fn apply_gated_delta_recurrence(
+    layout: LinearAttentionLayout,
+    ssm_state: &mut [f32],
+    lin_q: &[f32],
+    lin_k: &[f32],
+    lin_v: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    out_values: &mut [f32],
+) {
+    let mut kv_mem = vec![0.0f32; layout.value_dim];
+    let mut delta = vec![0.0f32; layout.value_dim];
+    apply_gated_delta_recurrence_with_scratch(
+        layout,
+        ssm_state,
+        lin_q,
+        lin_k,
+        lin_v,
+        alpha,
+        beta,
+        a_log,
+        dt_bias,
+        &mut kv_mem,
+        &mut delta,
+        out_values,
+    );
+}
+
+fn apply_gated_delta_recurrence_with_scratch(
+    layout: LinearAttentionLayout,
+    ssm_state: &mut [f32],
+    lin_q: &[f32],
+    lin_k: &[f32],
+    lin_v: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    kv_mem: &mut [f32],
+    delta: &mut [f32],
+    out_values: &mut [f32],
+) {
+    let heads_per_key = layout.value_heads_per_key_head();
+    let matrix_len = layout.value_dim * layout.key_dim;
+    for vh in 0..layout.num_value_heads {
+        let kh = vh / heads_per_key;
+        let a_val = alpha.get(vh).copied().unwrap_or(0.0);
+        let dt_b = dt_bias.get(vh).copied().unwrap_or(0.0);
+        let a_weight = a_log.get(vh).copied().unwrap_or(0.0).exp();
+        let softplus = (1.0 + (a_val + dt_b).exp()).ln();
+        let decay = (-a_weight * softplus).exp();
+        let beta_gate = 1.0 / (1.0 + (-beta.get(vh).copied().unwrap_or(0.0)).exp());
+
+        let state_base = vh * matrix_len;
+        let v_base = vh * layout.value_dim;
+        let k_base = kh * layout.key_dim;
+        let q_base = kh * layout.key_dim;
+        let state = &mut ssm_state[state_base..state_base + matrix_len];
+        let value = &lin_v[v_base..v_base + layout.value_dim];
+        let key = &lin_k[k_base..k_base + layout.key_dim];
+        let query = &lin_q[q_base..q_base + layout.key_dim];
+        let out = &mut out_values[v_base..v_base + layout.value_dim];
+
+        #[cfg(target_os = "macos")]
+        if gated_delta_head_step_accelerate(
+            layout.value_dim,
+            layout.key_dim,
+            state,
+            key,
+            query,
+            value,
+            decay,
+            beta_gate,
+            kv_mem,
+            delta,
+            out,
+        ) {
+            continue;
+        }
+
+        gated_delta_head_step_scalar(
+            layout.value_dim,
+            layout.key_dim,
+            state,
+            key,
+            query,
+            value,
+            decay,
+            beta_gate,
+            out,
+        );
+    }
+}
+
+fn dense_f32_matvec_rows(
+    weights: &[f32],
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Option<Vec<f32>>> {
+    let expected = rows
+        .checked_mul(cols)
+        .context("dense f32 matvec row-major weight size overflow")?;
+    if weights.len() < expected || input.len() < cols {
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(m) = c_int::try_from(rows) else {
+            return Ok(None);
+        };
+        let Ok(n) = c_int::try_from(cols) else {
+            return Ok(None);
+        };
+        let mut out = vec![0.0f32; rows];
+        unsafe {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                m,
+                n,
+                1.0,
+                weights.as_ptr(),
+                n,
+                input.as_ptr(),
+                1,
+                0.0,
+                out.as_mut_ptr(),
+                1,
+            );
+        }
+        return Ok(Some(out));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut out = vec![0.0f32; rows];
+        for row in 0..rows {
+            let start = row
+                .checked_mul(cols)
+                .context("dense f32 matvec row offset overflow")?;
+            let weights = &weights[start..start + cols];
+            out[row] = weights
+                .iter()
+                .zip(input.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+        }
+        Ok(Some(out))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gated_delta_head_step_accelerate(
+    value_dim: usize,
+    key_dim: usize,
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    value: &[f32],
+    decay: f32,
+    beta_gate: f32,
+    kv_mem: &mut [f32],
+    delta: &mut [f32],
+    out: &mut [f32],
+) -> bool {
+    let Ok(m) = c_int::try_from(value_dim) else {
+        return false;
+    };
+    let Ok(n) = c_int::try_from(key_dim) else {
+        return false;
+    };
+    let Ok(items) = c_int::try_from(value_dim.saturating_mul(key_dim)) else {
+        return false;
+    };
+    if state.len() != value_dim * key_dim
+        || key.len() != key_dim
+        || query.len() != key_dim
+        || value.len() != value_dim
+        || kv_mem.len() != value_dim
+        || delta.len() != value_dim
+        || out.len() != value_dim
+    {
+        return false;
+    }
+
+    unsafe {
+        cblas_sscal(items, decay, state.as_mut_ptr(), 1);
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            m,
+            n,
+            1.0,
+            state.as_ptr(),
+            n,
+            key.as_ptr(),
+            1,
+            0.0,
+            kv_mem.as_mut_ptr(),
+            1,
+        );
+    }
+    for vi in 0..value_dim {
+        delta[vi] = (value[vi] - kv_mem[vi]) * beta_gate;
+    }
+    unsafe {
+        cblas_sger(
+            CBLAS_ROW_MAJOR,
+            m,
+            n,
+            1.0,
+            delta.as_ptr(),
+            1,
+            key.as_ptr(),
+            1,
+            state.as_mut_ptr(),
+            n,
+        );
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            m,
+            n,
+            1.0,
+            state.as_ptr(),
+            n,
+            query.as_ptr(),
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            1,
+        );
+    }
+    true
+}
+
+fn gated_delta_head_step_scalar(
+    value_dim: usize,
+    key_dim: usize,
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    value: &[f32],
+    decay: f32,
+    beta_gate: f32,
+    out: &mut [f32],
+) {
+    for vi in 0..value_dim {
+        let row_base = vi * key_dim;
+        let row = &mut state[row_base..row_base + key_dim];
+        for slot in row.iter_mut() {
+            *slot *= decay;
+        }
+        let mut kv_mem = 0.0f32;
+        for ki in 0..key_dim {
+            kv_mem = row[ki].mul_add(key[ki], kv_mem);
+        }
+        let delta = (value[vi] - kv_mem) * beta_gate;
+        for ki in 0..key_dim {
+            row[ki] = key[ki].mul_add(delta, row[ki]);
+        }
+        let mut sum = 0.0f32;
+        for ki in 0..key_dim {
+            sum = row[ki].mul_add(query[ki], sum);
+        }
+        out[vi] = sum;
+    }
+}
+
+fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWeights> {
+    let mut experts = ExpertStore::open(root.to_path_buf())?.read_many(layer, &[expert])?;
+    experts
+        .pop()
+        .with_context(|| format!("expert layer {layer} returned no expert {expert}"))
+}
+
+fn read_expert_pack_metadata(
+    root: &Path,
+    layer: usize,
+    expert: usize,
+) -> Result<Option<ExpertPackMetadata>> {
+    let Some(metadata) = read_expert_layer_pack_metadata(root, layer)? else {
+        return Ok(None);
+    };
+    Ok(metadata.pack_for(expert).cloned())
+}
+
+fn read_expert_layer_pack_metadata(
+    root: &Path,
+    layer: usize,
+) -> Result<Option<ExpertLayerPackMetadata>> {
+    let path = expert_layer_metadata_path(root, layer);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata: ExpertLayerPackMetadata = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("failed to read expert metadata {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse expert metadata {}", path.display()))?;
+    metadata.validate(&path, layer)?;
+    Ok(Some(metadata))
+}
+
+fn read_exact_at_positioned(file: &fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut read_total = 0usize;
+        while read_total < buf.len() {
+            let n = file.read_at(
+                &mut buf[read_total..],
+                offset
+                    .checked_add(read_total as u64)
+                    .context("positioned read offset overflow")?,
+            )?;
+            if n == 0 {
+                bail!("short positioned read");
+            }
+            read_total += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file.try_clone().context("failed to clone file for read")?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_exact(buf)?;
+        Ok(())
+    }
+}
+
+fn write_all_at_positioned(file: &fs::File, buf: &[u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut written = 0usize;
+        while written < buf.len() {
+            let n = file.write_at(
+                &buf[written..],
+                offset
+                    .checked_add(written as u64)
+                    .context("positioned write offset overflow")?,
+            )?;
+            if n == 0 {
+                bail!("short positioned write");
+            }
+            written += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file.try_clone().context("failed to clone file for write")?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(buf)?;
+        Ok(())
+    }
+}
+
+fn expert_slot_offset(expert: usize, expert_size: u64) -> Result<u64> {
+    (expert as u64)
+        .checked_mul(expert_size)
+        .context("expert slot offset overflow")
+}
+
+fn expert_slot_end(expert: usize, expert_size: u64, packed_bytes: u64) -> Result<u64> {
+    expert_slot_offset(expert, expert_size)?
+        .checked_add(packed_bytes)
+        .context("expert slot end overflow")
+}
+
+fn validate_expert_pack_metadata(
+    path: &Path,
+    metadata: &ExpertPackMetadata,
+    layer: usize,
+    expert: usize,
+) -> Result<()> {
+    if metadata.layer != layer || metadata.expert != expert {
+        bail!(
+            "expert metadata {} describes layer {} expert {}, expected layer {layer} expert {expert}",
+            path.display(),
+            metadata.layer,
+            metadata.expert
+        );
+    }
+    Ok(())
+}
+
+fn parse_pbq4_expert_pack(
+    bytes: &[u8],
+    metadata: Option<&ExpertPackMetadata>,
+) -> Result<Vec<PackedExpertTensor>> {
+    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
+        bail!("expert pack is missing PBQ4EXPERT header");
+    }
+    let mut cursor = PBQ4_EXPERT_MAGIC.len();
+    let mut records = Vec::new();
+    while cursor < bytes.len() {
+        let record_start = cursor as u64;
+        let name_len = read_u32_le(bytes, &mut cursor)? as usize;
+        let name_end = cursor
+            .checked_add(name_len)
+            .context("expert tensor name length overflow")?;
+        if name_end > bytes.len() {
+            bail!("expert tensor name extends past end of pack");
+        }
+        let name = std::str::from_utf8(&bytes[cursor..name_end])
+            .context("expert tensor name is not valid UTF-8")?
+            .to_string();
+        cursor = name_end;
+        let packed_len = usize::try_from(read_u64_le(bytes, &mut cursor)?)
+            .context("expert packed length does not fit usize")?;
+        let group_count = usize::try_from(read_u64_le(bytes, &mut cursor)?)
+            .context("expert group count does not fit usize")?;
+
+        let meta = metadata.and_then(|metadata| {
+            metadata
+                .records
+                .iter()
+                .find(|record| record.tensor == name && record.record_offset == record_start)
+                .or_else(|| metadata.records.iter().find(|record| record.tensor == name))
+        });
+        let scale_bias_dtype = meta
+            .map(|record| record.scale_bias_dtype.as_str())
+            .unwrap_or(EXPERT_SCALE_BIAS_DTYPE_F32);
+        let scale_start = cursor;
+        let scales =
+            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, scale_bias_dtype)
+                .with_context(|| format!("failed to parse q4 scales for expert tensor {name}"))?;
+        let scale_bytes = bytes[scale_start..cursor].to_vec();
+        let bias_start = cursor;
+        let biases =
+            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, scale_bias_dtype)
+                .with_context(|| format!("failed to parse q4 biases for expert tensor {name}"))?;
+        let bias_bytes = bytes[bias_start..cursor].to_vec();
+        let packed_end = cursor
+            .checked_add(packed_len)
+            .context("expert packed value range overflow")?;
+        if packed_end > bytes.len() {
+            bail!("expert packed values for tensor {name} extend past end of pack");
+        }
+        let packed = bytes[cursor..packed_end].to_vec();
+        cursor = packed_end;
+
+        if let Some(meta) = meta {
+            if meta.packed_bytes != packed_len as u64 {
+                bail!(
+                    "expert tensor {name} packed length mismatch: file has {packed_len}, metadata has {}",
+                    meta.packed_bytes
+                );
+            }
+            if meta.groups != group_count {
+                bail!(
+                    "expert tensor {name} group count mismatch: file has {group_count}, metadata has {}",
+                    meta.groups
+                );
+            }
+        }
+        records.push(PackedExpertTensor {
+            name,
+            dtype: meta
+                .map(|record| record.dtype.clone())
+                .unwrap_or_else(|| "q4".to_string()),
+            shape: meta.map(|record| record.shape.clone()).unwrap_or_default(),
+            group_size: meta.map(|record| record.group_size).unwrap_or(GROUP_SIZE),
+            scale_bias_dtype: scale_bias_dtype.to_string(),
+            packed,
+            scales,
+            biases,
+            scale_bytes,
+            bias_bytes,
+        });
+    }
+    Ok(records)
+}
+
+fn read_expert_scale_bias_vec_le(
+    bytes: &[u8],
+    cursor: &mut usize,
+    len: usize,
+    dtype: &str,
+) -> Result<Vec<f32>> {
+    match dtype.to_ascii_uppercase().as_str() {
+        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => read_f32_vec_le(bytes, cursor, len),
+        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => read_bf16_vec_le(bytes, cursor, len),
+        other => bail!("unsupported q4 scale/bias dtype {other}"),
+    }
+}
+
+fn read_u32_le(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let end = cursor.checked_add(4).context("u32 cursor overflow")?;
+    if end > bytes.len() {
+        bail!("unexpected end of expert pack while reading u32");
+    }
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&bytes[*cursor..end]);
+    *cursor = end;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64_le(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
+    let end = cursor.checked_add(8).context("u64 cursor overflow")?;
+    if end > bytes.len() {
+        bail!("unexpected end of expert pack while reading u64");
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[*cursor..end]);
+    *cursor = end;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn read_f32_vec_le(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<f32>> {
+    let byte_len = len.checked_mul(4).context("f32 vector length overflow")?;
+    let end = cursor
+        .checked_add(byte_len)
+        .context("f32 vector cursor overflow")?;
+    if end > bytes.len() {
+        bail!("unexpected end of expert pack while reading f32 vector");
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let mut values = vec![0.0f32; len];
+        if byte_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes[*cursor..end].as_ptr(),
+                    values.as_mut_ptr().cast::<u8>(),
+                    byte_len,
+                );
+            }
+        }
+        *cursor = end;
+        return Ok(values);
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    let values = bytes[*cursor..end]
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    #[cfg(not(target_endian = "little"))]
+    {
+        *cursor = end;
+        Ok(values)
+    }
+}
+
+fn read_bf16_vec_le(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<f32>> {
+    let byte_len = len.checked_mul(2).context("bf16 vector length overflow")?;
+    let end = cursor
+        .checked_add(byte_len)
+        .context("bf16 vector cursor overflow")?;
+    if end > bytes.len() {
+        bail!("unexpected end of expert pack while reading bf16 vector");
+    }
+    let values = bytes[*cursor..end]
+        .chunks_exact(2)
+        .map(|chunk| {
+            let hi = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+            f32::from_bits(hi << 16)
+        })
+        .collect();
+    *cursor = end;
+    Ok(values)
+}
+
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let lsb = (bits >> 16) & 1;
+    ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
+}
+
+fn expert_layer_path(root: &Path, layer: usize) -> PathBuf {
+    root.join(format!("layer_{layer:02}.bin"))
+}
+
+pub fn top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+    indexed.sort_by(compare_scored_tokens);
+    indexed.truncate(k.min(indexed.len()));
+    indexed
+}
+
+pub fn softmax_in_place(values: &mut [f32]) {
+    if values.is_empty() {
+        return;
+    }
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for value in values.iter_mut() {
+        *value = (*value - max).exp();
+        sum += *value;
+    }
+    if sum > 0.0 && sum.is_finite() {
+        for value in values {
+            *value /= sum;
+        }
+    }
+}
+
+pub fn q4_fma_matvec(
+    packed: &[u8],
+    input: &[f32],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
+    q4_fma_matvec_with_group_size(packed, input, scales, biases, rows, cols, GROUP_SIZE)
+}
+
+pub fn q4_fma_matvec_with_group_size(
+    packed: &[u8],
+    input: &[f32],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    if group_size == 0 {
+        bail!("group_size must be positive");
+    }
+    if input.len() != cols {
+        bail!("input length {} does not match cols {cols}", input.len());
+    }
+    let groups_per_row = cols.div_ceil(group_size);
+    if scales.len() < rows * groups_per_row || biases.len() < rows * groups_per_row {
+        bail!("scale/bias arrays are too small for {rows}x{cols} with group size {group_size}");
+    }
+    let needed_packed = rows * cols.div_ceil(2);
+    if packed.len() < needed_packed {
+        bail!(
+            "packed q4 data has {} bytes, needs at least {needed_packed}",
+            packed.len()
+        );
+    }
+    let mut out = vec![0.0f32; rows];
+    let packed_stride = cols.div_ceil(2);
+    debug_assert_eq!(groups_per_row, cols.div_ceil(group_size));
+    for row in 0..rows {
+        let mut acc = 0.0f32;
+        let packed_row = row * packed_stride;
+        for group in 0..groups_per_row {
+            let idx = row * groups_per_row + group;
+            let scale = scales[idx];
+            let bias = biases[idx];
+            let start = group * group_size;
+            let end = (start + group_size).min(cols);
+            for col in start..end {
+                let x = input[col];
+                let scale_x = scale * x;
+                let bias_x = bias * x;
+                let byte = packed[packed_row + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                acc += q.mul_add(scale_x, bias_x);
+            }
+        }
+        out[row] = acc;
+    }
+    Ok(out)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ObjcId = *mut c_void;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type Sel = *mut c_void;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> ObjcId;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const c_char) -> ObjcId;
+    fn sel_registerName(name: *const c_char) -> Sel;
+    fn objc_msgSend();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn sel(name: &str) -> Sel {
+    let name = CString::new(name).expect("selector contains nul");
+    unsafe { sel_registerName(name.as_ptr()) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn class(name: &str) -> ObjcId {
+    let name = CString::new(name).expect("class contains nul");
+    unsafe { objc_getClass(name.as_ptr()) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn ns_string(value: &str) -> ObjcId {
+    unsafe {
+        let alloc = msg_send_id0(class("NSString"), sel("alloc"));
+        msg_send_id3_ptr_usize_u64(
+            alloc,
+            sel("initWithBytes:length:encoding:"),
+            value.as_ptr().cast(),
+            value.len(),
+            4,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn ns_error_localized_description(error: ObjcId) -> Option<String> {
+    unsafe {
+        if error.is_null() {
+            return None;
+        }
+        let description = msg_send_id0(error, sel("localizedDescription"));
+        if description.is_null() {
+            return None;
+        }
+        let bytes = msg_send_const_char_ptr0(description, sel("UTF8String"));
+        if bytes.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(bytes).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn new_function(library: ObjcId, name: &str) -> Result<ObjcId> {
+    unsafe {
+        let function_name = ns_string(name);
+        let function = msg_send_id1_id(library, sel("newFunctionWithName:"), function_name);
+        release(function_name);
+        if function.is_null() {
+            bail!("compiled Flash-MoE Metal library is missing kernel `{name}`");
+        }
+        Ok(function)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn compile_pipeline(device: ObjcId, library: ObjcId, name: &str) -> Result<ObjcId> {
+    unsafe {
+        let function = new_function(library, name)?;
+        let pipeline = new_compute_pipeline(device, function)
+            .with_context(|| format!("failed to create {name} Metal pipeline"))?;
+        release(function);
+        Ok(pipeline)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn new_compute_pipeline(device: ObjcId, function: ObjcId) -> Result<ObjcId> {
+    unsafe {
+        let pipeline = msg_send_id3(
+            device,
+            sel("newComputePipelineStateWithFunction:error:"),
+            function,
+        );
+        if pipeline.is_null() {
+            bail!("failed to create Flash-MoE Metal compute pipeline");
+        }
+        Ok(pipeline)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_page_size() -> usize {
+    unsafe {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if page_size > 0 {
+            page_size as usize
+        } else {
+            16 * 1024
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn wrap_dense_mmap_as_metal_buffer(
+    device: ObjcId,
+    mmap: Arc<memmap2::Mmap>,
+    len: u64,
+) -> Result<Option<MetalDenseWeights>> {
+    let len = usize::try_from(len).context("dense mmap length does not fit usize")?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let ptr = mmap.as_ptr() as *mut c_void;
+    let page_size = metal_page_size();
+    if (ptr as usize) % page_size != 0 {
+        tracing::debug!(
+            ptr = ?ptr,
+            page_size,
+            "dense mmap is not page-aligned; resident Metal dense buffer disabled"
+        );
+        return Ok(None);
+    }
+    unsafe {
+        let buffer = msg_send_id4_ptr_usize_u64_ptr(
+            device,
+            sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            ptr,
+            len,
+            0,
+            ptr::null_mut(),
+        );
+        if buffer.is_null() {
+            tracing::debug!(len, "failed to wrap dense mmap as resident Metal buffer");
+            return Ok(None);
+        }
+        Ok(Some(MetalDenseWeights {
+            buffer,
+            _mmap: mmap,
+            len,
+        }))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_buffer(encoder: ObjcId, buffer: ObjcId, index: u64) {
+    unsafe {
+        set_buffer_with_offset(encoder, buffer, 0, index);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, index: u64) {
+    unsafe {
+        msg_send_void4(
+            encoder,
+            sel("setBuffer:offset:atIndex:"),
+            buffer,
+            offset,
+            index,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        let mut output = vec![0.0f32; len];
+        ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), len);
+        output
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
+    unsafe {
+        let grid = MtlSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: threads.clamp(1, 64),
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreads:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
+    unsafe {
+        const Q4_ROWS_PER_THREADGROUP: u64 = 8;
+        let grid = MtlSize {
+            width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn f32_as_bytes(values: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u32_as_bytes(value: &u32) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (value as *const u32).cast::<u8>(),
+            std::mem::size_of::<u32>(),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u32_as_bytes_slice(values: &[u32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u64_as_bytes(value: &u64) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (value as *const u64).cast::<u8>(),
+            std::mem::size_of::<u64>(),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MtlSize {
+    width: u64,
+    height: u64,
+    depth: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn commit_metal_command_buffer(command_buffer: ObjcId, context: &MetalCommandContext) {
+    unsafe {
+        set_metal_command_buffer_label(command_buffer, context);
+        msg_send_void0(command_buffer, sel("commit"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn commit_and_wait_metal_command_buffer(
+    command_buffer: ObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    unsafe {
+        commit_metal_command_buffer(command_buffer, context);
+        wait_for_metal_command_buffer(command_buffer, context)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_metal_command_buffer_label(command_buffer: ObjcId, context: &MetalCommandContext) {
+    unsafe {
+        let label = ns_string(&context.label());
+        msg_send_void1_id(command_buffer, sel("setLabel:"), label);
+        release(label);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn wait_for_metal_command_buffer(
+    command_buffer: ObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    let started = Instant::now();
+    let timeout = metal_command_timeout();
+    let poll_interval = Duration::from_millis(2);
+    loop {
+        let status = unsafe { metal_command_buffer_status(command_buffer) };
+        if status.is_terminal() {
+            let elapsed = started.elapsed();
+            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
+            return match status {
+                MetalCommandStatus::Completed if metal_error.is_none() => Ok(()),
+                _ => Err(MetalCommandBufferFailure::failed(
+                    context,
+                    elapsed,
+                    status,
+                    metal_error,
+                )),
+            };
+        }
+        if started.elapsed() >= timeout {
+            let elapsed = started.elapsed();
+            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
+            return Err(MetalCommandBufferFailure::timeout(
+                context,
+                elapsed,
+                status,
+                metal_error,
+            ));
+        }
+        thread::sleep(poll_interval);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_status(command_buffer: ObjcId) -> MetalCommandStatus {
+    unsafe { MetalCommandStatus::from_raw(msg_send_usize0(command_buffer, sel("status"))) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_error(command_buffer: ObjcId) -> Option<String> {
+    unsafe {
+        let error = msg_send_id0(command_buffer, sel("error"));
+        ns_error_localized_description(error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn release(receiver: ObjcId) {
+    unsafe {
+        if !receiver.is_null() {
+            msg_send_void0(receiver, sel("release"));
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id0(receiver: ObjcId, selector: Sel) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id3(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, *mut ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg, ptr::null_mut())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id2_id_error(
+    receiver: ObjcId,
+    selector: Sel,
+    arg1: ObjcId,
+    arg2: ObjcId,
+    error: *mut ObjcId,
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId, *mut ObjcId) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id2_usize_u64(
+    receiver: ObjcId,
+    selector: Sel,
+    len: usize,
+    options: u64,
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, usize, u64) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, len, options)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id3_ptr_usize_u64(
+    receiver: ObjcId,
+    selector: Sel,
+    bytes: *const c_void,
+    len: usize,
+    options: u64,
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, *const c_void, usize, u64) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_id4_ptr_usize_u64_ptr(
+    receiver: ObjcId,
+    selector: Sel,
+    bytes: *mut c_void,
+    len: usize,
+    options: u64,
+    deallocator: *mut c_void,
+) -> ObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, *mut c_void, usize, u64, *mut c_void) -> ObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options, deallocator)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, a, b);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void4(receiver: ObjcId, selector: Sel, arg1: ObjcId, arg2: u64, arg3: u64) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, u64, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, arg3);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_ptr0(receiver: ObjcId, selector: Sel) -> *mut c_void {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_const_char_ptr0(receiver: ObjcId, selector: Sel) -> *const c_char {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> *const c_char =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_usize0(receiver: ObjcId, selector: Sel) -> usize {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+fn expert_store_size(path: &Path) -> Result<(usize, u64)> {
+    if !path.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("bin")
+        {
+            files += 1;
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn format_missing(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        "none".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+pub fn expected_hf_files() -> Vec<OsString> {
+    [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
+}
+
+/// The minimum set of HuggingFace snapshot files required for a Qwen3-VL
+/// (vision-language) FlashMoe model.  The ViT tensors are embedded in the
+/// same shards as the text tensors and are split out during caching.
+pub fn expected_vl_hf_files() -> Vec<OsString> {
+    expected_hf_files()
+}
+
+pub const METAL_SHADERS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void q4_fma_matvec(
+    device const uchar* packed [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& groups_per_row [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = scales[scale_row + group];
+            float bias = biases[scale_row + group];
+
+            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
+            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
+            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
+            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
+            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
+            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
+            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
+            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
+
+            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
+            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
+            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
+            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
+            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
+            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
+            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
+            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float scale0 = scales[scale_row + group0];
+            float bias0 = biases[scale_row + group0];
+            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float scale1 = scales[scale_row + group1];
+                float bias1 = biases[scale_row + group1];
+                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
+inline float bf16_to_float(ushort value) {
+    return as_type<float>(uint(value) << 16u);
+}
+
+kernel void q4_fma_matvec_bf16_scale_bias(
+    device const uchar* packed [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& groups_per_row [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = bf16_to_float(scales[scale_row + group]);
+            float bias = bf16_to_float(biases[scale_row + group]);
+
+            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
+            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
+            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
+            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
+            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
+            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
+            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
+            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
+
+            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
+            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
+            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
+            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
+            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
+            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
+            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
+            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float scale0 = bf16_to_float(scales[scale_row + group0]);
+            float bias0 = bf16_to_float(biases[scale_row + group0]);
+            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float scale1 = bf16_to_float(scales[scale_row + group1]);
+                float bias1 = bf16_to_float(biases[scale_row + group1]);
+                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
+kernel void q4_mmap_fma_matvec(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& packed_byte_offset [[buffer(3)]],
+    constant ulong& scales_byte_offset [[buffer(4)]],
+    constant ulong& biases_byte_offset [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& cols [[buffer(7)]],
+    constant uint& groups_per_row [[buffer(8)]],
+    constant uint& group_size [[buffer(9)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    device const uchar* packed = weight_bytes + packed_byte_offset;
+    device const float* scales = reinterpret_cast<device const float*>(weight_bytes + scales_byte_offset);
+    device const float* biases = reinterpret_cast<device const float*>(weight_bytes + biases_byte_offset);
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 4096;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[4096];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = scales[scale_row + group];
+            float bias = biases[scale_row + group];
+
+            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
+            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
+            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
+            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
+            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
+            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
+            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
+            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
+
+            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
+            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
+            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
+            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
+            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
+            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
+            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
+            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float scale0 = scales[scale_row + group0];
+            float bias0 = biases[scale_row + group0];
+            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float scale1 = scales[scale_row + group1];
+                float bias1 = biases[scale_row + group1];
+                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
+kernel void route_top4(
+    device const float* scores [[buffer(0)]],
+    device uint4* indices [[buffer(1)]],
+    device float4* weights [[buffer(2)]],
+    constant uint& experts [[buffer(3)]],
+    uint token [[thread_position_in_grid]]) {
+    float4 best = float4(-INFINITY);
+    uint4 best_i = uint4(0);
+    for (uint i = 0; i < experts; ++i) {
+        float score = scores[token * experts + i];
+        if (score > best.x) { best.w = best.z; best_i.w = best_i.z; best.z = best.y; best_i.z = best_i.y; best.y = best.x; best_i.y = best_i.x; best.x = score; best_i.x = i; }
+        else if (score > best.y) { best.w = best.z; best_i.w = best_i.z; best.z = best.y; best_i.z = best_i.y; best.y = score; best_i.y = i; }
+        else if (score > best.z) { best.w = best.z; best_i.w = best_i.z; best.z = score; best_i.z = i; }
+        else if (score > best.w) { best.w = score; best_i.w = i; }
+    }
+    weights[token] = best;
+    indices[token] = best_i;
+}
+
+kernel void dense_matvec(
+    device const float* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(weights[row * cols + col], input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_matvec_bf16(
+    device const ushort* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint row [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    uint row_offset = row * cols;
+    for (uint col = 0; col < cols; ++col) {
+        uint bits = uint(weights[row_offset + col]) << 16u;
+        float weight = as_type<float>(bits);
+        acc = fma(weight, input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_mmap_matvec_f32(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& stride [[buffer(6)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) { return; }
+    device const float* weights = reinterpret_cast<device const float*>(weight_bytes + byte_offset);
+    float acc = 0.0f;
+    uint row_offset = row * stride;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(weights[row_offset + col], input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_mmap_matvec_bf16(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& stride [[buffer(6)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) { return; }
+    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + byte_offset);
+    float acc = 0.0f;
+    uint row_offset = row * stride;
+    for (uint col = 0; col < cols; ++col) {
+        uint bits = uint(weights[row_offset + col]) << 16u;
+        acc = fma(as_type<float>(bits), input[col], acc);
+    }
+    output[row] = acc;
+}
+
+kernel void dense_mmap_matvec_bf16_simd(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& stride [[buffer(6)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 4096;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[4096];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) { return; }
+
+    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + byte_offset);
+    uint row_offset = row * stride;
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < cols; col += 32) {
+        uint bits = uint(weights[row_offset + col]) << 16u;
+        float x = use_input_cache ? input_cache[col] : input[col];
+        acc = fma(as_type<float>(bits), x, acc);
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
+kernel void rms_norm(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float sum = 0.0f;
+    for (uint i = 0; i < width; ++i) {
+        sum = fma(input[i], input[i], sum);
+    }
+    float scale = rsqrt(sum / float(max(width, 1u)) + 1.0e-6f);
+    output[idx] = input[idx] * scale * weight[idx];
+}
+
+kernel void rope_apply(
+    device float* values [[buffer(0)]],
+    constant uint& position [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant float& theta [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint pair = idx * 2u;
+    uint lane = pair % head_dim;
+    float inv_freq = pow(theta, -float(lane) / float(max(head_dim, 1u)));
+    float angle = float(position) * inv_freq;
+    float s = sin(angle);
+    float c = cos(angle);
+    float x = values[pair];
+    float y = values[pair + 1u];
+    values[pair] = x * c - y * s;
+    values[pair + 1u] = x * s + y * c;
+}
+
+kernel void rope_split_half_apply(
+    device float* values [[buffer(0)]],
+    constant uint& temporal_position [[buffer(1)]],
+    constant uint& height_position [[buffer(2)]],
+    constant uint& width_position [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& rotary_dim [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    constant uint& use_mrope [[buffer(7)]],
+    device const uint* mrope_section [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint safe_head_dim = max(head_dim, 1u);
+    uint safe_rotary = min(rotary_dim, safe_head_dim);
+    safe_rotary -= safe_rotary % 2u;
+    uint rotary_half = max(safe_rotary / 2u, 1u);
+    uint head = idx / rotary_half;
+    uint i = idx % rotary_half;
+    if (i >= rotary_half) { return; }
+
+    uint position = temporal_position;
+    if (use_mrope != 0u) {
+        uint height = mrope_section[1];
+        uint width = mrope_section[2];
+        if ((i % 3u) == 1u && i < height * 3u) {
+            position = height_position;
+        } else if ((i % 3u) == 2u && i < width * 3u) {
+            position = width_position;
+        }
+    }
+
+    float inv_freq = pow(max(theta, 1.0f), -float(2u * i) / float(max(safe_rotary, 1u)));
+    float angle = float(position) * inv_freq;
+    float s = sin(angle);
+    float c = cos(angle);
+    uint base = head * safe_head_dim;
+    uint lo = base + i;
+    uint hi = base + i + rotary_half;
+    float x0 = values[lo];
+    float x1 = values[hi];
+    values[lo] = x0 * c - x1 * s;
+    values[hi] = x0 * s + x1 * c;
+}
+
+kernel void attention_scores(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    uint token [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    for (uint i = 0; i < width; ++i) {
+        acc = fma(query[i], keys[token * width + i], acc);
+    }
+    scores[token] = acc * rsqrt(float(max(head_dim, 1u)));
+}
+
+kernel void kv_cache_write(
+    device const float* key [[buffer(0)]],
+    device const float* value [[buffer(1)]],
+    device float* keys [[buffer(2)]],
+    device float* values [[buffer(3)]],
+    constant ulong& offset [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    keys[offset + idx] = key[idx];
+    values[offset + idx] = value[idx];
+}
+
+kernel void kv_cache_read_attention(
+    device const float* weights [[buffer(0)]],
+    device const float* values [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant uint& tokens [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float acc = 0.0f;
+    for (uint token = 0; token < tokens; ++token) {
+        acc = fma(weights[token], values[token * width + idx], acc);
+    }
+    output[idx] = acc;
+}
+
+kernel void expert_mlp_fused(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device const float* down [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& intermediate [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    for (uint i = 0; i < intermediate; ++i) {
+        float g = gate[i] / (1.0f + exp(-gate[i]));
+        acc = fma(down[row * intermediate + i], g * up[i], acc);
+    }
+    output[row] = acc * rsqrt(float(max(intermediate, 1u)));
+}
+
+kernel void silu_product(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float g = gate[idx];
+    output[idx] = (g / (1.0f + exp(-g))) * up[idx];
+}
+
+kernel void shared_expert_activation(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device const float* router [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& intermediate [[buffer(4)]],
+    constant uint& total_intermediate [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= total_intermediate) { return; }
+    uint shared_idx = intermediate == 0 ? 0 : idx / intermediate;
+    float route = router[shared_idx];
+    float route_weight = 1.0f / (1.0f + exp(-route));
+    float g = gate[idx];
+    output[idx] = (g / (1.0f + exp(-g))) * up[idx] * route_weight;
+}
+
+kernel void combine_expert_phase(
+    device const float* residual [[buffer(0)]],
+    device const float* shared [[buffer(1)]],
+    device const float* expert_outputs [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device float* hidden [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    constant uint& active_experts [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    float acc = residual[idx] + shared[idx];
+    for (uint expert = 0; expert < active_experts; ++expert) {
+        acc = fma(expert_outputs[expert * width + idx], weights[expert], acc);
+    }
+    hidden[idx] = acc;
+}
+
+kernel void fill_zero(
+    device float* output [[buffer(0)]],
+    constant uint& width [[buffer(1)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= width) { return; }
+    output[idx] = 0.0f;
+}
+
+kernel void lm_head_logits(
+    device const float* lm_head [[buffer(0)]],
+    device const float* hidden [[buffer(1)]],
+    device float* logits [[buffer(2)]],
+    constant uint& hidden_width [[buffer(3)]],
+    constant uint& vocab [[buffer(4)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint hidden_cache_len = 4096;
+    uint token = tile * rows_per_threadgroup + simd_group;
+    bool use_hidden_cache = hidden_width <= hidden_cache_len;
+    threadgroup float hidden_cache[4096];
+    if (use_hidden_cache) {
+        for (uint i = lid; i < hidden_width; i += 256) {
+            hidden_cache[i] = hidden[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (token >= vocab) {
+        return;
+    }
+
+    float acc = 0.0f;
+    for (uint i = simd_lane; i < hidden_width; i += 32) {
+        float h = use_hidden_cache ? hidden_cache[i] : hidden[i];
+        acc = fma(lm_head[token * hidden_width + i], h, acc);
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        logits[token] = sum;
+    }
+}
+
+kernel void topk_vocab(
+    device const float* logits [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    device float* values [[buffer(2)]],
+    constant uint& vocab [[buffer(3)]],
+    constant uint& top_k [[buffer(4)]],
+    uint slot [[thread_position_in_grid]]) {
+    if (slot != 0) { return; }
+    uint limit = min(top_k, vocab);
+    for (uint out = 0; out < limit; ++out) {
+        float best = -INFINITY;
+        uint best_i = 0;
+        bool found = false;
+        for (uint i = 0; i < vocab; ++i) {
+            float raw_value = logits[i];
+            float value = isfinite(raw_value) ? raw_value : -INFINITY;
+            bool already_used = false;
+            for (uint prev = 0; prev < out; ++prev) {
+                already_used = already_used || (indices[prev] == i);
+            }
+            if (!already_used && (!found || value > best)) {
+                best = value;
+                best_i = i;
+                found = true;
+            }
+        }
+        indices[out] = best_i;
+        values[out] = best;
+    }
+}
+
+// Multi-head GQA attention scores.
+// One thread per (q_head, token) pair: tid = q_head * tokens + token.
+// query   : [num_q_heads * head_dim]
+// keys    : [tokens * kv_width]   (layer-offset slice supplied by the caller)
+// scores  : [num_q_heads * tokens]  (output)
+kernel void gqa_attention_scores(
+    device const float* query       [[buffer(0)]],
+    device const float* keys        [[buffer(1)]],
+    device float*       scores      [[buffer(2)]],
+    constant uint& head_dim         [[buffer(3)]],
+    constant uint& groups_per_kv    [[buffer(4)]],
+    constant uint& tokens           [[buffer(5)]],
+    constant uint& kv_width         [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]) {
+    uint q_head  = tid / max(tokens, 1u);
+    uint token   = tid % max(tokens, 1u);
+    uint kv_head = q_head / max(groups_per_kv, 1u);
+    float acc = 0.0f;
+    uint q_base = q_head  * head_dim;
+    uint k_base = token   * kv_width + kv_head * head_dim;
+    for (uint d = 0; d < head_dim; ++d) {
+        acc = fma(query[q_base + d], keys[k_base + d], acc);
+    }
+    scores[q_head * max(tokens, 1u) + token] = acc * rsqrt(float(max(head_dim, 1u)));
+}
+
+// Multi-head GQA weighted value aggregation.
+// One thread per output element idx = q_head * head_dim + d.
+// scores  : [num_q_heads * tokens]  (softmax-normalised per Q-head, supplied by caller)
+// values  : [tokens * kv_width]     (layer-offset slice supplied by the caller)
+// output  : [num_q_heads * head_dim]
+kernel void gqa_kv_read_attention(
+    device const float* scores      [[buffer(0)]],
+    device const float* values      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    constant uint& head_dim         [[buffer(3)]],
+    constant uint& groups_per_kv    [[buffer(4)]],
+    constant uint& tokens           [[buffer(5)]],
+    constant uint& kv_width         [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint q_head  = idx / max(head_dim, 1u);
+    uint d       = idx % max(head_dim, 1u);
+    uint kv_head = q_head / max(groups_per_kv, 1u);
+    float acc = 0.0f;
+    for (uint token = 0; token < tokens; ++token) {
+        float w = scores[q_head * max(tokens, 1u) + token];
+        float v = values[token * kv_width + kv_head * head_dim + d];
+        acc = fma(w, v, acc);
+    }
+    output[idx] = acc;
+}
+"#;
+
+pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<FlashMoePlan> {
+    let plan = plan_unchecked(model, snapshot_dir.parent().unwrap_or(snapshot_dir));
+    fs::create_dir_all(&plan.runtime_dir)
+        .with_context(|| format!("failed to create {}", plan.runtime_dir.display()))?;
+    fs::create_dir_all(&plan.experts_dir)
+        .with_context(|| format!("failed to create {}", plan.experts_dir.display()))?;
+
+    let config_json = snapshot_dir.join("config.json");
+    let config = if config_json.is_file() {
+        let config = QwenModelConfig::from_file(&config_json)?;
+        fs::copy(&config_json, &plan.model_config).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                config_json.display(),
+                plan.model_config.display()
+            )
+        })?;
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
+        tracing::debug!(
+            layers = config.num_hidden_layers,
+            hidden_size = config.hidden_size,
+            attention_heads = config.num_attention_heads,
+            kv_heads = config.kv_heads(),
+            experts = config.experts(),
+            active_experts = routing_policy.active_experts,
+            active_experts_source = ?routing_policy.source,
+            vocab_size = config.vocab_size,
+            "validated Qwen Flash-MoE model config"
+        );
+        Some(config)
+    } else {
+        None
+    };
+
+    prepare_tokenizer_artifacts(snapshot_dir, &plan)?;
+
+    let index_json = snapshot_dir.join("model.safetensors.index.json");
+    let (manifest, visual_tensor_refs) = if index_json.is_file() {
+        build_manifest(model, snapshot_dir, &index_json)?
+    } else {
+        (
+            FlashMoeManifest {
+                model: canonical_model(model),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: Vec::new(),
+                expert_tensors: Vec::new(),
+                dense_tensors: Vec::new(),
+            },
+            Vec::new(),
+        )
+    };
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("failed to encode Flash-MoE manifest")?;
+    fs::write(&plan.tensor_manifest, manifest_bytes).with_context(|| {
+        format!(
+            "failed to write Flash-MoE tensor manifest {}",
+            plan.tensor_manifest.display()
+        )
+    })?;
+
+    write_dense_tensor_store(
+        snapshot_dir,
+        &plan.non_expert_weights,
+        &manifest.dense_tensors,
+    )?;
+    pack_expert_tensors(
+        snapshot_dir,
+        &plan,
+        &manifest.expert_tensors,
+        config.as_ref(),
+    )?;
+
+    // For VL models, build and write the vision weights store.
+    if let (Some(vision_weights), Some(vision_manifest)) =
+        (plan.vision_weights.as_ref(), plan.vision_manifest.as_ref())
+    {
+        if !visual_tensor_refs.is_empty() {
+            write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
+            let vision_manifest_data = FlashMoeManifest {
+                model: canonical_model(model),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: Vec::new(),
+                expert_tensors: Vec::new(),
+                dense_tensors: visual_tensor_refs,
+            };
+            let vision_manifest_bytes = serde_json::to_vec_pretty(&vision_manifest_data)
+                .context("failed to encode vision weights manifest")?;
+            fs::write(vision_manifest, vision_manifest_bytes).with_context(|| {
+                format!(
+                    "failed to write vision weights manifest {}",
+                    vision_manifest.display()
+                )
+            })?;
+        }
+        // Write vision_config.json (the nested vision_config object from config.json).
+        if let (Some(vc), Some(vc_path)) = (
+            config.as_ref().and_then(|c| c.vision_config.as_ref()),
+            plan.vision_config_path.as_ref(),
+        ) {
+            let vc_bytes =
+                serde_json::to_vec_pretty(vc).context("failed to encode vision config")?;
+            fs::write(vc_path, vc_bytes)
+                .with_context(|| format!("failed to write vision config {}", vc_path.display()))?;
+        }
+    }
+
+    fs::write(plan.runtime_dir.join("kernels.metal"), METAL_SHADERS).with_context(|| {
+        format!(
+            "failed to write Metal kernels to {}",
+            plan.runtime_dir.display()
+        )
+    })?;
+    fs::write(plan.runtime_dir.join("README.txt"), plan.describe())
+        .with_context(|| "failed to write Flash-MoE cache README".to_string())?;
+    Ok(plan)
+}
+
+fn prepare_tokenizer_artifacts(snapshot_dir: &Path, plan: &FlashMoePlan) -> Result<()> {
+    let tokenizer_json = snapshot_dir.join("tokenizer.json");
+    let tokenizer_config_json = snapshot_dir.join("tokenizer_config.json");
+    if !tokenizer_json.is_file() {
+        bail!(
+            "Flash-MoE requires tokenizer.json from the active model directory; missing {}",
+            tokenizer_json.display()
+        );
+    }
+    fs::create_dir_all(&plan.model_cache_dir)
+        .with_context(|| format!("failed to create {}", plan.model_cache_dir.display()))?;
+    if tokenizer_json != plan.tokenizer {
+        fs::copy(&tokenizer_json, &plan.tokenizer).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                tokenizer_json.display(),
+                plan.tokenizer.display()
+            )
+        })?;
+    }
+    if tokenizer_config_json.is_file() && tokenizer_config_json != plan.tokenizer_config {
+        fs::copy(&tokenizer_config_json, &plan.tokenizer_config).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                tokenizer_config_json.display(),
+                plan.tokenizer_config.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn build_manifest(
+    model: &str,
+    snapshot_dir: &Path,
+    index_json: &Path,
+) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
+    let index: SafetensorsIndex = serde_json::from_slice(
+        &fs::read(index_json)
+            .with_context(|| format!("failed to read {}", index_json.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", index_json.display()))?;
+    let mut dense_shards = BTreeSet::new();
+    let mut dense_tensor_refs = Vec::new();
+    let mut visual_tensor_refs = Vec::new();
+    let mut expert_tensors = Vec::new();
+    let mut shard_cache = BTreeMap::<String, SafetensorShard>::new();
+    let mut runtime_offset = 0u64;
+    let mut visual_offset = 0u64;
+    for (tensor, shard) in index.weight_map {
+        let canonical_tensor = canonical_hf_tensor_name(&tensor);
+        if skip_flashmoe_runtime_tensor(&canonical_tensor) {
+            continue;
+        }
+        let shard_path = snapshot_dir.join(&shard);
+        if !shard_path.is_file() {
+            bail!(
+                "safetensors shard referenced by index is missing: {}",
+                shard_path.display()
+            );
+        }
+        if !shard_cache.contains_key(&shard) {
+            shard_cache.insert(shard.clone(), parse_safetensors_header(&shard_path)?);
+        }
+        let shard_info = shard_cache.get(&shard).expect("inserted above");
+        let tensor_info = shard_info.tensors.get(&tensor).with_context(|| {
+            format!("tensor {tensor} listed in index but missing from safetensors header {shard}")
+        })?;
+        if is_expert_tensor_name(&canonical_tensor) {
+            let (layer, expert) = parse_layer_expert(&canonical_tensor);
+            expert_tensors.push(ExpertTensorRef {
+                tensor: canonical_tensor,
+                shard,
+                layer,
+                expert,
+                dtype: Some(tensor_info.dtype.clone()),
+                shape: tensor_info.shape.clone(),
+                source_offsets: Some(tensor_info.data_offsets),
+            });
+        } else if canonical_tensor.starts_with("visual.") {
+            // Vision encoder tensors go into a separate store.
+            let byte_len = tensor_info.data_offsets[1]
+                .checked_sub(tensor_info.data_offsets[0])
+                .with_context(|| format!("invalid data_offsets for visual tensor {tensor}"))?;
+            visual_offset = align_to(visual_offset, TENSOR_ALIGNMENT);
+            visual_tensor_refs.push(DenseTensorRef {
+                tensor: canonical_tensor,
+                shard,
+                dtype: tensor_info.dtype.clone(),
+                shape: tensor_info.shape.clone(),
+                source_offsets: tensor_info.data_offsets,
+                runtime_offset: visual_offset,
+                byte_len,
+                quantization: TensorQuantization::None,
+            });
+            visual_offset = visual_offset.saturating_add(byte_len);
+        } else {
+            dense_shards.insert(shard.clone());
+            let source_byte_len = tensor_info.data_offsets[1]
+                .checked_sub(tensor_info.data_offsets[0])
+                .with_context(|| format!("invalid data_offsets for tensor {tensor}"))?;
+            let quantization = dense_tensor_quantization(&canonical_tensor, tensor_info);
+            let byte_len = match &quantization {
+                TensorQuantization::None => source_byte_len,
+                TensorQuantization::Q4 { group_size, .. } => {
+                    dense_q4_layout(&tensor_info.shape, *group_size)?.total_bytes as u64
+                }
+            };
+            runtime_offset = align_to(runtime_offset, TENSOR_ALIGNMENT);
+            dense_tensor_refs.push(DenseTensorRef {
+                tensor: canonical_tensor,
+                shard,
+                dtype: tensor_info.dtype.clone(),
+                shape: tensor_info.shape.clone(),
+                source_offsets: tensor_info.data_offsets,
+                runtime_offset,
+                byte_len,
+                quantization,
+            });
+            runtime_offset = runtime_offset.saturating_add(byte_len);
+        }
+    }
+    Ok((
+        FlashMoeManifest {
+            model: canonical_model(model),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: dense_shards.into_iter().collect(),
+            expert_tensors,
+            dense_tensors: dense_tensor_refs,
+        },
+        visual_tensor_refs,
+    ))
+}
+
+fn skip_flashmoe_runtime_tensor(canonical_tensor: &str) -> bool {
+    canonical_tensor.starts_with("mtp.")
+}
+
+fn dense_tensor_quantization(
+    canonical_tensor: &str,
+    tensor_info: &SafetensorTensorInfo,
+) -> TensorQuantization {
+    let _ = (canonical_tensor, tensor_info);
+    TensorQuantization::None
+}
+
+fn canonical_hf_tensor_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("model.language_model.") {
+        format!("model.{rest}")
+    } else if let Some(rest) = name.strip_prefix("model.visual.") {
+        format!("visual.{rest}")
+    } else {
+        name.to_string()
+    }
+}
+
+const TENSOR_ALIGNMENT: u64 = 4096;
+
+fn align_to(value: u64, alignment: u64) -> u64 {
+    if alignment == 0 {
+        return value;
+    }
+    value.div_ceil(alignment) * alignment
+}
+
+fn parse_safetensors_header(path: &Path) -> Result<SafetensorShard> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open safetensors shard {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat safetensors shard {}", path.display()))?
+        .len();
+    if file_len < 8 {
+        bail!(
+            "safetensors shard {} is too small to contain a header",
+            path.display()
+        );
+    }
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes)
+        .with_context(|| format!("failed to read header length from {}", path.display()))?;
+    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+    let header_start = 8usize;
+    let header_end = header_start
+        .checked_add(header_len)
+        .context("safetensors header length overflow")?;
+    if header_end as u64 > file_len {
+        bail!("safetensors shard {} has truncated header", path.display());
+    }
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .with_context(|| format!("failed to read safetensors header from {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .with_context(|| format!("failed to parse safetensors header {}", path.display()))?;
+    let mut tensors = BTreeMap::new();
+    let object = value
+        .as_object()
+        .context("safetensors header must be a JSON object")?;
+    for (name, entry) in object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let info: SafetensorTensorInfo = serde_json::from_value(entry.clone())
+            .with_context(|| format!("failed to parse safetensors tensor metadata for {name}"))?;
+        if info.data_offsets[1] < info.data_offsets[0] {
+            bail!("tensor {name} has invalid safetensors data_offsets");
+        }
+        let absolute_end = header_end as u64 + info.data_offsets[1];
+        if absolute_end > file_len {
+            bail!(
+                "tensor {name} data range exceeds shard length in {}",
+                path.display()
+            );
+        }
+        tensors.insert(name.clone(), info);
+    }
+    Ok(SafetensorShard {
+        data_start: header_end as u64,
+        tensors,
+    })
+}
+
+fn write_dense_tensor_store(
+    snapshot_dir: &Path,
+    destination: &Path,
+    dense_tensors: &[DenseTensorRef],
+) -> Result<()> {
+    let mut out = fs::File::create(destination).with_context(|| {
+        format!(
+            "failed to create dense tensor store {}",
+            destination.display()
+        )
+    })?;
+    let mut current = 0u64;
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+    for tensor in dense_tensors {
+        if !shard_cache.contains_key(&tensor.shard) {
+            let path = snapshot_dir.join(&tensor.shard);
+            let file = fs::File::open(&path)
+                .with_context(|| format!("failed to open shard {}", path.display()))?;
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .map(&file)
+                    .with_context(|| format!("failed to memory-map {}", path.display()))?
+            };
+            shard_cache.insert(
+                tensor.shard.clone(),
+                (mmap, parse_safetensors_header(&path)?),
+            );
+        }
+        if current < tensor.runtime_offset {
+            write_padding(&mut out, tensor.runtime_offset - current)?;
+            current = tensor.runtime_offset;
+        }
+        let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
+        let start = shard.data_start + tensor.source_offsets[0];
+        let end = shard.data_start + tensor.source_offsets[1];
+        let raw = &bytes[start as usize..end as usize];
+        match &tensor.quantization {
+            TensorQuantization::None => {
+                out.write_all(raw)
+                    .with_context(|| format!("failed to write dense tensor {}", tensor.tensor))?;
+            }
+            TensorQuantization::Q4 { group_size, .. } => {
+                let values = decode_dense_tensor_f32(&tensor.dtype, raw).with_context(|| {
+                    format!(
+                        "failed to decode dense tensor {} as {} before q4 quantization",
+                        tensor.tensor, tensor.dtype
+                    )
+                })?;
+                let packed =
+                    quantize_q4(&values, &tensor.shape, *group_size).with_context(|| {
+                        format!(
+                            "failed to quantize dense tensor {} into q4 groups",
+                            tensor.tensor
+                        )
+                    })?;
+                let layout = dense_q4_layout(&tensor.shape, *group_size)?;
+                if packed.values.len() != layout.packed_bytes
+                    || packed.scales.len() != layout.scales_bytes / std::mem::size_of::<f32>()
+                    || packed.biases.len() != layout.scales_bytes / std::mem::size_of::<f32>()
+                    || tensor.byte_len as usize != layout.total_bytes
+                {
+                    bail!(
+                        "dense q4 layout mismatch for {}: packed={} scales={} biases={} manifest_bytes={} computed_bytes={}",
+                        tensor.tensor,
+                        packed.values.len(),
+                        packed.scales.len(),
+                        packed.biases.len(),
+                        tensor.byte_len,
+                        layout.total_bytes
+                    );
+                }
+                out.write_all(&packed.values).with_context(|| {
+                    format!(
+                        "failed to write dense q4 packed values for {}",
+                        tensor.tensor
+                    )
+                })?;
+                for scale in &packed.scales {
+                    out.write_all(&scale.to_le_bytes())?;
+                }
+                for bias in &packed.biases {
+                    out.write_all(&bias.to_le_bytes())?;
+                }
+            }
+        }
+        current = current.saturating_add(tensor.byte_len);
+    }
+    Ok(())
+}
+
+fn write_padding(out: &mut fs::File, mut bytes: u64) -> Result<()> {
+    const ZEROES: [u8; 4096] = [0; 4096];
+    while bytes > 0 {
+        let n = usize::try_from(bytes.min(ZEROES.len() as u64)).unwrap_or(ZEROES.len());
+        out.write_all(&ZEROES[..n])
+            .context("failed to write tensor alignment padding")?;
+        bytes -= n as u64;
+    }
+    Ok(())
+}
+
+fn pack_expert_tensors(
+    snapshot_dir: &Path,
+    plan: &FlashMoePlan,
+    expert_tensors: &[ExpertTensorRef],
+    config: Option<&QwenModelConfig>,
+) -> Result<()> {
+    let mut by_layer: BTreeMap<usize, BTreeMap<usize, Vec<&ExpertTensorRef>>> = BTreeMap::new();
+    let mut aggregate_by_layer: BTreeMap<usize, Vec<&ExpertTensorRef>> = BTreeMap::new();
+    for tensor in expert_tensors {
+        if let (Some(layer), Some(expert)) = (tensor.layer, tensor.expert) {
+            by_layer
+                .entry(layer)
+                .or_default()
+                .entry(expert)
+                .or_default()
+                .push(tensor);
+        } else if let Some(layer) = tensor.layer
+            && aggregate_expert_tensor_kind(&tensor.tensor).is_some()
+        {
+            aggregate_by_layer.entry(layer).or_default().push(tensor);
+        }
+    }
+
+    let deleted_temps = cleanup_stale_expert_temp_files(&plan.experts_dir)?;
+    if deleted_temps > 0 {
+        eprintln!(
+            "deleted {deleted_temps} stale temporary expert pack file(s) from {}",
+            plan.experts_dir.display()
+        );
+    }
+
+    let aggregate_layers = aggregate_by_layer.len();
+    if aggregate_layers > 0 {
+        eprintln!("packing aggregate experts across {aggregate_layers} layer(s)");
+    }
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+    for (layer_index, (layer, tensors)) in aggregate_by_layer.into_iter().enumerate() {
+        pack_aggregate_expert_layer(
+            snapshot_dir,
+            plan,
+            layer,
+            layer_index + 1,
+            aggregate_layers,
+            &tensors,
+            config,
+        )?;
+    }
+    for (layer, experts) in by_layer {
+        pack_direct_expert_layer(snapshot_dir, plan, layer, experts, config, &mut shard_cache)?;
+    }
+    Ok(())
+}
+
+fn pack_direct_expert_layer(
+    snapshot_dir: &Path,
+    plan: &FlashMoePlan,
+    layer: usize,
+    experts: BTreeMap<usize, Vec<&ExpertTensorRef>>,
+    config: Option<&QwenModelConfig>,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+) -> Result<()> {
+    let mut expected = Vec::with_capacity(experts.len());
+    for (expert, tensors) in &experts {
+        validate_expert_tensor_group(layer, *expert, tensors, config)?;
+        expected.push(expected_expert_pack(
+            snapshot_dir,
+            shard_cache,
+            *expert,
+            tensors,
+        )?);
+    }
+    let expert_count = layer_expert_count(config, &experts);
+    rewrite_expert_layer_pack(plan, layer, expert_count, &expected, |expert| {
+        let tensors = experts
+            .get(&expert)
+            .with_context(|| format!("missing expert {expert} tensors for layer {layer}"))?;
+        build_direct_expert_pack(snapshot_dir, shard_cache, layer, expert, tensors)
+    })?;
+    Ok(())
+}
+
+fn layer_expert_count(
+    config: Option<&QwenModelConfig>,
+    experts: &BTreeMap<usize, Vec<&ExpertTensorRef>>,
+) -> usize {
+    let declared = config.map(|config| config.experts()).unwrap_or(0);
+    let observed = experts
+        .keys()
+        .next_back()
+        .map(|expert| expert + 1)
+        .unwrap_or(0);
+    declared.max(observed).max(1)
+}
+
+fn build_direct_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    tensors: &[&ExpertTensorRef],
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let mut inputs = Vec::with_capacity(tensors.len());
+    for tensor in tensors {
+        let dtype = tensor.dtype.as_deref().unwrap_or("unknown");
+        let (values, source_offsets, source_hash) = decode_expert_tensor_range(
+            snapshot_dir,
+            shard_cache,
+            tensor,
+            0,
+            tensor.shape.iter().product(),
+        )?;
+        inputs.push(ExpertRecordInput {
+            tensor: tensor.tensor.clone(),
+            dtype: dtype.to_string(),
+            shape: tensor.shape.clone(),
+            source_offsets,
+            source_hash: Some(source_hash),
+            values,
+        });
+    }
+    build_expert_pack(layer, expert, inputs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateExpertTensorKind {
+    GateUp,
+    Down,
+}
+
+fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind> {
+    if name.ends_with(".mlp.experts.gate_up_proj")
+        || name.ends_with(".mlp.experts.gate_up_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::GateUp)
+    } else if name.ends_with(".mlp.experts.down_proj")
+        || name.ends_with(".mlp.experts.down_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Down)
+    } else {
+        None
+    }
+}
+
+fn cleanup_stale_expert_temp_files(experts_dir: &Path) -> Result<usize> {
+    if !experts_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    for entry in fs::read_dir(experts_dir)
+        .with_context(|| format!("failed to read {}", experts_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.contains(".tmp-") {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to delete stale temp file {}", path.display()))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn pack_aggregate_expert_layer(
+    snapshot_dir: &Path,
+    plan: &FlashMoePlan,
+    layer: usize,
+    layer_index: usize,
+    layer_total: usize,
+    tensors: &[&ExpertTensorRef],
+    config: Option<&QwenModelConfig>,
+) -> Result<()> {
+    let config = config.context("Qwen config is required to split aggregate expert tensors")?;
+    let layout = AggregateExpertLayout::new(config)?;
+
+    let gate_up =
+        single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp, layer)?;
+    let down = single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
+    validate_aggregate_expert_tensor_shape(
+        gate_up,
+        &[layout.experts, layout.intermediate * 2, layout.hidden],
+        "gate_up_proj",
+    )?;
+    validate_aggregate_expert_tensor_shape(
+        down,
+        &[layout.experts, layout.hidden, layout.intermediate],
+        "down_proj",
+    )?;
+
+    eprintln!(
+        "packing aggregate experts for layer {layer} ({layer_index}/{layer_total}): {} experts",
+        layout.experts
+    );
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+    let mut expected = Vec::with_capacity(layout.experts);
+    for expert in 0..layout.experts {
+        let records = expected_aggregate_expert_records(
+            snapshot_dir,
+            &mut shard_cache,
+            layer,
+            expert,
+            gate_up,
+            down,
+            layout,
+        )?;
+        expected.push(ExpectedExpertPack {
+            expert,
+            packed_bytes: pbq4_expert_pack_wire_size(&records)?,
+            records,
+        });
+    }
+    let skipped = rewrite_expert_layer_pack(plan, layer, layout.experts, &expected, |expert| {
+        build_aggregate_expert_pack(
+            snapshot_dir,
+            &mut shard_cache,
+            layer,
+            expert,
+            gate_up,
+            down,
+            layout,
+        )
+    })?;
+    eprintln!(
+        "prepared aggregate experts for layer {layer} ({layer_index}/{layer_total}): {}/{} ({skipped} reused)",
+        layout.experts, layout.experts,
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AggregateExpertLayout {
+    experts: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_expert_values: usize,
+    single_projection_values: usize,
+    down_expert_values: usize,
+}
+
+impl AggregateExpertLayout {
+    fn new(config: &QwenModelConfig) -> Result<Self> {
+        let experts = config.experts();
+        let hidden = config.hidden_size;
+        let intermediate = config
+            .moe_intermediate_size
+            .or(config.intermediate_size)
+            .context("Qwen config is missing moe_intermediate_size/intermediate_size for aggregate expert packing")?;
+
+        let gate_up_expert_values = intermediate
+            .checked_mul(2)
+            .and_then(|rows| rows.checked_mul(hidden))
+            .context("aggregate gate_up expert element count overflow")?;
+        let single_projection_values = intermediate
+            .checked_mul(hidden)
+            .context("aggregate gate/up projection element count overflow")?;
+        let down_expert_values = hidden
+            .checked_mul(intermediate)
+            .context("aggregate down projection element count overflow")?;
+        Ok(Self {
+            experts,
+            hidden,
+            intermediate,
+            gate_up_expert_values,
+            single_projection_values,
+            down_expert_values,
+        })
+    }
+}
+
+fn build_aggregate_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    gate_up: &ExpertTensorRef,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let mut inputs = Vec::with_capacity(3);
+    let gate_up_base = expert
+        .checked_mul(layout.gate_up_expert_values)
+        .context("aggregate gate_up expert offset overflow")?;
+    let (gate_values, gate_offsets, gate_hash) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        gate_up_base,
+        layout.single_projection_values,
+    )?;
+    inputs.push(ExpertRecordInput {
+        tensor: format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+        dtype: gate_up
+            .dtype
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        shape: vec![layout.intermediate, layout.hidden],
+        source_offsets: gate_offsets,
+        source_hash: Some(gate_hash),
+        values: gate_values,
+    });
+
+    let (up_values, up_offsets, up_hash) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        gate_up_base + layout.single_projection_values,
+        layout.single_projection_values,
+    )?;
+    inputs.push(ExpertRecordInput {
+        tensor: format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+        dtype: gate_up
+            .dtype
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        shape: vec![layout.intermediate, layout.hidden],
+        source_offsets: up_offsets,
+        source_hash: Some(up_hash),
+        values: up_values,
+    });
+
+    let down_base = expert
+        .checked_mul(layout.down_expert_values)
+        .context("aggregate down expert offset overflow")?;
+    let (down_values, down_offsets, down_hash) = decode_expert_tensor_range(
+        snapshot_dir,
+        shard_cache,
+        down,
+        down_base,
+        layout.down_expert_values,
+    )?;
+    inputs.push(ExpertRecordInput {
+        tensor: format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+        dtype: down.dtype.clone().unwrap_or_else(|| "unknown".to_string()),
+        shape: vec![layout.hidden, layout.intermediate],
+        source_offsets: down_offsets,
+        source_hash: Some(down_hash),
+        values: down_values,
+    });
+    build_expert_pack(layer, expert, inputs)
+}
+
+fn expected_aggregate_expert_records(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    gate_up: &ExpertTensorRef,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+) -> Result<Vec<ExpectedExpertPackRecord>> {
+    let gate_up_base = expert
+        .checked_mul(layout.gate_up_expert_values)
+        .context("aggregate gate_up expert offset overflow")?;
+    let gate = expected_expert_pack_record(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+        vec![layout.intermediate, layout.hidden],
+        gate_up_base,
+        layout.single_projection_values,
+    )?;
+    let up = expected_expert_pack_record(
+        snapshot_dir,
+        shard_cache,
+        gate_up,
+        format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+        vec![layout.intermediate, layout.hidden],
+        gate_up_base + layout.single_projection_values,
+        layout.single_projection_values,
+    )?;
+    let down_base = expert
+        .checked_mul(layout.down_expert_values)
+        .context("aggregate down expert offset overflow")?;
+    let down = expected_expert_pack_record(
+        snapshot_dir,
+        shard_cache,
+        down,
+        format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+        vec![layout.hidden, layout.intermediate],
+        down_base,
+        layout.down_expert_values,
+    )?;
+    Ok(vec![gate, up, down])
+}
+
+fn expected_expert_pack_record(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    source: &ExpertTensorRef,
+    tensor: String,
+    shape: Vec<usize>,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<ExpectedExpertPackRecord> {
+    let (source_offsets, source_hash) = expert_tensor_source_fingerprint(
+        snapshot_dir,
+        shard_cache,
+        source,
+        element_offset,
+        element_count,
+    )?;
+    let (packed_bytes, groups) = q4_layout_for_shape(&shape)?;
+    Ok(ExpectedExpertPackRecord {
+        tensor,
+        dtype: source
+            .dtype
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        shape,
+        source_offsets,
+        source_hash,
+        packed_bytes,
+        groups,
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
+    })
+}
+
+fn expected_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    expert: usize,
+    tensors: &[&ExpertTensorRef],
+) -> Result<ExpectedExpertPack> {
+    let mut records = Vec::with_capacity(tensors.len());
+    for tensor in tensors {
+        let shape = tensor.shape.clone();
+        let element_count = shape.iter().product();
+        records.push(expected_expert_pack_record(
+            snapshot_dir,
+            shard_cache,
+            tensor,
+            tensor.tensor.clone(),
+            shape,
+            0,
+            element_count,
+        )?);
+    }
+    let packed_bytes = pbq4_expert_pack_wire_size(&records)?;
+    Ok(ExpectedExpertPack {
+        expert,
+        packed_bytes,
+        records,
+    })
+}
+
+fn pbq4_expert_pack_wire_size(records: &[ExpectedExpertPackRecord]) -> Result<u64> {
+    let mut size = PBQ4_EXPERT_MAGIC.len() as u64;
+    for record in records {
+        let scale_bias_bytes = expert_scale_bias_dtype_size(&record.scale_bias_dtype)
+            .with_context(|| {
+                format!(
+                    "cannot compute expert pack wire size for q4 scale/bias dtype {}",
+                    record.scale_bias_dtype
+                )
+            })?;
+        let record_size = 4u64
+            .checked_add(record.tensor.len() as u64)
+            .and_then(|size| size.checked_add(8))
+            .and_then(|size| size.checked_add(8))
+            .and_then(|size| {
+                size.checked_add((record.groups as u64).checked_mul(scale_bias_bytes as u64)?)
+            })
+            .and_then(|size| {
+                size.checked_add((record.groups as u64).checked_mul(scale_bias_bytes as u64)?)
+            })
+            .and_then(|size| size.checked_add(record.packed_bytes))
+            .context("expert pack record wire size overflow")?;
+        size = size
+            .checked_add(record_size)
+            .context("expert pack wire size overflow")?;
+    }
+    Ok(size)
+}
+
+fn expert_pack_records_match_expected(
+    actual: &[ExpertPackRecord],
+    expected: &[ExpectedExpertPackRecord],
+) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            actual.tensor == expected.tensor
+                && actual.dtype == expected.dtype
+                && actual.shape == expected.shape
+                && actual.source_offsets == expected.source_offsets
+                && actual.source_hash.as_deref() == Some(expected.source_hash.as_str())
+                && actual.packed_bytes == expected.packed_bytes
+                && actual.groups == expected.groups
+                && actual.group_size == expected.group_size
+                && actual.scale_bias_dtype == expected.scale_bias_dtype
+        })
+}
+
+fn expert_scale_bias_dtype_size(dtype: &str) -> Result<usize> {
+    match dtype.to_ascii_uppercase().as_str() {
+        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => Ok(4),
+        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => Ok(2),
+        other => bail!("unsupported q4 scale/bias dtype {other}"),
+    }
+}
+
+fn rewrite_expert_layer_pack(
+    plan: &FlashMoePlan,
+    layer: usize,
+    experts: usize,
+    expected: &[ExpectedExpertPack],
+    mut build: impl FnMut(usize) -> Result<(Vec<u8>, ExpertPackMetadata)>,
+) -> Result<usize> {
+    if expected.is_empty() {
+        return Ok(0);
+    }
+    let slot_size = expected
+        .iter()
+        .map(|pack| pack.packed_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let old_metadata = read_expert_layer_pack_metadata(&plan.experts_dir, layer)?;
+    let layer_path = expert_layer_path(&plan.experts_dir, layer);
+    let all_reusable = old_metadata.as_ref().is_some_and(|metadata| {
+        expected
+            .iter()
+            .all(|pack| expert_layer_slot_is_reusable(&layer_path, metadata, pack).unwrap_or(false))
+    });
+    if all_reusable {
+        return Ok(expected.len());
+    }
+
+    let temp_path = temp_pack_path(&layer_path);
+    let out = fs::File::create(&temp_path).with_context(|| {
+        format!(
+            "failed to create temporary packed expert layer {}",
+            temp_path.display()
+        )
+    })?;
+    let layer_size = (experts as u64)
+        .checked_mul(slot_size)
+        .context("expert layer file size overflow")?;
+    out.set_len(layer_size)
+        .with_context(|| format!("failed to preallocate {}", temp_path.display()))?;
+
+    let mut packs = Vec::with_capacity(expected.len());
+    let mut reused = 0usize;
+    for pack in expected {
+        let offset = expert_slot_offset(pack.expert, slot_size)?;
+        let (packed, metadata) = if let Some(old_metadata) = old_metadata.as_ref()
+            && expert_layer_slot_is_reusable(&layer_path, old_metadata, pack)?
+        {
+            reused += 1;
+            let metadata = old_metadata
+                .pack_for(pack.expert)
+                .cloned()
+                .context("reusable expert metadata disappeared")?;
+            let bytes = read_layer_slot_bytes(&layer_path, old_metadata, pack.expert, &metadata)?;
+            (bytes, metadata)
+        } else {
+            build(pack.expert)?
+        };
+        if packed.len() as u64 > slot_size {
+            bail!(
+                "packed expert layer {layer} expert {} is {} bytes, exceeds slot size {slot_size}",
+                pack.expert,
+                packed.len()
+            );
+        }
+        write_all_at_positioned(&out, &packed, offset).with_context(|| {
+            format!(
+                "failed to write layer {layer} expert {} into {}",
+                pack.expert,
+                temp_path.display()
+            )
+        })?;
+        packs.push(ExpertPackMetadata {
+            packed_bytes: packed.len() as u64,
+            ..metadata
+        });
+    }
+
+    finish_expert_pack_atomically(out, &temp_path, &layer_path)?;
+    let metadata = ExpertLayerPackMetadata::new(layer, slot_size, experts, packs);
+    write_expert_metadata_atomically(&plan.experts_dir, layer, &metadata)?;
+    Ok(reused)
+}
+
+fn expert_layer_slot_is_reusable(
+    layer_path: &Path,
+    layer_metadata: &ExpertLayerPackMetadata,
+    expected: &ExpectedExpertPack,
+) -> Result<bool> {
+    let Some(metadata) = layer_metadata.pack_for(expected.expert) else {
+        return Ok(false);
+    };
+    if metadata.packed_bytes != expected.packed_bytes
+        || !expert_pack_records_match_expected(&metadata.records, &expected.records)
+    {
+        return Ok(false);
+    }
+    if metadata
+        .records
+        .iter()
+        .any(|record| record.source_hash.is_none())
+    {
+        return Ok(false);
+    }
+    if metadata.packed_bytes > layer_metadata.expert_size {
+        return Ok(false);
+    }
+    let file = match fs::File::open(layer_path) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let file_len = file.metadata()?.len();
+    let end = expert_slot_end(
+        expected.expert,
+        layer_metadata.expert_size,
+        metadata.packed_bytes,
+    )?;
+    if file_len < end {
+        return Ok(false);
+    }
+    let offset = expert_slot_offset(expected.expert, layer_metadata.expert_size)?;
+    let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
+    if read_exact_at_positioned(&file, &mut magic, offset).is_err() {
+        return Ok(false);
+    }
+    Ok(magic == PBQ4_EXPERT_MAGIC)
+}
+
+fn read_layer_slot_bytes(
+    layer_path: &Path,
+    layer_metadata: &ExpertLayerPackMetadata,
+    expert: usize,
+    metadata: &ExpertPackMetadata,
+) -> Result<Vec<u8>> {
+    let file = fs::File::open(layer_path)
+        .with_context(|| format!("failed to open expert layer {}", layer_path.display()))?;
+    let offset = expert_slot_offset(expert, layer_metadata.expert_size)?;
+    let len =
+        usize::try_from(metadata.packed_bytes).context("expert pack length does not fit usize")?;
+    let mut bytes = vec![0u8; len];
+    read_exact_at_positioned(&file, &mut bytes, offset)?;
+    Ok(bytes)
+}
+
+fn temp_pack_path(path: &Path) -> PathBuf {
+    let suffix = format!("tmp-{}-{:?}", std::process::id(), thread::current().id());
+    let extension = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => format!("{ext}.{suffix}"),
+        None => suffix,
+    };
+    path.with_extension(extension)
+}
+
+fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
+    let path = expert_layer_path(root, layer);
+    let Ok(file) = fs::File::open(&path) else {
+        return false;
+    };
+    let Ok(Some(layer_metadata)) = read_expert_layer_pack_metadata(root, layer) else {
+        return false;
+    };
+    let Some(_metadata) = layer_metadata.pack_for(expert) else {
+        return false;
+    };
+    let Ok(offset) = expert_slot_offset(expert, layer_metadata.expert_size) else {
+        return false;
+    };
+    let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
+    read_exact_at_positioned(&file, &mut magic, offset).is_ok() && magic == PBQ4_EXPERT_MAGIC
+}
+
+fn finish_expert_pack_atomically(
+    mut out: fs::File,
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<()> {
+    out.flush()
+        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+    out.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    drop(out);
+    fs::rename(temp_path, final_path).with_context(|| {
+        format!(
+            "failed to atomically move {} to {}",
+            temp_path.display(),
+            final_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_expert_metadata_atomically(
+    root: &Path,
+    layer: usize,
+    metadata: &ExpertLayerPackMetadata,
+) -> Result<()> {
+    let path = expert_layer_metadata_path(root, layer);
+    let temp_path = temp_pack_path(&path);
+    let bytes = serde_json::to_vec_pretty(metadata).context("failed to encode expert metadata")?;
+    {
+        let mut out = fs::File::create(&temp_path).with_context(|| {
+            format!(
+                "failed to create temporary expert metadata {}",
+                temp_path.display()
+            )
+        })?;
+        out.write_all(&bytes)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        out.flush()
+            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+        out.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    }
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to atomically move {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn single_aggregate_expert_tensor<'a>(
+    tensors: &[&'a ExpertTensorRef],
+    kind: AggregateExpertTensorKind,
+    layer: usize,
+) -> Result<&'a ExpertTensorRef> {
+    let matches: Vec<&ExpertTensorRef> = tensors
+        .iter()
+        .copied()
+        .filter(|tensor| aggregate_expert_tensor_kind(&tensor.tensor) == Some(kind))
+        .collect();
+    match matches.as_slice() {
+        [tensor] => Ok(*tensor),
+        [] => bail!("aggregate expert layer {layer} is missing {kind:?} tensor"),
+        _ => bail!("aggregate expert layer {layer} has duplicate {kind:?} tensors"),
+    }
+}
+
+fn validate_aggregate_expert_tensor_shape(
+    tensor: &ExpertTensorRef,
+    expected: &[usize; 3],
+    label: &str,
+) -> Result<()> {
+    if tensor.shape.as_slice() != expected {
+        bail!(
+            "aggregate expert tensor {} has shape {:?}; expected {:?} for {label}",
+            tensor.tensor,
+            tensor.shape,
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn q4_layout_for_shape(shape: &[usize]) -> Result<(u64, usize)> {
+    let cols = shape.last().copied().unwrap_or(0);
+    if cols == 0 {
+        bail!("cannot compute q4 layout for zero-column tensor");
+    }
+    let rows = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product::<usize>().max(1)
+    } else {
+        1
+    };
+    let packed_bytes = rows
+        .checked_mul(cols.div_ceil(2))
+        .context("q4 packed byte count overflow")?;
+    let groups = rows
+        .checked_mul(cols.div_ceil(GROUP_SIZE))
+        .context("q4 group count overflow")?;
+    Ok((packed_bytes as u64, groups))
+}
+
+fn decode_expert_tensor_range(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    tensor: &ExpertTensorRef,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<(Vec<f32>, [u64; 2], String)> {
+    with_expert_tensor_raw_range(
+        snapshot_dir,
+        shard_cache,
+        tensor,
+        element_offset,
+        element_count,
+        |raw, source_offsets, dtype| {
+            let values = decode_dense_tensor_f32(dtype, raw).with_context(|| {
+                format!(
+                    "failed to decode expert tensor {} as {dtype} before q4 quantization",
+                    tensor.tensor
+                )
+            })?;
+            Ok((values, source_offsets, sha256_hex(raw)))
+        },
+    )
+}
+
+fn expert_tensor_source_fingerprint(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    tensor: &ExpertTensorRef,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<([u64; 2], String)> {
+    with_expert_tensor_raw_range(
+        snapshot_dir,
+        shard_cache,
+        tensor,
+        element_offset,
+        element_count,
+        |raw, source_offsets, _| Ok((source_offsets, sha256_hex(raw))),
+    )
+}
+
+fn with_expert_tensor_raw_range<R>(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    tensor: &ExpertTensorRef,
+    element_offset: usize,
+    element_count: usize,
+    read: impl FnOnce(&[u8], [u64; 2], &str) -> Result<R>,
+) -> Result<R> {
+    if !shard_cache.contains_key(&tensor.shard) {
+        let shard_path = snapshot_dir.join(&tensor.shard);
+        let file = fs::File::open(&shard_path)
+            .with_context(|| format!("failed to open shard {}", shard_path.display()))?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
+        };
+        shard_cache.insert(
+            tensor.shard.clone(),
+            (mmap, parse_safetensors_header(&shard_path)?),
+        );
+    }
+    let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
+    let dtype = tensor.dtype.as_deref().unwrap_or("unknown");
+    let [byte_start, byte_end] =
+        expert_tensor_byte_range(tensor, dtype, element_offset, element_count)?;
+    let abs_start = shard.data_start + byte_start;
+    let abs_end = shard.data_start + byte_end;
+    let raw = &bytes[abs_start as usize..abs_end as usize];
+    read(raw, [byte_start, byte_end], dtype)
+}
+
+fn expert_tensor_byte_range(
+    tensor: &ExpertTensorRef,
+    dtype: &str,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<[u64; 2]> {
+    let [tensor_start, tensor_end] = tensor
+        .source_offsets
+        .with_context(|| format!("expert tensor {} is missing source offsets", tensor.tensor))?;
+    let element_size = dtype_size(dtype).with_context(|| {
+        format!(
+            "expert tensor {} has unsupported dtype {dtype}",
+            tensor.tensor
+        )
+    })?;
+    let byte_start = tensor_start
+        .checked_add(
+            (element_offset
+                .checked_mul(element_size)
+                .context("expert tensor byte offset overflow")?) as u64,
+        )
+        .context("expert tensor source offset overflow")?;
+    let byte_len = element_count
+        .checked_mul(element_size)
+        .context("expert tensor byte length overflow")?;
+    let byte_end = byte_start
+        .checked_add(byte_len as u64)
+        .context("expert tensor byte range overflow")?;
+    if byte_end > tensor_end {
+        bail!(
+            "expert tensor {} range {}..{} exceeds source offsets {:?}",
+            tensor.tensor,
+            byte_start,
+            byte_end,
+            [tensor_start, tensor_end]
+        );
+    }
+    Ok([byte_start, byte_end])
+}
+
+struct ExpertRecordInput {
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    source_hash: Option<String>,
+    values: Vec<f32>,
+}
+
+fn build_expert_pack(
+    layer: usize,
+    expert: usize,
+    inputs: Vec<ExpertRecordInput>,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut records = Vec::with_capacity(inputs.len());
+    out.write_all(PBQ4_EXPERT_MAGIC)
+        .context("failed to write packed expert header")?;
+    for input in inputs {
+        write_quantized_expert_record(&mut out, &mut records, input)?;
+    }
+    let packed = out.into_inner();
+    let metadata = ExpertPackMetadata {
+        layer,
+        expert,
+        packed_bytes: packed.len() as u64,
+        records,
+    };
+    Ok((packed, metadata))
+}
+
+fn write_quantized_expert_record<W: Write + Seek>(
+    out: &mut W,
+    records: &mut Vec<ExpertPackRecord>,
+    input: ExpertRecordInput,
+) -> Result<()> {
+    let packed = quantize_q4(&input.values, &input.shape, GROUP_SIZE).with_context(|| {
+        format!(
+            "failed to quantize decoded expert tensor {} into q4 groups",
+            input.tensor
+        )
+    })?;
+    let record_offset = out
+        .stream_position()
+        .context("failed to get expert record offset")?;
+    out.write_all(&(input.tensor.len() as u32).to_le_bytes())?;
+    out.write_all(input.tensor.as_bytes())?;
+    out.write_all(&(packed.values.len() as u64).to_le_bytes())?;
+    out.write_all(&(packed.scales.len() as u64).to_le_bytes())?;
+    write_expert_scale_bias_vec_le(out, &packed.scales, EXPERT_PACK_SCALE_BIAS_DTYPE)?;
+    write_expert_scale_bias_vec_le(out, &packed.biases, EXPERT_PACK_SCALE_BIAS_DTYPE)?;
+    out.write_all(&packed.values)?;
+    records.push(ExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        source_hash: input.source_hash,
+        record_offset,
+        packed_bytes: packed.values.len() as u64,
+        groups: packed.scales.len(),
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
+    });
+    Ok(())
+}
+
+fn write_expert_scale_bias_vec_le<W: Write>(
+    out: &mut W,
+    values: &[f32],
+    dtype: &str,
+) -> Result<()> {
+    match dtype.to_ascii_uppercase().as_str() {
+        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => {
+            for value in values {
+                out.write_all(&value.to_le_bytes())?;
+            }
+        }
+        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => {
+            for value in values {
+                out.write_all(&f32_to_bf16_bits(*value).to_le_bytes())?;
+            }
+        }
+        other => bail!("unsupported q4 scale/bias dtype {other}"),
+    }
+    Ok(())
+}
+
+fn validate_expert_tensor_group(
+    layer: usize,
+    expert: usize,
+    tensors: &[&ExpertTensorRef],
+    config: Option<&QwenModelConfig>,
+) -> Result<()> {
+    let mut seen = BTreeMap::<&'static str, &ExpertTensorRef>::new();
+    for suffix in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+        let matches: Vec<&ExpertTensorRef> = tensors
+            .iter()
+            .copied()
+            .filter(|tensor| tensor.tensor.ends_with(suffix))
+            .collect();
+        match matches.as_slice() {
+            [tensor] => {
+                seen.insert(suffix, *tensor);
+            }
+            [] => {
+                bail!(
+                    "Flash-MoE expert layer {layer} expert {expert} is missing required tensor {suffix}"
+                );
+            }
+            _ => {
+                bail!(
+                    "Flash-MoE expert layer {layer} expert {expert} has duplicate tensors ending in {suffix}"
+                );
+            }
+        }
+    }
+
+    if let Some(config) = config {
+        let hidden = config.hidden_size;
+        let intermediate = config
+            .moe_intermediate_size
+            .or(config.intermediate_size)
+            .context("Qwen config is missing moe_intermediate_size/intermediate_size for expert validation")?;
+        validate_expert_matrix_shape(
+            seen["gate_proj.weight"],
+            &[intermediate, hidden],
+            "gate_proj.weight",
+        )?;
+        validate_expert_matrix_shape(
+            seen["up_proj.weight"],
+            &[intermediate, hidden],
+            "up_proj.weight",
+        )?;
+        validate_expert_matrix_shape(
+            seen["down_proj.weight"],
+            &[hidden, intermediate],
+            "down_proj.weight",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_expert_matrix_shape(
+    tensor: &ExpertTensorRef,
+    expected: &[usize; 2],
+    suffix: &str,
+) -> Result<()> {
+    if tensor.shape.as_slice() != expected {
+        bail!(
+            "Flash-MoE expert tensor {} has shape {:?}; expected {:?} for {suffix}",
+            tensor.tensor,
+            tensor.shape,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertLayerPackMetadata {
+    format: String,
+    layer: usize,
+    expert_size: u64,
+    experts: usize,
+    packs: Vec<ExpertPackMetadata>,
+}
+
+impl ExpertLayerPackMetadata {
+    fn new(layer: usize, expert_size: u64, experts: usize, packs: Vec<ExpertPackMetadata>) -> Self {
+        Self {
+            format: PBQ4_EXPERT_LAYER_FORMAT_V2.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
+    fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
+        self.packs.iter().find(|metadata| metadata.expert == expert)
+    }
+
+    fn validate(&self, path: &Path, layer: usize) -> Result<()> {
+        if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1 && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
+        {
+            bail!(
+                "expert metadata {} has unsupported format {}",
+                path.display(),
+                self.format
+            );
+        }
+        if self.layer != layer {
+            bail!(
+                "expert metadata {} describes layer {}, expected layer {layer}",
+                path.display(),
+                self.layer
+            );
+        }
+        if self.expert_size == 0 {
+            bail!("expert metadata {} has zero expert_size", path.display());
+        }
+        if self.experts == 0 {
+            bail!("expert metadata {} has zero experts", path.display());
+        }
+        let mut seen = BTreeSet::new();
+        for pack in &self.packs {
+            validate_expert_pack_metadata(path, pack, layer, pack.expert)?;
+            if pack.expert >= self.experts {
+                bail!(
+                    "expert metadata {} describes expert {} outside 0..{}",
+                    path.display(),
+                    pack.expert,
+                    self.experts
+                );
+            }
+            if !seen.insert(pack.expert) {
+                bail!(
+                    "expert metadata {} has duplicate expert {}",
+                    path.display(),
+                    pack.expert
+                );
+            }
+            if pack.packed_bytes > self.expert_size {
+                bail!(
+                    "expert metadata {} expert {} length {} exceeds slot size {}",
+                    path.display(),
+                    pack.expert,
+                    pack.packed_bytes,
+                    self.expert_size
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPackMetadata {
+    layer: usize,
+    expert: usize,
+    #[serde(default)]
+    packed_bytes: u64,
+    records: Vec<ExpertPackRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPackRecord {
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_hash: Option<String>,
+    record_offset: u64,
+    packed_bytes: u64,
+    groups: usize,
+    group_size: usize,
+    #[serde(default = "default_expert_scale_bias_dtype")]
+    scale_bias_dtype: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedExpertPackRecord {
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    source_hash: String,
+    packed_bytes: u64,
+    groups: usize,
+    group_size: usize,
+    scale_bias_dtype: String,
+}
+
+fn default_expert_scale_bias_dtype() -> String {
+    EXPERT_SCALE_BIAS_DTYPE_F32.to_string()
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedExpertPack {
+    expert: usize,
+    packed_bytes: u64,
+    records: Vec<ExpectedExpertPackRecord>,
+}
+
+struct QuantizedQ4 {
+    values: Vec<u8>,
+    scales: Vec<f32>,
+    biases: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct QuantizedQ4Group {
+    codes: Vec<u8>,
+    scale: f32,
+    bias: f32,
+    error: f32,
+}
+
+fn quantize_q4(values: &[f32], shape: &[usize], group_size: usize) -> Result<QuantizedQ4> {
+    if group_size == 0 {
+        bail!("group_size must be positive");
+    }
+    let cols = shape.last().copied().unwrap_or(values.len());
+    if cols == 0 {
+        bail!("cannot quantize q4 tensor with zero columns");
+    }
+    let rows = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product::<usize>().max(1)
+    } else {
+        1
+    };
+    let expected = rows
+        .checked_mul(cols)
+        .context("q4 tensor element count overflow")?;
+    if expected != values.len() {
+        bail!(
+            "q4 tensor shape {:?} describes {expected} values but decoded tensor has {}",
+            shape,
+            values.len()
+        );
+    }
+    let row_stride = cols.div_ceil(2);
+    let mut packed_values = Vec::with_capacity(rows * row_stride);
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+
+    for row in values.chunks_exact(cols) {
+        let mut pending_low: Option<u8> = None;
+        let row_start_len = packed_values.len();
+        for group in row.chunks(group_size) {
+            let quantized = quantize_q4_group_affine_mse(group);
+            scales.push(quantized.scale);
+            biases.push(quantized.bias);
+            for q in quantized.codes {
+                if let Some(low) = pending_low.take() {
+                    packed_values.push(low | (q << 4));
+                } else {
+                    pending_low = Some(q);
+                }
+            }
+        }
+        if let Some(low) = pending_low {
+            packed_values.push(low);
+        }
+        while packed_values.len() - row_start_len < row_stride {
+            packed_values.push(0);
+        }
+    }
+    Ok(QuantizedQ4 {
+        values: packed_values,
+        scales,
+        biases,
+    })
+}
+
+fn quantize_q4_group_affine_mse(group: &[f32]) -> QuantizedQ4Group {
+    if group.is_empty() {
+        return QuantizedQ4Group {
+            codes: Vec::new(),
+            scale: 1.0,
+            bias: 0.0,
+            error: 0.0,
+        };
+    }
+
+    let finite: Vec<f32> = group
+        .iter()
+        .map(|value| if value.is_finite() { *value } else { 0.0 })
+        .collect();
+    let min = finite.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    quantize_q4_group_from_range(&finite, min, max)
+}
+
+fn quantize_q4_group_from_range(values: &[f32], min: f32, max: f32) -> QuantizedQ4Group {
+    let range = (max - min).abs();
+    if !range.is_finite() || range <= f32::EPSILON {
+        let bias = if min.is_finite() { min } else { 0.0 };
+        let codes = vec![0; values.len()];
+        let error = values
+            .iter()
+            .map(|value| {
+                let delta = *value - bias;
+                delta * delta
+            })
+            .sum();
+        return QuantizedQ4Group {
+            codes,
+            scale: 1.0,
+            bias,
+            error,
+        };
+    }
+
+    let mut scale = range / 15.0;
+    let mut bias = min;
+    let mut codes = quantize_q4_codes(values, scale, bias);
+    let mut best = quantized_q4_group(values, scale, bias, codes.clone());
+
+    for _ in 0..4 {
+        if let Some((fit_scale, fit_bias)) = fit_q4_affine(values, &codes) {
+            scale = fit_scale;
+            bias = fit_bias;
+        }
+        codes = quantize_q4_codes(values, scale, bias);
+        let candidate = quantized_q4_group(values, scale, bias, codes.clone());
+        if candidate.error < best.error {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn quantize_q4_codes(values: &[f32], scale: f32, bias: f32) -> Vec<u8> {
+    let scale = if scale.is_finite() && scale.abs() > f32::EPSILON {
+        scale
+    } else {
+        1.0
+    };
+    values
+        .iter()
+        .map(|value| ((*value - bias) / scale).round().clamp(0.0, 15.0) as u8)
+        .collect()
+}
+
+fn fit_q4_affine(values: &[f32], codes: &[u8]) -> Option<(f32, f32)> {
+    if values.len() != codes.len() || values.is_empty() {
+        return None;
+    }
+    let n = values.len() as f32;
+    let mut sum_q = 0.0f32;
+    let mut sum_x = 0.0f32;
+    let mut sum_qq = 0.0f32;
+    let mut sum_qx = 0.0f32;
+    for (value, code) in values.iter().zip(codes) {
+        let q = *code as f32;
+        sum_q += q;
+        sum_x += *value;
+        sum_qq += q * q;
+        sum_qx += q * *value;
+    }
+    let denom = n.mul_add(sum_qq, -(sum_q * sum_q));
+    if !denom.is_finite() || denom.abs() <= f32::EPSILON {
+        return None;
+    }
+    let scale = (n.mul_add(sum_qx, -(sum_q * sum_x))) / denom;
+    let bias = (sum_x - scale * sum_q) / n;
+    if scale.is_finite() && scale > f32::EPSILON && bias.is_finite() {
+        Some((scale, bias))
+    } else {
+        None
+    }
+}
+
+fn quantized_q4_group(values: &[f32], scale: f32, bias: f32, codes: Vec<u8>) -> QuantizedQ4Group {
+    let error = values
+        .iter()
+        .zip(&codes)
+        .map(|(value, code)| {
+            let decoded = (*code as f32).mul_add(scale, bias);
+            let delta = *value - decoded;
+            delta * delta
+        })
+        .sum();
+    QuantizedQ4Group {
+        codes,
+        scale,
+        bias,
+        error,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
+}
+
+fn expert_layer_metadata_path(root: &Path, layer: usize) -> PathBuf {
+    root.join(format!("layer_{layer:02}.json"))
+}
+
+fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<Option<PathBuf>> {
+    let (layers, experts) = match QwenModelConfig::from_file(model_config) {
+        Ok(config) => (config.num_hidden_layers, config.experts()),
+        Err(_) => (NUM_LAYERS, NUM_EXPERTS),
+    };
+    for layer in 0..layers {
+        let path = expert_layer_path(experts_dir, layer);
+        if !path.is_file() {
+            return Ok(Some(path));
+        }
+        let metadata_path = expert_layer_metadata_path(experts_dir, layer);
+        let Some(metadata) = read_expert_layer_pack_metadata(experts_dir, layer)? else {
+            return Ok(Some(metadata_path));
+        };
+        if metadata.experts < experts {
+            return Ok(Some(metadata_path));
+        }
+        let file_len = fs::metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len();
+        let required = (experts as u64)
+            .checked_mul(metadata.expert_size)
+            .context("expert layer size overflow")?;
+        if file_len < required {
+            return Ok(Some(path));
+        }
+        for expert in 0..experts {
+            if metadata.pack_for(expert).is_none() {
+                return Ok(Some(metadata_path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_expert_tensor_name(name: &str) -> bool {
+    name.starts_with("model.layers.")
+        && (name.contains(".experts.") || name.contains(".mlp.experts"))
+}
+
+fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
+    let parts: Vec<&str> = name.split('.').collect();
+    let mut layer = None;
+    let mut expert = None;
+    for window in parts.windows(2) {
+        match window[0] {
+            "layers" => layer = window[1].parse().ok(),
+            "experts" => expert = window[1].parse().ok(),
+            _ => {}
+        }
+    }
+    (layer, expert)
+}
+
+pub fn is_flashmoe_hf_model(model: &str) -> bool {
+    model.starts_with("hf://") && is_flashmoe_model_name(model)
+}
+
+#[cfg(test)]
+fn test_default_tokenizer_config_json() -> &'static [u8] {
+    br#"{
+  "eos_token": "<|im_end|>",
+  "add_bos_token": false,
+  "split_special_tokens": false,
+  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+}"#
+}
+
+// ── Image preprocessor ────────────────────────────────────────────────────────
+
+/// Image preprocessor for Qwen3-VL vision inputs.
+///
+/// Resizes the input image to fit within the pixel budget, splits it into
+/// `patch_size × patch_size` pixel patches, applies channel-wise normalisation,
+/// and returns the patches in `[N, C, patch_h, patch_w]` order ready for the
+/// ViT patch-embedding layer.
+#[derive(Debug, Clone)]
+pub struct ImagePreprocessor {
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub max_pixels: usize,
+    pub min_pixels: usize,
+}
+
+impl ImagePreprocessor {
+    /// Construct from a [`Qwen3VLVisionConfig`].
+    pub fn from_vision_config(config: &Qwen3VLVisionConfig) -> Self {
+        Self {
+            patch_size: config.patch_size,
+            merge_size: config.merge_size,
+            temporal_patch_size: config.temporal_patch_size,
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    /// Construct with the published Qwen3-VL defaults.
+    pub fn default_qwen3_vl() -> Self {
+        Self {
+            patch_size: VIT_PATCH_SIZE,
+            merge_size: VIT_MERGE_SIZE,
+            temporal_patch_size: default_vit_temporal_patch_size(),
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    /// Pixels covered by one merged visual token along each spatial axis.
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    /// Number of float values in one flattened patch.
+    pub fn patch_flat_dim(&self) -> usize {
+        3 * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    /// Resize `(orig_h, orig_w)` so that:
+    ///
+    /// 1. Both dimensions are multiples of `token_stride`.
+    /// 2. `height × width` stays within `[min_pixels, max_pixels]`.
+    ///
+    /// Returns `(target_h, target_w)`.
+    pub fn smart_resize(&self, orig_h: u32, orig_w: u32) -> (u32, u32) {
+        let stride = self.token_stride() as u32;
+        let mut h = round_up_to_stride(orig_h.max(stride), stride);
+        let mut w = round_up_to_stride(orig_w.max(stride), stride);
+        let pixels = (h as usize) * (w as usize);
+        if pixels > self.max_pixels {
+            let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
+        } else if pixels < self.min_pixels {
+            let scale = ((self.min_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
+        }
+        while (h as usize) * (w as usize) > self.max_pixels && (h > stride || w > stride) {
+            if h >= w && h > stride {
+                h -= stride;
+            } else if w > stride {
+                w -= stride;
+            } else {
+                break;
+            }
+        }
+        while (h as usize) * (w as usize) < self.min_pixels {
+            if h <= w {
+                h = h.saturating_add(stride);
+            } else {
+                w = w.saturating_add(stride);
+            }
+        }
+        (h.max(stride), w.max(stride))
+    }
+
+    /// Preprocess the image at `path`:
+    ///
+    /// 1. Decode and resize to target dimensions.
+    /// 2. Normalise: `(pixel / 255 - mean) / std` per channel.
+    /// 3. Split into `patch_size × patch_size` patches.
+    ///
+    /// Returns `(grid_h, grid_w, flat_patch_data)` where `flat_patch_data` is
+    /// laid out as `[num_patches × channels × patch_h × patch_w]`
+    /// (channel-first patch ordering).
+    pub fn preprocess(&self, path: &Path) -> Result<(usize, usize, Vec<f32>)> {
+        let img = image::ImageReader::open(path)
+            .with_context(|| format!("vision: failed to open image {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("vision: failed to guess format for {}", path.display()))?
+            .decode()
+            .with_context(|| format!("vision: failed to decode image {}", path.display()))?
+            .to_rgb8();
+
+        let (orig_w, orig_h) = img.dimensions();
+        let (target_h, target_w) = self.smart_resize(orig_h, orig_w);
+
+        let img = if (orig_h, orig_w) != (target_h, target_w) {
+            image::imageops::resize(
+                &img,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            img
+        };
+
+        let grid_h = (target_h as usize) / self.patch_size;
+        let grid_w = (target_w as usize) / self.patch_size;
+        let num_patches = grid_h * grid_w;
+        let patch_pixels = self.patch_size * self.patch_size;
+        let patch_flat = self.patch_flat_dim();
+        // Layout per patch: [channels=3, temporal_patch_size, patch_h, patch_w].
+        // Patches are ordered block-major so each spatial-merge group is contiguous.
+        let mut patches = vec![0.0f32; num_patches * patch_flat];
+        let pixels = img.as_raw(); // interleaved RGBRGB...
+
+        let mut patch_idx = 0usize;
+        for block_y in 0..grid_h / self.merge_size {
+            for block_x in 0..grid_w / self.merge_size {
+                for dy in 0..self.merge_size {
+                    for dx in 0..self.merge_size {
+                        let py = block_y * self.merge_size + dy;
+                        let px = block_x * self.merge_size + dx;
+                        for c in 0..3usize {
+                            for temporal in 0..self.temporal_patch_size {
+                                for ky in 0..self.patch_size {
+                                    for kx in 0..self.patch_size {
+                                        let src_y = py * self.patch_size + ky;
+                                        let src_x = px * self.patch_size + kx;
+                                        let pixel_idx = (src_y * target_w as usize + src_x) * 3 + c;
+                                        let raw = pixels[pixel_idx] as f32 / 255.0;
+                                        let normed = (raw - self.image_mean[c]) / self.image_std[c];
+                                        let dst = patch_idx * patch_flat
+                                            + c * self.temporal_patch_size * patch_pixels
+                                            + temporal * patch_pixels
+                                            + ky * self.patch_size
+                                            + kx;
+                                        patches[dst] = normed;
+                                    }
+                                }
+                            }
+                        }
+                        patch_idx += 1;
+                    }
+                }
+            }
+        }
+        Ok((grid_h, grid_w, patches))
+    }
+}
+
+fn round_up_to_stride(value: u32, stride: u32) -> u32 {
+    value.div_ceil(stride) * stride
+}
+
+fn round_to_stride(value: f64, stride: u32) -> u32 {
+    let stride_f = stride as f64;
+    ((value / stride_f).max(1.0).round() as u32).max(1) * stride
+}
+
+// ── Vision encoder (ViT) ──────────────────────────────────────────────────────
+
+fn block_major_patch_coords(
+    grid_h: usize,
+    grid_w: usize,
+    merge_size: usize,
+) -> Vec<(usize, usize)> {
+    if merge_size == 0 || grid_h == 0 || grid_w == 0 {
+        return Vec::new();
+    }
+    let mut coords = Vec::with_capacity(grid_h.saturating_mul(grid_w));
+    for block_y in 0..grid_h / merge_size {
+        for block_x in 0..grid_w / merge_size {
+            for dy in 0..merge_size {
+                for dx in 0..merge_size {
+                    coords.push((block_y * merge_size + dy, block_x * merge_size + dx));
+                }
+            }
+        }
+    }
+    coords
+}
+
+fn perfect_square_side(entries: usize) -> Option<usize> {
+    let side = (entries as f64).sqrt() as usize;
+    if side.saturating_mul(side) == entries {
+        Some(side)
+    } else if (side + 1).saturating_mul(side + 1) == entries {
+        Some(side + 1)
+    } else {
+        None
+    }
+}
+
+fn bilinear_position_corners(
+    row: usize,
+    col: usize,
+    grid_h: usize,
+    grid_w: usize,
+    side: usize,
+) -> [(usize, f32); 4] {
+    let side = side.max(1);
+    let h_pos = if grid_h > 1 {
+        row as f32 * (side - 1) as f32 / (grid_h - 1) as f32
+    } else {
+        0.0
+    };
+    let w_pos = if grid_w > 1 {
+        col as f32 * (side - 1) as f32 / (grid_w - 1) as f32
+    } else {
+        0.0
+    };
+    let h_floor = h_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let w_floor = w_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let h_ceil = (h_floor + 1).min(side - 1);
+    let w_ceil = (w_floor + 1).min(side - 1);
+    let h_frac = h_pos - h_floor as f32;
+    let w_frac = w_pos - w_floor as f32;
+
+    [
+        (h_floor * side + w_floor, (1.0 - h_frac) * (1.0 - w_frac)),
+        (h_floor * side + w_ceil, (1.0 - h_frac) * w_frac),
+        (h_ceil * side + w_floor, h_frac * (1.0 - w_frac)),
+        (h_ceil * side + w_ceil, h_frac * w_frac),
+    ]
+}
+
+/// Vision Transformer encoder for Qwen3-VL MoE.
+///
+/// Implements the forward pass that converts an image into a sequence of visual
+/// token embeddings at the text model's hidden size, ready for injection into
+/// the MoE language-model prefix.
+///
+/// The ViT architecture follows the Qwen3-VL specification:
+/// - Patch embedding: linear(`in_chans × patch_h × patch_w`, `embed_dim`)
+/// - `depth` transformer blocks (LayerNorm → QKV-attention → LayerNorm → MLP)
+/// - Spatial merger: 2×2 patch groups → LayerNorm → MLP → `text_hidden_size`
+///
+/// Applies Qwen3-VL's spatial rotary embeddings to ViT Q/K states before
+/// attention, then merges patch groups into decoder visual tokens.
+#[derive(Debug, Clone)]
+pub struct VisionEncoder {
+    config: Qwen3VLVisionConfig,
+    /// Target hidden size of the language-model decoder.
+    text_hidden_size: usize,
+    dense: DenseStore,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisionEncoding {
+    pub embeddings: Vec<Vec<f32>>,
+    pub deepstack_features: Vec<Vec<Vec<f32>>>,
+    pub merged_grid_h: usize,
+    pub merged_grid_w: usize,
+}
+
+impl VisionEncoder {
+    /// Try to construct a `VisionEncoder` from a Flash-MoE plan.
+    ///
+    /// Returns `Ok(None)` when the plan has no vision weights (text-only model).
+    pub fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Option<Self>> {
+        let (Some(weights), Some(manifest), Some(vc)) = (
+            plan.vision_weights.as_ref(),
+            plan.vision_manifest.as_ref(),
+            text_config.vision_config.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if !weights.is_file() || !manifest.is_file() {
+            tracing::debug!(
+                model = %plan.model,
+                "vision weights not found on disk; VisionEncoder skipped"
+            );
+            return Ok(None);
+        }
+        let dense = DenseStore::open(weights.clone(), manifest.clone())?;
+        Ok(Some(Self {
+            config: vc.clone(),
+            text_hidden_size: text_config.hidden_size,
+            dense,
+        }))
+    }
+
+    /// Encode an image into a sequence of visual token embeddings.
+    ///
+    /// Returns visual token embeddings plus their merged spatial grid.
+    pub fn encode(
+        &self,
+        preprocessor: &ImagePreprocessor,
+        image_path: &Path,
+    ) -> Result<VisionEncoding> {
+        // 1. Preprocess → patches [N, C, temporal, pH, pW]
+        let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
+        let num_patches = grid_h * grid_w;
+        let patch_flat = self.config.patch_flat_dim();
+
+        // 2. Patch embedding → [num_patches, embed_dim]
+        let mut hidden: Vec<Vec<f32>> = (0..num_patches)
+            .map(|i| {
+                let patch = &flat_patches[i * patch_flat..(i + 1) * patch_flat];
+                self.patch_embed(patch)
+            })
+            .collect::<Result<_>>()?;
+        self.add_vision_pos_embeds(&mut hidden, grid_h, grid_w)?;
+
+        // 3. Transformer blocks, retaining configured DeepStack features.
+        let mut deepstack_features = Vec::new();
+        for layer in 0..self.config.depth {
+            self.vit_block(layer, &mut hidden, grid_h, grid_w)?;
+            if let Some(merger_idx) = self
+                .config
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&idx| idx == layer)
+            {
+                deepstack_features.push(self.merge_visual_tokens_with_prefix(
+                    &format!("visual.deepstack_merger_list.{merger_idx}"),
+                    true,
+                    &hidden,
+                    grid_h,
+                    grid_w,
+                )?);
+            }
+        }
+
+        // 4. Merge 2×2 patch groups into language-model visual tokens
+        let embeddings = self.merge_visual_tokens(&hidden, grid_h, grid_w)?;
+        Ok(VisionEncoding {
+            embeddings,
+            deepstack_features,
+            merged_grid_h: grid_h / self.config.merge_size,
+            merged_grid_w: grid_w / self.config.merge_size,
+        })
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Linear patch embedding: `[patch_flat] → [embed_dim]`.
+    fn patch_embed(&self, patch: &[f32]) -> Result<Vec<f32>> {
+        let name = "visual.patch_embed.proj.weight";
+        let embed_dim = self.config.embed_dim;
+        let entry = self
+            .dense
+            .registry()
+            .tensor(name)
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        if entry.shape.len() < 2 {
+            bail!(
+                "vision: {name} has shape {:?}; expected Conv3d weight",
+                entry.shape
+            );
+        }
+        let rows = entry.shape.first().copied().unwrap_or(0);
+        let cols = entry.shape[1..]
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .context("vision: patch embedding shape overflow")?;
+        if rows != embed_dim || cols != patch.len() {
+            bail!(
+                "vision: {name} shape {:?} is incompatible with embed_dim {embed_dim} and patch len {}",
+                entry.shape,
+                patch.len()
+            );
+        }
+        let weights = self
+            .dense
+            .read_full_tensor_f32(name)?
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        let mut projected = vec![0.0f32; embed_dim];
+        for row in 0..embed_dim {
+            let start = row * cols;
+            let end = start + cols;
+            projected[row] = weights[start..end]
+                .iter()
+                .zip(patch.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+        }
+        // Add bias if present
+        let with_bias = self.vit_add_bias("visual.patch_embed.proj.bias", projected)?;
+        Ok(with_bias)
+    }
+
+    fn add_vision_pos_embeds(
+        &self,
+        hidden: &mut [Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
+        let pos_embed = self
+            .dense
+            .read_full_tensor_f32("visual.pos_embed.weight")?
+            .context("vision: required tensor 'visual.pos_embed.weight' is missing")?;
+        let embed_dim = self.config.embed_dim;
+        if embed_dim == 0 || pos_embed.len() % embed_dim != 0 {
+            bail!(
+                "vision: visual.pos_embed.weight has {} values; expected a multiple of embed_dim {embed_dim}",
+                pos_embed.len()
+            );
+        }
+        let entries = pos_embed.len() / embed_dim;
+        if entries == 0 {
+            bail!("vision: visual.pos_embed.weight has no position rows");
+        }
+        let side = perfect_square_side(entries).with_context(|| {
+            format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
+        })?;
+        if let Some(config_entries) = self.config.num_position_embeddings
+            && config_entries != entries
+        {
+            bail!(
+                "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
+            );
+        }
+
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != hidden.len() {
+            bail!(
+                "vision: {} patch coordinates for {} hidden patches",
+                coords.len(),
+                hidden.len()
+            );
+        }
+        for (patch, (row, col)) in hidden.iter_mut().zip(coords) {
+            for (idx, weight) in bilinear_position_corners(row, col, grid_h, grid_w, side) {
+                let start = idx * embed_dim;
+                for (value, pos) in patch
+                    .iter_mut()
+                    .zip(pos_embed[start..start + embed_dim].iter())
+                {
+                    *value += weight * *pos;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one ViT transformer block in-place.
+    fn vit_block(
+        &self,
+        layer: usize,
+        hidden: &mut Vec<Vec<f32>>,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
+        let embed_dim = self.config.embed_dim;
+
+        // Pre-attention LayerNorm
+        let norm1_w_name = format!("visual.blocks.{layer}.norm1.weight");
+        let norm1_b_name = format!("visual.blocks.{layer}.norm1.bias");
+
+        let normed: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| self.layer_norm_named(h, &norm1_w_name, &norm1_b_name))
+            .collect::<Result<_>>()?;
+
+        // Self-attention
+        let attn_out = self.vit_attention(layer, &normed, embed_dim, grid_h, grid_w)?;
+
+        // Residual
+        for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
+            for (hi, ai) in h.iter_mut().zip(a.iter()) {
+                *hi += ai;
+            }
+        }
+
+        // Pre-MLP LayerNorm
+        let norm2_w_name = format!("visual.blocks.{layer}.norm2.weight");
+        let norm2_b_name = format!("visual.blocks.{layer}.norm2.bias");
+
+        let normed2: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| self.layer_norm_named(h, &norm2_w_name, &norm2_b_name))
+            .collect::<Result<_>>()?;
+
+        // MLP
+        let mlp_out: Vec<Vec<f32>> = normed2
+            .iter()
+            .map(|h| self.vit_mlp(layer, h))
+            .collect::<Result<_>>()?;
+
+        // Residual
+        for (h, m) in hidden.iter_mut().zip(mlp_out.iter()) {
+            for (hi, mi) in h.iter_mut().zip(m.iter()) {
+                *hi += mi;
+            }
+        }
+        Ok(())
+    }
+
+    /// Multi-head self-attention with Qwen3-VL spatial rotary embeddings.
+    fn vit_attention(
+        &self,
+        layer: usize,
+        hidden: &[Vec<f32>],
+        embed_dim: usize,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let num_heads = self.config.num_heads;
+        let head_dim = embed_dim / num_heads;
+        let num_tokens = hidden.len();
+
+        let qkv_name = format!("visual.blocks.{layer}.attn.qkv.weight");
+        let qkv_bias_name = format!("visual.blocks.{layer}.attn.qkv.bias");
+        let proj_name = format!("visual.blocks.{layer}.attn.proj.weight");
+        let proj_bias_name = format!("visual.blocks.{layer}.attn.proj.bias");
+
+        // Compute Q, K, V for all tokens at once: [num_tokens, 3*embed_dim]
+        let qkv_width = 3 * embed_dim;
+        let mut all_qkv: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&qkv_name, h, qkv_width)?
+                    .with_context(|| format!("vision: required tensor '{qkv_name}' is missing"))?;
+                self.vit_add_bias(&qkv_bias_name, projected)
+            })
+            .collect::<Result<_>>()?;
+
+        // Separate Q, K, V
+        let mut q_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut k_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut v_all = vec![vec![0.0f32; embed_dim]; num_tokens];
+        for (t, qkv) in all_qkv.iter_mut().enumerate() {
+            q_all[t].copy_from_slice(&qkv[..embed_dim]);
+            k_all[t].copy_from_slice(&qkv[embed_dim..2 * embed_dim]);
+            v_all[t].copy_from_slice(&qkv[2 * embed_dim..]);
+        }
+
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != num_tokens {
+            bail!(
+                "vision: {} rotary coordinates for {num_tokens} attention tokens",
+                coords.len()
+            );
+        }
+        let theta = 10_000.0f64;
+        for (token_idx, (row, col)) in coords.into_iter().enumerate() {
+            apply_vision_spatial_rotary(&mut q_all[token_idx], row, col, head_dim, theta);
+            apply_vision_spatial_rotary(&mut k_all[token_idx], row, col, head_dim, theta);
+        }
+
+        // Multi-head attention: for each head, compute scores then weighted values
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attn_output = vec![vec![0.0f32; embed_dim]; num_tokens];
+
+        for h in 0..num_heads {
+            let h_start = h * head_dim;
+            let h_end = h_start + head_dim;
+
+            // Compute attention scores: [num_tokens, num_tokens]
+            let mut scores = vec![0.0f32; num_tokens * num_tokens];
+            for i in 0..num_tokens {
+                for j in 0..num_tokens {
+                    let qi = &q_all[i][h_start..h_end];
+                    let kj = &k_all[j][h_start..h_end];
+                    let dot: f32 = qi.iter().zip(kj.iter()).map(|(a, b)| a * b).sum();
+                    scores[i * num_tokens + j] = dot * scale;
+                }
+            }
+
+            // Softmax over keys dimension (two-pass: exp then normalise)
+            for i in 0..num_tokens {
+                let row = &mut scores[i * num_tokens..(i + 1) * num_tokens];
+                let max_s = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                for s in row.iter_mut() {
+                    *s = (*s - max_s).exp();
+                }
+                let sum: f32 = row.iter().sum();
+                if sum > 0.0 {
+                    row.iter_mut().for_each(|s| *s /= sum);
+                }
+            }
+
+            // Weighted values
+            for i in 0..num_tokens {
+                for j in 0..num_tokens {
+                    let w = scores[i * num_tokens + j];
+                    let vj = &v_all[j][h_start..h_end];
+                    let out = &mut attn_output[i][h_start..h_end];
+                    for (o, v) in out.iter_mut().zip(vj.iter()) {
+                        *o += w * v;
+                    }
+                }
+            }
+        }
+
+        // Output projection
+        let out: Vec<Vec<f32>> = attn_output
+            .into_iter()
+            .map(|h| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&proj_name, &h, embed_dim)?
+                    .with_context(|| format!("vision: required tensor '{proj_name}' is missing"))?;
+                self.vit_add_bias(&proj_bias_name, projected)
+            })
+            .collect::<Result<_>>()?;
+        Ok(out)
+    }
+
+    /// Two-layer MLP with approximate GeLU activation.
+    fn vit_mlp(&self, layer: usize, hidden: &[f32]) -> Result<Vec<f32>> {
+        let embed_dim = self.config.embed_dim;
+        let mlp_hidden = self.config.mlp_hidden_size();
+        let fc1_name = format!("visual.blocks.{layer}.mlp.fc1.weight");
+        let fc1_bias = format!("visual.blocks.{layer}.mlp.fc1.bias");
+        let fc2_name = format!("visual.blocks.{layer}.mlp.fc2.weight");
+        let fc2_bias = format!("visual.blocks.{layer}.mlp.fc2.bias");
+
+        // fc1 + bias + GeLU
+        let mut mid = self
+            .dense
+            .matvec_tensor_prefix(&fc1_name, hidden, mlp_hidden)?
+            .with_context(|| format!("vision: required tensor '{fc1_name}' is missing"))?;
+        mid = self.vit_add_bias(&fc1_bias, mid)?;
+        for v in mid.iter_mut() {
+            *v = gelu_approx(*v);
+        }
+
+        // fc2 + bias
+        let out = self
+            .dense
+            .matvec_tensor_prefix(&fc2_name, &mid, embed_dim)?
+            .with_context(|| format!("vision: required tensor '{fc2_name}' is missing"))?;
+        self.vit_add_bias(&fc2_bias, out)
+    }
+
+    /// Merge 2×2 groups of patch embeddings into language-model visual tokens.
+    ///
+    /// Layout assumption: the `hidden` slice contains patches in block-major
+    /// order, with each `merge_size × merge_size` group contiguous.
+    fn merge_visual_tokens(
+        &self,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.merge_visual_tokens_with_prefix("visual.merger", false, hidden, grid_h, grid_w)
+    }
+
+    fn merge_visual_tokens_with_prefix(
+        &self,
+        prefix: &str,
+        use_postshuffle_norm: bool,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let embed_dim = self.config.embed_dim;
+        let m = self.config.merge_size;
+        let merged_h = grid_h / m;
+        let merged_w = grid_w / m;
+        let group_size = m * m;
+        let concat_dim = group_size * embed_dim;
+        let out_dim = self.config.out_hidden_size.unwrap_or(self.text_hidden_size);
+
+        let qwen3_norm_w = format!("{prefix}.norm.weight");
+        let has_qwen3_names = self.dense.registry().tensor(&qwen3_norm_w).is_some();
+        let (norm_w, norm_b, fc1_w, fc1_b, fc2_w, fc2_b) = if has_qwen3_names {
+            (
+                qwen3_norm_w,
+                format!("{prefix}.norm.bias"),
+                format!("{prefix}.linear_fc1.weight"),
+                format!("{prefix}.linear_fc1.bias"),
+                format!("{prefix}.linear_fc2.weight"),
+                format!("{prefix}.linear_fc2.bias"),
+            )
+        } else {
+            (
+                format!("{prefix}.ln_q.weight"),
+                format!("{prefix}.ln_q.bias"),
+                format!("{prefix}.mlp.0.weight"),
+                format!("{prefix}.mlp.0.bias"),
+                format!("{prefix}.mlp.2.weight"),
+                format!("{prefix}.mlp.2.bias"),
+            )
+        };
+
+        let mut merged_tokens = Vec::with_capacity(merged_h * merged_w);
+
+        for group_idx in 0..merged_h * merged_w {
+            // Patches are already block-major, so each merge group is contiguous.
+            let mut concat = Vec::with_capacity(concat_dim);
+            if use_postshuffle_norm {
+                for offset in 0..group_size {
+                    let patch_idx = group_idx * group_size + offset;
+                    concat.extend_from_slice(&hidden[patch_idx]);
+                }
+                concat = self.layer_norm_named(&concat, &norm_w, &norm_b)?;
+            } else {
+                for offset in 0..group_size {
+                    let patch_idx = group_idx * group_size + offset;
+                    let normed = self.layer_norm_named(&hidden[patch_idx], &norm_w, &norm_b)?;
+                    concat.extend_from_slice(&normed);
+                }
+            }
+
+            // MLP: fc1 + GeLU + fc2
+            let mut mid = self
+                .dense
+                .matvec_tensor_prefix(&fc1_w, &concat, concat_dim)?
+                .with_context(|| format!("vision: required tensor '{fc1_w}' is missing"))?;
+            mid = self.vit_add_bias(&fc1_b, mid)?;
+            for v in mid.iter_mut() {
+                *v = gelu_approx(*v);
+            }
+            let out = self
+                .dense
+                .matvec_tensor_prefix(&fc2_w, &mid, out_dim)?
+                .with_context(|| format!("vision: required tensor '{fc2_w}' is missing"))?;
+            let out = self.vit_add_bias(&fc2_b, out)?;
+            merged_tokens.push(out);
+        }
+        Ok(merged_tokens)
+    }
+
+    /// Load a bias vector and add it to `values`, returning the result.
+    ///
+    /// Returns `values` unchanged when the bias tensor is absent.
+    fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
+        if let Some(bias) = self.dense.read_full_tensor_f32(bias_name)? {
+            for (v, b) in values.iter_mut().zip(bias.iter()) {
+                *v += b;
+            }
+        }
+        Ok(values)
+    }
+
+    /// LayerNorm: `(x - mean) / sqrt(var + eps) * weight + bias`.
+    fn layer_norm_named(&self, input: &[f32], w_name: &str, b_name: &str) -> Result<Vec<f32>> {
+        let n = input.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let mean: f32 = input.iter().sum::<f32>() / n as f32;
+        let var: f32 = input.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        let std_inv = 1.0 / (var + 1e-6).sqrt();
+
+        let weight = self.dense.read_full_tensor_f32(w_name)?;
+        let bias = self.dense.read_full_tensor_f32(b_name)?;
+
+        let out: Vec<f32> = input
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let normed = (x - mean) * std_inv;
+                let w = weight
+                    .as_ref()
+                    .and_then(|w| w.get(i))
+                    .copied()
+                    .unwrap_or(1.0);
+                let b = bias.as_ref().and_then(|b| b.get(i)).copied().unwrap_or(0.0);
+                normed * w + b
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
+/// Approximate GeLU: `0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))`.
+#[inline]
+fn gelu_approx(x: f32) -> f32 {
+    const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
+    0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_safetensors(tensors: &[(&str, &[u8])]) -> Vec<u8> {
+        let typed: Vec<(&str, &str, Vec<usize>, &[u8])> = tensors
+            .iter()
+            .map(|(name, bytes)| (*name, "U8", vec![bytes.len()], *bytes))
+            .collect();
+        make_typed_safetensors(&typed)
+    }
+
+    fn make_typed_safetensors(tensors: &[(&str, &str, Vec<usize>, &[u8])]) -> Vec<u8> {
+        let mut offset = 0usize;
+        let mut entries = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let end = offset + bytes.len();
+            entries.insert(
+                (*name).to_string(),
+                serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,end]}),
+            );
+            data.extend_from_slice(bytes);
+            offset = end;
+        }
+        let header = serde_json::Value::Object(entries).to_string().into_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn f32_tensor_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn bf16_tensor_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u16>());
+        for value in values {
+            let bits = (value.to_bits() >> 16) as u16;
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn test_expert_triplet(
+        layer: usize,
+        expert: usize,
+    ) -> Vec<(String, String, Vec<usize>, Vec<u8>)> {
+        let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
+        vec![
+            (
+                format!("{prefix}.gate_proj.weight"),
+                "U8".to_string(),
+                vec![16, 8],
+                vec![1; 16 * 8],
+            ),
+            (
+                format!("{prefix}.up_proj.weight"),
+                "U8".to_string(),
+                vec![16, 8],
+                vec![2; 16 * 8],
+            ),
+            (
+                format!("{prefix}.down_proj.weight"),
+                "U8".to_string(),
+                vec![8, 16],
+                vec![3; 8 * 16],
+            ),
+        ]
+    }
+
+    fn typed_fixture_refs(
+        tensors: &[(String, String, Vec<usize>, Vec<u8>)],
+    ) -> Vec<(&str, &str, Vec<usize>, &[u8])> {
+        tensors
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (
+                    name.as_str(),
+                    dtype.as_str(),
+                    shape.clone(),
+                    bytes.as_slice(),
+                )
+            })
+            .collect()
+    }
+
+    fn expert_triplet_weight_map(layer: usize, expert: usize) -> String {
+        format!(
+            r#"{{"weight_map":{{"model.layers.0.self_attn.q_proj.weight":"dense.safetensors","model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight":"expert.safetensors","model.layers.{layer}.mlp.experts.{expert}.up_proj.weight":"expert.safetensors","model.layers.{layer}.mlp.experts.{expert}.down_proj.weight":"expert.safetensors"}}}}"#
+        )
+    }
+
+    fn write_test_config(snapshot: &Path) {
+        std::fs::write(
+            snapshot.join("config.json"),
+            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+    }
+
+    fn test_tokenizer_json() -> &'static [u8] {
+        br#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 100, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 101, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 102, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "h": 1,
+      "i": 2,
+      "hi": 3,
+      "hello": 4,
+      "user": 5,
+      "assistant": 6,
+      "<|im_start|>": 100,
+      "<|im_end|>": 101,
+      "<|endoftext|>": 102
+    },
+    "unk_token": "<unk>"
+  }
+}"#
+    }
+
+    fn test_tokenizer_config_json() -> &'static [u8] {
+        br##"{
+  "bos_token": null,
+  "eos_token": "<|im_end|>",
+  "pad_token": "<|endoftext|>",
+  "add_bos_token": false,
+  "added_tokens_decoder": {
+    "100": {"content": "<|im_start|>", "special": true},
+    "101": {"content": "<|im_end|>", "special": true},
+    "102": {"content": "<|endoftext|>", "special": true}
+  },
+  "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+  "split_special_tokens": false,
+  "model_max_length": 32768,
+  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+}"##
+    }
+
+    fn test_default_tokenizer_config_json() -> &'static [u8] {
+        br#"{
+  "eos_token": "<|im_end|>",
+  "add_bos_token": false,
+  "split_special_tokens": false,
+  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+}"#
+    }
+
+    fn test_tokenizer_config_json_with_template(template: &str) -> Vec<u8> {
+        serde_json::json!({
+            "bos_token": null,
+            "eos_token": "<|im_end|>",
+            "pad_token": "<|endoftext|>",
+            "add_bos_token": false,
+            "added_tokens_decoder": {
+                "100": {"content": "<|im_start|>", "special": true},
+                "101": {"content": "<|im_end|>", "special": true},
+                "102": {"content": "<|endoftext|>", "special": true}
+            },
+            "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+            "split_special_tokens": false,
+            "model_max_length": 32768u64,
+            "chat_template": template
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn non_flashmoe_models_still_select_llamacpp_backend() {
+        for model in [
+            "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf",
+            "qwen-vision.gguf",
+            "/models/local-model.gguf",
+        ] {
+            assert_eq!(select_backend(model), BackendSelection::LlamaCpp);
+            assert!(plan(model, Path::new("/models")).is_none());
+        }
+    }
+
+    #[test]
+    fn flashmoe_tokenizer_loads_metadata_from_active_model_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        std::fs::write(
+            snapshot.join("tokenizer_config.json"),
+            test_tokenizer_config_json(),
+        )
+        .unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config).unwrap();
+        assert_eq!(tokenizer.eos_token_id(), 101);
+        assert_eq!(tokenizer.encode("<|im_end|>").unwrap(), vec![101]);
+    }
+
+    fn test_qwen3_tool_tokenizer_config_json() -> &'static [u8] {
+        Box::leak(
+            test_tokenizer_config_json_with_template(
+                r#"{%- if tools %}
+{{- '<|im_start|>system\n' }}
+{%- if messages and messages[0].role == 'system' %}{{- messages[0].content + '\n\n' }}{%- endif %}
+{{- '<tools>\n' }}
+{%- for tool in tools %}{{- tool | tojson }}{{- '\n' }}{%- endfor %}
+{{- '</tools><|im_end|>\n' }}
+{%- endif %}
+{%- for message in messages %}
+{%- if not (tools and loop.first and message.role == 'system') %}
+{%- if message.role == 'tool' %}
+{{- '<|im_start|>user\n<tool_response>\n' + message.content + '\n</tool_response><|im_end|>\n' }}
+{%- else %}
+{{- '<|im_start|>' + message.role + '\n' }}{{- message.content }}
+{%- for tool_call in message.tool_calls %}
+{%- if message.content and loop.first %}{{- '\n' }}{%- endif %}
+{{- '<tool_call>\n{"name": ' }}{{- tool_call.name | tojson }}{{- ', "arguments": ' }}{{- tool_call.arguments | tojson }}{{- '}\n</tool_call>\n' }}
+{%- endfor %}
+{{- '<|im_end|>\n' }}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}"#,
+            )
+            .into_boxed_slice(),
+        )
+    }
+
+    fn test_qwen3vl_tool_tokenizer_config_json() -> &'static [u8] {
+        Box::leak(
+            test_tokenizer_config_json_with_template(
+                r#"{%- macro render_content(content) %}
+{%- if content and (content[0].type is defined or content[0].image is defined or content[0].image_url is defined or content[0].text is defined) %}
+{%- for item in content %}
+{%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+{{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+{%- elif 'text' in item %}
+{{- item.text }}
+{%- endif %}
+{%- endfor %}
+{%- else %}
+{{- content }}
+{%- endif %}
+{%- endmacro %}
+{%- if tools %}
+{{- '<|im_start|>system\n<tools>\n' }}
+{%- for tool in tools %}{{- tool | tojson }}{{- '\n' }}{%- endfor %}
+{{- '</tools><|im_end|>\n' }}
+{%- endif %}
+{%- for message in messages %}
+{%- if message.role == 'tool' %}
+{{- '<|im_start|>user\n<tool_response>\n' }}{{- render_content(message.content) }}{{- '\n</tool_response><|im_end|>\n' }}
+{%- else %}
+{{- '<|im_start|>' + message.role + '\n' }}{{- render_content(message.content) }}
+{%- for tool_call in message.tool_calls %}
+{%- if message.content and loop.first %}{{- '\n' }}{%- endif %}
+{{- '<tool_call>\n{"name": ' }}{{- tool_call.name | tojson }}{{- ', "arguments": ' }}{{- tool_call.arguments | tojson }}{{- '}\n</tool_call>\n' }}
+{%- endfor %}
+{{- '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}"#,
+            )
+            .into_boxed_slice(),
+        )
+    }
+
+    fn test_byte_bpe_tokenizer_json() -> &'static [u8] {
+        br#"{
+  "version": "1.0",
+  "added_tokens": [
+    {"id": 100, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 101, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 102, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+  "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "h": 1,
+      "e": 2,
+      "l": 3,
+      "o": 4,
+      "he": 5,
+      "hel": 6,
+      "hell": 7,
+      "hello": 8,
+      "\u0120": 9,
+      "w": 10,
+      "r": 11,
+      "d": 12,
+      "wo": 13,
+      "wor": 14,
+      "worl": 15,
+      "world": 16,
+      "<|im_start|>": 100,
+      "<|im_end|>": 101,
+      "<|endoftext|>": 102
+    },
+    "merges": ["h e", "he l", "hel l", "hell o", "w o", "wo r", "wor l", "worl d"],
+    "unk_token": "<unk>"
+  }
+}"#
+    }
+
+    fn test_qwen3vl_tokenizer_json() -> &'static [u8] {
+        br#"{
+  "version": "1.0",
+  "added_tokens": [
+    {"id": 100, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 101, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 102, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 200, "content": "<|vision_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 201, "content": "<|vision_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 202, "content": "<|image_pad|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "pre_tokenizer": {"type": "Whitespace"},
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "user": 5,
+      "assistant": 6,
+      "describe": 7,
+      "now": 8,
+      "<|im_start|>": 100,
+      "<|im_end|>": 101,
+      "<|endoftext|>": 102,
+      "<|vision_start|>": 200,
+      "<|vision_end|>": 201,
+      "<|image_pad|>": 202
+    },
+    "unk_token": "<unk>"
+  }
+}"#
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "{actual:.8} != {expected:.8}"
+        );
+    }
+
+    fn assert_close_with_tolerance(actual: f32, expected: f32, tolerance: f32) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual:.8} != {expected:.8} within {tolerance:.8}"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FlashMoeFixtureFamily {
+        Qwen35FlashMoe,
+        Qwen3Moe,
+        Qwen3VlMoe,
+    }
+
+    impl FlashMoeFixtureFamily {
+        fn model(self) -> &'static str {
+            match self {
+                Self::Qwen35FlashMoe => QWEN35_MODEL,
+                Self::Qwen3Moe => "hf://Qwen/Qwen3-30B-A3B",
+                Self::Qwen3VlMoe => QWEN3_VL_MODEL,
+            }
+        }
+
+        fn config_json(self) -> &'static [u8] {
+            match self {
+                Self::Qwen35FlashMoe => {
+                    br#"{
+  "model_type": "qwen3_5_moe",
+  "architectures": ["Qwen3_5MoeForCausalLM"],
+  "num_hidden_layers": 60,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 2,
+  "vocab_size": 248320,
+  "rope_theta": 10000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "moe_intermediate_size": 1536
+}"#
+                }
+                Self::Qwen3Moe => {
+                    br#"{
+  "model_type": "qwen3_moe",
+  "architectures": ["Qwen3MoeForCausalLM"],
+  "num_hidden_layers": 2,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "vocab_size": 151936,
+  "rope_theta": 1000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 2,
+  "moe_intermediate_size": 1536
+}"#
+                }
+                Self::Qwen3VlMoe => {
+                    br#"{
+  "model_type": "qwen3_vl_moe",
+  "architectures": ["Qwen3VLMoeForConditionalGeneration"],
+  "num_hidden_layers": 2,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "vocab_size": 248320,
+  "rope_theta": 1000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 3,
+  "moe_intermediate_size": 1536,
+  "rope_scaling": {"mrope_section": [24, 20, 20]},
+  "vision_config": {
+    "depth": 1,
+    "hidden_size": 64,
+    "num_heads": 4,
+    "patch_size": 14,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2,
+    "out_hidden_size": 4096
+  }
+}"#
+                }
+            }
+        }
+
+        fn config(self) -> QwenModelConfig {
+            serde_json::from_slice(self.config_json()).unwrap()
+        }
+    }
+
+    fn tiny_q4_expert_pack() -> (Vec<u8>, ExpertPackMetadata) {
+        let prefix = "model.layers.0.mlp.experts.1";
+        build_expert_pack(
+            0,
+            1,
+            vec![
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.gate_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, 16],
+                    source_hash: Some("fixture-gate".to_string()),
+                    values: vec![0.0, 15.0, 15.0, 0.0],
+                },
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.up_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [16, 32],
+                    source_hash: Some("fixture-up".to_string()),
+                    values: vec![15.0, 15.0, 15.0, 15.0],
+                },
+                ExpertRecordInput {
+                    tensor: format!("{prefix}.down_proj.weight"),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [32, 48],
+                    source_hash: Some("fixture-down".to_string()),
+                    values: vec![15.0, 0.0, 0.0, 15.0],
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn flashmoe_parity_tokenizer_chat_template_and_routing_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(tokenizer.encode("hi<|im_end|>").unwrap(), vec![3, 101]);
+        assert_eq!(tokenizer.decode(&[3, 101, 4]).unwrap(), "hi");
+
+        let routed = top_k(&[0.0, 2.0, 2.0, -1.0, 1.0], 3);
+        assert_eq!(routed, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
+        let mut weights: Vec<f32> = routed.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        for (actual, expected) in weights.iter().zip([0.42231882, 0.42231882, 0.15536241]) {
+            assert_close(*actual, expected);
+        }
+    }
+
+    #[test]
+    fn flashmoe_parity_q4_expert_pack_and_mlp_goldens() {
+        let (pack, metadata) = tiny_q4_expert_pack();
+        let records = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].shape, vec![2, 2]);
+        assert_eq!(records[0].group_size, GROUP_SIZE);
+        assert_eq!(records[0].packed, vec![0xf0, 0x0f]);
+        assert_eq!(records[0].scales, vec![1.0, 1.0]);
+        assert_eq!(records[0].biases, vec![0.0, 0.0]);
+        assert_eq!(records[1].packed, vec![0x00, 0x00]);
+        assert_eq!(records[1].biases, vec![15.0, 15.0]);
+
+        let expert = ExpertWeights {
+            layer: 0,
+            expert: 1,
+            packed: pack,
+            records,
+        };
+        let hidden = [1.0, 2.0];
+        let gate = expert
+            .project_record(
+                expert.record_suffix("gate_proj.weight").unwrap(),
+                &hidden,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let up = expert
+            .project_record(expert.record_suffix("up_proj.weight").unwrap(), &hidden, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate, vec![30.0, 15.0]);
+        assert_eq!(up, vec![45.0, 45.0]);
+
+        let intermediate = [silu(gate[0]) * up[0], silu(gate[1]) * up[1]];
+        let out = expert.mlp(&hidden, 2).unwrap();
+        assert_close(out[0], 15.0 * intermediate[0]);
+        assert_close(out[1], 15.0 * intermediate[1]);
+    }
+
+    #[test]
+    fn read_f32_vec_le_bulk_path_decodes_values_and_advances_cursor() {
+        let mut bytes = vec![0xaa, 0xbb, 0xcc];
+        for value in [1.0f32, -2.5, f32::from_bits(0x7fc0_1234)] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0xdd, 0xee]);
+
+        let mut cursor = 3;
+        let values = read_f32_vec_le(&bytes, &mut cursor, 3).unwrap();
+        assert_eq!(cursor, 15);
+        assert_eq!(values[0], 1.0);
+        assert_eq!(values[1], -2.5);
+        assert_eq!(values[2].to_bits(), 0x7fc0_1234);
+    }
+
+    #[test]
+    fn read_bf16_vec_le_decodes_values_and_advances_cursor() {
+        let mut bytes = vec![0xaa];
+        for value in [0.5f32, -2.0, 1.25] {
+            bytes.extend_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
+        }
+        bytes.push(0xbb);
+
+        let mut cursor = 1;
+        let values = read_bf16_vec_le(&bytes, &mut cursor, 3).unwrap();
+        assert_eq!(cursor, 7);
+        assert_eq!(values, vec![0.5, -2.0, 1.25]);
+    }
+
+    #[test]
+    fn pbq4_expert_wire_size_accounts_for_bf16_scale_bias_metadata() {
+        let records: Vec<ExpectedExpertPackRecord> = [
+            ("gate_proj.weight", 2_097_152, 65_536),
+            ("up_proj.weight", 2_097_152, 65_536),
+            ("down_proj.weight", 2_097_152, 65_536),
+        ]
+        .into_iter()
+        .map(|(tensor, packed_bytes, groups)| ExpectedExpertPackRecord {
+            tensor: tensor.to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![1024, 4096],
+            source_offsets: [0, 0],
+            source_hash: "hash".to_string(),
+            packed_bytes,
+            groups,
+            group_size: GROUP_SIZE,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+        })
+        .collect();
+        let f32_size = pbq4_expert_pack_wire_size(&records).unwrap();
+        let mut bf16_records = records.clone();
+        for record in &mut bf16_records {
+            record.scale_bias_dtype = EXPERT_SCALE_BIAS_DTYPE_BF16.to_string();
+        }
+        let bf16_size = pbq4_expert_pack_wire_size(&bf16_records).unwrap();
+
+        assert_eq!(f32_size - bf16_size, 786_432);
+        assert!(bf16_size < f32_size);
+    }
+
+    #[test]
+    fn build_expert_pack_writes_bf16_scale_bias_metadata_and_stays_projectable() {
+        let input_values: Vec<f32> = (0..64).map(|idx| (idx as f32 - 32.0) * 0.125).collect();
+        let (pack, metadata) = build_expert_pack(
+            0,
+            0,
+            vec![ExpertRecordInput {
+                tensor: "model.layers.0.mlp.experts.0.down_proj.weight".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 64],
+                source_offsets: [0, 256],
+                source_hash: Some("fixture".to_string()),
+                values: input_values,
+            }],
+        )
+        .unwrap();
+        let record = &metadata.records[0];
+        assert_eq!(record.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        assert_eq!(record.groups, 1);
+        assert_eq!(
+            pack.len(),
+            PBQ4_EXPERT_MAGIC.len()
+                + 4
+                + record.tensor.len()
+                + 8
+                + 8
+                + 2
+                + 2
+                + record.packed_bytes as usize
+        );
+
+        let parsed = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].packed.len(), 32);
+        assert_eq!(parsed[0].scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        assert_eq!(parsed[0].scale_bytes.len(), 2);
+        assert_eq!(parsed[0].bias_bytes.len(), 2);
+        let scale_offset = record.record_offset as usize + 4 + record.tensor.len() + 8 + 8;
+        assert_eq!(parsed[0].scale_bytes, pack[scale_offset..scale_offset + 2]);
+        let out = q4_fma_matvec_with_group_size(
+            &parsed[0].packed,
+            &[1.0; 64],
+            &parsed[0].scales,
+            &parsed[0].biases,
+            1,
+            64,
+            GROUP_SIZE,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_finite());
+    }
+
+    #[test]
+    fn flashmoe_parity_attention_layout_and_prefix_reuse_goldens() {
+        let (mut config, mut manifest) =
+            tiny_attention_manifest(&[AttentionLayerType::Full, AttentionLayerType::Linear]);
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = Some(1);
+
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry).unwrap();
+        let full = runtime.full_attention_layout(0).unwrap();
+        assert_eq!(full.q_layout, FullAttentionQLayout::Standard);
+        assert_eq!(full.q_projection_width, 8);
+        assert_eq!(full.q_width, 8);
+        assert_eq!(full.kv_width, 4);
+        assert_eq!(full.head_dim, 4);
+        assert_eq!(full.rotary_dim, 4);
+        assert_eq!(full.num_q_heads, 2);
+        assert_eq!(full.kv_heads, 1);
+
+        let linear = runtime.linear_attention_layout(1).unwrap();
+        assert_eq!(
+            linear,
+            LinearAttentionLayout {
+                num_value_heads: 2,
+                num_key_heads: 1,
+                key_dim: 4,
+                value_dim: 2,
+                total_key_width: 4,
+                total_value_width: 4,
+                conv_dim: 12,
+                conv_kernel_size: 3,
+            }
+        );
+        assert_eq!(linear.conv_state_len(), 24);
+        assert_eq!(linear.ssm_state_len(), 16);
+
+        let q_name = attention_tensor_name(0, "q_proj");
+        manifest
+            .dense_tensors
+            .iter_mut()
+            .find(|tensor| tensor.tensor == q_name)
+            .unwrap()
+            .shape = vec![16, 8];
+        let gated = DenseTransformerRuntime::from_registry(
+            &config,
+            &TensorRegistry::from_manifest(&manifest),
+        )
+        .unwrap()
+        .full_attention_layout(0)
+        .unwrap();
+        assert_eq!(gated.q_layout, FullAttentionQLayout::Gated);
+        assert_eq!(gated.q_projection_width, 16);
+        assert_eq!(gated.rotary_dim, 2);
+
+        assert_eq!(
+            reusable_session_prefix_len(&[10, 20, 30], &[10, 20, 30, 40]),
+            Some(3)
+        );
+        assert_eq!(reusable_session_prefix_len(&[10, 20, 30], &[10, 20]), None);
+        assert_eq!(
+            reusable_session_prefix_len(&[10, 20, 30], &[10, 20, 99, 40]),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen3vl_parity_multimodal_prompt_image_tokens_and_mrope_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![ChatContentPart::Image {
+                        image: Some("fixture.png".to_string()),
+                        placeholder_tokens: None,
+                    }]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_file = temp.path().join("qwen3vl_fixture.png");
+        let image = image::RgbImage::from_fn(84, 56, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8])
+        });
+        image.save(&image_file).unwrap();
+
+        let preprocessor = ImagePreprocessor::default_qwen3_vl();
+        let (patch_grid_h, patch_grid_w, patches) = preprocessor.preprocess(&image_file).unwrap();
+        assert_eq!((patch_grid_h, patch_grid_w), (4, 6));
+        assert_eq!(
+            patches.len(),
+            patch_grid_h * patch_grid_w * preprocessor.patch_flat_dim()
+        );
+        let visual_grid_h = patch_grid_h / preprocessor.merge_size;
+        let visual_grid_w = patch_grid_w / preprocessor.merge_size;
+        let visual_tokens = visual_grid_h * visual_grid_w;
+        assert_eq!((visual_grid_h, visual_grid_w, visual_tokens), (2, 3, 6));
+
+        let vision_start = tokenizer.token_id("<|vision_start|>").unwrap();
+        let vision_end = tokenizer.token_id("<|vision_end|>").unwrap();
+        let image_pad = tokenizer.token_id("<|image_pad|>").unwrap();
+        let prompt_tokens = tokenizer.encode(&rendered).unwrap();
+        assert_eq!(token_run_bounds(&prompt_tokens, image_pad), vec![(3, 4, 1)]);
+
+        let expanded = expand_multimodal_image_placeholders(
+            prompt_tokens,
+            vision_start,
+            vision_end,
+            image_pad,
+            &[ImagePlaceholderSpec {
+                token_count: visual_tokens,
+                grid_h: visual_grid_h,
+                grid_w: visual_grid_w,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.tokens,
+            vec![100, 5, 200, 202, 202, 202, 202, 202, 202, 201, 101, 100, 6]
+        );
+        assert_eq!(
+            expanded.visual_spans,
+            vec![VisualTokenSpan::image(3, 9, 2, 3)]
+        );
+
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, image_pad, &expanded.visual_spans)
+                .unwrap();
+        assert_eq!(
+            &positions[..3],
+            &[
+                MropePosition::text(0),
+                MropePosition::text(1),
+                MropePosition::text(2)
+            ]
+        );
+        assert_eq!(
+            &positions[3..9],
+            &[
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 3,
+                    width: 5,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 3,
+                    height: 4,
+                    width: 5,
+                },
+            ]
+        );
+        assert_eq!(
+            &positions[9..],
+            &[
+                MropePosition::text(6),
+                MropePosition::text(7),
+                MropePosition::text(8),
+                MropePosition::text(9)
+            ]
+        );
+        assert_eq!(next_position, 10);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod arm_macos_integration {
+        use super::*;
+
+        fn tiny_snapshot() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+            std::fs::create_dir_all(&snapshot).unwrap();
+            std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+            write_test_config(&snapshot);
+            std::fs::write(
+                snapshot.join("dense.safetensors"),
+                make_safetensors(&[("model.layers.0.self_attn.q_proj.weight", b"dense")]),
+            )
+            .unwrap();
+            std::fs::write(
+                snapshot.join("expert.safetensors"),
+                make_typed_safetensors(&typed_fixture_refs(&test_expert_triplet(0, 0))),
+            )
+            .unwrap();
+            std::fs::write(
+                snapshot.join("model.safetensors.index.json"),
+                expert_triplet_weight_map(0, 0),
+            )
+            .unwrap();
+            tmp
+        }
+
+        fn tiny_dense_store(root: &Path) -> DenseStore {
+            let dense_path = root.join("model_weights.bin");
+            let manifest_path = root.join("model_weights.json");
+            std::fs::write(&dense_path, [0u8]).unwrap();
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec(&FlashMoeManifest {
+                    model: QWEN35_MODEL.to_string(),
+                    cache_version: CACHE_VERSION.to_string(),
+                    dense_shards: Vec::new(),
+                    expert_tensors: Vec::new(),
+                    dense_tensors: Vec::new(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            DenseStore::open(dense_path, manifest_path).unwrap()
+        }
+
+        #[test]
+        #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
+        fn arm_macos_compiles_flashmoe_metal_kernels() {
+            let temp = tempfile::tempdir().unwrap();
+            let plan = plan_unchecked(QWEN35_MODEL, temp.path());
+            let config: QwenModelConfig = serde_json::from_slice(
+                br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+            )
+            .unwrap();
+            let runtime = DenseTransformerRuntime::new(&config);
+            let dense = tiny_dense_store(temp.path());
+            let _executor =
+                MetalExecutorInner::new(&plan, &config, &runtime, &dense, false).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
+        fn arm_macos_command_buffer_helper_completes_rms_norm() {
+            let temp = tempfile::tempdir().unwrap();
+            let plan = plan_unchecked(QWEN35_MODEL, temp.path());
+            let config: QwenModelConfig = serde_json::from_slice(
+                br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+            )
+            .unwrap();
+            let runtime = DenseTransformerRuntime::new(&config);
+            let dense = tiny_dense_store(temp.path());
+            let executor =
+                MetalExecutorInner::new(&plan, &config, &runtime, &dense, false).unwrap();
+            let output = executor.rms_norm(&[3.0, 4.0], Some(&[1.0, 1.0])).unwrap();
+
+            assert_eq!(output.len(), 2);
+            assert!(output.iter().all(|value| value.is_finite()));
+        }
+
+        #[test]
+        #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
+        fn arm_macos_tiny_flashmoe_cache_builds_loads_and_generates() {
+            let tmp = tiny_snapshot();
+            let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+            let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+            assert!(plan.cache_status().unwrap().ready);
+
+            let mut engine = load(&plan).unwrap();
+            let output = engine
+                .generate(&GenerationRequest {
+                    prompt: "hello".to_string(),
+                    max_tokens: 1,
+                    temperature: 0.0,
+                    top_k: 1,
+                    seed: 1,
+                })
+                .unwrap();
+            assert_eq!(output.generated_tokens, 1);
+        }
+    }
+
+    #[test]
+    fn legacy_qwen_coder_alias_maps_to_qwen35_flashmoe_model() {
+        assert_eq!(
+            canonical_model("hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
+            QWEN35_MODEL
+        );
+    }
+
+    #[test]
+    fn qwen35_and_legacy_alias_are_flashmoe_names() {
+        assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
+        assert!(is_qwen35_or_legacy_alias("qwen3-coder-next"));
+        assert!(!is_qwen35_or_legacy_alias("qwen-vision.gguf"));
+        assert_eq!(
+            select_backend("qwen-vision.gguf"),
+            BackendSelection::LlamaCpp
+        );
+    }
+
+    #[test]
+    fn qwen3_moe_hf_repos_are_flashmoe_pull_candidates() {
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-30B-A3B"));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-235B-A22B-Instruct"));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-MoE-Instruct"));
+        assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
+        assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
+    }
+
+    #[test]
+    fn plan_uses_flashmoe_cache_layout() {
+        let plan = plan_unchecked(QWEN35_MODEL, Path::new("/models"));
+        assert!(plan.runtime_dir.ends_with(CACHE_VERSION));
+        assert!(plan.non_expert_weights.ends_with("model_weights.bin"));
+        assert!(plan.experts_dir.ends_with("packed_experts"));
+        assert!(plan.uses_metal);
+        assert!(plan.streams_experts_from_nand);
+        assert_eq!(plan.quantization, ExpertQuantization::FourBitProduction);
+        assert!(plan.describe().contains("397B"));
+    }
+
+    #[test]
+    fn cache_status_reports_missing_runtime_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        let status = plan.cache_status().unwrap();
+        assert!(!status.ready);
+        assert!(
+            status
+                .missing
+                .iter()
+                .any(|p| p.ends_with("model_weights.bin"))
+        );
+        assert_eq!(status.expert_files, 0);
+    }
+
+    #[test]
+    fn cache_status_rejects_partial_expert_layer_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+        fs::write(&plan.non_expert_weights, b"dense").unwrap();
+        fs::write(
+            &plan.tensor_manifest,
+            br#"{"model":"","cache_version":"","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &plan.model_config,
+            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        fs::write(&plan.tokenizer, test_tokenizer_json()).unwrap();
+        let packs: Vec<_> = (0..8)
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(&plan.experts_dir, 0, packs, 8).unwrap();
+
+        let status = plan.cache_status().unwrap();
+        assert!(!status.ready);
+        assert!(
+            status
+                .missing
+                .iter()
+                .any(|path| path.ends_with("layer_01.bin"))
+        );
+    }
+
+    #[test]
+    fn cleanup_deletes_stale_expert_temp_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let experts_dir = tmp.path();
+        let final_bin = experts_dir.join("layer_00.bin");
+        let temp_bin = experts_dir.join("layer_00.bin.tmp-123-ThreadId(1)");
+        let temp_json = experts_dir.join("layer_00.json.tmp-123-ThreadId(1)");
+
+        fs::write(&final_bin, b"PBQ4EXPERT ").unwrap();
+        fs::write(&temp_bin, b"partial").unwrap();
+        fs::write(&temp_json, b"partial").unwrap();
+
+        let deleted = cleanup_stale_expert_temp_files(experts_dir).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(final_bin.is_file());
+        assert!(!temp_bin.exists());
+        assert!(!temp_json.exists());
+    }
+
+    #[test]
+    fn routing_top_k_is_stable_and_softmax_normalizes() {
+        let selected = top_k(&[0.1, 0.9, 0.9, -1.0], 2);
+        assert_eq!(selected, vec![(1, 0.9), (2, 0.9)]);
+        let mut weights: Vec<f32> = selected.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn optional_qk_norm_absent_leaves_projection_unchanged() {
+        let mut values = vec![3.0, 4.0, 5.0, 12.0];
+        let original = values.clone();
+        apply_optional_per_head_rms_norm(&mut values, 2, 2, None).unwrap();
+        assert_eq!(values, original);
+
+        let mut normed = original.clone();
+        apply_optional_per_head_rms_norm(&mut normed, 2, 2, Some(&[1.0, 1.0])).unwrap();
+        assert_ne!(normed, original);
+    }
+
+    #[test]
+    fn fused_qk_norm_rope_matches_separate_reference_steps() {
+        let layout = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 16,
+            q_width: 16,
+            kv_width: 8,
+            head_dim: 8,
+            rotary_dim: 8,
+            num_q_heads: 2,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let q_weight = vec![0.5, 1.0, 1.5, 2.0, 0.75, 1.25, 1.75, 2.25];
+        let k_weight = vec![1.25, 0.75, 1.5, 0.5, 2.0, 1.0, 0.875, 1.125];
+        let mut expected_q: Vec<f32> = (0..layout.q_width)
+            .map(|idx| ((idx as f32) * 0.31).sin() + 0.125)
+            .collect();
+        let mut expected_k: Vec<f32> = (0..layout.kv_width)
+            .map(|idx| ((idx as f32) * 0.19).cos() - 0.25)
+            .collect();
+        let mut actual_q = expected_q.clone();
+        let mut actual_k = expected_k.clone();
+
+        apply_optional_per_head_rms_norm(
+            &mut expected_q,
+            layout.num_q_heads,
+            layout.head_dim,
+            Some(&q_weight),
+        )
+        .unwrap();
+        apply_optional_per_head_rms_norm(
+            &mut expected_k,
+            layout.kv_heads,
+            layout.head_dim,
+            Some(&k_weight),
+        )
+        .unwrap();
+        apply_rotary_for_layout(
+            &mut expected_q,
+            &mut expected_k,
+            MropePosition {
+                temporal: 7,
+                height: 3,
+                width: 5,
+            },
+            1_000_000.0,
+            layout,
+            Some([1, 1, 1]),
+        );
+
+        apply_full_attention_qk_norm_and_rotary(
+            &mut actual_q,
+            &mut actual_k,
+            layout,
+            MropePosition {
+                temporal: 7,
+                height: 3,
+                width: 5,
+            },
+            1_000_000.0,
+            Some([1, 1, 1]),
+            Some(&q_weight),
+            Some(&k_weight),
+        )
+        .unwrap();
+
+        for (idx, (actual, expected)) in actual_q.iter().zip(expected_q.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "q element {idx} diverged: actual={actual}, expected={expected}"
+            );
+        }
+        for (idx, (actual, expected)) in actual_k.iter().zip(expected_k.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "k element {idx} diverged: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3next_plain_rms_norm_offsets_match_reference_module_types() {
+        let qwen35: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"rope_theta":10000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+        let legacy_qwen3: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+
+        for name in [
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.3.self_attn.q_norm.weight",
+            "model.layers.3.self_attn.k_norm.weight",
+        ] {
+            assert!(
+                qwen3next_norm_uses_offset(&qwen35, name),
+                "{name} should use Qwen3Next 1+weight RMSNorm semantics"
+            );
+        }
+
+        for name in [
+            "model.layers.0.linear_attn.norm.weight",
+            "model.layers.0.mlp.shared_expert_gate.weight",
+        ] {
+            assert!(
+                !qwen3next_norm_uses_offset(&qwen35, name),
+                "{name} is not a plain Qwen3NextRMSNorm weight"
+            );
+        }
+
+        assert!(!qwen3next_norm_uses_offset(
+            &legacy_qwen3,
+            "model.norm.weight"
+        ));
+    }
+
+    #[test]
+    fn split_gated_q_projection_matches_reference_head_chunks() {
+        let layout = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Gated,
+            q_projection_width: 12,
+            q_width: 6,
+            kv_width: 6,
+            head_dim: 3,
+            rotary_dim: 2,
+            num_q_heads: 2,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+
+        let projected = vec![
+            1.0, 2.0, 3.0, // head 0 query
+            10.0, 20.0, 30.0, // head 0 gate
+            4.0, 5.0, 6.0, // head 1 query
+            40.0, 50.0, 60.0, // head 1 gate
+        ];
+
+        let (query, gate) = split_q_projection(projected, layout).unwrap();
+
+        assert_eq!(query, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(gate.unwrap(), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn causal_attention_gqa_matches_independent_reference() {
+        let query = vec![
+            0.2, -0.1, // q head 0 -> kv head 0
+            0.4, 0.3, // q head 1 -> kv head 0
+            -0.5, 0.7, // q head 2 -> kv head 1
+            0.6, -0.2, // q head 3 -> kv head 1
+        ];
+        let k0 = vec![0.1, 0.3, -0.2, 0.4];
+        let v0 = vec![1.0, 2.0, 3.0, 4.0];
+        let k1 = vec![0.5, -0.4, 0.6, 0.2];
+        let v1 = vec![-1.0, 0.5, 2.0, -0.5];
+        let keys_values = vec![(&k0[..], &v0[..]), (&k1[..], &v1[..])];
+
+        let got = causal_attention(&query, &keys_values, 4, 2, 2);
+        let mut expected = vec![0.0f32; query.len()];
+        let scale = (2.0f32).sqrt().recip();
+        for q_head in 0..4 {
+            let kv_head = q_head / 2;
+            let q = &query[q_head * 2..q_head * 2 + 2];
+            let mut scores = keys_values
+                .iter()
+                .map(|(key, _)| {
+                    let k = &key[kv_head * 2..kv_head * 2 + 2];
+                    (q[0] * k[0] + q[1] * k[1]) * scale
+                })
+                .collect::<Vec<_>>();
+            softmax_in_place(&mut scores);
+            for (score, (_, value)) in scores.iter().zip(keys_values.iter()) {
+                let v = &value[kv_head * 2..kv_head * 2 + 2];
+                expected[q_head * 2] += score * v[0];
+                expected[q_head * 2 + 1] += score * v[1];
+            }
+        }
+
+        for (got, expected) in got.iter().zip(expected.iter()) {
+            assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
+        }
+    }
+
+    #[test]
+    fn token_sampler_supports_deterministic_and_seeded_sampling() {
+        let logits = vec![0.1, 3.0, 2.9, 0.0];
+        let mut deterministic = TokenSampler::new(0.0, 1, 123);
+        assert_eq!(deterministic.sample(&logits, &[], &[]).unwrap(), 1);
+
+        let mut seeded_a = TokenSampler::new(0.7, 3, 42);
+        let mut seeded_b = TokenSampler::new(0.7, 3, 42);
+        let first = seeded_a.sample(&logits, &[], &[]).unwrap();
+        let second = seeded_b.sample(&logits, &[], &[]).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn token_sampler_applies_repeat_penalty_before_sampling() {
+        let logits = vec![0.0, 2.0, 1.95];
+        let sampler = TokenSampler::new(0.7, 3, 7);
+        let repeated = sampler.repeated_tokens(&[], &[1]);
+        let processed: Vec<f32> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(token, logit)| sampler.process_logit(token, logit, &repeated))
+            .collect();
+        assert!(processed[1] < logits[1]);
+        assert_eq!(processed[2], logits[2]);
+    }
+
+    #[test]
+    fn shared_repeat_penalty_matches_sampler_for_cached_lm_head_topk() {
+        let sampler = TokenSampler::new(0.7, 4, 7);
+        let repeated = sampler.repeated_tokens(&[2], &[1]);
+        let logits = [0.0, 2.1, -2.0, 1.8];
+
+        for (token, logit) in logits.iter().copied().enumerate() {
+            assert_eq!(
+                process_sample_logit(token, logit, sampler.repeat_penalty, &repeated),
+                sampler.process_logit(token, logit, &repeated)
+            );
+        }
+        assert!(process_sample_logit(1, logits[1], sampler.repeat_penalty, &repeated) < logits[1]);
+        assert!(process_sample_logit(2, logits[2], sampler.repeat_penalty, &repeated) < logits[2]);
+        assert_eq!(
+            process_sample_logit(3, logits[3], sampler.repeat_penalty, &repeated),
+            logits[3]
+        );
+    }
+
+    #[test]
+    fn token_sampler_sampling_from_candidates_matches_full_logits() {
+        let logits = vec![0.1, 3.0, 2.9, 0.0, -0.5, 2.0];
+        let prompt = vec![5];
+        let generated = vec![1, 4];
+
+        let mut full = TokenSampler::new(0.7, 4, 99);
+        let mut candidate = TokenSampler::new(0.7, 4, 99);
+        let candidates = candidate.top_candidates(&logits, &prompt, &generated);
+
+        assert_eq!(
+            full.sample(&logits, &prompt, &generated).unwrap(),
+            candidate.sample_candidates(candidates).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_k_candidates_matches_full_top_k_across_tiles() {
+        let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0];
+        let mut candidates = TopKCandidates::new(3);
+        for (offset, chunk) in scores.chunks(2).enumerate() {
+            for (inner, score) in chunk.iter().copied().enumerate() {
+                candidates.push(offset * 2 + inner, score);
+            }
+        }
+        assert_eq!(candidates.into_sorted_vec(), top_k(&scores, 3));
+    }
+
+    #[test]
+    fn cpu_routing_topk_and_softmax_support_non_four_k() {
+        let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0, 1.5];
+        let active = top_k(&scores, 5);
+        let active_ids: Vec<_> = active.iter().map(|(expert, _)| *expert).collect();
+        assert_eq!(active_ids, vec![4, 6, 5, 7, 1]);
+
+        let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(
+            weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
+        );
+    }
+
+    #[test]
+    fn routing_weights_match_flashmoe_softmax_then_topk_reference() {
+        let router_scores = [0.25, -1.0, 3.5, 3.5, 0.0, 2.25, -0.5, 1.75];
+        let k = 4;
+
+        let active = top_k(&router_scores, k);
+        let mut pb_weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut pb_weights);
+
+        let mut reference_scores = router_scores;
+        softmax_in_place(&mut reference_scores);
+        let reference_active = top_k(&reference_scores, k);
+        let reference_sum: f32 = reference_active.iter().map(|(_, score)| *score).sum();
+        let reference_weights: Vec<f32> = reference_active
+            .iter()
+            .map(|(_, score)| *score / reference_sum)
+            .collect();
+
+        let pb_ids: Vec<_> = active.iter().map(|(expert, _)| *expert).collect();
+        let reference_ids: Vec<_> = reference_active.iter().map(|(expert, _)| *expert).collect();
+        assert_eq!(pb_ids, reference_ids);
+        for (idx, (actual, expected)) in pb_weights.iter().zip(reference_weights.iter()).enumerate()
+        {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "routing weight {idx} diverged: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_command_context_label_includes_actionable_details() {
+        let context = MetalCommandContext::new("deferred_expert_phase")
+            .with("position", 17)
+            .with("layer", 3)
+            .with("experts", "1,7,9,11")
+            .with("width", 4096);
+
+        assert_eq!(
+            context.label(),
+            "Flash-MoE deferred_expert_phase position=17 layer=3 experts=1,7,9,11 width=4096"
+        );
+        assert_eq!(
+            context.detail_summary(),
+            "position=17, layer=3, experts=1,7,9,11, width=4096"
+        );
+    }
+
+    #[test]
+    fn metal_command_status_names_known_and_unknown_values() {
+        assert_eq!(MetalCommandStatus::from_raw(0).to_string(), "not_enqueued");
+        assert_eq!(MetalCommandStatus::from_raw(3).to_string(), "scheduled");
+        assert_eq!(MetalCommandStatus::from_raw(4).to_string(), "completed");
+        assert_eq!(MetalCommandStatus::from_raw(5).to_string(), "error");
+        assert_eq!(MetalCommandStatus::from_raw(99).to_string(), "unknown(99)");
+        assert!(MetalCommandStatus::Completed.is_terminal());
+        assert!(MetalCommandStatus::Error.is_terminal());
+        assert!(!MetalCommandStatus::Scheduled.is_terminal());
+    }
+
+    #[test]
+    fn metal_command_failure_diagnostic_is_actionable() {
+        let context = MetalCommandContext::new("gqa_attention_scores")
+            .with("layer", 12)
+            .with("position", 128)
+            .with("tokens", 129)
+            .with("q_heads", 32)
+            .with("kv_heads", 8);
+
+        let message = format_metal_command_failure(
+            MetalCommandFailureKind::Timeout,
+            &context,
+            Duration::from_millis(1234),
+            MetalCommandStatus::Scheduled,
+            Some("GPU timeout"),
+        );
+
+        assert!(message.contains("timed out"));
+        assert!(message.contains("label=\"Flash-MoE gqa_attention_scores"));
+        assert!(message.contains("elapsed=1234ms"));
+        assert!(message.contains("status=scheduled"));
+        assert!(message.contains("metal_error=\"GPU timeout\""));
+        assert!(message.contains("layer=12"));
+        assert!(message.contains("position=128"));
+        assert!(message.contains("tokens=129"));
+    }
+
+    #[test]
+    fn metal_command_failure_marks_buffers_for_release() {
+        let context = MetalCommandContext::new("lm_head_topk").with("rows", 42);
+        let error = MetalCommandBufferFailure::failed(
+            &context,
+            Duration::from_millis(7),
+            MetalCommandStatus::Error,
+            None,
+        );
+        let anyhow_error = anyhow::Error::from(error.clone());
+
+        assert!(error.should_release_buffers());
+        assert!(metal_command_failure_requires_release(&anyhow_error));
+        assert!(error.to_string().contains("none reported"));
+    }
+
+    #[test]
+    fn build_cache_writes_runtime_metadata_and_metal_kernels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        std::fs::write(
+            snapshot.join("tokenizer_config.json"),
+            test_tokenizer_config_json(),
+        )
+        .unwrap();
+        write_test_config(&snapshot);
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            b"{\"weight_map\":{}}",
+        )
+        .unwrap();
+        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        assert!(plan.runtime_dir.join("kernels.metal").is_file());
+        assert!(plan.tokenizer.is_file());
+        assert!(plan.tokenizer_config.is_file());
+        assert!(plan.tensor_manifest.is_file());
+    }
+
+    #[test]
+    fn qwen3vl_cache_status_requires_vision_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN3_VL_MODEL, tmp.path());
+        std::fs::create_dir_all(&plan.runtime_dir).unwrap();
+        std::fs::create_dir_all(&plan.experts_dir).unwrap();
+        std::fs::write(&plan.non_expert_weights, b"").unwrap();
+        std::fs::write(
+            &plan.tensor_manifest,
+            br#"{"model":"hf://Qwen/Qwen3-VL-MoE-Instruct","cache_version":"flashmoe-v3","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &plan.model_config,
+            br#"{
+                "model_type": "qwen3_vl",
+                "text_config": {
+                    "hidden_size": 8,
+                    "num_attention_heads": 2,
+                    "num_hidden_layers": 1,
+                    "num_key_value_heads": 1,
+                    "vocab_size": 16,
+                    "num_experts": 1,
+                    "num_experts_per_tok": 1,
+                    "moe_intermediate_size": 4
+                },
+                "vision_config": {
+                    "depth": 1,
+                    "hidden_size": 4,
+                    "num_heads": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(&plan.tokenizer, b"{}").unwrap();
+
+        let status = plan.cache_status().unwrap();
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_weights.as_ref().unwrap())
+        );
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_manifest.as_ref().unwrap())
+        );
+        assert!(
+            status
+                .missing
+                .contains(plan.vision_config_path.as_ref().unwrap())
+        );
+    }
+
+    #[test]
+    fn metal_shader_source_defines_full_forward_kernel_set() {
+        for kernel in [
+            "q4_fma_matvec",
+            "q4_mmap_fma_matvec",
+            "route_top4",
+            "dense_matvec",
+            "dense_matvec_bf16",
+            "rms_norm",
+            "rope_apply",
+            "rope_split_half_apply",
+            "attention_scores",
+            "kv_cache_write",
+            "kv_cache_read_attention",
+            "expert_mlp_fused",
+            "silu_product",
+            "shared_expert_activation",
+            "combine_expert_phase",
+            "fill_zero",
+            "lm_head_logits",
+            "topk_vocab",
+            "gqa_attention_scores",
+            "gqa_kv_read_attention",
+        ] {
+            assert!(
+                METAL_SHADERS.contains(&format!("kernel void {kernel}")),
+                "missing Metal kernel {kernel}"
+            );
+        }
+        assert!(METAL_SHADERS.contains("threadgroup float input_cache"));
+        assert!(METAL_SHADERS.contains("simd_sum(acc)"));
+        assert!(METAL_SHADERS.contains("thread_index_in_simdgroup"));
+        assert!(METAL_SHADERS.contains("constant uint& group_size"));
+        assert!(METAL_SHADERS.contains("constant uint& top_k"));
+        assert!(METAL_SHADERS.contains("fma(float(byte & 0x0f), scale0 * x0, bias0 * x0)"));
+        assert!(
+            !METAL_SHADERS.contains("uint half"),
+            "`half` is a Metal scalar type and cannot be reused as a variable name"
+        );
+    }
+
+    #[test]
+    fn metal_kv_cache_uses_full_attention_layout_widths() {
+        let standard = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 8,
+            q_width: 8,
+            kv_width: 4,
+            head_dim: 4,
+            rotary_dim: 4,
+            num_q_heads: 2,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let gated = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Gated,
+            q_projection_width: 16,
+            q_width: 8,
+            kv_width: 6,
+            head_dim: 3,
+            rotary_dim: 2,
+            num_q_heads: 2,
+            kv_heads: 2,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let layouts = vec![Some(standard), None, Some(gated)];
+        let widths = metal_kv_layer_widths(&layouts);
+        assert_eq!(widths, vec![4, 0, 6]);
+        assert_eq!(
+            metal_kv_cache_bytes_for_widths(&widths, 5),
+            (4 + 6) * 5 * 2 * std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn attention_output_closeness_allows_small_metal_roundoff_only() {
+        assert!(attention_close(&[1.0, -2.0], &[1.0005, -2.0005]));
+        assert!(!attention_close(&[1.0, -2.0], &[1.1, -2.0]));
+    }
+
+    #[test]
+    fn expert_phase_cpu_combines_shared_experts_and_next_norm() {
+        let shared = SharedExpertPhaseWeights {
+            // Two shared experts, one intermediate channel each, hidden width two.
+            gate: Arc::new(vec![1.0, 0.0, 0.0, 1.0]),
+            up: Arc::new(vec![0.0, 2.0, 3.0, 0.0]),
+            down: Arc::new(vec![1.0, 2.0, -1.0, 0.5]),
+            router: Arc::new(vec![1.0, 0.0, 0.0, -1.0]),
+            shared_experts: 2,
+            intermediate: 1,
+            width: 2,
+        };
+        let residual = vec![0.5, -1.0];
+        let normed = vec![2.0, 4.0];
+        let experts: &[ExpertWeights] = &[];
+        let out = compute_expert_phase_cpu(
+            experts,
+            &[],
+            &normed,
+            &residual,
+            Some(&shared),
+            Some(&[1.0, 0.5]),
+        )
+        .unwrap();
+        let shared_gate: [f32; 2] = [2.0, 4.0];
+        let shared_up: [f32; 2] = [8.0, 6.0];
+        let shared_router: [f32; 2] = [2.0, -4.0];
+        let activated = [
+            silu(shared_gate[0]) * shared_up[0] * sigmoid(shared_router[0]),
+            silu(shared_gate[1]) * shared_up[1] * sigmoid(shared_router[1]),
+        ];
+        let expected_hidden = vec![
+            residual[0] + activated[0] + 2.0 * activated[1],
+            residual[1] - activated[0] + 0.5 * activated[1],
+        ];
+        for (actual, expected) in out.hidden.iter().zip(expected_hidden.iter()) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+        let mut expected_normed = expected_hidden;
+        rms_norm_with_weight_in_place(&mut expected_normed, Some(&[1.0, 0.5]));
+        for (actual, expected) in out.next_normed.unwrap().iter().zip(expected_normed.iter()) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn build_cache_parses_safetensors_index_into_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        write_test_config(&snapshot);
+        std::fs::write(
+            snapshot.join("dense.safetensors"),
+            make_safetensors(&[("model.layers.0.self_attn.q_proj.weight", b"dense")]),
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&typed_fixture_refs(&test_expert_triplet(2, 7))),
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            expert_triplet_weight_map(2, 7),
+        )
+        .unwrap();
+        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        let manifest: FlashMoeManifest =
+            serde_json::from_slice(&std::fs::read(&plan.tensor_manifest).unwrap()).unwrap();
+        assert_eq!(manifest.dense_shards, vec!["dense.safetensors"]);
+        assert_eq!(manifest.dense_tensors[0].dtype, "U8");
+        assert_eq!(manifest.dense_tensors[0].shape, vec![5]);
+        assert_eq!(manifest.dense_tensors[0].runtime_offset, 0);
+        assert_eq!(std::fs::read(&plan.non_expert_weights).unwrap(), b"dense");
+        assert_eq!(manifest.expert_tensors[0].layer, Some(2));
+        assert_eq!(manifest.expert_tensors[0].expert, Some(7));
+        assert!(plan.non_expert_weights.is_file());
+        let expert_pack = expert_layer_path(&plan.experts_dir, 2);
+        assert!(expert_pack.is_file());
+        assert!(std::fs::metadata(&expert_pack).unwrap().len() > 0);
+        let metadata = read_expert_pack_metadata(&plan.experts_dir, 2, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.expert, 7);
+
+        let registry = TensorRegistry::load(&plan.tensor_manifest).unwrap();
+        let dense = registry
+            .require("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(dense.dtype, "U8");
+        assert_eq!(dense.shape, vec![5]);
+        assert_eq!(dense.byte_offset, 0);
+        assert_eq!(dense.byte_len, 5);
+        assert_eq!(dense.quantization, TensorQuantization::None);
+        let expert = registry
+            .require("model.layers.2.mlp.experts.7.gate_proj.weight")
+            .unwrap();
+        assert!(matches!(
+            expert.quantization,
+            TensorQuantization::Q4 {
+                group_size: GROUP_SIZE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expert_tensor_classifier_ignores_mtp_speculative_layers() {
+        assert!(is_expert_tensor_name(
+            "model.layers.0.mlp.experts.gate_up_proj"
+        ));
+        assert!(is_expert_tensor_name(
+            "model.layers.0.mlp.experts.7.gate_proj.weight"
+        ));
+        assert!(!is_expert_tensor_name(
+            "mtp.layers.0.mlp.experts.7.gate_proj.weight"
+        ));
+    }
+
+    #[test]
+    fn expert_cache_requires_complete_qwen_expert_mlp_triplet() {
+        let tensor = ExpertTensorRef {
+            tensor: "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(0),
+            expert: Some(0),
+            dtype: Some("BF16".to_string()),
+            shape: vec![16, 8],
+            source_offsets: Some([0, 16]),
+        };
+        let err = validate_expert_tensor_group(0, 0, &[&tensor], None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing required tensor up_proj.weight"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn qwen_config_validates_runtime_dimensions() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.kv_heads(), 8);
+        assert_eq!(config.experts(), 512);
+        assert_eq!(config.config_active_experts(), 4);
+    }
+
+    #[test]
+    fn qwen_config_accepts_arbitrary_num_experts_per_tok() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.config_active_experts(), 10);
+    }
+
+    #[test]
+    fn routing_policy_defaults_qwen35_flashmoe_profile_to_k4() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"rope_theta":10000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::default()
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 4);
+        assert_eq!(policy.source, ActiveExpertsSource::Qwen35FlashMoeProfile);
+    }
+
+    #[test]
+    fn routing_policy_defaults_other_qwen_moe_to_model_config_k() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::default()
+            .resolve("hf://Qwen/Qwen3-30B-A3B", &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 2);
+        assert_eq!(policy.source, ActiveExpertsSource::ModelConfig);
+    }
+
+    #[test]
+    fn flashmoe_parity_routing_defaults_are_model_family_aware() {
+        let qwen35 = FlashMoeRoutingPolicy::default()
+            .resolve(
+                FlashMoeFixtureFamily::Qwen35FlashMoe.model(),
+                &FlashMoeFixtureFamily::Qwen35FlashMoe.config(),
+            )
+            .unwrap();
+        assert_eq!(qwen35.active_experts, 4);
+        assert_eq!(qwen35.source, ActiveExpertsSource::Qwen35FlashMoeProfile);
+
+        for (family, expected_k) in [
+            (FlashMoeFixtureFamily::Qwen3Moe, 2),
+            (FlashMoeFixtureFamily::Qwen3VlMoe, 3),
+        ] {
+            let policy = FlashMoeRoutingPolicy::default()
+                .resolve(family.model(), &family.config())
+                .unwrap();
+            assert_eq!(policy.active_experts, expected_k, "{family:?}");
+            assert_eq!(policy.source, ActiveExpertsSource::ModelConfig);
+        }
+    }
+
+    #[test]
+    fn routing_policy_honors_explicit_active_expert_override() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+
+        let policy = FlashMoeRoutingPolicy::new(Some(6), false)
+            .resolve("hf://Qwen/Qwen3-30B-A3B", &config)
+            .unwrap();
+
+        assert_eq!(policy.active_experts, 6);
+        assert_eq!(policy.source, ActiveExpertsSource::UserOverride);
+    }
+
+    #[test]
+    fn routing_policy_guards_qwen35_k_below_four_unless_forced() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"rope_theta":10000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+
+        let err = FlashMoeRoutingPolicy::new(Some(3), false)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap_err();
+        assert!(err.to_string().contains("requires K >= 4"), "{err:#}");
+
+        let forced = FlashMoeRoutingPolicy::new(Some(3), true)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap();
+        assert_eq!(forced.active_experts, 3);
+        assert!(forced.force_active_experts);
+    }
+
+    #[test]
+    fn dense_registry_validation_rejects_missing_lm_head_and_transformer_tensors() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: Vec::new(),
+            expert_tensors: Vec::new(),
+            dense_tensors: Vec::new(),
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("model.embed_tokens.weight"),
+            "{err:#}"
+        );
+    }
+
+    /// Build a `FlashMoeManifest` containing every dense tensor required by `validate_required_tensor_manifest`
+    /// for a tiny 1-layer, 8-hidden-dim, 2-head, 1-kv-head, 128-vocab, 4-expert model.
+    fn minimal_dense_manifest(with_lm_head: bool) -> (QwenModelConfig, FlashMoeManifest) {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
+        let mut tensors = vec![
+            ("model.embed_tokens.weight", vec![128usize, 8]),
+            ("model.norm.weight", vec![8]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+            ("model.layers.0.input_layernorm.weight", vec![8]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![8]),
+            ("model.layers.0.mlp.gate.weight", vec![4, 8]),
+        ];
+        if with_lm_head {
+            tensors.push(("lm_head.weight", vec![128, 8]));
+        }
+        let dense_tensors = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, shape))| {
+                let byte_len: u64 = shape.iter().product::<usize>() as u64 * 2; // BF16 = 2 bytes/elem
+                DenseTensorRef {
+                    tensor: name.to_string(),
+                    shard: "shard.safetensors".to_string(),
+                    dtype: "BF16".to_string(),
+                    shape: shape.clone(),
+                    source_offsets: [0, byte_len],
+                    runtime_offset: i as u64 * 4096,
+                    byte_len,
+                    quantization: TensorQuantization::None,
+                }
+            })
+            .collect();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["shard.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors,
+        };
+        (config, manifest)
+    }
+
+    fn make_dense_ref(tensor: &str, shape: Vec<usize>, slot: usize) -> DenseTensorRef {
+        let byte_len: u64 = shape.iter().product::<usize>() as u64 * 2;
+        DenseTensorRef {
+            tensor: tensor.to_string(),
+            shard: "hybrid.safetensors".to_string(),
+            dtype: "BF16".to_string(),
+            shape,
+            source_offsets: [0, byte_len],
+            runtime_offset: slot as u64 * 4096,
+            byte_len,
+            quantization: TensorQuantization::None,
+        }
+    }
+
+    fn tiny_attention_manifest(
+        layer_types: &[AttentionLayerType],
+    ) -> (QwenModelConfig, FlashMoeManifest) {
+        let (mut config, _) = minimal_dense_manifest(true);
+        config.num_hidden_layers = layer_types.len();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            "lm_head.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+
+        for (layer, layer_type) in layer_types.iter().copied().enumerate() {
+            push(
+                layer_norm_tensor_name(layer, "input_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                layer_norm_tensor_name(layer, "post_attention_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                router_tensor_name(layer),
+                vec![config.experts(), config.hidden_size],
+            );
+            match layer_type {
+                AttentionLayerType::Full => {
+                    push(
+                        attention_tensor_name(layer, "q_proj"),
+                        vec![config.hidden_size, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "k_proj"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "v_proj"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        attention_tensor_name(layer, "o_proj"),
+                        vec![config.hidden_size, config.hidden_size],
+                    );
+                }
+                AttentionLayerType::Linear => {
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_qkv"),
+                        vec![12, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_z"),
+                        vec![4, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_b"),
+                        vec![2, config.hidden_size],
+                    );
+                    push(
+                        linear_attention_tensor_name(layer, "in_proj_a"),
+                        vec![2, config.hidden_size],
+                    );
+                    push(linear_attention_tensor_name(layer, "conv1d"), vec![12, 3]);
+                    push(linear_attention_scalar_tensor_name(layer, "A_log"), vec![2]);
+                    push(
+                        linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                        vec![2],
+                    );
+                    push(linear_attention_tensor_name(layer, "norm"), vec![2]);
+                    push(
+                        linear_attention_tensor_name(layer, "out_proj"),
+                        vec![config.hidden_size, 4],
+                    );
+                }
+            }
+        }
+
+        let manifest = FlashMoeManifest {
+            model: "hf://example/tiny-attention".to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["tiny.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        (config, manifest)
+    }
+
+    fn assert_manifest_attention_kinds(layer_types: &[AttentionLayerType]) {
+        let (config, manifest) = tiny_attention_manifest(layer_types);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("manifest-driven attention schedule should validate");
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry)
+            .expect("manifest-driven attention schedule should build runtime layouts");
+
+        for (layer, layer_type) in layer_types.iter().copied().enumerate() {
+            match layer_type {
+                AttentionLayerType::Full => {
+                    assert_eq!(runtime.layer_kind(layer), FlashMoeLayerKind::FullAttention);
+                    runtime
+                        .full_attention_layout(layer)
+                        .expect("full-attention layer should have full layout");
+                    assert!(
+                        runtime.linear_attention_layout(layer).is_err(),
+                        "full-attention layer {layer} should not have a linear layout"
+                    );
+                }
+                AttentionLayerType::Linear => {
+                    assert_eq!(
+                        runtime.layer_kind(layer),
+                        FlashMoeLayerKind::LinearAttention
+                    );
+                    runtime
+                        .linear_attention_layout(layer)
+                        .expect("linear-attention layer should have linear layout");
+                    assert!(
+                        runtime.full_attention_layout(layer).is_err(),
+                        "linear-attention layer {layer} should not have a full layout"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_configured_shared_expert_without_gate() {
+        let (mut config, mut manifest) = minimal_dense_manifest(true);
+        config.num_shared_experts = Some(1);
+        config.shared_expert_intermediate_size = Some(16);
+        let mut slot = manifest.dense_tensors.len();
+        for (name, shape) in [
+            (
+                shared_expert_tensor_name(0, "gate_proj"),
+                vec![16, config.hidden_size],
+            ),
+            (
+                shared_expert_tensor_name(0, "up_proj"),
+                vec![16, config.hidden_size],
+            ),
+            (
+                shared_expert_tensor_name(0, "down_proj"),
+                vec![config.hidden_size, 16],
+            ),
+        ] {
+            manifest
+                .dense_tensors
+                .push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        }
+
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("shared_expert_gate.weight"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn hybrid_attention_schedule_matches_flashmoe() {
+        assert!(!is_full_attention_layer(0));
+        assert!(!is_full_attention_layer(1));
+        assert!(!is_full_attention_layer(2));
+        assert!(is_full_attention_layer(3));
+        assert!(!is_full_attention_layer(4));
+        assert!(!is_full_attention_layer(5));
+        assert!(!is_full_attention_layer(6));
+        assert!(is_full_attention_layer(7));
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_all_full_attention() {
+        assert_manifest_attention_kinds(&[
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+            AttentionLayerType::Full,
+        ]);
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_qwen35_mixed_schedule() {
+        let layer_types: Vec<_> = (0..8)
+            .map(|layer| {
+                if is_full_attention_layer(layer) {
+                    AttentionLayerType::Full
+                } else {
+                    AttentionLayerType::Linear
+                }
+            })
+            .collect();
+
+        assert_manifest_attention_kinds(&layer_types);
+    }
+
+    #[test]
+    fn manifest_attention_detection_accepts_non_every_fourth_mixed_schedule() {
+        assert_manifest_attention_kinds(&[
+            AttentionLayerType::Full,
+            AttentionLayerType::Linear,
+            AttentionLayerType::Full,
+            AttentionLayerType::Linear,
+        ]);
+    }
+
+    #[test]
+    fn manifest_attention_detection_rejects_conflicting_layer_layouts() {
+        let (config, mut manifest) = tiny_attention_manifest(&[AttentionLayerType::Full]);
+        let slot = manifest.dense_tensors.len();
+        manifest.dense_tensors.push(make_dense_ref(
+            &linear_attention_tensor_name(0, "in_proj_qkv"),
+            vec![12, config.hidden_size],
+            slot,
+        ));
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+
+        assert!(err.to_string().contains("both linear-attention"), "{err:#}");
+        assert!(err.to_string().contains("full-attention"), "{err:#}");
+    }
+
+    #[test]
+    fn prefill_strategy_skips_only_for_tiny_single_layer_text_fixture() {
+        let (single_layer, _) = minimal_dense_manifest(true);
+        let fixture_strategy =
+            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Text);
+        assert_eq!(
+            fixture_strategy,
+            PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
+        );
+        assert_eq!(
+            fixture_strategy.expert_execution_for_position(0, 3),
+            ExpertExecution::Skip
+        );
+        assert_eq!(
+            fixture_strategy.expert_execution_for_position(2, 3),
+            ExpertExecution::Normal
+        );
+
+        let mut multi_layer = single_layer.clone();
+        multi_layer.num_hidden_layers = 2;
+        assert_eq!(
+            prefill_expert_strategy(&multi_layer, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+
+        let real_qwen: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            prefill_expert_strategy(&real_qwen, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+
+        let mut vision = single_layer.clone();
+        vision.vision_config = Some(
+            serde_json::from_slice(br#"{"depth":1,"hidden_size":8,"num_heads":2,"mlp_ratio":4.0}"#)
+                .unwrap(),
+        );
+        assert_eq!(
+            prefill_expert_strategy(&vision, false, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+        assert_eq!(
+            prefill_expert_strategy(&single_layer, true, PrefillInputKind::Text),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+        assert_eq!(
+            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Visual),
+            PrefillExpertStrategy::ComputeAllExperts
+        );
+    }
+
+    #[test]
+    fn session_cache_reuse_requires_entire_cached_token_prefix() {
+        assert_eq!(
+            reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+            Some(3)
+        );
+        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 9]), None);
+        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2]), None);
+    }
+
+    fn byte_tokens(text: &str) -> Vec<u32> {
+        text.bytes().map(u32::from).collect()
+    }
+
+    fn weather_tool() -> ChatTool {
+        ChatTool {
+            name: "get_weather".to_string(),
+            description: Some("Get weather.".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        }
+    }
+
+    fn assistant_weather_tool_call(content: &str) -> ChatMessage {
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, content);
+        assistant.tool_calls.push(ChatToolCall {
+            id: None,
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "London"}),
+        });
+        assistant
+    }
+
+    fn weather_tool_result() -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: ChatMessageContent::Text("{\"temp\":12}".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: Some("get_weather".to_string()),
+        }
+    }
+
+    fn rendered_tool_prompt_pair(assistant: ChatMessage) -> (String, String) {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let tool = weather_tool();
+        let initial_messages = vec![
+            ChatMessage::text(ChatRole::System, "be precise"),
+            ChatMessage::text(ChatRole::User, "weather?"),
+        ];
+        let first_prompt = tokenizer
+            .apply_chat_template_to_messages(&initial_messages, std::slice::from_ref(&tool), true)
+            .unwrap();
+        let mut next_messages = initial_messages;
+        next_messages.push(assistant);
+        next_messages.push(weather_tool_result());
+        let next_prompt = tokenizer
+            .apply_chat_template_to_messages(&next_messages, &[tool], true)
+            .unwrap();
+        (first_prompt, next_prompt)
+    }
+
+    #[test]
+    fn session_cache_reuses_prompt_prefix_after_json_compat_tool_call() {
+        let (first_prompt, next_prompt) =
+            rendered_tool_prompt_pair(assistant_weather_tool_call(""));
+        let first_prompt_tokens = byte_tokens(&first_prompt);
+        let next_prompt_tokens = byte_tokens(&next_prompt);
+        let mut old_cached_tokens = first_prompt_tokens.clone();
+        old_cached_tokens.extend(byte_tokens(
+            r#"{"type":"tool_call","tool":"get_weather","arguments":{"city":"London"},"thinking":"checking"}"#,
+        ));
+
+        assert_eq!(
+            reusable_session_prefix_len(&old_cached_tokens, &next_prompt_tokens),
+            None
+        );
+        let stable_cached_tokens = stable_session_cache_tokens(&first_prompt_tokens);
+        assert_eq!(
+            reusable_session_prefix_len(&stable_cached_tokens, &next_prompt_tokens),
+            Some(first_prompt_tokens.len())
+        );
+    }
+
+    #[test]
+    fn session_cache_reuses_prompt_prefix_after_native_tool_call_rerender() {
+        let (first_prompt, next_prompt) =
+            rendered_tool_prompt_pair(assistant_weather_tool_call("checking"));
+        let first_prompt_tokens = byte_tokens(&first_prompt);
+        let next_prompt_tokens = byte_tokens(&next_prompt);
+        let mut old_cached_tokens = first_prompt_tokens.clone();
+        old_cached_tokens.extend(byte_tokens(
+            "checking\n<tool_call>\n{\"arguments\":{\"city\":\"London\"},\"name\":\"get_weather\"}\n</tool_call>\n",
+        ));
+
+        assert_eq!(
+            reusable_session_prefix_len(&old_cached_tokens, &next_prompt_tokens),
+            None
+        );
+        let stable_cached_tokens = stable_session_cache_tokens(&first_prompt_tokens);
+        assert_eq!(
+            reusable_session_prefix_len(&stable_cached_tokens, &next_prompt_tokens),
+            Some(first_prompt_tokens.len())
+        );
+    }
+
+    #[test]
+    fn session_cache_reuse_moves_state_and_shallow_snapshots_prompt_cache() {
+        let cached_tokens = vec![10, 20];
+        let mut cache = KvCache::new(2, 2);
+        for (position, token) in cached_tokens.iter().copied().enumerate() {
+            cache.record_prompt_token(position, token).unwrap();
+        }
+        cache
+            .record_kv(0, 0, vec![1.0, 1.1], vec![2.0, 2.1])
+            .unwrap();
+        cache
+            .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
+            .unwrap();
+
+        let linear_layout = LinearAttentionLayout {
+            num_value_heads: 1,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 2,
+            conv_dim: 6,
+            conv_kernel_size: 3,
+        };
+        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
+            .map(|idx| idx as f32 + 0.25)
+            .collect();
+        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
+            .map(|idx| idx as f32 + 10.5)
+            .collect();
+        {
+            let state = cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state.clone_from(&expected_conv_state);
+            state.ssm_state.clone_from(&expected_ssm_state);
+        }
+
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "chat".to_string(),
+            FlashMoeSessionState {
+                tokens: cached_tokens,
+                kv_cache: cache,
+                last_hidden: vec![9.0, 9.1],
+            },
+        );
+
+        let next_prompt = [10, 20, 30];
+        let (prefix_len, state) =
+            take_reusable_session_cache_entry(&mut sessions, "chat", &next_prompt).unwrap();
+        assert!(sessions.is_empty());
+        let FlashMoeSessionState {
+            tokens,
+            mut kv_cache,
+            last_hidden,
+        } = state;
+        assert_eq!(prefix_len, tokens.len());
+        assert_eq!(last_hidden, vec![9.0, 9.1]);
+
+        kv_cache.resize_capacity(next_prompt.len());
+        let snapshot = kv_cache.shallow_snapshot();
+        let (live_key, live_value) = kv_cache.kv[0][1].as_ref().unwrap();
+        let (snapshot_key, snapshot_value) = snapshot.kv[0][1].as_ref().unwrap();
+        assert!(Arc::ptr_eq(live_key, snapshot_key));
+        assert!(Arc::ptr_eq(live_value, snapshot_value));
+        assert!(Arc::ptr_eq(
+            &kv_cache.linear_states.get(&1).unwrap().inner,
+            &snapshot.linear_states.get(&1).unwrap().inner
+        ));
+
+        kv_cache
+            .record_kv(2, 0, vec![5.0, 5.1], vec![6.0, 6.1])
+            .unwrap();
+        assert!(snapshot.kv[0][2].is_none());
+
+        {
+            let state = kv_cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state[0] = -99.0;
+        }
+        let live_linear = kv_cache.linear_states.get(&1).unwrap();
+        let snapshot_linear = snapshot.linear_states.get(&1).unwrap();
+        assert!(!Arc::ptr_eq(&live_linear.inner, &snapshot_linear.inner));
+        assert_eq!(snapshot_linear.conv_state, expected_conv_state);
+        assert_eq!(snapshot_linear.ssm_state, expected_ssm_state);
+    }
+
+    #[test]
+    fn session_prefix_reuse_preserves_kv_and_linear_attention_state_boundaries() {
+        let cached_tokens = vec![10, 20];
+        let mut cache = KvCache::new(2, 2);
+        for (position, token) in cached_tokens.iter().copied().enumerate() {
+            cache.record_prompt_token(position, token).unwrap();
+        }
+        cache
+            .record_kv(0, 0, vec![1.0, 1.1], vec![2.0, 2.1])
+            .unwrap();
+        cache
+            .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
+            .unwrap();
+
+        let linear_layout = LinearAttentionLayout {
+            num_value_heads: 1,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 2,
+            conv_dim: 6,
+            conv_kernel_size: 3,
+        };
+        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
+            .map(|idx| idx as f32 + 0.25)
+            .collect();
+        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
+            .map(|idx| idx as f32 + 10.5)
+            .collect();
+        {
+            let state = cache.linear_state_mut(1, linear_layout).unwrap();
+            state.conv_state.clone_from(&expected_conv_state);
+            state.ssm_state.clone_from(&expected_ssm_state);
+        }
+
+        let session_state = FlashMoeSessionState {
+            tokens: cached_tokens,
+            kv_cache: cache,
+            last_hidden: vec![9.0, 9.1],
+        };
+        let next_prompt = [10, 20, 30];
+        let prefix_len = reusable_session_prefix_len(&session_state.tokens, &next_prompt).unwrap();
+        assert_eq!(prefix_len, session_state.tokens.len());
+
+        let mut reused = session_state.kv_cache.shallow_snapshot();
+        reused.resize_capacity(next_prompt.len());
+        assert_eq!(reused.keys_values(1, 0).unwrap().len(), prefix_len);
+        assert_eq!(reused.keys_values(2, 0).unwrap().len(), prefix_len);
+        assert_eq!(reused.kv[0][2], None);
+        assert!(reused.linear_states.get(&0).is_none());
+
+        let linear_state = reused.linear_states.get(&1).unwrap();
+        assert_eq!(linear_state.conv_state, expected_conv_state);
+        assert_eq!(linear_state.ssm_state, expected_ssm_state);
+        assert_eq!(session_state.last_hidden, vec![9.0, 9.1]);
+
+        assert_eq!(
+            reusable_session_prefix_len(&session_state.tokens, &[10]),
+            None
+        );
+        assert_eq!(
+            reusable_session_prefix_len(&session_state.tokens, &[10, 99, 30]),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_accepts_hybrid_gated_deltanet_manifest() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":4,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            "lm_head.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        let kv_width = config.kv_heads() * head_dim;
+        for layer in 0..config.num_hidden_layers {
+            push(
+                layer_norm_tensor_name(layer, "input_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                layer_norm_tensor_name(layer, "post_attention_layernorm"),
+                vec![config.hidden_size],
+            );
+            push(
+                router_tensor_name(layer),
+                vec![config.experts(), config.hidden_size],
+            );
+            if is_full_attention_layer(layer) {
+                push(
+                    attention_tensor_name(layer, "q_proj"),
+                    vec![config.hidden_size, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "k_proj"),
+                    vec![kv_width, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "v_proj"),
+                    vec![kv_width, config.hidden_size],
+                );
+                push(
+                    attention_tensor_name(layer, "o_proj"),
+                    vec![config.hidden_size, config.hidden_size],
+                );
+            } else {
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_qkv"),
+                    vec![LINEAR_CONV_DIM, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_z"),
+                    vec![LINEAR_TOTAL_VALUE, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_b"),
+                    vec![LINEAR_NUM_V_HEADS, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "in_proj_a"),
+                    vec![LINEAR_NUM_V_HEADS, config.hidden_size],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "conv1d"),
+                    vec![LINEAR_CONV_DIM, CONV_KERNEL_SIZE],
+                );
+                push(
+                    linear_attention_scalar_tensor_name(layer, "A_log"),
+                    vec![LINEAR_NUM_V_HEADS],
+                );
+                push(
+                    linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                    vec![LINEAR_NUM_V_HEADS],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "norm"),
+                    vec![LINEAR_VALUE_DIM],
+                );
+                push(
+                    linear_attention_tensor_name(layer, "out_proj"),
+                    vec![config.hidden_size, LINEAR_TOTAL_VALUE],
+                );
+            }
+        }
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["hybrid.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("hybrid manifest should validate for GatedDeltaNet/full-attn layer mix");
+    }
+
+    #[test]
+    fn validate_accepts_hf_conv1d_singleton_axis_shape() {
+        let tensor_name = linear_attention_tensor_name(0, "conv1d");
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["hybrid.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.clone(),
+                shard: "hybrid.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![LINEAR_CONV_DIM, 1, CONV_KERNEL_SIZE],
+                source_offsets: [0, 0],
+                runtime_offset: 0,
+                byte_len: 0,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        assert_eq!(
+            require_conv1d_tensor_shape(&registry, &tensor_name)
+                .expect("HF conv1d [channels, 1, kernel] shape should validate"),
+            (LINEAR_CONV_DIM, CONV_KERNEL_SIZE)
+        );
+    }
+
+    #[test]
+    fn linear_attention_layout_infers_non_qwen35_dimensions() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        let mut slot = 0usize;
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            tensors.push(make_dense_ref(&name, shape, slot));
+            slot += 1;
+        };
+        push(
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        );
+        push("model.norm.weight".to_string(), vec![config.hidden_size]);
+        push(
+            layer_norm_tensor_name(0, "input_layernorm"),
+            vec![config.hidden_size],
+        );
+        push(
+            layer_norm_tensor_name(0, "post_attention_layernorm"),
+            vec![config.hidden_size],
+        );
+        push(
+            router_tensor_name(0),
+            vec![config.experts(), config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_qkv"),
+            vec![12, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_z"),
+            vec![4, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_b"),
+            vec![2, config.hidden_size],
+        );
+        push(
+            linear_attention_tensor_name(0, "in_proj_a"),
+            vec![2, config.hidden_size],
+        );
+        push(linear_attention_tensor_name(0, "conv1d"), vec![12, 3]);
+        push(linear_attention_scalar_tensor_name(0, "A_log"), vec![2]);
+        push(linear_attention_scalar_tensor_name(0, "dt_bias"), vec![2]);
+        push(linear_attention_tensor_name(0, "norm"), vec![2]);
+        push(
+            linear_attention_tensor_name(0, "out_proj"),
+            vec![config.hidden_size, 4],
+        );
+
+        let manifest = FlashMoeManifest {
+            model: "hf://example/tiny-linear".to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["tiny.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors,
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("variable linear attention layout should validate");
+        let runtime = DenseTransformerRuntime::from_registry(&config, &registry).unwrap();
+        let layout = runtime.linear_attention_layout(0).unwrap();
+
+        assert_eq!(layout.num_value_heads, 2);
+        assert_eq!(layout.num_key_heads, 1);
+        assert_eq!(layout.key_dim, 4);
+        assert_eq!(layout.value_dim, 2);
+        assert_eq!(layout.conv_dim, 12);
+        assert_eq!(layout.conv_kernel_size, 3);
+        assert_eq!(layout.conv_state_len(), 24);
+        assert_eq!(layout.ssm_state_len(), 16);
+    }
+
+    #[test]
+    fn linear_attention_key_dim_uses_qwen35_default_only_for_known_shape() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":31,"num_key_value_heads":1,"vocab_size":128,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+
+        let key_dim = infer_linear_attention_key_dim(
+            &config,
+            LINEAR_TOTAL_KEY,
+            LINEAR_TOTAL_VALUE,
+            LINEAR_VALUE_DIM,
+        )
+        .expect("exact Qwen3.5 linear-attention shape should allow the default key dim");
+        assert_eq!(key_dim, LINEAR_KEY_DIM);
+
+        let err = infer_linear_attention_key_dim(
+            &config,
+            LINEAR_TOTAL_KEY,
+            LINEAR_TOTAL_VALUE,
+            LINEAR_VALUE_DIM * 32,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not divisible by config head_dim"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn qwen35_linear_attention_keeps_direct_qkv_projection_order() {
+        let qwen35: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe_text","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+        assert!(!qwen35.linear_attention_qkv_projection_requires_reorder());
+
+        let qwen_next: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_next","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        )
+        .unwrap();
+        assert!(qwen_next.linear_attention_qkv_projection_requires_reorder());
+    }
+
+    #[test]
+    fn linear_attention_qk_normalization_matches_qwen35_reference_scaling() {
+        let layout = LinearAttentionLayout {
+            num_value_heads: 4,
+            num_key_heads: 2,
+            key_dim: 4,
+            value_dim: 3,
+            total_key_width: 8,
+            total_value_width: 12,
+            conv_dim: 28,
+            conv_kernel_size: 4,
+        };
+        let mut q = vec![1.0, 2.0, -3.0, 4.0, -0.5, 0.25, 1.5, -2.0];
+        let mut k = vec![0.5, -1.5, 2.5, -3.5, 4.0, -2.0, 1.0, 0.5];
+        let mut expected_q = q.clone();
+        let mut expected_k = k.clone();
+
+        for head in 0..layout.num_key_heads {
+            let start = head * layout.key_dim;
+            let end = start + layout.key_dim;
+            let q_sum_sq = expected_q[start..end]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>();
+            let q_inv_rms = (q_sum_sq / layout.key_dim as f32 + 1e-6).sqrt().recip();
+            let k_sum_sq = expected_k[start..end]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>();
+            let k_inv_rms = (k_sum_sq / layout.key_dim as f32 + 1e-6).sqrt().recip();
+            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+            for value in &mut expected_q[start..end] {
+                *value *= q_inv_rms * inv_scale * inv_scale;
+            }
+            for value in &mut expected_k[start..end] {
+                *value *= k_inv_rms * inv_scale;
+            }
+        }
+
+        normalize_linear_attention_qk_in_place(layout, &mut q, &mut k).unwrap();
+
+        for (actual, expected) in q.iter().zip(expected_q.iter()) {
+            assert_close(*actual, *expected);
+        }
+        for (actual, expected) in k.iter().zip(expected_k.iter()) {
+            assert_close(*actual, *expected);
+        }
+    }
+
+    #[test]
+    fn linear_attention_qkv_projection_reorders_key_head_groups_for_conv() {
+        let layout = LinearAttentionLayout {
+            num_value_heads: 4,
+            num_key_heads: 2,
+            key_dim: 2,
+            value_dim: 3,
+            total_key_width: 4,
+            total_value_width: 12,
+            conv_dim: 20,
+            conv_kernel_size: 4,
+        };
+        let mut qkv = vec![
+            10.0, 11.0, // head 0 q
+            20.0, 21.0, // head 0 k
+            30.0, 31.0, 32.0, 33.0, 34.0, 35.0, // head 0 value heads
+            40.0, 41.0, // head 1 q
+            50.0, 51.0, // head 1 k
+            60.0, 61.0, 62.0, 63.0, 64.0, 65.0, // head 1 value heads
+        ];
+
+        reorder_grouped_linear_qkv_projection(&mut qkv, layout).unwrap();
+
+        assert_eq!(
+            qkv,
+            vec![
+                10.0, 11.0, 40.0, 41.0, // all q
+                20.0, 21.0, 50.0, 51.0, // all k
+                30.0, 31.0, 32.0, 33.0, 34.0, 35.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn conv1d_step_matches_reference_causal_conv1d_state_order() {
+        let channels = 2usize;
+        let kernel_size = 4usize;
+        // State is chronological: [oldest token channels, ..., newest token channels].
+        let conv_state = vec![
+            1.0, 10.0, // t - 3
+            2.0, 20.0, // t - 2
+            3.0, 30.0, // t - 1
+        ];
+        let new_input = vec![4.0, 40.0];
+        // Per-channel PyTorch Conv1d cross-correlation weights. With left causal
+        // padding, weight[0] multiplies the oldest context and weight[K-1] the
+        // current input for the current output position.
+        let weight = vec![
+            0.1, 0.2, 0.3, 0.4, // channel 0
+            -0.2, 0.05, 0.15, -0.1, // channel 1
+        ];
+        let mut got = vec![0.0; channels];
+
+        conv1d_step(
+            &conv_state,
+            &new_input,
+            &weight,
+            &mut got,
+            channels,
+            kernel_size,
+        );
+
+        let expected0 = silu(1.0 * 0.1 + 2.0 * 0.2 + 3.0 * 0.3 + 4.0 * 0.4);
+        let expected1 = silu(10.0 * -0.2 + 20.0 * 0.05 + 30.0 * 0.15 + 40.0 * -0.1);
+        assert!(
+            (got[0] - expected0).abs() < 1e-6,
+            "{} != {expected0}",
+            got[0]
+        );
+        assert!(
+            (got[1] - expected1).abs() < 1e-6,
+            "{} != {expected1}",
+            got[1]
+        );
+    }
+
+    #[test]
+    fn gated_delta_recurrence_matches_qwen3next_recurrent_reference() {
+        let layout = LinearAttentionLayout {
+            num_value_heads: 4,
+            num_key_heads: 2,
+            key_dim: 2,
+            value_dim: 3,
+            total_key_width: 4,
+            total_value_width: 12,
+            conv_dim: 10,
+            conv_kernel_size: 2,
+        };
+        let mut reference_state_key_major = vec![
+            vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60], // value head 0: [key_dim, value_dim]
+            vec![-0.10, 0.05, 0.15, 0.25, -0.20, 0.35],
+            vec![0.30, -0.40, 0.10, 0.05, 0.07, -0.02],
+            vec![-0.15, 0.25, -0.35, 0.45, -0.55, 0.65],
+        ];
+        let mut state = vec![0.0f32; layout.ssm_state_len()];
+        for vh in 0..layout.num_value_heads {
+            let base = vh * layout.value_dim * layout.key_dim;
+            for key_idx in 0..layout.key_dim {
+                for value_idx in 0..layout.value_dim {
+                    state[base + value_idx * layout.key_dim + key_idx] =
+                        reference_state_key_major[vh][key_idx * layout.value_dim + value_idx];
+                }
+            }
+        }
+
+        let lin_q = vec![0.7, -0.2, 0.3, 0.6];
+        let lin_k = vec![0.4, 0.1, -0.5, 0.8];
+        let lin_v = vec![
+            0.2, -0.1, 0.6, 0.05, 0.4, -0.3, 0.9, 0.8, -0.2, -0.6, 0.3, 0.7,
+        ];
+        let alpha = vec![0.1f32, -0.3, 0.7, -0.2];
+        let beta = vec![0.2f32, 0.5, -0.4, 0.8];
+        let a_log = vec![-0.2f32, 0.4, 0.1, -0.5];
+        let dt_bias = vec![0.05f32, -0.15, 0.2, -0.1];
+        let mut out = vec![0.0; layout.total_value_width];
+        let mut expected_out = vec![0.0; layout.total_value_width];
+        let heads_per_key = layout.value_heads_per_key_head();
+
+        for vh in 0..layout.num_value_heads {
+            let key_head = vh / heads_per_key;
+            let q = &lin_q[key_head * layout.key_dim..key_head * layout.key_dim + layout.key_dim];
+            let k = &lin_k[key_head * layout.key_dim..key_head * layout.key_dim + layout.key_dim];
+            let v = &lin_v[vh * layout.value_dim..vh * layout.value_dim + layout.value_dim];
+            let a_weight = a_log[vh].exp();
+            let softplus = (1.0 + (alpha[vh] + dt_bias[vh]).exp()).ln();
+            let decay = (-a_weight * softplus).exp();
+            let beta_gate = 1.0 / (1.0 + (-beta[vh]).exp());
+            let state = &mut reference_state_key_major[vh];
+            for key_idx in 0..layout.key_dim {
+                for value_idx in 0..layout.value_dim {
+                    state[key_idx * layout.value_dim + value_idx] *= decay;
+                }
+            }
+            let mut kv_mem = vec![0.0f32; layout.value_dim];
+            for value_idx in 0..layout.value_dim {
+                for key_idx in 0..layout.key_dim {
+                    kv_mem[value_idx] += state[key_idx * layout.value_dim + value_idx] * k[key_idx];
+                }
+            }
+            for key_idx in 0..layout.key_dim {
+                for value_idx in 0..layout.value_dim {
+                    let delta = (v[value_idx] - kv_mem[value_idx]) * beta_gate;
+                    state[key_idx * layout.value_dim + value_idx] += k[key_idx] * delta;
+                }
+            }
+            for value_idx in 0..layout.value_dim {
+                for key_idx in 0..layout.key_dim {
+                    expected_out[vh * layout.value_dim + value_idx] +=
+                        state[key_idx * layout.value_dim + value_idx] * q[key_idx];
+                }
+            }
+        }
+
+        apply_gated_delta_recurrence(
+            layout, &mut state, &lin_q, &lin_k, &lin_v, &alpha, &beta, &a_log, &dt_bias, &mut out,
+        );
+
+        for (got, expected) in out.iter().zip(expected_out.iter()) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
+        for vh in 0..layout.num_value_heads {
+            let base = vh * layout.value_dim * layout.key_dim;
+            for key_idx in 0..layout.key_dim {
+                for value_idx in 0..layout.value_dim {
+                    let got = state[base + value_idx * layout.key_dim + key_idx];
+                    let expected =
+                        reference_state_key_major[vh][key_idx * layout.value_dim + value_idx];
+                    assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_tied_lm_head() {
+        // lm_head.weight absent → tied embeddings; validator should pass.
+        let (config, manifest) = minimal_dense_manifest(false);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("tied-embedding manifest should pass validation");
+    }
+
+    #[test]
+    fn validate_accepts_separate_lm_head() {
+        // lm_head.weight present with correct shape → should pass.
+        let (config, manifest) = minimal_dense_manifest(true);
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("manifest with separate lm_head should pass validation");
+    }
+
+    #[test]
+    fn validate_rejects_misshapen_lm_head() {
+        let (config, mut manifest) = minimal_dense_manifest(true);
+        // Corrupt the lm_head shape so it has wrong dimensions.
+        for t in &mut manifest.dense_tensors {
+            if t.tensor == "lm_head.weight" {
+                t.shape = vec![128, 16]; // should be [128, 8]
+            }
+        }
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let err = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("lm_head.weight"),
+            "expected lm_head shape error, got: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("expected"),
+            "expected shape mismatch message, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_expert_tensors_absent_from_registry() {
+        // Expert tensors are packed into ExpertStore files and need not all appear in the dense
+        // registry.  The validator must not reject a registry that has no expert entries.
+        let (config, manifest) = minimal_dense_manifest(false);
+        assert!(manifest.expert_tensors.is_empty());
+        let registry = TensorRegistry::from_manifest(&manifest);
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("registry without expert tensors should still pass dense validation");
+    }
+
+    #[test]
+    fn tensor_registry_aliases_qwen35_language_model_prefix() {
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "model.language_model.embed_tokens.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![248320, 4096],
+                source_offsets: [0, 0],
+                runtime_offset: 0,
+                byte_len: 0,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        assert!(
+            registry
+                .tensor("model.language_model.embed_tokens.weight")
+                .is_some()
+        );
+        assert!(registry.tensor("model.embed_tokens.weight").is_some());
+    }
+
+    #[test]
+    fn qwen35_hf_tensor_names_are_canonicalized_for_runtime() {
+        assert_eq!(
+            canonical_hf_tensor_name("model.language_model.embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("model.language_model.layers.7.self_attn.q_proj.weight"),
+            "model.layers.7.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("model.visual.patch_embed.proj.weight"),
+            "visual.patch_embed.proj.weight"
+        );
+        assert_eq!(canonical_hf_tensor_name("lm_head.weight"), "lm_head.weight");
+    }
+
+    #[test]
+    fn qwen_config_deserializes_qwen3_moe_extra_fields() {
+        // Real Qwen3 MoE checkpoints include additional config fields that should be parsed
+        // without error and reflected in the struct.
+        let json = br#"{
+            "model_type": "qwen3_moe",
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "num_hidden_layers": 60,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "rope_theta": 1000000.0,
+            "torch_dtype": "bfloat16",
+            "num_experts": 512,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1536,
+            "tie_word_embeddings": false,
+            "num_shared_experts": 1,
+            "shared_expert_intermediate_size": 1536
+        }"#;
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.tie_word_embeddings, Some(false));
+        assert_eq!(config.num_shared_experts, Some(1));
+        assert_eq!(config.shared_expert_intermediate_size, Some(1536));
+        assert_eq!(config.experts(), 512);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen_config_deserializes_qwen35_nested_text_and_vision_fields() {
+        let json = br#"{
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "image_token_id": 248056,
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "dtype": "bfloat16",
+                "hidden_size": 4096,
+                "max_position_embeddings": 262144,
+                "model_type": "qwen3_5_moe_text",
+                "moe_intermediate_size": 1024,
+                "num_attention_heads": 32,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "num_hidden_layers": 60,
+                "num_key_value_heads": 2,
+                "shared_expert_intermediate_size": 1024,
+                "vocab_size": 248320,
+                "rope_parameters": {
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25
+                }
+            },
+            "tie_word_embeddings": false,
+            "vision_config": {
+                "depth": 27,
+                "deepstack_visual_indexes": [5, 11, 17],
+                "hidden_size": 1152,
+                "in_channels": 3,
+                "intermediate_size": 4304,
+                "num_heads": 16,
+                "out_hidden_size": 4096,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            },
+            "vision_end_token_id": 248054,
+            "vision_start_token_id": 248053
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.num_hidden_layers, 60);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, Some(2));
+        assert_eq!(config.vocab_size, 248320);
+        assert_eq!(config.rope_theta, Some(10000000.0));
+        assert_eq!(config.partial_rotary_factor, Some(0.25));
+        assert_eq!(config.torch_dtype.as_deref(), Some("bfloat16"));
+        assert_eq!(config.num_experts_per_tok, Some(10));
+        assert_eq!(config.tie_word_embeddings, Some(false));
+
+        let vision = config.vision_config.as_ref().unwrap();
+        assert_eq!(vision.depth, 27);
+        assert_eq!(vision.embed_dim, 1152);
+        assert_eq!(vision.num_heads, 16);
+        assert_eq!(vision.patch_size, 16);
+        assert_eq!(vision.merge_size, 2);
+        assert_eq!(vision.temporal_patch_size, 2);
+        assert_eq!(vision.in_chans, 3);
+        assert_eq!(vision.deepstack_visual_indexes, vec![5, 11, 17]);
+        assert_eq!(vision.out_hidden_size, Some(4096));
+        assert_eq!(vision.patch_flat_dim(), 3 * 2 * 16 * 16);
+        assert_eq!(vision.mlp_hidden_size(), 4304);
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen_config_deserializes_mrope_section_from_rope_scaling() {
+        let json = br#"{
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 128,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "vocab_size": 1024,
+                "rope_scaling": {
+                    "rope_theta": 1000000.0,
+                    "mrope_section": [24, 20, 20]
+                }
+            },
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 64,
+                "num_heads": 4
+            }
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(config.rope_theta, Some(1_000_000.0));
+        assert_eq!(config.mrope_section, Some(DEFAULT_MROPE_SECTION));
+        assert_eq!(config.text_mrope_section(), Some(DEFAULT_MROPE_SECTION));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen3vl_config_rejects_out_of_range_deepstack_index() {
+        let json = br#"{
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 128,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 1024
+            },
+            "vision_config": {
+                "depth": 2,
+                "hidden_size": 64,
+                "num_heads": 4,
+                "deepstack_visual_indexes": [0, 2]
+            }
+        }"#;
+
+        let config: QwenModelConfig = serde_json::from_slice(json).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("deepstack_visual_indexes"),
+            "expected deepstack bounds error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_single_image_placeholder_is_expanded_in_place() {
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 9, 2], 7, 8, 9, 4).unwrap(),
+            vec![1, 7, 9, 9, 9, 9, 8, 2]
+        );
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 7, 9, 9, 8, 2], 7, 8, 9, 2).unwrap(),
+            vec![1, 7, 9, 9, 8, 2]
+        );
+        assert_eq!(
+            expand_single_image_placeholders(vec![1, 9, 9, 2], 7, 8, 9, 2).unwrap(),
+            vec![1, 7, 9, 9, 8, 2]
+        );
+        assert!(expand_single_image_placeholders(vec![1, 2], 7, 8, 9, 2).is_err());
+        assert!(expand_single_image_placeholders(vec![1, 9, 2, 9], 7, 8, 9, 2).is_err());
+        assert!(expand_single_image_placeholders(vec![1, 7, 9, 2], 7, 8, 9, 2).is_err());
+        assert!(qwen3vl_single_image_mrope_positions(&[1, 9, 2, 9], 9, 1, 2).is_err());
+    }
+
+    #[test]
+    fn qwen3vl_placeholder_expansion_handles_explicit_and_implicit_spans() {
+        let expanded = expand_multimodal_image_placeholders(
+            vec![1, 7, 9, 9, 9, 9, 8, 2, 9, 3],
+            7,
+            8,
+            9,
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 4,
+                    grid_h: 2,
+                    grid_w: 2,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 9, 9, 8, 2, 7, 9, 9, 8, 3]);
+        assert_eq!(
+            expanded.visual_spans,
+            vec![
+                VisualTokenSpan::image(2, 6, 2, 2),
+                VisualTokenSpan::image(9, 11, 1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen3vl_placeholder_expansion_rejects_clear_mismatches() {
+        let err = expand_multimodal_image_placeholders(
+            vec![1, 9, 2],
+            7,
+            8,
+            9,
+            &[ImagePlaceholderSpec {
+                token_count: 5,
+                grid_h: 2,
+                grid_w: 3,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("image 0 visual token count 5 does not match merged grid 2x3 (6 tokens)"),
+            "{err:#}"
+        );
+
+        let err = expand_multimodal_image_placeholders(
+            vec![1, 7, 9, 9, 9, 8, 2],
+            7,
+            8,
+            9,
+            &[ImagePlaceholderSpec {
+                token_count: 4,
+                grid_h: 2,
+                grid_w: 2,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("image 0 placeholder span contains 3 <|image_pad|> tokens but the encoded image produced 4 visual tokens; use one placeholder for implicit expansion or exactly one per visual token"),
+            "{err:#}"
+        );
+
+        let err = expand_multimodal_image_placeholders(
+            vec![1, 7, 9, 2],
+            7,
+            8,
+            9,
+            &[ImagePlaceholderSpec {
+                token_count: 2,
+                grid_h: 1,
+                grid_w: 2,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be wrapped by both <|vision_start|> and <|vision_end|>"),
+            "{err:#}"
+        );
+
+        let err = qwen3vl_multimodal_mrope_positions(
+            &[9, 9, 9],
+            9,
+            &[VisualTokenSpan::image(0, 3, 2, 2)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("image span 0 has 3 placeholder tokens but grid 2x2 requires 4"),
+            "{err:#}"
+        );
+
+        let err =
+            qwen3vl_multimodal_mrope_positions(&[9, 1], 9, &[VisualTokenSpan::image(0, 2, 1, 2)])
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("image placeholder count 1 does not match expected visual token count 2"),
+            "{err:#}"
+        );
+    }
+
+    fn expand_and_position_for_test(
+        tokens: Vec<u32>,
+        image_specs: &[ImagePlaceholderSpec],
+    ) -> (ExpandedVisionPrompt, Vec<MropePosition>, usize) {
+        let expanded = expand_multimodal_image_placeholders(tokens, 7, 8, 9, image_specs).unwrap();
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, 9, &expanded.visual_spans)
+                .unwrap();
+        (expanded, positions, next_position)
+    }
+
+    #[test]
+    fn qwen3vl_text_before_image_gets_own_visual_span() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9],
+            &[ImagePlaceholderSpec {
+                token_count: 4,
+                grid_h: 2,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 9, 9, 8]);
+        assert_eq!(
+            expanded.visual_spans,
+            vec![VisualTokenSpan::image(2, 6, 2, 2)]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(
+            &positions[2..6],
+            &[
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 3,
+                },
+            ]
+        );
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(next_position, 5);
+    }
+
+    #[test]
+    fn qwen3vl_image_before_text_gets_own_visual_span() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![9, 2],
+            &[ImagePlaceholderSpec {
+                token_count: 2,
+                grid_h: 1,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![7, 9, 9, 8, 2]);
+        assert_eq!(
+            expanded.visual_spans,
+            vec![VisualTokenSpan::image(1, 3, 1, 2)]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(
+            &positions[1..3],
+            &[
+                MropePosition {
+                    temporal: 1,
+                    height: 1,
+                    width: 1,
+                },
+                MropePosition {
+                    temporal: 1,
+                    height: 1,
+                    width: 2,
+                },
+            ]
+        );
+        assert_eq!(positions[3], MropePosition::text(3));
+        assert_eq!(positions[4], MropePosition::text(4));
+        assert_eq!(next_position, 5);
+    }
+
+    #[test]
+    fn qwen3vl_text_image_text_advances_after_visual_grid() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9, 2],
+            &[ImagePlaceholderSpec {
+                token_count: 4,
+                grid_h: 2,
+                grid_w: 2,
+            }],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 9, 9, 8, 2]);
+        assert_eq!(
+            expanded.visual_spans,
+            vec![VisualTokenSpan::image(2, 6, 2, 2)]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(positions[7], MropePosition::text(5));
+        assert_eq!(next_position, 6);
+    }
+
+    #[test]
+    fn qwen3vl_two_images_get_separate_visual_spans() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9, 2, 9, 3],
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 2,
+                    grid_w: 1,
+                },
+            ],
+        );
+
+        assert_eq!(expanded.tokens, vec![1, 7, 9, 9, 8, 2, 7, 9, 9, 8, 3]);
+        assert_eq!(
+            expanded.visual_spans,
+            vec![
+                VisualTokenSpan::image(2, 4, 1, 2),
+                VisualTokenSpan::image(7, 9, 2, 1),
+            ]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(
+            &positions[2..4],
+            &[
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 3,
+                },
+            ]
+        );
+        assert_eq!(positions[4], MropePosition::text(4));
+        assert_eq!(positions[5], MropePosition::text(5));
+        assert_eq!(positions[6], MropePosition::text(6));
+        assert_eq!(
+            &positions[7..9],
+            &[
+                MropePosition {
+                    temporal: 7,
+                    height: 7,
+                    width: 7,
+                },
+                MropePosition {
+                    temporal: 7,
+                    height: 8,
+                    width: 7,
+                },
+            ]
+        );
+        assert_eq!(positions[9], MropePosition::text(9));
+        assert_eq!(positions[10], MropePosition::text(10));
+        assert_eq!(next_position, 11);
+    }
+
+    #[test]
+    fn qwen3vl_multiple_image_grids_with_different_dimensions_are_positioned() {
+        let (expanded, positions, next_position) = expand_and_position_for_test(
+            vec![1, 9, 2, 9, 3],
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 6,
+                    grid_h: 2,
+                    grid_w: 3,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 4,
+                    grid_h: 1,
+                    grid_w: 4,
+                },
+            ],
+        );
+
+        assert_eq!(
+            expanded.tokens,
+            vec![1, 7, 9, 9, 9, 9, 9, 9, 8, 2, 7, 9, 9, 9, 9, 8, 3]
+        );
+        assert_eq!(
+            expanded.visual_spans,
+            vec![
+                VisualTokenSpan::image(2, 8, 2, 3),
+                VisualTokenSpan::image(11, 15, 1, 4),
+            ]
+        );
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[1], MropePosition::text(1));
+        assert_eq!(
+            &positions[2..8],
+            &[
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 2,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 2,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 3,
+                },
+                MropePosition {
+                    temporal: 2,
+                    height: 3,
+                    width: 4,
+                },
+            ]
+        );
+        assert_eq!(positions[8], MropePosition::text(5));
+        assert_eq!(positions[9], MropePosition::text(6));
+        assert_eq!(positions[10], MropePosition::text(7));
+        assert_eq!(
+            &positions[11..15],
+            &[
+                MropePosition {
+                    temporal: 8,
+                    height: 8,
+                    width: 8,
+                },
+                MropePosition {
+                    temporal: 8,
+                    height: 8,
+                    width: 9,
+                },
+                MropePosition {
+                    temporal: 8,
+                    height: 8,
+                    width: 10,
+                },
+                MropePosition {
+                    temporal: 8,
+                    height: 8,
+                    width: 11,
+                },
+            ]
+        );
+        assert_eq!(positions[15], MropePosition::text(12));
+        assert_eq!(positions[16], MropePosition::text(13));
+        assert_eq!(next_position, 14);
+    }
+
+    #[test]
+    fn qwen3vl_parity_multiple_images_render_expand_and_position() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![
+                        ChatContentPart::Text {
+                            text: "describe ".to_string(),
+                        },
+                        ChatContentPart::Image {
+                            image: Some("first.png".to_string()),
+                            placeholder_tokens: None,
+                        },
+                        ChatContentPart::Text {
+                            text: " now ".to_string(),
+                        },
+                        ChatContentPart::Image {
+                            image: Some("second.png".to_string()),
+                            placeholder_tokens: None,
+                        },
+                    ]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\ndescribe <|vision_start|><|image_pad|><|vision_end|> now <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let vision_start = tokenizer.token_id("<|vision_start|>").unwrap();
+        let vision_end = tokenizer.token_id("<|vision_end|>").unwrap();
+        let image_pad = tokenizer.token_id("<|image_pad|>").unwrap();
+        let prompt_tokens = tokenizer.encode(&rendered).unwrap();
+        assert_eq!(
+            token_run_bounds(&prompt_tokens, image_pad),
+            vec![(4, 5, 1), (8, 9, 1)]
+        );
+
+        let expanded = expand_multimodal_image_placeholders(
+            prompt_tokens,
+            vision_start,
+            vision_end,
+            image_pad,
+            &[
+                ImagePlaceholderSpec {
+                    token_count: 4,
+                    grid_h: 2,
+                    grid_w: 2,
+                },
+                ImagePlaceholderSpec {
+                    token_count: 2,
+                    grid_h: 1,
+                    grid_w: 2,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.tokens,
+            vec![
+                100, 5, 7, 200, 202, 202, 202, 202, 201, 8, 200, 202, 202, 201, 101, 100, 6
+            ]
+        );
+        assert_eq!(
+            expanded.visual_spans,
+            vec![
+                VisualTokenSpan::image(4, 8, 2, 2),
+                VisualTokenSpan::image(11, 13, 1, 2),
+            ]
+        );
+
+        let (positions, next_position) =
+            qwen3vl_multimodal_mrope_positions(&expanded.tokens, image_pad, &expanded.visual_spans)
+                .unwrap();
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(positions[3], MropePosition::text(3));
+        assert_eq!(
+            &positions[4..8],
+            &[
+                MropePosition {
+                    temporal: 4,
+                    height: 4,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 4,
+                    width: 5,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 5,
+                    width: 4,
+                },
+                MropePosition {
+                    temporal: 4,
+                    height: 5,
+                    width: 5,
+                },
+            ]
+        );
+        assert_eq!(positions[8], MropePosition::text(6));
+        assert_eq!(positions[10], MropePosition::text(8));
+        assert_eq!(
+            &positions[11..13],
+            &[
+                MropePosition {
+                    temporal: 9,
+                    height: 9,
+                    width: 9,
+                },
+                MropePosition {
+                    temporal: 9,
+                    height: 9,
+                    width: 10,
+                },
+            ]
+        );
+        assert_eq!(positions[16], MropePosition::text(14));
+        assert_eq!(next_position, 15);
+    }
+
+    #[test]
+    fn qwen3vl_smart_resize_obeys_pixel_budget_after_rounding() {
+        let preprocessor = ImagePreprocessor::default_qwen3_vl();
+        let (h, w) = preprocessor.smart_resize(10_000, 10_000);
+        assert_eq!(h % VIT_SPATIAL_MERGE_SIZE as u32, 0);
+        assert_eq!(w % VIT_SPATIAL_MERGE_SIZE as u32, 0);
+        assert!((h as usize) * (w as usize) <= preprocessor.max_pixels);
+
+        let (small_h, small_w) = preprocessor.smart_resize(1, 1);
+        assert!((small_h as usize) * (small_w as usize) >= preprocessor.min_pixels);
+    }
+
+    #[test]
+    fn qwen3vl_vision_patch_coords_are_block_major() {
+        assert_eq!(
+            block_major_patch_coords(4, 4, 2),
+            vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (0, 2),
+                (0, 3),
+                (1, 2),
+                (1, 3),
+                (2, 0),
+                (2, 1),
+                (3, 0),
+                (3, 1),
+                (2, 2),
+                (2, 3),
+                (3, 2),
+                (3, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
+        // Fixture derived from the Qwen3 MoE architecture:
+        //   - q_norm / k_norm per attention layer (Qwen3 QK-norm)
+        //   - shared_expert MLP that is always active and gated by shared_expert_gate
+        //   - separate lm_head.weight (tie_word_embeddings=false)
+        //   - 4 routable experts per layer
+        // All of these tensors should be classified correctly (dense vs expert) and the
+        // validator should accept the resulting manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+
+        // config.json with Qwen3-style extra fields
+        std::fs::write(
+            snapshot.join("config.json"),
+            br#"{
+                "model_type": "qwen3_moe",
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "num_hidden_layers": 1,
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "vocab_size": 300,
+                "rope_theta": 1000000.0,
+                "torch_dtype": "bfloat16",
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 16,
+                "tie_word_embeddings": false,
+                "num_shared_experts": 1,
+                "shared_expert_intermediate_size": 16
+            }"#,
+        )
+        .unwrap();
+
+        // Dense shard: all non-expert tensors including Qwen3-specific q_norm/k_norm and
+        // shared_expert projections.  Shapes are consistent with the config above.
+        // kv_width = num_key_value_heads(1) * (hidden_size / num_attention_heads) = 1 * (8/2) = 4
+        let dense_shard = make_typed_safetensors(&[
+            (
+                "model.embed_tokens.weight",
+                "BF16",
+                vec![300, 8],
+                &vec![0u8; 300 * 8 * 2],
+            ),
+            (
+                "lm_head.weight",
+                "BF16",
+                vec![300, 8],
+                &vec![0u8; 300 * 8 * 2],
+            ),
+            ("model.norm.weight", "BF16", vec![8], &vec![0u8; 8 * 2]),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                "BF16",
+                vec![8, 8],
+                &vec![0u8; 8 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "BF16",
+                vec![8, 8],
+                &vec![0u8; 8 * 8 * 2],
+            ),
+            // QK-norm tensors present in Qwen3 MoE checkpoints
+            (
+                "model.layers.0.self_attn.q_norm.weight",
+                "BF16",
+                vec![4],
+                &vec![0u8; 4 * 2],
+            ),
+            (
+                "model.layers.0.self_attn.k_norm.weight",
+                "BF16",
+                vec![4],
+                &vec![0u8; 4 * 2],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "BF16",
+                vec![8],
+                &vec![0u8; 8 * 2],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "BF16",
+                vec![8],
+                &vec![0u8; 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.gate.weight",
+                "BF16",
+                vec![4, 8],
+                &vec![0u8; 4 * 8 * 2],
+            ),
+            // Shared expert (always active, not gated): treated as dense, not packed
+            (
+                "model.layers.0.mlp.shared_expert.gate_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &vec![0u8; 16 * 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.shared_expert.up_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &vec![0u8; 16 * 8 * 2],
+            ),
+            (
+                "model.layers.0.mlp.shared_expert.down_proj.weight",
+                "BF16",
+                vec![8, 16],
+                &vec![0u8; 8 * 16 * 2],
+            ),
+            (
+                "model.layers.0.mlp.shared_expert_gate.weight",
+                "BF16",
+                vec![1, 8],
+                &vec![0u8; 8 * 2],
+            ),
+        ]);
+        std::fs::write(snapshot.join("dense.safetensors"), dense_shard).unwrap();
+
+        // Expert shard: 4 routed experts, each with gate/up/down projections.
+        let mut expert_entries: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+        let gate_bytes = vec![0u8; 16 * 8 * 2];
+        let down_bytes = vec![0u8; 8 * 16 * 2];
+        let names: Vec<(String, String, String)> = (0..4)
+            .flat_map(|e| {
+                let pfx = format!("model.layers.0.mlp.experts.{e}");
+                [
+                    (
+                        format!("{pfx}.gate_proj.weight"),
+                        "gate".to_string(),
+                        format!("{e}-gate"),
+                    ),
+                    (
+                        format!("{pfx}.up_proj.weight"),
+                        "up".to_string(),
+                        format!("{e}-up"),
+                    ),
+                    (
+                        format!("{pfx}.down_proj.weight"),
+                        "down".to_string(),
+                        format!("{e}-down"),
+                    ),
+                ]
+            })
+            .collect();
+        for (name, proj, _) in &names {
+            let (shape, data): (Vec<usize>, &[u8]) = if proj == "down" {
+                (vec![8, 16], &down_bytes)
+            } else {
+                (vec![16, 8], &gate_bytes)
+            };
+            expert_entries.push((name.as_str(), "BF16", shape, data.to_vec()));
+        }
+        std::fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(
+                &expert_entries
+                    .iter()
+                    .map(|(n, d, s, b)| (*n, *d, s.clone(), b.as_slice()))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap();
+
+        // Build weight_map: all tensors → their shard file
+        let mut weight_map = serde_json::Map::new();
+        // dense tensors
+        for name in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.norm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.layers.0.mlp.shared_expert_gate.weight",
+        ] {
+            weight_map.insert(
+                name.to_string(),
+                serde_json::Value::String("dense.safetensors".to_string()),
+            );
+        }
+        // expert tensors
+        for (name, _, _) in &names {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("expert.safetensors".to_string()),
+            );
+        }
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            serde_json::to_string(&serde_json::json!({"weight_map": weight_map})).unwrap(),
+        )
+        .unwrap();
+
+        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot)
+            .expect("build should succeed for Qwen3-style snapshot with qknorm and shared_expert");
+
+        // Validate: manifest should classify shared_expert and q/k_norm as dense, not expert.
+        let manifest: FlashMoeManifest =
+            serde_json::from_slice(&std::fs::read(&plan.tensor_manifest).unwrap()).unwrap();
+        assert!(
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("q_norm")),
+            "q_norm should be a dense tensor"
+        );
+        assert!(
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("k_norm")),
+            "k_norm should be a dense tensor"
+        );
+        assert!(
+            manifest
+                .dense_tensors
+                .iter()
+                .any(|t| t.tensor.contains("shared_expert")),
+            "shared_expert should be a dense tensor"
+        );
+        // 4 experts × 3 projections = 12 expert tensor entries
+        assert_eq!(manifest.expert_tensors.len(), 12);
+
+        // The validator must accept the resulting registry.
+        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let registry = TensorRegistry::load(&plan.tensor_manifest).unwrap();
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("Qwen3-style manifest should pass validation");
+    }
+
+    #[test]
+    fn packer_splits_qwen35_aggregate_expert_tensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        fs::create_dir_all(&snapshot).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+
+        let gate_up_bytes: Vec<u8> = (0u8..16).collect();
+        let down_bytes: Vec<u8> = (16u8..24).collect();
+        fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&[
+                (
+                    "model.layers.1.mlp.experts.gate_up_proj",
+                    "U8",
+                    vec![2, 4, 2],
+                    &gate_up_bytes,
+                ),
+                (
+                    "model.layers.1.mlp.experts.down_proj",
+                    "U8",
+                    vec![2, 2, 2],
+                    &down_bytes,
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+        let tensors = vec![
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.gate_up_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 4, 2],
+                source_offsets: Some([0, 16]),
+            },
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([16, 24]),
+            },
+        ];
+
+        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+
+        let layer_path = expert_layer_path(&plan.experts_dir, 1);
+        let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
+            .unwrap()
+            .unwrap();
+        assert!(layer_path.is_file());
+        assert_eq!(
+            fs::metadata(&layer_path).unwrap().len(),
+            metadata.expert_size * metadata.experts as u64
+        );
+        assert_eq!(metadata.experts, 2);
+        assert_eq!(metadata.packs.len(), 2);
+        assert!(metadata.pack_for(0).is_some());
+        assert!(metadata.pack_for(1).is_some());
+
+        let expert0 = read_one_expert(&plan.experts_dir, 1, 0).unwrap();
+        let expert1 = read_one_expert(&plan.experts_dir, 1, 1).unwrap();
+        assert!(expert_pack_is_complete(&plan.experts_dir, 1, 0));
+        assert!(expert_pack_is_complete(&plan.experts_dir, 1, 1));
+        for expert in [&expert0, &expert1] {
+            assert_eq!(expert.records.len(), 3);
+            assert!(expert.record_suffix("gate_proj.weight").is_some());
+            assert!(expert.record_suffix("up_proj.weight").is_some());
+            assert!(expert.record_suffix("down_proj.weight").is_some());
+        }
+        let input = [1.0, 1.0];
+        let expert0_gate = expert0
+            .project_record(
+                expert0.record_suffix("gate_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let expert0_up = expert0
+            .project_record(expert0.record_suffix("up_proj.weight").unwrap(), &input, 2)
+            .unwrap()
+            .unwrap();
+        let expert1_gate = expert1
+            .project_record(
+                expert1.record_suffix("gate_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let expert1_down = expert1
+            .project_record(
+                expert1.record_suffix("down_proj.weight").unwrap(),
+                &input,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        for (actual, expected) in expert0_gate.iter().zip([1.0, 5.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert0_up.iter().zip([9.0, 13.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert1_gate.iter().zip([17.0, 21.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+        for (actual, expected) in expert1_down.iter().zip([41.0, 45.0]) {
+            assert_close_with_tolerance(*actual, expected, 0.01);
+        }
+    }
+
+    #[test]
+    fn aggregate_expert_reuse_rejects_changed_source_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        fs::create_dir_all(&snapshot).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+        let tensors = vec![
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.gate_up_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 4, 2],
+                source_offsets: Some([0, 16]),
+            },
+            ExpertTensorRef {
+                tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
+                shard: "expert.safetensors".to_string(),
+                layer: Some(1),
+                expert: None,
+                dtype: Some("U8".to_string()),
+                shape: vec![2, 2, 2],
+                source_offsets: Some([16, 24]),
+            },
+        ];
+
+        let write_expert_shard = |gate_up_bytes: Vec<u8>, down_bytes: Vec<u8>| {
+            fs::write(
+                snapshot.join("expert.safetensors"),
+                make_typed_safetensors(&[
+                    (
+                        "model.layers.1.mlp.experts.gate_up_proj",
+                        "U8",
+                        vec![2, 4, 2],
+                        gate_up_bytes.as_slice(),
+                    ),
+                    (
+                        "model.layers.1.mlp.experts.down_proj",
+                        "U8",
+                        vec![2, 2, 2],
+                        down_bytes.as_slice(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        };
+
+        write_expert_shard((0u8..16).collect(), (16u8..24).collect());
+        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        let before = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
+            .unwrap()
+            .unwrap()
+            .records[0]
+            .source_hash
+            .clone()
+            .unwrap();
+
+        write_expert_shard((100u8..116).collect(), (200u8..208).collect());
+        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        let after = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
+            .unwrap()
+            .unwrap()
+            .records[0]
+            .source_hash
+            .clone()
+            .unwrap();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn dense_store_reads_registered_tensor_rows_by_dtype() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![2, 2],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let row = store
+            .read_tensor_row_f32("model.layers.0.self_attn.q_proj.weight", 1, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, vec![3.0, 4.0]);
+        let tile = store
+            .read_tensor_rows_f32("model.layers.0.self_attn.q_proj.weight", 0, 2)
+            .unwrap();
+        assert_eq!(tile, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            store
+                .resident
+                .lock()
+                .expect("dense tensor cache poisoned")
+                .bytes,
+            0
+        );
+        let projected = store
+            .project(0, "q_proj", &[1.0, 1.0], 2)
+            .expect("registered dense projection should decode F32 weights");
+        assert_eq!(projected.len(), 2);
+        assert!(projected[1] > projected[0]);
+    }
+
+    #[test]
+    fn router_scores_use_cached_full_tensor_matvec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: router_tensor_name(0),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![2, 3],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+
+        let scores = store
+            .router_scores_with_metal(None, 0, 2, &[0.5, -1.0, 2.0])
+            .unwrap();
+
+        assert_eq!(scores, vec![4.5, 9.0]);
+        assert_eq!(
+            store
+                .decoded_tensor_tiles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn dense_store_caches_small_norm_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "model.layers.0.input_layernorm.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![4],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+
+        let first = store
+            .norm_weight("model.layers.0.input_layernorm.weight", 4)
+            .unwrap()
+            .unwrap();
+        let second = store
+            .norm_weight("model.layers.0.input_layernorm.weight", 4)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(second, first);
+        assert_eq!(
+            store
+                .norm_weights
+                .lock()
+                .expect("dense norm weight cache poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dense_store_rms_norm_uses_small_weight_cache_without_decoded_tile_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let weights = [0.5f32, 1.0, 1.5, 2.0];
+        let mut bytes = Vec::new();
+        for value in weights {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "model.layers.0.post_attention_layernorm.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![weights.len()],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+
+        let input = [3.0f32, 4.0, -5.0, 12.0];
+        let actual = store
+            .rms_norm("model.layers.0.post_attention_layernorm.weight", &input)
+            .unwrap();
+        let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+        let scale = (mean_square + 1e-6).sqrt().recip();
+        let expected: Vec<f32> = input
+            .iter()
+            .zip(weights)
+            .map(|(value, weight)| value * scale * weight)
+            .collect();
+
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "rms norm element {idx} diverged: actual={actual}, expected={expected}"
+            );
+        }
+        assert_eq!(
+            store
+                .norm_weights
+                .lock()
+                .expect("dense norm weight cache poisoned")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .decoded_tiles
+                .lock()
+                .expect("decoded tile cache poisoned")
+                .bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn dense_bf16_store_projects_synthetic_tensor_like_runtime_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let tensor_name = "model.layers.0.self_attn.o_proj.weight";
+        let rows = 3;
+        let cols = 7;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|idx| ((idx as f32) * 0.37).sin() * 0.75 - ((idx % cols) as f32) * 0.03125)
+            .collect();
+        let bytes = bf16_tensor_bytes(&values);
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![rows, cols],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let input = vec![0.25, -1.0, 0.5, 2.0, -0.75, 1.5, -0.125];
+        let decoded = decode_dense_tensor_f32("BF16", &bytes).unwrap();
+        let expected = cpu_dense_matvec(&decoded, &input, rows, cols);
+        let projected = store
+            .project_dense_tensor_with_metal(None, tensor_name, &input, rows)
+            .unwrap()
+            .unwrap();
+
+        for (row, (actual, expected)) in projected.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "row {row}: BF16 projection {actual} diverged from decoded reference {expected}"
+            );
+        }
+        assert_eq!(store.decoded_full_tensor_count(), 1);
+    }
+
+    #[test]
+    fn dense_q4_store_projects_synthetic_tensor_like_runtime_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let values = vec![-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 1.5, -1.0, -0.25, 0.75];
+        let shape = vec![2, 5];
+        let group_size = 3;
+        let quantized = quantize_q4(&values, &shape, group_size).unwrap();
+        let layout = dense_q4_layout(&shape, group_size).unwrap();
+        assert_eq!(layout.rows, 2);
+        assert_eq!(layout.cols, 5);
+        assert_eq!(layout.row_packed_bytes, 3);
+        assert_eq!(layout.groups_per_row, 2);
+        assert_eq!(quantized.values.len(), layout.packed_bytes);
+        assert_eq!(
+            quantized.scales.len() * std::mem::size_of::<f32>(),
+            layout.scales_bytes
+        );
+
+        let mut bytes = quantized.values.clone();
+        for scale in &quantized.scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        for bias in &quantized.biases {
+            bytes.extend_from_slice(&bias.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), layout.total_bytes);
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: shape.clone(),
+                source_offsets: [0, (values.len() * std::mem::size_of::<f32>()) as u64],
+                runtime_offset: 0,
+                byte_len: layout.total_bytes as u64,
+                quantization: TensorQuantization::Q4 {
+                    group_size,
+                    format: DENSE_Q4_FORMAT.to_string(),
+                },
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let entry = store.registry().tensor(tensor_name).unwrap();
+        let (packed_row, scales_row, biases_row, timing) =
+            store.read_dense_q4_rows(entry, 1, 1, group_size).unwrap();
+        assert_eq!(
+            packed_row,
+            quantized.values[layout.row_packed_bytes..].to_vec()
+        );
+        assert_eq!(
+            scales_row,
+            quantized.scales[layout.groups_per_row..].to_vec()
+        );
+        assert_eq!(
+            biases_row,
+            quantized.biases[layout.groups_per_row..].to_vec()
+        );
+        assert_eq!(
+            timing.bytes_read,
+            (layout.row_packed_bytes + layout.groups_per_row * 2 * std::mem::size_of::<f32>())
+                as u64
+        );
+
+        let (packed_tile, scales_tile, biases_tile, tile_timing) =
+            store.read_dense_q4_rows(entry, 0, 2, group_size).unwrap();
+        assert_eq!(packed_tile, quantized.values);
+        assert_eq!(scales_tile, quantized.scales);
+        assert_eq!(biases_tile, quantized.biases);
+        assert_eq!(
+            tile_timing.bytes_read,
+            (layout.packed_bytes + layout.scales_bytes * 2) as u64
+        );
+
+        let input = vec![1.0, -1.0, 0.5, 2.0, -0.25];
+        let expected = q4_fma_matvec_with_group_size(
+            &quantized.values,
+            &input,
+            &quantized.scales,
+            &quantized.biases,
+            2,
+            5,
+            group_size,
+        )
+        .unwrap();
+        let projected = store
+            .project_dense_tensor_with_metal(None, tensor_name, &input, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected, expected);
+        let dense_expected = cpu_dense_matvec(&values, &input, 2, 5);
+        for (actual, dense) in projected.iter().zip(dense_expected.iter()) {
+            assert!(
+                (*actual - *dense).abs() <= 0.12,
+                "q4 projection drifted too far from dense matvec: actual={actual}, dense={dense}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_dense_q4_mmap_matches_cpu_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let rows = 3;
+        let cols = 16;
+        let group_size = 8;
+        let shape = vec![rows, cols];
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|idx| {
+                let wave = ((idx as f32) * 0.19).sin() * 0.75;
+                let slope = ((idx % cols) as f32 - 7.5) * 0.03125;
+                wave + slope
+            })
+            .collect();
+        let quantized = quantize_q4(&values, &shape, group_size).unwrap();
+        let layout = dense_q4_layout(&shape, group_size).unwrap();
+        let mut bytes = quantized.values.clone();
+        for scale in &quantized.scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        for bias in &quantized.biases {
+            bytes.extend_from_slice(&bias.to_le_bytes());
+        }
+        fs::write(&plan.non_expert_weights, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: shape.clone(),
+                source_offsets: [0, (values.len() * std::mem::size_of::<f32>()) as u64],
+                runtime_offset: 0,
+                byte_len: layout.total_bytes as u64,
+                quantization: TensorQuantization::Q4 {
+                    group_size,
+                    format: DENSE_Q4_FORMAT.to_string(),
+                },
+            }],
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: cols,
+            num_attention_heads: 1,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("float32".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+        let input: Vec<f32> = (0..cols)
+            .map(|idx| ((idx as f32) * 0.13).cos() - 0.25)
+            .collect();
+        let expected = q4_fma_matvec_with_group_size(
+            &quantized.values,
+            &input,
+            &quantized.scales,
+            &quantized.biases,
+            rows,
+            cols,
+            group_size,
+        )
+        .unwrap();
+        let (actual, _timing) = metal
+            .q4_mmap_matvec(
+                0,
+                layout.packed_bytes as u64,
+                (layout.packed_bytes + layout.scales_bytes) as u64,
+                &input,
+                rows,
+                cols,
+                layout.row_packed_bytes,
+                layout.groups_per_row,
+                group_size,
+            )
+            .unwrap()
+            .expect("resident dense mmap buffer should be available");
+        for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() < 1e-4,
+                "row {row}: Metal q4 mmap {actual} diverged from CPU reference {expected}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_dense_bf16_mmap_simd_matches_cpu_reference_at_runtime_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let tensor_name = "model.layers.0.self_attn.o_proj.weight";
+        let rows = 9;
+        let cols = 8192;
+        let shape = vec![rows, cols];
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|idx| {
+                let wave = ((idx as f32) * 0.011).sin() * 0.0625;
+                let slope = ((idx % cols) as f32 / cols as f32 - 0.5) * 0.03125;
+                wave + slope
+            })
+            .collect();
+        let bytes = bf16_tensor_bytes(&values);
+        fs::write(&plan.non_expert_weights, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: shape.clone(),
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: cols,
+            num_attention_heads: 1,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("bfloat16".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+        let input: Vec<f32> = (0..cols)
+            .map(|idx| ((idx as f32) * 0.017).cos() * 0.125 - 0.015625)
+            .collect();
+        let decoded = decode_dense_tensor_f32("BF16", &bytes).unwrap();
+        let expected = cpu_dense_matvec(&decoded, &input, rows, cols);
+        let (actual, _timing) = metal
+            .dense_mmap_matvec(0, "BF16", &input, rows, cols, cols)
+            .unwrap()
+            .expect("resident dense mmap buffer should be available");
+        for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let tolerance = 2e-2_f32.max(expected.abs() * 2e-4);
+            assert!(
+                (*actual - *expected).abs() <= tolerance,
+                "row {row}: Metal BF16 mmap SIMD {actual} diverged from CPU reference {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_manifest_quantizes_projection_weights_but_not_vocab_or_embeddings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path();
+        let q_proj = f32_tensor_bytes(&[0.0, 1.0, 2.0, 3.0, -1.0, -2.0, -3.0, -4.0]);
+        let lm_head = f32_tensor_bytes(&[0.25; 8]);
+        let embed = f32_tensor_bytes(&[0.5; 8]);
+        let mtp_q_proj = f32_tensor_bytes(&[0.75; 8]);
+        let mtp_expert = f32_tensor_bytes(&[1.25; 8]);
+        let tensors = vec![
+            (
+                "model.layers.0.self_attn.q_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![2, 4],
+                q_proj,
+            ),
+            (
+                "lm_head.weight".to_string(),
+                "F32".to_string(),
+                vec![2, 4],
+                lm_head,
+            ),
+            (
+                "model.embed_tokens.weight".to_string(),
+                "F32".to_string(),
+                vec![2, 4],
+                embed,
+            ),
+            (
+                "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![2, 4],
+                mtp_q_proj,
+            ),
+            (
+                "mtp.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![2, 4],
+                mtp_expert,
+            ),
+        ];
+        let fixture_refs = typed_fixture_refs(&tensors);
+        fs::write(
+            snapshot.join("dense.safetensors"),
+            make_typed_safetensors(&fixture_refs),
+        )
+        .unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (name, _, _, _) in &tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("dense.safetensors".to_string()),
+            );
+        }
+        let index = serde_json::Value::Object(serde_json::Map::from_iter([(
+            "weight_map".to_string(),
+            serde_json::Value::Object(weight_map),
+        )]));
+        let index_path = snapshot.join("model.safetensors.index.json");
+        fs::write(&index_path, index.to_string()).unwrap();
+
+        let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+        assert!(visual_refs.is_empty());
+        assert!(manifest.expert_tensors.is_empty());
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let q_proj_entry = registry
+            .tensor("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(q_proj_entry.quantization, TensorQuantization::None);
+        assert_eq!(q_proj_entry.byte_len, 2 * 4 * 4);
+        assert_eq!(
+            registry.tensor("lm_head.weight").unwrap().quantization,
+            TensorQuantization::None
+        );
+        assert_eq!(
+            registry
+                .tensor("model.embed_tokens.weight")
+                .unwrap()
+                .quantization,
+            TensorQuantization::None
+        );
+        assert!(
+            registry
+                .tensor("mtp.layers.0.self_attn.q_proj.weight")
+                .is_none()
+        );
+        assert!(
+            registry
+                .tensor("mtp.layers.0.mlp.experts.0.gate_proj.weight")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dense_store_reuses_decoded_tiles_for_repeated_lm_head_sampling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "lm_head.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![4, 2],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+            }],
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+
+        let first = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(first.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(store.decoded_tensor_tile_count(), 1);
+
+        let second = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 0, 2)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            store.decoded_tensor_tile_count(),
+            1,
+            "cached LM-head tile should not be decoded again for the next token"
+        );
+
+        let other = store
+            .read_tensor_rows_f32_cached("lm_head.weight", 2, 2)
+            .unwrap();
+        assert_eq!(other.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(store.decoded_tensor_tile_count(), 2);
+    }
+
+    #[test]
+    fn dense_store_reports_decoded_tile_cache_hit_and_miss_timing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let mut bytes = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let (_, miss) = store
+            .read_tensor_rows_f32_cached_profiled("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(miss.cache_misses, 1);
+        assert_eq!(miss.cache_hits, 0);
+        assert_eq!(miss.cache_inserts, 1);
+        assert_eq!(miss.bytes_read, bytes.len() as u64);
+        assert_eq!(miss.decoded_bytes, bytes.len() as u64);
+
+        let (_, hit) = store
+            .read_tensor_rows_f32_cached_profiled("lm_head.weight", 0, 2)
+            .unwrap();
+        assert_eq!(hit.cache_hits, 1);
+        assert_eq!(hit.cache_misses, 0);
+        assert_eq!(hit.bytes_read, 0);
+        assert_eq!(hit.decoded_bytes, 0);
+    }
+
+    #[test]
+    fn shared_expert_phase_weights_are_cached_per_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let experts_dir = tmp.path().join("experts");
+        fs::create_dir_all(&experts_dir).unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{
+                "model_type":"qwen3_moe",
+                "num_hidden_layers":1,
+                "hidden_size":2,
+                "num_attention_heads":1,
+                "num_key_value_heads":1,
+                "vocab_size":8,
+                "torch_dtype":"float32",
+                "num_experts":1,
+                "num_experts_per_tok":1,
+                "num_shared_experts":2,
+                "shared_expert_intermediate_size":1
+            }"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        let mut dense_tensors = Vec::new();
+        let mut append_tensor = |name: String, shape: Vec<usize>, values: &[f32]| {
+            let offset = bytes.len() as u64;
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let byte_len = bytes.len() as u64 - offset;
+            dense_tensors.push(DenseTensorRef {
+                tensor: name,
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape,
+                source_offsets: [0, byte_len],
+                runtime_offset: offset,
+                byte_len,
+                quantization: TensorQuantization::None,
+            });
+        };
+        append_tensor(
+            shared_expert_tensor_name(0, "gate_proj"),
+            vec![2, 2],
+            &[1.0, 0.0, 0.0, 1.0],
+        );
+        append_tensor(
+            shared_expert_tensor_name(0, "up_proj"),
+            vec![2, 2],
+            &[0.0, 2.0, 3.0, 0.0],
+        );
+        append_tensor(
+            shared_expert_tensor_name(0, "down_proj"),
+            vec![2, 2],
+            &[1.0, 2.0, -1.0, 0.5],
+        );
+        append_tensor(
+            shared_expert_gate_tensor_name(0),
+            vec![2, 2],
+            &[1.0, 0.0, 0.0, -1.0],
+        );
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut plan = plan_unchecked_with_routing(
+            QWEN35_MODEL,
+            tmp.path(),
+            FlashMoeRoutingPolicy::new(Some(1), true),
+        );
+        plan.uses_metal = false;
+        plan.non_expert_weights = dense_path;
+        plan.tensor_manifest = manifest_path;
+        plan.experts_dir = experts_dir;
+
+        let dense = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        let engine = FlashMoeEngine {
+            plan,
+            experts: experts.clone(),
+            scheduler: ExpertScheduler::new(experts),
+            dense,
+            tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
+            metal: None,
+            config,
+            routing_policy,
+            runtime,
+            shared_expert_cache: Mutex::new(BTreeMap::new()),
+            linear_attention_cache: Mutex::new(BTreeMap::new()),
+            vision_encoder: None,
+            session_cache: BTreeMap::new(),
+        };
+
+        let first = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+
+        let second = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.gate, &second.gate));
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+
+        let contribution = engine
+            .shared_expert_contribution(0, &[2.0, 4.0], 2)
+            .unwrap();
+        assert_eq!(contribution.len(), 2);
+        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+    }
+
+    #[test]
+    fn dense_transformer_runtime_runs_core_blocks() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2}"#,
+        )
+        .unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        let mut hidden = vec![1.0; runtime.width];
+        rms_norm_in_place(&mut hidden);
+        let before = hidden.clone();
+        apply_rotary(&mut hidden, 4, runtime.head_dim, config.rope_theta.unwrap());
+        let attended = causal_attention(
+            &hidden,
+            &[(&before, &before)],
+            runtime.num_q_heads,
+            runtime.kv_heads,
+            runtime.head_dim,
+        );
+        assert_eq!(attended.len(), runtime.width);
+    }
+
+    #[test]
+    fn gated_delta_recurrence_matches_explicit_reference_update() {
+        let layout = LinearAttentionLayout {
+            num_key_heads: 2,
+            num_value_heads: 4,
+            key_dim: 3,
+            value_dim: 2,
+            total_key_width: 6,
+            total_value_width: 8,
+            conv_dim: 14,
+            conv_kernel_size: 4,
+        };
+        let matrix_len = layout.value_dim * layout.key_dim;
+        let mut state: Vec<f32> = (0..layout.num_value_heads * matrix_len)
+            .map(|idx| ((idx as f32) * 0.13).sin() * 0.25)
+            .collect();
+        let mut expected_state = state.clone();
+        let lin_q = [0.2, -0.5, 0.75, -0.1, 0.35, 0.9];
+        let lin_k = [0.4, -0.25, 0.6, 0.15, -0.8, 0.5];
+        let lin_v = [0.7, -0.2, -0.45, 0.3, 0.1, 0.55, -0.35, 0.85];
+        let alpha = [-0.4, 0.2, 0.7, -1.1];
+        let beta = [0.6, -0.9, 1.4, -0.25];
+        let a_log = [-1.2, -0.7, 0.1, -1.6];
+        let dt_bias = [0.05, -0.2, 0.3, -0.1];
+        let mut actual = vec![0.0; layout.num_value_heads * layout.value_dim];
+        let mut expected = vec![0.0; actual.len()];
+
+        apply_gated_delta_recurrence(
+            layout,
+            &mut state,
+            &lin_q,
+            &lin_k,
+            &lin_v,
+            &alpha,
+            &beta,
+            &a_log,
+            &dt_bias,
+            &mut actual,
+        );
+
+        let heads_per_key = layout.value_heads_per_key_head();
+        for vh in 0..layout.num_value_heads {
+            let kh = vh / heads_per_key;
+            let decay = (-(a_log[vh].exp()) * (1.0 + (alpha[vh] + dt_bias[vh]).exp()).ln()).exp();
+            let beta_gate = 1.0 / (1.0 + (-beta[vh]).exp());
+            let state_base = vh * matrix_len;
+            let key = &lin_k[kh * layout.key_dim..(kh + 1) * layout.key_dim];
+            let query = &lin_q[kh * layout.key_dim..(kh + 1) * layout.key_dim];
+            let value = &lin_v[vh * layout.value_dim..(vh + 1) * layout.value_dim];
+            for vi in 0..layout.value_dim {
+                let row_base = state_base + vi * layout.key_dim;
+                for ki in 0..layout.key_dim {
+                    expected_state[row_base + ki] *= decay;
+                }
+                let kv_mem: f32 = (0..layout.key_dim)
+                    .map(|ki| expected_state[row_base + ki] * key[ki])
+                    .sum();
+                let delta = (value[vi] - kv_mem) * beta_gate;
+                for ki in 0..layout.key_dim {
+                    expected_state[row_base + ki] += delta * key[ki];
+                }
+                expected[vh * layout.value_dim + vi] = (0..layout.key_dim)
+                    .map(|ki| expected_state[row_base + ki] * query[ki])
+                    .sum();
+            }
+        }
+
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "gated delta output {idx} diverged: actual={actual} expected={expected}"
+            );
+        }
+        for (idx, (actual, expected)) in state.iter().zip(expected_state.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "gated delta state {idx} diverged: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_transformer_runtime_uses_full_config_hidden_size() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
+        )
+        .unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        assert_eq!(runtime.width, 4096);
+        assert_eq!(runtime.head_dim, 128);
+    }
+
+    #[test]
+    fn metal_kv_context_is_capped_by_memory_budget() {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4,"max_position_embeddings":131072}"#,
+        )
+        .unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        // kv_width = kv_heads * head_dim = 8 * 128 = 1024
+        assert_eq!(runtime.kv_width, 1024);
+        let context = metal_kv_max_context(&config, runtime.kv_width, 64 * 1024 * 1024 * 1024);
+        assert!(context < 131_072);
+        assert!(
+            metal_kv_cache_bytes(config.num_hidden_layers, context, runtime.kv_width)
+                <= 16 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn expert_scheduler_reads_only_active_experts_without_process_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let packs: Vec<_> = [1usize, 3, 7]
+            .into_iter()
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let pending = scheduler.issue(0, &[1, 3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
+        let experts = scheduler.finish(pending).unwrap();
+        assert_eq!(experts.len(), 2);
+        assert!(experts.iter().all(|expert| expert.layer == 0));
+        assert_eq!(experts[0].expert, 1);
+        assert_eq!(experts[1].expert, 3);
+        let first = scheduler.snapshot();
+        assert_eq!(first.issued_reads, 2);
+        assert_eq!(first.positioned_reads, 2);
+        assert_eq!(first.read_failures, 0);
+        assert_eq!(first.warm_reads, 0);
+        assert!(first.bytes_read > 0);
+        assert!(first.total_queue_latency >= first.max_queue_latency);
+        assert!(first.total_read_latency >= first.max_read_latency);
+
+        let pending = scheduler.issue(0, &[3, 7]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
+        let experts = scheduler.finish(pending).unwrap();
+        assert_eq!(experts.len(), 2);
+        assert_eq!(experts[0].expert, 3);
+        assert_eq!(experts[1].expert, 7);
+        let second = scheduler.snapshot();
+        assert_eq!(second.issued_reads, 4);
+        assert_eq!(second.positioned_reads, 4);
+        assert_eq!(second.read_failures, 0);
+        assert_eq!(second.warm_reads, 1);
+        assert!(second.warm_bytes_read > 0);
+        assert!(second.total_warm_read_latency >= second.max_warm_read_latency);
+        assert!(second.total_read_latency >= second.max_read_latency);
+
+        let pending = scheduler.issue(0, &[3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 2);
+        let experts = scheduler.finish(pending).unwrap();
+        assert_eq!(experts.len(), 1);
+        assert_eq!(experts[0].expert, 3);
+        let third = scheduler.snapshot();
+        assert_eq!(third.issued_reads, 5);
+        assert_eq!(third.positioned_reads, 5);
+        assert_eq!(third.read_failures, 0);
+        assert_eq!(third.warm_reads, 2);
+        assert!(third.warm_bytes_read >= second.warm_bytes_read);
+    }
+
+    #[test]
+    fn expert_scheduler_guardrails_keep_flashmoe_discarded_experiments_disabled() {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead
+        );
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.application_expert_cache);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.speculative_routing);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap);
+    }
+
+    #[test]
+    fn expert_scheduler_preserves_requested_result_order() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let packs: Vec<_> = [1usize, 3, 7]
+            .into_iter()
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let pending = scheduler.issue(0, &[7, 1, 3]).unwrap();
+        assert_eq!(scheduler.worker_count(), 3);
+        let experts = scheduler.finish(pending).unwrap();
+        let order: Vec<_> = experts.iter().map(|expert| expert.expert).collect();
+        assert_eq!(order, vec![7, 1, 3]);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 3);
+        assert_eq!(snapshot.positioned_reads, 3);
+        assert_eq!(snapshot.read_failures, 0);
+    }
+
+    #[test]
+    fn expert_scheduler_records_worker_read_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let tensor = "model.layers.0.mlp.experts.2.down_proj.weight";
+        let pack = test_expert_pack(tensor);
+        let metadata = test_expert_pack_metadata(0, 2, tensor, pack.len());
+        write_test_expert_layer(temp.path(), 0, vec![(2, pack, metadata)], 8).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(expert_layer_path(temp.path(), 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let pending = scheduler.issue(0, &[2]).unwrap();
+        let err = scheduler.finish(pending).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to read expert 2"),
+            "{err:#}"
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 1);
+        assert_eq!(snapshot.positioned_reads, 1);
+        assert_eq!(snapshot.read_failures, 1);
+        assert!(snapshot.total_read_latency >= snapshot.max_read_latency);
+    }
+
+    #[test]
+    fn expert_store_parses_pbq4expert_records_and_projects_with_scales() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let tensor = "model.layers.0.mlp.experts.2.down_proj.weight";
+        let pack = test_expert_pack(tensor);
+        let metadata = test_expert_pack_metadata(0, 2, tensor, pack.len());
+        write_test_expert_layer(temp.path(), 0, vec![(2, pack, metadata)], 8).unwrap();
+        let layer_metadata = read_expert_layer_pack_metadata(temp.path(), 0)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedExpertPack {
+            expert: 2,
+            packed_bytes: layer_metadata.pack_for(2).unwrap().packed_bytes,
+            records: layer_metadata
+                .pack_for(2)
+                .unwrap()
+                .records
+                .iter()
+                .map(|record| ExpectedExpertPackRecord {
+                    tensor: record.tensor.clone(),
+                    dtype: record.dtype.clone(),
+                    shape: record.shape.clone(),
+                    source_offsets: record.source_offsets,
+                    source_hash: record.source_hash.clone().unwrap(),
+                    packed_bytes: record.packed_bytes,
+                    groups: record.groups,
+                    group_size: record.group_size,
+                    scale_bias_dtype: record.scale_bias_dtype.clone(),
+                })
+                .collect(),
+        };
+        assert!(
+            expert_layer_slot_is_reusable(
+                &expert_layer_path(temp.path(), 0),
+                &layer_metadata,
+                &expected
+            )
+            .unwrap()
+        );
+
+        let expert = read_one_expert(temp.path(), 0, 2).unwrap();
+        assert_eq!(expert.records.len(), 1);
+        assert_eq!(expert.records[0].name, tensor);
+        assert_eq!(expert.records[0].scales, vec![0.5]);
+        assert_eq!(expert.records[0].biases, vec![1.0]);
+        let out = expert.project(&[1.0, 2.0, 3.0, 4.0], 1).unwrap();
+        let expected = (1.0 * 0.5 + 1.0) * 1.0
+            + (2.0 * 0.5 + 1.0) * 2.0
+            + (3.0 * 0.5 + 1.0) * 3.0
+            + (4.0 * 0.5 + 1.0) * 4.0;
+        assert!((out[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen_tokenizer_loads_special_tokens_and_applies_chat_template() {
+        let tokenizer = QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap();
+        let templated = tokenizer.apply_chat_template("hi");
+        assert!(templated.contains("<|im_start|>user"));
+        let encoded = tokenizer.encode(&templated).unwrap();
+        assert_eq!(encoded, vec![100, 5, 3, 101, 100, 6]);
+        assert!(encoded.contains(&100));
+        assert!(encoded.contains(&101));
+        assert_eq!(tokenizer.decode(&[3, 101]).unwrap(), "hi");
+        assert!(tokenizer.candidate_token_ids().contains(&102));
+        assert!(tokenizer.candidate_token_ids().len() > 4);
+    }
+
+    #[test]
+    fn qwen_tokenizer_loads_tokenizer_config_chat_template() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+        let templated = tokenizer.apply_chat_template("hi");
+        assert_eq!(
+            templated,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(
+            tokenizer.encode(&templated).unwrap(),
+            vec![100, 5, 3, 101, 100, 6]
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_single_user_prompt() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_system_and_user_messages() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[
+                    ChatMessage::text(ChatRole::System, "be terse"),
+                    ChatMessage::text(ChatRole::User, "hi"),
+                ],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>system\nbe terse<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_multi_turn_chat() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[
+                    ChatMessage::text(ChatRole::User, "hi"),
+                    ChatMessage::text(ChatRole::Assistant, "hello"),
+                    ChatMessage::text(ChatRole::User, "again"),
+                ],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_injects_tool_schema() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage::text(ChatRole::User, "weather?")],
+                &[ChatTool {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather.".to_string()),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }),
+                }],
+                true,
+            )
+            .unwrap();
+        assert!(rendered.starts_with("<|im_start|>system\n<tools>\n"));
+        assert!(rendered.contains("<tools>\n"));
+        assert!(rendered.contains("\"name\":\"get_weather\""));
+        assert!(rendered.contains("\"description\":\"Get weather.\""));
+        assert!(rendered.contains("\"parameters\""));
+        assert!(rendered.contains("\"city\":{\"type\":\"string\"}"));
+        assert!(rendered.contains("</tools>"));
+        assert!(rendered.contains("<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn qwen3_template_renderer_matches_tool_history_output() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let tool = ChatTool {
+            name: "get_weather".to_string(),
+            description: Some("Get weather.".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        };
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "checking");
+        assistant.tool_calls.push(ChatToolCall {
+            id: Some("call_1".to_string()),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "London"}),
+        });
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[
+                    ChatMessage::text(ChatRole::System, "be precise"),
+                    ChatMessage::text(ChatRole::User, "weather?"),
+                    assistant,
+                    ChatMessage {
+                        role: ChatRole::Tool,
+                        content: ChatMessageContent::Text("{\"temp\":12}".to_string()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some("call_1".to_string()),
+                        name: Some("get_weather".to_string()),
+                    },
+                    ChatMessage {
+                        role: ChatRole::Tool,
+                        content: ChatMessageContent::Text("{\"wind\":\"calm\"}".to_string()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some("call_2".to_string()),
+                        name: Some("get_weather".to_string()),
+                    },
+                ],
+                std::slice::from_ref(&tool),
+                true,
+            )
+            .unwrap();
+        let tool_json = serde_json::to_string(&qwen_tool_schema_value(&tool)).unwrap();
+        assert!(rendered.starts_with("<|im_start|>system\nbe precise\n\n<tools>\n"));
+        assert!(rendered.contains(&tool_json));
+        assert!(rendered.contains("<|im_start|>user\nweather?<|im_end|>\n"));
+        assert!(rendered.contains("<|im_start|>assistant\nchecking\n<tool_call>\n"));
+        assert!(rendered.contains("\"name\": \"get_weather\""));
+        assert!(rendered.contains("\"arguments\": {\"city\":\"London\"}"));
+        assert!(rendered.contains("<tool_response>\n{\"temp\":12}\n</tool_response>"));
+        assert!(rendered.contains("<tool_response>\n{\"wind\":\"calm\"}\n</tool_response>"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn qwen3vl_template_renderer_matches_image_and_tool_output() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "");
+        assistant.tool_calls.push(ChatToolCall {
+            id: Some("call_1".to_string()),
+            name: "describe_image".to_string(),
+            arguments: serde_json::json!({"detail": "short"}),
+        });
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: ChatMessageContent::Parts(vec![
+                            ChatContentPart::Text {
+                                text: "describe ".to_string(),
+                            },
+                            ChatContentPart::Image {
+                                image: Some("first.png".to_string()),
+                                placeholder_tokens: None,
+                            },
+                            ChatContentPart::Text {
+                                text: " now".to_string(),
+                            },
+                        ]),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        name: None,
+                    },
+                    assistant,
+                    ChatMessage {
+                        role: ChatRole::Tool,
+                        content: ChatMessageContent::Text("{\"ok\":true}".to_string()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some("call_1".to_string()),
+                        name: Some("describe_image".to_string()),
+                    },
+                ],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\ndescribe <|vision_start|><|image_pad|><|vision_end|> now<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"describe_image\", \"arguments\": {\"detail\":\"short\"}}\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\n{\"ok\":true}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_template_renderer_defers_image_parts_to_tokenizer_template() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![ChatContentPart::Image {
+                        image: Some("image.png".to_string()),
+                        placeholder_tokens: None,
+                    }]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert!(rendered.contains("<|im_start|>user\n"));
+        assert!(rendered.contains("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn invalid_tokenizer_chat_template_errors_instead_of_falling_back() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(
+                br#"{"eos_token":"<|im_end|>","add_bos_token":false,"split_special_tokens":false,"chat_template":"{% if messages %}"}"#,
+            ),
+        )
+        .unwrap();
+        let err = tokenizer
+            .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to render tokenizer chat_template")
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_assistant_tool_call() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "checking");
+        assistant.tool_calls.push(ChatToolCall {
+            id: Some("call_1".to_string()),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "London"}),
+        });
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[assistant], &[], false)
+            .unwrap();
+        assert!(rendered.starts_with("<|im_start|>assistant\nchecking\n<tool_call>\n"));
+        assert!(rendered.contains("\"name\": \"get_weather\""));
+        assert!(rendered.contains("\"arguments\": {\"city\":\"London\"}"));
+        assert!(rendered.ends_with("\n</tool_call>\n<|im_end|>\n"));
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_tool_result_as_user_response() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::Tool,
+                    content: ChatMessageContent::Text("{\"temp\":12}".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("get_weather".to_string()),
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\n<tool_response>\n{\"temp\":12}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_formats_vl_text_with_image_placeholder() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_qwen3vl_tokenizer_json(),
+            Some(test_qwen3vl_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: ChatMessageContent::Parts(vec![
+                        ChatContentPart::Text {
+                            text: "describe ".to_string(),
+                        },
+                        ChatContentPart::Image {
+                            image: Some("image.png".to_string()),
+                            placeholder_tokens: None,
+                        },
+                    ]),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\ndescribe <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_tool_call_output_parser_extracts_calls_and_content() {
+        let (content, calls) = parse_qwen_tool_call_output(
+            "checking\n<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"London\"}}\n</tool_call>\n",
+        )
+        .unwrap();
+        assert_eq!(content, "checking");
+        assert_eq!(
+            calls,
+            vec![ChatToolCall {
+                id: None,
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "London"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn qwen_tool_call_output_parser_extracts_function_calls() {
+        let (content, calls) = parse_qwen_tool_call_output(
+            "checking\n<tool_call>\n<function=get_weather>\n<parameter=city>\nLondon\n</parameter>\n<parameter=options>\n{\"unit\":\"c\"}\n</parameter>\n</function>\n</tool_call>\n",
+        )
+        .unwrap();
+        assert_eq!(content, "checking");
+        assert_eq!(
+            calls,
+            vec![ChatToolCall {
+                id: None,
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({
+                    "city": "London",
+                    "options": {"unit": "c"}
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn flashmoe_parity_qwen_tool_call_serialization_and_parsing_goldens() {
+        let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+            test_tokenizer_json(),
+            Some(test_qwen3_tool_tokenizer_config_json()),
+        )
+        .unwrap();
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "");
+        assistant.tool_calls = vec![
+            ChatToolCall {
+                id: Some("call_1".to_string()),
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "London"}),
+            },
+            ChatToolCall {
+                id: Some("call_2".to_string()),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "forecast"}),
+            },
+        ];
+
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[assistant], &[], false)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"London\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\":\"forecast\"}}\n</tool_call>\n<|im_end|>\n"
+        );
+
+        let (content, calls) = parse_qwen_tool_call_output(
+            "ready\n<tool_call>\n{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"London\\\"}\"}}\n</tool_call>\n<tool_call>\n{\"tool_call_id\":\"call_2\",\"name\":\"search\",\"arguments\":{\"query\":\"forecast\"}}\n</tool_call>\n",
+        )
+        .unwrap();
+        assert_eq!(content, "ready");
+        assert_eq!(
+            calls,
+            vec![
+                ChatToolCall {
+                    id: Some("call_1".to_string()),
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "London"}),
+                },
+                ChatToolCall {
+                    id: Some("call_2".to_string()),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({"query": "forecast"}),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_tokenizer_uses_byte_level_bpe_from_tokenizer_json() {
+        let tokenizer = QwenTokenizer::from_json_bytes(test_byte_bpe_tokenizer_json()).unwrap();
+        assert_eq!(tokenizer.encode("hello world").unwrap(), vec![8, 9, 16]);
+        assert_eq!(tokenizer.decode(&[8, 9, 16, 101]).unwrap(), "hello world");
+        assert_eq!(
+            tokenizer.encode("<|im_start|>hello<|im_end|>").unwrap(),
+            vec![100, 8, 101]
+        );
+    }
+
+    #[test]
+    fn lm_head_logits_scores_full_vocab_in_cpu_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(tokenizer.vocab_size(), 3);
+        assert_eq!(tokenizer.candidate_token_ids(), &[0, 2]);
+
+        let mut bytes = Vec::new();
+        for row in 0..tokenizer.vocab_size() {
+            let value = (row as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![tokenizer.vocab_size(), 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let logits = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap();
+
+        assert_eq!(logits.len(), 3);
+        assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn lm_head_logits_accepts_padded_vocab_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        for row_idx in 0..5usize {
+            let value = (row_idx as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![5, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let logits = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap();
+
+        assert_eq!(logits, vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn expert_q4_payload_borrows_record_buffers() {
+        let tensor = PackedExpertTensor {
+            name: "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            group_size: 2,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+            packed: vec![0x10, 0x32, 0x54, 0x76],
+            scales: vec![0.5, 0.25, 0.125, 0.0625],
+            biases: vec![1.0, 2.0, 3.0, 4.0],
+            scale_bytes: vec![
+                0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00,
+                0x80, 0x3d,
+            ],
+            bias_bytes: vec![
+                0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+                0x80, 0x40,
+            ],
+        };
+        let payload = tensor.matvec_payload(&[1.0, 2.0, 3.0, 4.0], 2).unwrap();
+
+        assert_eq!(payload.rows, 2);
+        assert_eq!(payload.cols, 4);
+        assert_eq!(payload.packed.as_ptr(), tensor.packed.as_ptr());
+        assert_eq!(payload.scales.as_ptr(), tensor.scales.as_ptr());
+        assert_eq!(payload.biases.as_ptr(), tensor.biases.as_ptr());
+    }
+
+    #[test]
+    fn dense_projection_rejects_input_width_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let mut bytes = Vec::new();
+        for value in 0..6u32 {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "proj.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 3],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .matvec_tensor_prefix("proj.weight", &[1.0, 1.0], 2)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("proj.weight"), "{err:#}");
+        assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [2, 3]"), "{err:#}");
+        assert!(message.contains("input length 2"), "{err:#}");
+    }
+
+    #[test]
+    fn dense_projection_rejects_output_width_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let mut bytes = Vec::new();
+        for value in 0..2u32 {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "proj.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![1, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .project_dense_tensor_with_metal(None, "proj.weight", &[1.0, 1.0], 2)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("proj.weight"), "{err:#}");
+        assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [1, 2]"), "{err:#}");
+    }
+
+    #[test]
+    fn lm_head_logits_rejects_missing_vocab_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("dense.bin");
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        for row_idx in 0..2usize {
+            let value = (row_idx as f32) + 1.0;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: "lm_head.weight".to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let err = store
+            .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("lm_head.weight"), "{err:#}");
+        assert!(message.contains("expected at least [3, 2]"), "{err:#}");
+        assert!(message.contains("actual shape [2, 2]"), "{err:#}");
+    }
+
+    #[test]
+    fn generate_runs_prefill_decode_sample_and_text_decode_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        std::fs::write(
+            snapshot.join("config.json"),
+            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"float32","num_experts":8,"num_experts_per_tok":1,"moe_intermediate_size":16,"tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+
+        let mut embedding = vec![0.0f32; 300 * 8];
+        for (token, scale) in [
+            (1usize, 0.5),
+            (2, 0.5),
+            (3, 1.0),
+            (4, 4.0),
+            (5, 0.75),
+            (6, 1.0),
+        ] {
+            embedding[token * 8] = scale;
+        }
+        let mut dense_tensors = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                "F32".to_string(),
+                vec![300, 8],
+                f32_tensor_bytes(&embedding),
+            ),
+            (
+                "model.norm.weight".to_string(),
+                "F32".to_string(),
+                vec![8],
+                f32_tensor_bytes(&vec![1.0; 8]),
+            ),
+            (
+                "model.layers.0.input_layernorm.weight".to_string(),
+                "F32".to_string(),
+                vec![8],
+                f32_tensor_bytes(&vec![1.0; 8]),
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight".to_string(),
+                "F32".to_string(),
+                vec![8],
+                f32_tensor_bytes(&vec![1.0; 8]),
+            ),
+            (
+                "model.layers.0.mlp.gate.weight".to_string(),
+                "F32".to_string(),
+                vec![8, 8],
+                f32_tensor_bytes(&vec![0.0; 8 * 8]),
+            ),
+        ];
+        for (suffix, shape) in [
+            ("q_proj", vec![8, 8]),
+            ("k_proj", vec![4, 8]),
+            ("v_proj", vec![4, 8]),
+            ("o_proj", vec![8, 8]),
+        ] {
+            let rows = shape[0];
+            let cols = shape[1];
+            dense_tensors.push((
+                format!("model.layers.0.self_attn.{suffix}.weight"),
+                "F32".to_string(),
+                shape,
+                f32_tensor_bytes(&vec![0.0; rows * cols]),
+            ));
+        }
+        let dense_refs = typed_fixture_refs(&dense_tensors);
+        std::fs::write(
+            snapshot.join("dense.safetensors"),
+            make_typed_safetensors(&dense_refs),
+        )
+        .unwrap();
+
+        let expert_tensors = vec![
+            (
+                "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![16, 8],
+                f32_tensor_bytes(&vec![0.0; 16 * 8]),
+            ),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![16, 8],
+                f32_tensor_bytes(&vec![0.0; 16 * 8]),
+            ),
+            (
+                "model.layers.0.mlp.experts.0.down_proj.weight".to_string(),
+                "F32".to_string(),
+                vec![8, 16],
+                f32_tensor_bytes(&vec![0.0; 8 * 16]),
+            ),
+        ];
+        let expert_refs = typed_fixture_refs(&expert_tensors);
+        std::fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&expert_refs),
+        )
+        .unwrap();
+
+        let mut weight_map = serde_json::Map::new();
+        for (name, _, _, _) in &dense_tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("dense.safetensors".to_string()),
+            );
+        }
+        for (name, _, _, _) in &expert_tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("expert.safetensors".to_string()),
+            );
+        }
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            serde_json::Value::Object(serde_json::Map::from_iter([(
+                "weight_map".to_string(),
+                serde_json::Value::Object(weight_map),
+            )]))
+            .to_string(),
+        )
+        .unwrap();
+        let mut plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        plan.routing_policy = FlashMoeRoutingPolicy::new(Some(1), true);
+        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let dense = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let tokenizer = QwenTokenizer::from_file(&plan.tokenizer).unwrap();
+        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
+        let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
+        let mut engine = FlashMoeEngine {
+            plan,
+            experts: experts.clone(),
+            scheduler: ExpertScheduler::new(experts),
+            dense,
+            tokenizer,
+            metal: None,
+            config,
+            routing_policy,
+            runtime,
+            shared_expert_cache: Mutex::new(BTreeMap::new()),
+            linear_attention_cache: Mutex::new(BTreeMap::new()),
+            vision_encoder: None,
+            session_cache: BTreeMap::new(),
+        };
+        let output = engine
+            .generate(&GenerationRequest {
+                prompt: "hello".to_string(),
+                max_tokens: 16,
+                temperature: 0.0,
+                top_k: 1,
+                seed: 1,
+            })
+            .unwrap();
+        assert_eq!(output.generated_tokens, 16);
+        assert!(!output.content.is_empty());
+
+        let timed = engine
+            .generate_timed(&GenerationRequest {
+                prompt: "hello".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                seed: 1,
+            })
+            .unwrap();
+        assert_eq!(timed.output.generated_tokens, 2);
+        assert_eq!(timed.timing.dimensions.hidden_size, 8);
+        assert!(!timed.timing.tokens.is_empty());
+        assert!(
+            timed
+                .timing
+                .tokens
+                .iter()
+                .any(|token| !token.layers.is_empty())
+        );
+    }
+
+    #[test]
+    fn quantize_q4_packs_nibbles_and_group_metadata() {
+        let packed = quantize_q4(&[0.0, 15.0, 30.0], &[1, 3], 2).unwrap();
+        assert_eq!(packed.values.len(), 2);
+        assert_eq!(packed.scales.len(), 2);
+        assert_eq!(packed.biases.len(), 2);
+    }
+
+    #[test]
+    fn dense_q4_group16_reduces_projection_reconstruction_error() {
+        let values: Vec<f32> = (0..128)
+            .map(|idx| {
+                let base = ((idx as f32) * 0.071).sin() * 0.35;
+                let trend = ((idx % 17) as f32 - 8.0) * 0.013;
+                if idx % 37 == 0 {
+                    base + trend + 1.15
+                } else {
+                    base + trend
+                }
+            })
+            .collect();
+        let q64 = quantize_q4(&values, &[1, values.len()], GROUP_SIZE).unwrap();
+        let q16 = quantize_q4(&values, &[1, values.len()], DENSE_Q4_GROUP_SIZE).unwrap();
+        let reconstruction_error = |quantized: &QuantizedQ4, group_size: usize| -> f32 {
+            values
+                .iter()
+                .enumerate()
+                .map(|(col, value)| {
+                    let byte = quantized.values[col / 2];
+                    let code = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                    let group = col / group_size;
+                    let decoded = code.mul_add(quantized.scales[group], quantized.biases[group]);
+                    let delta = *value - decoded;
+                    delta * delta
+                })
+                .sum()
+        };
+        let error64 = reconstruction_error(&q64, GROUP_SIZE);
+        let error16 = reconstruction_error(&q16, DENSE_Q4_GROUP_SIZE);
+        assert!(
+            error16 < error64,
+            "group16 reconstruction error {error16} was not below group64 error {error64}"
+        );
+    }
+
+    #[test]
+    fn expert_cache_quantizes_decoded_bf16_values_not_raw_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+        write_test_config(&snapshot);
+        std::fs::write(
+            snapshot.join("dense.safetensors"),
+            make_safetensors(&[("model.layers.0.self_attn.q_proj.weight", b"dense")]),
+        )
+        .unwrap();
+        let mut gate_bytes = Vec::new();
+        for value in 1u32..=128 {
+            gate_bytes.extend_from_slice(&(((value as f32).to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let mut up_bytes = Vec::new();
+        for _ in 0..(16 * 8) {
+            up_bytes.extend_from_slice(&0x3f80u16.to_le_bytes());
+        }
+        let mut down_bytes = Vec::new();
+        for _ in 0..(8 * 16) {
+            down_bytes.extend_from_slice(&0x3f80u16.to_le_bytes());
+        }
+        std::fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&[
+                (
+                    "model.layers.0.mlp.experts.0.gate_proj.weight",
+                    "BF16",
+                    vec![16, 8],
+                    &gate_bytes,
+                ),
+                (
+                    "model.layers.0.mlp.experts.0.up_proj.weight",
+                    "BF16",
+                    vec![16, 8],
+                    &up_bytes,
+                ),
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight",
+                    "BF16",
+                    vec![8, 16],
+                    &down_bytes,
+                ),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            expert_triplet_weight_map(0, 0),
+        )
+        .unwrap();
+
+        let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+        let expert = read_one_expert(&plan.experts_dir, 0, 0).unwrap();
+        let record = expert
+            .records
+            .iter()
+            .find(|record| record.name.ends_with("gate_proj.weight"))
+            .unwrap();
+        let input = [1.0; 8];
+        let payload = record.matvec_payload(&input, 1).unwrap();
+        let out =
+            q4_fma_matvec(payload.packed, &input, payload.scales, payload.biases, 1, 8).unwrap();
+        assert!((out[0] - 36.0).abs() < 1.0, "decoded q4 sum was {}", out[0]);
+    }
+
+    #[test]
+    fn q4_fma_matvec_dequantizes_nibbles_by_group() {
+        let packed = [0x21, 0x43];
+        let input = [1.0, 2.0, 3.0, 4.0];
+        let scales = [0.5];
+        let biases = [1.0];
+        let out = q4_fma_matvec(&packed, &input, &scales, &biases, 1, 4).unwrap();
+        let expected = (1.0 * 0.5 + 1.0) * 1.0
+            + (2.0 * 0.5 + 1.0) * 2.0
+            + (3.0 * 0.5 + 1.0) * 3.0
+            + (4.0 * 0.5 + 1.0) * 4.0;
+        assert!((out[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn q4_fma_matvec_supports_variable_groups_and_odd_shapes() {
+        let rows = 3;
+        let cols = 5;
+        let group_size = 3;
+        let packed = [
+            0x10, 0x32, 0x04, // row 0: 0, 1, 2, 3, 4
+            0x65, 0x87, 0x09, // row 1: 5, 6, 7, 8, 9
+            0xba, 0xdc, 0x0e, // row 2: 10, 11, 12, 13, 14
+        ];
+        let input = [0.25, -1.0, 2.0, 0.5, -0.75];
+        let scales = [0.5, -0.25, 0.125, 0.75, -0.5, 0.25];
+        let biases = [1.0, 2.0, -1.5, 0.25, 0.0, -0.5];
+        let out = q4_fma_matvec_with_group_size(
+            &packed, &input, &scales, &biases, rows, cols, group_size,
+        )
+        .unwrap();
+
+        let mut expected = [0.0f32; 3];
+        let groups_per_row = cols.div_ceil(group_size);
+        for row in 0..rows {
+            for col in 0..cols {
+                let byte = packed[row * cols.div_ceil(2) + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                let group = col / group_size;
+                let idx = row * groups_per_row + group;
+                expected[row] += q.mul_add(scales[idx] * input[col], biases[idx] * input[col]);
+            }
+        }
+
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 1e-6,
+                "actual {actual} expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4_fma_matvec_matches_explicit_dequant_reference() {
+        let rows = 2;
+        let cols = 7;
+        let group_size = 4;
+        let packed = [
+            0xf0, 0x21, 0x43, 0x06, // row 0: 0, 15, 1, 2, 3, 4, 6
+            0x75, 0x98, 0xba, 0x0d, // row 1: 5, 7, 8, 9, 10, 11, 13
+        ];
+        let input = [0.5, -2.0, 1.25, 0.0, -0.75, 3.0, -1.5];
+        let scales = [0.03125, -0.125, 0.5, -0.25];
+        let biases = [-1.0, 2.0, 0.25, -0.5];
+
+        let actual = q4_fma_matvec_with_group_size(
+            &packed, &input, &scales, &biases, rows, cols, group_size,
+        )
+        .unwrap();
+
+        let packed_stride = cols.div_ceil(2);
+        let groups_per_row = cols.div_ceil(group_size);
+        let expected: Vec<f32> = (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let byte = packed[row * packed_stride + col / 2];
+                        let code = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                        let group = row * groups_per_row + col / group_size;
+                        let decoded = code * scales[group] + biases[group];
+                        decoded * input[col]
+                    })
+                    .sum()
+            })
+            .collect();
+
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!(
+                (*actual - *expected).abs() <= 1e-6,
+                "FMA matvec diverged from explicit dequant: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4_bf16_expert_pack_matches_flashmoe_uint32_nibble_reference() {
+        let tensor = "model.layers.0.mlp.experts.0.gate_proj.weight";
+        let input = [1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, -0.75];
+        let mut pack = Vec::new();
+        pack.extend_from_slice(PBQ4_EXPERT_MAGIC);
+        pack.extend_from_slice(&(tensor.len() as u32).to_le_bytes());
+        pack.extend_from_slice(tensor.as_bytes());
+        pack.extend_from_slice(&4u64.to_le_bytes());
+        pack.extend_from_slice(&1u64.to_le_bytes());
+        pack.extend_from_slice(&f32_to_bf16_bits(0.5).to_le_bytes());
+        pack.extend_from_slice(&f32_to_bf16_bits(1.0).to_le_bytes());
+        pack.extend_from_slice(&0x7654_3210u32.to_le_bytes());
+
+        let metadata = ExpertPackMetadata {
+            layer: 0,
+            expert: 0,
+            packed_bytes: pack.len() as u64,
+            records: vec![ExpertPackRecord {
+                tensor: tensor.to_string(),
+                dtype: "Q4".to_string(),
+                shape: vec![1, 8],
+                source_offsets: [0, 8],
+                source_hash: Some("synthetic".to_string()),
+                record_offset: PBQ4_EXPERT_MAGIC.len() as u64,
+                packed_bytes: 4,
+                groups: 1,
+                group_size: 8,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }],
+        };
+        let records = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+        let payload = records[0].matvec_payload(&input, 1).unwrap();
+        let actual = q4_fma_matvec_with_group_size(
+            payload.packed,
+            &input,
+            payload.scales,
+            payload.biases,
+            payload.rows,
+            payload.cols,
+            payload.group_size,
+        )
+        .unwrap();
+
+        let packed_word = u32::from_le_bytes([
+            payload.packed[0],
+            payload.packed[1],
+            payload.packed[2],
+            payload.packed[3],
+        ]);
+        let expected: f32 = input
+            .iter()
+            .enumerate()
+            .map(|(n, x)| {
+                let nibble = ((packed_word >> (n * 4)) & 0x0f) as f32;
+                (nibble * 0.5 + 1.0) * x
+            })
+            .sum();
+
+        assert_eq!(payload.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        assert_eq!(payload.scale_bytes.len(), 2);
+        assert_eq!(payload.bias_bytes.len(), 2);
+        assert!(
+            (actual[0] - expected).abs() <= 1e-6,
+            "bf16 q4 matvec diverged from uint32 nibble reference: actual={} expected={expected}",
+            actual[0]
+        );
+    }
+
+    fn test_expert_pack(name: &str) -> Vec<u8> {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(PBQ4_EXPERT_MAGIC);
+        pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        pack.extend_from_slice(name.as_bytes());
+        pack.extend_from_slice(&2u64.to_le_bytes());
+        pack.extend_from_slice(&1u64.to_le_bytes());
+        pack.extend_from_slice(&0.5f32.to_le_bytes());
+        pack.extend_from_slice(&1.0f32.to_le_bytes());
+        pack.extend_from_slice(&[0x21, 0x43]);
+        pack
+    }
+
+    fn test_expert_pack_metadata(
+        layer: usize,
+        expert: usize,
+        tensor: &str,
+        packed_bytes: usize,
+    ) -> ExpertPackMetadata {
+        ExpertPackMetadata {
+            layer,
+            expert,
+            packed_bytes: packed_bytes as u64,
+            records: vec![ExpertPackRecord {
+                tensor: tensor.to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 4],
+                source_offsets: [0, 4],
+                source_hash: Some(format!("hash-{layer}-{expert}")),
+                record_offset: PBQ4_EXPERT_MAGIC.len() as u64,
+                packed_bytes: 2,
+                groups: 1,
+                group_size: GROUP_SIZE,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+            }],
+        }
+    }
+
+    fn write_test_expert_layer(
+        root: &Path,
+        layer: usize,
+        packs: Vec<(usize, Vec<u8>, ExpertPackMetadata)>,
+        experts: usize,
+    ) -> Result<()> {
+        let slot_size = packs
+            .iter()
+            .map(|(_, pack, _)| pack.len() as u64)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let path = expert_layer_path(root, layer);
+        let file = fs::File::create(&path)
+            .with_context(|| format!("failed to create test layer {}", path.display()))?;
+        file.set_len((experts as u64) * slot_size)?;
+        let mut metadata = Vec::new();
+        for (expert, pack, mut pack_metadata) in packs {
+            pack_metadata.packed_bytes = pack.len() as u64;
+            write_all_at_positioned(&file, &pack, expert_slot_offset(expert, slot_size)?)?;
+            metadata.push(pack_metadata);
+        }
+        let layer_metadata = ExpertLayerPackMetadata::new(layer, slot_size, experts, metadata);
+        fs::write(
+            expert_layer_metadata_path(root, layer),
+            serde_json::to_vec(&layer_metadata)?,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod flashmoe_rope_tests {
+    use super::*;
+
+    fn assert_close(left: f32, right: f32) {
+        let diff = (left - right).abs();
+        assert!(
+            diff <= 1e-5,
+            "values differ: left={left:.9}, right={right:.9}, diff={diff:.9}"
+        );
+    }
+
+    #[test]
+    fn flashmoe_rope_split_half_matches_reference() {
+        // Mirrors danveloper/flash-moe:
+        //   half = rotary_dim / 2
+        //   freq = 1 / pow(theta, 2*i / rotary_dim)
+        //   pairs are (x[i], x[i + half]), not adjacent pairs.
+        let position = 3usize;
+        let head_dim = 8usize;
+        let rotary_dim = 4usize;
+        let theta = 10_000_000.0f64;
+
+        let mut got = vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        apply_rotary_split_half(&mut got, position, head_dim, rotary_dim, theta);
+
+        let mut expected = vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        let half = rotary_dim / 2;
+        for i in 0..half {
+            let freq = 1.0f32 / (theta as f32).powf((2 * i) as f32 / rotary_dim as f32);
+            let angle = position as f32 * freq;
+            let (sin_a, cos_a) = angle.sin_cos();
+
+            let x0 = expected[i];
+            let x1 = expected[i + half];
+            expected[i] = x0 * cos_a - x1 * sin_a;
+            expected[i + half] = x0 * sin_a + x1 * cos_a;
+        }
+
+        for (left, right) in got.iter().zip(expected.iter()) {
+            assert_close(*left, *right);
+        }
+
+        // Non-rotary tail must be untouched.
+        assert_eq!(&got[rotary_dim..], &[100.0, 200.0, 300.0, 400.0]);
+    }
+
+    #[test]
+    fn gated_flashmoe_rope_defaults_to_partial_split_half() {
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: 4096,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(2),
+            vocab_size: 248320,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("bfloat16".to_string()),
+            num_experts: Some(512),
+            num_experts_per_tok: Some(4),
+            moe_intermediate_size: Some(1024),
+            intermediate_size: None,
+            max_position_embeddings: None,
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+
+        let rotary_dim = rotary_dim_for(&config, 256, FullAttentionQLayout::Gated);
+        assert_eq!(rotary_dim, 64);
+    }
+
+    #[test]
+    fn standard_qwen_rope_uses_split_half_pairing() {
+        let layout = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 8,
+            q_width: 8,
+            kv_width: 8,
+            head_dim: 8,
+            rotary_dim: 8,
+            num_q_heads: 1,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+
+        let mut q = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let mut k = q.clone();
+        apply_rotary_for_layout(
+            &mut q,
+            &mut k,
+            MropePosition::text(1),
+            1_000_000.0,
+            layout,
+            None,
+        );
+
+        // Adjacent pairing would rotate (0,1), (2,3), ...
+        // Split-half pairing rotates (0,4), (1,5), ...
+        assert_ne!(q[1], 2.0);
+        assert_ne!(q[5], 20.0);
+    }
+
+    #[test]
+    fn qwen3vl_mrope_interleaves_height_and_width_frequency_slots() {
+        let position = MropePosition {
+            temporal: 2,
+            height: 5,
+            width: 7,
+        };
+        let section = [2, 1, 1];
+        let head_dim = 8usize;
+        let theta = 10_000.0f64;
+
+        let mut got = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        apply_rotary_split_half_mrope(&mut got, position, head_dim, head_dim, theta, section);
+
+        let mut expected = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let half = head_dim / 2;
+        for i in 0..half {
+            let axis = match i {
+                1 => position.height,
+                2 => position.width,
+                _ => position.temporal,
+            };
+            let freq = 1.0f32 / (theta as f32).powf((2 * i) as f32 / head_dim as f32);
+            let angle = axis as f32 * freq;
+            let (sin_a, cos_a) = angle.sin_cos();
+            let x0 = expected[i];
+            let x1 = expected[i + half];
+            expected[i] = x0 * cos_a - x1 * sin_a;
+            expected[i + half] = x0 * sin_a + x1 * cos_a;
+        }
+
+        for (left, right) in got.iter().zip(expected.iter()) {
+            assert_close(*left, *right);
+        }
+    }
+
+    #[test]
+    fn qwen3vl_image_mrope_positions_match_single_image_get_rope_index_shape() {
+        let tokens = [101, 999, 999, 999, 999, 102, 201, 202];
+        let (positions, next_position) =
+            qwen3vl_single_image_mrope_positions(&tokens, 999, 2, 2).unwrap();
+
+        assert_eq!(positions[0], MropePosition::text(0));
+        assert_eq!(
+            positions[1],
+            MropePosition {
+                temporal: 1,
+                height: 1,
+                width: 1,
+            }
+        );
+        assert_eq!(
+            positions[2],
+            MropePosition {
+                temporal: 1,
+                height: 1,
+                width: 2,
+            }
+        );
+        assert_eq!(
+            positions[3],
+            MropePosition {
+                temporal: 1,
+                height: 2,
+                width: 1,
+            }
+        );
+        assert_eq!(
+            positions[4],
+            MropePosition {
+                temporal: 1,
+                height: 2,
+                width: 2,
+            }
+        );
+        assert_eq!(positions[5], MropePosition::text(3));
+        assert_eq!(positions[6], MropePosition::text(4));
+        assert_eq!(positions[7], MropePosition::text(5));
+        assert_eq!(next_position, 6);
+    }
+}
