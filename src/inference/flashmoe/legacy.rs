@@ -1983,6 +1983,35 @@ impl MetalExecutor {
         }
     }
 
+    fn dense_mmap_top_candidates(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.dense_mmap_top_candidates(
+                byte_offset,
+                dtype,
+                input,
+                rows,
+                cols,
+                stride,
+                top_k,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (byte_offset, dtype, input, rows, cols, stride, top_k);
+            Ok(None)
+        }
+    }
+
     fn q4_mmap_matvec_batch(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
@@ -3913,6 +3942,147 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some((outputs, timing, projections.len())))
+        }
+    }
+
+    fn dense_mmap_top_candidates(
+        &self,
+        byte_offset: u64,
+        dtype: &str,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        stride: usize,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        if rows == 0 || cols == 0 || top_k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let dtype = dtype.to_ascii_uppercase();
+        let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
+            "F32" | "FLOAT32" | "FP32" => (
+                std::mem::size_of::<f32>(),
+                self.dense_mmap_matvec_pipeline,
+                false,
+            ),
+            "BF16" | "BFLOAT16" => (
+                std::mem::size_of::<u16>(),
+                self.dense_mmap_matvec_bf16_simd_pipeline,
+                true,
+            ),
+            _ => return Ok(None),
+        };
+        if stride < cols {
+            bail!("dense mmap top-k stride {stride} is smaller than cols {cols}");
+        }
+        if input.len() != cols {
+            bail!(
+                "dense mmap top-k input len {} does not match cols {cols}",
+                input.len()
+            );
+        }
+        let last_row = rows.saturating_sub(1);
+        let values = last_row
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(cols))
+            .context("dense mmap top-k value range overflow")?;
+        let byte_len = values
+            .checked_mul(element_size)
+            .context("dense mmap top-k byte length overflow")?;
+        let byte_offset_usize =
+            usize::try_from(byte_offset).context("dense mmap top-k offset does not fit usize")?;
+        if byte_offset_usize
+            .checked_add(byte_len)
+            .map_or(true, |end| end > dense_weights.len)
+        {
+            return Ok(None);
+        }
+        if byte_offset_usize % element_size != 0 {
+            return Ok(None);
+        }
+
+        let top_k = top_k.min(rows).max(1);
+        unsafe {
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let logits_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
+            let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
+            let transient_buffers =
+                vec![input_buffer, logits_buffer, indices_buffer, values_buffer];
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let stride_u32 = stride as u32;
+            let top_k_u32 = top_k as u32;
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE dense mmap top-k Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE dense mmap top-k Metal compute encoder");
+            }
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, logits_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&byte_offset), 3);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
+            set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
+            if simd_reduced {
+                dispatch_q4_threadgroups(encoder, rows as u64);
+            } else {
+                dispatch_threads(encoder, rows as u64);
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.topk_vocab_pipeline,
+            );
+            set_buffer(encoder, logits_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, values_buffer, 2);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
+            set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
+            dispatch_threads(encoder, 1);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("dense_mmap_lm_head_topk")
+                .with("dtype", dtype)
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("stride", stride)
+                .with("top_k", top_k)
+                .with("offset", byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
+            let mut candidates = Vec::with_capacity(top_k);
+            for idx in 0..top_k {
+                candidates.push((*indices_ptr.add(idx) as usize, *values_ptr.add(idx)));
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in transient_buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some(candidates))
         }
     }
 
@@ -10852,6 +11022,20 @@ impl DenseStore {
         let top_k = sampler.top_k.min(vocab_rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
         if metal.has_resident_dense_weights() && entry.quantization == TensorQuantization::None {
+            if sampler.repeat_penalty <= 1.0
+                && repeated.is_empty()
+                && let Some(candidates) = metal.dense_mmap_top_candidates(
+                    entry.byte_offset,
+                    &entry.dtype,
+                    hidden,
+                    rows,
+                    cols,
+                    cols,
+                    top_k,
+                )?
+            {
+                return Ok(Some(candidates));
+            }
             let projected =
                 self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
             let mut candidates = TopKCandidates::new(top_k);
