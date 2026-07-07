@@ -1517,6 +1517,15 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         timed.output.generated_tokens,
         generation_started.elapsed().as_millis()
     );
+    let throughput = flashmoe_throughput_summary(&timed);
+    eprintln!(
+        "flashmoe infer: throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+        throughput.total_wall.as_millis(),
+        throughput.prefill_or_ttft_wall.as_millis(),
+        throughput.decode_tokens,
+        throughput.decode_wall.as_millis(),
+        fmt_optional_tok_s(throughput.decode_tok_s())
+    );
     let content = timed.output.content.trim();
     if content.is_empty() {
         bail!("FlashMoe inference returned an empty response");
@@ -1630,6 +1639,16 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             prompt_index + 1,
             timed.output.generated_tokens,
             generation_started.elapsed().as_millis()
+        );
+        let throughput = flashmoe_throughput_summary(&timed);
+        eprintln!(
+            "flashmoe bench: prompt {} throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+            prompt_index + 1,
+            throughput.total_wall.as_millis(),
+            throughput.prefill_or_ttft_wall.as_millis(),
+            throughput.decode_tokens,
+            throughput.decode_wall.as_millis(),
+            fmt_optional_tok_s(throughput.decode_tok_s())
         );
         let expected = baseline.as_ref().and_then(|baseline| {
             baseline
@@ -1859,6 +1878,58 @@ fn append_flashmoe_timing_tsv(
             );
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlashMoeThroughputSummary {
+    prefill_or_ttft_tokens: usize,
+    decode_tokens: usize,
+    prefill_or_ttft_wall: Duration,
+    decode_wall: Duration,
+    total_wall: Duration,
+}
+
+impl FlashMoeThroughputSummary {
+    fn decode_tok_s(self) -> Option<f64> {
+        if self.decode_tokens == 0 || self.decode_wall.is_zero() {
+            return None;
+        }
+        Some(self.decode_tokens as f64 / self.decode_wall.as_secs_f64())
+    }
+}
+
+fn flashmoe_throughput_summary(
+    timed: &inference::flashmoe::TimedGenerationOutput,
+) -> FlashMoeThroughputSummary {
+    let mut summary = FlashMoeThroughputSummary {
+        prefill_or_ttft_tokens: 0,
+        decode_tokens: 0,
+        prefill_or_ttft_wall: Duration::ZERO,
+        decode_wall: Duration::ZERO,
+        total_wall: timed.timing.total_wall,
+    };
+    for token in &timed.timing.tokens {
+        match token.phase {
+            inference::flashmoe::FlashMoeTokenPhase::Prefill => {
+                summary.prefill_or_ttft_tokens += 1;
+                summary.prefill_or_ttft_wall += token.buckets.total_wall;
+            }
+            inference::flashmoe::FlashMoeTokenPhase::Decode => {
+                summary.decode_tokens += 1;
+                summary.decode_wall += token.buckets.total_wall;
+            }
+        }
+    }
+    if timed.timing.tokens.is_empty() {
+        summary.prefill_or_ttft_wall = timed.timing.total_wall;
+    }
+    summary
+}
+
+fn fmt_optional_tok_s(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "NA".to_string())
 }
 
 fn push_tsv_row(out: &mut String, fields: &[&str]) {
@@ -3032,6 +3103,73 @@ mod tests {
                 assert_eq!(columns[deferred_wait_index], "3.000");
             }
         }
+    }
+
+    #[test]
+    fn flashmoe_throughput_summary_reports_decode_only_tok_s() {
+        let mut timed = crate::inference::flashmoe::TimedGenerationOutput {
+            output: crate::inference::flashmoe::GenerationOutput {
+                content: "ok".to_string(),
+                tool_calls: Vec::new(),
+                generated_tokens: 3,
+            },
+            timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
+                model: "test-model".to_string(),
+                dimensions: crate::inference::flashmoe::FlashMoeModelDimensions {
+                    layers: 1,
+                    hidden_size: 4,
+                    attention_heads: 1,
+                    kv_heads: 1,
+                    vocab_size: 8,
+                    experts_per_layer: Some(2),
+                    active_experts_per_token: Some(1),
+                    moe_intermediate_size: Some(2),
+                    shared_experts: Some(1),
+                },
+                tokens: Vec::new(),
+                total_wall: Duration::from_millis(1100),
+            },
+        };
+        timed
+            .timing
+            .tokens
+            .push(crate::inference::flashmoe::FlashMoeTokenTiming {
+                token_index: 0,
+                position: 0,
+                phase: crate::inference::flashmoe::FlashMoeTokenPhase::Prefill,
+                input_token: 1,
+                sampled_token: Some(2),
+                layers: Vec::new(),
+                buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
+                    total_wall: Duration::from_millis(600),
+                    ..Default::default()
+                },
+            });
+        for token_index in 1..=2 {
+            timed
+                .timing
+                .tokens
+                .push(crate::inference::flashmoe::FlashMoeTokenTiming {
+                    token_index,
+                    position: token_index,
+                    phase: crate::inference::flashmoe::FlashMoeTokenPhase::Decode,
+                    input_token: token_index as u32,
+                    sampled_token: Some((token_index + 1) as u32),
+                    layers: Vec::new(),
+                    buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
+                        total_wall: Duration::from_millis(250),
+                        ..Default::default()
+                    },
+                });
+        }
+
+        let summary = flashmoe_throughput_summary(&timed);
+
+        assert_eq!(summary.prefill_or_ttft_tokens, 1);
+        assert_eq!(summary.decode_tokens, 2);
+        assert_eq!(summary.prefill_or_ttft_wall, Duration::from_millis(600));
+        assert_eq!(summary.decode_wall, Duration::from_millis(500));
+        assert_eq!(summary.decode_tok_s(), Some(4.0));
     }
 
     #[test]
