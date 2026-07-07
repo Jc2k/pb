@@ -3687,13 +3687,9 @@ impl MetalExecutorInner {
             let upload_started = Instant::now();
             let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
             let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
-            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&byte_offset))?;
             let rows_u32 = rows as u32;
             let cols_u32 = cols as u32;
             let stride_u32 = stride as u32;
-            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-            let stride_buffer = self.buffer_with_bytes(u32_as_bytes(&stride_u32))?;
             timing.buffer_upload += upload_started.elapsed();
 
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
@@ -3709,10 +3705,10 @@ impl MetalExecutorInner {
             set_buffer(encoder, dense_weights.buffer, 0);
             set_buffer(encoder, input_buffer, 1);
             set_buffer(encoder, output_buffer, 2);
-            set_buffer(encoder, offset_buffer, 3);
-            set_buffer(encoder, rows_buffer, 4);
-            set_buffer(encoder, cols_buffer, 5);
-            set_buffer(encoder, stride_buffer, 6);
+            set_bytes(encoder, u64_as_bytes(&byte_offset), 3);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
+            set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
             if simd_reduced {
                 dispatch_q4_threadgroups(encoder, rows as u64);
             } else {
@@ -3731,14 +3727,7 @@ impl MetalExecutorInner {
                 release(encoder);
                 release(command_buffer);
                 self.recycle_or_release_buffers(
-                    &[
-                        input_buffer,
-                        output_buffer,
-                        offset_buffer,
-                        rows_buffer,
-                        cols_buffer,
-                        stride_buffer,
-                    ],
+                    &[input_buffer, output_buffer],
                     error.should_release_buffers(),
                 );
                 return Err(error.into());
@@ -3753,10 +3742,6 @@ impl MetalExecutorInner {
             release(command_buffer);
             self.recycle(input_buffer);
             self.recycle(output_buffer);
-            self.recycle(offset_buffer);
-            self.recycle(rows_buffer);
-            self.recycle(cols_buffer);
-            self.recycle(stride_buffer);
             Ok(Some((output, timing)))
         }
     }
@@ -3849,23 +3834,7 @@ impl MetalExecutorInner {
             let upload_started = Instant::now();
             let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
             let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
-            let mut buffers = vec![input_buffer, output_buffer];
-            let mut params = Vec::with_capacity(projections.len());
-            for projection in projections {
-                let offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.byte_offset))?;
-                buffers.push(offset_buffer);
-                let rows_u32 = projection.rows as u32;
-                let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-                buffers.push(rows_buffer);
-                let cols_u32 = projection.cols as u32;
-                let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-                buffers.push(cols_buffer);
-                let stride_u32 = projection.stride() as u32;
-                let stride_buffer = self.buffer_with_bytes(u32_as_bytes(&stride_u32))?;
-                buffers.push(stride_buffer);
-                params.push((offset_buffer, rows_buffer, cols_buffer, stride_buffer));
-            }
+            let buffers = vec![input_buffer, output_buffer];
             timing.buffer_upload += upload_started.elapsed();
 
             let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
@@ -3886,15 +3855,17 @@ impl MetalExecutorInner {
                     .checked_mul(std::mem::size_of::<f32>())
                     .context("dense mmap batch output byte offset overflow")?
                     as u64;
-                let (offset_buffer, rows_buffer, cols_buffer, stride_buffer) = params[idx];
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let stride_u32 = projection.stride() as u32;
                 msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
                 set_buffer(encoder, dense_weights.buffer, 0);
                 set_buffer(encoder, input_buffer, 1);
                 set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                set_buffer(encoder, offset_buffer, 3);
-                set_buffer(encoder, rows_buffer, 4);
-                set_buffer(encoder, cols_buffer, 5);
-                set_buffer(encoder, stride_buffer, 6);
+                set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
+                set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
                 if simd_reduced {
                     dispatch_q4_threadgroups(encoder, projection.rows as u64);
                 } else {
@@ -13494,6 +13465,19 @@ unsafe fn set_buffer_with_offset(encoder: ObjcId, buffer: ObjcId, offset: u64, i
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_bytes(encoder: ObjcId, bytes: &[u8], index: u64) {
+    unsafe {
+        msg_send_void3_ptr_usize_u64(
+            encoder,
+            sel("setBytes:length:atIndex:"),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            index,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> {
     unsafe {
         let contents = msg_send_ptr0(buffer, sel("contents"));
@@ -13788,6 +13772,21 @@ unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: Mt
         let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector, a, b);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void3_ptr_usize_u64(
+    receiver: ObjcId,
+    selector: Sel,
+    bytes: *const c_void,
+    len: usize,
+    index: u64,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, *const c_void, usize, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, index);
     }
 }
 
