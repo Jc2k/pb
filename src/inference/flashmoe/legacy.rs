@@ -440,6 +440,8 @@ pub struct ExpertTensorRef {
     pub dtype: Option<String>,
     pub shape: Vec<usize>,
     pub source_offsets: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q4_sources: Option<DenseQ4SourceRefs>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -15847,14 +15849,26 @@ fn build_manifest(
         let tensor_source_offsets = tensor_info.data_offsets;
         if is_expert_tensor_name(&canonical_tensor) {
             let (layer, expert) = parse_layer_expert(&canonical_tensor);
+            let native_q4 = dense_native_q4_sources(
+                snapshot_dir,
+                &index.weight_map,
+                &mut shard_cache,
+                &tensor,
+            )?;
+            let runtime_shape = if native_q4.is_some() {
+                logical_shape_for_mlx_q4(&tensor_shape)?
+            } else {
+                tensor_shape
+            };
             expert_tensors.push(ExpertTensorRef {
                 tensor: canonical_tensor,
                 shard: shard.clone(),
                 layer,
                 expert,
                 dtype: Some(tensor_dtype),
-                shape: tensor_shape,
+                shape: runtime_shape,
                 source_offsets: Some(tensor_source_offsets),
+                q4_sources: native_q4,
             });
         } else if canonical_tensor.starts_with("visual.") {
             // Vision encoder tensors go into a separate store.
@@ -16713,6 +16727,18 @@ fn build_aggregate_expert_pack(
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    if aggregate_native_q4_enabled(aggregate_tensors, down)? {
+        return build_native_q4_aggregate_expert_pack(
+            snapshot_dir,
+            shard_cache,
+            layer,
+            expert,
+            aggregate_tensors,
+            down,
+            layout,
+        );
+    }
+
     let mut inputs = Vec::with_capacity(3);
     let (gate_values, gate_offsets, gate_hash) = decode_expert_tensor_range(
         snapshot_dir,
@@ -16786,6 +16812,18 @@ fn expected_aggregate_expert_records(
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
+    if aggregate_native_q4_enabled(aggregate_tensors, down)? {
+        return expected_native_q4_aggregate_expert_records(
+            snapshot_dir,
+            shard_cache,
+            layer,
+            expert,
+            aggregate_tensors,
+            down,
+            layout,
+        );
+    }
+
     let gate = expected_expert_pack_record(
         snapshot_dir,
         shard_cache,
@@ -16817,6 +16855,144 @@ fn expected_aggregate_expert_records(
         layout.down_expert_values,
     )?;
     Ok(vec![gate, up, down])
+}
+
+fn aggregate_native_q4_enabled(
+    aggregate_tensors: AggregateExpertTensors<'_>,
+    down: &ExpertTensorRef,
+) -> Result<bool> {
+    let sources = [
+        aggregate_tensors.gate.tensor,
+        aggregate_tensors.up.tensor,
+        down,
+    ];
+    let native_count = sources
+        .iter()
+        .filter(|tensor| tensor.q4_sources.is_some())
+        .count();
+    match native_count {
+        0 => Ok(false),
+        3 => Ok(true),
+        _ => bail!("aggregate expert tensors must be all native MLX Q4 or all decoded tensors"),
+    }
+}
+
+fn build_native_q4_aggregate_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    aggregate_tensors: AggregateExpertTensors<'_>,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let inputs = vec![
+        native_q4_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.gate.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.gate.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        native_q4_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.up.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.up.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        native_q4_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            down,
+            format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            vec![layout.hidden, layout.intermediate],
+            expert
+                .checked_mul(layout.down_expert_values)
+                .context("aggregate down expert offset overflow")?,
+            layout.down_expert_values,
+        )?,
+    ];
+    build_native_q4_expert_pack(layer, expert, inputs)
+}
+
+fn expected_native_q4_aggregate_expert_records(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    aggregate_tensors: AggregateExpertTensors<'_>,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+) -> Result<Vec<ExpectedExpertPackRecord>> {
+    Ok(vec![
+        expected_native_q4_expert_record(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.gate.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.gate.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        expected_native_q4_expert_record(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.up.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.up.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        expected_native_q4_expert_record(
+            snapshot_dir,
+            shard_cache,
+            down,
+            format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            vec![layout.hidden, layout.intermediate],
+            expert
+                .checked_mul(layout.down_expert_values)
+                .context("aggregate down expert offset overflow")?,
+            layout.down_expert_values,
+        )?,
+    ])
+}
+
+fn expected_native_q4_expert_record(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    source: &ExpertTensorRef,
+    tensor: String,
+    shape: Vec<usize>,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<ExpectedExpertPackRecord> {
+    let input = native_q4_expert_record_input(
+        snapshot_dir,
+        shard_cache,
+        source,
+        tensor,
+        shape,
+        element_offset,
+        element_count,
+    )?;
+    Ok(ExpectedExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        source_hash: input
+            .source_hash
+            .context("native q4 expert record is missing source hash")?,
+        packed_bytes: input.packed.len() as u64,
+        groups: input.groups,
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: input.scale_bias_dtype,
+    })
 }
 
 fn expected_expert_pack_record(
@@ -17301,6 +17477,187 @@ fn with_expert_tensor_raw_range<R>(
     read(raw, [byte_start, byte_end], dtype)
 }
 
+fn native_q4_expert_record_input(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    source: &ExpertTensorRef,
+    tensor: String,
+    shape: Vec<usize>,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<NativeQ4ExpertRecordInput> {
+    let q4_sources = source
+        .q4_sources
+        .as_ref()
+        .with_context(|| format!("expert tensor {} is not native MLX Q4", source.tensor))?;
+    let slice = native_q4_slice_byte_ranges(
+        source,
+        shape.as_slice(),
+        &q4_sources.scale_bias_dtype,
+        element_offset,
+        element_count,
+    )?;
+    let source_offsets = source
+        .source_offsets
+        .with_context(|| format!("expert tensor {} is missing source offsets", source.tensor))?;
+    let (packed, packed_offsets) = read_safetensor_source_byte_range(
+        snapshot_dir,
+        shard_cache,
+        &source.shard,
+        source_offsets,
+        slice.packed_offset,
+        slice.packed_bytes,
+    )?;
+    let (scale_bytes, _) = read_safetensor_source_byte_range(
+        snapshot_dir,
+        shard_cache,
+        &q4_sources.scales_shard,
+        q4_sources.scales_offsets,
+        slice.scale_bias_offset,
+        slice.scale_bias_bytes,
+    )?;
+    let (bias_bytes, _) = read_safetensor_source_byte_range(
+        snapshot_dir,
+        shard_cache,
+        &q4_sources.biases_shard,
+        q4_sources.biases_offsets,
+        slice.scale_bias_offset,
+        slice.scale_bias_bytes,
+    )?;
+    let source_hash = sha256_hex_parts(&[&packed, &scale_bytes, &bias_bytes]);
+    Ok(NativeQ4ExpertRecordInput {
+        tensor,
+        dtype: source
+            .dtype
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        shape,
+        source_offsets: packed_offsets,
+        source_hash: Some(source_hash),
+        packed,
+        scale_bytes,
+        bias_bytes,
+        groups: slice.groups,
+        scale_bias_dtype: q4_sources.scale_bias_dtype.clone(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeQ4SliceByteRanges {
+    packed_offset: usize,
+    packed_bytes: usize,
+    scale_bias_offset: usize,
+    scale_bias_bytes: usize,
+    groups: usize,
+}
+
+fn native_q4_slice_byte_ranges(
+    source: &ExpertTensorRef,
+    shape: &[usize],
+    scale_bias_dtype: &str,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<NativeQ4SliceByteRanges> {
+    if source.shape.len() < 2 {
+        bail!(
+            "native q4 expert tensor {} has invalid logical shape {:?}",
+            source.tensor,
+            source.shape
+        );
+    }
+    let cols = source.shape.last().copied().unwrap_or(0);
+    if cols == 0 || element_offset % cols != 0 || element_count % cols != 0 {
+        bail!(
+            "native q4 expert tensor {} slice {element_offset}..{} is not aligned to {cols} columns",
+            source.tensor,
+            element_offset.saturating_add(element_count)
+        );
+    }
+    let slice_rows = element_count / cols;
+    let expected_rows =
+        shape[..shape.len().saturating_sub(1)]
+            .iter()
+            .try_fold(1usize, |acc, dim| {
+                acc.checked_mul(*dim)
+                    .context("native q4 expert slice row count overflow")
+            })?;
+    if shape.last().copied() != Some(cols) || expected_rows != slice_rows {
+        bail!(
+            "native q4 expert tensor {} slice shape {:?} does not match {slice_rows} rows x {cols} cols",
+            source.tensor,
+            shape
+        );
+    }
+
+    let source_layout =
+        dense_q4_layout_with_scale_bias_dtype(&source.shape, GROUP_SIZE, scale_bias_dtype)?;
+    let slice_layout = dense_q4_layout_with_scale_bias_dtype(shape, GROUP_SIZE, scale_bias_dtype)?;
+    let row_start = element_offset / cols;
+    let packed_offset = row_start
+        .checked_mul(source_layout.row_packed_bytes)
+        .context("native q4 expert packed byte offset overflow")?;
+    let scale_bias_offset = row_start
+        .checked_mul(source_layout.groups_per_row)
+        .and_then(|groups| groups.checked_mul(source_layout.scale_bias_bytes))
+        .context("native q4 expert scale/bias byte offset overflow")?;
+    Ok(NativeQ4SliceByteRanges {
+        packed_offset,
+        packed_bytes: slice_layout.packed_bytes,
+        scale_bias_offset,
+        scale_bias_bytes: slice_layout.scales_bytes,
+        groups: slice_layout.rows * slice_layout.groups_per_row,
+    })
+}
+
+fn read_safetensor_source_byte_range(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    shard_name: &str,
+    data_offsets: [u64; 2],
+    relative_offset: usize,
+    byte_len: usize,
+) -> Result<(Vec<u8>, [u64; 2])> {
+    if !shard_cache.contains_key(shard_name) {
+        let shard_path = snapshot_dir.join(shard_name);
+        let file = fs::File::open(&shard_path)
+            .with_context(|| format!("failed to open shard {}", shard_path.display()))?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .with_context(|| format!("failed to memory-map {}", shard_path.display()))?
+        };
+        shard_cache.insert(
+            shard_name.to_string(),
+            (mmap, parse_safetensors_header(&shard_path)?),
+        );
+    }
+    let (bytes, shard) = shard_cache.get(shard_name).expect("inserted above");
+    let byte_start = data_offsets[0]
+        .checked_add(relative_offset as u64)
+        .context("safetensor source byte offset overflow")?;
+    let byte_end = byte_start
+        .checked_add(byte_len as u64)
+        .context("safetensor source byte range overflow")?;
+    if byte_end > data_offsets[1] {
+        bail!(
+            "safetensor source range {byte_start}..{byte_end} exceeds offsets {:?} in {shard_name}",
+            data_offsets
+        );
+    }
+    let abs_start = shard
+        .data_start
+        .checked_add(byte_start)
+        .context("safetensor absolute byte offset overflow")?;
+    let abs_end = shard
+        .data_start
+        .checked_add(byte_end)
+        .context("safetensor absolute byte range overflow")?;
+    Ok((
+        bytes[abs_start as usize..abs_end as usize].to_vec(),
+        [byte_start, byte_end],
+    ))
+}
+
 fn expert_tensor_byte_range(
     tensor: &ExpertTensorRef,
     dtype: &str,
@@ -17350,6 +17707,19 @@ struct ExpertRecordInput {
     values: Vec<f32>,
 }
 
+struct NativeQ4ExpertRecordInput {
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    source_hash: Option<String>,
+    packed: Vec<u8>,
+    scale_bytes: Vec<u8>,
+    bias_bytes: Vec<u8>,
+    groups: usize,
+    scale_bias_dtype: String,
+}
+
 fn build_expert_pack(
     layer: usize,
     expert: usize,
@@ -17361,6 +17731,28 @@ fn build_expert_pack(
         .context("failed to write packed expert header")?;
     for input in inputs {
         write_quantized_expert_record(&mut out, &mut records, input)?;
+    }
+    let packed = out.into_inner();
+    let metadata = ExpertPackMetadata {
+        layer,
+        expert,
+        packed_bytes: packed.len() as u64,
+        records,
+    };
+    Ok((packed, metadata))
+}
+
+fn build_native_q4_expert_pack(
+    layer: usize,
+    expert: usize,
+    inputs: Vec<NativeQ4ExpertRecordInput>,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut records = Vec::with_capacity(inputs.len());
+    out.write_all(PBQ4_EXPERT_MAGIC)
+        .context("failed to write packed expert header")?;
+    for input in inputs {
+        write_native_q4_expert_record(&mut out, &mut records, input)?;
     }
     let packed = out.into_inner();
     let metadata = ExpertPackMetadata {
@@ -17404,6 +17796,52 @@ fn write_quantized_expert_record<W: Write + Seek>(
         groups: packed.scales.len(),
         group_size: GROUP_SIZE,
         scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
+    });
+    Ok(())
+}
+
+fn write_native_q4_expert_record<W: Write + Seek>(
+    out: &mut W,
+    records: &mut Vec<ExpertPackRecord>,
+    input: NativeQ4ExpertRecordInput,
+) -> Result<()> {
+    let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
+    let scale_bias_len = input
+        .groups
+        .checked_mul(scale_bias_bytes)
+        .context("native q4 expert scale/bias byte length overflow")?;
+    if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len {
+        bail!(
+            "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
+            input.tensor,
+            input.scale_bytes.len(),
+            input.bias_bytes.len(),
+            input.groups,
+            scale_bias_bytes
+        );
+    }
+
+    let record_offset = out
+        .stream_position()
+        .context("failed to get expert record offset")?;
+    out.write_all(&(input.tensor.len() as u32).to_le_bytes())?;
+    out.write_all(input.tensor.as_bytes())?;
+    out.write_all(&(input.packed.len() as u64).to_le_bytes())?;
+    out.write_all(&(input.groups as u64).to_le_bytes())?;
+    out.write_all(&input.scale_bytes)?;
+    out.write_all(&input.bias_bytes)?;
+    out.write_all(&input.packed)?;
+    records.push(ExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        source_hash: input.source_hash,
+        record_offset,
+        packed_bytes: input.packed.len() as u64,
+        groups: input.groups,
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: input.scale_bias_dtype,
     });
     Ok(())
 }
@@ -17818,6 +18256,20 @@ fn quantized_q4_group(values: &[f32], scale: f32, bias: f32, codes: Vec<u8>) -> 
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
+}
+
+fn sha256_hex_parts(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
@@ -18736,6 +19188,14 @@ mod tests {
         for value in values {
             let bits = (value.to_bits() >> 16) as u16;
             bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn u32_tensor_bytes(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes
     }
@@ -20519,6 +20979,7 @@ mod tests {
             dtype: Some("BF16".to_string()),
             shape: vec![16, 8],
             source_offsets: Some([0, 16]),
+            q4_sources: None,
         };
         let err = validate_expert_tensor_group(0, 0, &[&tensor], None).unwrap_err();
         assert!(
@@ -22890,6 +23351,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 4, 2],
                 source_offsets: Some([0, 16]),
+                q4_sources: None,
             },
             ExpertTensorRef {
                 tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
@@ -22899,6 +23361,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 2, 2],
                 source_offsets: Some([16, 24]),
+                q4_sources: None,
             },
         ];
 
@@ -23020,6 +23483,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 2, 2],
                 source_offsets: Some([0, 8]),
+                q4_sources: None,
             },
             ExpertTensorRef {
                 tensor: "model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
@@ -23029,6 +23493,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 2, 2],
                 source_offsets: Some([8, 16]),
+                q4_sources: None,
             },
             ExpertTensorRef {
                 tensor: "model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
@@ -23038,6 +23503,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 2, 2],
                 source_offsets: Some([16, 24]),
+                q4_sources: None,
             },
         ];
 
@@ -23100,6 +23566,145 @@ mod tests {
     }
 
     #[test]
+    fn packer_copies_native_mlx_q4_switch_mlp_experts_without_requantizing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+        fs::create_dir_all(&snapshot).unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+
+        let packed_words: Vec<u32> = (0..16).map(|_| 0x7654_3210).collect();
+        let gate_packed = u32_tensor_bytes(&packed_words);
+        let up_words: Vec<u32> = (0..16)
+            .map(|row| 0x0123_4567u32.wrapping_add(row))
+            .collect();
+        let up_packed = u32_tensor_bytes(&up_words);
+        let down_words: Vec<u32> = (0..16)
+            .map(|row| 0x89ab_cdefu32.wrapping_add(row))
+            .collect();
+        let down_packed = u32_tensor_bytes(&down_words);
+        let gate_scales = bf16_tensor_bytes(&[0.5; 16]);
+        let gate_biases = bf16_tensor_bytes(&[1.0; 16]);
+        let up_scales = bf16_tensor_bytes(&[0.25; 16]);
+        let up_biases = bf16_tensor_bytes(&[2.0; 16]);
+        let down_scales = bf16_tensor_bytes(&[0.125; 16]);
+        let down_biases = bf16_tensor_bytes(&[3.0; 16]);
+        let tensors = vec![
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 8, 1],
+                gate_packed.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                gate_scales.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                gate_biases.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 8, 1],
+                up_packed.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                up_scales.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                up_biases.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+                "U32".to_string(),
+                vec![2, 8, 1],
+                down_packed.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                down_scales.clone(),
+            ),
+            (
+                "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases".to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![2, 8, 1],
+                down_biases.clone(),
+            ),
+        ];
+        let fixture_refs = typed_fixture_refs(&tensors);
+        fs::write(
+            snapshot.join("experts.safetensors"),
+            make_typed_safetensors(&fixture_refs),
+        )
+        .unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (name, _, _, _) in &tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("experts.safetensors".to_string()),
+            );
+        }
+        let index = serde_json::Value::Object(serde_json::Map::from_iter([(
+            "weight_map".to_string(),
+            serde_json::Value::Object(weight_map),
+        )]));
+        let index_path = snapshot.join("model.safetensors.index.json");
+        fs::write(&index_path, index.to_string()).unwrap();
+
+        let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, &snapshot, &index_path).unwrap();
+        assert!(visual_refs.is_empty());
+        assert!(manifest.dense_tensors.is_empty());
+        assert_eq!(manifest.expert_tensors.len(), 3);
+        assert!(manifest.expert_tensors.iter().all(|tensor| {
+            tensor.q4_sources.is_some()
+                && tensor.shape == vec![2, 8, 8]
+                && tensor.dtype.as_deref() == Some("U32")
+        }));
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":8,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":8}"#,
+        )
+        .unwrap();
+        pack_expert_tensors(&snapshot, &plan, &manifest.expert_tensors, Some(&config)).unwrap();
+
+        let expert0 = read_one_expert(&plan.experts_dir, 1, 0).unwrap();
+        let gate0 = expert0.record_suffix("gate_proj.weight").unwrap();
+        assert_eq!(gate0.dtype, "U32");
+        assert_eq!(gate0.shape, vec![8, 8]);
+        assert_eq!(gate0.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        assert_eq!(gate0.packed, gate_packed[..32]);
+        assert_eq!(gate0.scale_bytes, gate_scales[..16]);
+        assert_eq!(gate0.bias_bytes, gate_biases[..16]);
+        let input = [1.0; 8];
+        let projected = expert0.project_record(gate0, &input, 8).unwrap().unwrap();
+        assert_eq!(projected, vec![22.0; 8]);
+
+        let expert1 = read_one_expert(&plan.experts_dir, 1, 1).unwrap();
+        let up1 = expert1.record_suffix("up_proj.weight").unwrap();
+        assert_eq!(up1.packed, up_packed[32..]);
+        assert_eq!(up1.scale_bytes, up_scales[16..]);
+        assert_eq!(up1.bias_bytes, up_biases[16..]);
+        let down1 = expert1.record_suffix("down_proj.weight").unwrap();
+        assert_eq!(down1.packed, down_packed[32..]);
+        assert_eq!(down1.scale_bytes, down_scales[16..]);
+        assert_eq!(down1.bias_bytes, down_biases[16..]);
+    }
+
+    #[test]
     fn aggregate_expert_reuse_rejects_changed_source_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
@@ -23120,6 +23725,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 4, 2],
                 source_offsets: Some([0, 16]),
+                q4_sources: None,
             },
             ExpertTensorRef {
                 tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
@@ -23129,6 +23735,7 @@ mod tests {
                 dtype: Some("U8".to_string()),
                 shape: vec![2, 2, 2],
                 source_offsets: Some([16, 24]),
+                q4_sources: None,
             },
         ];
 
