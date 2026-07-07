@@ -64,8 +64,8 @@ use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate
 
 type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
 
-#[cfg(test)]
 const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
+const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
 const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
 const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
 #[cfg(test)]
@@ -453,6 +453,17 @@ pub struct DenseTensorRef {
     pub byte_len: u64,
     #[serde(default)]
     pub quantization: TensorQuantization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q4_sources: Option<DenseQ4SourceRefs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseQ4SourceRefs {
+    pub scales_shard: String,
+    pub scales_offsets: [u64; 2],
+    pub biases_shard: String,
+    pub biases_offsets: [u64; 2],
+    pub scale_bias_dtype: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1709,6 +1720,7 @@ struct DenseQ4MmapMatvecProjection {
     row_packed_bytes: usize,
     groups_per_row: usize,
     group_size: usize,
+    scale_bias_dtype: String,
 }
 
 impl MetalExecutor {
@@ -1903,6 +1915,7 @@ impl MetalExecutor {
         row_packed_bytes: usize,
         groups_per_row: usize,
         group_size: usize,
+        scale_bias_dtype: &str,
     ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -1916,6 +1929,7 @@ impl MetalExecutor {
                 row_packed_bytes,
                 groups_per_row,
                 group_size,
+                scale_bias_dtype,
             )
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2254,6 +2268,7 @@ struct MetalExecutorInner {
     q4_pipeline: ObjcId,
     q4_bf16_scale_bias_pipeline: ObjcId,
     q4_mmap_pipeline: ObjcId,
+    q4_mmap_bf16_scale_bias_pipeline: ObjcId,
     route_pipeline: Option<ObjcId>,
     dense_matvec_pipeline: ObjcId,
     dense_matvec_bf16_pipeline: ObjcId,
@@ -2464,6 +2479,7 @@ impl Drop for MetalExecutorInner {
             release(self.q4_pipeline);
             release(self.q4_bf16_scale_bias_pipeline);
             release(self.q4_mmap_pipeline);
+            release(self.q4_mmap_bf16_scale_bias_pipeline);
             if let Some(route_pipeline) = self.route_pipeline {
                 release(route_pipeline);
             }
@@ -2560,6 +2576,8 @@ impl MetalExecutorInner {
             let q4_bf16_scale_bias_pipeline =
                 compile_pipeline(device, library, "q4_fma_matvec_bf16_scale_bias")?;
             let q4_mmap_pipeline = compile_pipeline(device, library, "q4_mmap_fma_matvec")?;
+            let q4_mmap_bf16_scale_bias_pipeline =
+                compile_pipeline(device, library, "q4_mmap_fma_matvec_bf16_scale_bias")?;
             let route_pipeline = if route_top4_enabled {
                 Some(compile_pipeline(device, library, "route_top4")?)
             } else {
@@ -2600,6 +2618,7 @@ impl MetalExecutorInner {
                 release(q4_pipeline);
                 release(q4_bf16_scale_bias_pipeline);
                 release(q4_mmap_pipeline);
+                release(q4_mmap_bf16_scale_bias_pipeline);
                 if let Some(route_pipeline) = route_pipeline {
                     release(route_pipeline);
                 }
@@ -2655,6 +2674,7 @@ impl MetalExecutorInner {
                 q4_pipeline,
                 q4_bf16_scale_bias_pipeline,
                 q4_mmap_pipeline,
+                q4_mmap_bf16_scale_bias_pipeline,
                 route_pipeline,
                 dense_matvec_pipeline,
                 dense_matvec_bf16_pipeline,
@@ -2826,6 +2846,7 @@ impl MetalExecutorInner {
         row_packed_bytes: usize,
         groups_per_row: usize,
         group_size: usize,
+        scale_bias_dtype: &str,
     ) -> Result<Option<(Vec<f32>, MetalMatvecTiming)>> {
         if rows == 0 || cols == 0 {
             return Ok(Some((Vec::new(), MetalMatvecTiming::default())));
@@ -2833,8 +2854,9 @@ impl MetalExecutorInner {
         if group_size == 0 || groups_per_row == 0 || row_packed_bytes == 0 {
             return Ok(None);
         }
-        if scales_byte_offset % std::mem::size_of::<f32>() as u64 != 0
-            || biases_byte_offset % std::mem::size_of::<f32>() as u64 != 0
+        let scale_bias_bytes = expert_scale_bias_dtype_size(scale_bias_dtype)?;
+        if scales_byte_offset % scale_bias_bytes as u64 != 0
+            || biases_byte_offset % scale_bias_bytes as u64 != 0
         {
             return Ok(None);
         }
@@ -2846,7 +2868,7 @@ impl MetalExecutorInner {
             .context("dense q4 mmap packed byte length overflow")?;
         let groups_len = rows
             .checked_mul(groups_per_row)
-            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|groups| groups.checked_mul(scale_bias_bytes))
             .context("dense q4 mmap group byte length overflow")?;
         for (offset, len) in [
             (packed_byte_offset, packed_len),
@@ -2894,7 +2916,11 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.q4_mmap_pipeline,
+                if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
+                    self.q4_mmap_bf16_scale_bias_pipeline
+                } else {
+                    self.q4_mmap_pipeline
+                },
             );
             set_buffer(encoder, dense_weights.buffer, 0);
             set_buffer(encoder, input_buffer, 1);
@@ -4128,6 +4154,12 @@ impl MetalExecutorInner {
                     projection.cols
                 );
             }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
             let packed_len = projection
                 .rows
                 .checked_mul(projection.row_packed_bytes)
@@ -4135,7 +4167,7 @@ impl MetalExecutorInner {
             let group_bytes = projection
                 .rows
                 .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
                 .context("dense q4 mmap batch group byte length overflow")?;
             for (offset, len, label) in [
                 (projection.packed_byte_offset, packed_len, "packed"),
@@ -4232,7 +4264,14 @@ impl MetalExecutorInner {
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    self.q4_mmap_pipeline,
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
                 set_buffer(encoder, input_buffer, 1);
@@ -9826,13 +9865,22 @@ fn report_generation_progress(progress: &GenerationProgress<'_>, message: String
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TensorQuantization {
     None,
-    Q4 { group_size: usize, format: String },
+    Q4 {
+        group_size: usize,
+        format: String,
+        #[serde(default = "default_dense_q4_scale_bias_dtype")]
+        scale_bias_dtype: String,
+    },
 }
 
 impl Default for TensorQuantization {
     fn default() -> Self {
         Self::None
     }
+}
+
+fn default_dense_q4_scale_bias_dtype() -> String {
+    EXPERT_SCALE_BIAS_DTYPE_F32.to_string()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9843,10 +9891,19 @@ struct DenseQ4Layout {
     groups_per_row: usize,
     packed_bytes: usize,
     scales_bytes: usize,
+    scale_bias_bytes: usize,
     total_bytes: usize,
 }
 
 fn dense_q4_layout(shape: &[usize], group_size: usize) -> Result<DenseQ4Layout> {
+    dense_q4_layout_with_scale_bias_dtype(shape, group_size, EXPERT_SCALE_BIAS_DTYPE_F32)
+}
+
+fn dense_q4_layout_with_scale_bias_dtype(
+    shape: &[usize],
+    group_size: usize,
+    scale_bias_dtype: &str,
+) -> Result<DenseQ4Layout> {
     if group_size == 0 {
         bail!("dense q4 group_size must be positive");
     }
@@ -9871,8 +9928,10 @@ fn dense_q4_layout(shape: &[usize], group_size: usize) -> Result<DenseQ4Layout> 
     let groups = rows
         .checked_mul(groups_per_row)
         .context("dense q4 group count overflow")?;
+    let scale_bias_bytes = expert_scale_bias_dtype_size(scale_bias_dtype)
+        .with_context(|| format!("unsupported dense q4 scale/bias dtype {scale_bias_dtype}"))?;
     let scales_bytes = groups
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(scale_bias_bytes)
         .context("dense q4 scale byte length overflow")?;
     let total_bytes = packed_bytes
         .checked_add(scales_bytes)
@@ -9885,6 +9944,7 @@ fn dense_q4_layout(shape: &[usize], group_size: usize) -> Result<DenseQ4Layout> 
         groups_per_row,
         packed_bytes,
         scales_bytes,
+        scale_bias_bytes,
         total_bytes,
     })
 }
@@ -9958,6 +10018,7 @@ impl TensorRegistry {
                         quantization: TensorQuantization::Q4 {
                             group_size: GROUP_SIZE,
                             format: ExpertQuantization::FourBitProduction.as_str().to_string(),
+                            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
                         },
                     },
                 );
@@ -10657,7 +10718,12 @@ impl DenseStore {
                 let Some(entry) = self.registry.tensor(spec.tensor_name) else {
                     return Ok(None);
                 };
-                let TensorQuantization::Q4 { group_size, .. } = &entry.quantization else {
+                let TensorQuantization::Q4 {
+                    group_size,
+                    scale_bias_dtype,
+                    ..
+                } = &entry.quantization
+                else {
                     return Ok(None);
                 };
                 let (rows, cols) = validate_dense_matvec_shape(
@@ -10666,7 +10732,11 @@ impl DenseStore {
                     spec.output_width,
                     input.len(),
                 )?;
-                let layout = dense_q4_layout(&entry.shape, *group_size)?;
+                let layout = dense_q4_layout_with_scale_bias_dtype(
+                    &entry.shape,
+                    *group_size,
+                    scale_bias_dtype,
+                )?;
                 if entry.byte_len as usize != layout.total_bytes {
                     bail!(
                         "dense q4 tensor {} byte length {} does not match computed layout {}",
@@ -10718,6 +10788,7 @@ impl DenseStore {
                     row_packed_bytes: layout.row_packed_bytes,
                     groups_per_row: layout.groups_per_row,
                     group_size: *group_size,
+                    scale_bias_dtype: scale_bias_dtype.clone(),
                 });
             }
 
@@ -11341,14 +11412,20 @@ impl DenseStore {
         let entry = self.registry.tensor(canonical_name).with_context(|| {
             format!("Flash-MoE dense tensor registry is missing {canonical_name}")
         })?;
-        let TensorQuantization::Q4 { group_size, .. } = &entry.quantization else {
+        let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        else {
             bail!("Flash-MoE dense tensor {canonical_name} is not q4-quantized");
         };
         let group_size = metal
             .as_ref()
             .map(|(_, group_size, _)| *group_size)
             .unwrap_or(*group_size);
-        let layout = dense_q4_layout(&entry.shape, group_size)?;
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, group_size, scale_bias_dtype)?;
         if rows != layout.rows || cols != layout.cols {
             bail!(
                 "Flash-MoE dense q4 tensor {canonical_name} matvec dimensions mismatch: layout rows={}, cols={}, requested rows={rows}, cols={cols}",
@@ -11368,7 +11445,7 @@ impl DenseStore {
             let tile_rows = end - start;
             let groups_offset = start
                 .checked_mul(layout.groups_per_row)
-                .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+                .and_then(|groups| groups.checked_mul(layout.scale_bias_bytes))
                 .context("dense q4 mmap groups tile offset overflow")?;
             let resident = if let Some((metal, _, _)) = metal.as_ref() {
                 let packed_offset = entry
@@ -11400,6 +11477,7 @@ impl DenseStore {
                     layout.row_packed_bytes,
                     layout.groups_per_row,
                     group_size,
+                    scale_bias_dtype,
                 )?
             } else {
                 None
@@ -11409,7 +11487,7 @@ impl DenseStore {
                 resident_tiles += 1;
                 resident_bytes = resident_bytes.saturating_add(
                     (tile_rows * layout.row_packed_bytes
-                        + tile_rows * layout.groups_per_row * 2 * std::mem::size_of::<f32>())
+                        + tile_rows * layout.groups_per_row * 2 * layout.scale_bias_bytes)
                         as u64,
                 );
                 projected
@@ -11601,7 +11679,14 @@ impl DenseStore {
     ) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>, DenseTileReadTiming)> {
         let started = Instant::now();
         let mut timing = DenseTileReadTiming::default();
-        let layout = dense_q4_layout(&entry.shape, group_size)?;
+        let TensorQuantization::Q4 {
+            scale_bias_dtype, ..
+        } = &entry.quantization
+        else {
+            bail!("dense tensor {} is not q4-quantized", entry.name);
+        };
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, group_size, scale_bias_dtype)?;
         if entry.byte_len as usize != layout.total_bytes {
             bail!(
                 "dense q4 tensor {} byte length {} does not match computed layout {}",
@@ -11633,11 +11718,11 @@ impl DenseStore {
             .context("dense q4 packed tile length overflow")?;
         let groups_offset = start_row
             .checked_mul(layout.groups_per_row)
-            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|groups| groups.checked_mul(layout.scale_bias_bytes))
             .context("dense q4 groups tile offset overflow")?;
         let groups_len = row_count
             .checked_mul(layout.groups_per_row)
-            .and_then(|groups| groups.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|groups| groups.checked_mul(layout.scale_bias_bytes))
             .context("dense q4 groups tile byte length overflow")?;
 
         let (packed, read_packed) =
@@ -11658,8 +11743,8 @@ impl DenseStore {
             .bytes_read
             .saturating_add((packed_len + groups_len + groups_len) as u64);
         let decode_started = Instant::now();
-        let scales = decode_dense_tensor_f32("F32", &scale_bytes)?;
-        let biases = decode_dense_tensor_f32("F32", &bias_bytes)?;
+        let scales = decode_dense_tensor_f32(scale_bias_dtype, &scale_bytes)?;
+        let biases = decode_dense_tensor_f32(scale_bias_dtype, &bias_bytes)?;
         timing.decode += decode_started.elapsed();
         timing.decoded_bytes = timing
             .decoded_bytes
@@ -14457,6 +14542,99 @@ kernel void q4_mmap_fma_matvec(
     }
 }
 
+kernel void q4_mmap_fma_matvec_bf16_scale_bias(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& packed_byte_offset [[buffer(3)]],
+    constant ulong& scales_byte_offset [[buffer(4)]],
+    constant ulong& biases_byte_offset [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& cols [[buffer(7)]],
+    constant uint& groups_per_row [[buffer(8)]],
+    constant uint& group_size [[buffer(9)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    device const uchar* packed = weight_bytes + packed_byte_offset;
+    device const ushort* scales = reinterpret_cast<device const ushort*>(weight_bytes + scales_byte_offset);
+    device const ushort* biases = reinterpret_cast<device const ushort*>(weight_bytes + biases_byte_offset);
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 4096;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[4096];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = bf16_to_float(scales[scale_row + group]);
+            float bias = bf16_to_float(biases[scale_row + group]);
+
+            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
+            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
+            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
+            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
+            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
+            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
+            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
+            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
+
+            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
+            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
+            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
+            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
+            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
+            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
+            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
+            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float scale0 = bf16_to_float(scales[scale_row + group0]);
+            float bias0 = bf16_to_float(biases[scale_row + group0]);
+            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float scale1 = bf16_to_float(scales[scale_row + group1]);
+                float bias1 = bf16_to_float(biases[scale_row + group1]);
+                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
 kernel void route_top4(
     device const float* scores [[buffer(0)]],
     device uint4* indices [[buffer(1)]],
@@ -15054,75 +15232,108 @@ fn build_manifest(
     let mut shard_cache = BTreeMap::<String, SafetensorShard>::new();
     let mut runtime_offset = 0u64;
     let mut visual_offset = 0u64;
-    for (tensor, shard) in index.weight_map {
+    for (tensor, shard) in &index.weight_map {
         let canonical_tensor = canonical_hf_tensor_name(&tensor);
         if skip_flashmoe_runtime_tensor(&canonical_tensor) {
             continue;
         }
-        let shard_path = snapshot_dir.join(&shard);
+        if is_q4_aux_tensor_name(&canonical_tensor)
+            && index
+                .weight_map
+                .contains_key(q4_weight_name_for_aux(&tensor).as_str())
+        {
+            continue;
+        }
+        let shard_path = snapshot_dir.join(shard);
         if !shard_path.is_file() {
             bail!(
                 "safetensors shard referenced by index is missing: {}",
                 shard_path.display()
             );
         }
-        if !shard_cache.contains_key(&shard) {
+        if !shard_cache.contains_key(shard) {
             shard_cache.insert(shard.clone(), parse_safetensors_header(&shard_path)?);
         }
-        let shard_info = shard_cache.get(&shard).expect("inserted above");
-        let tensor_info = shard_info.tensors.get(&tensor).with_context(|| {
+        let shard_info = shard_cache.get(shard).expect("inserted above");
+        let tensor_info = shard_info.tensors.get(tensor).with_context(|| {
             format!("tensor {tensor} listed in index but missing from safetensors header {shard}")
         })?;
+        let tensor_dtype = tensor_info.dtype.clone();
+        let tensor_shape = tensor_info.shape.clone();
+        let tensor_source_offsets = tensor_info.data_offsets;
         if is_expert_tensor_name(&canonical_tensor) {
             let (layer, expert) = parse_layer_expert(&canonical_tensor);
             expert_tensors.push(ExpertTensorRef {
                 tensor: canonical_tensor,
-                shard,
+                shard: shard.clone(),
                 layer,
                 expert,
-                dtype: Some(tensor_info.dtype.clone()),
-                shape: tensor_info.shape.clone(),
-                source_offsets: Some(tensor_info.data_offsets),
+                dtype: Some(tensor_dtype),
+                shape: tensor_shape,
+                source_offsets: Some(tensor_source_offsets),
             });
         } else if canonical_tensor.starts_with("visual.") {
             // Vision encoder tensors go into a separate store.
-            let byte_len = tensor_info.data_offsets[1]
-                .checked_sub(tensor_info.data_offsets[0])
+            let byte_len = tensor_source_offsets[1]
+                .checked_sub(tensor_source_offsets[0])
                 .with_context(|| format!("invalid data_offsets for visual tensor {tensor}"))?;
             visual_offset = align_to(visual_offset, TENSOR_ALIGNMENT);
             visual_tensor_refs.push(DenseTensorRef {
                 tensor: canonical_tensor,
-                shard,
-                dtype: tensor_info.dtype.clone(),
-                shape: tensor_info.shape.clone(),
-                source_offsets: tensor_info.data_offsets,
+                shard: shard.clone(),
+                dtype: tensor_dtype,
+                shape: tensor_shape,
+                source_offsets: tensor_source_offsets,
                 runtime_offset: visual_offset,
                 byte_len,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             });
             visual_offset = visual_offset.saturating_add(byte_len);
         } else {
             dense_shards.insert(shard.clone());
-            let source_byte_len = tensor_info.data_offsets[1]
-                .checked_sub(tensor_info.data_offsets[0])
+            let source_byte_len = tensor_source_offsets[1]
+                .checked_sub(tensor_source_offsets[0])
                 .with_context(|| format!("invalid data_offsets for tensor {tensor}"))?;
-            let quantization = dense_tensor_quantization(&canonical_tensor, tensor_info);
+            let native_q4 = dense_native_q4_sources(
+                snapshot_dir,
+                &index.weight_map,
+                &mut shard_cache,
+                &tensor,
+            )?;
+            let quantization =
+                dense_tensor_quantization(&canonical_tensor, &tensor_dtype, &native_q4);
+            let runtime_shape = if native_q4.is_some() {
+                logical_shape_for_mlx_q4(&tensor_shape)?
+            } else {
+                tensor_shape.clone()
+            };
             let byte_len = match &quantization {
                 TensorQuantization::None => source_byte_len,
-                TensorQuantization::Q4 { group_size, .. } => {
-                    dense_q4_layout(&tensor_info.shape, *group_size)?.total_bytes as u64
+                TensorQuantization::Q4 {
+                    group_size,
+                    scale_bias_dtype,
+                    ..
+                } => {
+                    dense_q4_layout_with_scale_bias_dtype(
+                        &runtime_shape,
+                        *group_size,
+                        scale_bias_dtype,
+                    )?
+                    .total_bytes as u64
                 }
             };
             runtime_offset = align_to(runtime_offset, TENSOR_ALIGNMENT);
             dense_tensor_refs.push(DenseTensorRef {
                 tensor: canonical_tensor,
-                shard,
-                dtype: tensor_info.dtype.clone(),
-                shape: tensor_info.shape.clone(),
-                source_offsets: tensor_info.data_offsets,
+                shard: shard.clone(),
+                dtype: tensor_dtype,
+                shape: runtime_shape,
+                source_offsets: tensor_source_offsets,
                 runtime_offset,
                 byte_len,
                 quantization,
+                q4_sources: native_q4,
             });
             runtime_offset = runtime_offset.saturating_add(byte_len);
         }
@@ -15143,12 +15354,143 @@ fn skip_flashmoe_runtime_tensor(canonical_tensor: &str) -> bool {
     canonical_tensor.starts_with("mtp.")
 }
 
+fn is_q4_aux_tensor_name(canonical_tensor: &str) -> bool {
+    canonical_tensor.ends_with(".scales") || canonical_tensor.ends_with(".biases")
+}
+
+fn q4_weight_name_for_aux(tensor: &str) -> String {
+    tensor
+        .strip_suffix(".scales")
+        .or_else(|| tensor.strip_suffix(".biases"))
+        .map(|base| format!("{base}.weight"))
+        .unwrap_or_else(|| tensor.to_string())
+}
+
+fn q4_aux_tensor_name(weight: &str, suffix: &str) -> String {
+    weight
+        .strip_suffix(".weight")
+        .map(|base| format!("{base}.{suffix}"))
+        .unwrap_or_else(|| format!("{weight}.{suffix}"))
+}
+
+fn logical_shape_for_mlx_q4(shape: &[usize]) -> Result<Vec<usize>> {
+    let Some((last, prefix)) = shape.split_last() else {
+        bail!("native dense q4 tensor has empty shape");
+    };
+    let cols = last
+        .checked_mul(8)
+        .context("native dense q4 logical column count overflow")?;
+    let mut logical = prefix.to_vec();
+    logical.push(cols);
+    Ok(logical)
+}
+
+fn dense_native_q4_sources(
+    snapshot_dir: &Path,
+    weight_map: &BTreeMap<String, String>,
+    shard_cache: &mut BTreeMap<String, SafetensorShard>,
+    tensor: &str,
+) -> Result<Option<DenseQ4SourceRefs>> {
+    let canonical_tensor = canonical_hf_tensor_name(tensor);
+    if !canonical_tensor.ends_with(".weight") {
+        return Ok(None);
+    }
+    let Some(weight_shard) = weight_map.get(tensor) else {
+        return Ok(None);
+    };
+    if !shard_cache.contains_key(weight_shard) {
+        let path = snapshot_dir.join(weight_shard);
+        shard_cache.insert(weight_shard.clone(), parse_safetensors_header(&path)?);
+    }
+    let (weight_shape, weight_offsets) = {
+        let weight_info = shard_cache
+            .get(weight_shard)
+            .and_then(|shard| shard.tensors.get(tensor))
+            .with_context(|| format!("tensor {tensor} missing from safetensors header"))?;
+        if !weight_info.dtype.eq_ignore_ascii_case("U32") {
+            return Ok(None);
+        }
+        (weight_info.shape.clone(), weight_info.data_offsets)
+    };
+
+    let scales_name = q4_aux_tensor_name(tensor, "scales");
+    let biases_name = q4_aux_tensor_name(tensor, "biases");
+    let (Some(scales_shard), Some(biases_shard)) =
+        (weight_map.get(&scales_name), weight_map.get(&biases_name))
+    else {
+        return Ok(None);
+    };
+    for shard in [scales_shard, biases_shard] {
+        if !shard_cache.contains_key(shard) {
+            let path = snapshot_dir.join(shard);
+            shard_cache.insert(shard.clone(), parse_safetensors_header(&path)?);
+        }
+    }
+    let scales_info = shard_cache
+        .get(scales_shard)
+        .and_then(|shard| shard.tensors.get(&scales_name))
+        .with_context(|| format!("tensor {scales_name} missing from safetensors header"))?;
+    let biases_info = shard_cache
+        .get(biases_shard)
+        .and_then(|shard| shard.tensors.get(&biases_name))
+        .with_context(|| format!("tensor {biases_name} missing from safetensors header"))?;
+    if !scales_info
+        .dtype
+        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        || !biases_info
+            .dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+    {
+        bail!(
+            "native dense q4 tensor {tensor} expects BF16 scales/biases, found {}/{}",
+            scales_info.dtype,
+            biases_info.dtype
+        );
+    }
+    let logical_shape = logical_shape_for_mlx_q4(&weight_shape)?;
+    let layout = dense_q4_layout_with_scale_bias_dtype(
+        &logical_shape,
+        GROUP_SIZE,
+        EXPERT_SCALE_BIAS_DTYPE_BF16,
+    )?;
+    let weight_bytes = weight_offsets[1].saturating_sub(weight_offsets[0]);
+    let scales_bytes = scales_info.data_offsets[1].saturating_sub(scales_info.data_offsets[0]);
+    let biases_bytes = biases_info.data_offsets[1].saturating_sub(biases_info.data_offsets[0]);
+    if weight_bytes != layout.packed_bytes as u64
+        || scales_bytes != layout.scales_bytes as u64
+        || biases_bytes != layout.scales_bytes as u64
+    {
+        bail!(
+            "native dense q4 tensor {tensor} layout mismatch: weight/scales/biases bytes {weight_bytes}/{scales_bytes}/{biases_bytes}, expected {}/{}/{}",
+            layout.packed_bytes,
+            layout.scales_bytes,
+            layout.scales_bytes
+        );
+    }
+    Ok(Some(DenseQ4SourceRefs {
+        scales_shard: scales_shard.clone(),
+        scales_offsets: scales_info.data_offsets,
+        biases_shard: biases_shard.clone(),
+        biases_offsets: biases_info.data_offsets,
+        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+    }))
+}
+
 fn dense_tensor_quantization(
     canonical_tensor: &str,
-    tensor_info: &SafetensorTensorInfo,
+    tensor_dtype: &str,
+    native_q4: &Option<DenseQ4SourceRefs>,
 ) -> TensorQuantization {
-    let _ = (canonical_tensor, tensor_info);
-    TensorQuantization::None
+    let _ = (canonical_tensor, tensor_dtype);
+    if let Some(native_q4) = native_q4 {
+        TensorQuantization::Q4 {
+            group_size: GROUP_SIZE,
+            format: DENSE_Q4_MLX_FORMAT.to_string(),
+            scale_bias_dtype: native_q4.scale_bias_dtype.clone(),
+        }
+    } else {
+        TensorQuantization::None
+    }
 }
 
 fn canonical_hf_tensor_name(name: &str) -> String {
@@ -15260,6 +15602,21 @@ fn write_dense_tensor_store(
             write_padding(&mut out, tensor.runtime_offset - current)?;
             current = tensor.runtime_offset;
         }
+        if let Some(q4_sources) = &tensor.q4_sources {
+            for shard in [&q4_sources.scales_shard, &q4_sources.biases_shard] {
+                if !shard_cache.contains_key(shard) {
+                    let path = snapshot_dir.join(shard);
+                    let file = fs::File::open(&path)
+                        .with_context(|| format!("failed to open shard {}", path.display()))?;
+                    let mmap = unsafe {
+                        memmap2::MmapOptions::new()
+                            .map(&file)
+                            .with_context(|| format!("failed to memory-map {}", path.display()))?
+                    };
+                    shard_cache.insert(shard.clone(), (mmap, parse_safetensors_header(&path)?));
+                }
+            }
+        }
         let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
         let start = shard.data_start + tensor.source_offsets[0];
         let end = shard.data_start + tensor.source_offsets[1];
@@ -15269,7 +15626,81 @@ fn write_dense_tensor_store(
                 out.write_all(raw)
                     .with_context(|| format!("failed to write dense tensor {}", tensor.tensor))?;
             }
-            TensorQuantization::Q4 { group_size, .. } => {
+            TensorQuantization::Q4 {
+                group_size,
+                scale_bias_dtype,
+                ..
+            } => {
+                let layout = dense_q4_layout_with_scale_bias_dtype(
+                    &tensor.shape,
+                    *group_size,
+                    scale_bias_dtype,
+                )?;
+                if let Some(q4_sources) = &tensor.q4_sources {
+                    if raw.len() != layout.packed_bytes {
+                        bail!(
+                            "native dense q4 packed byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            raw.len(),
+                            layout.packed_bytes
+                        );
+                    }
+                    out.write_all(raw).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 packed values for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    let (scale_bytes, scale_shard) = shard_cache
+                        .get(&q4_sources.scales_shard)
+                        .expect("inserted above");
+                    let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                    let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                    let scales = &scale_bytes[scale_start as usize..scale_end as usize];
+                    if scales.len() != layout.scales_bytes {
+                        bail!(
+                            "native dense q4 scale byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            scales.len(),
+                            layout.scales_bytes
+                        );
+                    }
+                    out.write_all(scales).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 scales for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    let (bias_bytes, bias_shard) = shard_cache
+                        .get(&q4_sources.biases_shard)
+                        .expect("inserted above");
+                    let bias_start = bias_shard.data_start + q4_sources.biases_offsets[0];
+                    let bias_end = bias_shard.data_start + q4_sources.biases_offsets[1];
+                    let biases = &bias_bytes[bias_start as usize..bias_end as usize];
+                    if biases.len() != layout.scales_bytes {
+                        bail!(
+                            "native dense q4 bias byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            biases.len(),
+                            layout.scales_bytes
+                        );
+                    }
+                    out.write_all(biases).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 biases for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    current = current.saturating_add(tensor.byte_len);
+                    continue;
+                }
+                if !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_F32) {
+                    bail!(
+                        "post-hoc dense q4 quantization for {} only supports F32 scale/bias output, requested {}",
+                        tensor.tensor,
+                        scale_bias_dtype
+                    );
+                }
                 let values = decode_dense_tensor_f32(&tensor.dtype, raw).with_context(|| {
                     format!(
                         "failed to decode dense tensor {} as {} before q4 quantization",
@@ -15283,7 +15714,6 @@ fn write_dense_tensor_store(
                             tensor.tensor
                         )
                     })?;
-                let layout = dense_q4_layout(&tensor.shape, *group_size)?;
                 if packed.values.len() != layout.packed_bytes
                     || packed.scales.len() != layout.scales_bytes / std::mem::size_of::<f32>()
                     || packed.biases.len() != layout.scales_bytes / std::mem::size_of::<f32>()
@@ -19167,6 +19597,7 @@ mod tests {
         for kernel in [
             "q4_fma_matvec",
             "q4_mmap_fma_matvec",
+            "q4_mmap_fma_matvec_bf16_scale_bias",
             "route_top4",
             "dense_matvec",
             "dense_matvec_bf16",
@@ -19547,6 +19978,7 @@ mod tests {
                     runtime_offset: i as u64 * 4096,
                     byte_len,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }
             })
             .collect();
@@ -19571,6 +20003,7 @@ mod tests {
             runtime_offset: slot as u64 * 4096,
             byte_len,
             quantization: TensorQuantization::None,
+            q4_sources: None,
         }
     }
 
@@ -20242,6 +20675,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: 0,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         let registry = TensorRegistry::from_manifest(&manifest);
@@ -20662,6 +21096,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: 0,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         let registry = TensorRegistry::from_manifest(&manifest);
@@ -21909,6 +22344,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -21962,6 +22398,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22004,6 +22441,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22055,6 +22493,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22123,6 +22562,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22190,7 +22630,9 @@ mod tests {
                 quantization: TensorQuantization::Q4 {
                     group_size,
                     format: DENSE_Q4_FORMAT.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
                 },
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22296,7 +22738,9 @@ mod tests {
                 quantization: TensorQuantization::Q4 {
                     group_size,
                     format: DENSE_Q4_FORMAT.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
                 },
+                q4_sources: None,
             }],
         };
         fs::write(
@@ -22359,6 +22803,7 @@ mod tests {
                 layout.row_packed_bytes,
                 layout.groups_per_row,
                 group_size,
+                EXPERT_SCALE_BIAS_DTYPE_F32,
             )
             .unwrap()
             .expect("resident dense mmap buffer should be available");
@@ -22404,6 +22849,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(
@@ -22461,7 +22907,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_manifest_quantizes_projection_weights_but_not_vocab_or_embeddings() {
+    fn dense_manifest_preserves_non_native_dense_weights() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path();
         let q_proj = f32_tensor_bytes(&[0.0, 1.0, 2.0, 3.0, -1.0, -2.0, -3.0, -4.0]);
@@ -22554,6 +23000,112 @@ mod tests {
     }
 
     #[test]
+    fn dense_manifest_imports_native_mlx_q4_triples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path();
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let scales_name = "model.layers.0.self_attn.q_proj.scales";
+        let biases_name = "model.layers.0.self_attn.q_proj.biases";
+        let packed_word = 0x7654_3210u32.to_le_bytes().to_vec();
+        let scales = bf16_tensor_bytes(&[0.5]);
+        let biases = bf16_tensor_bytes(&[1.0]);
+        let tensors = vec![
+            (
+                tensor_name.to_string(),
+                "U32".to_string(),
+                vec![1, 1],
+                packed_word.clone(),
+            ),
+            (
+                scales_name.to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![1, 1],
+                scales.clone(),
+            ),
+            (
+                biases_name.to_string(),
+                EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                vec![1, 1],
+                biases.clone(),
+            ),
+        ];
+        let fixture_refs = typed_fixture_refs(&tensors);
+        fs::write(
+            snapshot.join("dense.safetensors"),
+            make_typed_safetensors(&fixture_refs),
+        )
+        .unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (name, _, _, _) in &tensors {
+            weight_map.insert(
+                name.clone(),
+                serde_json::Value::String("dense.safetensors".to_string()),
+            );
+        }
+        let index = serde_json::Value::Object(serde_json::Map::from_iter([(
+            "weight_map".to_string(),
+            serde_json::Value::Object(weight_map),
+        )]));
+        let index_path = snapshot.join("model.safetensors.index.json");
+        fs::write(&index_path, index.to_string()).unwrap();
+
+        let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+        assert!(visual_refs.is_empty());
+        assert!(manifest.expert_tensors.is_empty());
+        assert_eq!(manifest.dense_tensors.len(), 1);
+        let dense_ref = &manifest.dense_tensors[0];
+        assert_eq!(dense_ref.tensor, tensor_name);
+        assert_eq!(dense_ref.dtype, "U32");
+        assert_eq!(dense_ref.shape, vec![1, 8]);
+        assert_eq!(
+            dense_ref.quantization,
+            TensorQuantization::Q4 {
+                group_size: GROUP_SIZE,
+                format: DENSE_Q4_MLX_FORMAT.to_string(),
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        );
+        assert!(dense_ref.q4_sources.is_some());
+        let layout = dense_q4_layout_with_scale_bias_dtype(
+            &dense_ref.shape,
+            GROUP_SIZE,
+            EXPERT_SCALE_BIAS_DTYPE_BF16,
+        )
+        .unwrap();
+        assert_eq!(dense_ref.byte_len, layout.total_bytes as u64);
+        assert_eq!(layout.packed_bytes, packed_word.len());
+        assert_eq!(layout.scales_bytes, scales.len());
+
+        let dense_path = snapshot.join("model_weights.bin");
+        write_dense_tensor_store(snapshot, &dense_path, &manifest.dense_tensors).unwrap();
+        let mut expected_bytes = packed_word.clone();
+        expected_bytes.extend_from_slice(&scales);
+        expected_bytes.extend_from_slice(&biases);
+        assert_eq!(fs::read(&dense_path).unwrap(), expected_bytes);
+
+        let manifest_path = snapshot.join("model_weights.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let entry = store.registry().tensor(tensor_name).unwrap();
+        let (packed, decoded_scales, decoded_biases, timing) =
+            store.read_dense_q4_rows(entry, 0, 1, GROUP_SIZE).unwrap();
+        assert_eq!(packed, packed_word);
+        assert_eq!(decoded_scales, vec![0.5]);
+        assert_eq!(decoded_biases, vec![1.0]);
+        assert_eq!(
+            timing.bytes_read,
+            (layout.packed_bytes + layout.scales_bytes * 2) as u64
+        );
+
+        let input = vec![1.0; 8];
+        let projected = store
+            .project_dense_tensor_with_metal(None, tensor_name, &input, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected, vec![22.0]);
+    }
+
+    #[test]
     fn dense_store_reuses_decoded_tiles_for_repeated_lm_head_sampling() {
         let tmp = tempfile::tempdir().unwrap();
         let dense_path = tmp.path().join("model_weights.bin");
@@ -22577,6 +23129,7 @@ mod tests {
                 runtime_offset: 0,
                 byte_len: bytes.len() as u64,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             }],
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -22631,6 +23184,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
@@ -22697,6 +23251,7 @@ mod tests {
                 runtime_offset: offset,
                 byte_len,
                 quantization: TensorQuantization::None,
+                q4_sources: None,
             });
         };
         append_tensor(
@@ -23610,6 +24165,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
@@ -23670,6 +24226,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
@@ -23739,6 +24296,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
@@ -23782,6 +24340,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
@@ -23843,6 +24402,7 @@ mod tests {
                     runtime_offset: 0,
                     byte_len: bytes.len() as u64,
                     quantization: TensorQuantization::None,
+                    q4_sources: None,
                 }],
             })
             .unwrap(),
