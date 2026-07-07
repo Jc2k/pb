@@ -10297,6 +10297,26 @@ fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {
         .min(rows.max(1))
 }
 
+fn dense_mmap_dtype_supported(dtype: &str) -> bool {
+    matches!(
+        dtype.to_ascii_uppercase().as_str(),
+        "F32" | "FLOAT32" | "FP32" | "BF16" | "BFLOAT16"
+    )
+}
+
+fn dense_projection_tile_rows_for_metal(
+    dtype: &str,
+    cols: usize,
+    rows: usize,
+    resident_mmap_available: bool,
+) -> usize {
+    if resident_mmap_available && dense_mmap_dtype_supported(dtype) {
+        rows.max(1)
+    } else {
+        dense_projection_tile_rows(cols, rows)
+    }
+}
+
 fn validate_dense_matvec_shape(
     entry: &RuntimeTensorEntry,
     canonical_name: &str,
@@ -11304,7 +11324,12 @@ impl DenseStore {
         let mut output = vec![0.0f32; output_width];
         let mut resident_tiles = 0usize;
         let mut resident_bytes = 0u64;
-        let tile_rows = dense_projection_tile_rows(cols, rows);
+        let tile_rows = dense_projection_tile_rows_for_metal(
+            &dtype,
+            cols,
+            rows,
+            metal.has_resident_dense_weights(),
+        );
         let mut tiles = 0usize;
         let element_size = dtype_size(&dtype);
         for start in (0..rows).step_by(tile_rows) {
@@ -19631,6 +19656,23 @@ mod tests {
         assert!(
             !METAL_SHADERS.contains("uint half"),
             "`half` is a Metal scalar type and cannot be reused as a variable name"
+        );
+    }
+
+    #[test]
+    fn resident_dense_mmap_projection_uses_full_row_dispatch() {
+        assert_eq!(dense_projection_tile_rows(8192, 4096), 2048);
+        assert_eq!(
+            dense_projection_tile_rows_for_metal("BF16", 8192, 4096, true),
+            4096
+        );
+        assert_eq!(
+            dense_projection_tile_rows_for_metal("BF16", 8192, 4096, false),
+            2048
+        );
+        assert_eq!(
+            dense_projection_tile_rows_for_metal("U8", 8192, 4096, true),
+            2048
         );
     }
 
