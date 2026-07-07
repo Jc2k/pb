@@ -6263,9 +6263,14 @@ impl FlashMoeEngine {
             let mut pending_for_layer = deferred_expert_phase.take();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let deferred_attention_input = if deepstack.is_none() {
-                pending_for_layer
+                let candidate = pending_for_layer
                     .as_ref()
-                    .and_then(DeferredExpertPhase::next_normed_metal_input)
+                    .and_then(DeferredExpertPhase::next_normed_metal_input);
+                if candidate.is_some() && self.deferred_attention_input_supported(layer, runtime) {
+                    candidate
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -6361,8 +6366,6 @@ impl FlashMoeEngine {
                 next_layer_normed = None;
             }
             let combine_started = Instant::now();
-            let attention_residual = hidden.clone();
-            hidden = attention_residual;
             add_in_place(&mut hidden, &projected);
 
             let mlp_residual = hidden.clone();
@@ -6773,6 +6776,77 @@ impl FlashMoeEngine {
             buckets.attention_output_projection += subphase_started.elapsed();
         }
         Ok(projected)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn deferred_attention_input_supported(
+        &self,
+        layer: usize,
+        runtime: &DenseTransformerRuntime,
+    ) -> bool {
+        let Some(metal) = self.metal.as_ref() else {
+            return false;
+        };
+        if self.runtime.is_linear_attention_layer(layer) {
+            let Ok(layout) = runtime.linear_attention_layout(layer) else {
+                return false;
+            };
+            let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+            let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+            let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+            let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+            let specs = [
+                DenseProjectionRequest {
+                    tensor_name: &qkv_name,
+                    output_width: layout.conv_dim,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &z_name,
+                    output_width: layout.total_value_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &b_name,
+                    output_width: layout.num_value_heads,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &a_name,
+                    output_width: layout.num_value_heads,
+                },
+            ];
+            self.dense
+                .can_project_dense_tensors_batched_with_metal_input_buffer(
+                    metal,
+                    &specs,
+                    runtime.width,
+                )
+        } else {
+            let Ok(layout) = runtime.full_attention_layout(layer) else {
+                return false;
+            };
+            let q_name = attention_tensor_name(layer, "q_proj");
+            let k_name = attention_tensor_name(layer, "k_proj");
+            let v_name = attention_tensor_name(layer, "v_proj");
+            let specs = [
+                DenseProjectionRequest {
+                    tensor_name: &q_name,
+                    output_width: layout.q_projection_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &k_name,
+                    output_width: layout.kv_width,
+                },
+                DenseProjectionRequest {
+                    tensor_name: &v_name,
+                    output_width: layout.kv_width,
+                },
+            ];
+            self.dense
+                .can_project_dense_tensors_batched_with_metal_input_buffer(
+                    metal,
+                    &specs,
+                    runtime.width,
+                )
+        }
     }
 
     fn full_attention_cached(
@@ -11224,6 +11298,49 @@ impl DenseStore {
         }
 
         Ok(Some(outputs))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn can_project_dense_tensors_batched_with_metal_input_buffer(
+        &self,
+        metal: &MetalExecutor,
+        specs: &[DenseProjectionRequest<'_>],
+        input_len: usize,
+    ) -> bool {
+        if !metal.has_resident_dense_weights() || specs.is_empty() {
+            return false;
+        }
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return false;
+            };
+            if entry.quantization != TensorQuantization::None || dtype_size(&entry.dtype).is_none()
+            {
+                return false;
+            }
+            let Ok((rows, cols)) =
+                validate_dense_matvec_shape(entry, spec.tensor_name, spec.output_width, input_len)
+            else {
+                return false;
+            };
+            let Some(element_size) = dtype_size(&entry.dtype) else {
+                return false;
+            };
+            let Some(row_bytes) = cols.checked_mul(element_size) else {
+                return false;
+            };
+            let Some(byte_len) = rows.checked_mul(row_bytes) else {
+                return false;
+            };
+            if entry
+                .byte_offset
+                .checked_add(byte_len as u64)
+                .map_or(true, |end| end > self.len)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
