@@ -1684,12 +1684,26 @@ impl DeferredExpertPhase {
             Self::Metal(output) => output.wait(),
         }
     }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn next_normed_metal_input(&self) -> Option<DeferredMetalInput> {
+        match self {
+            Self::Metal(output) => output.next_normed_input(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DenseProjectionRequest<'a> {
     tensor_name: &'a str,
     output_width: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeferredMetalInput {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    buffer: ObjcId,
+    len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1995,6 +2009,17 @@ impl MetalExecutor {
             let _ = (projections, input);
             Ok(None)
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn dense_mmap_matvec_batch_with_input_buffer(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input_buffer: ObjcId,
+        input_len: usize,
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        self.inner
+            .dense_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
     }
 
     fn dense_mmap_top_candidates(
@@ -2437,6 +2462,13 @@ struct MetalDeferredExpertPhase {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalDeferredExpertPhase {
+    fn next_normed_input(&self) -> Option<DeferredMetalInput> {
+        self.next_normed_buffer.map(|buffer| DeferredMetalInput {
+            buffer,
+            len: self.width,
+        })
+    }
+
     fn wait(self) -> Result<ExpertPhaseOutput> {
         unsafe {
             if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
@@ -3972,6 +4004,173 @@ impl MetalExecutorInner {
             for buffer in buffers {
                 self.recycle(buffer);
             }
+            Ok(Some((outputs, timing, projections.len())))
+        }
+    }
+
+    fn dense_mmap_matvec_batch_with_input_buffer(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input_buffer: ObjcId,
+        input_len: usize,
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut dispatches = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len {
+                bail!(
+                    "dense mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input_len,
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            let dtype = projection.dtype.to_ascii_uppercase();
+            let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
+                "F32" | "FLOAT32" | "FP32" => (
+                    std::mem::size_of::<f32>(),
+                    self.dense_mmap_matvec_pipeline,
+                    false,
+                ),
+                "BF16" | "BFLOAT16" => (
+                    std::mem::size_of::<u16>(),
+                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    true,
+                ),
+                _ => return Ok(None),
+            };
+            let stride = projection.stride();
+            if stride < projection.cols {
+                bail!(
+                    "dense mmap batch projection {} stride {} is smaller than cols {}",
+                    projection.tensor_name,
+                    stride,
+                    projection.cols
+                );
+            }
+            let last_row = projection.rows.saturating_sub(1);
+            let values = last_row
+                .checked_mul(stride)
+                .and_then(|base| base.checked_add(projection.cols))
+                .context("dense mmap batch value range overflow")?;
+            let byte_len = values
+                .checked_mul(element_size)
+                .context("dense mmap batch byte length overflow")?;
+            let byte_offset = usize::try_from(projection.byte_offset)
+                .context("dense mmap batch offset does not fit usize")?;
+            if byte_offset
+                .checked_add(byte_len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                return Ok(None);
+            }
+            if byte_offset % element_size != 0 {
+                return Ok(None);
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense mmap batch output row count overflow")?;
+            dispatches.push((pipeline, output_offset, simd_reduced));
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&[output_buffer], true);
+                bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
+            }
+            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&[output_buffer], true);
+                bail!("failed to create Flash-MoE dense mmap batch Metal compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let (pipeline, output_offset_rows, simd_reduced) = dispatches[idx];
+                let output_offset = output_offset_rows
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("dense mmap batch output byte offset overflow")?
+                    as u64;
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let stride_u32 = projection.stride() as u32;
+                msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
+                set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
+                if simd_reduced {
+                    dispatch_q4_threadgroups(encoder, projection.rows as u64);
+                } else {
+                    dispatch_threads(encoder, projection.rows as u64);
+                }
+            }
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_mmap_matvec_batch_deferred_input")
+                .with("projections", projections.len())
+                .with("dispatches", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            timing.readback += readback_started.elapsed();
+
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, (_, output_offset, _)) in projections.iter().zip(dispatches.iter()) {
+                let start = *output_offset;
+                let end = start + projection.rows;
+                let mut output = vec![0.0f32; projection.output_width];
+                output.copy_from_slice(&packed_output[start..end]);
+                outputs.push(output);
+            }
+
+            release(encoder);
+            release(command_buffer);
+            self.recycle(output_buffer);
             Ok(Some((outputs, timing, projections.len())))
         }
     }
@@ -6061,7 +6260,22 @@ impl FlashMoeEngine {
                     ),
                 );
             }
-            if let Some(pending) = deferred_expert_phase.take() {
+            let mut pending_for_layer = deferred_expert_phase.take();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let deferred_attention_input = if deepstack.is_none() {
+                pending_for_layer
+                    .as_ref()
+                    .and_then(DeferredExpertPhase::next_normed_metal_input)
+            } else {
+                None
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let deferred_attention_input: Option<DeferredMetalInput> = None;
+
+            if pending_for_layer.is_some() && deferred_attention_input.is_none() {
+                let pending = pending_for_layer
+                    .take()
+                    .context("missing deferred expert phase")?;
                 let wait_started = Instant::now();
                 let output = pending.wait()?;
                 let wait_elapsed = wait_started.elapsed();
@@ -6089,10 +6303,11 @@ impl FlashMoeEngine {
                 dimensions: self.layer_dimensions(layer),
                 buckets: FlashMoeTimingBuckets::default(),
             };
-            let attention_residual = hidden.clone();
             let combine_started = Instant::now();
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
-            let mut normed = if let Some(normed) = next_layer_normed.take() {
+            let mut normed = if deferred_attention_input.is_some() {
+                Vec::new()
+            } else if let Some(normed) = next_layer_normed.take() {
                 normed
             } else {
                 self.rms_norm_with_model_weight(input_norm_name.as_str(), &hidden)?
@@ -6103,6 +6318,7 @@ impl FlashMoeEngine {
                 self.linear_attention_projected(
                     layer,
                     &normed,
+                    deferred_attention_input,
                     kv_cache,
                     runtime,
                     Some(&mut layer_timing.buckets),
@@ -6111,6 +6327,7 @@ impl FlashMoeEngine {
                 self.full_attention_projected(
                     layer,
                     &normed,
+                    deferred_attention_input,
                     kv_cache,
                     position,
                     rope_position,
@@ -6120,7 +6337,31 @@ impl FlashMoeEngine {
             };
             trace_layer_values(position, layer, "attention", &projected);
             layer_timing.buckets.attention_projection += attention_started.elapsed();
+            if deferred_attention_input.is_some() {
+                let pending = pending_for_layer
+                    .take()
+                    .context("missing deferred expert phase after input projection")?;
+                let wait_started = Instant::now();
+                let output = pending.wait()?;
+                let wait_elapsed = wait_started.elapsed();
+                info!(
+                    token_position = position,
+                    completed_layer = layer.saturating_sub(1),
+                    wait_ms = wait_elapsed.as_millis(),
+                    "flashmoe deferred expert wait complete after input projection"
+                );
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.deferred_wait += wait_elapsed;
+                    if let Some(previous_layer) = timing.layers.last_mut() {
+                        previous_layer.buckets.deferred_wait += wait_elapsed;
+                        previous_layer.buckets.total_wall += wait_elapsed;
+                    }
+                }
+                hidden = output.hidden;
+                next_layer_normed = None;
+            }
             let combine_started = Instant::now();
+            let attention_residual = hidden.clone();
             hidden = attention_residual;
             add_in_place(&mut hidden, &projected);
 
@@ -6372,6 +6613,7 @@ impl FlashMoeEngine {
         &self,
         layer: usize,
         normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
         kv_cache: &mut KvCache,
         position: usize,
         rope_position: MropePosition,
@@ -6384,24 +6626,42 @@ impl FlashMoeEngine {
         let v_name = attention_tensor_name(layer, "v_proj");
 
         let subphase_started = Instant::now();
-        let batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-            self.metal.as_ref(),
-            &[
-                DenseProjectionRequest {
-                    tensor_name: &q_name,
-                    output_width: layout.q_projection_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &k_name,
-                    output_width: layout.kv_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &v_name,
-                    output_width: layout.kv_width,
-                },
-            ],
-            normed,
-        )?;
+        let input_specs = [
+            DenseProjectionRequest {
+                tensor_name: &q_name,
+                output_width: layout.q_projection_width,
+            },
+            DenseProjectionRequest {
+                tensor_name: &k_name,
+                output_width: layout.kv_width,
+            },
+            DenseProjectionRequest {
+                tensor_name: &v_name,
+                output_width: layout.kv_width,
+            },
+        ];
+        let mut batched_input_projections = None;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
+            batched_input_projections = self
+                .dense
+                .project_dense_tensors_batched_with_metal_input_buffer(
+                    metal,
+                    &input_specs,
+                    input.buffer,
+                    input.len,
+                )?;
+        }
+        if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
+            bail!("deferred Metal full-attention input projection is unavailable");
+        }
+        if batched_input_projections.is_none() {
+            batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
+                self.metal.as_ref(),
+                &input_specs,
+                normed,
+            )?;
+        }
         let (q_projected, mut k, v) = if let Some(mut projections) = batched_input_projections {
             let v = projections
                 .pop()
@@ -6566,6 +6826,7 @@ impl FlashMoeEngine {
         &self,
         layer: usize,
         normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
         kv_cache: &mut KvCache,
         runtime: &DenseTransformerRuntime,
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
@@ -6579,28 +6840,46 @@ impl FlashMoeEngine {
         let static_weights = self.linear_attention_static_weights(layer, layout)?;
 
         let subphase_started = Instant::now();
-        let batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-            self.metal.as_ref(),
-            &[
-                DenseProjectionRequest {
-                    tensor_name: &qkv_name,
-                    output_width: layout.conv_dim,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &z_name,
-                    output_width: layout.total_value_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &b_name,
-                    output_width: layout.num_value_heads,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &a_name,
-                    output_width: layout.num_value_heads,
-                },
-            ],
-            normed,
-        )?;
+        let input_specs = [
+            DenseProjectionRequest {
+                tensor_name: &qkv_name,
+                output_width: layout.conv_dim,
+            },
+            DenseProjectionRequest {
+                tensor_name: &z_name,
+                output_width: layout.total_value_width,
+            },
+            DenseProjectionRequest {
+                tensor_name: &b_name,
+                output_width: layout.num_value_heads,
+            },
+            DenseProjectionRequest {
+                tensor_name: &a_name,
+                output_width: layout.num_value_heads,
+            },
+        ];
+        let mut batched_input_projections = None;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
+            batched_input_projections = self
+                .dense
+                .project_dense_tensors_batched_with_metal_input_buffer(
+                    metal,
+                    &input_specs,
+                    input.buffer,
+                    input.len,
+                )?;
+        }
+        if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
+            bail!("deferred Metal linear-attention input projection is unavailable");
+        }
+        if batched_input_projections.is_none() {
+            batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
+                self.metal.as_ref(),
+                &input_specs,
+                normed,
+            )?;
+        }
         let (mut qkv, z, beta, alpha) = if let Some(mut projections) = batched_input_projections {
             let alpha = projections
                 .pop()
@@ -10941,6 +11220,98 @@ impl DenseStore {
                 metal_readback_ms = duration_ms(timing.readback),
                 total_ms = duration_ms(total),
                 "flashmoe dense projection batch complete"
+            );
+        }
+
+        Ok(Some(outputs))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn project_dense_tensors_batched_with_metal_input_buffer(
+        &self,
+        metal: &MetalExecutor,
+        specs: &[DenseProjectionRequest<'_>],
+        input_buffer: ObjcId,
+        input_len: usize,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        if !metal.has_resident_dense_weights() || specs.is_empty() {
+            return Ok(None);
+        }
+        let projection_started = Instant::now();
+        let mut projections = Vec::with_capacity(specs.len());
+        let mut total_rows = 0usize;
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            if entry.quantization != TensorQuantization::None {
+                return Ok(None);
+            }
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, spec.tensor_name, spec.output_width, input_len)?;
+            let Some(element_size) = dtype_size(&entry.dtype) else {
+                bail!(
+                    "Flash-MoE dense tensor {} has unsupported dtype {}",
+                    spec.tensor_name,
+                    entry.dtype
+                );
+            };
+            let row_bytes = cols
+                .checked_mul(element_size)
+                .context("dense tensor batch resident row byte length overflow")?;
+            let byte_len = rows
+                .checked_mul(row_bytes)
+                .context("dense tensor batch resident byte length overflow")?;
+            if entry
+                .byte_offset
+                .checked_add(byte_len as u64)
+                .map_or(true, |end| end > self.len)
+            {
+                bail!(
+                    "Flash-MoE dense tensor {} byte range {}..{} exceeds dense store length {}",
+                    spec.tensor_name,
+                    entry.byte_offset,
+                    entry.byte_offset.saturating_add(byte_len as u64),
+                    self.len
+                );
+            }
+            total_rows = total_rows
+                .checked_add(rows)
+                .context("dense tensor batch total row count overflow")?;
+            projections.push(DenseMmapMatvecProjection {
+                tensor_name: spec.tensor_name.to_string(),
+                byte_offset: entry.byte_offset,
+                dtype: entry.dtype.clone(),
+                rows,
+                cols,
+                output_width: spec.output_width,
+            });
+        }
+
+        let Some((outputs, timing, dispatch_count)) = metal
+            .dense_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?
+        else {
+            return Ok(None);
+        };
+
+        let total = projection_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            let names = specs
+                .iter()
+                .map(|spec| spec.tensor_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
+                projection_batch = %names,
+                projection_count = specs.len(),
+                dispatch_count,
+                input_len,
+                total_rows,
+                metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(timing.dispatch),
+                metal_readback_ms = duration_ms(timing.readback),
+                total_ms = duration_ms(total),
+                "flashmoe dense projection batch from deferred input complete"
             );
         }
 
