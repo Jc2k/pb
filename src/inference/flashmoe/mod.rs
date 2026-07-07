@@ -5,5 +5,7 @@
 //! behind smaller modules.
 
 mod legacy;
+mod types;
 
 pub use legacy::*;
+pub use types::*;
