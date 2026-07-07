@@ -1679,7 +1679,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     Ok(())
 }
 
-const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\tattention_input_projection_ms\tattention_kernel_ms\tattention_output_projection_ms\tattention_misc_ms\trouting_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
+const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\tattention_input_projection_ms\tattention_kernel_ms\tattention_output_projection_ms\tattention_misc_ms\trouting_ms\tdeferred_wait_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlashMoeSmokeBaseline {
@@ -1752,6 +1752,7 @@ fn append_flashmoe_timing_tsv(
             "0.000",
             "0.000",
             "0.000",
+            "0.000",
             "0",
             "0",
             "0.000",
@@ -1794,6 +1795,7 @@ fn append_flashmoe_timing_tsv(
                 &fmt_duration_ms(token.buckets.attention_output_projection),
                 &fmt_duration_ms(token.buckets.attention_misc),
                 &fmt_duration_ms(token.buckets.routing),
+                &fmt_duration_ms(token.buckets.deferred_wait),
                 &fmt_duration_ms(token.buckets.expert_io),
                 &fmt_duration_ms(token.buckets.expert_queue),
                 &fmt_duration_ms(token.buckets.expert_read),
@@ -1839,6 +1841,7 @@ fn append_flashmoe_timing_tsv(
                     &fmt_duration_ms(layer.buckets.attention_output_projection),
                     &fmt_duration_ms(layer.buckets.attention_misc),
                     &fmt_duration_ms(layer.buckets.routing),
+                    &fmt_duration_ms(layer.buckets.deferred_wait),
                     &fmt_duration_ms(layer.buckets.expert_io),
                     &fmt_duration_ms(layer.buckets.expert_queue),
                     &fmt_duration_ms(layer.buckets.expert_read),
@@ -2890,6 +2893,7 @@ fn blob_path(root: &Path, model: &str, digest: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -2953,6 +2957,81 @@ mod tests {
             parse_hf_uri(&canonical),
             Some(("Qwen".to_owned(), "Qwen3.5-397B-A17B".to_owned(), None))
         );
+    }
+
+    #[test]
+    fn flashmoe_timing_tsv_rows_match_header_columns() {
+        let timed = crate::inference::flashmoe::TimedGenerationOutput {
+            output: crate::inference::flashmoe::GenerationOutput {
+                content: "ok".to_string(),
+                tool_calls: Vec::new(),
+                generated_tokens: 1,
+            },
+            timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
+                model: "test-model".to_string(),
+                dimensions: crate::inference::flashmoe::FlashMoeModelDimensions {
+                    layers: 1,
+                    hidden_size: 4,
+                    attention_heads: 1,
+                    kv_heads: 1,
+                    vocab_size: 8,
+                    experts_per_layer: Some(2),
+                    active_experts_per_token: Some(1),
+                    moe_intermediate_size: Some(2),
+                    shared_experts: Some(1),
+                },
+                tokens: vec![crate::inference::flashmoe::FlashMoeTokenTiming {
+                    token_index: 0,
+                    position: 0,
+                    phase: crate::inference::flashmoe::FlashMoeTokenPhase::Decode,
+                    input_token: 1,
+                    sampled_token: Some(2),
+                    layers: vec![crate::inference::flashmoe::FlashMoeLayerTiming {
+                        layer: 0,
+                        layer_kind: crate::inference::flashmoe::FlashMoeLayerKind::LinearAttention,
+                        active_experts: 1,
+                        dimensions: crate::inference::flashmoe::FlashMoeLayerDimensions {
+                            hidden_size: 4,
+                            q_width: Some(4),
+                            kv_width: Some(2),
+                            head_dim: Some(2),
+                            experts_per_layer: Some(2),
+                            active_experts_per_token: Some(1),
+                            shared_experts: Some(1),
+                        },
+                        buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
+                            deferred_wait: Duration::from_millis(3),
+                            total_wall: Duration::from_millis(7),
+                            ..Default::default()
+                        },
+                    }],
+                    buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
+                        deferred_wait: Duration::from_millis(3),
+                        total_wall: Duration::from_millis(9),
+                        ..Default::default()
+                    },
+                }],
+                total_wall: Duration::from_millis(11),
+            },
+        };
+
+        let mut tsv = String::from(FLASHMOE_TIMING_TSV_HEADER);
+        append_flashmoe_timing_tsv(&mut tsv, "kept", 0, "prompt", "pass", &timed);
+        let mut lines = tsv.lines();
+        let header = lines.next().expect("header");
+        let column_count = header.split('\t').count();
+        let deferred_wait_index = header
+            .split('\t')
+            .position(|column| column == "deferred_wait_ms")
+            .expect("deferred_wait_ms column");
+
+        for line in lines {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(columns.len(), column_count, "{line}");
+            if columns[1] == "token" || columns[1] == "layer" {
+                assert_eq!(columns[deferred_wait_index], "3.000");
+            }
+        }
     }
 
     #[test]

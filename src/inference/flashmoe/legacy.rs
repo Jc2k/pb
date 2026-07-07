@@ -6059,12 +6059,20 @@ impl FlashMoeEngine {
             if let Some(pending) = deferred_expert_phase.take() {
                 let wait_started = Instant::now();
                 let output = pending.wait()?;
+                let wait_elapsed = wait_started.elapsed();
                 info!(
                     token_position = position,
                     completed_layer = layer.saturating_sub(1),
-                    wait_ms = wait_started.elapsed().as_millis(),
+                    wait_ms = wait_elapsed.as_millis(),
                     "flashmoe deferred expert wait complete"
                 );
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.deferred_wait += wait_elapsed;
+                    if let Some(previous_layer) = timing.layers.last_mut() {
+                        previous_layer.buckets.deferred_wait += wait_elapsed;
+                        previous_layer.buckets.total_wall += wait_elapsed;
+                    }
+                }
                 hidden = output.hidden;
                 next_layer_normed = output.next_normed;
             }
@@ -6324,12 +6332,20 @@ impl FlashMoeEngine {
         if let Some(pending) = deferred_expert_phase.take() {
             let wait_started = Instant::now();
             let output = pending.wait()?;
+            let wait_elapsed = wait_started.elapsed();
             info!(
                 token_position = position,
                 completed_layer = self.config.num_hidden_layers.saturating_sub(1),
-                wait_ms = wait_started.elapsed().as_millis(),
+                wait_ms = wait_elapsed.as_millis(),
                 "flashmoe deferred expert wait complete"
             );
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.buckets.deferred_wait += wait_elapsed;
+                if let Some(previous_layer) = timing.layers.last_mut() {
+                    previous_layer.buckets.deferred_wait += wait_elapsed;
+                    previous_layer.buckets.total_wall += wait_elapsed;
+                }
+            }
             hidden = output.hidden;
             next_layer_normed = output.next_normed;
         }

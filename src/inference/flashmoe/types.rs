@@ -339,6 +339,7 @@ pub struct FlashMoeTimingBuckets {
     pub attention_output_projection: Duration,
     pub attention_misc: Duration,
     pub routing: Duration,
+    pub deferred_wait: Duration,
     pub expert_io: Duration,
     pub expert_queue: Duration,
     pub expert_read: Duration,
@@ -360,6 +361,7 @@ impl FlashMoeTimingBuckets {
         self.attention_output_projection += other.attention_output_projection;
         self.attention_misc += other.attention_misc;
         self.routing += other.routing;
+        self.deferred_wait += other.deferred_wait;
         self.expert_io += other.expert_io;
         self.expert_queue += other.expert_queue;
         self.expert_read += other.expert_read;
