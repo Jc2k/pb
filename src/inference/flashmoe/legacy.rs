@@ -19694,6 +19694,11 @@ mod tests {
     }
 
     #[test]
+    fn explicit_qwen35_bf16_model_is_not_rewritten_to_mlx() {
+        assert_eq!(canonical_model(QWEN35_BF16_MODEL), QWEN35_BF16_MODEL);
+    }
+
+    #[test]
     fn qwen35_and_legacy_alias_are_flashmoe_names() {
         assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
         assert!(is_qwen35_or_legacy_alias("qwen3-coder-next"));

@@ -3026,7 +3026,11 @@ mod tests {
         let canonical = crate::inference::flashmoe::canonical_model(DEFAULT_MODEL);
         assert_eq!(
             parse_hf_uri(&canonical),
-            Some(("Qwen".to_owned(), "Qwen3.5-397B-A17B".to_owned(), None))
+            Some((
+                "mlx-community".to_owned(),
+                "Qwen3.5-397B-A17B-4bit".to_owned(),
+                None
+            ))
         );
     }
 

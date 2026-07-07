@@ -4,7 +4,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const QWEN35_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
+pub const QWEN35_MODEL: &str = "hf://mlx-community/Qwen3.5-397B-A17B-4bit";
+pub const QWEN35_BF16_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
 pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
 /// Lowercase substring used to identify Qwen3 MoE checkpoints with active
@@ -14,7 +15,7 @@ pub const QWEN3_ACTIVE_PARAMS_MARKER: &str = "-a";
 pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
 /// Lowercase substring used to identify Qwen3-VL MoE model strings.
 pub const QWEN3_VL_MODEL_MARKER: &str = "qwen3-vl-moe";
-pub const CACHE_VERSION: &str = "flashmoe-v1-densebf16";
+pub const CACHE_VERSION: &str = "flashmoe-v2-mlxq4";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
