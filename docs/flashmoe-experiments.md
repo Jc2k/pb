@@ -101,6 +101,10 @@ cargo build --release --target aarch64-apple-darwin
 | 2026-07-07 | Discard | Routing | GPU/Metal route topK env-gated path is disabled; CPU routing is the stable path. | Smoke output sane; prior GPU routing experiments were not faster enough and added risk. | Retry only with isolated parity tests and timing evidence. |
 | 2026-07-07 | Discard | Attention policy | Short-context Metal attention benchmarking path was removed; policy is fixed and simple. | Tests/clippy pass; upstream results note short-context GPU attention can be slower. | Revisit only with long-context benchmark rows. |
 | 2026-07-07 | Open | Performance | Current pb backend is correct enough for smoke but far slower than upstream. | 1 token in about 9 s vs upstream 4-bit target above 4 tok/s. | Profile per-bucket timing from `pb flashmoe bench`; first suspect is dense projection / expert I/O pipeline shape. |
+| 2026-07-07 | Keep | Refactor | Moved the historical FlashMoe monolith behind `src/inference/flashmoe/legacy.rs` and kept `mod.rs` as the stable facade. | `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets` passed after the move. | Continue extracting modules behind the facade without changing cache/runtime behavior. |
+| 2026-07-07 | Keep | Refactor | Extracted public FlashMoe request/output/timing constants and structs to `types.rs`. | Same per-step fmt, clippy, and full Rust test suite passed. | Keep public API types out of execution/platform modules. |
+| 2026-07-07 | Keep | Refactor | Extracted pure routing/Q4 math helpers to `math.rs`. | Same per-step fmt, clippy, and full Rust test suite passed. | Move more pure math only with parity tests nearby. |
+| 2026-07-07 | Keep | Refactor | Added `inference::backend::InferenceBackend` so llama.cpp and FlashMoe can share text/chat/vision request and output shapes. | Same per-step fmt, clippy, and full Rust test suite passed. | Gradually migrate agent/CLI call sites onto the shared interface after behavior tests cover token accounting and tool-call parsing. |
 
 ## Required Regression Notes For Future Agents
 
