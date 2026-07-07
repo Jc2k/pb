@@ -13288,6 +13288,123 @@ fn parse_pbq4_expert_pack(
     bytes: &[u8],
     metadata: Option<&ExpertPackMetadata>,
 ) -> Result<Vec<PackedExpertTensor>> {
+    if let Some(metadata) = metadata {
+        return parse_pbq4_expert_pack_with_metadata(bytes, metadata);
+    }
+    parse_pbq4_expert_pack_generic(bytes, None)
+}
+
+fn parse_pbq4_expert_pack_with_metadata(
+    bytes: &[u8],
+    metadata: &ExpertPackMetadata,
+) -> Result<Vec<PackedExpertTensor>> {
+    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
+        bail!("expert pack is missing PBQ4EXPERT header");
+    }
+    let mut cursor = PBQ4_EXPERT_MAGIC.len();
+    let mut records = Vec::with_capacity(metadata.records.len());
+    for meta in &metadata.records {
+        if cursor as u64 != meta.record_offset {
+            bail!(
+                "expert tensor {} metadata offset mismatch: file cursor {}, metadata has {}",
+                meta.tensor,
+                cursor,
+                meta.record_offset
+            );
+        }
+        let name_len = read_u32_le(bytes, &mut cursor)? as usize;
+        let name_end = cursor
+            .checked_add(name_len)
+            .context("expert tensor name length overflow")?;
+        if name_end > bytes.len() {
+            bail!("expert tensor name extends past end of pack");
+        }
+        let name_bytes = &bytes[cursor..name_end];
+        if name_bytes != meta.tensor.as_bytes() {
+            let file_name =
+                std::str::from_utf8(name_bytes).unwrap_or("<invalid utf-8 expert tensor name>");
+            bail!(
+                "expert tensor metadata name mismatch: file has {file_name}, metadata has {}",
+                meta.tensor
+            );
+        }
+        cursor = name_end;
+        let packed_len = read_u64_le(bytes, &mut cursor)?;
+        if meta.packed_bytes != packed_len {
+            bail!(
+                "expert tensor {} packed length mismatch: file has {packed_len}, metadata has {}",
+                meta.tensor,
+                meta.packed_bytes
+            );
+        }
+        let group_count = usize::try_from(read_u64_le(bytes, &mut cursor)?)
+            .context("expert group count does not fit usize")?;
+        if meta.groups != group_count {
+            bail!(
+                "expert tensor {} group count mismatch: file has {group_count}, metadata has {}",
+                meta.tensor,
+                meta.groups
+            );
+        }
+        let scale_start = cursor;
+        let scales =
+            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, &meta.scale_bias_dtype)
+                .with_context(|| {
+                    format!(
+                        "failed to parse q4 scales for expert tensor {}",
+                        meta.tensor
+                    )
+                })?;
+        let scale_bytes = bytes[scale_start..cursor].to_vec();
+        let bias_start = cursor;
+        let biases =
+            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, &meta.scale_bias_dtype)
+                .with_context(|| {
+                    format!(
+                        "failed to parse q4 biases for expert tensor {}",
+                        meta.tensor
+                    )
+                })?;
+        let bias_bytes = bytes[bias_start..cursor].to_vec();
+        let packed_len =
+            usize::try_from(packed_len).context("expert packed length does not fit usize")?;
+        let packed_end = cursor
+            .checked_add(packed_len)
+            .context("expert packed value range overflow")?;
+        if packed_end > bytes.len() {
+            bail!(
+                "expert packed values for tensor {} extend past end of pack",
+                meta.tensor
+            );
+        }
+        let packed = bytes[cursor..packed_end].to_vec();
+        cursor = packed_end;
+        records.push(PackedExpertTensor {
+            name: meta.tensor.clone(),
+            dtype: meta.dtype.clone(),
+            shape: meta.shape.clone(),
+            group_size: meta.group_size,
+            scale_bias_dtype: meta.scale_bias_dtype.clone(),
+            packed,
+            scales,
+            biases,
+            scale_bytes,
+            bias_bytes,
+        });
+    }
+    if cursor != bytes.len() {
+        bail!(
+            "expert pack has {} trailing bytes after metadata records",
+            bytes.len() - cursor
+        );
+    }
+    Ok(records)
+}
+
+fn parse_pbq4_expert_pack_generic(
+    bytes: &[u8],
+    metadata: Option<&ExpertPackMetadata>,
+) -> Result<Vec<PackedExpertTensor>> {
     if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
         bail!("expert pack is missing PBQ4EXPERT header");
     }
@@ -18010,6 +18127,28 @@ mod tests {
         let out = expert.mlp(&hidden, 2).unwrap();
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
+    }
+
+    #[test]
+    fn pbq4_metadata_parser_matches_generic_parser() {
+        let (pack, metadata) = tiny_q4_expert_pack();
+        let generic = parse_pbq4_expert_pack_generic(&pack, Some(&metadata)).unwrap();
+        let metadata_fast = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+
+        assert_eq!(metadata_fast, generic);
+    }
+
+    #[test]
+    fn pbq4_metadata_parser_rejects_record_offset_drift() {
+        let (pack, mut metadata) = tiny_q4_expert_pack();
+        metadata.records[1].record_offset += 1;
+
+        let err = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap_err();
+
+        assert!(
+            err.to_string().contains("metadata offset mismatch"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
