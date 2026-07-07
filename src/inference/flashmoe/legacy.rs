@@ -1140,6 +1140,161 @@ impl FlashMoePlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashMoeCacheCleanupKind {
+    StaleRuntimeDir,
+    SourceShard,
+}
+
+impl FlashMoeCacheCleanupKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleRuntimeDir => "stale-runtime-dir",
+            Self::SourceShard => "source-shard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeCacheCleanupCandidate {
+    pub path: PathBuf,
+    pub kind: FlashMoeCacheCleanupKind,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashMoeCacheCleanupReport {
+    pub model: String,
+    pub model_cache_dir: PathBuf,
+    pub active_runtime_dir: PathBuf,
+    pub include_source_shards: bool,
+    pub deleted: bool,
+    pub candidates: Vec<FlashMoeCacheCleanupCandidate>,
+}
+
+impl FlashMoeCacheCleanupReport {
+    pub fn total_bytes(&self) -> u64 {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.bytes)
+            .sum()
+    }
+}
+
+pub fn plan_cache_cleanup(
+    plan: &FlashMoePlan,
+    include_source_shards: bool,
+) -> Result<FlashMoeCacheCleanupReport> {
+    let mut candidates = Vec::new();
+    if plan.model_cache_dir.is_dir() {
+        for entry in fs::read_dir(&plan.model_cache_dir)
+            .with_context(|| format!("failed to read {}", plan.model_cache_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let file_type = entry.file_type()?;
+
+            if file_type.is_dir() && file_name.starts_with("flashmoe-") && path != plan.runtime_dir
+            {
+                candidates.push(FlashMoeCacheCleanupCandidate {
+                    bytes: cache_cleanup_path_size(&path)?,
+                    kind: FlashMoeCacheCleanupKind::StaleRuntimeDir,
+                    path,
+                });
+                continue;
+            }
+
+            if include_source_shards
+                && file_type.is_file()
+                && is_flashmoe_source_shard_name(&file_name)
+            {
+                candidates.push(FlashMoeCacheCleanupCandidate {
+                    bytes: entry.metadata()?.len(),
+                    kind: FlashMoeCacheCleanupKind::SourceShard,
+                    path,
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(FlashMoeCacheCleanupReport {
+        model: plan.model.clone(),
+        model_cache_dir: plan.model_cache_dir.clone(),
+        active_runtime_dir: plan.runtime_dir.clone(),
+        include_source_shards,
+        deleted: false,
+        candidates,
+    })
+}
+
+pub fn clean_cache(
+    plan: &FlashMoePlan,
+    include_source_shards: bool,
+    delete: bool,
+) -> Result<FlashMoeCacheCleanupReport> {
+    let mut report = plan_cache_cleanup(plan, include_source_shards)?;
+    if delete {
+        for candidate in &report.candidates {
+            ensure_cache_cleanup_candidate_is_safe(&report.model_cache_dir, candidate)?;
+            delete_cache_cleanup_candidate(candidate)?;
+        }
+        report.deleted = true;
+    }
+    Ok(report)
+}
+
+fn is_flashmoe_source_shard_name(file_name: &str) -> bool {
+    file_name.starts_with("model.safetensors-") && file_name.ends_with(".safetensors")
+}
+
+fn ensure_cache_cleanup_candidate_is_safe(
+    model_cache_dir: &Path,
+    candidate: &FlashMoeCacheCleanupCandidate,
+) -> Result<()> {
+    if candidate.path.parent() != Some(model_cache_dir) {
+        bail!(
+            "refusing to clean cache path outside model cache root: {}",
+            candidate.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn delete_cache_cleanup_candidate(candidate: &FlashMoeCacheCleanupCandidate) -> Result<()> {
+    let metadata = fs::symlink_metadata(&candidate.path)
+        .with_context(|| format!("failed to inspect {}", candidate.path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(&candidate.path)
+            .with_context(|| format!("failed to delete {}", candidate.path.display()))?;
+    } else {
+        fs::remove_file(&candidate.path)
+            .with_context(|| format!("failed to delete {}", candidate.path.display()))?;
+    }
+    Ok(())
+}
+
+fn cache_cleanup_path_size(path: &Path) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        bytes = bytes.saturating_add(cache_cleanup_path_size(&entry.path())?);
+    }
+    Ok(bytes)
+}
+
 pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
     load_with_progress(plan, |_, _| {})
 }
@@ -20219,6 +20374,73 @@ mod tests {
         let plan = plan_unchecked(QWEN35_BF16_MODEL, Path::new("/models"));
         assert!(plan.runtime_dir.ends_with(QWEN35_BF16_CACHE_VERSION));
         assert_eq!(plan.model, QWEN35_BF16_MODEL);
+    }
+
+    #[test]
+    fn cache_cleanup_preserves_active_runtime_and_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v2-denseq4");
+        fs::create_dir_all(stale_runtime.join("packed_experts")).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+        fs::write(
+            plan.model_cache_dir
+                .join("model.safetensors-00001-of-00094.safetensors"),
+            b"src",
+        )
+        .unwrap();
+
+        let dry_run = clean_cache(&plan, false, false).unwrap();
+
+        assert!(!dry_run.deleted);
+        assert_eq!(dry_run.candidates.len(), 1);
+        assert_eq!(
+            dry_run.candidates[0].kind,
+            FlashMoeCacheCleanupKind::StaleRuntimeDir
+        );
+        assert_eq!(dry_run.candidates[0].path, stale_runtime);
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+        assert!(stale_runtime.is_dir());
+    }
+
+    #[test]
+    fn cache_cleanup_deletes_stale_runtimes_and_source_shards_only_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v1");
+        let source_shard = plan
+            .model_cache_dir
+            .join("model.safetensors-00002-of-00094.safetensors");
+        let unrelated_file = plan.model_cache_dir.join("config.json");
+        fs::create_dir_all(&stale_runtime).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+        fs::write(&source_shard, b"source").unwrap();
+        fs::write(&unrelated_file, b"{}").unwrap();
+
+        let runtimes_only = clean_cache(&plan, false, true).unwrap();
+
+        assert!(runtimes_only.deleted);
+        assert_eq!(runtimes_only.candidates.len(), 1);
+        assert!(!stale_runtime.exists());
+        assert!(source_shard.is_file());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+
+        let with_sources = clean_cache(&plan, true, true).unwrap();
+
+        assert_eq!(with_sources.candidates.len(), 1);
+        assert_eq!(
+            with_sources.candidates[0].kind,
+            FlashMoeCacheCleanupKind::SourceShard
+        );
+        assert!(!source_shard.exists());
+        assert!(unrelated_file.is_file());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
     }
 
     #[test]

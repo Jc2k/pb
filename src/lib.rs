@@ -338,6 +338,8 @@ pub enum FlashMoeCommand {
     Infer(FlashMoeInferArgs),
     /// Benchmark FlashMoe generation and emit per-token/per-layer timing TSV
     Bench(FlashMoeBenchArgs),
+    /// Inspect and optionally delete stale FlashMoe cache artifacts
+    CacheClean(FlashMoeCacheCleanArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -451,6 +453,25 @@ pub struct FlashMoeBenchArgs {
     /// Print detailed load/generation progress to stderr
     #[arg(long)]
     pub verbose: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FlashMoeCacheCleanArgs {
+    /// FlashMoe model identifier whose cache should be cleaned
+    #[arg(long, default_value = inference::flashmoe::QWEN35_BF16_MODEL)]
+    pub model: String,
+
+    /// Directory containing pulled model blobs; defaults to the configured model dir
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Also include downloaded source safetensor shards in the candidate list
+    #[arg(long)]
+    pub source_shards: bool,
+
+    /// Delete the listed candidates. Without this flag the command is a dry run.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1431,6 +1452,70 @@ fn run_flashmoe_command(command: FlashMoeCommand) -> Result<()> {
     match command {
         FlashMoeCommand::Infer(args) => run_flashmoe_infer(args),
         FlashMoeCommand::Bench(args) => run_flashmoe_bench(args),
+        FlashMoeCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
+    }
+}
+
+fn run_flashmoe_cache_clean(args: FlashMoeCacheCleanArgs) -> Result<()> {
+    let user_config = UserConfig::load()?;
+    let models_root = args
+        .model_dir
+        .clone()
+        .or_else(|| user_config.effective_model_dir())
+        .unwrap_or_else(default_models_dir);
+    let plan = inference::flashmoe::plan_unchecked(&args.model, &models_root);
+    let report = inference::flashmoe::clean_cache(&plan, args.source_shards, args.yes)?;
+    let action = if report.deleted {
+        "deleted"
+    } else {
+        "would delete"
+    };
+
+    println!("flashmoe cache-clean: model={}", report.model);
+    println!(
+        "flashmoe cache-clean: cache_dir={}",
+        report.model_cache_dir.display()
+    );
+    println!(
+        "flashmoe cache-clean: preserving active_runtime={}",
+        report.active_runtime_dir.display()
+    );
+    if !report.include_source_shards {
+        println!("flashmoe cache-clean: source shards excluded; pass --source-shards to list them");
+    }
+    if report.candidates.is_empty() {
+        println!("flashmoe cache-clean: no stale cache artifacts found");
+        return Ok(());
+    }
+
+    for candidate in &report.candidates {
+        println!(
+            "{action}\t{}\t{}\t{}",
+            candidate.kind.as_str(),
+            format_cache_bytes(candidate.bytes),
+            candidate.path.display()
+        );
+    }
+    println!(
+        "flashmoe cache-clean: {action} {} artifact(s), {} total",
+        report.candidates.len(),
+        format_cache_bytes(report.total_bytes())
+    );
+    if !report.deleted {
+        println!("flashmoe cache-clean: dry run only; pass --yes to delete listed artifacts");
+    }
+    Ok(())
+}
+
+fn format_cache_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
