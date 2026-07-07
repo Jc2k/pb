@@ -92,10 +92,10 @@ impl TokenizerChatTemplate {
     }
 
     fn template_for_tools(&self, tools: &Value) -> Result<&str> {
-        if value_is_non_empty_array(tools) {
-            if let Some(template) = &self.tool_template {
-                return Ok(template);
-            }
+        if value_is_non_empty_array(tools)
+            && let Some(template) = &self.tool_template
+        {
+            return Ok(template);
         }
         if let Some(template) = &self.default_template {
             return Ok(template);

@@ -2957,6 +2957,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
                 messages: to_model_messages(messages)?,
                 tools: to_model_tools(tools),
                 add_generation_prompt: true,
+                raw_prompt: false,
                 max_tokens: args.max_tokens,
                 temperature: args.temperature,
                 top_k: args.top_k,
@@ -6724,12 +6725,10 @@ mod tests {
         let workspace = tmp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
         let resolved = resolve_workspace_path(&workspace, "new/dir/file.txt", false).unwrap();
+        let expected = workspace.canonicalize().unwrap().join("new/dir/file.txt");
         assert_eq!(
             resolved.canonicalize().unwrap_or(resolved),
-            workspace
-                .join("new/dir/file.txt")
-                .canonicalize()
-                .unwrap_or(workspace.join("new/dir/file.txt"))
+            expected.canonicalize().unwrap_or(expected)
         );
     }
 

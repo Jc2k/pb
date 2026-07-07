@@ -336,11 +336,15 @@ fn block_on<F: std::future::Future<Output = Result<String>>>(future: F) -> Resul
         .enable_all()
         .build()
         .context("failed to create browser tool runtime")?
-        .block_on(timeout(TOOL_TIMEOUT, future))
-        .context("browser tool timed out")?
+        .block_on(async move {
+            timeout(TOOL_TIMEOUT, future)
+                .await
+                .context("browser tool timed out")?
+        })
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::await_holding_lock)]
 async fn with_client(
     f: impl for<'a> FnOnce(&'a mut WebDriverClient) -> LocalBoxFuture<'a, Result<String>>,
 ) -> Result<String> {

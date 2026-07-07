@@ -172,7 +172,7 @@ fn write_plist_if_changed(path: &PathBuf, content: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn load_plist(path: &PathBuf) -> Result<()> {
+fn load_plist(path: &Path) -> Result<()> {
     use std::process::Command;
 
     let status = Command::new("launchctl")
@@ -194,7 +194,7 @@ fn load_plist(path: &PathBuf) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn unload_plist(label: &str, path: &PathBuf) -> Result<()> {
+fn unload_plist(label: &str, path: &Path) -> Result<()> {
     use std::process::Command;
 
     if !path.exists() {
@@ -299,7 +299,7 @@ fn service_is_running(label: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn unload_plist_if_loaded(label: &str, path: &PathBuf) -> Result<()> {
+fn unload_plist_if_loaded(label: &str, path: &Path) -> Result<()> {
     if service_is_loaded(label)? {
         unload_plist(label, path)?;
     }

@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module, clippy::too_many_arguments)]
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
@@ -7,7 +9,7 @@ use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 use crate::agent_core::AgentProfile;
 use crate::config::UserConfig;
@@ -332,8 +334,56 @@ pub enum ServiceCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum FlashMoeCommand {
+    /// Run a single FlashMoe inference and print the model response
+    Infer(FlashMoeInferArgs),
     /// Benchmark FlashMoe generation and emit per-token/per-layer timing TSV
     Bench(FlashMoeBenchArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FlashMoeInferArgs {
+    /// Prompt to send to Qwen3.5-397B-A17B
+    pub prompt: String,
+
+    /// FlashMoe model identifier to load
+    #[arg(long, default_value = inference::flashmoe::QWEN35_MODEL)]
+    pub model: String,
+
+    /// Directory containing pulled model blobs; defaults to the configured model dir
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Maximum generated tokens
+    #[arg(long, default_value_t = 128)]
+    pub max_tokens: i32,
+
+    /// Sampling temperature; 0.0 is deterministic
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Top-k candidates to sample from
+    #[arg(long, default_value_t = 1)]
+    pub top_k: i32,
+
+    /// RNG seed
+    #[arg(long, default_value_t = 1)]
+    pub seed: u32,
+
+    /// Override routed experts per token; Qwen3.5 config uses 10, Flash-MoE profile defaults to 4
+    #[arg(long)]
+    pub active_experts: Option<usize>,
+
+    /// Allow experimental active expert counts below the Qwen3.5 Flash-MoE safety floor
+    #[arg(long)]
+    pub force_active_experts: bool,
+
+    /// Tokenize the CLI prompt exactly instead of applying the chat template
+    #[arg(long)]
+    pub raw: bool,
+
+    /// Print detailed load/generation progress to stderr
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -349,6 +399,18 @@ pub struct FlashMoeBenchArgs {
     /// Prompt to run; repeat for a multi-prompt smoke set
     #[arg(long = "prompt")]
     pub prompts: Vec<String>,
+
+    /// Tokenize bench prompts exactly instead of applying the chat template
+    #[arg(long)]
+    pub raw: bool,
+
+    /// Override routed experts per token; Qwen3.5 config uses 10, Flash-MoE profile defaults to 4
+    #[arg(long)]
+    pub active_experts: Option<usize>,
+
+    /// Allow experimental active expert counts below the Qwen3.5 Flash-MoE safety floor
+    #[arg(long)]
+    pub force_active_experts: bool,
 
     /// Use pb's built-in deterministic smoke prompts
     #[arg(long = "quality-smoke")]
@@ -385,6 +447,10 @@ pub struct FlashMoeBenchArgs {
     /// RNG seed
     #[arg(long, default_value_t = 1)]
     pub seed: u32,
+
+    /// Print detailed load/generation progress to stderr
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1363,8 +1429,100 @@ fn run_service_command(command: ServiceCommand) -> Result<()> {
 
 fn run_flashmoe_command(command: FlashMoeCommand) -> Result<()> {
     match command {
+        FlashMoeCommand::Infer(args) => run_flashmoe_infer(args),
         FlashMoeCommand::Bench(args) => run_flashmoe_bench(args),
     }
+}
+
+fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
+    if args.prompt.trim().is_empty() {
+        bail!("prompt cannot be empty");
+    }
+    if args.max_tokens < 1 {
+        bail!("--max-tokens must be at least 1");
+    }
+    if args.top_k < 1 {
+        bail!("--top-k must be at least 1");
+    }
+
+    let user_config = UserConfig::load()?;
+    let models_root = args
+        .model_dir
+        .clone()
+        .or_else(|| user_config.effective_model_dir())
+        .unwrap_or_else(default_models_dir);
+    let routing_policy = inference::flashmoe::FlashMoeRoutingPolicy::new(
+        args.active_experts,
+        args.force_active_experts,
+    );
+    eprintln!(
+        "flashmoe infer: planning model={} cache_root={}",
+        args.model,
+        models_root.display()
+    );
+    let plan = inference::flashmoe::plan_unchecked_with_cache_version(
+        &args.model,
+        &models_root,
+        routing_policy,
+        inference::flashmoe::CACHE_VERSION,
+    );
+    let load_started = Instant::now();
+    eprintln!("flashmoe infer: loading backend");
+    let mut engine = if args.verbose {
+        inference::flashmoe::load_with_progress(&plan, |phase, elapsed| {
+            eprintln!(
+                "flashmoe infer: load {phase} complete in {} ms",
+                elapsed.as_millis()
+            );
+        })?
+    } else {
+        inference::flashmoe::load(&plan)?
+    };
+    eprintln!(
+        "flashmoe infer: backend loaded in {} ms",
+        load_started.elapsed().as_millis()
+    );
+    let request = inference::flashmoe::GenerationRequest {
+        prompt: args.prompt,
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        seed: args.seed,
+    };
+    eprintln!(
+        "flashmoe infer: generating max_tokens={} temperature={} top_k={}",
+        args.max_tokens, args.temperature, args.top_k
+    );
+    let generation_started = Instant::now();
+    let timed = if args.verbose {
+        if args.raw {
+            engine.generate_raw_timed_with_progress(&request, |message| {
+                eprintln!("flashmoe infer: {message}");
+            })?
+        } else {
+            engine.generate_timed_with_progress(&request, |message| {
+                eprintln!("flashmoe infer: {message}");
+            })?
+        }
+    } else if args.raw {
+        let mut request = inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
+        request.raw_prompt = true;
+        request.add_generation_prompt = false;
+        engine.generate_structured_timed(&request)?
+    } else {
+        engine.generate_timed(&request)?
+    };
+    eprintln!(
+        "flashmoe infer: generated {} tokens in {} ms",
+        timed.output.generated_tokens,
+        generation_started.elapsed().as_millis()
+    );
+    let content = timed.output.content.trim();
+    if content.is_empty() {
+        bail!("FlashMoe inference returned an empty response");
+    }
+    println!("{content}");
+    Ok(())
 }
 
 fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
@@ -1376,14 +1534,43 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     let model = args
         .model
         .clone()
-        .unwrap_or_else(|| user_config.effective_model());
+        .unwrap_or_else(|| inference::flashmoe::QWEN35_MODEL.to_string());
     let models_root = args
         .model_dir
         .clone()
         .or_else(|| user_config.effective_model_dir())
         .unwrap_or_else(default_models_dir);
-    let plan = inference::flashmoe::plan_unchecked(&model, &models_root);
-    let mut engine = inference::flashmoe::load(&plan)?;
+    eprintln!(
+        "flashmoe bench: planning model={} cache_root={}",
+        model,
+        models_root.display()
+    );
+    let routing_policy = inference::flashmoe::FlashMoeRoutingPolicy::new(
+        args.active_experts,
+        args.force_active_experts,
+    );
+    let plan = inference::flashmoe::plan_unchecked_with_cache_version(
+        &model,
+        &models_root,
+        routing_policy,
+        inference::flashmoe::CACHE_VERSION,
+    );
+    let load_started = Instant::now();
+    eprintln!("flashmoe bench: loading backend");
+    let mut engine = if args.verbose {
+        inference::flashmoe::load_with_progress(&plan, |phase, elapsed| {
+            eprintln!(
+                "flashmoe bench: load {phase} complete in {} ms",
+                elapsed.as_millis()
+            );
+        })?
+    } else {
+        inference::flashmoe::load(&plan)?
+    };
+    eprintln!(
+        "flashmoe bench: backend loaded in {} ms",
+        load_started.elapsed().as_millis()
+    );
     let prompts = flashmoe_bench_prompts(&args);
     let temperature = if args.quality_smoke {
         0.0
@@ -1405,13 +1592,45 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     let mut tsv = String::new();
     tsv.push_str(FLASHMOE_TIMING_TSV_HEADER);
     for (prompt_index, prompt) in prompts.iter().enumerate() {
-        let timed = engine.generate_timed(&inference::flashmoe::GenerationRequest {
+        eprintln!(
+            "flashmoe bench: generating prompt {}/{} max_tokens={}",
+            prompt_index + 1,
+            prompts.len(),
+            args.max_tokens
+        );
+        let generation_started = Instant::now();
+        let request = inference::flashmoe::GenerationRequest {
             prompt: prompt.clone(),
             max_tokens: args.max_tokens,
             temperature,
             top_k,
             seed,
-        })?;
+        };
+        let timed = if args.verbose {
+            if args.raw {
+                engine.generate_raw_timed_with_progress(&request, |message| {
+                    eprintln!("flashmoe bench: {message}");
+                })?
+            } else {
+                engine.generate_timed_with_progress(&request, |message| {
+                    eprintln!("flashmoe bench: {message}");
+                })?
+            }
+        } else if args.raw {
+            let mut request =
+                inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
+            request.raw_prompt = true;
+            request.add_generation_prompt = false;
+            engine.generate_structured_timed(&request)?
+        } else {
+            engine.generate_timed(&request)?
+        };
+        eprintln!(
+            "flashmoe bench: prompt {} generated {} tokens in {} ms",
+            prompt_index + 1,
+            timed.output.generated_tokens,
+            generation_started.elapsed().as_millis()
+        );
         let expected = baseline.as_ref().and_then(|baseline| {
             baseline
                 .results
@@ -1460,7 +1679,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     Ok(())
 }
 
-const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\trouting_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
+const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\tattention_input_projection_ms\tattention_kernel_ms\tattention_output_projection_ms\tattention_misc_ms\trouting_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FlashMoeSmokeBaseline {
@@ -1529,6 +1748,10 @@ fn append_flashmoe_timing_tsv(
             "0.000",
             "0.000",
             "0.000",
+            "0.000",
+            "0.000",
+            "0.000",
+            "0.000",
             "0",
             "0",
             "0.000",
@@ -1566,6 +1789,10 @@ fn append_flashmoe_timing_tsv(
                 &fmt_option_usize(dims.active_experts_per_token),
                 &fmt_option_usize(dims.shared_experts),
                 &fmt_duration_ms(token.buckets.attention_projection),
+                &fmt_duration_ms(token.buckets.attention_input_projection),
+                &fmt_duration_ms(token.buckets.attention_kernel),
+                &fmt_duration_ms(token.buckets.attention_output_projection),
+                &fmt_duration_ms(token.buckets.attention_misc),
                 &fmt_duration_ms(token.buckets.routing),
                 &fmt_duration_ms(token.buckets.expert_io),
                 &fmt_duration_ms(token.buckets.expert_queue),
@@ -1607,6 +1834,10 @@ fn append_flashmoe_timing_tsv(
                     &layer.active_experts.to_string(),
                     &fmt_option_usize(layer.dimensions.shared_experts),
                     &fmt_duration_ms(layer.buckets.attention_projection),
+                    &fmt_duration_ms(layer.buckets.attention_input_projection),
+                    &fmt_duration_ms(layer.buckets.attention_kernel),
+                    &fmt_duration_ms(layer.buckets.attention_output_projection),
+                    &fmt_duration_ms(layer.buckets.attention_misc),
                     &fmt_duration_ms(layer.buckets.routing),
                     &fmt_duration_ms(layer.buckets.expert_io),
                     &fmt_duration_ms(layer.buckets.expert_queue),

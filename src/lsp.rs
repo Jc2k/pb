@@ -422,21 +422,6 @@ impl LspClient {
         self.stdout.read_exact(&mut body)?;
         Ok(serde_json::from_slice(&body)?)
     }
-    fn drain_notifications(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < deadline {
-            if let Ok(msg) = self.read_message() {
-                if let Some(method) = msg.get("method").and_then(Value::as_str) {
-                    self.handle_notification(
-                        method,
-                        msg.get("params").cloned().unwrap_or(Value::Null),
-                    );
-                }
-            } else {
-                break;
-            }
-        }
-    }
     fn handle_notification(&mut self, method: &str, params: Value) {
         if method == "textDocument/publishDiagnostics"
             && let Some(uri) = params.get("uri").and_then(Value::as_str)

@@ -91,10 +91,10 @@ impl UserConfig {
         Ok(match key {
             "web.listen" => self.web.listen.clone(),
             "web.port" => self.web.port.map(|value| value.to_string()),
-            "web.socket_path" => self.web.socket_path.as_ref().map(display_path),
+            "web.socket_path" => self.web.socket_path.as_ref().map(|path| display_path(path)),
             "model.model" => self.model.model.clone(),
-            "model.model_dir" => self.model.model_dir.as_ref().map(display_path),
-            "model.workdir" => self.model.workdir.as_ref().map(display_path),
+            "model.model_dir" => self.model.model_dir.as_ref().map(|path| display_path(path)),
+            "model.workdir" => self.model.workdir.as_ref().map(|path| display_path(path)),
             "model.max_steps" => self.model.max_steps.map(|value| value.to_string()),
             "model.max_tokens" => self.model.max_tokens.map(|value| value.to_string()),
             "model.ctx_size" => self.model.ctx_size.map(|value| value.to_string()),
@@ -105,7 +105,11 @@ impl UserConfig {
             "model.profile" => self.model.profile.map(|value| value.to_string()),
             "model.top_k" => self.model.top_k.map(|value| value.to_string()),
             "model.seed" => self.model.seed.map(|value| value.to_string()),
-            "memory.personal_repo" => self.memory.personal_repo.as_ref().map(display_path),
+            "memory.personal_repo" => self
+                .memory
+                .personal_repo
+                .as_ref()
+                .map(|path| display_path(path)),
             _ => bail_unknown_key(key)?,
         })
     }
@@ -227,7 +231,7 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir.join("pb").join("config.toml"))
 }
 
-fn display_path(path: &PathBuf) -> String {
+fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
