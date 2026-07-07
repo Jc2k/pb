@@ -1247,6 +1247,24 @@ pub fn clean_cache(
     Ok(report)
 }
 
+pub fn clean_source_shards(
+    plan: &FlashMoePlan,
+    delete: bool,
+) -> Result<FlashMoeCacheCleanupReport> {
+    let mut report = plan_cache_cleanup(plan, true)?;
+    report
+        .candidates
+        .retain(|candidate| candidate.kind == FlashMoeCacheCleanupKind::SourceShard);
+    if delete {
+        for candidate in &report.candidates {
+            ensure_cache_cleanup_candidate_is_safe(&report.model_cache_dir, candidate)?;
+            delete_cache_cleanup_candidate(candidate)?;
+        }
+        report.deleted = true;
+    }
+    Ok(report)
+}
+
 fn is_flashmoe_source_shard_name(file_name: &str) -> bool {
     file_name.starts_with("model.safetensors-") && file_name.ends_with(".safetensors")
 }
@@ -20440,6 +20458,34 @@ mod tests {
         );
         assert!(!source_shard.exists());
         assert!(unrelated_file.is_file());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+    }
+
+    #[test]
+    fn source_shard_cleanup_does_not_delete_runtime_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v1");
+        let source_shard = plan
+            .model_cache_dir
+            .join("model.safetensors-00001-of-00002.safetensors");
+        fs::create_dir_all(&stale_runtime).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+        fs::write(&source_shard, b"source").unwrap();
+
+        let report = clean_source_shards(&plan, true).unwrap();
+
+        assert!(report.deleted);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].kind,
+            FlashMoeCacheCleanupKind::SourceShard
+        );
+        assert!(!source_shard.exists());
+        assert!(stale_runtime.is_dir());
         assert!(plan.runtime_dir.join("model_weights.bin").is_file());
     }
 

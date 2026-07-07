@@ -558,6 +558,10 @@ pub struct PullArgs {
     /// Output directory for downloaded blobs
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
+
+    /// For FlashMoe Hugging Face pulls, delete source safetensor shards after the runtime cache is built
+    #[arg(long)]
+    pub flashmoe_prune_source_shards: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2320,6 +2324,7 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
             &output_root,
             args.parallel,
             args.retries,
+            args.flashmoe_prune_source_shards,
         )
         .await
     } else {
@@ -2511,6 +2516,7 @@ async fn pull_flashmoe_from_hf(
     output_root: &Path,
     parallel: usize,
     retries: u32,
+    prune_source_shards: bool,
 ) -> Result<()> {
     let siblings = list_hf_files(client, owner, repo).await?;
     let wanted: Vec<&HfSibling> = siblings
@@ -2571,6 +2577,14 @@ async fn pull_flashmoe_from_hf(
     progress.finish_with_message("download complete");
 
     let plan = crate::inference::flashmoe::build_cache_from_hf_snapshot(hf_uri, &cache_dir)?;
+    if prune_source_shards {
+        let report = crate::inference::flashmoe::clean_source_shards(&plan, true)?;
+        println!(
+            "Flash-MoE source shard pruning removed {} file(s), {} total",
+            report.candidates.len(),
+            format_cache_bytes(report.total_bytes())
+        );
+    }
     println!(
         "Pull complete: {total_files} Hugging Face file(s) available in {}; Flash-MoE cache prepared at {}",
         cache_dir.display(),
@@ -2585,6 +2599,7 @@ async fn pull_from_hf(
     output_root: &Path,
     parallel: usize,
     retries: u32,
+    flashmoe_prune_source_shards: bool,
 ) -> Result<()> {
     if crate::inference::flashmoe::is_flashmoe_hf_model(hf_uri) {
         let flashmoe_hf_uri = crate::inference::flashmoe::canonical_model(hf_uri);
@@ -2598,6 +2613,7 @@ async fn pull_from_hf(
             output_root,
             parallel,
             retries,
+            flashmoe_prune_source_shards,
         )
         .await;
     }
