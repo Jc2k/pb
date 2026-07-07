@@ -1012,6 +1012,14 @@ pub fn canonical_model(model: &str) -> String {
     }
 }
 
+pub fn cache_version_for_model(model: &str) -> &'static str {
+    if canonical_model(model) == QWEN35_BF16_MODEL {
+        QWEN35_BF16_CACHE_VERSION
+    } else {
+        CACHE_VERSION
+    }
+}
+
 pub fn plan(model: &str, models_root: &Path) -> Option<FlashMoePlan> {
     plan_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
 }
@@ -1034,7 +1042,12 @@ pub fn plan_unchecked_with_routing(
     models_root: &Path,
     routing_policy: FlashMoeRoutingPolicy,
 ) -> FlashMoePlan {
-    plan_unchecked_with_cache_version(model, models_root, routing_policy, CACHE_VERSION)
+    plan_unchecked_with_cache_version(
+        model,
+        models_root,
+        routing_policy,
+        cache_version_for_model(model),
+    )
 }
 
 pub fn plan_unchecked_with_cache_version(
@@ -15695,7 +15708,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
         (
             FlashMoeManifest {
                 model: canonical_model(model),
-                cache_version: CACHE_VERSION.to_string(),
+                cache_version: cache_version_for_model(model).to_string(),
                 dense_shards: Vec::new(),
                 expert_tensors: Vec::new(),
                 dense_tensors: Vec::new(),
@@ -15732,7 +15745,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
             write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
             let vision_manifest_data = FlashMoeManifest {
                 model: canonical_model(model),
-                cache_version: CACHE_VERSION.to_string(),
+                cache_version: cache_version_for_model(model).to_string(),
                 dense_shards: Vec::new(),
                 expert_tensors: Vec::new(),
                 dense_tensors: visual_tensor_refs,
@@ -15939,7 +15952,7 @@ fn build_manifest(
     Ok((
         FlashMoeManifest {
             model: canonical_model(model),
-            cache_version: CACHE_VERSION.to_string(),
+            cache_version: cache_version_for_model(model).to_string(),
             dense_shards: dense_shards.into_iter().collect(),
             expert_tensors,
             dense_tensors: dense_tensor_refs,
@@ -20188,6 +20201,24 @@ mod tests {
         assert!(plan.streams_experts_from_nand);
         assert_eq!(plan.quantization, ExpertQuantization::FourBitProduction);
         assert!(plan.describe().contains("397B"));
+    }
+
+    #[test]
+    fn explicit_bf16_qwen35_uses_bf16_cache_layout() {
+        assert_eq!(
+            cache_version_for_model(QWEN35_MODEL),
+            CACHE_VERSION,
+            "default Qwen3.5 FlashMoe model should stay on the MLX Q4 cache"
+        );
+        assert_eq!(
+            cache_version_for_model(QWEN35_BF16_MODEL),
+            QWEN35_BF16_CACHE_VERSION,
+            "explicit BF16 source model should use the existing BF16 cache"
+        );
+
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, Path::new("/models"));
+        assert!(plan.runtime_dir.ends_with(QWEN35_BF16_CACHE_VERSION));
+        assert_eq!(plan.model, QWEN35_BF16_MODEL);
     }
 
     #[test]

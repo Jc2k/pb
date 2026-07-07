@@ -16,6 +16,7 @@ pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
 /// Lowercase substring used to identify Qwen3-VL MoE model strings.
 pub const QWEN3_VL_MODEL_MARKER: &str = "qwen3-vl-moe";
 pub const CACHE_VERSION: &str = "flashmoe-v2-mlxq4";
+pub const QWEN35_BF16_CACHE_VERSION: &str = "flashmoe-v1-densebf16";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;

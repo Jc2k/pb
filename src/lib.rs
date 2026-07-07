@@ -1460,12 +1460,8 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         args.model,
         models_root.display()
     );
-    let plan = inference::flashmoe::plan_unchecked_with_cache_version(
-        &args.model,
-        &models_root,
-        routing_policy,
-        inference::flashmoe::CACHE_VERSION,
-    );
+    let plan =
+        inference::flashmoe::plan_unchecked_with_routing(&args.model, &models_root, routing_policy);
     let load_started = Instant::now();
     eprintln!("flashmoe infer: loading backend");
     let mut engine = if args.verbose {
@@ -1558,12 +1554,8 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
         args.active_experts,
         args.force_active_experts,
     );
-    let plan = inference::flashmoe::plan_unchecked_with_cache_version(
-        &model,
-        &models_root,
-        routing_policy,
-        inference::flashmoe::CACHE_VERSION,
-    );
+    let plan =
+        inference::flashmoe::plan_unchecked_with_routing(&model, &models_root, routing_policy);
     let load_started = Instant::now();
     eprintln!("flashmoe bench: loading backend");
     let mut engine = if args.verbose {
