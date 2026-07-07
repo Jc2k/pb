@@ -2276,6 +2276,7 @@ struct MetalExecutorInner {
     dense_mmap_matvec_bf16_pipeline: ObjcId,
     dense_mmap_matvec_bf16_simd_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
+    rms_norm_reduced_pipeline: ObjcId,
     rope_pipeline: ObjcId,
     rope_split_half_pipeline: ObjcId,
     attention_pipeline: ObjcId,
@@ -2489,6 +2490,7 @@ impl Drop for MetalExecutorInner {
             release(self.dense_mmap_matvec_bf16_pipeline);
             release(self.dense_mmap_matvec_bf16_simd_pipeline);
             release(self.rms_norm_pipeline);
+            release(self.rms_norm_reduced_pipeline);
             release(self.rope_pipeline);
             release(self.rope_split_half_pipeline);
             release(self.attention_pipeline);
@@ -2593,6 +2595,7 @@ impl MetalExecutorInner {
             let dense_mmap_matvec_bf16_simd_pipeline =
                 compile_pipeline(device, library, "dense_mmap_matvec_bf16_simd")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
+            let rms_norm_reduced_pipeline = compile_pipeline(device, library, "rms_norm_reduced")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
             let rope_split_half_pipeline =
                 compile_pipeline(device, library, "rope_split_half_apply")?;
@@ -2628,6 +2631,7 @@ impl MetalExecutorInner {
                 release(dense_mmap_matvec_bf16_pipeline);
                 release(dense_mmap_matvec_bf16_simd_pipeline);
                 release(rms_norm_pipeline);
+                release(rms_norm_reduced_pipeline);
                 release(rope_pipeline);
                 release(rope_split_half_pipeline);
                 release(attention_pipeline);
@@ -2682,6 +2686,7 @@ impl MetalExecutorInner {
                 dense_mmap_matvec_bf16_pipeline,
                 dense_mmap_matvec_bf16_simd_pipeline,
                 rms_norm_pipeline,
+                rms_norm_reduced_pipeline,
                 rope_pipeline,
                 rope_split_half_pipeline,
                 attention_pipeline,
@@ -3327,13 +3332,13 @@ impl MetalExecutorInner {
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    self.rms_norm_pipeline,
+                    self.rms_norm_reduced_pipeline,
                 );
                 set_buffer(encoder, hidden_buffer, 0);
                 set_buffer(encoder, norm_weight_buffer, 1);
                 set_buffer(encoder, next_normed_buffer, 2);
                 set_buffer(encoder, width_buffer, 3);
-                dispatch_threads(encoder, width as u64);
+                dispatch_single_threadgroup(encoder, 256);
             }
 
             msg_send_void0(encoder, sel("endEncoding"));
@@ -13960,6 +13965,28 @@ unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_single_threadgroup(encoder: ObjcId, threads: u64) {
+    unsafe {
+        let grid = MtlSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: threads.clamp(1, 256),
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn f32_as_bytes(values: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
@@ -14815,6 +14842,34 @@ kernel void rms_norm(
     }
     float scale = rsqrt(sum / float(max(width, 1u)) + 1.0e-6f);
     output[idx] = input[idx] * scale * weight[idx];
+}
+
+kernel void rms_norm_reduced(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]]) {
+    const uint threads = 256;
+    threadgroup float partial[256];
+    float sum = 0.0f;
+    for (uint i = lid; i < width; i += threads) {
+        sum = fma(input[i], input[i], sum);
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
+    for (uint i = lid; i < width; i += threads) {
+        output[i] = input[i] * scale * weight[i];
+    }
 }
 
 kernel void rope_apply(
@@ -19643,6 +19698,7 @@ mod tests {
             "dense_matvec",
             "dense_matvec_bf16",
             "rms_norm",
+            "rms_norm_reduced",
             "rope_apply",
             "rope_split_half_apply",
             "attention_scores",
