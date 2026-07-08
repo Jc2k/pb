@@ -6,8 +6,10 @@
 
 mod legacy;
 mod math;
+mod model_family;
 mod types;
 
 pub use legacy::*;
 pub use math::*;
+pub use model_family::*;
 pub use types::*;

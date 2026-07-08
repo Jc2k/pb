@@ -59,6 +59,7 @@ use tokenizers::Tokenizer;
 use tracing::info;
 
 use super::math::*;
+use super::model_family::QwenMoeModelLayout;
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -893,19 +894,19 @@ impl QwenModelConfig {
         Ok(())
     }
 
-    fn kv_heads(&self) -> usize {
+    pub(crate) fn kv_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 
-    fn experts(&self) -> usize {
+    pub(crate) fn experts(&self) -> usize {
         self.num_experts.unwrap_or(NUM_EXPERTS)
     }
 
-    fn config_active_experts(&self) -> usize {
+    pub(crate) fn config_active_experts(&self) -> usize {
         self.num_experts_per_tok.unwrap_or(ACTIVE_EXPERTS_PER_TOKEN)
     }
 
-    fn shared_experts(&self) -> usize {
+    pub(crate) fn shared_experts(&self) -> usize {
         self.num_shared_experts
             .unwrap_or_else(|| usize::from(self.shared_expert_intermediate_size.unwrap_or(0) > 0))
     }
@@ -933,13 +934,13 @@ impl QwenModelConfig {
         !is_qwen35
     }
 
-    fn text_mrope_section(&self) -> Option<[usize; 3]> {
+    pub(crate) fn text_mrope_section(&self) -> Option<[usize; 3]> {
         self.mrope_section
             .or_else(|| self.vision_config.as_ref().map(|_| DEFAULT_MROPE_SECTION))
     }
 
     /// Returns the intermediate hidden size used by each shared expert MLP.
-    fn shared_expert_intermediate_size(&self) -> usize {
+    pub(crate) fn shared_expert_intermediate_size(&self) -> usize {
         self.shared_expert_intermediate_size
             .or(self.moe_intermediate_size)
             .or(self.intermediate_size)
@@ -1341,6 +1342,9 @@ where
     let config = QwenModelConfig::from_file(&plan.model_config)?;
     progress("config", phase_started.elapsed());
     phase_started = Instant::now();
+    let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?;
+    progress("model_layout", phase_started.elapsed());
+    phase_started = Instant::now();
     let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
     progress("routing_policy", phase_started.elapsed());
     phase_started = Instant::now();
@@ -1377,6 +1381,7 @@ where
         metal,
         vision_encoder,
         config,
+        model_layout,
         routing_policy,
         runtime,
         shared_expert_cache: Mutex::new(BTreeMap::new()),
@@ -1394,6 +1399,7 @@ pub struct FlashMoeEngine {
     tokenizer: QwenTokenizer,
     metal: Option<MetalExecutor>,
     config: QwenModelConfig,
+    model_layout: QwenMoeModelLayout,
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
     shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
@@ -8939,23 +8945,25 @@ impl FlashMoeEngine {
 
     fn model_dimensions(&self) -> FlashMoeModelDimensions {
         FlashMoeModelDimensions {
-            layers: self.config.num_hidden_layers,
-            hidden_size: self.config.hidden_size,
-            attention_heads: self.config.num_attention_heads,
-            kv_heads: self.config.kv_heads(),
-            vocab_size: self.config.vocab_size,
-            experts_per_layer: self.config.num_experts,
+            layers: self.model_layout.layers,
+            hidden_size: self.model_layout.hidden_size,
+            attention_heads: self.model_layout.attention_heads,
+            kv_heads: self.model_layout.kv_heads,
+            vocab_size: self.model_layout.vocab_size,
+            experts_per_layer: Some(self.model_layout.experts_per_layer),
             active_experts_per_token: Some(self.routing_policy.active_experts),
-            moe_intermediate_size: self
-                .config
-                .moe_intermediate_size
-                .or(self.config.intermediate_size),
-            shared_experts: nonzero_usize(self.config.shared_experts()),
+            moe_intermediate_size: nonzero_usize(self.model_layout.moe_intermediate_size),
+            shared_experts: nonzero_usize(self.model_layout.shared_experts),
         }
     }
 
     fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
-        self.runtime.layer_kind(layer)
+        let runtime_kind = self.runtime.layer_kind(layer);
+        if runtime_kind == FlashMoeLayerKind::Unknown {
+            self.model_layout.layer_kind(layer).into()
+        } else {
+            runtime_kind
+        }
     }
 
     fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
@@ -8970,7 +8978,7 @@ impl FlashMoeEngine {
             .get(layer)
             .and_then(|layout| *layout);
         FlashMoeLayerDimensions {
-            hidden_size: self.config.hidden_size,
+            hidden_size: self.model_layout.hidden_size,
             q_width: full_layout
                 .map(|layout| layout.q_width)
                 .or_else(|| linear_layout.map(|layout| layout.total_key_width)),
@@ -8980,9 +8988,9 @@ impl FlashMoeEngine {
             head_dim: full_layout
                 .map(|layout| layout.head_dim)
                 .or_else(|| linear_layout.map(|layout| layout.key_dim)),
-            experts_per_layer: self.config.num_experts,
-            active_experts_per_token: self.config.num_experts_per_tok,
-            shared_experts: nonzero_usize(self.config.shared_experts()),
+            experts_per_layer: Some(self.model_layout.experts_per_layer),
+            active_experts_per_token: Some(self.routing_policy.active_experts),
+            shared_experts: nonzero_usize(self.model_layout.shared_experts),
         }
     }
 }
@@ -27301,6 +27309,7 @@ mod tests {
         let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::new(&config);
+        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
         let engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -27309,6 +27318,7 @@ mod tests {
             tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
             metal: None,
             config,
+            model_layout,
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
@@ -28563,6 +28573,7 @@ mod tests {
         let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
+        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
         let mut engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -28571,6 +28582,7 @@ mod tests {
             tokenizer,
             metal: None,
             config,
+            model_layout,
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
