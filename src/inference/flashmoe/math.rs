@@ -99,3 +99,69 @@ pub fn q4_fma_matvec_with_group_size(
     }
     Ok(out)
 }
+
+pub fn q4_dequantize_rows_with_group_size(
+    packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    if group_size == 0 {
+        bail!("group_size must be positive");
+    }
+    let groups_per_row = cols.div_ceil(group_size);
+    if scales.len() < rows * groups_per_row || biases.len() < rows * groups_per_row {
+        bail!("scale/bias arrays are too small for {rows}x{cols} with group size {group_size}");
+    }
+    let needed_packed = rows * cols.div_ceil(2);
+    if packed.len() < needed_packed {
+        bail!(
+            "packed q4 data has {} bytes, needs at least {needed_packed}",
+            packed.len()
+        );
+    }
+    let mut out = vec![0.0f32; rows * cols];
+    let packed_stride = cols.div_ceil(2);
+    for row in 0..rows {
+        let packed_row = row * packed_stride;
+        let out_row = row * cols;
+        for group in 0..groups_per_row {
+            let idx = row * groups_per_row + group;
+            let scale = scales[idx];
+            let bias = biases[idx];
+            let start = group * group_size;
+            let end = (start + group_size).min(cols);
+            for col in start..end {
+                let byte = packed[packed_row + col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                out[out_row + col] = q.mul_add(scale, bias);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q4_dequantize_rows_supports_variable_groups_and_odd_widths() {
+        let packed = [
+            0x10, 0x32, 0x04, // row 0: 0, 1, 2, 3, 4
+            0x65, 0x87, 0x09, // row 1: 5, 6, 7, 8, 9
+        ];
+        let scales = [0.5, -0.25, 0.125, 0.75];
+        let biases = [1.0, 2.0, -1.5, 0.25];
+
+        let decoded =
+            q4_dequantize_rows_with_group_size(&packed, &scales, &biases, 2, 5, 3).unwrap();
+
+        assert_eq!(
+            decoded,
+            vec![1.0, 1.5, 2.0, 1.25, 1.0, -0.875, -0.75, -0.625, 6.25, 7.0]
+        );
+    }
+}

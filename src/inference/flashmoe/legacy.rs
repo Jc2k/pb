@@ -72,6 +72,7 @@ const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
 const DENSE_Q4_GROUP_SIZE: usize = 16;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
 const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
@@ -1266,7 +1267,9 @@ pub fn clean_source_shards(
 }
 
 fn is_flashmoe_source_shard_name(file_name: &str) -> bool {
-    file_name.starts_with("model.safetensors-") && file_name.ends_with(".safetensors")
+    (file_name.starts_with("model.safetensors-") || file_name.starts_with("model-"))
+        && file_name.contains("-of-")
+        && file_name.ends_with(".safetensors")
 }
 
 fn ensure_cache_cleanup_candidate_is_safe(
@@ -6302,7 +6305,9 @@ impl FlashMoeEngine {
         let Some(mut weight) = self.dense.norm_weight(canonical_name, width)? else {
             return Ok(None);
         };
-        if self.uses_qwen3next_offset_norm(canonical_name) {
+        if self.uses_qwen3next_offset_norm(canonical_name)
+            && qwen3next_norm_weight_needs_offset(&weight)
+        {
             for value in &mut weight {
                 *value += 1.0;
             }
@@ -8019,12 +8024,7 @@ fn require_2d_tensor_shape(
     canonical_name: &str,
 ) -> Result<(usize, usize)> {
     let tensor = registry.require(canonical_name)?;
-    if dtype_size(&tensor.dtype).is_none() {
-        bail!(
-            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
-            tensor.dtype
-        );
-    }
+    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
     match tensor.shape.as_slice() {
         [rows, cols] if *rows > 0 && *cols > 0 => Ok((*rows, *cols)),
         shape => bail!(
@@ -8088,6 +8088,21 @@ fn qwen3next_norm_uses_offset(config: &QwenModelConfig, canonical_name: &str) ->
             || canonical_name.contains(".post_attention_layernorm.weight")
             || canonical_name.contains(".self_attn.q_norm.weight")
             || canonical_name.contains(".self_attn.k_norm.weight"))
+}
+
+fn qwen3next_norm_weight_needs_offset(weight: &[f32]) -> bool {
+    if weight.is_empty() {
+        return false;
+    }
+
+    let mut sum = 0.0f32;
+    let mut has_negative = false;
+    for value in weight {
+        sum += *value;
+        has_negative |= *value < 0.0;
+    }
+
+    has_negative || sum / (weight.len() as f32) < 0.75
 }
 
 fn l2_norm_in_place(values: &mut [f32]) {
@@ -10721,12 +10736,7 @@ fn require_tensor_shape(
     expected_shape: &[usize],
 ) -> Result<()> {
     let tensor = registry.require(canonical_name)?;
-    if dtype_size(&tensor.dtype).is_none() {
-        bail!(
-            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
-            tensor.dtype
-        );
-    }
+    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
     if tensor.shape.as_slice() != expected_shape {
         bail!(
             "Flash-MoE tensor {canonical_name} has shape {:?}; expected {:?}",
@@ -10739,12 +10749,7 @@ fn require_tensor_shape(
 
 fn require_1d_tensor_shape(registry: &TensorRegistry, canonical_name: &str) -> Result<usize> {
     let tensor = registry.require(canonical_name)?;
-    if dtype_size(&tensor.dtype).is_none() {
-        bail!(
-            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
-            tensor.dtype
-        );
-    }
+    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
     match tensor.shape.as_slice() {
         [width] if *width > 0 => Ok(*width),
         shape => bail!(
@@ -10759,12 +10764,7 @@ fn require_conv1d_tensor_shape(
     canonical_name: &str,
 ) -> Result<(usize, usize)> {
     let tensor = registry.require(canonical_name)?;
-    if dtype_size(&tensor.dtype).is_none() {
-        bail!(
-            "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
-            tensor.dtype
-        );
-    }
+    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
     match tensor.shape.as_slice() {
         [channels, kernel_size] if *channels > 0 && *kernel_size > 0 => {
             Ok((*channels, *kernel_size))
@@ -10772,11 +10772,47 @@ fn require_conv1d_tensor_shape(
         [channels, 1, kernel_size] if *channels > 0 && *kernel_size > 0 => {
             Ok((*channels, *kernel_size))
         }
+        [channels, kernel_size, 1] if *channels > 0 && *kernel_size > 0 => {
+            Ok((*channels, *kernel_size))
+        }
         shape => bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty [channels, kernel] or [channels, 1, kernel]",
+            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty [channels, kernel], [channels, 1, kernel], or [channels, kernel, 1]",
             shape
         ),
     }
+}
+
+fn ensure_runtime_tensor_storage_supported(
+    canonical_name: &str,
+    tensor: &RuntimeTensorEntry,
+) -> Result<()> {
+    match &tensor.quantization {
+        TensorQuantization::None => {
+            if dtype_size(&tensor.dtype).is_none() {
+                bail!(
+                    "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
+                    tensor.dtype
+                );
+            }
+        }
+        TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } => {
+            if !tensor.dtype.eq_ignore_ascii_case("U32") {
+                bail!(
+                    "Flash-MoE q4 tensor {canonical_name} has unsupported packed dtype {}",
+                    tensor.dtype
+                );
+            }
+            dense_q4_layout_with_scale_bias_dtype(&tensor.shape, *group_size, scale_bias_dtype)
+                .with_context(|| {
+                    format!("Flash-MoE q4 tensor {canonical_name} has unsupported runtime layout")
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
@@ -11833,6 +11869,22 @@ impl DenseStore {
             return Ok(Some(candidates.into_sorted_vec()));
         }
 
+        if let TensorQuantization::Q4 { group_size, .. } = entry.quantization {
+            let projected = self.q4_matvec_tiled(
+                lm_head_name,
+                hidden,
+                rows,
+                cols,
+                rows,
+                Some((metal, group_size, Instant::now())),
+            )?;
+            let mut candidates = TopKCandidates::new(top_k);
+            for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
+                candidates.push(token, sampler.process_logit(token, value, &repeated));
+            }
+            return Ok(Some(candidates.into_sorted_vec()));
+        }
+
         let lm_head_bytes = vocab_rows
             .checked_mul(cols)
             .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
@@ -12269,6 +12321,43 @@ impl DenseStore {
         {
             return Ok(Some(tensor));
         }
+        if let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        {
+            let layout =
+                dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+            let decoded_bytes = layout
+                .rows
+                .checked_mul(layout.cols)
+                .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                .context("dense q4 full tensor decoded byte length overflow")?;
+            if decoded_bytes > DENSE_Q4_FULL_DECODE_MAX_BYTES {
+                bail!(
+                    "dense q4 tensor {canonical_name} would decode to {decoded_bytes} bytes, over full decode limit {DENSE_Q4_FULL_DECODE_MAX_BYTES}"
+                );
+            }
+            let (packed, scales, biases, _) =
+                self.read_dense_q4_rows(entry, 0, layout.rows, *group_size)?;
+            let tensor = Arc::new(q4_dequantize_rows_with_group_size(
+                &packed,
+                &scales,
+                &biases,
+                layout.rows,
+                layout.cols,
+                *group_size,
+            )?);
+            #[cfg(test)]
+            self.decoded_full_tensors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.resident
+                .lock()
+                .expect("dense tensor cache poisoned")
+                .insert(canonical_name.to_string(), tensor.clone());
+            return Ok(Some(tensor));
+        }
         let bytes = self.read_range(entry.byte_offset, entry.byte_len as usize)?;
         let tensor = Arc::new(decode_dense_tensor_f32(&entry.dtype, &bytes)?);
         #[cfg(test)]
@@ -12624,8 +12713,25 @@ impl DenseStore {
         let Some(entry) = self.registry.tensor(canonical_name) else {
             return Ok(None);
         };
-        if entry.quantization != TensorQuantization::None {
-            bail!("dense q4 tensor {canonical_name} cannot be read as a f32 row");
+        if let TensorQuantization::Q4 { group_size, .. } = entry.quantization {
+            let cols = entry.shape.last().copied().unwrap_or(0);
+            if entry.shape.is_empty() || requested_cols == 0 || cols == 0 {
+                return Ok(None);
+            }
+            let rows = entry
+                .shape
+                .iter()
+                .take(entry.shape.len() - 1)
+                .product::<usize>()
+                .max(1);
+            if row >= rows {
+                return Ok(None);
+            }
+            let (packed, scales, biases, _) = self.read_dense_q4_rows(entry, row, 1, group_size)?;
+            let mut decoded =
+                q4_dequantize_rows_with_group_size(&packed, &scales, &biases, 1, cols, group_size)?;
+            decoded.truncate(requested_cols.min(cols));
+            return Ok(Some(decoded));
         }
         let Some(element_size) = dtype_size(&entry.dtype) else {
             bail!(
@@ -20490,6 +20596,30 @@ mod tests {
     }
 
     #[test]
+    fn source_shard_cleanup_matches_mlx_model_shard_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+
+        let mlx_source_shard = plan
+            .model_cache_dir
+            .join("model-00001-of-00046.safetensors");
+        fs::write(&mlx_source_shard, b"source").unwrap();
+
+        let report = clean_source_shards(&plan, true).unwrap();
+
+        assert!(report.deleted);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].kind,
+            FlashMoeCacheCleanupKind::SourceShard
+        );
+        assert!(!mlx_source_shard.exists());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+    }
+
+    #[test]
     fn cache_status_reports_missing_runtime_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
@@ -20702,6 +20832,22 @@ mod tests {
             &legacy_qwen3,
             "model.norm.weight"
         ));
+    }
+
+    #[test]
+    fn qwen3next_norm_offset_is_applied_only_to_offset_style_weights() {
+        assert!(qwen3next_norm_weight_needs_offset(&[
+            -0.0498, -0.0654, -0.0209, 0.0547
+        ]));
+        assert!(qwen3next_norm_weight_needs_offset(&[
+            0.6679, 0.7187, 0.7265, 0.7031
+        ]));
+        assert!(!qwen3next_norm_weight_needs_offset(&[
+            0.9492, 0.9335, 0.9804, 0.9609
+        ]));
+        assert!(!qwen3next_norm_weight_needs_offset(&[
+            1.6718, 1.7187, 1.7265, 1.7031
+        ]));
     }
 
     #[test]
@@ -22525,6 +22671,34 @@ mod tests {
     }
 
     #[test]
+    fn dense_registry_validation_accepts_native_mlx_q4_dense_tensors() {
+        let (config, mut manifest) = minimal_dense_manifest(true);
+        let embed = manifest
+            .dense_tensors
+            .iter_mut()
+            .find(|tensor| tensor.tensor == "model.embed_tokens.weight")
+            .expect("minimal manifest should include embeddings");
+        embed.dtype = "U32".to_string();
+        embed.quantization = TensorQuantization::Q4 {
+            group_size: GROUP_SIZE,
+            format: DENSE_Q4_MLX_FORMAT.to_string(),
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        };
+        let layout = dense_q4_layout_with_scale_bias_dtype(
+            &embed.shape,
+            GROUP_SIZE,
+            EXPERT_SCALE_BIAS_DTYPE_BF16,
+        )
+        .unwrap();
+        embed.byte_len = layout.total_bytes as u64;
+
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        validate_required_tensor_manifest(&config, &registry)
+            .expect("native MLX q4 dense tensors should validate by quantization metadata");
+    }
+
+    #[test]
     fn validate_rejects_misshapen_lm_head() {
         let (config, mut manifest) = minimal_dense_manifest(true);
         // Corrupt the lm_head shape so it has wrong dimensions.
@@ -22542,6 +22716,35 @@ mod tests {
         assert!(
             err.to_string().contains("expected"),
             "expected shape mismatch message, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_mlx_conv1d_trailing_singleton_axis_shape() {
+        let tensor_name = linear_attention_tensor_name(0, "conv1d");
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["hybrid.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.clone(),
+                shard: "hybrid.safetensors".to_string(),
+                dtype: "BF16".to_string(),
+                shape: vec![LINEAR_CONV_DIM, CONV_KERNEL_SIZE, 1],
+                source_offsets: [0, 0],
+                runtime_offset: 0,
+                byte_len: 0,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        assert_eq!(
+            require_conv1d_tensor_shape(&registry, &tensor_name)
+                .expect("MLX conv1d [channels, kernel, 1] shape should validate"),
+            (LINEAR_CONV_DIM, CONV_KERNEL_SIZE)
         );
     }
 
@@ -24419,6 +24622,20 @@ mod tests {
             (layout.row_packed_bytes + layout.groups_per_row * 2 * std::mem::size_of::<f32>())
                 as u64
         );
+        let decoded_row = store
+            .read_tensor_row_f32(tensor_name, 1, 5)
+            .unwrap()
+            .unwrap();
+        let expected_row = q4_dequantize_rows_with_group_size(
+            &quantized.values[layout.row_packed_bytes..],
+            &quantized.scales[layout.groups_per_row..],
+            &quantized.biases[layout.groups_per_row..],
+            1,
+            5,
+            group_size,
+        )
+        .unwrap();
+        assert_eq!(decoded_row, expected_row);
 
         let (packed_tile, scales_tile, biases_tile, tile_timing) =
             store.read_dense_q4_rows(entry, 0, 2, group_size).unwrap();
@@ -24451,6 +24668,17 @@ mod tests {
             assert!(
                 (*actual - *dense).abs() <= 0.12,
                 "q4 projection drifted too far from dense matvec: actual={actual}, dense={dense}"
+            );
+        }
+        let decoded = store
+            .read_full_tensor_f32_cached(tensor_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.len(), values.len());
+        for (actual, dense) in decoded.iter().zip(values.iter()) {
+            assert!(
+                (*actual - *dense).abs() <= 0.12,
+                "q4 full decode drifted too far from dense tensor: actual={actual}, dense={dense}"
             );
         }
     }
