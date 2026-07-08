@@ -15030,11 +15030,12 @@ impl ExpertLayerReader {
             Vec::new()
         };
         let packed_prefix = slot.payload_prefix(4096).to_vec();
+        let slot = slot.descriptor();
         Ok(ExpertReadResult {
-            slot: slot.descriptor(),
             weights: ExpertWeights {
                 layer: self.metadata.layer,
                 expert,
+                slot,
                 packed: packed_prefix,
                 records,
             },
@@ -15054,7 +15055,6 @@ struct ExpertReadPlan {
 
 #[derive(Debug)]
 struct ExpertReadResult {
-    slot: ExpertSlotDescriptor,
     weights: ExpertWeights,
     read_latency: Duration,
     read_path: ExpertReadPath,
@@ -15383,6 +15383,7 @@ struct ExpertReadResponse {
 pub struct ExpertWeights {
     pub layer: usize,
     pub expert: usize,
+    pub slot: ExpertSlotDescriptor,
     pub packed: Vec<u8>,
     pub records: Vec<PackedExpertTensor>,
 }
@@ -21924,9 +21925,18 @@ mod tests {
         let expert = ExpertWeights {
             layer: 0,
             expert: 1,
+            slot: ExpertSlotDescriptor {
+                layer: 0,
+                expert: 1,
+                slot_offset: 0,
+                slot_capacity: metadata.packed_bytes as usize,
+                payload_len: metadata.packed_bytes as usize,
+            },
             packed: pack,
             records,
         };
+        assert_eq!(expert.slot.layer, expert.layer);
+        assert_eq!(expert.slot.expert, expert.expert);
         let hidden = [1.0, 2.0];
         let gate = expert
             .project_record(
