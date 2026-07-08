@@ -7049,21 +7049,32 @@ impl FlashMoeEngine {
             normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let routing_started = Instant::now();
-            let router_scores = self.dense.router_scores_with_metal(
-                self.metal.as_ref(),
-                layer,
-                self.config.experts(),
-                &normed,
-            )?;
-            let active = if let Some(metal) = &self.metal {
-                metal.route_topk(
-                    position,
+            let active = if let Some(metal) = &self.metal
+                && let Some(active) = self.dense.router_topk_with_metal(
+                    metal,
                     layer,
-                    &router_scores,
+                    self.config.experts(),
+                    &normed,
                     self.routing_policy.active_experts,
-                )?
+                )? {
+                active
             } else {
-                top_k(&router_scores, self.routing_policy.active_experts)
+                let router_scores = self.dense.router_scores_with_metal(
+                    self.metal.as_ref(),
+                    layer,
+                    self.config.experts(),
+                    &normed,
+                )?;
+                if let Some(metal) = &self.metal {
+                    metal.route_topk(
+                        position,
+                        layer,
+                        &router_scores,
+                        self.routing_policy.active_experts,
+                    )?
+                } else {
+                    top_k(&router_scores, self.routing_policy.active_experts)
+                }
             };
             layer_timing.buckets.routing += routing_started.elapsed();
             layer_timing.active_experts = active.len();
@@ -12473,6 +12484,71 @@ impl DenseStore {
             *score = self.router_projection(layer, expert, hidden)?;
         }
         Ok(router_scores)
+    }
+
+    fn router_topk_with_metal(
+        &self,
+        metal: &MetalExecutor,
+        layer: usize,
+        experts: usize,
+        hidden: &[f32],
+        active_experts: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        if active_experts == 0 || !metal.has_resident_dense_weights() {
+            return Ok(None);
+        }
+        let tensor_name = router_tensor_name(layer);
+        let Some(entry) = self.registry.tensor(&tensor_name) else {
+            return Ok(None);
+        };
+        let (rows, cols) = validate_dense_matvec_shape(entry, &tensor_name, experts, hidden.len())?;
+        if rows != experts || cols != hidden.len() {
+            return Ok(None);
+        }
+
+        if entry.quantization == TensorQuantization::None {
+            return metal.dense_mmap_top_candidates(
+                entry.byte_offset,
+                &entry.dtype,
+                hidden,
+                rows,
+                cols,
+                cols,
+                active_experts,
+            );
+        }
+
+        let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        else {
+            return Ok(None);
+        };
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+        let packed_offset = entry.byte_offset;
+        let scales_offset = entry
+            .byte_offset
+            .checked_add(layout.packed_bytes as u64)
+            .context("router q4 mmap scales offset overflow")?;
+        let biases_offset = scales_offset
+            .checked_add(layout.scales_bytes as u64)
+            .context("router q4 mmap biases offset overflow")?;
+        metal.q4_mmap_top_candidates(
+            packed_offset,
+            scales_offset,
+            biases_offset,
+            hidden,
+            rows,
+            cols,
+            layout.row_packed_bytes,
+            layout.groups_per_row,
+            *group_size,
+            scale_bias_dtype,
+            active_experts,
+        )
     }
 
     fn router_scores_with_accelerate(
