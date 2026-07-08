@@ -6407,6 +6407,24 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
     ) -> Result<u32> {
+        if trace_candidates {
+            let logits = self.dense.lm_head_logits_with_metal(
+                self.metal.as_ref(),
+                0,
+                hidden,
+                &self.tokenizer,
+            )?;
+            let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            trace_sampling_candidates(
+                progress,
+                &self.tokenizer,
+                prompt_tokens.len(),
+                generated,
+                &candidates,
+                Some((hidden, &logits)),
+            );
+            return sampler.sample_candidates(candidates);
+        }
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
             self.metal.as_ref(),
             hidden,
@@ -6421,7 +6439,7 @@ impl FlashMoeEngine {
                 prompt_tokens.len(),
                 generated,
                 &candidates,
-                trace_candidates,
+                None,
             );
             return sampler.sample_candidates(candidates);
         }
@@ -6438,7 +6456,7 @@ impl FlashMoeEngine {
             prompt_tokens.len(),
             generated,
             &candidates,
-            trace_candidates,
+            None,
         );
         sampler.sample_candidates(candidates)
     }
@@ -8826,11 +8844,11 @@ fn trace_sampling_candidates(
     prompt_len: usize,
     generated: &[u32],
     candidates: &[(usize, f32)],
-    enabled: bool,
+    vector_stats: Option<(&[f32], &[f32])>,
 ) {
-    if !enabled {
+    let Some((hidden, logits)) = vector_stats else {
         return;
-    }
+    };
     let rendered = candidates
         .iter()
         .enumerate()
@@ -8843,10 +8861,12 @@ fn trace_sampling_candidates(
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let (hidden_rms, hidden_max, hidden_finite) = vector_rms_max_finite(hidden);
+    let (logits_rms, logits_max, logits_finite) = vector_rms_max_finite(logits);
     report_generation_progress(
         progress,
         format!(
-            "sampling candidates prompt_tokens={} generated_tokens={} {}",
+            "sampling candidates prompt_tokens={} generated_tokens={} hidden_rms={hidden_rms:.6} hidden_max={hidden_max:.6} hidden_finite={hidden_finite} logits_rms={logits_rms:.6} logits_max={logits_max:.6} logits_finite={logits_finite} {}",
             prompt_len,
             generated.len(),
             rendered
