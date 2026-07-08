@@ -1897,6 +1897,15 @@ struct DeferredMetalInput {
     len: usize,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalPostAttentionPrep {
+    residual_buffer: ObjcId,
+    normed_buffer: ObjcId,
+    width: usize,
+    active: Vec<(usize, f32)>,
+}
+
 #[derive(Debug, Clone)]
 struct DenseMmapMatvecProjection {
     tensor_name: String,
@@ -2013,6 +2022,32 @@ impl MetalExecutor {
                 next_norm_weight,
             )?)))
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn submit_expert_phase_from_metal_prep(
+        &self,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        prep: MetalPostAttentionPrep,
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<DeferredExpertPhase>> {
+        self.inner
+            .submit_expert_phase_from_buffers(
+                position,
+                layer,
+                experts,
+                weights,
+                prep.normed_buffer,
+                prep.residual_buffer,
+                prep.width,
+                shared,
+                next_norm_weight,
+            )
+            .map(|pending| pending.map(DeferredExpertPhase::Metal))
     }
 
     fn route_topk(
@@ -2292,6 +2327,26 @@ impl MetalExecutor {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn q4_post_attention_prep_topk(
+        &self,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        attention_output: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        self.inner.q4_post_attention_prep_topk(
+            out_proj,
+            router,
+            attention_output,
+            residual,
+            post_norm_weight,
+            top_k,
+        )
+    }
+
     fn q4_mmap_matvec_batch(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
@@ -2554,6 +2609,7 @@ struct MetalExecutorInner {
     dense_mmap_matvec_bf16_simd_pipeline: ObjcId,
     rms_norm_pipeline: ObjcId,
     rms_norm_reduced_pipeline: ObjcId,
+    residual_rms_norm_pipeline: ObjcId,
     rope_pipeline: ObjcId,
     rope_split_half_pipeline: ObjcId,
     attention_pipeline: ObjcId,
@@ -2775,6 +2831,7 @@ impl Drop for MetalExecutorInner {
             release(self.dense_mmap_matvec_bf16_simd_pipeline);
             release(self.rms_norm_pipeline);
             release(self.rms_norm_reduced_pipeline);
+            release(self.residual_rms_norm_pipeline);
             release(self.rope_pipeline);
             release(self.rope_split_half_pipeline);
             release(self.attention_pipeline);
@@ -2880,6 +2937,8 @@ impl MetalExecutorInner {
                 compile_pipeline(device, library, "dense_mmap_matvec_bf16_simd")?;
             let rms_norm_pipeline = compile_pipeline(device, library, "rms_norm")?;
             let rms_norm_reduced_pipeline = compile_pipeline(device, library, "rms_norm_reduced")?;
+            let residual_rms_norm_pipeline =
+                compile_pipeline(device, library, "residual_add_rms_norm")?;
             let rope_pipeline = compile_pipeline(device, library, "rope_apply")?;
             let rope_split_half_pipeline =
                 compile_pipeline(device, library, "rope_split_half_apply")?;
@@ -2916,6 +2975,7 @@ impl MetalExecutorInner {
                 release(dense_mmap_matvec_bf16_simd_pipeline);
                 release(rms_norm_pipeline);
                 release(rms_norm_reduced_pipeline);
+                release(residual_rms_norm_pipeline);
                 release(rope_pipeline);
                 release(rope_split_half_pipeline);
                 release(attention_pipeline);
@@ -2971,6 +3031,7 @@ impl MetalExecutorInner {
                 dense_mmap_matvec_bf16_simd_pipeline,
                 rms_norm_pipeline,
                 rms_norm_reduced_pipeline,
+                residual_rms_norm_pipeline,
                 rope_pipeline,
                 rope_split_half_pipeline,
                 attention_pipeline,
@@ -3393,7 +3454,7 @@ impl MetalExecutorInner {
         }
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts.iter() {
-            let Some(payload) = expert_phase_mlp_payload(expert, normed, width) else {
+            let Some(payload) = expert_phase_mlp_payload(expert, width) else {
                 return Ok(None);
             };
             payloads.push(payload);
@@ -3632,6 +3693,296 @@ impl MetalExecutorInner {
                 .collect::<Vec<_>>()
                 .join(",");
             let context = MetalCommandContext::new("deferred_expert_phase")
+                .with("position", position)
+                .with("layer", layer)
+                .with("active_experts", experts.len())
+                .with("experts", expert_ids)
+                .with("width", width)
+                .with("shared", shared.is_some())
+                .with("next_norm", next_normed_buffer.is_some());
+            commit_metal_command_buffer(command_buffer, &context);
+            release(encoder);
+
+            Ok(Some(MetalDeferredExpertPhase {
+                inner: self.clone(),
+                command_buffer,
+                buffers,
+                retained_experts: experts,
+                hidden_buffer,
+                next_normed_buffer,
+                context,
+                width,
+            }))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_expert_phase_from_buffers(
+        self: &Arc<Self>,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        normed_buffer: ObjcId,
+        residual_buffer: ObjcId,
+        width: usize,
+        shared: Option<&SharedExpertPhaseWeights>,
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        if width == 0 || weights.len() != experts.len() {
+            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+            return Ok(None);
+        }
+        if let Some(weight) = next_norm_weight
+            && weight.len() < width
+        {
+            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+            return Ok(None);
+        }
+        let mut payloads = Vec::with_capacity(experts.len());
+        for expert in experts.iter() {
+            let Some(payload) = expert_phase_mlp_payload(expert, width) else {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Ok(None);
+            };
+            payloads.push(payload);
+        }
+        let shared_total_intermediate = if let Some(shared) = shared {
+            let total = shared
+                .shared_experts
+                .checked_mul(shared.intermediate)
+                .context("shared expert intermediate width overflow")?;
+            if shared.width != width
+                || shared.gate.len() != total * width
+                || shared.up.len() != total * width
+                || shared.down.len() != width * total
+                || shared.router.len() != shared.shared_experts * width
+            {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Ok(None);
+            }
+            total
+        } else {
+            0
+        };
+        let shared_metal = if let Some(shared) = shared {
+            Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
+        } else {
+            None
+        };
+
+        unsafe {
+            let mut buffers: Vec<MetalPhaseBuffer> = vec![
+                MetalPhaseBuffer::recyclable(normed_buffer),
+                MetalPhaseBuffer::recyclable(residual_buffer),
+            ];
+            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
+            buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
+            let expert_outputs_buffer = self.buffer_with_len(
+                experts
+                    .len()
+                    .max(1)
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer size overflow")?,
+            )?;
+            buffers.push(MetalPhaseBuffer::recyclable(expert_outputs_buffer));
+            let shared_output_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(MetalPhaseBuffer::recyclable(shared_output_buffer));
+            let hidden_buffer =
+                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            buffers.push(MetalPhaseBuffer::recyclable(hidden_buffer));
+            let next_normed_buffer = if next_norm_weight.is_some() {
+                let buffer = self
+                    .buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+                buffers.push(MetalPhaseBuffer::recyclable(buffer));
+                Some(buffer)
+            } else {
+                None
+            };
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_phase_buffers(buffers, true);
+                bail!("failed to create Flash-MoE deferred expert command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_phase_buffers(buffers, true);
+                bail!("failed to create Flash-MoE deferred expert compute encoder");
+            }
+
+            let width_u32 = width as u32;
+            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
+
+            if let Some(shared) = shared {
+                let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
+                let total_u32 = shared_total_intermediate as u32;
+                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_gate_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
+                let shared_up_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
+                let shared_router_out =
+                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
+                let shared_activated =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
+                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
+                let shared_intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
+
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.gate,
+                    normed_buffer,
+                    shared_gate_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.up,
+                    normed_buffer,
+                    shared_up_out,
+                    width_buffer,
+                    shared_total_intermediate,
+                );
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.router,
+                    normed_buffer,
+                    shared_router_out,
+                    width_buffer,
+                    shared.shared_experts,
+                );
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.shared_expert_activation_pipeline,
+                );
+                set_buffer(encoder, shared_gate_out, 0);
+                set_buffer(encoder, shared_up_out, 1);
+                set_buffer(encoder, shared_router_out, 2);
+                set_buffer(encoder, shared_activated, 3);
+                set_buffer(encoder, shared_intermediate_buffer, 4);
+                set_buffer(encoder, total_buffer, 5);
+                dispatch_threads(encoder, shared_total_intermediate as u64);
+                self.encode_dense_matvec(
+                    encoder,
+                    shared_metal.down,
+                    shared_activated,
+                    shared_output_buffer,
+                    total_buffer,
+                    width,
+                );
+            } else {
+                self.encode_fill_zero(encoder, shared_output_buffer, width_buffer, width);
+            }
+
+            for (idx, payload) in payloads.iter().enumerate() {
+                let gate_out =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+                let up_out = self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(up_out));
+                let activated =
+                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(activated));
+
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.gate,
+                    normed_buffer,
+                    gate_out,
+                    0,
+                    &mut buffers,
+                )?;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.up,
+                    normed_buffer,
+                    up_out,
+                    0,
+                    &mut buffers,
+                )?;
+                let intermediate_u32 = payload.gate.rows as u32;
+                let intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.silu_product_pipeline,
+                );
+                set_buffer(encoder, gate_out, 0);
+                set_buffer(encoder, up_out, 1);
+                set_buffer(encoder, activated, 2);
+                set_buffer(encoder, intermediate_buffer, 3);
+                dispatch_threads(encoder, payload.gate.rows as u64);
+                let expert_offset = idx
+                    .checked_mul(width)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
+                    .context("expert output buffer offset overflow")?
+                    as u64;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.down,
+                    activated,
+                    expert_outputs_buffer,
+                    expert_offset,
+                    &mut buffers,
+                )?;
+            }
+
+            let active_u32 = experts.len() as u32;
+            let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.combine_expert_phase_pipeline,
+            );
+            set_buffer(encoder, residual_buffer, 0);
+            set_buffer(encoder, shared_output_buffer, 1);
+            set_buffer(encoder, expert_outputs_buffer, 2);
+            set_buffer(encoder, weights_buffer, 3);
+            set_buffer(encoder, hidden_buffer, 4);
+            set_buffer(encoder, width_buffer, 5);
+            set_buffer(encoder, active_buffer, 6);
+            dispatch_threads(encoder, width as u64);
+
+            if let (Some(weight), Some(next_normed_buffer)) = (next_norm_weight, next_normed_buffer)
+            {
+                let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(&weight[..width]))?;
+                buffers.push(MetalPhaseBuffer::recyclable(norm_weight_buffer));
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.rms_norm_reduced_pipeline,
+                );
+                set_buffer(encoder, hidden_buffer, 0);
+                set_buffer(encoder, norm_weight_buffer, 1);
+                set_buffer(encoder, next_normed_buffer, 2);
+                set_buffer(encoder, width_buffer, 3);
+                dispatch_single_threadgroup(encoder, 256);
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+            let expert_ids = experts
+                .iter()
+                .map(|expert| expert.expert.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("deferred_expert_phase_from_buffers")
                 .with("position", position)
                 .with("layer", layer)
                 .with("active_experts", experts.len())
@@ -4714,6 +5065,205 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some(candidates))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q4_post_attention_prep_topk(
+        &self,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        attention_output: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        if top_k == 0 || residual.is_empty() || residual.len() != post_norm_weight.len() {
+            return Ok(None);
+        }
+        if out_proj.output_width != residual.len()
+            || out_proj.rows != residual.len()
+            || out_proj.cols != attention_output.len()
+            || router.cols != residual.len()
+            || router.output_width != router.rows
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        for projection in [out_proj, router] {
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("post-attention q4 packed byte length overflow")?;
+            let groups_len = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("post-attention q4 group byte length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, groups_len),
+                (projection.biases_byte_offset, groups_len),
+            ] {
+                let offset = usize::try_from(offset)
+                    .context("post-attention q4 offset does not fit usize")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let width = residual.len();
+        let top_k = top_k.min(router.rows).max(1);
+        unsafe {
+            let attention_buffer = self.buffer_with_bytes(f32_as_bytes(attention_output))?;
+            let residual_input_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
+            let projected_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let residual_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let normed_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let router_logits_buffer =
+                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
+            let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
+            let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
+            let buffers = vec![
+                attention_buffer,
+                residual_input_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                residual_buffer,
+                normed_buffer,
+                router_logits_buffer,
+                indices_buffer,
+                values_buffer,
+            ];
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE post-attention prep command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE post-attention prep compute encoder");
+            }
+
+            for (projection, input_buffer, output_buffer) in [
+                (out_proj, attention_buffer, projected_buffer),
+                (router, normed_buffer, router_logits_buffer),
+            ] {
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer(encoder, output_buffer, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_threadgroups(encoder, projection.rows as u64);
+
+                if std::ptr::eq(projection, out_proj) {
+                    let width_u32 = width as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, projected_buffer, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, residual_buffer, 3);
+                    set_buffer(encoder, normed_buffer, 4);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                    dispatch_single_threadgroup(encoder, 256);
+                }
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.topk_vocab_pipeline,
+            );
+            let rows_u32 = router.rows as u32;
+            let top_k_u32 = top_k as u32;
+            set_buffer(encoder, router_logits_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, values_buffer, 2);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
+            set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
+            dispatch_threads(encoder, 1);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("linear_post_attention_q4_topk")
+                .with("width", width)
+                .with("attention_width", attention_output.len())
+                .with("experts", router.rows)
+                .with("top_k", top_k)
+                .with("out_proj", out_proj.tensor_name.as_str())
+                .with("router", router.tensor_name.as_str());
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
+            let mut active = Vec::with_capacity(top_k);
+            for idx in 0..top_k {
+                active.push((*indices_ptr.add(idx) as usize, *values_ptr.add(idx)));
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in [
+                attention_buffer,
+                residual_input_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                router_logits_buffer,
+                indices_buffer,
+                values_buffer,
+            ] {
+                self.recycle(buffer);
+            }
+            Ok(Some(MetalPostAttentionPrep {
+                residual_buffer,
+                normed_buffer,
+                width,
+                active,
+            }))
         }
     }
 
@@ -5902,6 +6452,18 @@ impl MetalExecutorInner {
             }
         }
     }
+
+    fn recycle_or_release_phase_buffers(&self, buffers: Vec<MetalPhaseBuffer>, release_only: bool) {
+        unsafe {
+            for buffer in buffers {
+                if release_only || !buffer.recycle {
+                    release(buffer.id);
+                } else {
+                    self.recycle(buffer.id);
+                }
+            }
+        }
+    }
 }
 
 impl FlashMoeEngine {
@@ -6995,15 +7557,46 @@ impl FlashMoeEngine {
             };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
-            let projected = if self.runtime.is_linear_attention_layer(layer) {
-                self.linear_attention_projected(
-                    layer,
-                    &normed,
-                    deferred_attention_input,
-                    kv_cache,
-                    runtime,
-                    Some(&mut layer_timing.buckets),
-                )?
+            let mut linear_attention_values_for_prep = None;
+            let mut projected = if self.runtime.is_linear_attention_layer(layer) {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    if self.metal.is_some()
+                        && deepstack.is_none()
+                        && expert_execution != ExpertExecution::Skip
+                    {
+                        let values = self.linear_attention_output_values(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            runtime,
+                            Some(&mut layer_timing.buckets),
+                        )?;
+                        linear_attention_values_for_prep = Some(values);
+                        Vec::new()
+                    } else {
+                        self.linear_attention_projected(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            runtime,
+                            Some(&mut layer_timing.buckets),
+                        )?
+                    }
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    self.linear_attention_projected(
+                        layer,
+                        &normed,
+                        deferred_attention_input,
+                        kv_cache,
+                        runtime,
+                        Some(&mut layer_timing.buckets),
+                    )?
+                }
             } else {
                 self.full_attention_projected(
                     layer,
@@ -7041,42 +7634,72 @@ impl FlashMoeEngine {
                 hidden = output.hidden;
                 next_layer_normed = None;
             }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             let combine_started = Instant::now();
-            add_in_place(&mut hidden, &projected);
-
-            let mlp_residual = hidden.clone();
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
-            normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
-            layer_timing.buckets.combine_norm += combine_started.elapsed();
-            let routing_started = Instant::now();
-            let active = if let Some(metal) = &self.metal
-                && let Some(active) = self.dense.router_topk_with_metal(
-                    metal,
-                    layer,
-                    self.config.experts(),
-                    &normed,
-                    self.routing_policy.active_experts,
-                )? {
-                active
-            } else {
-                let router_scores = self.dense.router_scores_with_metal(
-                    self.metal.as_ref(),
-                    layer,
-                    self.config.experts(),
-                    &normed,
-                )?;
-                if let Some(metal) = &self.metal {
-                    metal.route_topk(
-                        position,
+            let active = if let Some(attention_values) = linear_attention_values_for_prep.take() {
+                let mut prepared = None;
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if let Some(metal) = &self.metal
+                    && let Some(post_norm_weight) =
+                        self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                    && let Some(prep) = self.dense.linear_post_attention_q4_prep_with_metal(
+                        metal,
                         layer,
-                        &router_scores,
+                        self.config.experts(),
+                        &attention_values,
+                        &hidden,
+                        &post_norm_weight,
                         self.routing_policy.active_experts,
                     )?
-                } else {
-                    top_k(&router_scores, self.routing_policy.active_experts)
+                {
+                    let active = prep.active.clone();
+                    metal_post_attention_prep = Some(prep);
+                    prepared = Some(active);
                 }
+                if let Some(active) = prepared {
+                    layer_timing.buckets.combine_norm += combine_started.elapsed();
+                    active
+                } else {
+                    let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+                    let subphase_started = Instant::now();
+                    projected = self
+                        .dense
+                        .project_dense_tensor_with_metal(
+                            self.metal.as_ref(),
+                            &out_proj_name,
+                            &attention_values,
+                            runtime.width,
+                        )?
+                        .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
+                    layer_timing.buckets.attention_output_projection += subphase_started.elapsed();
+                    add_in_place(&mut hidden, &projected);
+                    normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
+                    layer_timing.buckets.combine_norm += combine_started.elapsed();
+                    let routing_started = Instant::now();
+                    let active = self.route_layer(
+                        position,
+                        layer,
+                        &normed,
+                        self.routing_policy.active_experts,
+                    )?;
+                    layer_timing.buckets.routing += routing_started.elapsed();
+                    active
+                }
+            } else {
+                add_in_place(&mut hidden, &projected);
+                normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                let routing_started = Instant::now();
+                let active =
+                    self.route_layer(position, layer, &normed, self.routing_policy.active_experts)?;
+                layer_timing.buckets.routing += routing_started.elapsed();
+                active
             };
-            layer_timing.buckets.routing += routing_started.elapsed();
+            let mlp_residual = hidden.clone();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
             layer_timing.active_experts = active.len();
             let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
@@ -7124,7 +7747,34 @@ impl FlashMoeEngine {
                 None
             };
             let mut submitted_deferred = false;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(metal) = &self.metal
+                && let Some(prep) = metal_post_attention_prep.take()
+            {
+                let Some(pending) = metal.submit_expert_phase_from_metal_prep(
+                    position,
+                    layer,
+                    experts.clone(),
+                    &weights,
+                    prep,
+                    shared_phase.as_deref(),
+                    next_norm_weight.as_deref(),
+                )?
+                else {
+                    bail!("Flash-MoE Metal post-attention prep could not submit expert phase");
+                };
+                if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
+                    deferred_expert_phase = Some(pending);
+                    submitted_deferred = true;
+                } else {
+                    let output = pending.wait()?;
+                    hidden = output.hidden;
+                    next_layer_normed = output.next_normed;
+                    submitted_deferred = true;
+                }
+            }
+            if !submitted_deferred
+                && let Some(metal) = &self.metal
                 && let Some(pending) = metal.submit_expert_phase(
                     position,
                     layer,
@@ -7147,6 +7797,10 @@ impl FlashMoeEngine {
                 }
             }
             if !submitted_deferred {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if has_metal_post_attention_prep {
+                    bail!("Flash-MoE Metal post-attention prep fell through to CPU expert phase");
+                }
                 let output = compute_expert_phase_cpu(
                     experts.as_ref(),
                     &weights,
@@ -7583,7 +8237,38 @@ impl FlashMoeEngine {
         }
     }
 
-    fn linear_attention_projected(
+    fn route_layer(
+        &self,
+        position: usize,
+        layer: usize,
+        normed: &[f32],
+        active_experts: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        if let Some(metal) = &self.metal
+            && let Some(active) = self.dense.router_topk_with_metal(
+                metal,
+                layer,
+                self.config.experts(),
+                normed,
+                active_experts,
+            )?
+        {
+            return Ok(active);
+        }
+        let router_scores = self.dense.router_scores_with_metal(
+            self.metal.as_ref(),
+            layer,
+            self.config.experts(),
+            normed,
+        )?;
+        if let Some(metal) = &self.metal {
+            metal.route_topk(position, layer, &router_scores, active_experts)
+        } else {
+            Ok(top_k(&router_scores, active_experts))
+        }
+    }
+
+    fn linear_attention_output_values(
         &self,
         layer: usize,
         normed: &[f32],
@@ -7597,7 +8282,6 @@ impl FlashMoeEngine {
         let z_name = linear_attention_tensor_name(layer, "in_proj_z");
         let b_name = linear_attention_tensor_name(layer, "in_proj_b");
         let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
         let static_weights = self.linear_attention_static_weights(layer, layout)?;
 
         let subphase_started = Instant::now();
@@ -7761,6 +8445,27 @@ impl FlashMoeEngine {
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_kernel += subphase_started.elapsed();
         }
+        Ok(state.out_values.clone())
+    }
+
+    fn linear_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
+        kv_cache: &mut KvCache,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Vec<f32>> {
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let values = self.linear_attention_output_values(
+            layer,
+            normed,
+            deferred_input,
+            kv_cache,
+            runtime,
+            attention_buckets.as_deref_mut(),
+        )?;
 
         let subphase_started = Instant::now();
         let projected = self
@@ -7768,7 +8473,7 @@ impl FlashMoeEngine {
             .project_dense_tensor_with_metal(
                 self.metal.as_ref(),
                 &out_proj_name,
-                &state.out_values,
+                &values,
                 runtime.width,
             )?
             .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
@@ -12486,6 +13191,98 @@ impl DenseStore {
         Ok(router_scores)
     }
 
+    fn dense_q4_mmap_projection(
+        &self,
+        tensor_name: &str,
+        output_width: usize,
+        input_len: usize,
+    ) -> Result<Option<DenseQ4MmapMatvecProjection>> {
+        let Some(entry) = self.registry.tensor(tensor_name) else {
+            return Ok(None);
+        };
+        let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        else {
+            return Ok(None);
+        };
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, tensor_name, output_width, input_len)?;
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+        if entry.byte_len as usize != layout.total_bytes
+            || rows != layout.rows
+            || cols != layout.cols
+        {
+            return Ok(None);
+        }
+        if entry
+            .byte_offset
+            .checked_add(entry.byte_len)
+            .map_or(true, |end| end > self.len)
+        {
+            return Ok(None);
+        }
+        let packed_byte_offset = entry.byte_offset;
+        let scales_byte_offset = entry
+            .byte_offset
+            .checked_add(layout.packed_bytes as u64)
+            .context("dense q4 projection scales offset overflow")?;
+        let biases_byte_offset = scales_byte_offset
+            .checked_add(layout.scales_bytes as u64)
+            .context("dense q4 projection biases offset overflow")?;
+        Ok(Some(DenseQ4MmapMatvecProjection {
+            tensor_name: tensor_name.to_string(),
+            packed_byte_offset,
+            scales_byte_offset,
+            biases_byte_offset,
+            rows,
+            cols,
+            output_width,
+            row_packed_bytes: layout.row_packed_bytes,
+            groups_per_row: layout.groups_per_row,
+            group_size: *group_size,
+            scale_bias_dtype: scale_bias_dtype.clone(),
+        }))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_post_attention_q4_prep_with_metal(
+        &self,
+        metal: &MetalExecutor,
+        layer: usize,
+        experts: usize,
+        attention_output: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        active_experts: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        if !metal.has_resident_dense_weights() {
+            return Ok(None);
+        }
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let router_name = router_tensor_name(layer);
+        let Some(out_proj) =
+            self.dense_q4_mmap_projection(&out_proj_name, residual.len(), attention_output.len())?
+        else {
+            return Ok(None);
+        };
+        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual.len())?
+        else {
+            return Ok(None);
+        };
+        metal.q4_post_attention_prep_topk(
+            &out_proj,
+            &router,
+            attention_output,
+            residual,
+            post_norm_weight,
+            active_experts,
+        )
+    }
+
     fn router_topk_with_metal(
         &self,
         metal: &MetalExecutor,
@@ -14552,7 +15349,6 @@ struct ExpertPhaseMlpPayload<'a> {
 
 fn expert_phase_mlp_payload<'a>(
     expert: &'a ExpertWeights,
-    hidden: &[f32],
     width: usize,
 ) -> Option<ExpertPhaseMlpPayload<'a>> {
     let gate_tensor = expert.record_suffix("gate_proj.weight")?;
@@ -14564,8 +15360,9 @@ fn expert_phase_mlp_payload<'a>(
         .copied()
         .or_else(|| up_tensor.shape.first().copied())
         .unwrap_or(width);
-    let gate = gate_tensor.matvec_payload(hidden, intermediate)?;
-    let up = up_tensor.matvec_payload(hidden, intermediate)?;
+    let fake_hidden = vec![0.0f32; width];
+    let gate = gate_tensor.matvec_payload(&fake_hidden, intermediate)?;
+    let up = up_tensor.matvec_payload(&fake_hidden, intermediate)?;
     if gate.rows != up.rows {
         return None;
     }
@@ -16476,6 +17273,39 @@ kernel void rms_norm_reduced(
     float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
     for (uint i = lid; i < width; i += threads) {
         output[i] = input[i] * scale * weight[i];
+    }
+}
+
+kernel void residual_add_rms_norm(
+    device const float* projected [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* hidden [[buffer(3)]],
+    device float* normed [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]]) {
+    const uint threads = 256;
+    threadgroup float partial[256];
+    float sum = 0.0f;
+    for (uint i = lid; i < width; i += threads) {
+        float value = projected[i] + residual[i];
+        sum = fma(value, value, sum);
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
+    for (uint i = lid; i < width; i += threads) {
+        float value = projected[i] + residual[i];
+        hidden[i] = value;
+        normed[i] = value * scale * weight[i];
     }
 }
 
@@ -22028,6 +22858,7 @@ mod tests {
             "dense_matvec_bf16",
             "rms_norm",
             "rms_norm_reduced",
+            "residual_add_rms_norm",
             "rope_apply",
             "rope_split_half_apply",
             "attention_scores",
