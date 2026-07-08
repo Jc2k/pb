@@ -9183,10 +9183,20 @@ impl QwenTokenizer {
         {
             return Ok(prompt.clone());
         }
-        let template = self.config.chat_template.as_ref().context(
-            "tokenizer_config.json is missing chat_template; Flash-MoE chat generation requires the active model tokenizer_config.json",
-        )?;
-        render_tokenizer_chat_template(template, messages, tools, add_generation_prompt)
+        if let Some(template) = self.config.chat_template.as_ref() {
+            return render_tokenizer_chat_template(
+                template,
+                messages,
+                tools,
+                add_generation_prompt,
+            );
+        }
+        if self.im_start.is_some() && self.im_end.is_some() {
+            return render_qwen_chatml(messages, tools, add_generation_prompt);
+        }
+        bail!(
+            "tokenizer_config.json is missing chat_template and tokenizer.json is missing Qwen chat special tokens; Flash-MoE chat generation requires one of them"
+        )
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -25747,6 +25757,18 @@ mod tests {
             Some(test_tokenizer_config_json()),
         )
         .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_structured_renderer_falls_back_to_chatml_without_tokenizer_template() {
+        let tokenizer = QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap();
         let rendered = tokenizer
             .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
             .unwrap();
