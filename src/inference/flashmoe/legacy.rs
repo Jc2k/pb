@@ -2996,11 +2996,11 @@ impl MetalExecutorInner {
             let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups))?;
             let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE Metal compute encoder");
@@ -3131,11 +3131,11 @@ impl MetalExecutorInner {
             let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE dense q4 mmap Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE dense q4 mmap Metal compute encoder");
@@ -3392,11 +3392,11 @@ impl MetalExecutorInner {
                 None
             };
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE deferred expert command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE deferred expert compute encoder");
@@ -3724,11 +3724,11 @@ impl MetalExecutorInner {
             let experts = scores.len() as u32;
             let experts_buffer = self.buffer_with_bytes(u32_as_bytes(&experts))?;
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE routing command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE routing compute encoder");
@@ -3975,11 +3975,11 @@ impl MetalExecutorInner {
             let stride_u32 = stride as u32;
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE dense mmap Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE dense mmap Metal compute encoder");
@@ -4120,12 +4120,12 @@ impl MetalExecutorInner {
             let buffers = vec![input_buffer, output_buffer];
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&buffers, true);
                 bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.recycle_or_release_buffers(&buffers, true);
@@ -4289,12 +4289,12 @@ impl MetalExecutorInner {
             let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&[output_buffer], true);
                 bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.recycle_or_release_buffers(&[output_buffer], true);
@@ -4438,12 +4438,12 @@ impl MetalExecutorInner {
             let stride_u32 = stride as u32;
             let top_k_u32 = top_k as u32;
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&transient_buffers, true);
                 bail!("failed to create Flash-MoE dense mmap top-k Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.recycle_or_release_buffers(&transient_buffers, true);
@@ -4630,12 +4630,12 @@ impl MetalExecutorInner {
             }
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&buffers, true);
                 bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.recycle_or_release_buffers(&buffers, true);
@@ -4848,12 +4848,12 @@ impl MetalExecutorInner {
             let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
             let transient_buffers = vec![hidden_buffer, logits_buffer, cols_buffer, rows_buffer];
 
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&transient_buffers, true);
                 bail!("failed to create Flash-MoE LM-head Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.recycle_or_release_buffers(&transient_buffers, true);
@@ -5104,11 +5104,11 @@ impl MetalExecutorInner {
             let kv_width_buf = self.buffer_with_bytes(u32_as_bytes(&kv_width_u32))?;
 
             // Step 1: compute raw dot-product scores for all (q_head, token) pairs
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE Metal compute encoder");
@@ -5164,11 +5164,11 @@ impl MetalExecutorInner {
             // Step 3: weighted sum of values
             let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
             let output_buffer = self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE Metal compute encoder");
@@ -5245,11 +5245,11 @@ impl MetalExecutorInner {
         context: &MetalCommandContext,
     ) -> Result<()> {
         unsafe {
-            let command_buffer = msg_send_id0(self.command_queue, sel("commandBuffer"));
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 bail!("failed to create Flash-MoE Metal command buffer");
             }
-            let encoder = msg_send_id0(command_buffer, sel("computeCommandEncoder"));
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 bail!("failed to create Flash-MoE Metal compute encoder");
@@ -14906,6 +14906,11 @@ unsafe fn release(receiver: ObjcId) {
             msg_send_void0(receiver, sel("release"));
         }
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn retain(receiver: ObjcId) -> ObjcId {
+    unsafe { msg_send_id0(receiver, sel("retain")) }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
