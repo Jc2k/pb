@@ -5,15 +5,15 @@ This is the implementation plan for bringing pb's MoE backend into architectural
 tokenizers, structured request APIs, Qwen model-family flexibility, Qwen-VL image support, and the
 shared inference facade with llama.cpp.
 
-The target is not a special "fast path" beside a generic slow path. The target is one MoE execution
-architecture for Qwen-family MoE models. Model-family traits describe dimensions, tensor naming,
-quantized layouts, vision adapters, and dtype variants, but they must not fork buffer ownership,
-expert scheduling, command-buffer structure, or CPU/GPU handoff policy.
+The target is one MoE execution architecture for Qwen-family MoE models. FlashMoe owns buffer
+lifetime, expert scheduling, command-buffer structure, read scheduling, and CPU/GPU handoff policy
+for every supported Qwen MoE variant. Model-family traits describe dimensions, tensor naming,
+quantized layouts, vision adapters, and dtype variants without forking that execution flow.
 
 ## Principles
 
-- FlashMoe is the primary backend for supported MoE models. llama.cpp is the fallback for unsupported
-  or intentionally delegated models.
+- FlashMoe is the backend for supported Qwen-family MoE models. llama.cpp is reserved for
+  unsupported or intentionally delegated models.
 - The MoE backend owns expert buffers, resident dense buffers, scheduler state, KV and recurrent
   state, command-buffer sequencing, and read scheduling.
 - Model variants supply metadata through typed layouts and traits. They do not get a separate slow
@@ -117,7 +117,8 @@ The refactor should break the current monolith by ownership boundary, not by "fa
 
 ## Non-Goals
 
-- No second-class generic MoE path that keeps excessive copies because it is "not the fast path".
+- No second-class Qwen MoE execution path with different buffer ownership, scheduling, or CPU/GPU
+  handoff behavior.
 - No hidden environment toggles for scheduler behavior.
 - No application expert cache, LZ4 main path, mmap expert reads, dispatch_io, broad prefetch, or
   speculative expert reads unless a fresh architectural reason invalidates upstream's measured

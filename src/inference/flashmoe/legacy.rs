@@ -2619,6 +2619,8 @@ struct MetalExecutorInner {
     command_queue: ObjcId,
     q4_pipeline: ObjcId,
     q4_bf16_scale_bias_pipeline: ObjcId,
+    q4_swiglu_pipeline: ObjcId,
+    q4_swiglu_bf16_scale_bias_pipeline: ObjcId,
     q4_mmap_pipeline: ObjcId,
     q4_mmap_bf16_scale_bias_pipeline: ObjcId,
     route_pipeline: Option<ObjcId>,
@@ -2839,6 +2841,8 @@ impl Drop for MetalExecutorInner {
         unsafe {
             release(self.q4_pipeline);
             release(self.q4_bf16_scale_bias_pipeline);
+            release(self.q4_swiglu_pipeline);
+            release(self.q4_swiglu_bf16_scale_bias_pipeline);
             release(self.q4_mmap_pipeline);
             release(self.q4_mmap_bf16_scale_bias_pipeline);
             if let Some(route_pipeline) = self.route_pipeline {
@@ -2938,6 +2942,9 @@ impl MetalExecutorInner {
             let q4_pipeline = compile_pipeline(device, library, "q4_fma_matvec")?;
             let q4_bf16_scale_bias_pipeline =
                 compile_pipeline(device, library, "q4_fma_matvec_bf16_scale_bias")?;
+            let q4_swiglu_pipeline = compile_pipeline(device, library, "q4_swiglu_fused")?;
+            let q4_swiglu_bf16_scale_bias_pipeline =
+                compile_pipeline(device, library, "q4_swiglu_fused_bf16_scale_bias")?;
             let q4_mmap_pipeline = compile_pipeline(device, library, "q4_mmap_fma_matvec")?;
             let q4_mmap_bf16_scale_bias_pipeline =
                 compile_pipeline(device, library, "q4_mmap_fma_matvec_bf16_scale_bias")?;
@@ -2983,6 +2990,8 @@ impl MetalExecutorInner {
             if command_queue.is_null() {
                 release(q4_pipeline);
                 release(q4_bf16_scale_bias_pipeline);
+                release(q4_swiglu_pipeline);
+                release(q4_swiglu_bf16_scale_bias_pipeline);
                 release(q4_mmap_pipeline);
                 release(q4_mmap_bf16_scale_bias_pipeline);
                 if let Some(route_pipeline) = route_pipeline {
@@ -3041,6 +3050,8 @@ impl MetalExecutorInner {
                 command_queue,
                 q4_pipeline,
                 q4_bf16_scale_bias_pipeline,
+                q4_swiglu_pipeline,
+                q4_swiglu_bf16_scale_bias_pipeline,
                 q4_mmap_pipeline,
                 q4_mmap_bf16_scale_bias_pipeline,
                 route_pipeline,
@@ -3619,45 +3630,56 @@ impl MetalExecutorInner {
             }
 
             for (idx, payload) in payloads.iter().enumerate() {
-                let gate_out =
-                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                let up_out = self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(up_out));
                 let activated =
                     self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
 
-                self.encode_q4_matvec(
+                let fused = self.encode_q4_swiglu(
                     encoder,
                     &payload.gate,
-                    normed_buffer,
-                    gate_out,
-                    0,
-                    &mut buffers,
-                )?;
-                self.encode_q4_matvec(
-                    encoder,
                     &payload.up,
                     normed_buffer,
-                    up_out,
-                    0,
+                    activated,
                     &mut buffers,
                 )?;
-                let intermediate_u32 = payload.gate.rows as u32;
-                let intermediate_buffer =
-                    self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.silu_product_pipeline,
-                );
-                set_buffer(encoder, gate_out, 0);
-                set_buffer(encoder, up_out, 1);
-                set_buffer(encoder, activated, 2);
-                set_buffer(encoder, intermediate_buffer, 3);
-                dispatch_threads(encoder, payload.gate.rows as u64);
+                if !fused {
+                    let gate_out =
+                        self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                    buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+                    let up_out =
+                        self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                    buffers.push(MetalPhaseBuffer::recyclable(up_out));
+                    self.encode_q4_matvec(
+                        encoder,
+                        &payload.gate,
+                        normed_buffer,
+                        gate_out,
+                        0,
+                        &mut buffers,
+                    )?;
+                    self.encode_q4_matvec(
+                        encoder,
+                        &payload.up,
+                        normed_buffer,
+                        up_out,
+                        0,
+                        &mut buffers,
+                    )?;
+                    let intermediate_u32 = payload.gate.rows as u32;
+                    let intermediate_buffer =
+                        self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
+                    buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.silu_product_pipeline,
+                    );
+                    set_buffer(encoder, gate_out, 0);
+                    set_buffer(encoder, up_out, 1);
+                    set_buffer(encoder, activated, 2);
+                    set_buffer(encoder, intermediate_buffer, 3);
+                    dispatch_threads(encoder, payload.gate.rows as u64);
+                }
                 let expert_offset = idx
                     .checked_mul(width)
                     .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
@@ -3986,45 +4008,56 @@ impl MetalExecutorInner {
             }
 
             for (idx, payload) in payloads.iter().enumerate() {
-                let gate_out =
-                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                let up_out = self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(up_out));
                 let activated =
                     self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
 
-                self.encode_q4_matvec(
+                let fused = self.encode_q4_swiglu(
                     encoder,
                     &payload.gate,
-                    normed_buffer,
-                    gate_out,
-                    0,
-                    &mut buffers,
-                )?;
-                self.encode_q4_matvec(
-                    encoder,
                     &payload.up,
                     normed_buffer,
-                    up_out,
-                    0,
+                    activated,
                     &mut buffers,
                 )?;
-                let intermediate_u32 = payload.gate.rows as u32;
-                let intermediate_buffer =
-                    self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.silu_product_pipeline,
-                );
-                set_buffer(encoder, gate_out, 0);
-                set_buffer(encoder, up_out, 1);
-                set_buffer(encoder, activated, 2);
-                set_buffer(encoder, intermediate_buffer, 3);
-                dispatch_threads(encoder, payload.gate.rows as u64);
+                if !fused {
+                    let gate_out =
+                        self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                    buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+                    let up_out =
+                        self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                    buffers.push(MetalPhaseBuffer::recyclable(up_out));
+                    self.encode_q4_matvec(
+                        encoder,
+                        &payload.gate,
+                        normed_buffer,
+                        gate_out,
+                        0,
+                        &mut buffers,
+                    )?;
+                    self.encode_q4_matvec(
+                        encoder,
+                        &payload.up,
+                        normed_buffer,
+                        up_out,
+                        0,
+                        &mut buffers,
+                    )?;
+                    let intermediate_u32 = payload.gate.rows as u32;
+                    let intermediate_buffer =
+                        self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
+                    buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.silu_product_pipeline,
+                    );
+                    set_buffer(encoder, gate_out, 0);
+                    set_buffer(encoder, up_out, 1);
+                    set_buffer(encoder, activated, 2);
+                    set_buffer(encoder, intermediate_buffer, 3);
+                    dispatch_threads(encoder, payload.gate.rows as u64);
+                }
                 let expert_offset = idx
                     .checked_mul(width)
                     .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
@@ -4169,6 +4202,113 @@ impl MetalExecutorInner {
             set_buffer(encoder, group_size_buffer, 8);
             dispatch_q4_threadgroups(encoder, payload.rows as u64);
             Ok(())
+        }
+    }
+
+    unsafe fn encode_q4_swiglu(
+        &self,
+        encoder: ObjcId,
+        gate: &Q4MatvecPayload<'_>,
+        up: &Q4MatvecPayload<'_>,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<bool> {
+        if gate.rows != up.rows
+            || gate.cols != up.cols
+            || gate.group_size != up.group_size
+            || gate.scale_bias_dtype != up.scale_bias_dtype
+        {
+            return Ok(false);
+        }
+        let expected_bf16_bytes = gate.scales.len().checked_mul(2).unwrap_or(usize::MAX);
+        let use_bf16_scale_bias = gate
+            .scale_bias_dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+            && gate.scale_bytes.len() == expected_bf16_bytes
+            && gate.bias_bytes.len() == expected_bf16_bytes
+            && up.scale_bytes.len() == expected_bf16_bytes
+            && up.bias_bytes.len() == expected_bf16_bytes;
+        let use_f32_scale_bias = !gate
+            .scale_bias_dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16);
+        if !use_bf16_scale_bias && !use_f32_scale_bias {
+            return Ok(false);
+        }
+
+        unsafe {
+            let gate_packed_phase =
+                self.phase_buffer_with_borrowed_bytes_aligned(gate.packed, 16)?;
+            let gate_packed_buffer = gate_packed_phase.id;
+            buffers.push(gate_packed_phase);
+            let up_packed_phase = self.phase_buffer_with_borrowed_bytes_aligned(up.packed, 16)?;
+            let up_packed_buffer = up_packed_phase.id;
+            buffers.push(up_packed_phase);
+
+            let (pipeline, gate_scale_bytes, gate_bias_bytes, up_scale_bytes, up_bias_bytes) =
+                if use_bf16_scale_bias {
+                    (
+                        self.q4_swiglu_bf16_scale_bias_pipeline,
+                        gate.scale_bytes,
+                        gate.bias_bytes,
+                        up.scale_bytes,
+                        up.bias_bytes,
+                    )
+                } else {
+                    (
+                        self.q4_swiglu_pipeline,
+                        f32_as_bytes(gate.scales),
+                        f32_as_bytes(gate.biases),
+                        f32_as_bytes(up.scales),
+                        f32_as_bytes(up.biases),
+                    )
+                };
+            let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
+            let gate_scale_phase = self
+                .phase_buffer_with_borrowed_bytes_aligned(gate_scale_bytes, scale_bias_alignment)?;
+            let gate_scale_buffer = gate_scale_phase.id;
+            buffers.push(gate_scale_phase);
+            let gate_bias_phase = self
+                .phase_buffer_with_borrowed_bytes_aligned(gate_bias_bytes, scale_bias_alignment)?;
+            let gate_bias_buffer = gate_bias_phase.id;
+            buffers.push(gate_bias_phase);
+            let up_scale_phase = self
+                .phase_buffer_with_borrowed_bytes_aligned(up_scale_bytes, scale_bias_alignment)?;
+            let up_scale_buffer = up_scale_phase.id;
+            buffers.push(up_scale_phase);
+            let up_bias_phase =
+                self.phase_buffer_with_borrowed_bytes_aligned(up_bias_bytes, scale_bias_alignment)?;
+            let up_bias_buffer = up_bias_phase.id;
+            buffers.push(up_bias_phase);
+
+            let rows_u32 = gate.rows as u32;
+            let cols_u32 = gate.cols as u32;
+            let groups_u32 = gate.cols.div_ceil(gate.group_size).max(1) as u32;
+            let group_size_u32 = gate.group_size as u32;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(rows_buffer));
+            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(cols_buffer));
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(groups_buffer));
+            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(group_size_buffer));
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, gate_packed_buffer, 0);
+            set_buffer(encoder, up_packed_buffer, 1);
+            set_buffer(encoder, input_buffer, 2);
+            set_buffer(encoder, gate_scale_buffer, 3);
+            set_buffer(encoder, gate_bias_buffer, 4);
+            set_buffer(encoder, up_scale_buffer, 5);
+            set_buffer(encoder, up_bias_buffer, 6);
+            set_buffer(encoder, output_buffer, 7);
+            set_buffer(encoder, rows_buffer, 8);
+            set_buffer(encoder, cols_buffer, 9);
+            set_buffer(encoder, groups_buffer, 10);
+            set_buffer(encoder, group_size_buffer, 11);
+            dispatch_q4_threadgroups(encoder, gate.rows as u64);
+            Ok(true)
         }
     }
 
@@ -17220,6 +17360,194 @@ kernel void q4_fma_matvec_bf16_scale_bias(
     }
 }
 
+kernel void q4_swiglu_fused(
+    device const uchar* gate_packed [[buffer(0)]],
+    device const uchar* up_packed [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device const float* gate_scales [[buffer(3)]],
+    device const float* gate_biases [[buffer(4)]],
+    device const float* up_scales [[buffer(5)]],
+    device const float* up_biases [[buffer(6)]],
+    device float* output [[buffer(7)]],
+    constant uint& rows [[buffer(8)]],
+    constant uint& cols [[buffer(9)]],
+    constant uint& groups_per_row [[buffer(10)]],
+    constant uint& group_size [[buffer(11)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    if (use_word_path) {
+        device const uint* gate_words = reinterpret_cast<device const uint*>(gate_packed);
+        device const uint* up_words = reinterpret_cast<device const uint*>(up_packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint gate_word = gate_words[word_row + packed_word];
+            uint up_word = up_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float gate_scale = gate_scales[scale_row + group];
+            float gate_bias = gate_biases[scale_row + group];
+            float up_scale = up_scales[scale_row + group];
+            float up_bias = up_biases[scale_row + group];
+
+            for (uint i = 0; i < 8; i++) {
+                uint shift = i * 4;
+                float x = use_input_cache ? input_cache[col0 + i] : input[col0 + i];
+                gate_acc += fma(float((gate_word >> shift) & 0x0f), gate_scale * x, gate_bias * x);
+                up_acc += fma(float((up_word >> shift) & 0x0f), up_scale * x, up_bias * x);
+            }
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar gate_byte = gate_packed[packed_row + packed_col];
+            uchar up_byte = up_packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float gate_scale0 = gate_scales[scale_row + group0];
+            float gate_bias0 = gate_biases[scale_row + group0];
+            float up_scale0 = up_scales[scale_row + group0];
+            float up_bias0 = up_biases[scale_row + group0];
+            gate_acc += fma(float(gate_byte & 0x0f), gate_scale0 * x0, gate_bias0 * x0);
+            up_acc += fma(float(up_byte & 0x0f), up_scale0 * x0, up_bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float gate_scale1 = gate_scales[scale_row + group1];
+                float gate_bias1 = gate_biases[scale_row + group1];
+                float up_scale1 = up_scales[scale_row + group1];
+                float up_bias1 = up_biases[scale_row + group1];
+                gate_acc += fma(float(gate_byte >> 4), gate_scale1 * x1, gate_bias1 * x1);
+                up_acc += fma(float(up_byte >> 4), up_scale1 * x1, up_bias1 * x1);
+            }
+        }
+    }
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum = simd_sum(up_acc);
+    if (simd_lane == 0) {
+        output[row] = (gate_sum / (1.0f + exp(-gate_sum))) * up_sum;
+    }
+}
+
+kernel void q4_swiglu_fused_bf16_scale_bias(
+    device const uchar* gate_packed [[buffer(0)]],
+    device const uchar* up_packed [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device const ushort* gate_scales [[buffer(3)]],
+    device const ushort* gate_biases [[buffer(4)]],
+    device const ushort* up_scales [[buffer(5)]],
+    device const ushort* up_biases [[buffer(6)]],
+    device float* output [[buffer(7)]],
+    constant uint& rows [[buffer(8)]],
+    constant uint& cols [[buffer(9)]],
+    constant uint& groups_per_row [[buffer(10)]],
+    constant uint& group_size [[buffer(11)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    if (use_word_path) {
+        device const uint* gate_words = reinterpret_cast<device const uint*>(gate_packed);
+        device const uint* up_words = reinterpret_cast<device const uint*>(up_packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint gate_word = gate_words[word_row + packed_word];
+            uint up_word = up_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float gate_scale = bf16_to_float(gate_scales[scale_row + group]);
+            float gate_bias = bf16_to_float(gate_biases[scale_row + group]);
+            float up_scale = bf16_to_float(up_scales[scale_row + group]);
+            float up_bias = bf16_to_float(up_biases[scale_row + group]);
+
+            for (uint i = 0; i < 8; i++) {
+                uint shift = i * 4;
+                float x = use_input_cache ? input_cache[col0 + i] : input[col0 + i];
+                gate_acc += fma(float((gate_word >> shift) & 0x0f), gate_scale * x, gate_bias * x);
+                up_acc += fma(float((up_word >> shift) & 0x0f), up_scale * x, up_bias * x);
+            }
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar gate_byte = gate_packed[packed_row + packed_col];
+            uchar up_byte = up_packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float gate_scale0 = bf16_to_float(gate_scales[scale_row + group0]);
+            float gate_bias0 = bf16_to_float(gate_biases[scale_row + group0]);
+            float up_scale0 = bf16_to_float(up_scales[scale_row + group0]);
+            float up_bias0 = bf16_to_float(up_biases[scale_row + group0]);
+            gate_acc += fma(float(gate_byte & 0x0f), gate_scale0 * x0, gate_bias0 * x0);
+            up_acc += fma(float(up_byte & 0x0f), up_scale0 * x0, up_bias0 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float gate_scale1 = bf16_to_float(gate_scales[scale_row + group1]);
+                float gate_bias1 = bf16_to_float(gate_biases[scale_row + group1]);
+                float up_scale1 = bf16_to_float(up_scales[scale_row + group1]);
+                float up_bias1 = bf16_to_float(up_biases[scale_row + group1]);
+                gate_acc += fma(float(gate_byte >> 4), gate_scale1 * x1, gate_bias1 * x1);
+                up_acc += fma(float(up_byte >> 4), up_scale1 * x1, up_bias1 * x1);
+            }
+        }
+    }
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum = simd_sum(up_acc);
+    if (simd_lane == 0) {
+        output[row] = (gate_sum / (1.0f + exp(-gate_sum))) * up_sum;
+    }
+}
+
 kernel void q4_mmap_fma_matvec(
     device const uchar* weight_bytes [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -23159,6 +23487,8 @@ mod tests {
     fn metal_shader_source_defines_full_forward_kernel_set() {
         for kernel in [
             "q4_fma_matvec",
+            "q4_swiglu_fused",
+            "q4_swiglu_fused_bf16_scale_bias",
             "q4_mmap_fma_matvec",
             "q4_mmap_fma_matvec_bf16_scale_bias",
             "route_top4",
