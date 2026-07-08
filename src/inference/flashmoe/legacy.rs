@@ -8933,11 +8933,16 @@ impl FlashMoeEngine {
     }
 
     pub fn read_active_experts(
-        &self,
+        &mut self,
         layer: usize,
         experts: &[usize],
     ) -> Result<Vec<ExpertWeights>> {
-        self.experts.read_many(layer, experts)
+        let pending = self.scheduler.issue(layer, experts)?;
+        let experts = self.scheduler.finish(pending)?;
+        Ok(experts
+            .iter()
+            .map(|expert| expert.as_ref().clone())
+            .collect())
     }
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
