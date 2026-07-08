@@ -189,6 +189,7 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             tools: request.tools.clone(),
             add_generation_prompt: request.add_generation_prompt,
             raw_prompt: false,
+            trace_candidates: false,
             max_tokens: request.options.max_tokens,
             temperature: request.options.temperature,
             top_k: request.options.top_k,

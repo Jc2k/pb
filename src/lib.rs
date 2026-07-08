@@ -383,6 +383,10 @@ pub struct FlashMoeInferArgs {
     #[arg(long)]
     pub raw: bool,
 
+    /// Print top-k candidate token scores to stderr while sampling
+    #[arg(long)]
+    pub trace_candidates: bool,
+
     /// Print detailed load/generation progress to stderr
     #[arg(long)]
     pub verbose: bool,
@@ -1579,23 +1583,23 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         args.max_tokens, args.temperature, args.top_k
     );
     let generation_started = Instant::now();
-    let timed = if args.verbose {
-        if args.raw {
-            engine.generate_raw_timed_with_progress(&request, |message| {
+    let mut structured_request =
+        inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
+    structured_request.trace_candidates = args.trace_candidates;
+    if args.raw {
+        structured_request.raw_prompt = true;
+        structured_request.add_generation_prompt = false;
+    }
+    let timed = if args.verbose || args.trace_candidates {
+        let verbose = args.verbose;
+        let mut progress = |message: String| {
+            if verbose || message.starts_with("sampling candidates") {
                 eprintln!("flashmoe infer: {message}");
-            })?
-        } else {
-            engine.generate_timed_with_progress(&request, |message| {
-                eprintln!("flashmoe infer: {message}");
-            })?
-        }
-    } else if args.raw {
-        let mut request = inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
-        request.raw_prompt = true;
-        request.add_generation_prompt = false;
-        engine.generate_structured_timed(&request)?
+            }
+        };
+        engine.generate_structured_timed_with_progress(&structured_request, &mut progress)?
     } else {
-        engine.generate_timed(&request)?
+        engine.generate_structured_timed(&structured_request)?
     };
     eprintln!(
         "flashmoe infer: generated {} tokens in {} ms",

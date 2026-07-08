@@ -5566,7 +5566,7 @@ impl FlashMoeEngine {
         self.generate_structured_inner_with_session(request, None, Some(&mut timing))
     }
 
-    fn generate_structured_timed_with_progress(
+    pub fn generate_structured_timed_with_progress(
         &mut self,
         request: &StructuredGenerationRequest,
         progress: &mut dyn FnMut(String),
@@ -5740,8 +5740,14 @@ impl FlashMoeEngine {
             let sample_started = Instant::now();
             report_generation_progress(&progress, "first-token sampling begin".to_string());
             info!("flashmoe: first-token sampling begin");
-            let token =
-                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            let token = self.sample_from_hidden(
+                &mut sampler,
+                &prefill_hidden,
+                &prompt_tokens,
+                &generated,
+                request.trace_candidates,
+                &progress,
+            )?;
             report_generation_progress(
                 &progress,
                 format!(
@@ -5795,6 +5801,7 @@ impl FlashMoeEngine {
                 position,
                 MropePosition::text(position),
                 timing.as_deref_mut(),
+                request.trace_candidates,
                 progress.clone(),
             )?;
             let token = sampled.token;
@@ -6265,8 +6272,14 @@ impl FlashMoeEngine {
         let max_tokens = max_tokens.max(0) as usize;
         let mut stopped = false;
         if max_tokens > 0 {
-            let token =
-                self.sample_from_hidden(&mut sampler, &prefill_hidden, &prompt_tokens, &generated)?;
+            let token = self.sample_from_hidden(
+                &mut sampler,
+                &prefill_hidden,
+                &prompt_tokens,
+                &generated,
+                false,
+                &None,
+            )?;
             if !self.tokenizer.is_eos(token) {
                 generated.push(token);
             } else {
@@ -6283,6 +6296,7 @@ impl FlashMoeEngine {
                 position,
                 MropePosition::text(next_mrope_position + generated.len() - 1),
                 None,
+                false,
                 None,
             )?;
             let token = sampled.token;
@@ -6335,6 +6349,7 @@ impl FlashMoeEngine {
         position: usize,
         rope_position: MropePosition,
         timing: Option<&mut FlashMoeGenerationTiming>,
+        trace_candidates: bool,
         progress: GenerationProgress<'_>,
     ) -> Result<SampledDecode> {
         let previous = generated
@@ -6362,10 +6377,17 @@ impl FlashMoeEngine {
             } else {
                 None
             },
-            progress,
+            progress.clone(),
         )?;
         let sample_started = Instant::now();
-        let token = self.sample_from_hidden(sampler, &hidden, prompt_tokens, generated)?;
+        let token = self.sample_from_hidden(
+            sampler,
+            &hidden,
+            prompt_tokens,
+            generated,
+            trace_candidates,
+            &progress,
+        )?;
         let elapsed = sample_started.elapsed();
         token_timing.buckets.sampling += elapsed;
         token_timing.buckets.total_wall += elapsed;
@@ -6382,6 +6404,8 @@ impl FlashMoeEngine {
         hidden: &[f32],
         prompt_tokens: &[u32],
         generated: &[u32],
+        trace_candidates: bool,
+        progress: &GenerationProgress<'_>,
     ) -> Result<u32> {
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
             self.metal.as_ref(),
@@ -6391,7 +6415,14 @@ impl FlashMoeEngine {
             prompt_tokens,
             generated,
         )? {
-            trace_sampling_candidates(&self.tokenizer, prompt_tokens.len(), generated, &candidates);
+            trace_sampling_candidates(
+                progress,
+                &self.tokenizer,
+                prompt_tokens.len(),
+                generated,
+                &candidates,
+                trace_candidates,
+            );
             return sampler.sample_candidates(candidates);
         }
         let logits = self.dense.lm_head_logits_with_metal(
@@ -6401,7 +6432,14 @@ impl FlashMoeEngine {
             &self.tokenizer,
         )?;
         let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
-        trace_sampling_candidates(&self.tokenizer, prompt_tokens.len(), generated, &candidates);
+        trace_sampling_candidates(
+            progress,
+            &self.tokenizer,
+            prompt_tokens.len(),
+            generated,
+            &candidates,
+            trace_candidates,
+        );
         sampler.sample_candidates(candidates)
     }
 
@@ -8783,12 +8821,51 @@ fn nonzero_usize(value: usize) -> Option<usize> {
 }
 
 fn trace_sampling_candidates(
+    progress: &GenerationProgress<'_>,
     tokenizer: &QwenTokenizer,
     prompt_len: usize,
     generated: &[u32],
     candidates: &[(usize, f32)],
+    enabled: bool,
 ) {
-    let _ = (tokenizer, prompt_len, generated, candidates);
+    if !enabled {
+        return;
+    }
+    let rendered = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, (token, score))| {
+            format!(
+                "#{rank}:id={token}:score={score:.6}:text={text}",
+                rank = idx + 1,
+                text = trace_token_text(tokenizer, *token)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    report_generation_progress(
+        progress,
+        format!(
+            "sampling candidates prompt_tokens={} generated_tokens={} {}",
+            prompt_len,
+            generated.len(),
+            rendered
+        ),
+    );
+}
+
+fn trace_token_text(tokenizer: &QwenTokenizer, token: usize) -> String {
+    let Ok(token) = u32::try_from(token) else {
+        return "\"<id-overflow>\"".to_string();
+    };
+    let decoded = tokenizer
+        .decode(&[token])
+        .unwrap_or_else(|_| "<decode-error>".to_string());
+    let escaped = decoded
+        .chars()
+        .flat_map(|ch| ch.escape_default())
+        .collect::<String>();
+    format!("\"{escaped}\"")
 }
 
 fn trace_layer_values(position: usize, layer: usize, stage: &str, values: &[f32]) {

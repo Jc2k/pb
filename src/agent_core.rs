@@ -2958,6 +2958,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
                 tools: to_model_tools(tools),
                 add_generation_prompt: true,
                 raw_prompt: false,
+                trace_candidates: false,
                 max_tokens: args.max_tokens,
                 temperature: args.temperature,
                 top_k: args.top_k,
