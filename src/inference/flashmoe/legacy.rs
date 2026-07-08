@@ -7557,7 +7557,7 @@ impl FlashMoeEngine {
             };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
-            let mut linear_attention_values_for_prep = None;
+            let mut post_attention_values_for_prep = None;
             let mut projected = if self.runtime.is_linear_attention_layer(layer) {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
@@ -7573,7 +7573,8 @@ impl FlashMoeEngine {
                             runtime,
                             Some(&mut layer_timing.buckets),
                         )?;
-                        linear_attention_values_for_prep = Some(values);
+                        post_attention_values_for_prep =
+                            Some((linear_attention_tensor_name(layer, "out_proj"), values));
                         Vec::new()
                     } else {
                         self.linear_attention_projected(
@@ -7598,16 +7599,51 @@ impl FlashMoeEngine {
                     )?
                 }
             } else {
-                self.full_attention_projected(
-                    layer,
-                    &normed,
-                    deferred_attention_input,
-                    kv_cache,
-                    position,
-                    rope_position,
-                    runtime,
-                    Some(&mut layer_timing.buckets),
-                )?
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    if self.metal.is_some()
+                        && deepstack.is_none()
+                        && expert_execution != ExpertExecution::Skip
+                    {
+                        let values = self.full_attention_output_values(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            position,
+                            rope_position,
+                            runtime,
+                            Some(&mut layer_timing.buckets),
+                        )?;
+                        post_attention_values_for_prep =
+                            Some((attention_tensor_name(layer, "o_proj"), values));
+                        Vec::new()
+                    } else {
+                        self.full_attention_projected(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            position,
+                            rope_position,
+                            runtime,
+                            Some(&mut layer_timing.buckets),
+                        )?
+                    }
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    self.full_attention_projected(
+                        layer,
+                        &normed,
+                        deferred_attention_input,
+                        kv_cache,
+                        position,
+                        rope_position,
+                        runtime,
+                        Some(&mut layer_timing.buckets),
+                    )?
+                }
             };
             trace_layer_values(position, layer, "attention", &projected);
             layer_timing.buckets.attention_projection += attention_started.elapsed();
@@ -7638,16 +7674,19 @@ impl FlashMoeEngine {
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             let combine_started = Instant::now();
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
-            let active = if let Some(attention_values) = linear_attention_values_for_prep.take() {
+            let active = if let Some((out_proj_name, attention_values)) =
+                post_attention_values_for_prep.take()
+            {
                 let mut prepared = None;
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if let Some(metal) = &self.metal
                     && let Some(post_norm_weight) =
                         self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                    && let Some(prep) = self.dense.linear_post_attention_q4_prep_with_metal(
+                    && let Some(prep) = self.dense.post_attention_q4_prep_with_metal(
                         metal,
                         layer,
                         self.config.experts(),
+                        &out_proj_name,
                         &attention_values,
                         &hidden,
                         &post_norm_weight,
@@ -7662,7 +7701,6 @@ impl FlashMoeEngine {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     active
                 } else {
-                    let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
                     let subphase_started = Instant::now();
                     projected = self
                         .dense
@@ -7953,7 +7991,7 @@ impl FlashMoeEngine {
         Ok(hidden)
     }
 
-    fn full_attention_projected(
+    fn full_attention_output_values(
         &self,
         layer: usize,
         normed: &[f32],
@@ -8104,7 +8142,30 @@ impl FlashMoeEngine {
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_kernel += subphase_started.elapsed();
         }
+        Ok(attended)
+    }
 
+    fn full_attention_projected(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Vec<f32>> {
+        let attended = self.full_attention_output_values(
+            layer,
+            normed,
+            deferred_input,
+            kv_cache,
+            position,
+            rope_position,
+            runtime,
+            attention_buckets.as_deref_mut(),
+        )?;
         let subphase_started = Instant::now();
         let projected = self.dense.project_with_metal(
             self.metal.as_ref(),
@@ -13249,11 +13310,12 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_post_attention_q4_prep_with_metal(
+    fn post_attention_q4_prep_with_metal(
         &self,
         metal: &MetalExecutor,
         layer: usize,
         experts: usize,
+        out_proj_name: &str,
         attention_output: &[f32],
         residual: &[f32],
         post_norm_weight: &[f32],
@@ -13262,10 +13324,9 @@ impl DenseStore {
         if !metal.has_resident_dense_weights() {
             return Ok(None);
         }
-        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
         let router_name = router_tensor_name(layer);
         let Some(out_proj) =
-            self.dense_q4_mmap_projection(&out_proj_name, residual.len(), attention_output.len())?
+            self.dense_q4_mmap_projection(out_proj_name, residual.len(), attention_output.len())?
         else {
             return Ok(None);
         };
