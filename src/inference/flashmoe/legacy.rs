@@ -58,6 +58,7 @@ use std::os::unix::fs::FileExt;
 use tokenizers::Tokenizer;
 use tracing::info;
 
+use super::experts::{ExpertSlotDescriptor, ReusableExpertBuffer};
 use super::math::*;
 use super::model_family::QwenMoeModelLayout;
 use super::types::*;
@@ -14901,7 +14902,7 @@ impl ExpertStore {
 
     pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
         let reader = self.layer_reader(layer)?;
-        let mut scratch = Vec::new();
+        let mut scratch = ReusableExpertBuffer::default();
         let mut out = Vec::with_capacity(experts.len());
         for &expert in experts {
             let plan = reader.prepare_read(expert)?;
@@ -15006,31 +15007,31 @@ impl ExpertLayerReader {
         offset: u64,
         packed_len: usize,
         slot_capacity: usize,
-        scratch: &mut Vec<u8>,
+        scratch: &mut ReusableExpertBuffer,
     ) -> Result<ExpertReadResult> {
-        if scratch.capacity() < slot_capacity {
-            scratch.reserve_exact(slot_capacity - scratch.capacity());
-        }
-        scratch.resize(packed_len, 0);
+        let payload = scratch.prepare_payload(slot_capacity, packed_len)?;
         let read_started = Instant::now();
-        read_exact_at_positioned(&self.file, scratch, offset).with_context(|| {
+        read_exact_at_positioned(&self.file, payload, offset).with_context(|| {
             format!(
                 "failed to read expert {expert} from {}",
                 self.path.display()
             )
         })?;
         let read_latency = read_started.elapsed();
-        if !cfg!(test) && !scratch.starts_with(PBQ4_EXPERT_MAGIC) {
+        let slot = scratch.slot_view(self.metadata.layer, expert, offset, slot_capacity)?;
+        let payload = slot.payload();
+        if !cfg!(test) && !payload.starts_with(PBQ4_EXPERT_MAGIC) {
             bail!("expert {} is not a pb q4 expert pack", self.path.display());
         }
-        let records = if scratch.starts_with(PBQ4_EXPERT_MAGIC) {
-            parse_pbq4_expert_pack(scratch, Some(&metadata))
+        let records = if payload.starts_with(PBQ4_EXPERT_MAGIC) {
+            parse_pbq4_expert_pack(payload, Some(&metadata))
                 .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?
         } else {
             Vec::new()
         };
-        let packed_prefix = scratch[..scratch.len().min(4096)].to_vec();
+        let packed_prefix = slot.payload_prefix(4096).to_vec();
         Ok(ExpertReadResult {
+            slot: slot.descriptor(),
             weights: ExpertWeights {
                 layer: self.metadata.layer,
                 expert,
@@ -15053,6 +15054,7 @@ struct ExpertReadPlan {
 
 #[derive(Debug)]
 struct ExpertReadResult {
+    slot: ExpertSlotDescriptor,
     weights: ExpertWeights,
     read_latency: Duration,
     read_path: ExpertReadPath,
@@ -15292,7 +15294,7 @@ impl ExpertIoWorkerPool {
         while self.workers.len() < workers {
             let (tx, rx) = mpsc::channel::<ExpertReadJob>();
             let handle = thread::spawn(move || {
-                let mut scratch = Vec::new();
+                let mut scratch = ReusableExpertBuffer::default();
                 while let Ok(job) = rx.recv() {
                     let started_at = Instant::now();
                     let queue_latency = started_at.saturating_duration_since(job.issued_at);

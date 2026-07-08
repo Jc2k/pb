@@ -4,11 +4,13 @@
 //! `legacy`. Keep this module as the stable public surface while internals move
 //! behind smaller modules.
 
+mod experts;
 mod legacy;
 mod math;
 mod model_family;
 mod types;
 
+pub use experts::*;
 pub use legacy::*;
 pub use math::*;
 pub use model_family::*;
