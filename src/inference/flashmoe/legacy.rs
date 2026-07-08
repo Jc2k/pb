@@ -2242,6 +2242,56 @@ impl MetalExecutor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn q4_mmap_top_candidates(
+        &self,
+        packed_byte_offset: u64,
+        scales_byte_offset: u64,
+        biases_byte_offset: u64,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        row_packed_bytes: usize,
+        groups_per_row: usize,
+        group_size: usize,
+        scale_bias_dtype: &str,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.q4_mmap_top_candidates(
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                input,
+                rows,
+                cols,
+                row_packed_bytes,
+                groups_per_row,
+                group_size,
+                scale_bias_dtype,
+                top_k,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                input,
+                rows,
+                cols,
+                row_packed_bytes,
+                groups_per_row,
+                group_size,
+                scale_bias_dtype,
+                top_k,
+            );
+            Ok(None)
+        }
+    }
+
     fn q4_mmap_matvec_batch(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
@@ -4495,6 +4545,155 @@ impl MetalExecutorInner {
                 .with("stride", stride)
                 .with("top_k", top_k)
                 .with("offset", byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
+            let mut candidates = Vec::with_capacity(top_k);
+            for idx in 0..top_k {
+                candidates.push((*indices_ptr.add(idx) as usize, *values_ptr.add(idx)));
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in transient_buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some(candidates))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q4_mmap_top_candidates(
+        &self,
+        packed_byte_offset: u64,
+        scales_byte_offset: u64,
+        biases_byte_offset: u64,
+        input: &[f32],
+        rows: usize,
+        cols: usize,
+        row_packed_bytes: usize,
+        groups_per_row: usize,
+        group_size: usize,
+        scale_bias_dtype: &str,
+        top_k: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        if rows == 0 || cols == 0 || top_k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if input.len() != cols {
+            bail!(
+                "dense q4 mmap top-k input len {} does not match cols {cols}",
+                input.len()
+            );
+        }
+        if group_size == 0 || groups_per_row == 0 || row_packed_bytes == 0 {
+            return Ok(None);
+        }
+        let scale_bias_bytes = expert_scale_bias_dtype_size(scale_bias_dtype)?;
+        if scales_byte_offset % scale_bias_bytes as u64 != 0
+            || biases_byte_offset % scale_bias_bytes as u64 != 0
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let packed_len = rows
+            .checked_mul(row_packed_bytes)
+            .context("dense q4 mmap top-k packed byte length overflow")?;
+        let groups_len = rows
+            .checked_mul(groups_per_row)
+            .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+            .context("dense q4 mmap top-k group byte length overflow")?;
+        for (offset, len) in [
+            (packed_byte_offset, packed_len),
+            (scales_byte_offset, groups_len),
+            (biases_byte_offset, groups_len),
+        ] {
+            let offset =
+                usize::try_from(offset).context("dense q4 mmap top-k offset does not fit usize")?;
+            if offset
+                .checked_add(len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                return Ok(None);
+            }
+        }
+
+        let top_k = top_k.min(rows).max(1);
+        unsafe {
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let logits_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
+            let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
+            let transient_buffers =
+                vec![input_buffer, logits_buffer, indices_buffer, values_buffer];
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            let groups_u32 = groups_per_row as u32;
+            let group_size_u32 = group_size as u32;
+            let top_k_u32 = top_k as u32;
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap top-k Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&transient_buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap top-k Metal compute encoder");
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
+                    self.q4_mmap_bf16_scale_bias_pipeline
+                } else {
+                    self.q4_mmap_pipeline
+                },
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, logits_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+            dispatch_q4_threadgroups(encoder, rows as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.topk_vocab_pipeline,
+            );
+            set_buffer(encoder, logits_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, values_buffer, 2);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
+            set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
+            dispatch_threads(encoder, 1);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("dense_q4_mmap_lm_head_topk")
+                .with("rows", rows)
+                .with("cols", cols)
+                .with("groups_per_row", groups_per_row)
+                .with("group_size", group_size)
+                .with("scale_bias_dtype", scale_bias_dtype)
+                .with("top_k", top_k)
+                .with("packed_offset", packed_byte_offset);
             if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
                 release(encoder);
                 release(command_buffer);
@@ -12379,14 +12578,49 @@ impl DenseStore {
             return Ok(Some(candidates.into_sorted_vec()));
         }
 
-        if let TensorQuantization::Q4 { group_size, .. } = entry.quantization {
+        if let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        {
+            if sampler.repeat_penalty <= 1.0 && metal.has_resident_dense_weights() {
+                let layout = dense_q4_layout_with_scale_bias_dtype(
+                    &entry.shape,
+                    *group_size,
+                    scale_bias_dtype,
+                )?;
+                let packed_offset = entry.byte_offset;
+                let scales_offset = entry
+                    .byte_offset
+                    .checked_add(layout.packed_bytes as u64)
+                    .context("LM-head q4 mmap scales offset overflow")?;
+                let biases_offset = scales_offset
+                    .checked_add(layout.scales_bytes as u64)
+                    .context("LM-head q4 mmap biases offset overflow")?;
+                if let Some(candidates) = metal.q4_mmap_top_candidates(
+                    packed_offset,
+                    scales_offset,
+                    biases_offset,
+                    hidden,
+                    vocab_rows.min(rows),
+                    cols,
+                    layout.row_packed_bytes,
+                    layout.groups_per_row,
+                    *group_size,
+                    scale_bias_dtype,
+                    top_k,
+                )? {
+                    return Ok(Some(candidates));
+                }
+            }
             let projected = self.q4_matvec_tiled(
                 lm_head_name,
                 hidden,
                 rows,
                 cols,
                 rows,
-                Some((metal, group_size, Instant::now())),
+                Some((metal, *group_size, Instant::now())),
             )?;
             let mut candidates = TopKCandidates::new(top_k);
             for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
