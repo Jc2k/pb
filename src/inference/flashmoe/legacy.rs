@@ -1844,6 +1844,17 @@ struct SharedExpertPhaseWeights {
 }
 
 #[derive(Debug, Clone)]
+struct SharedExpertPhaseQ4Projections {
+    gate: DenseQ4MmapMatvecProjection,
+    up: DenseQ4MmapMatvecProjection,
+    down: DenseQ4MmapMatvecProjection,
+    router: DenseQ4MmapMatvecProjection,
+    shared_experts: usize,
+    intermediate: usize,
+    width: usize,
+}
+
+#[derive(Debug, Clone)]
 struct LinearAttentionStaticWeights {
     conv_weight: Arc<Vec<f32>>,
     a_log: Arc<Vec<f32>>,
@@ -2033,6 +2044,7 @@ impl MetalExecutor {
         weights: &[f32],
         prep: MetalPostAttentionPrep,
         shared: Option<&SharedExpertPhaseWeights>,
+        shared_q4: Option<&SharedExpertPhaseQ4Projections>,
         next_norm_weight: Option<&[f32]>,
     ) -> Result<Option<DeferredExpertPhase>> {
         self.inner
@@ -2045,6 +2057,7 @@ impl MetalExecutor {
                 prep.residual_buffer,
                 prep.width,
                 shared,
+                shared_q4,
                 next_norm_weight,
             )
             .map(|pending| pending.map(DeferredExpertPhase::Metal))
@@ -3727,6 +3740,7 @@ impl MetalExecutorInner {
         residual_buffer: ObjcId,
         width: usize,
         shared: Option<&SharedExpertPhaseWeights>,
+        shared_q4: Option<&SharedExpertPhaseQ4Projections>,
         next_norm_weight: Option<&[f32]>,
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         if width == 0 || weights.len() != experts.len() {
@@ -3767,6 +3781,28 @@ impl MetalExecutorInner {
         };
         let shared_metal = if let Some(shared) = shared {
             Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
+        } else {
+            None
+        };
+        let shared_q4_total_intermediate = if let Some(shared) = shared_q4 {
+            let total = shared
+                .shared_experts
+                .checked_mul(shared.intermediate)
+                .context("shared q4 expert intermediate width overflow")?;
+            if shared.width != width
+                || shared.gate.rows != total
+                || shared.gate.cols != width
+                || shared.up.rows != total
+                || shared.up.cols != width
+                || shared.router.rows != shared.shared_experts
+                || shared.router.cols != width
+                || shared.down.rows != width
+                || shared.down.cols != total
+            {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Ok(None);
+            }
+            Some(total)
         } else {
             None
         };
@@ -3818,7 +3854,61 @@ impl MetalExecutorInner {
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
 
-            if let Some(shared) = shared {
+            if let (Some(shared), Some(shared_total_intermediate)) =
+                (shared_q4, shared_q4_total_intermediate)
+            {
+                let total_u32 = shared_total_intermediate as u32;
+                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_gate_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
+                let shared_up_out =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
+                let shared_router_out =
+                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
+                let shared_activated =
+                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
+                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
+                let shared_intermediate_buffer =
+                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
+                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
+
+                self.encode_q4_mmap_projection(
+                    encoder,
+                    &shared.gate,
+                    normed_buffer,
+                    shared_gate_out,
+                )?;
+                self.encode_q4_mmap_projection(encoder, &shared.up, normed_buffer, shared_up_out)?;
+                self.encode_q4_mmap_projection(
+                    encoder,
+                    &shared.router,
+                    normed_buffer,
+                    shared_router_out,
+                )?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.shared_expert_activation_pipeline,
+                );
+                set_buffer(encoder, shared_gate_out, 0);
+                set_buffer(encoder, shared_up_out, 1);
+                set_buffer(encoder, shared_router_out, 2);
+                set_buffer(encoder, shared_activated, 3);
+                set_buffer(encoder, shared_intermediate_buffer, 4);
+                set_buffer(encoder, total_buffer, 5);
+                dispatch_threads(encoder, shared_total_intermediate as u64);
+                self.encode_q4_mmap_projection(
+                    encoder,
+                    &shared.down,
+                    shared_activated,
+                    shared_output_buffer,
+                )?;
+            } else if let Some(shared) = shared {
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let total_u32 = shared_total_intermediate as u32;
                 let shared_intermediate_u32 = shared.intermediate as u32;
@@ -4096,6 +4186,76 @@ impl MetalExecutorInner {
             set_buffer(encoder, cols_buffer, 3);
             dispatch_threads(encoder, rows as u64);
         }
+    }
+
+    unsafe fn encode_q4_mmap_projection(
+        &self,
+        encoder: ObjcId,
+        projection: &DenseQ4MmapMatvecProjection,
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+    ) -> Result<()> {
+        let Some(dense_weights) = &self.dense_weights else {
+            bail!("missing resident dense weights for q4 mmap projection");
+        };
+        let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+        let packed_len = projection
+            .rows
+            .checked_mul(projection.row_packed_bytes)
+            .context("q4 mmap projection packed byte length overflow")?;
+        let groups_len = projection
+            .rows
+            .checked_mul(projection.groups_per_row)
+            .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+            .context("q4 mmap projection group byte length overflow")?;
+        for (offset, len) in [
+            (projection.packed_byte_offset, packed_len),
+            (projection.scales_byte_offset, groups_len),
+            (projection.biases_byte_offset, groups_len),
+        ] {
+            let offset =
+                usize::try_from(offset).context("q4 mmap projection offset does not fit usize")?;
+            if offset
+                .checked_add(len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                bail!(
+                    "q4 mmap projection {} is outside dense weights",
+                    projection.tensor_name
+                );
+            }
+        }
+
+        unsafe {
+            let rows_u32 = projection.rows as u32;
+            let cols_u32 = projection.cols as u32;
+            let groups_u32 = projection.groups_per_row as u32;
+            let group_size_u32 = projection.group_size as u32;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                if projection
+                    .scale_bias_dtype
+                    .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                {
+                    self.q4_mmap_bf16_scale_bias_pipeline
+                } else {
+                    self.q4_mmap_pipeline
+                },
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+            dispatch_q4_threadgroups(encoder, projection.rows as u64);
+        }
+        Ok(())
     }
 
     unsafe fn encode_fill_zero(
@@ -7758,7 +7918,24 @@ impl FlashMoeEngine {
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
-            let shared_phase = self.shared_expert_phase_weights(layer, runtime.width)?;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let shared_q4_phase = if has_metal_post_attention_prep {
+                self.dense.shared_expert_q4_phase_projections(
+                    layer,
+                    runtime.width,
+                    self.config.shared_experts(),
+                    self.config.shared_expert_intermediate_size(),
+                )?
+            } else {
+                None
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let shared_q4_phase: Option<SharedExpertPhaseQ4Projections> = None;
+            let shared_phase = if shared_q4_phase.is_some() {
+                None
+            } else {
+                self.shared_expert_phase_weights(layer, runtime.width)?
+            };
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let expert_io_started = Instant::now();
             let experts = self.scheduler.finish(pending_experts)?;
@@ -7796,6 +7973,7 @@ impl FlashMoeEngine {
                     &weights,
                     prep,
                     shared_phase.as_deref(),
+                    shared_q4_phase.as_ref(),
                     next_norm_weight.as_deref(),
                 )?
                 else {
@@ -13306,6 +13484,50 @@ impl DenseStore {
             groups_per_row: layout.groups_per_row,
             group_size: *group_size,
             scale_bias_dtype: scale_bias_dtype.clone(),
+        }))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn shared_expert_q4_phase_projections(
+        &self,
+        layer: usize,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+    ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
+        if width == 0 || shared_experts == 0 || intermediate == 0 {
+            return Ok(None);
+        }
+        let total_intermediate = shared_experts
+            .checked_mul(intermediate)
+            .context("shared q4 expert intermediate width overflow")?;
+        let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+        let up_name = shared_expert_tensor_name(layer, "up_proj");
+        let down_name = shared_expert_tensor_name(layer, "down_proj");
+        let router_name = shared_expert_gate_tensor_name(layer);
+        let Some(gate) = self.dense_q4_mmap_projection(&gate_name, total_intermediate, width)?
+        else {
+            return Ok(None);
+        };
+        let Some(up) = self.dense_q4_mmap_projection(&up_name, total_intermediate, width)? else {
+            return Ok(None);
+        };
+        let Some(down) = self.dense_q4_mmap_projection(&down_name, width, total_intermediate)?
+        else {
+            return Ok(None);
+        };
+        let Some(router) = self.dense_q4_mmap_projection(&router_name, shared_experts, width)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SharedExpertPhaseQ4Projections {
+            gate,
+            up,
+            down,
+            router,
+            shared_experts,
+            intermediate,
+            width,
         }))
     }
 
