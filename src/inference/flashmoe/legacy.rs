@@ -58,9 +58,11 @@ use std::os::unix::fs::FileExt;
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::experts::{ExpertSlotDescriptor, ReusableExpertBuffer};
+use super::experts::{
+    ExpertSlotDescriptor, ExpertSlotView, FixedQ4ExpertSlotView, ReusableExpertBuffer,
+};
 use super::math::*;
-use super::model_family::QwenMoeModelLayout;
+use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -79,6 +81,7 @@ const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120
 const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
 const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
 const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
+const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
 const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
 const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
 const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
@@ -491,6 +494,7 @@ pub struct QwenModelConfig {
     pub num_hidden_layers: usize,
     pub hidden_size: usize,
     pub num_attention_heads: usize,
+    pub head_dim: Option<usize>,
     pub num_key_value_heads: Option<usize>,
     pub vocab_size: usize,
     pub rope_theta: Option<f64>,
@@ -572,6 +576,7 @@ struct RawQwenModelConfig {
     num_hidden_layers: Option<usize>,
     hidden_size: Option<usize>,
     num_attention_heads: Option<usize>,
+    head_dim: Option<usize>,
     num_key_value_heads: Option<usize>,
     vocab_size: Option<usize>,
     rope_theta: Option<f64>,
@@ -599,6 +604,7 @@ struct RawQwenTextConfig {
     num_hidden_layers: Option<usize>,
     hidden_size: Option<usize>,
     num_attention_heads: Option<usize>,
+    head_dim: Option<usize>,
     num_key_value_heads: Option<usize>,
     vocab_size: Option<usize>,
     rope_theta: Option<f64>,
@@ -654,6 +660,7 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                 raw.num_attention_heads,
                 text.num_attention_heads,
             )?,
+            head_dim: raw.head_dim.or(text.head_dim),
             num_key_value_heads: raw.num_key_value_heads.or(text.num_key_value_heads),
             vocab_size: required("vocab_size", raw.vocab_size, text.vocab_size)?,
             rope_theta: raw
@@ -823,6 +830,11 @@ impl QwenModelConfig {
                 self.num_attention_heads
             );
         }
+        if let Some(head_dim) = self.head_dim
+            && head_dim == 0
+        {
+            bail!("head_dim must be positive when present");
+        }
         if let Some(kv_heads) = self.num_key_value_heads
             && (kv_heads == 0 || !self.num_attention_heads.is_multiple_of(kv_heads))
         {
@@ -897,6 +909,15 @@ impl QwenModelConfig {
 
     pub(crate) fn kv_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    pub(crate) fn derived_attention_head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads.max(1)
+    }
+
+    pub(crate) fn full_attention_head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or_else(|| self.derived_attention_head_dim())
     }
 
     pub(crate) fn experts(&self) -> usize {
@@ -1346,6 +1367,16 @@ where
     let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
+    let upgraded_expert_layers = ensure_fixed_q4_expert_cache(plan, &model_layout)?;
+    if upgraded_expert_layers > 0 {
+        tracing::info!(
+            model = %plan.model,
+            layers = upgraded_expert_layers,
+            "upgraded PBQ4 expert cache layers to fixed Q4 slots"
+        );
+    }
+    progress("expert_cache_format", phase_started.elapsed());
+    phase_started = Instant::now();
     let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
     progress("routing_policy", phase_started.elapsed());
     phase_started = Instant::now();
@@ -1367,8 +1398,11 @@ where
     let metal = MetalExecutor::new(plan, &config, &runtime, &dense)?;
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
-    let experts = ExpertStore::open(plan.experts_dir.clone())?;
-    let scheduler = ExpertScheduler::new(ExpertStore::open(plan.experts_dir.clone())?);
+    let experts = ExpertStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
+    let scheduler = ExpertScheduler::new_with_routed_expert_scale(
+        ExpertStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?,
+        model_layout.routed_expert_scale,
+    );
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
@@ -1386,6 +1420,8 @@ where
         routing_policy,
         runtime,
         shared_expert_cache: Mutex::new(BTreeMap::new()),
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
         linear_attention_cache: Mutex::new(BTreeMap::new()),
         session_cache: BTreeMap::new(),
     })
@@ -1404,6 +1440,8 @@ pub struct FlashMoeEngine {
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
     shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    shared_expert_q4_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseQ4Projections>>>,
     linear_attention_cache: Mutex<BTreeMap<usize, Arc<LinearAttentionStaticWeights>>>,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
@@ -1861,6 +1899,65 @@ struct SharedExpertPhaseQ4Projections {
     width: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SharedExpertPhaseRef<'a> {
+    None,
+    Dense(&'a SharedExpertPhaseWeights),
+    Q4(&'a SharedExpertPhaseQ4Projections),
+}
+
+impl<'a> SharedExpertPhaseRef<'a> {
+    fn from_options(
+        dense: Option<&'a SharedExpertPhaseWeights>,
+        q4: Option<&'a SharedExpertPhaseQ4Projections>,
+    ) -> Self {
+        if let Some(q4) = q4 {
+            Self::Q4(q4)
+        } else if let Some(dense) = dense {
+            Self::Dense(dense)
+        } else {
+            Self::None
+        }
+    }
+
+    fn dense(self) -> Option<&'a SharedExpertPhaseWeights> {
+        match self {
+            Self::Dense(shared) => Some(shared),
+            Self::None | Self::Q4(_) => None,
+        }
+    }
+
+    fn q4(self) -> Option<&'a SharedExpertPhaseQ4Projections> {
+        match self {
+            Self::Q4(shared) => Some(shared),
+            Self::None | Self::Dense(_) => None,
+        }
+    }
+
+    fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug)]
+enum ExpertPhaseInput<'a> {
+    Cpu {
+        normed: &'a [f32],
+        residual: &'a [f32],
+    },
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MetalPostAttention(MetalPostAttentionPrep),
+}
+
+#[derive(Debug)]
+struct ScheduledExpertPhase<'a> {
+    position: usize,
+    scheduled: &'a ScheduledExpertSet,
+    input: ExpertPhaseInput<'a>,
+    shared: SharedExpertPhaseRef<'a>,
+    next_norm_weight: Option<&'a [f32]>,
+}
+
 #[derive(Debug, Clone)]
 struct LinearAttentionStaticWeights {
     conv_weight: Arc<Vec<f32>>,
@@ -1900,12 +1997,68 @@ impl DeferredExpertPhase {
             Self::Metal(output) => output.next_normed_input(),
         }
     }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hidden_metal_input(&self) -> Option<DeferredMetalInput> {
+        match self {
+            Self::Metal(output) => Some(output.hidden_input()),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn finish_without_readback(self) -> Result<()> {
+        match self {
+            Self::Metal(output) => output.finish_without_readback(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DenseProjectionRequest<'a> {
     tensor_name: &'a str,
     output_width: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalProjectionBatch {
+    output_buffer: ObjcId,
+    output_offsets: Vec<usize>,
+    output_widths: Vec<usize>,
+    total_rows: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+enum MetalBatchProjectionInput<'a> {
+    Cpu(&'a [f32]),
+    Buffer { buffer: ObjcId, len: usize },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalBatchProjectionInput<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Cpu(input) => input.len(),
+            Self::Buffer { len, .. } => len,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalLinearAttentionStaticOffsets {
+    conv_weight_byte_offset: u64,
+    a_log_byte_offset: u64,
+    dt_bias_byte_offset: u64,
+    norm_weight_byte_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalAttentionValues {
+    buffer: ObjcId,
+    len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1986,6 +2139,13 @@ impl MetalExecutor {
         }
     }
 
+    fn reset_linear_attention_state(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.reset_linear_attention_state();
+        }
+    }
+
     fn project_q4_expert(
         &self,
         expert: &ExpertWeights,
@@ -2010,7 +2170,7 @@ impl MetalExecutor {
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
-        shared: Option<&SharedExpertPhaseWeights>,
+        shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
     ) -> Result<Option<DeferredExpertPhase>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2036,38 +2196,43 @@ impl MetalExecutor {
                 weights,
                 normed,
                 residual,
-                shared,
+                shared.dense(),
                 next_norm_weight,
             )?)))
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn submit_expert_phase_from_metal_prep(
+    fn submit_scheduled_expert_phase(
         &self,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
-        weights: &[f32],
-        prep: MetalPostAttentionPrep,
-        shared: Option<&SharedExpertPhaseWeights>,
-        shared_q4: Option<&SharedExpertPhaseQ4Projections>,
-        next_norm_weight: Option<&[f32]>,
+        phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
-        self.inner
-            .submit_expert_phase_from_buffers(
-                position,
-                layer,
-                experts,
-                weights,
-                prep.normed_buffer,
-                prep.residual_buffer,
-                prep.width,
-                shared,
-                shared_q4,
-                next_norm_weight,
-            )
-            .map(|pending| pending.map(DeferredExpertPhase::Metal))
+        match phase.input {
+            ExpertPhaseInput::Cpu { normed, residual } => self.submit_expert_phase(
+                phase.position,
+                phase.scheduled.layer,
+                phase.scheduled.experts.clone(),
+                &phase.scheduled.weights,
+                normed,
+                residual,
+                phase.shared,
+                phase.next_norm_weight,
+            ),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            ExpertPhaseInput::MetalPostAttention(prep) => self
+                .inner
+                .submit_expert_phase_from_buffers(
+                    phase.position,
+                    phase.scheduled.layer,
+                    phase.scheduled.experts.clone(),
+                    &phase.scheduled.weights,
+                    prep.normed_buffer,
+                    prep.residual_buffer,
+                    prep.width,
+                    phase.shared,
+                    phase.next_norm_weight,
+                )
+                .map(|pending| pending.map(DeferredExpertPhase::Metal)),
+        }
     }
 
     fn route_topk(
@@ -2268,6 +2433,16 @@ impl MetalExecutor {
             .dense_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn dense_mmap_matvec_batch_to_buffer(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
+        self.inner
+            .dense_mmap_matvec_batch_to_buffer(projections, input)
+    }
+
     fn dense_mmap_top_candidates(
         &self,
         byte_offset: u64,
@@ -2353,7 +2528,7 @@ impl MetalExecutor {
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &[f32],
-        residual: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
@@ -2361,6 +2536,55 @@ impl MetalExecutor {
             out_proj,
             router,
             attention_output,
+            residual,
+            post_norm_weight,
+            top_k,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn q4_post_attention_prep_topk_from_buffer(
+        &self,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        attention_output: &MetalAttentionValues,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        self.inner.q4_post_attention_prep_topk_from_buffer(
+            out_proj,
+            router,
+            attention_output,
+            residual,
+            post_norm_weight,
+            top_k,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_q4_post_attention_prep(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        input_projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        self.inner.linear_attention_q4_post_attention_prep(
+            layer,
+            layout,
+            input_projections,
+            input,
+            static_offsets,
+            out_proj,
+            router,
             residual,
             post_norm_weight,
             top_k,
@@ -2392,6 +2616,56 @@ impl MetalExecutor {
     ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
         self.inner
             .q4_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn q4_mmap_matvec_batch_to_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
+        self.inner
+            .q4_mmap_matvec_batch_to_buffer(projections, input)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_q4_mmap_batch(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+    ) -> Result<Option<MetalAttentionValues>> {
+        self.inner
+            .linear_attention_q4_mmap_batch(layer, layout, projections, input, static_offsets)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_from_projection_batch(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        batch: MetalProjectionBatch,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+    ) -> Result<Option<Vec<f32>>> {
+        self.inner
+            .linear_attention_from_projection_batch(layer, layout, batch, static_offsets)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn recycle_projection_batch(&self, batch: MetalProjectionBatch) {
+        self.inner.recycle_projection_batch(batch);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn read_and_recycle_attention_values(&self, values: MetalAttentionValues) -> Vec<f32> {
+        self.inner.read_and_recycle_attention_values(values)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn recycle_attention_values(&self, values: MetalAttentionValues) {
+        self.inner.recycle_attention_values(values);
     }
 
     fn lm_head_top_candidates_from_cached_buffer(
@@ -2623,6 +2897,8 @@ struct MetalExecutorInner {
     q4_swiglu_bf16_scale_bias_pipeline: ObjcId,
     q4_mmap_pipeline: ObjcId,
     q4_mmap_bf16_scale_bias_pipeline: ObjcId,
+    q4_mmap_batch_pipeline: ObjcId,
+    q4_mmap_batch_bf16_scale_bias_pipeline: ObjcId,
     route_pipeline: Option<ObjcId>,
     dense_matvec_pipeline: ObjcId,
     dense_matvec_bf16_pipeline: ObjcId,
@@ -2646,10 +2922,16 @@ struct MetalExecutorInner {
     topk_vocab_pipeline: ObjcId,
     gqa_scores_pipeline: ObjcId,
     gqa_read_pipeline: ObjcId,
+    linear_conv1d_pipeline: ObjcId,
+    linear_rms_norm_qk_pipeline: ObjcId,
+    linear_decay_beta_pipeline: ObjcId,
+    linear_delta_step_pipeline: ObjcId,
+    linear_gated_rms_norm_pipeline: ObjcId,
     shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
     dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
+    linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
 }
@@ -2743,6 +3025,9 @@ struct MetalReusableBuffer {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct MetalKvCacheInner {
     keys: ObjcId,
@@ -2761,6 +3046,28 @@ struct MetalKvLayer {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+struct MetalLinearAttentionStateCache {
+    layers: Vec<Option<MetalLinearAttentionLayerState>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalLinearAttentionLayerState {
+    conv_state: ObjcId,
+    ssm_state: ObjcId,
+    conv_output: ObjcId,
+    delta_output: ObjcId,
+    g_decay: ObjcId,
+    beta_gate: ObjcId,
+    conv_state_len: usize,
+    ssm_state_len: usize,
+    conv_dim: usize,
+    total_value_width: usize,
+    num_value_heads: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 struct MetalPhaseBuffer {
     id: ObjcId,
     recycle: bool,
@@ -2774,6 +3081,51 @@ impl MetalPhaseBuffer {
 
     fn borrowed(id: ObjcId) -> Self {
         Self { id, recycle: false }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalQ4SourceBufferKey {
+    ptr: usize,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalQ4SourceBufferEntry {
+    key: MetalQ4SourceBufferKey,
+    buffer: ObjcId,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct MetalQ4SourceBufferCache {
+    entries: Vec<MetalQ4SourceBufferEntry>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalQ4SourceBufferCache {
+    fn key_for(bytes: &[u8]) -> MetalQ4SourceBufferKey {
+        MetalQ4SourceBufferKey {
+            ptr: bytes.as_ptr() as usize,
+            len: bytes.len(),
+        }
+    }
+
+    fn get(&self, bytes: &[u8]) -> Option<ObjcId> {
+        let key = Self::key_for(bytes);
+        self.entries
+            .iter()
+            .find_map(|entry| (entry.key == key).then_some(entry.buffer))
+    }
+
+    fn insert(&mut self, bytes: &[u8], buffer: ObjcId) {
+        let key = Self::key_for(bytes);
+        if self.entries.iter().any(|entry| entry.key == key) {
+            return;
+        }
+        self.entries.push(MetalQ4SourceBufferEntry { key, buffer });
     }
 }
 
@@ -2797,6 +3149,35 @@ impl MetalDeferredExpertPhase {
             buffer,
             len: self.width,
         })
+    }
+
+    fn hidden_input(&self) -> DeferredMetalInput {
+        DeferredMetalInput {
+            buffer: self.hidden_buffer,
+            len: self.width,
+        }
+    }
+
+    fn finish_without_readback(self) -> Result<()> {
+        unsafe {
+            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
+                release(self.command_buffer);
+                for buffer in self.buffers {
+                    release(buffer.id);
+                }
+                return Err(error.into());
+            }
+            release(self.command_buffer);
+            for buffer in self.buffers {
+                if buffer.recycle {
+                    self.inner.recycle(buffer.id);
+                } else {
+                    release(buffer.id);
+                }
+            }
+            drop(self.retained_experts);
+            Ok(())
+        }
     }
 
     fn wait(self) -> Result<ExpertPhaseOutput> {
@@ -2845,6 +3226,8 @@ impl Drop for MetalExecutorInner {
             release(self.q4_swiglu_bf16_scale_bias_pipeline);
             release(self.q4_mmap_pipeline);
             release(self.q4_mmap_bf16_scale_bias_pipeline);
+            release(self.q4_mmap_batch_pipeline);
+            release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
             if let Some(route_pipeline) = self.route_pipeline {
                 release(route_pipeline);
             }
@@ -2870,6 +3253,11 @@ impl Drop for MetalExecutorInner {
             release(self.topk_vocab_pipeline);
             release(self.gqa_scores_pipeline);
             release(self.gqa_read_pipeline);
+            release(self.linear_conv1d_pipeline);
+            release(self.linear_rms_norm_qk_pipeline);
+            release(self.linear_decay_beta_pipeline);
+            release(self.linear_delta_step_pipeline);
+            release(self.linear_gated_rms_norm_pipeline);
             if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
                 for buffers in shared_buffers.values() {
                     release(buffers.gate);
@@ -2894,6 +3282,16 @@ impl Drop for MetalExecutorInner {
             {
                 release(kv_cache.keys);
                 release(kv_cache.values);
+            }
+            if let Ok(linear_state) = self.linear_attention_state.get_mut() {
+                for layer in linear_state.layers.iter_mut().filter_map(Option::take) {
+                    release(layer.conv_state);
+                    release(layer.ssm_state);
+                    release(layer.conv_output);
+                    release(layer.delta_output);
+                    release(layer.g_decay);
+                    release(layer.beta_gate);
+                }
             }
             release(self.command_queue);
             release(self.device);
@@ -2948,6 +3346,10 @@ impl MetalExecutorInner {
             let q4_mmap_pipeline = compile_pipeline(device, library, "q4_mmap_fma_matvec")?;
             let q4_mmap_bf16_scale_bias_pipeline =
                 compile_pipeline(device, library, "q4_mmap_fma_matvec_bf16_scale_bias")?;
+            let q4_mmap_batch_pipeline =
+                compile_pipeline(device, library, "q4_mmap_fma_matvec_batch")?;
+            let q4_mmap_batch_bf16_scale_bias_pipeline =
+                compile_pipeline(device, library, "q4_mmap_fma_matvec_batch_bf16_scale_bias")?;
             let route_pipeline = if route_top4_enabled {
                 Some(compile_pipeline(device, library, "route_top4")?)
             } else {
@@ -2984,6 +3386,15 @@ impl MetalExecutorInner {
             let topk_vocab_pipeline = compile_pipeline(device, library, "topk_vocab")?;
             let gqa_scores_pipeline = compile_pipeline(device, library, "gqa_attention_scores")?;
             let gqa_read_pipeline = compile_pipeline(device, library, "gqa_kv_read_attention")?;
+            let linear_conv1d_pipeline = compile_pipeline(device, library, "linear_conv1d_step")?;
+            let linear_rms_norm_qk_pipeline =
+                compile_pipeline(device, library, "linear_rms_norm_qk")?;
+            let linear_decay_beta_pipeline =
+                compile_pipeline(device, library, "linear_compute_decay_beta")?;
+            let linear_delta_step_pipeline =
+                compile_pipeline(device, library, "linear_gated_delta_step")?;
+            let linear_gated_rms_norm_pipeline =
+                compile_pipeline(device, library, "linear_gated_rms_norm")?;
             release(library);
 
             let command_queue = msg_send_id0(device, sel("newCommandQueue"));
@@ -2994,6 +3405,8 @@ impl MetalExecutorInner {
                 release(q4_swiglu_bf16_scale_bias_pipeline);
                 release(q4_mmap_pipeline);
                 release(q4_mmap_bf16_scale_bias_pipeline);
+                release(q4_mmap_batch_pipeline);
+                release(q4_mmap_batch_bf16_scale_bias_pipeline);
                 if let Some(route_pipeline) = route_pipeline {
                     release(route_pipeline);
                 }
@@ -3019,6 +3432,11 @@ impl MetalExecutorInner {
                 release(topk_vocab_pipeline);
                 release(gqa_scores_pipeline);
                 release(gqa_read_pipeline);
+                release(linear_conv1d_pipeline);
+                release(linear_rms_norm_qk_pipeline);
+                release(linear_decay_beta_pipeline);
+                release(linear_delta_step_pipeline);
+                release(linear_gated_rms_norm_pipeline);
                 release(device);
                 bail!("failed to create Flash-MoE Metal command queue");
             }
@@ -3033,6 +3451,8 @@ impl MetalExecutorInner {
             );
             let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
             let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
+            let linear_attention_state =
+                allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
 
             tracing::info!(
                 model = %plan.model,
@@ -3054,6 +3474,8 @@ impl MetalExecutorInner {
                 q4_swiglu_bf16_scale_bias_pipeline,
                 q4_mmap_pipeline,
                 q4_mmap_bf16_scale_bias_pipeline,
+                q4_mmap_batch_pipeline,
+                q4_mmap_batch_bf16_scale_bias_pipeline,
                 route_pipeline,
                 dense_matvec_pipeline,
                 dense_matvec_bf16_pipeline,
@@ -3077,12 +3499,18 @@ impl MetalExecutorInner {
                 topk_vocab_pipeline,
                 gqa_scores_pipeline,
                 gqa_read_pipeline,
+                linear_conv1d_pipeline,
+                linear_rms_norm_qk_pipeline,
+                linear_decay_beta_pipeline,
+                linear_delta_step_pipeline,
+                linear_gated_rms_norm_pipeline,
                 shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
                 dense_weights,
                 lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
                     metal_lm_head_buffer_budget_bytes(),
                 )),
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
+                linear_attention_state: std::sync::Mutex::new(linear_attention_state),
                 attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
                 reusable: std::sync::Mutex::new(Vec::new()),
             })
@@ -3116,6 +3544,1139 @@ impl MetalExecutorInner {
             )?;
             Ok(Some(output))
         })
+    }
+
+    fn reset_linear_attention_state(&self) {
+        let Ok(state) = self.linear_attention_state.lock() else {
+            return;
+        };
+        unsafe {
+            for layer in state.layers.iter().flatten() {
+                zero_metal_buffer(layer.conv_state, layer.conv_state_len);
+                zero_metal_buffer(layer.ssm_state, layer.ssm_state_len);
+                zero_metal_buffer(layer.conv_output, layer.conv_dim);
+                zero_metal_buffer(layer.delta_output, layer.total_value_width);
+                zero_metal_buffer(layer.g_decay, layer.num_value_heads);
+                zero_metal_buffer(layer.beta_gate, layer.num_value_heads);
+            }
+        }
+    }
+
+    fn recycle_projection_batch(&self, batch: MetalProjectionBatch) {
+        if !batch.output_buffer.is_null() {
+            unsafe {
+                self.recycle(batch.output_buffer);
+            }
+        }
+    }
+
+    fn recycle_attention_values(&self, values: MetalAttentionValues) {
+        if !values.buffer.is_null() {
+            unsafe {
+                self.recycle(values.buffer);
+            }
+        }
+    }
+
+    fn read_and_recycle_attention_values(&self, values: MetalAttentionValues) -> Vec<f32> {
+        unsafe {
+            let output = read_f32_buffer(values.buffer, values.len);
+            self.recycle(values.buffer);
+            output
+        }
+    }
+
+    fn linear_attention_from_projection_batch(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        batch: MetalProjectionBatch,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+    ) -> Result<Option<Vec<f32>>> {
+        if batch.output_offsets.len() != 4
+            || batch.output_widths.len() != 4
+            || batch.output_widths[0] != layout.conv_dim
+            || batch.output_widths[1] != layout.total_value_width
+            || batch.output_widths[2] != layout.num_value_heads
+            || batch.output_widths[3] != layout.num_value_heads
+            || layout.key_dim == 0
+            || layout.value_dim == 0
+            || layout.key_dim > 256
+            || layout.value_dim > 256
+            || layout.num_key_heads == 0
+            || layout.num_value_heads == 0
+        {
+            self.recycle_projection_batch(batch);
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            self.recycle_projection_batch(batch);
+            return Ok(None);
+        };
+        let qkv_offset = batch.output_offsets[0]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention qkv projection offset overflow")?
+            as u64;
+        let z_offset = batch.output_offsets[1]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention z projection offset overflow")?
+            as u64;
+        let beta_offset = batch.output_offsets[2]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention beta projection offset overflow")?
+            as u64;
+        let alpha_offset = batch.output_offsets[3]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention alpha projection offset overflow")?
+            as u64;
+
+        let mut state_guard = self
+            .linear_attention_state
+            .lock()
+            .expect("metal linear attention state poisoned");
+        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
+            drop(state_guard);
+            self.recycle_projection_batch(batch);
+            return Ok(None);
+        };
+        if state.conv_dim != layout.conv_dim
+            || state.total_value_width != layout.total_value_width
+            || state.num_value_heads != layout.num_value_heads
+            || state.conv_state_len != layout.conv_state_len()
+            || state.ssm_state_len != layout.ssm_state_len()
+        {
+            drop(state_guard);
+            self.recycle_projection_batch(batch);
+            return Ok(None);
+        }
+
+        unsafe {
+            let output_buffer =
+                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle(output_buffer);
+                drop(state_guard);
+                self.recycle_projection_batch(batch);
+                bail!("failed to create Flash-MoE linear-attention Metal command buffer");
+            }
+
+            let conv_dim_u32 = layout.conv_dim as u32;
+            let kernel_size_u32 = layout.conv_kernel_size as u32;
+            let key_dim_u32 = layout.key_dim as u32;
+            let value_dim_u32 = layout.value_dim as u32;
+            let heads_u32 = layout.num_value_heads as u32;
+            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
+            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+            let eps = 1e-6f32;
+
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle(output_buffer);
+                drop(state_guard);
+                self.recycle_projection_batch(batch);
+                bail!("failed to create Flash-MoE linear-attention Metal compute encoder");
+            }
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_conv1d_pipeline,
+            );
+            set_buffer(encoder, state.conv_state, 0);
+            set_buffer_with_offset(encoder, batch.output_buffer, qkv_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.conv_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, state.conv_output, 3);
+            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
+            dispatch_threads(encoder, layout.conv_dim as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_rms_norm_qk_pipeline,
+            );
+            set_buffer(encoder, state.conv_output, 0);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                1,
+            );
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_key_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.key_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_decay_beta_pipeline,
+            );
+            set_buffer_with_offset(encoder, batch.output_buffer, alpha_offset, 0);
+            set_buffer_with_offset(encoder, batch.output_buffer, beta_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.a_log_byte_offset,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.dt_bias_byte_offset,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
+            dispatch_threads(encoder, layout.num_value_heads as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_delta_step_pipeline,
+            );
+            set_buffer(encoder, state.ssm_state, 0);
+            set_buffer(encoder, state.conv_output, 1);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_buffer(encoder, state.delta_output, 6);
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_gated_rms_norm_pipeline,
+            );
+            set_buffer(encoder, state.delta_output, 0);
+            set_buffer_with_offset(encoder, batch.output_buffer, z_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.norm_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, output_buffer, 3);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("linear_attention_gated_delta")
+                .with("layer", layer)
+                .with("conv_dim", layout.conv_dim)
+                .with("key_dim", layout.key_dim)
+                .with("value_dim", layout.value_dim)
+                .with("value_heads", layout.num_value_heads);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
+                drop(state_guard);
+                self.recycle_projection_batch(batch);
+                return Err(error.into());
+            }
+
+            let output = read_f32_buffer(output_buffer, layout.total_value_width);
+            release(encoder);
+            release(command_buffer);
+            self.recycle(output_buffer);
+            drop(state_guard);
+            self.recycle_projection_batch(batch);
+            Ok(Some(output))
+        }
+    }
+
+    fn linear_attention_q4_mmap_batch(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+    ) -> Result<Option<MetalAttentionValues>> {
+        if projections.len() != 4
+            || projections[0].output_width != layout.conv_dim
+            || projections[1].output_width != layout.total_value_width
+            || projections[2].output_width != layout.num_value_heads
+            || projections[3].output_width != layout.num_value_heads
+            || layout.key_dim == 0
+            || layout.value_dim == 0
+            || layout.key_dim > 256
+            || layout.value_dim > 256
+            || layout.num_key_heads == 0
+            || layout.num_value_heads == 0
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len || projection.output_width != projection.rows {
+                return Ok(None);
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                return Ok(None);
+            }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("linear-attention q4 projection packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("linear-attention q4 projection group byte length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, group_bytes),
+                (projection.biases_byte_offset, group_bytes),
+            ] {
+                let offset =
+                    usize::try_from(offset).context("linear-attention q4 offset overflow")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            output_offsets.push(total_rows);
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("linear-attention q4 projection output row overflow")?;
+        }
+
+        let qkv_offset = output_offsets[0]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention qkv projection offset overflow")?
+            as u64;
+        let z_offset = output_offsets[1]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention z projection offset overflow")?
+            as u64;
+        let beta_offset = output_offsets[2]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention beta projection offset overflow")?
+            as u64;
+        let alpha_offset = output_offsets[3]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention alpha projection offset overflow")?
+            as u64;
+
+        let mut state_guard = self
+            .linear_attention_state
+            .lock()
+            .expect("metal linear attention state poisoned");
+        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
+            return Ok(None);
+        };
+        if state.conv_dim != layout.conv_dim
+            || state.total_value_width != layout.total_value_width
+            || state.num_value_heads != layout.num_value_heads
+            || state.conv_state_len != layout.conv_state_len()
+            || state.ssm_state_len != layout.ssm_state_len()
+        {
+            return Ok(None);
+        }
+
+        unsafe {
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let projection_buffer =
+                self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let output_buffer =
+                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(projection_buffer);
+                self.recycle(output_buffer);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE linear-attention q4 CMD1 command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(projection_buffer);
+                self.recycle(output_buffer);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE linear-attention q4 CMD1 compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let output_offset = output_offsets[idx]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("linear-attention q4 output byte offset overflow")?
+                    as u64;
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, projection_buffer, output_offset, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+            }
+            metal_buffer_barrier(encoder);
+
+            let conv_dim_u32 = layout.conv_dim as u32;
+            let kernel_size_u32 = layout.conv_kernel_size as u32;
+            let key_dim_u32 = layout.key_dim as u32;
+            let value_dim_u32 = layout.value_dim as u32;
+            let heads_u32 = layout.num_value_heads as u32;
+            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
+            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+            let eps = 1e-6f32;
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_conv1d_pipeline,
+            );
+            set_buffer(encoder, state.conv_state, 0);
+            set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.conv_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, state.conv_output, 3);
+            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
+            dispatch_threads(encoder, layout.conv_dim as u64);
+            metal_buffer_barrier(encoder);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_rms_norm_qk_pipeline,
+            );
+            set_buffer(encoder, state.conv_output, 0);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                1,
+            );
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_key_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.key_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            metal_buffer_barrier(encoder);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_decay_beta_pipeline,
+            );
+            set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
+            set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.a_log_byte_offset,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.dt_bias_byte_offset,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
+            dispatch_threads(encoder, layout.num_value_heads as u64);
+            metal_buffer_barrier(encoder);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_delta_step_pipeline,
+            );
+            set_buffer(encoder, state.ssm_state, 0);
+            set_buffer(encoder, state.conv_output, 1);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_buffer(encoder, state.delta_output, 6);
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            metal_buffer_barrier(encoder);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_gated_rms_norm_pipeline,
+            );
+            set_buffer(encoder, state.delta_output, 0);
+            set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.norm_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, output_buffer, 3);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("linear_attention_q4_cmd1")
+                .with("layer", layer)
+                .with("projections", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("conv_dim", layout.conv_dim)
+                .with("value_heads", layout.num_value_heads);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(
+                    &[projection_buffer, output_buffer],
+                    error.should_release_buffers(),
+                );
+                drop(state_guard);
+                return Err(error.into());
+            }
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            self.recycle(projection_buffer);
+            drop(state_guard);
+            Ok(Some(MetalAttentionValues {
+                buffer: output_buffer,
+                len: layout.total_value_width,
+            }))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_q4_post_attention_prep(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        let residual_len = residual.len();
+        if top_k == 0
+            || residual_len == 0
+            || residual_len != post_norm_weight.len()
+            || projections.len() != 4
+            || projections[0].output_width != layout.conv_dim
+            || projections[1].output_width != layout.total_value_width
+            || projections[2].output_width != layout.num_value_heads
+            || projections[3].output_width != layout.num_value_heads
+            || out_proj.output_width != residual_len
+            || out_proj.rows != residual_len
+            || out_proj.cols != layout.total_value_width
+            || router.cols != residual_len
+            || router.output_width != router.rows
+            || layout.key_dim == 0
+            || layout.value_dim == 0
+            || layout.key_dim > 256
+            || layout.value_dim > 256
+            || layout.num_key_heads == 0
+            || layout.num_value_heads == 0
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0
+                || projection.cols == 0
+                || projection.cols != input_len
+                || projection.output_width != projection.rows
+                || projection.row_packed_bytes != projection.cols.div_ceil(2)
+            {
+                return Ok(None);
+            }
+            output_offsets.push(total_rows);
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("linear-attention q4 projection output row overflow")?;
+        }
+        for projection in projections.iter().chain([out_proj, router]) {
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("linear fused q4 packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("linear fused q4 group byte length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, group_bytes),
+                (projection.biases_byte_offset, group_bytes),
+            ] {
+                let offset = usize::try_from(offset).context("linear fused q4 offset overflow")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let qkv_offset = output_offsets[0]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention qkv projection offset overflow")?
+            as u64;
+        let z_offset = output_offsets[1]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention z projection offset overflow")?
+            as u64;
+        let beta_offset = output_offsets[2]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention beta projection offset overflow")?
+            as u64;
+        let alpha_offset = output_offsets[3]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention alpha projection offset overflow")?
+            as u64;
+
+        let mut state_guard = self
+            .linear_attention_state
+            .lock()
+            .expect("metal linear attention state poisoned");
+        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
+            return Ok(None);
+        };
+        if state.conv_dim != layout.conv_dim
+            || state.total_value_width != layout.total_value_width
+            || state.num_value_heads != layout.num_value_heads
+            || state.conv_state_len != layout.conv_state_len()
+            || state.ssm_state_len != layout.ssm_state_len()
+        {
+            return Ok(None);
+        }
+
+        unsafe {
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let projection_buffer =
+                self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let attention_output_buffer =
+                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
+            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
+                MetalBatchProjectionInput::Cpu(residual) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
+            let projected_buffer =
+                self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let residual_buffer =
+                self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let normed_buffer = self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let router_logits_buffer =
+                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
+            let mut owned_buffers = vec![
+                projection_buffer,
+                attention_output_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                residual_buffer,
+                normed_buffer,
+                router_logits_buffer,
+            ];
+            if let Some(buffer) = owned_residual_input_buffer {
+                owned_buffers.push(buffer);
+            }
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle_or_release_buffers(&owned_buffers, true);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE fused linear q4 command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle_or_release_buffers(&owned_buffers, true);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE fused linear q4 compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let output_offset = output_offsets[idx]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("linear fused q4 output byte offset overflow")?
+                    as u64;
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, projection_buffer, output_offset, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+            }
+
+            let conv_dim_u32 = layout.conv_dim as u32;
+            let kernel_size_u32 = layout.conv_kernel_size as u32;
+            let key_dim_u32 = layout.key_dim as u32;
+            let value_dim_u32 = layout.value_dim as u32;
+            let heads_u32 = layout.num_value_heads as u32;
+            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
+            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+            let eps = 1e-6f32;
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_conv1d_pipeline,
+            );
+            set_buffer(encoder, state.conv_state, 0);
+            set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.conv_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, state.conv_output, 3);
+            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
+            dispatch_threads(encoder, layout.conv_dim as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_rms_norm_qk_pipeline,
+            );
+            set_buffer(encoder, state.conv_output, 0);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                1,
+            );
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_key_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.key_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_decay_beta_pipeline,
+            );
+            set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
+            set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.a_log_byte_offset,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.dt_bias_byte_offset,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
+            dispatch_threads(encoder, layout.num_value_heads as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_delta_step_pipeline,
+            );
+            set_buffer(encoder, state.ssm_state, 0);
+            set_buffer(encoder, state.conv_output, 1);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_buffer(encoder, state.delta_output, 6);
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.linear_gated_rms_norm_pipeline,
+            );
+            set_buffer(encoder, state.delta_output, 0);
+            set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.norm_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, attention_output_buffer, 3);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MtlSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MtlSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            for (projection, input_buffer, output_buffer) in [
+                (out_proj, attention_output_buffer, projected_buffer),
+                (router, normed_buffer, router_logits_buffer),
+            ] {
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer(encoder, output_buffer, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+
+                if std::ptr::eq(projection, out_proj) {
+                    let width_u32 = residual_len as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, projected_buffer, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, residual_buffer, 3);
+                    set_buffer(encoder, normed_buffer, 4);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                    dispatch_single_threadgroup(encoder, 256);
+                }
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let active_count = top_k.min(router.rows).max(1);
+            let context = MetalCommandContext::new("linear_attention_q4_fused_post")
+                .with("layer", layer)
+                .with("projections", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("experts", router.rows)
+                .with("top_k", active_count);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(&owned_buffers, error.should_release_buffers());
+                drop(state_guard);
+                return Err(error.into());
+            }
+
+            let router_logits_ptr =
+                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
+            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
+            let active = super::math::top_k(&router_scores, active_count);
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            if let Some(buffer) = owned_residual_input_buffer {
+                self.recycle(buffer);
+            }
+            for buffer in [
+                projection_buffer,
+                attention_output_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                router_logits_buffer,
+            ] {
+                self.recycle(buffer);
+            }
+            drop(state_guard);
+            Ok(Some(MetalPostAttentionPrep {
+                residual_buffer,
+                normed_buffer,
+                width: residual_len,
+                active,
+            }))
+        }
     }
 
     fn dispatch_q4_matvec(
@@ -3271,17 +4832,10 @@ impl MetalExecutorInner {
             let upload_started = Instant::now();
             let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
             let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
-            let packed_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&packed_byte_offset))?;
-            let scales_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&scales_byte_offset))?;
-            let biases_offset_buffer = self.buffer_with_bytes(u64_as_bytes(&biases_byte_offset))?;
             let rows_u32 = rows as u32;
             let cols_u32 = cols as u32;
             let groups_u32 = groups_per_row as u32;
             let group_size_u32 = group_size as u32;
-            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
             timing.buffer_upload += upload_started.elapsed();
 
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
@@ -3306,14 +4860,14 @@ impl MetalExecutorInner {
             set_buffer(encoder, dense_weights.buffer, 0);
             set_buffer(encoder, input_buffer, 1);
             set_buffer(encoder, output_buffer, 2);
-            set_buffer(encoder, packed_offset_buffer, 3);
-            set_buffer(encoder, scales_offset_buffer, 4);
-            set_buffer(encoder, biases_offset_buffer, 5);
-            set_buffer(encoder, rows_buffer, 6);
-            set_buffer(encoder, cols_buffer, 7);
-            set_buffer(encoder, groups_buffer, 8);
-            set_buffer(encoder, group_size_buffer, 9);
-            dispatch_q4_threadgroups(encoder, rows as u64);
+            set_bytes(encoder, u64_as_bytes(&packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
             msg_send_void0(encoder, sel("endEncoding"));
 
             let dispatch_started = Instant::now();
@@ -3327,17 +4881,7 @@ impl MetalExecutorInner {
                 release(encoder);
                 release(command_buffer);
                 self.recycle_or_release_buffers(
-                    &[
-                        input_buffer,
-                        output_buffer,
-                        packed_offset_buffer,
-                        scales_offset_buffer,
-                        biases_offset_buffer,
-                        rows_buffer,
-                        cols_buffer,
-                        groups_buffer,
-                        group_size_buffer,
-                    ],
+                    &[input_buffer, output_buffer],
                     error.should_release_buffers(),
                 );
                 return Err(error.into());
@@ -3352,13 +4896,6 @@ impl MetalExecutorInner {
             release(command_buffer);
             self.recycle(input_buffer);
             self.recycle(output_buffer);
-            self.recycle(packed_offset_buffer);
-            self.recycle(scales_offset_buffer);
-            self.recycle(biases_offset_buffer);
-            self.recycle(rows_buffer);
-            self.recycle(cols_buffer);
-            self.recycle(groups_buffer);
-            self.recycle(group_size_buffer);
             Ok(Some((output, timing)))
         }
     }
@@ -3471,7 +5008,7 @@ impl MetalExecutorInner {
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
-        shared: Option<&SharedExpertPhaseWeights>,
+        shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         let width = residual.len();
@@ -3483,278 +5020,27 @@ impl MetalExecutorInner {
         {
             return Ok(None);
         }
-        let mut payloads = Vec::with_capacity(experts.len());
-        for expert in experts.iter() {
-            let Some(payload) = expert_phase_mlp_payload(expert, width) else {
-                return Ok(None);
-            };
-            payloads.push(payload);
-        }
-        let shared_total_intermediate = if let Some(shared) = shared {
-            let total = shared
-                .shared_experts
-                .checked_mul(shared.intermediate)
-                .context("shared expert intermediate width overflow")?;
-            if shared.width != width
-                || shared.gate.len() != total * width
-                || shared.up.len() != total * width
-                || shared.down.len() != width * total
-                || shared.router.len() != shared.shared_experts * width
-            {
-                return Ok(None);
-            }
-            total
-        } else {
-            0
-        };
-        let shared_metal = if let Some(shared) = shared {
-            Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
-        } else {
-            None
-        };
 
         unsafe {
-            let mut buffers: Vec<MetalPhaseBuffer> = Vec::new();
             let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
-            buffers.push(MetalPhaseBuffer::recyclable(normed_buffer));
-            let residual_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
-            buffers.push(MetalPhaseBuffer::recyclable(residual_buffer));
-            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
-            buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
-            let expert_outputs_buffer = self.buffer_with_len(
-                experts
-                    .len()
-                    .max(1)
-                    .checked_mul(width)
-                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
-                    .context("expert output buffer size overflow")?,
-            )?;
-            buffers.push(MetalPhaseBuffer::recyclable(expert_outputs_buffer));
-            let shared_output_buffer =
-                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
-            buffers.push(MetalPhaseBuffer::recyclable(shared_output_buffer));
-            let hidden_buffer =
-                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
-            buffers.push(MetalPhaseBuffer::recyclable(hidden_buffer));
-            let next_normed_buffer = if next_norm_weight.is_some() {
-                let buffer = self
-                    .buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
-                buffers.push(MetalPhaseBuffer::recyclable(buffer));
-                Some(buffer)
-            } else {
-                None
-            };
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                bail!("failed to create Flash-MoE deferred expert command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                bail!("failed to create Flash-MoE deferred expert compute encoder");
-            }
-
-            let width_u32 = width as u32;
-            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
-
-            if let Some(shared) = shared {
-                let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
-                let total_u32 = shared_total_intermediate as u32;
-                let shared_intermediate_u32 = shared.intermediate as u32;
-                let shared_gate_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out =
-                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
-                let shared_activated =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
-                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
-                let shared_intermediate_buffer =
-                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
-
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.gate,
-                    normed_buffer,
-                    shared_gate_out,
-                    width_buffer,
-                    shared_total_intermediate,
-                );
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.up,
-                    normed_buffer,
-                    shared_up_out,
-                    width_buffer,
-                    shared_total_intermediate,
-                );
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.router,
-                    normed_buffer,
-                    shared_router_out,
-                    width_buffer,
-                    shared.shared_experts,
-                );
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.shared_expert_activation_pipeline,
-                );
-                set_buffer(encoder, shared_gate_out, 0);
-                set_buffer(encoder, shared_up_out, 1);
-                set_buffer(encoder, shared_router_out, 2);
-                set_buffer(encoder, shared_activated, 3);
-                set_buffer(encoder, shared_intermediate_buffer, 4);
-                set_buffer(encoder, total_buffer, 5);
-                dispatch_threads(encoder, shared_total_intermediate as u64);
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.down,
-                    shared_activated,
-                    shared_output_buffer,
-                    total_buffer,
-                    width,
-                );
-            } else {
-                self.encode_fill_zero(encoder, shared_output_buffer, width_buffer, width);
-            }
-
-            for (idx, payload) in payloads.iter().enumerate() {
-                let activated =
-                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
-                buffers.push(MetalPhaseBuffer::recyclable(activated));
-
-                let fused = self.encode_q4_swiglu(
-                    encoder,
-                    &payload.gate,
-                    &payload.up,
-                    normed_buffer,
-                    activated,
-                    &mut buffers,
-                )?;
-                if !fused {
-                    let gate_out =
-                        self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
-                    buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                    let up_out =
-                        self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
-                    buffers.push(MetalPhaseBuffer::recyclable(up_out));
-                    self.encode_q4_matvec(
-                        encoder,
-                        &payload.gate,
-                        normed_buffer,
-                        gate_out,
-                        0,
-                        &mut buffers,
-                    )?;
-                    self.encode_q4_matvec(
-                        encoder,
-                        &payload.up,
-                        normed_buffer,
-                        up_out,
-                        0,
-                        &mut buffers,
-                    )?;
-                    let intermediate_u32 = payload.gate.rows as u32;
-                    let intermediate_buffer =
-                        self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
-                    buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        self.silu_product_pipeline,
-                    );
-                    set_buffer(encoder, gate_out, 0);
-                    set_buffer(encoder, up_out, 1);
-                    set_buffer(encoder, activated, 2);
-                    set_buffer(encoder, intermediate_buffer, 3);
-                    dispatch_threads(encoder, payload.gate.rows as u64);
+            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.recycle(normed_buffer);
+                    return Err(error);
                 }
-                let expert_offset = idx
-                    .checked_mul(width)
-                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
-                    .context("expert output buffer offset overflow")?
-                    as u64;
-                self.encode_q4_matvec(
-                    encoder,
-                    &payload.down,
-                    activated,
-                    expert_outputs_buffer,
-                    expert_offset,
-                    &mut buffers,
-                )?;
-            }
-
-            let active_u32 = experts.len() as u32;
-            let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.combine_expert_phase_pipeline,
-            );
-            set_buffer(encoder, residual_buffer, 0);
-            set_buffer(encoder, shared_output_buffer, 1);
-            set_buffer(encoder, expert_outputs_buffer, 2);
-            set_buffer(encoder, weights_buffer, 3);
-            set_buffer(encoder, hidden_buffer, 4);
-            set_buffer(encoder, width_buffer, 5);
-            set_buffer(encoder, active_buffer, 6);
-            dispatch_threads(encoder, width as u64);
-
-            if let (Some(weight), Some(next_normed_buffer)) = (next_norm_weight, next_normed_buffer)
-            {
-                let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(&weight[..width]))?;
-                buffers.push(MetalPhaseBuffer::recyclable(norm_weight_buffer));
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.rms_norm_reduced_pipeline,
-                );
-                set_buffer(encoder, hidden_buffer, 0);
-                set_buffer(encoder, norm_weight_buffer, 1);
-                set_buffer(encoder, next_normed_buffer, 2);
-                set_buffer(encoder, width_buffer, 3);
-                dispatch_single_threadgroup(encoder, 256);
-            }
-
-            msg_send_void0(encoder, sel("endEncoding"));
-            let expert_ids = experts
-                .iter()
-                .map(|expert| expert.expert.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let context = MetalCommandContext::new("deferred_expert_phase")
-                .with("position", position)
-                .with("layer", layer)
-                .with("active_experts", experts.len())
-                .with("experts", expert_ids)
-                .with("width", width)
-                .with("shared", shared.is_some())
-                .with("next_norm", next_normed_buffer.is_some());
-            commit_metal_command_buffer(command_buffer, &context);
-            release(encoder);
-
-            Ok(Some(MetalDeferredExpertPhase {
-                inner: self.clone(),
-                command_buffer,
-                buffers,
-                retained_experts: experts,
-                hidden_buffer,
-                next_normed_buffer,
-                context,
+            };
+            self.submit_expert_phase_from_buffers(
+                position,
+                layer,
+                experts,
+                weights,
+                normed_buffer,
+                residual_buffer,
                 width,
-            }))
+                shared,
+                next_norm_weight,
+            )
         }
     }
 
@@ -3768,8 +5054,7 @@ impl MetalExecutorInner {
         normed_buffer: ObjcId,
         residual_buffer: ObjcId,
         width: usize,
-        shared: Option<&SharedExpertPhaseWeights>,
-        shared_q4: Option<&SharedExpertPhaseQ4Projections>,
+        shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         if width == 0 || weights.len() != experts.len() {
@@ -3790,7 +5075,9 @@ impl MetalExecutorInner {
             };
             payloads.push(payload);
         }
-        let shared_total_intermediate = if let Some(shared) = shared {
+        let shared_dense = shared.dense();
+        let shared_q4 = shared.q4();
+        let shared_total_intermediate = if let Some(shared) = shared_dense {
             let total = shared
                 .shared_experts
                 .checked_mul(shared.intermediate)
@@ -3808,7 +5095,7 @@ impl MetalExecutorInner {
         } else {
             0
         };
-        let shared_metal = if let Some(shared) = shared {
+        let shared_metal = if let Some(shared) = shared_dense {
             Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
         } else {
             None
@@ -3882,6 +5169,7 @@ impl MetalExecutorInner {
             let width_u32 = width as u32;
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
+            let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
 
             if let (Some(shared), Some(shared_total_intermediate)) =
                 (shared_q4, shared_q4_total_intermediate)
@@ -3937,7 +5225,7 @@ impl MetalExecutorInner {
                     shared_activated,
                     shared_output_buffer,
                 )?;
-            } else if let Some(shared) = shared {
+            } else if let Some(shared) = shared_dense {
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let total_u32 = shared_total_intermediate as u32;
                 let shared_intermediate_u32 = shared.intermediate as u32;
@@ -4008,6 +5296,7 @@ impl MetalExecutorInner {
             }
 
             for (idx, payload) in payloads.iter().enumerate() {
+                let payload = payload.q4();
                 let activated =
                     self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
@@ -4019,6 +5308,7 @@ impl MetalExecutorInner {
                     normed_buffer,
                     activated,
                     &mut buffers,
+                    &mut q4_source_buffers,
                 )?;
                 if !fused {
                     let gate_out =
@@ -4034,6 +5324,7 @@ impl MetalExecutorInner {
                         gate_out,
                         0,
                         &mut buffers,
+                        &mut q4_source_buffers,
                     )?;
                     self.encode_q4_matvec(
                         encoder,
@@ -4042,6 +5333,7 @@ impl MetalExecutorInner {
                         up_out,
                         0,
                         &mut buffers,
+                        &mut q4_source_buffers,
                     )?;
                     let intermediate_u32 = payload.gate.rows as u32;
                     let intermediate_buffer =
@@ -4070,6 +5362,7 @@ impl MetalExecutorInner {
                     expert_outputs_buffer,
                     expert_offset,
                     &mut buffers,
+                    &mut q4_source_buffers,
                 )?;
             }
 
@@ -4144,62 +5437,83 @@ impl MetalExecutorInner {
         output_buffer: ObjcId,
         output_offset: u64,
         buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalQ4SourceBufferCache,
     ) -> Result<()> {
         unsafe {
-            let packed_phase_buffer =
-                self.phase_buffer_with_borrowed_bytes_aligned(payload.packed, 16)?;
-            let packed_buffer = packed_phase_buffer.id;
-            buffers.push(packed_phase_buffer);
-            let expected_bf16_bytes = payload.scales.len().checked_mul(2).unwrap_or(usize::MAX);
+            let expected_bf16_bytes = payload
+                .scale_bias_groups
+                .checked_mul(2)
+                .unwrap_or(usize::MAX);
             let use_bf16_scale_bias = payload
                 .scale_bias_dtype
                 .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                 && payload.scale_bytes.len() == expected_bf16_bytes
                 && payload.bias_bytes.len() == expected_bf16_bytes;
-            let (pipeline, scale_bytes, bias_bytes) = if use_bf16_scale_bias {
+            let fixed_source = payload.source.filter(|source| {
+                use_bf16_scale_bias && source.covers(payload) && source.offsets_are_metal_aligned()
+            });
+            let (
+                pipeline,
+                packed_buffer,
+                packed_offset,
+                scale_buffer,
+                scale_offset,
+                bias_buffer,
+                bias_offset,
+            ) = if let Some(source) = fixed_source {
+                let buffer = self.q4_source_phase_buffer(source, buffers, source_buffers)?;
                 (
                     self.q4_bf16_scale_bias_pipeline,
-                    payload.scale_bytes,
-                    payload.bias_bytes,
+                    buffer,
+                    source.packed_offset as u64,
+                    buffer,
+                    source.scale_offset as u64,
+                    buffer,
+                    source.bias_offset as u64,
                 )
             } else {
-                (
-                    self.q4_pipeline,
-                    f32_as_bytes(payload.scales),
-                    f32_as_bytes(payload.biases),
-                )
+                let packed_phase_buffer =
+                    self.phase_buffer_with_borrowed_bytes_aligned(payload.packed, 16)?;
+                let packed_buffer = packed_phase_buffer.id;
+                buffers.push(packed_phase_buffer);
+                let (pipeline, scale_bytes, bias_bytes) = if use_bf16_scale_bias {
+                    (
+                        self.q4_bf16_scale_bias_pipeline,
+                        payload.scale_bytes,
+                        payload.bias_bytes,
+                    )
+                } else {
+                    (
+                        self.q4_pipeline,
+                        f32_as_bytes(payload.scales),
+                        f32_as_bytes(payload.biases),
+                    )
+                };
+                let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
+                let scale_phase_buffer = self
+                    .phase_buffer_with_borrowed_bytes_aligned(scale_bytes, scale_bias_alignment)?;
+                let scale_buffer = scale_phase_buffer.id;
+                buffers.push(scale_phase_buffer);
+                let bias_phase_buffer = self
+                    .phase_buffer_with_borrowed_bytes_aligned(bias_bytes, scale_bias_alignment)?;
+                let bias_buffer = bias_phase_buffer.id;
+                buffers.push(bias_phase_buffer);
+                (pipeline, packed_buffer, 0, scale_buffer, 0, bias_buffer, 0)
             };
-            let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
-            let scale_phase_buffer =
-                self.phase_buffer_with_borrowed_bytes_aligned(scale_bytes, scale_bias_alignment)?;
-            let scale_buffer = scale_phase_buffer.id;
-            buffers.push(scale_phase_buffer);
-            let bias_phase_buffer =
-                self.phase_buffer_with_borrowed_bytes_aligned(bias_bytes, scale_bias_alignment)?;
-            let bias_buffer = bias_phase_buffer.id;
-            buffers.push(bias_phase_buffer);
             let rows_u32 = payload.rows as u32;
             let cols_u32 = payload.cols as u32;
             let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
             let group_size_u32 = payload.group_size as u32;
-            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(rows_buffer));
-            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(cols_buffer));
-            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(groups_buffer));
-            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(group_size_buffer));
             msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer(encoder, packed_buffer, 0);
+            set_buffer_with_offset(encoder, packed_buffer, packed_offset, 0);
             set_buffer(encoder, input_buffer, 1);
-            set_buffer(encoder, scale_buffer, 2);
-            set_buffer(encoder, bias_buffer, 3);
+            set_buffer_with_offset(encoder, scale_buffer, scale_offset, 2);
+            set_buffer_with_offset(encoder, bias_buffer, bias_offset, 3);
             set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
-            set_buffer(encoder, rows_buffer, 5);
-            set_buffer(encoder, cols_buffer, 6);
-            set_buffer(encoder, groups_buffer, 7);
-            set_buffer(encoder, group_size_buffer, 8);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 5);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 8);
             dispatch_q4_threadgroups(encoder, payload.rows as u64);
             Ok(())
         }
@@ -4213,6 +5527,7 @@ impl MetalExecutorInner {
         input_buffer: ObjcId,
         output_buffer: ObjcId,
         buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalQ4SourceBufferCache,
     ) -> Result<bool> {
         if gate.rows != up.rows
             || gate.cols != up.cols
@@ -4221,7 +5536,7 @@ impl MetalExecutorInner {
         {
             return Ok(false);
         }
-        let expected_bf16_bytes = gate.scales.len().checked_mul(2).unwrap_or(usize::MAX);
+        let expected_bf16_bytes = gate.scale_bias_groups.checked_mul(2).unwrap_or(usize::MAX);
         let use_bf16_scale_bias = gate
             .scale_bias_dtype
             .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
@@ -4237,76 +5552,136 @@ impl MetalExecutorInner {
         }
 
         unsafe {
-            let gate_packed_phase =
-                self.phase_buffer_with_borrowed_bytes_aligned(gate.packed, 16)?;
-            let gate_packed_buffer = gate_packed_phase.id;
-            buffers.push(gate_packed_phase);
-            let up_packed_phase = self.phase_buffer_with_borrowed_bytes_aligned(up.packed, 16)?;
-            let up_packed_buffer = up_packed_phase.id;
-            buffers.push(up_packed_phase);
+            let fixed_sources = gate
+                .source
+                .zip(up.source)
+                .filter(|(gate_source, up_source)| {
+                    use_bf16_scale_bias
+                        && gate_source.same_buffer(*up_source)
+                        && gate_source.covers(gate)
+                        && up_source.covers(up)
+                        && gate_source.offsets_are_metal_aligned()
+                        && up_source.offsets_are_metal_aligned()
+                });
+            let (
+                pipeline,
+                gate_packed_buffer,
+                gate_packed_offset,
+                up_packed_buffer,
+                up_packed_offset,
+                gate_scale_buffer,
+                gate_scale_offset,
+                gate_bias_buffer,
+                gate_bias_offset,
+                up_scale_buffer,
+                up_scale_offset,
+                up_bias_buffer,
+                up_bias_offset,
+            ) = if let Some((gate_source, up_source)) = fixed_sources {
+                let buffer = self.q4_source_phase_buffer(gate_source, buffers, source_buffers)?;
+                (
+                    self.q4_swiglu_bf16_scale_bias_pipeline,
+                    buffer,
+                    gate_source.packed_offset as u64,
+                    buffer,
+                    up_source.packed_offset as u64,
+                    buffer,
+                    gate_source.scale_offset as u64,
+                    buffer,
+                    gate_source.bias_offset as u64,
+                    buffer,
+                    up_source.scale_offset as u64,
+                    buffer,
+                    up_source.bias_offset as u64,
+                )
+            } else {
+                let gate_packed_phase =
+                    self.phase_buffer_with_borrowed_bytes_aligned(gate.packed, 16)?;
+                let gate_packed_buffer = gate_packed_phase.id;
+                buffers.push(gate_packed_phase);
+                let up_packed_phase =
+                    self.phase_buffer_with_borrowed_bytes_aligned(up.packed, 16)?;
+                let up_packed_buffer = up_packed_phase.id;
+                buffers.push(up_packed_phase);
 
-            let (pipeline, gate_scale_bytes, gate_bias_bytes, up_scale_bytes, up_bias_bytes) =
-                if use_bf16_scale_bias {
-                    (
-                        self.q4_swiglu_bf16_scale_bias_pipeline,
-                        gate.scale_bytes,
-                        gate.bias_bytes,
-                        up.scale_bytes,
-                        up.bias_bytes,
-                    )
-                } else {
-                    (
-                        self.q4_swiglu_pipeline,
-                        f32_as_bytes(gate.scales),
-                        f32_as_bytes(gate.biases),
-                        f32_as_bytes(up.scales),
-                        f32_as_bytes(up.biases),
-                    )
-                };
-            let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
-            let gate_scale_phase = self
-                .phase_buffer_with_borrowed_bytes_aligned(gate_scale_bytes, scale_bias_alignment)?;
-            let gate_scale_buffer = gate_scale_phase.id;
-            buffers.push(gate_scale_phase);
-            let gate_bias_phase = self
-                .phase_buffer_with_borrowed_bytes_aligned(gate_bias_bytes, scale_bias_alignment)?;
-            let gate_bias_buffer = gate_bias_phase.id;
-            buffers.push(gate_bias_phase);
-            let up_scale_phase = self
-                .phase_buffer_with_borrowed_bytes_aligned(up_scale_bytes, scale_bias_alignment)?;
-            let up_scale_buffer = up_scale_phase.id;
-            buffers.push(up_scale_phase);
-            let up_bias_phase =
-                self.phase_buffer_with_borrowed_bytes_aligned(up_bias_bytes, scale_bias_alignment)?;
-            let up_bias_buffer = up_bias_phase.id;
-            buffers.push(up_bias_phase);
+                let (pipeline, gate_scale_bytes, gate_bias_bytes, up_scale_bytes, up_bias_bytes) =
+                    if use_bf16_scale_bias {
+                        (
+                            self.q4_swiglu_bf16_scale_bias_pipeline,
+                            gate.scale_bytes,
+                            gate.bias_bytes,
+                            up.scale_bytes,
+                            up.bias_bytes,
+                        )
+                    } else {
+                        (
+                            self.q4_swiglu_pipeline,
+                            f32_as_bytes(gate.scales),
+                            f32_as_bytes(gate.biases),
+                            f32_as_bytes(up.scales),
+                            f32_as_bytes(up.biases),
+                        )
+                    };
+                let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
+                let gate_scale_phase = self.phase_buffer_with_borrowed_bytes_aligned(
+                    gate_scale_bytes,
+                    scale_bias_alignment,
+                )?;
+                let gate_scale_buffer = gate_scale_phase.id;
+                buffers.push(gate_scale_phase);
+                let gate_bias_phase = self.phase_buffer_with_borrowed_bytes_aligned(
+                    gate_bias_bytes,
+                    scale_bias_alignment,
+                )?;
+                let gate_bias_buffer = gate_bias_phase.id;
+                buffers.push(gate_bias_phase);
+                let up_scale_phase = self.phase_buffer_with_borrowed_bytes_aligned(
+                    up_scale_bytes,
+                    scale_bias_alignment,
+                )?;
+                let up_scale_buffer = up_scale_phase.id;
+                buffers.push(up_scale_phase);
+                let up_bias_phase = self.phase_buffer_with_borrowed_bytes_aligned(
+                    up_bias_bytes,
+                    scale_bias_alignment,
+                )?;
+                let up_bias_buffer = up_bias_phase.id;
+                buffers.push(up_bias_phase);
+                (
+                    pipeline,
+                    gate_packed_buffer,
+                    0,
+                    up_packed_buffer,
+                    0,
+                    gate_scale_buffer,
+                    0,
+                    gate_bias_buffer,
+                    0,
+                    up_scale_buffer,
+                    0,
+                    up_bias_buffer,
+                    0,
+                )
+            };
 
             let rows_u32 = gate.rows as u32;
             let cols_u32 = gate.cols as u32;
             let groups_u32 = gate.cols.div_ceil(gate.group_size).max(1) as u32;
             let group_size_u32 = gate.group_size as u32;
-            let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(rows_buffer));
-            let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(cols_buffer));
-            let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(groups_buffer));
-            let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(group_size_buffer));
 
             msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer(encoder, gate_packed_buffer, 0);
-            set_buffer(encoder, up_packed_buffer, 1);
+            set_buffer_with_offset(encoder, gate_packed_buffer, gate_packed_offset, 0);
+            set_buffer_with_offset(encoder, up_packed_buffer, up_packed_offset, 1);
             set_buffer(encoder, input_buffer, 2);
-            set_buffer(encoder, gate_scale_buffer, 3);
-            set_buffer(encoder, gate_bias_buffer, 4);
-            set_buffer(encoder, up_scale_buffer, 5);
-            set_buffer(encoder, up_bias_buffer, 6);
+            set_buffer_with_offset(encoder, gate_scale_buffer, gate_scale_offset, 3);
+            set_buffer_with_offset(encoder, gate_bias_buffer, gate_bias_offset, 4);
+            set_buffer_with_offset(encoder, up_scale_buffer, up_scale_offset, 5);
+            set_buffer_with_offset(encoder, up_bias_buffer, up_bias_offset, 6);
             set_buffer(encoder, output_buffer, 7);
-            set_buffer(encoder, rows_buffer, 8);
-            set_buffer(encoder, cols_buffer, 9);
-            set_buffer(encoder, groups_buffer, 10);
-            set_buffer(encoder, group_size_buffer, 11);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 9);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 10);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 11);
             dispatch_q4_threadgroups(encoder, gate.rows as u64);
             Ok(true)
         }
@@ -4400,7 +5775,7 @@ impl MetalExecutorInner {
             set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
             set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
             set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-            dispatch_q4_threadgroups(encoder, projection.rows as u64);
+            dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
         }
         Ok(())
     }
@@ -4421,6 +5796,119 @@ impl MetalExecutorInner {
             set_buffer(encoder, output_buffer, 0);
             set_buffer(encoder, width_buffer, 1);
             dispatch_threads(encoder, width as u64);
+        }
+    }
+
+    unsafe fn try_encode_q4_mmap_projection_batch(
+        &self,
+        encoder: ObjcId,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input_buffer: ObjcId,
+        output_buffer: ObjcId,
+        output_offsets: &[usize],
+        total_rows: usize,
+        buffers: &mut Vec<ObjcId>,
+    ) -> Result<bool> {
+        unsafe {
+            if projections.len() < 2 || output_offsets.len() != projections.len() {
+                return Ok(false);
+            }
+            let Some(dense_weights) = &self.dense_weights else {
+                return Ok(false);
+            };
+            let first = &projections[0];
+            if first.cols == 0 || first.cols > 4096 || first.group_size == 0 {
+                return Ok(false);
+            }
+            let scale_bias_dtype = first.scale_bias_dtype.as_str();
+            if !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_F32)
+                && !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+            {
+                return Ok(false);
+            }
+            if projections.iter().any(|projection| {
+                projection.cols != first.cols
+                    || projection.group_size != first.group_size
+                    || projection.row_packed_bytes != first.row_packed_bytes
+                    || !projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(scale_bias_dtype)
+            }) {
+                return Ok(false);
+            }
+
+            let packed_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.packed_byte_offset)
+                .collect();
+            let scale_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.scales_byte_offset)
+                .collect();
+            let bias_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.biases_byte_offset)
+                .collect();
+            let row_offsets: Vec<u32> = output_offsets
+                .iter()
+                .map(|offset| u32::try_from(*offset))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch row offset does not fit u32")?;
+            let rows: Vec<u32> = projections
+                .iter()
+                .map(|projection| u32::try_from(projection.rows))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch row count does not fit u32")?;
+            let groups_per_rows: Vec<u32> = projections
+                .iter()
+                .map(|projection| u32::try_from(projection.groups_per_row))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch group count does not fit u32")?;
+            let projection_count = u32::try_from(projections.len())
+                .context("dense q4 mmap batch projection count does not fit u32")?;
+            let cols = first.cols as u32;
+            let group_size = first.group_size as u32;
+
+            let packed_offsets_buffer =
+                self.buffer_with_bytes(u64_as_bytes_slice(&packed_offsets))?;
+            let scale_offsets_buffer =
+                self.buffer_with_bytes(u64_as_bytes_slice(&scale_offsets))?;
+            let bias_offsets_buffer = self.buffer_with_bytes(u64_as_bytes_slice(&bias_offsets))?;
+            let row_offsets_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&row_offsets))?;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&rows))?;
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&groups_per_rows))?;
+            buffers.extend_from_slice(&[
+                packed_offsets_buffer,
+                scale_offsets_buffer,
+                bias_offsets_buffer,
+                row_offsets_buffer,
+                rows_buffer,
+                groups_buffer,
+            ]);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
+                    self.q4_mmap_batch_bf16_scale_bias_pipeline
+                } else {
+                    self.q4_mmap_batch_pipeline
+                },
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, packed_offsets_buffer, 3);
+            set_buffer(encoder, scale_offsets_buffer, 4);
+            set_buffer(encoder, bias_offsets_buffer, 5);
+            set_buffer(encoder, row_offsets_buffer, 6);
+            set_buffer(encoder, rows_buffer, 7);
+            set_buffer(encoder, groups_buffer, 8);
+            set_bytes(encoder, u32_as_bytes(&projection_count), 9);
+            set_bytes(encoder, u32_as_bytes(&cols), 10);
+            set_bytes(encoder, u32_as_bytes(&group_size), 11);
+            dispatch_q4_mmap_threadgroups(encoder, total_rows as u64);
+            Ok(true)
         }
     }
 
@@ -4918,6 +6406,421 @@ impl MetalExecutorInner {
         }
     }
 
+    fn q4_mmap_matvec_batch_to_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((
+                MetalProjectionBatch {
+                    output_buffer: ptr::null_mut(),
+                    output_offsets: Vec::new(),
+                    output_widths: Vec::new(),
+                    total_rows: 0,
+                },
+                MetalMatvecTiming::default(),
+                0,
+            )));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        let mut output_widths = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len {
+                bail!(
+                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input_len,
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                bail!(
+                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
+                    projection.tensor_name,
+                    projection.row_packed_bytes,
+                    projection.cols
+                );
+            }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("dense q4 mmap batch packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("dense q4 mmap batch group byte length overflow")?;
+            for (offset, len, label) in [
+                (projection.packed_byte_offset, packed_len, "packed"),
+                (projection.scales_byte_offset, group_bytes, "scales"),
+                (projection.biases_byte_offset, group_bytes, "biases"),
+            ] {
+                let offset = usize::try_from(offset).with_context(|| {
+                    format!(
+                        "dense q4 mmap batch {label} offset for {} does not fit usize",
+                        projection.tensor_name
+                    )
+                })?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense q4 mmap batch output row count overflow")?;
+            output_offsets.push(output_offset);
+            output_widths.push(projection.output_width);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
+            }
+
+            let mut transient_buffers = Vec::new();
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut transient_buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch_buffer")
+                .with("projections", projections.len())
+                .with("dispatches", dispatch_count)
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                for buffer in transient_buffers {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            for buffer in transient_buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((
+                MetalProjectionBatch {
+                    output_buffer,
+                    output_offsets,
+                    output_widths,
+                    total_rows,
+                },
+                timing,
+                projections.len(),
+            )))
+        }
+    }
+
+    fn dense_mmap_matvec_batch_to_buffer(
+        &self,
+        projections: &[DenseMmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((
+                MetalProjectionBatch {
+                    output_buffer: ptr::null_mut(),
+                    output_offsets: Vec::new(),
+                    output_widths: Vec::new(),
+                    total_rows: 0,
+                },
+                MetalMatvecTiming::default(),
+                0,
+            )));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut dispatches = Vec::with_capacity(projections.len());
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        let mut output_widths = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len {
+                bail!(
+                    "dense mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input_len,
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            let dtype = projection.dtype.to_ascii_uppercase();
+            let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
+                "F32" | "FLOAT32" | "FP32" => (
+                    std::mem::size_of::<f32>(),
+                    self.dense_mmap_matvec_pipeline,
+                    false,
+                ),
+                "BF16" | "BFLOAT16" => (
+                    std::mem::size_of::<u16>(),
+                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    true,
+                ),
+                _ => return Ok(None),
+            };
+            let stride = projection.stride();
+            if stride < projection.cols {
+                bail!(
+                    "dense mmap batch projection {} stride {} is smaller than cols {}",
+                    projection.tensor_name,
+                    stride,
+                    projection.cols
+                );
+            }
+            let last_row = projection.rows.saturating_sub(1);
+            let values = last_row
+                .checked_mul(stride)
+                .and_then(|base| base.checked_add(projection.cols))
+                .context("dense mmap batch value range overflow")?;
+            let byte_len = values
+                .checked_mul(element_size)
+                .context("dense mmap batch byte length overflow")?;
+            let byte_offset = usize::try_from(projection.byte_offset)
+                .context("dense mmap batch offset does not fit usize")?;
+            if byte_offset
+                .checked_add(byte_len)
+                .map_or(true, |end| end > dense_weights.len)
+            {
+                return Ok(None);
+            }
+            if byte_offset % element_size != 0 {
+                return Ok(None);
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense mmap batch output row count overflow")?;
+            dispatches.push((pipeline, output_offset, simd_reduced));
+            output_offsets.push(output_offset);
+            output_widths.push(projection.output_width);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense mmap batch Metal compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let (pipeline, output_offset_rows, simd_reduced) = dispatches[idx];
+                let output_offset = output_offset_rows
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("dense mmap batch output byte offset overflow")?
+                    as u64;
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let stride_u32 = projection.stride() as u32;
+                msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
+                set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
+                if simd_reduced {
+                    dispatch_q4_threadgroups(encoder, projection.rows as u64);
+                } else {
+                    dispatch_threads(encoder, projection.rows as u64);
+                }
+            }
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_mmap_matvec_batch_buffer")
+                .with("projections", projections.len())
+                .with("dispatches", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            Ok(Some((
+                MetalProjectionBatch {
+                    output_buffer,
+                    output_offsets,
+                    output_widths,
+                    total_rows,
+                },
+                timing,
+                projections.len(),
+            )))
+        }
+    }
+
     fn dense_mmap_matvec_batch_with_input_buffer(
         &self,
         projections: &[DenseMmapMatvecProjection],
@@ -5329,7 +7232,7 @@ impl MetalExecutorInner {
             set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
             set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
             set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-            dispatch_q4_threadgroups(encoder, rows as u64);
+            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
 
             msg_send_void1_id(
                 encoder,
@@ -5381,17 +7284,18 @@ impl MetalExecutorInner {
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &[f32],
-        residual: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
-        if top_k == 0 || residual.is_empty() || residual.len() != post_norm_weight.len() {
+        let width = residual.len();
+        if top_k == 0 || width == 0 || width != post_norm_weight.len() {
             return Ok(None);
         }
-        if out_proj.output_width != residual.len()
-            || out_proj.rows != residual.len()
+        if out_proj.output_width != width
+            || out_proj.rows != width
             || out_proj.cols != attention_output.len()
-            || router.cols != residual.len()
+            || router.cols != width
             || router.output_width != router.rows
         {
             return Ok(None);
@@ -5431,30 +7335,33 @@ impl MetalExecutorInner {
             }
         }
 
-        let width = residual.len();
-        let top_k = top_k.min(router.rows).max(1);
+        let active_count = top_k.min(router.rows).max(1);
         unsafe {
             let attention_buffer = self.buffer_with_bytes(f32_as_bytes(attention_output))?;
-            let residual_input_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
+                MetalBatchProjectionInput::Cpu(residual) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
             let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
             let projected_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
             let residual_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
             let normed_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
             let router_logits_buffer =
                 self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
-            let indices_buffer = self.buffer_with_len(top_k * std::mem::size_of::<u32>())?;
-            let values_buffer = self.buffer_with_len(top_k * std::mem::size_of::<f32>())?;
-            let buffers = vec![
+            let mut buffers = vec![
                 attention_buffer,
-                residual_input_buffer,
                 norm_weight_buffer,
                 projected_buffer,
                 residual_buffer,
                 normed_buffer,
                 router_logits_buffer,
-                indices_buffer,
-                values_buffer,
             ];
+            if let Some(buffer) = owned_residual_input_buffer {
+                buffers.push(buffer);
+            }
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.recycle_or_release_buffers(&buffers, true);
@@ -5497,7 +7404,7 @@ impl MetalExecutorInner {
                 set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
                 set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
                 set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_threadgroups(encoder, projection.rows as u64);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
 
                 if std::ptr::eq(projection, out_proj) {
                     let width_u32 = width as u32;
@@ -5516,26 +7423,14 @@ impl MetalExecutorInner {
                 }
             }
 
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.topk_vocab_pipeline,
-            );
-            let rows_u32 = router.rows as u32;
-            let top_k_u32 = top_k as u32;
-            set_buffer(encoder, router_logits_buffer, 0);
-            set_buffer(encoder, indices_buffer, 1);
-            set_buffer(encoder, values_buffer, 2);
-            set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
-            set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
-            dispatch_threads(encoder, 1);
             msg_send_void0(encoder, sel("endEncoding"));
 
-            let context = MetalCommandContext::new("linear_post_attention_q4_topk")
+            let context = MetalCommandContext::new("linear_post_attention_q4_router")
                 .with("width", width)
                 .with("attention_width", attention_output.len())
                 .with("experts", router.rows)
-                .with("top_k", top_k)
+                .with("top_k", active_count)
+                .with("routing_topk", "cpu")
                 .with("out_proj", out_proj.tensor_name.as_str())
                 .with("router", router.tensor_name.as_str());
             if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
@@ -5545,24 +7440,207 @@ impl MetalExecutorInner {
                 return Err(error.into());
             }
 
-            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
-            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
-            let mut active = Vec::with_capacity(top_k);
-            for idx in 0..top_k {
-                active.push((*indices_ptr.add(idx) as usize, *values_ptr.add(idx)));
-            }
+            let router_logits_ptr =
+                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
+            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
+            let active = super::math::top_k(&router_scores, active_count);
 
             release(encoder);
             release(command_buffer);
+            if let Some(buffer) = owned_residual_input_buffer {
+                self.recycle(buffer);
+            }
             for buffer in [
                 attention_buffer,
-                residual_input_buffer,
                 norm_weight_buffer,
                 projected_buffer,
                 router_logits_buffer,
-                indices_buffer,
-                values_buffer,
             ] {
+                self.recycle(buffer);
+            }
+            Ok(Some(MetalPostAttentionPrep {
+                residual_buffer,
+                normed_buffer,
+                width,
+                active,
+            }))
+        }
+    }
+
+    fn q4_post_attention_prep_topk_from_buffer(
+        &self,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        attention_output: &MetalAttentionValues,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        let width = residual.len();
+        if top_k == 0
+            || width == 0
+            || width != post_norm_weight.len()
+            || attention_output.buffer.is_null()
+        {
+            return Ok(None);
+        }
+        if out_proj.output_width != width
+            || out_proj.rows != width
+            || out_proj.cols != attention_output.len
+            || router.cols != width
+            || router.output_width != router.rows
+        {
+            return Ok(None);
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        for projection in [out_proj, router] {
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("post-attention q4 packed byte length overflow")?;
+            let groups_len = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("post-attention q4 group byte length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, groups_len),
+                (projection.biases_byte_offset, groups_len),
+            ] {
+                let offset = usize::try_from(offset)
+                    .context("post-attention q4 offset does not fit usize")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let active_count = top_k.min(router.rows).max(1);
+        unsafe {
+            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
+                MetalBatchProjectionInput::Cpu(residual) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
+            let projected_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let residual_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let normed_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
+            let router_logits_buffer =
+                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![
+                norm_weight_buffer,
+                projected_buffer,
+                residual_buffer,
+                normed_buffer,
+                router_logits_buffer,
+            ];
+            if let Some(buffer) = owned_residual_input_buffer {
+                buffers.push(buffer);
+            }
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE post-attention prep command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE post-attention prep compute encoder");
+            }
+
+            for (projection, input_buffer, output_buffer) in [
+                (out_proj, attention_output.buffer, projected_buffer),
+                (router, normed_buffer, router_logits_buffer),
+            ] {
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer(encoder, output_buffer, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+
+                if std::ptr::eq(projection, out_proj) {
+                    let width_u32 = width as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, projected_buffer, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, residual_buffer, 3);
+                    set_buffer(encoder, normed_buffer, 4);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                    dispatch_single_threadgroup(encoder, 256);
+                }
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("linear_post_attention_q4_router_buffer")
+                .with("width", width)
+                .with("attention_width", attention_output.len)
+                .with("experts", router.rows)
+                .with("top_k", active_count)
+                .with("routing_topk", "cpu")
+                .with("out_proj", out_proj.tensor_name.as_str())
+                .with("router", router.tensor_name.as_str());
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let router_logits_ptr =
+                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
+            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
+            let active = super::math::top_k(&router_scores, active_count);
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_residual_input_buffer {
+                self.recycle(buffer);
+            }
+            for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
                 self.recycle(buffer);
             }
             Ok(Some(MetalPostAttentionPrep {
@@ -5662,39 +7740,6 @@ impl MetalExecutorInner {
             let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
             let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
             let mut buffers = vec![input_buffer, output_buffer];
-            let mut params = Vec::with_capacity(projections.len());
-            for projection in projections {
-                let packed_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.packed_byte_offset))?;
-                buffers.push(packed_offset_buffer);
-                let scales_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.scales_byte_offset))?;
-                buffers.push(scales_offset_buffer);
-                let biases_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.biases_byte_offset))?;
-                buffers.push(biases_offset_buffer);
-                let rows_u32 = projection.rows as u32;
-                let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-                buffers.push(rows_buffer);
-                let cols_u32 = projection.cols as u32;
-                let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-                buffers.push(cols_buffer);
-                let groups_u32 = projection.groups_per_row as u32;
-                let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-                buffers.push(groups_buffer);
-                let group_size_u32 = projection.group_size as u32;
-                let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
-                buffers.push(group_size_buffer);
-                params.push((
-                    packed_offset_buffer,
-                    scales_offset_buffer,
-                    biases_offset_buffer,
-                    rows_buffer,
-                    cols_buffer,
-                    groups_buffer,
-                    group_size_buffer,
-                ));
-            }
             timing.buffer_upload += upload_started.elapsed();
 
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
@@ -5709,44 +7754,52 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
             }
 
-            for (idx, projection) in projections.iter().enumerate() {
-                let output_offset = output_offsets[idx]
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("dense q4 mmap batch output byte offset overflow")?
-                    as u64;
-                let (
-                    packed_offset_buffer,
-                    scales_offset_buffer,
-                    biases_offset_buffer,
-                    rows_buffer,
-                    cols_buffer,
-                    groups_buffer,
-                    group_size_buffer,
-                ) = params[idx];
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                set_buffer(encoder, packed_offset_buffer, 3);
-                set_buffer(encoder, scales_offset_buffer, 4);
-                set_buffer(encoder, biases_offset_buffer, 5);
-                set_buffer(encoder, rows_buffer, 6);
-                set_buffer(encoder, cols_buffer, 7);
-                set_buffer(encoder, groups_buffer, 8);
-                set_buffer(encoder, group_size_buffer, 9);
-                dispatch_q4_threadgroups(encoder, projection.rows as u64);
-            }
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
             msg_send_void0(encoder, sel("endEncoding"));
 
             let dispatch_started = Instant::now();
@@ -5757,7 +7810,7 @@ impl MetalExecutorInner {
                 .join(",");
             let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch")
                 .with("projections", projections.len())
-                .with("dispatches", projections.len())
+                .with("dispatches", dispatch_count)
                 .with("rows", total_rows)
                 .with("input_len", input.len())
                 .with("tensors", names);
@@ -5787,7 +7840,7 @@ impl MetalExecutorInner {
             for buffer in buffers {
                 self.recycle(buffer);
             }
-            Ok(Some((outputs, timing, projections.len())))
+            Ok(Some((outputs, timing, dispatch_count)))
         }
     }
 
@@ -5879,39 +7932,6 @@ impl MetalExecutorInner {
             let upload_started = Instant::now();
             let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
             let mut buffers = vec![output_buffer];
-            let mut params = Vec::with_capacity(projections.len());
-            for projection in projections {
-                let packed_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.packed_byte_offset))?;
-                buffers.push(packed_offset_buffer);
-                let scales_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.scales_byte_offset))?;
-                buffers.push(scales_offset_buffer);
-                let biases_offset_buffer =
-                    self.buffer_with_bytes(u64_as_bytes(&projection.biases_byte_offset))?;
-                buffers.push(biases_offset_buffer);
-                let rows_u32 = projection.rows as u32;
-                let rows_buffer = self.buffer_with_bytes(u32_as_bytes(&rows_u32))?;
-                buffers.push(rows_buffer);
-                let cols_u32 = projection.cols as u32;
-                let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
-                buffers.push(cols_buffer);
-                let groups_u32 = projection.groups_per_row as u32;
-                let groups_buffer = self.buffer_with_bytes(u32_as_bytes(&groups_u32))?;
-                buffers.push(groups_buffer);
-                let group_size_u32 = projection.group_size as u32;
-                let group_size_buffer = self.buffer_with_bytes(u32_as_bytes(&group_size_u32))?;
-                buffers.push(group_size_buffer);
-                params.push((
-                    packed_offset_buffer,
-                    scales_offset_buffer,
-                    biases_offset_buffer,
-                    rows_buffer,
-                    cols_buffer,
-                    groups_buffer,
-                    group_size_buffer,
-                ));
-            }
             timing.buffer_upload += upload_started.elapsed();
 
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
@@ -5926,44 +7946,52 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
             }
 
-            for (idx, projection) in projections.iter().enumerate() {
-                let output_offset = output_offsets[idx]
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("dense q4 mmap batch output byte offset overflow")?
-                    as u64;
-                let (
-                    packed_offset_buffer,
-                    scales_offset_buffer,
-                    biases_offset_buffer,
-                    rows_buffer,
-                    cols_buffer,
-                    groups_buffer,
-                    group_size_buffer,
-                ) = params[idx];
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                set_buffer(encoder, packed_offset_buffer, 3);
-                set_buffer(encoder, scales_offset_buffer, 4);
-                set_buffer(encoder, biases_offset_buffer, 5);
-                set_buffer(encoder, rows_buffer, 6);
-                set_buffer(encoder, cols_buffer, 7);
-                set_buffer(encoder, groups_buffer, 8);
-                set_buffer(encoder, group_size_buffer, 9);
-                dispatch_q4_threadgroups(encoder, projection.rows as u64);
-            }
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
             msg_send_void0(encoder, sel("endEncoding"));
 
             let dispatch_started = Instant::now();
@@ -5974,7 +8002,7 @@ impl MetalExecutorInner {
                 .join(",");
             let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch_deferred_input")
                 .with("projections", projections.len())
-                .with("dispatches", projections.len())
+                .with("dispatches", dispatch_count)
                 .with("rows", total_rows)
                 .with("input_len", input_len)
                 .with("tensors", names);
@@ -6004,7 +8032,7 @@ impl MetalExecutorInner {
             for buffer in buffers {
                 self.recycle(buffer);
             }
-            Ok(Some((outputs, timing, projections.len())))
+            Ok(Some((outputs, timing, dispatch_count)))
         }
     }
 
@@ -6605,6 +8633,23 @@ impl MetalExecutorInner {
         unsafe { self.phase_buffer_with_borrowed_bytes(bytes) }
     }
 
+    unsafe fn q4_source_phase_buffer(
+        &self,
+        source: Q4MatvecSource<'_>,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalQ4SourceBufferCache,
+    ) -> Result<ObjcId> {
+        if let Some(buffer) = source_buffers.get(source.bytes) {
+            return Ok(buffer);
+        }
+        let phase_buffer =
+            unsafe { self.phase_buffer_with_borrowed_bytes_aligned(source.bytes, 16)? };
+        let buffer = phase_buffer.id;
+        buffers.push(phase_buffer);
+        source_buffers.insert(source.bytes, buffer);
+        Ok(buffer)
+    }
+
     fn shared_expert_buffers(
         &self,
         layer: usize,
@@ -6740,7 +8785,7 @@ impl MetalExecutorInner {
             // because expert data is streamed and can be very large.
             let len = msg_send_usize0(buffer, sel("length"));
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-            if reusable.len() < 8 {
+            if reusable.len() < METAL_REUSABLE_BUFFER_POOL_LIMIT {
                 reusable.push(MetalReusableBuffer { id: buffer, len });
             } else {
                 release(buffer);
@@ -6981,6 +9026,11 @@ impl FlashMoeEngine {
                     None,
                 )
             };
+        if prefill_start == 0
+            && let Some(metal) = &self.metal
+        {
+            metal.reset_linear_attention_state();
+        }
         let prefill_hidden = if prefill_start == prompt_tokens.len() {
             info!(
                 "flashmoe: prompt prefill fully cached tokens={}",
@@ -7807,17 +9857,22 @@ impl FlashMoeEngine {
             }
             let mut pending_for_layer = deferred_expert_phase.take();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let deferred_attention_input = if deepstack.is_none() {
-                let candidate = pending_for_layer
+            let (deferred_attention_input, deferred_residual_input) = if deepstack.is_none() {
+                let normed_candidate = pending_for_layer
                     .as_ref()
                     .and_then(DeferredExpertPhase::next_normed_metal_input);
-                if candidate.is_some() && self.deferred_attention_input_supported(layer, runtime) {
-                    candidate
+                if normed_candidate.is_some()
+                    && self.deferred_attention_input_supported(layer, runtime)
+                {
+                    let residual_candidate = pending_for_layer
+                        .as_ref()
+                        .and_then(DeferredExpertPhase::hidden_metal_input);
+                    (normed_candidate, residual_candidate)
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             };
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let deferred_attention_input: Option<DeferredMetalInput> = None;
@@ -7865,6 +9920,16 @@ impl FlashMoeEngine {
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
             let mut post_attention_values_for_prep = None;
+            let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let mut early_active: Option<Vec<(usize, f32)>> = None;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let mut metal_post_attention_values_for_prep: Option<(
+                String,
+                MetalAttentionValues,
+            )> = None;
             let mut projected = if self.runtime.is_linear_attention_layer(layer) {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
@@ -7872,16 +9937,53 @@ impl FlashMoeEngine {
                         && deepstack.is_none()
                         && expert_execution != ExpertExecution::Skip
                     {
-                        let values = self.linear_attention_output_values(
+                        let residual_input = deferred_residual_input
+                            .map(|input| MetalBatchProjectionInput::Buffer {
+                                buffer: input.buffer,
+                                len: input.len,
+                            })
+                            .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
+                        if let Some(post_norm_weight) =
+                            self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                            && let Some(prep) = self
+                                .linear_attention_post_attention_prep_with_metal(
+                                    layer,
+                                    &normed,
+                                    deferred_attention_input,
+                                    residual_input,
+                                    &post_norm_weight,
+                                    runtime,
+                                    Some(&mut layer_timing.buckets),
+                                )?
+                        {
+                            if deferred_residual_input.is_some()
+                                && let Some(pending) = pending_for_layer.take()
+                            {
+                                pending.finish_without_readback()?;
+                            }
+                            early_active = Some(prep.active.clone());
+                            early_metal_post_attention_prep = Some(prep);
+                        } else if let Some(values) = self.linear_attention_output_values_buffer(
                             layer,
                             &normed,
                             deferred_attention_input,
-                            kv_cache,
                             runtime,
                             Some(&mut layer_timing.buckets),
-                        )?;
-                        post_attention_values_for_prep =
-                            Some((linear_attention_tensor_name(layer, "out_proj"), values));
+                        )? {
+                            metal_post_attention_values_for_prep =
+                                Some((linear_attention_tensor_name(layer, "out_proj"), values));
+                        } else {
+                            let values = self.linear_attention_output_values(
+                                layer,
+                                &normed,
+                                deferred_attention_input,
+                                kv_cache,
+                                runtime,
+                                Some(&mut layer_timing.buckets),
+                            )?;
+                            post_attention_values_for_prep =
+                                Some((linear_attention_tensor_name(layer, "out_proj"), values));
+                        }
                         Vec::new()
                     } else {
                         self.linear_attention_projected(
@@ -7954,10 +10056,18 @@ impl FlashMoeEngine {
             };
             trace_layer_values(position, layer, "attention", &projected);
             layer_timing.buckets.attention_projection += attention_started.elapsed();
-            if deferred_attention_input.is_some() {
-                let pending = pending_for_layer
-                    .take()
-                    .context("missing deferred expert phase after input projection")?;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let can_defer_residual_wait_for_post_prep = deferred_residual_input.is_some()
+                && self.metal.is_some()
+                && expert_execution != ExpertExecution::Skip
+                && (metal_post_attention_values_for_prep.is_some()
+                    || post_attention_values_for_prep.is_some());
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let can_defer_residual_wait_for_post_prep = false;
+            if deferred_attention_input.is_some()
+                && let Some(pending) = pending_for_layer.take()
+                && !can_defer_residual_wait_for_post_prep
+            {
                 let wait_started = Instant::now();
                 let output = pending.wait()?;
                 let wait_elapsed = wait_started.elapsed();
@@ -7978,36 +10088,154 @@ impl FlashMoeEngine {
                 next_layer_normed = None;
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
+            let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
+                early_metal_post_attention_prep;
             let combine_started = Instant::now();
-            let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
-            let active = if let Some((out_proj_name, attention_values)) =
-                post_attention_values_for_prep.take()
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let mut precomputed_active: Option<Vec<(usize, f32)>> = None;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some((out_proj_name, attention_values)) =
+                metal_post_attention_values_for_prep.take()
             {
-                let mut prepared = None;
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let mut attention_values = Some(attention_values);
+                let mut used_buffer = false;
+                let residual_input = deferred_residual_input
+                    .map(|input| MetalBatchProjectionInput::Buffer {
+                        buffer: input.buffer,
+                        len: input.len,
+                    })
+                    .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
                 if let Some(metal) = &self.metal
                     && let Some(post_norm_weight) =
                         self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                    && let Some(prep) = self.dense.post_attention_q4_prep_with_metal(
+                    && let Some(prep) = self.dense.post_attention_q4_prep_with_metal_buffer(
                         metal,
                         layer,
                         self.config.experts(),
                         &out_proj_name,
-                        &attention_values,
-                        &hidden,
+                        attention_values
+                            .as_ref()
+                            .context("missing Metal attention values for Q4 prep")?,
+                        residual_input,
                         &post_norm_weight,
                         self.routing_policy.active_experts,
                     )?
                 {
+                    if deferred_residual_input.is_some()
+                        && let Some(pending) = pending_for_layer.take()
+                    {
+                        pending.finish_without_readback()?;
+                    }
                     let active = prep.active.clone();
                     metal_post_attention_prep = Some(prep);
-                    prepared = Some(active);
+                    precomputed_active = Some(active);
+                    if let Some(attention_values) = attention_values.take() {
+                        metal.recycle_attention_values(attention_values);
+                    }
+                    used_buffer = true;
+                }
+                if !used_buffer {
+                    if deferred_attention_input.is_some()
+                        && let Some(pending) = pending_for_layer.take()
+                    {
+                        let wait_started = Instant::now();
+                        let output = pending.wait()?;
+                        let wait_elapsed = wait_started.elapsed();
+                        info!(
+                            token_position = position,
+                            completed_layer = layer.saturating_sub(1),
+                            wait_ms = wait_elapsed.as_millis(),
+                            "flashmoe deferred expert wait complete before attention fallback"
+                        );
+                        if let Some(timing) = timing.as_deref_mut() {
+                            timing.buckets.deferred_wait += wait_elapsed;
+                            if let Some(previous_layer) = timing.layers.last_mut() {
+                                previous_layer.buckets.deferred_wait += wait_elapsed;
+                                previous_layer.buckets.total_wall += wait_elapsed;
+                            }
+                        }
+                        hidden = output.hidden;
+                        next_layer_normed = None;
+                    }
+                    if let Some(metal) = &self.metal {
+                        let attention_values = metal.read_and_recycle_attention_values(
+                            attention_values
+                                .take()
+                                .context("missing Metal attention values for fallback")?,
+                        );
+                        post_attention_values_for_prep = Some((out_proj_name, attention_values));
+                    } else {
+                        bail!("missing Metal executor for Metal attention values");
+                    }
+                }
+            }
+            let active = if let Some(active) = precomputed_active {
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                active
+            } else if let Some((out_proj_name, attention_values)) =
+                post_attention_values_for_prep.take()
+            {
+                let mut prepared = None;
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let residual_input = deferred_residual_input
+                        .map(|input| MetalBatchProjectionInput::Buffer {
+                            buffer: input.buffer,
+                            len: input.len,
+                        })
+                        .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
+                    if let Some(metal) = &self.metal
+                        && let Some(post_norm_weight) =
+                            self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                        && let Some(prep) = self.dense.post_attention_q4_prep_with_metal(
+                            metal,
+                            layer,
+                            self.config.experts(),
+                            &out_proj_name,
+                            &attention_values,
+                            residual_input,
+                            &post_norm_weight,
+                            self.routing_policy.active_experts,
+                        )?
+                    {
+                        if deferred_residual_input.is_some()
+                            && let Some(pending) = pending_for_layer.take()
+                        {
+                            pending.finish_without_readback()?;
+                        }
+                        let active = prep.active.clone();
+                        metal_post_attention_prep = Some(prep);
+                        prepared = Some(active);
+                    }
                 }
                 if let Some(active) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     active
                 } else {
+                    if deferred_attention_input.is_some()
+                        && let Some(pending) = pending_for_layer.take()
+                    {
+                        let wait_started = Instant::now();
+                        let output = pending.wait()?;
+                        let wait_elapsed = wait_started.elapsed();
+                        info!(
+                            token_position = position,
+                            completed_layer = layer.saturating_sub(1),
+                            wait_ms = wait_elapsed.as_millis(),
+                            "flashmoe deferred expert wait complete before CPU post-attention fallback"
+                        );
+                        if let Some(timing) = timing.as_deref_mut() {
+                            timing.buckets.deferred_wait += wait_elapsed;
+                            if let Some(previous_layer) = timing.layers.last_mut() {
+                                previous_layer.buckets.deferred_wait += wait_elapsed;
+                                previous_layer.buckets.total_wall += wait_elapsed;
+                            }
+                        }
+                        hidden = output.hidden;
+                        next_layer_normed = None;
+                    }
                     let subphase_started = Instant::now();
                     projected = self
                         .dense
@@ -8042,11 +10270,13 @@ impl FlashMoeEngine {
                 layer_timing.buckets.routing += routing_started.elapsed();
                 active
             };
-            let mlp_residual = hidden.clone();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let cpu_mlp_residual = (!has_metal_post_attention_prep).then(|| hidden.clone());
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let cpu_mlp_residual = Some(hidden.clone());
             layer_timing.active_experts = active.len();
-            let active_ids: Vec<usize> = active.iter().map(|(expert, _)| *expert).collect();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
                 kv_cache.record_layer_state(position, layer, state)?;
                 layer_timing.buckets.total_wall = layer_started.elapsed();
@@ -8058,34 +10288,31 @@ impl FlashMoeEngine {
             }
             let expert_metrics_before = self.scheduler.snapshot();
             let expert_io_started = Instant::now();
-            let pending_experts = self.scheduler.issue(layer, &active_ids)?;
+            let pending_experts = self.scheduler.issue_routes(layer, &active)?;
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
-            let mut weights: Vec<f32> = active.iter().map(|(_, score)| *score).collect();
-            softmax_in_place(&mut weights);
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let shared_q4_phase = if has_metal_post_attention_prep {
-                self.dense.shared_expert_q4_phase_projections(
-                    layer,
-                    runtime.width,
-                    self.config.shared_experts(),
-                    self.config.shared_expert_intermediate_size(),
-                )?
+                self.shared_expert_q4_phase_projections(layer, runtime.width)?
             } else {
                 None
             };
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let shared_q4_phase: Option<SharedExpertPhaseQ4Projections> = None;
-            let shared_phase = if shared_q4_phase.is_some() {
+            let shared_dense_phase = if shared_q4_phase.is_some() {
                 None
             } else {
                 self.shared_expert_phase_weights(layer, runtime.width)?
             };
+            let shared_phase = SharedExpertPhaseRef::from_options(
+                shared_dense_phase.as_deref(),
+                shared_q4_phase.as_deref(),
+            );
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let expert_io_started = Instant::now();
-            let experts = self.scheduler.finish(pending_experts)?;
+            let scheduled_experts = self.scheduler.finish_routes(pending_experts)?;
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
             let expert_metrics_after = self.scheduler.snapshot();
             let expert_delta = expert_metrics_after.saturating_delta(expert_metrics_before);
@@ -8093,14 +10320,21 @@ impl FlashMoeEngine {
                 .buckets
                 .add_expert_scheduler_delta(expert_delta);
             let expert_compute_started = Instant::now();
-            for (expert, weight) in experts.iter().zip(weights.iter().copied()) {
+            debug_assert_eq!(scheduled_experts.layer, layer);
+            debug_assert_eq!(scheduled_experts.len(), scheduled_experts.routes.len());
+            debug_assert_eq!(scheduled_experts.len(), scheduled_experts.weights.len());
+            debug_assert_eq!(scheduled_experts.is_empty(), active.is_empty());
+            for (expert, weight) in scheduled_experts
+                .experts
+                .iter()
+                .zip(scheduled_experts.weights.iter().copied())
+            {
                 state = state.wrapping_add(
                     expert
                         .mix_hash()
                         .wrapping_mul((weight.to_bits() as u64).max(1)),
                 );
             }
-            let experts: Arc<[Arc<ExpertWeights>]> = Arc::from(experts);
             let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
                 .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
             let next_norm_weight = if let Some(name) = next_norm_name.as_deref() {
@@ -8113,17 +10347,14 @@ impl FlashMoeEngine {
             if let Some(metal) = &self.metal
                 && let Some(prep) = metal_post_attention_prep.take()
             {
-                let Some(pending) = metal.submit_expert_phase_from_metal_prep(
+                let phase = ScheduledExpertPhase {
                     position,
-                    layer,
-                    experts.clone(),
-                    &weights,
-                    prep,
-                    shared_phase.as_deref(),
-                    shared_q4_phase.as_ref(),
-                    next_norm_weight.as_deref(),
-                )?
-                else {
+                    scheduled: &scheduled_experts,
+                    input: ExpertPhaseInput::MetalPostAttention(prep),
+                    shared: shared_phase,
+                    next_norm_weight: next_norm_weight.as_deref(),
+                };
+                let Some(pending) = metal.submit_scheduled_expert_phase(phase)? else {
                     bail!("Flash-MoE Metal post-attention prep could not submit expert phase");
                 };
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
@@ -8138,16 +10369,18 @@ impl FlashMoeEngine {
             }
             if !submitted_deferred
                 && let Some(metal) = &self.metal
-                && let Some(pending) = metal.submit_expert_phase(
-                    position,
-                    layer,
-                    experts.clone(),
-                    &weights,
-                    &normed,
-                    &mlp_residual,
-                    shared_phase.as_deref(),
-                    next_norm_weight.as_deref(),
-                )?
+                && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
+                && let Some(pending) =
+                    metal.submit_scheduled_expert_phase(ScheduledExpertPhase {
+                        position,
+                        scheduled: &scheduled_experts,
+                        input: ExpertPhaseInput::Cpu {
+                            normed: &normed,
+                            residual: mlp_residual,
+                        },
+                        shared: shared_phase,
+                        next_norm_weight: next_norm_weight.as_deref(),
+                    })?
             {
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
@@ -8164,12 +10397,15 @@ impl FlashMoeEngine {
                 if has_metal_post_attention_prep {
                     bail!("Flash-MoE Metal post-attention prep fell through to CPU expert phase");
                 }
+                let mlp_residual = cpu_mlp_residual
+                    .as_deref()
+                    .context("missing CPU residual for Flash-MoE expert phase")?;
                 let output = compute_expert_phase_cpu(
-                    experts.as_ref(),
-                    &weights,
+                    scheduled_experts.experts.as_ref(),
+                    &scheduled_experts.weights,
                     &normed,
-                    &mlp_residual,
-                    shared_phase.as_deref(),
+                    mlp_residual,
+                    shared_dense_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
                 hidden = output.hidden;
@@ -8654,6 +10890,168 @@ impl FlashMoeEngine {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_output_values_buffer(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Option<MetalAttentionValues>> {
+        let Some(metal) = self.metal.as_ref() else {
+            return Ok(None);
+        };
+        let layout = runtime.linear_attention_layout(layer)?;
+        if self
+            .config
+            .linear_attention_qkv_projection_requires_reorder()
+        {
+            return Ok(None);
+        }
+        let Some(static_offsets) = self
+            .dense
+            .linear_attention_static_offsets_for_metal(layer, layout)?
+        else {
+            return Ok(None);
+        };
+        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+        let input_specs = [
+            DenseProjectionRequest {
+                tensor_name: &qkv_name,
+                output_width: layout.conv_dim,
+            },
+            DenseProjectionRequest {
+                tensor_name: &z_name,
+                output_width: layout.total_value_width,
+            },
+            DenseProjectionRequest {
+                tensor_name: &b_name,
+                output_width: layout.num_value_heads,
+            },
+            DenseProjectionRequest {
+                tensor_name: &a_name,
+                output_width: layout.num_value_heads,
+            },
+        ];
+        let projection_input = if let Some(input) = deferred_input {
+            MetalBatchProjectionInput::Buffer {
+                buffer: input.buffer,
+                len: input.len,
+            }
+        } else if !normed.is_empty() {
+            MetalBatchProjectionInput::Cpu(normed)
+        } else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let values = self.dense.linear_attention_q4_with_metal(
+            metal,
+            layer,
+            layout,
+            &input_specs,
+            projection_input,
+            static_offsets,
+        )?;
+        if values.is_some()
+            && let Some(buckets) = attention_buckets.as_deref_mut()
+        {
+            buckets.attention_input_projection += started.elapsed();
+        }
+        Ok(values)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_post_attention_prep_with_metal(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        deferred_input: Option<DeferredMetalInput>,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        let Some(metal) = self.metal.as_ref() else {
+            return Ok(None);
+        };
+        let layout = runtime.linear_attention_layout(layer)?;
+        if self
+            .config
+            .linear_attention_qkv_projection_requires_reorder()
+        {
+            return Ok(None);
+        }
+        let Some(static_offsets) = self
+            .dense
+            .linear_attention_static_offsets_for_metal(layer, layout)?
+        else {
+            return Ok(None);
+        };
+        let residual_len = residual.len();
+        if residual_len != runtime.width || residual_len != post_norm_weight.len() {
+            return Ok(None);
+        }
+        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
+        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
+        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
+        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let input_specs = [
+            DenseProjectionRequest {
+                tensor_name: &qkv_name,
+                output_width: layout.conv_dim,
+            },
+            DenseProjectionRequest {
+                tensor_name: &z_name,
+                output_width: layout.total_value_width,
+            },
+            DenseProjectionRequest {
+                tensor_name: &b_name,
+                output_width: layout.num_value_heads,
+            },
+            DenseProjectionRequest {
+                tensor_name: &a_name,
+                output_width: layout.num_value_heads,
+            },
+        ];
+        let projection_input = if let Some(input) = deferred_input {
+            MetalBatchProjectionInput::Buffer {
+                buffer: input.buffer,
+                len: input.len,
+            }
+        } else if !normed.is_empty() {
+            MetalBatchProjectionInput::Cpu(normed)
+        } else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let prep = self
+            .dense
+            .linear_attention_q4_post_attention_prep_with_metal(
+                metal,
+                layer,
+                layout,
+                &input_specs,
+                projection_input,
+                static_offsets,
+                self.config.experts(),
+                &out_proj_name,
+                residual,
+                post_norm_weight,
+                self.routing_policy.active_experts,
+            )?;
+        if prep.is_some()
+            && let Some(buckets) = attention_buckets.as_deref_mut()
+        {
+            buckets.attention_input_projection += started.elapsed();
+        }
+        Ok(prep)
+    }
+
     fn linear_attention_output_values(
         &self,
         layer: usize,
@@ -8668,7 +11066,6 @@ impl FlashMoeEngine {
         let z_name = linear_attention_tensor_name(layer, "in_proj_z");
         let b_name = linear_attention_tensor_name(layer, "in_proj_b");
         let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-        let static_weights = self.linear_attention_static_weights(layer, layout)?;
 
         let subphase_started = Instant::now();
         let input_specs = [
@@ -8689,6 +11086,43 @@ impl FlashMoeEngine {
                 output_width: layout.num_value_heads,
             },
         ];
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = self.metal.as_ref()
+            && !self
+                .config
+                .linear_attention_qkv_projection_requires_reorder()
+            && let Some(static_offsets) = self
+                .dense
+                .linear_attention_static_offsets_for_metal(layer, layout)?
+        {
+            let projection_started = Instant::now();
+            let projection_input = if let Some(input) = deferred_input {
+                MetalBatchProjectionInput::Buffer {
+                    buffer: input.buffer,
+                    len: input.len,
+                }
+            } else if !normed.is_empty() {
+                MetalBatchProjectionInput::Cpu(normed)
+            } else {
+                MetalBatchProjectionInput::Cpu(&[])
+            };
+            if projection_input.len() > 0 {
+                if let Some(values) = self.dense.linear_attention_q4_with_metal(
+                    metal,
+                    layer,
+                    layout,
+                    &input_specs,
+                    projection_input,
+                    static_offsets,
+                )? {
+                    if let Some(buckets) = attention_buckets.as_deref_mut() {
+                        buckets.attention_input_projection += projection_started.elapsed();
+                    }
+                    let values = metal.read_and_recycle_attention_values(values);
+                    return Ok(values);
+                }
+            }
+        }
         let mut batched_input_projections = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
@@ -8769,6 +11203,7 @@ impl FlashMoeEngine {
         }
 
         let subphase_started = Instant::now();
+        let static_weights = self.linear_attention_static_weights(layer, layout)?;
         if self
             .config
             .linear_attention_qkv_projection_requires_reorder()
@@ -9006,6 +11441,60 @@ impl FlashMoeEngine {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn shared_expert_q4_phase_projections(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
+        let num_shared = self.config.shared_experts();
+        let shared_inter = self.config.shared_expert_intermediate_size();
+        if num_shared == 0 || shared_inter == 0 {
+            return Ok(None);
+        }
+        {
+            let cache = self
+                .shared_expert_q4_cache
+                .lock()
+                .expect("shared q4 expert cache poisoned");
+            if let Some(shared) = cache.get(&layer).cloned() {
+                if shared.width != width {
+                    bail!(
+                        "cached shared q4 expert projections for layer {layer} have width {}, requested {width}",
+                        shared.width
+                    );
+                }
+                return Ok(Some(shared));
+            }
+        }
+        let Some(shared) = self.dense.shared_expert_q4_phase_projections(
+            layer,
+            width,
+            num_shared,
+            shared_inter,
+        )?
+        else {
+            return Ok(None);
+        };
+        let shared = Arc::new(shared);
+        let mut cache = self
+            .shared_expert_q4_cache
+            .lock()
+            .expect("shared q4 expert cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            if existing.width != width {
+                bail!(
+                    "cached shared q4 expert projections for layer {layer} have width {}, requested {width}",
+                    existing.width
+                );
+            }
+            Ok(Some(existing))
+        } else {
+            cache.insert(layer, shared.clone());
+            Ok(Some(shared))
+        }
+    }
+
     fn load_shared_expert_phase_weights(
         &self,
         layer: usize,
@@ -9156,7 +11645,7 @@ struct DenseTransformerRuntime {
 
 impl DenseTransformerRuntime {
     fn new(config: &QwenModelConfig) -> Self {
-        let head_dim = config.hidden_size / config.num_attention_heads.max(1);
+        let head_dim = config.full_attention_head_dim();
         let kv_heads = config.kv_heads();
         Self {
             width: config.hidden_size,
@@ -9488,14 +11977,18 @@ fn normalize_linear_attention_qk_in_place(
         );
     }
     let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+    let q_scale = inv_scale * inv_scale;
     for head in 0..layout.num_key_heads {
         let start = head * layout.key_dim;
         let end = start + layout.key_dim;
-        l2_norm_in_place(&mut lin_q[start..end]);
+        rms_norm_with_weight_in_place(&mut lin_q[start..end], None);
         for value in &mut lin_q[start..end] {
+            *value *= q_scale;
+        }
+        rms_norm_with_weight_in_place(&mut lin_k[start..end], None);
+        for value in &mut lin_k[start..end] {
             *value *= inv_scale;
         }
-        l2_norm_in_place(&mut lin_k[start..end]);
     }
     Ok(())
 }
@@ -10260,6 +12753,159 @@ fn allocate_metal_kv_cache(
             total_items: offset,
         })
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn allocate_zeroed_metal_buffer(device: ObjcId, len: usize, label: &str) -> Result<ObjcId> {
+    let len = len.max(std::mem::size_of::<f32>());
+    unsafe {
+        let buffer = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
+        if buffer.is_null() {
+            bail!("failed to allocate Flash-MoE Metal {label} buffer ({len} bytes)");
+        }
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        ptr::write_bytes(contents.cast::<u8>(), 0, len);
+        Ok(buffer)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn zero_metal_buffer(buffer: ObjcId, f32_len: usize) {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        ptr::write_bytes(
+            contents.cast::<u8>(),
+            0,
+            f32_len.saturating_mul(std::mem::size_of::<f32>()),
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn allocate_metal_linear_attention_state(
+    device: ObjcId,
+    layouts: &[Option<LinearAttentionLayout>],
+) -> Result<MetalLinearAttentionStateCache> {
+    let mut layers = Vec::with_capacity(layouts.len());
+    for (layer, layout) in layouts.iter().copied().enumerate() {
+        let Some(layout) = layout else {
+            layers.push(None);
+            continue;
+        };
+        let conv_state_len = layout.conv_state_len();
+        let ssm_state_len = layout.ssm_state_len();
+        let conv_state = allocate_zeroed_metal_buffer(
+            device,
+            conv_state_len.saturating_mul(std::mem::size_of::<f32>()),
+            "linear conv state",
+        )
+        .with_context(|| {
+            format!("failed to allocate linear-attention conv state for layer {layer}")
+        })?;
+        let ssm_state = match allocate_zeroed_metal_buffer(
+            device,
+            ssm_state_len.saturating_mul(std::mem::size_of::<f32>()),
+            "linear SSM state",
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe { release(conv_state) };
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention SSM state for layer {layer}")
+                });
+            }
+        };
+        let conv_output = match allocate_zeroed_metal_buffer(
+            device,
+            layout.conv_dim.saturating_mul(std::mem::size_of::<f32>()),
+            "linear conv output",
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    release(conv_state);
+                    release(ssm_state);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention conv output for layer {layer}")
+                });
+            }
+        };
+        let delta_output = match allocate_zeroed_metal_buffer(
+            device,
+            layout
+                .total_value_width
+                .saturating_mul(std::mem::size_of::<f32>()),
+            "linear delta output",
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    release(conv_state);
+                    release(ssm_state);
+                    release(conv_output);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention delta output for layer {layer}")
+                });
+            }
+        };
+        let g_decay = match allocate_zeroed_metal_buffer(
+            device,
+            layout
+                .num_value_heads
+                .saturating_mul(std::mem::size_of::<f32>()),
+            "linear decay",
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    release(conv_state);
+                    release(ssm_state);
+                    release(conv_output);
+                    release(delta_output);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention decay state for layer {layer}")
+                });
+            }
+        };
+        let beta_gate = match allocate_zeroed_metal_buffer(
+            device,
+            layout
+                .num_value_heads
+                .saturating_mul(std::mem::size_of::<f32>()),
+            "linear beta gate",
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    release(conv_state);
+                    release(ssm_state);
+                    release(conv_output);
+                    release(delta_output);
+                    release(g_decay);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention beta gate for layer {layer}")
+                });
+            }
+        };
+        layers.push(Some(MetalLinearAttentionLayerState {
+            conv_state,
+            ssm_state,
+            conv_output,
+            delta_output,
+            g_decay,
+            beta_gate,
+            conv_state_len,
+            ssm_state_len,
+            conv_dim: layout.conv_dim,
+            total_value_width: layout.total_value_width,
+            num_value_heads: layout.num_value_heads,
+        }));
+    }
+    Ok(MetalLinearAttentionStateCache { layers })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12604,6 +15250,8 @@ pub struct DenseStore {
     registry: TensorRegistry,
     resident: Arc<std::sync::Mutex<DenseTensorCache>>,
     norm_weights: Arc<std::sync::Mutex<BTreeMap<DenseNormWeightKey, Arc<Vec<f32>>>>>,
+    q4_mmap_projections:
+        Arc<std::sync::Mutex<BTreeMap<DenseQ4ProjectionKey, Arc<DenseQ4MmapMatvecProjection>>>>,
     decoded_tiles: Arc<std::sync::Mutex<DenseTensorTileCache>>,
     raw_tiles: Arc<std::sync::Mutex<DenseRawTensorTileCache>>,
     #[cfg(test)]
@@ -12630,6 +15278,13 @@ struct DenseTensorTileKey {
 struct DenseNormWeightKey {
     name: String,
     width: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DenseQ4ProjectionKey {
+    name: String,
+    output_width: usize,
+    input_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -12869,6 +15524,7 @@ impl DenseStore {
                 512 * 1024 * 1024,
             ))),
             norm_weights: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            q4_mmap_projections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             decoded_tiles: Arc::new(std::sync::Mutex::new(DenseTensorTileCache::with_budget(
                 DENSE_DECODED_TILE_CACHE_BYTES,
             ))),
@@ -12884,6 +15540,14 @@ impl DenseStore {
 
     pub fn registry(&self) -> &TensorRegistry {
         &self.registry
+    }
+
+    #[cfg(test)]
+    fn q4_mmap_projection_cache_len(&self) -> usize {
+        self.q4_mmap_projections
+            .lock()
+            .expect("dense q4 projection cache poisoned")
+            .len()
     }
 
     fn seed(&self, position: usize, previous: u32) -> Result<u64> {
@@ -13261,6 +15925,406 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_static_offsets_for_metal(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+    ) -> Result<Option<MetalLinearAttentionStaticOffsets>> {
+        let conv_name = linear_attention_tensor_name(layer, "conv1d");
+        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+        let norm_name = linear_attention_tensor_name(layer, "norm");
+        let Some(conv_weight_byte_offset) = self.resident_static_tensor_offset(
+            &conv_name,
+            layout.conv_dim * layout.conv_kernel_size,
+            &["BF16", "BFLOAT16"],
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(a_log_byte_offset) = self.resident_static_tensor_offset(
+            &a_log_name,
+            layout.num_value_heads,
+            &["F32", "FLOAT32", "FP32"],
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(dt_bias_byte_offset) = self.resident_static_tensor_offset(
+            &dt_bias_name,
+            layout.num_value_heads,
+            &["BF16", "BFLOAT16"],
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(norm_weight_byte_offset) = self.resident_static_tensor_offset(
+            &norm_name,
+            layout.value_dim,
+            &["BF16", "BFLOAT16"],
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(MetalLinearAttentionStaticOffsets {
+            conv_weight_byte_offset,
+            a_log_byte_offset,
+            dt_bias_byte_offset,
+            norm_weight_byte_offset,
+        }))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn resident_static_tensor_offset(
+        &self,
+        tensor_name: &str,
+        expected_values: usize,
+        allowed_dtypes: &[&str],
+    ) -> Result<Option<u64>> {
+        let Some(entry) = self.registry.tensor(tensor_name) else {
+            return Ok(None);
+        };
+        if entry.quantization != TensorQuantization::None {
+            return Ok(None);
+        }
+        let dtype = entry.dtype.to_ascii_uppercase();
+        if !allowed_dtypes.iter().any(|allowed| dtype == *allowed) {
+            return Ok(None);
+        }
+        let Some(element_size) = dtype_size(&entry.dtype) else {
+            return Ok(None);
+        };
+        let expected_bytes = expected_values
+            .checked_mul(element_size)
+            .context("linear-attention static tensor byte length overflow")?;
+        if entry.byte_len as usize != expected_bytes {
+            return Ok(None);
+        }
+        if entry
+            .byte_offset
+            .checked_add(entry.byte_len)
+            .map_or(true, |end| end > self.len)
+        {
+            return Ok(None);
+        }
+        if entry.byte_offset % element_size as u64 != 0 {
+            return Ok(None);
+        }
+        Ok(Some(entry.byte_offset))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn project_dense_tensors_batched_with_metal_buffer(
+        &self,
+        metal: &MetalExecutor,
+        specs: &[DenseProjectionRequest<'_>],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<MetalProjectionBatch>> {
+        if !metal.has_resident_dense_weights() || specs.is_empty() {
+            return Ok(None);
+        }
+        let projection_started = Instant::now();
+        let input_len = input.len();
+        let mut has_q4 = false;
+        let mut has_dense = false;
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            match entry.quantization {
+                TensorQuantization::None => has_dense = true,
+                TensorQuantization::Q4 { .. } => has_q4 = true,
+            }
+        }
+        if has_q4 {
+            if has_dense {
+                return Ok(None);
+            }
+            let mut q4_projections = Vec::with_capacity(specs.len());
+            let mut total_rows = 0usize;
+            for spec in specs {
+                let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                    return Ok(None);
+                };
+                let TensorQuantization::Q4 {
+                    group_size,
+                    scale_bias_dtype,
+                    ..
+                } = &entry.quantization
+                else {
+                    return Ok(None);
+                };
+                let (rows, cols) = validate_dense_matvec_shape(
+                    entry,
+                    spec.tensor_name,
+                    spec.output_width,
+                    input_len,
+                )?;
+                let layout = dense_q4_layout_with_scale_bias_dtype(
+                    &entry.shape,
+                    *group_size,
+                    scale_bias_dtype,
+                )?;
+                if entry.byte_len as usize != layout.total_bytes
+                    || rows != layout.rows
+                    || cols != layout.cols
+                {
+                    return Ok(None);
+                }
+                let packed_byte_offset = entry.byte_offset;
+                let scales_byte_offset = entry
+                    .byte_offset
+                    .checked_add(layout.packed_bytes as u64)
+                    .context("dense q4 batch scales offset overflow")?;
+                let biases_byte_offset = scales_byte_offset
+                    .checked_add(layout.scales_bytes as u64)
+                    .context("dense q4 batch biases offset overflow")?;
+                if entry
+                    .byte_offset
+                    .checked_add(entry.byte_len)
+                    .map_or(true, |end| end > self.len)
+                {
+                    return Ok(None);
+                }
+                total_rows = total_rows
+                    .checked_add(rows)
+                    .context("dense q4 tensor batch total row count overflow")?;
+                q4_projections.push(DenseQ4MmapMatvecProjection {
+                    tensor_name: spec.tensor_name.to_string(),
+                    packed_byte_offset,
+                    scales_byte_offset,
+                    biases_byte_offset,
+                    rows,
+                    cols,
+                    output_width: spec.output_width,
+                    row_packed_bytes: layout.row_packed_bytes,
+                    groups_per_row: layout.groups_per_row,
+                    group_size: *group_size,
+                    scale_bias_dtype: scale_bias_dtype.clone(),
+                });
+            }
+
+            let Some((batch, timing, dispatch_count)) =
+                metal.q4_mmap_matvec_batch_to_buffer(&q4_projections, input)?
+            else {
+                return Ok(None);
+            };
+            let total = projection_started.elapsed();
+            if total >= Duration::from_millis(100) {
+                let names = specs
+                    .iter()
+                    .map(|spec| spec.tensor_name)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                info!(
+                    projection_batch = %names,
+                    projection_count = specs.len(),
+                    dispatch_count,
+                    input_len,
+                    total_rows,
+                    metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
+                    metal_dispatch_ms = duration_ms(timing.dispatch),
+                    total_ms = duration_ms(total),
+                    "flashmoe dense q4 projection batch buffer complete"
+                );
+            }
+            return Ok(Some(batch));
+        }
+
+        let mut projections = Vec::with_capacity(specs.len());
+        let mut total_rows = 0usize;
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            if entry.quantization != TensorQuantization::None {
+                return Ok(None);
+            }
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, spec.tensor_name, spec.output_width, input_len)?;
+            let Some(element_size) = dtype_size(&entry.dtype) else {
+                return Ok(None);
+            };
+            let row_bytes = cols
+                .checked_mul(element_size)
+                .context("dense tensor batch resident row byte length overflow")?;
+            let byte_len = rows
+                .checked_mul(row_bytes)
+                .context("dense tensor batch resident byte length overflow")?;
+            if entry
+                .byte_offset
+                .checked_add(byte_len as u64)
+                .map_or(true, |end| end > self.len)
+            {
+                return Ok(None);
+            }
+            total_rows = total_rows
+                .checked_add(rows)
+                .context("dense tensor batch total row count overflow")?;
+            projections.push(DenseMmapMatvecProjection {
+                tensor_name: spec.tensor_name.to_string(),
+                byte_offset: entry.byte_offset,
+                dtype: entry.dtype.clone(),
+                rows,
+                cols,
+                output_width: spec.output_width,
+            });
+        }
+
+        let Some((batch, timing, dispatch_count)) =
+            metal.dense_mmap_matvec_batch_to_buffer(&projections, input)?
+        else {
+            return Ok(None);
+        };
+        let total = projection_started.elapsed();
+        if total >= Duration::from_millis(100) {
+            let names = specs
+                .iter()
+                .map(|spec| spec.tensor_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
+                projection_batch = %names,
+                projection_count = specs.len(),
+                dispatch_count,
+                input_len,
+                total_rows,
+                metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
+                metal_dispatch_ms = duration_ms(timing.dispatch),
+                total_ms = duration_ms(total),
+                "flashmoe dense projection batch buffer complete"
+            );
+        }
+        Ok(Some(batch))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_q4_with_metal(
+        &self,
+        metal: &MetalExecutor,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        specs: &[DenseProjectionRequest<'_>],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+    ) -> Result<Option<MetalAttentionValues>> {
+        if !metal.has_resident_dense_weights() || specs.len() != 4 {
+            return Ok(None);
+        }
+        let input_len = input.len();
+        let mut q4_projections = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
+                return Ok(None);
+            };
+            let TensorQuantization::Q4 {
+                group_size,
+                scale_bias_dtype,
+                ..
+            } = &entry.quantization
+            else {
+                return Ok(None);
+            };
+            let (rows, cols) =
+                validate_dense_matvec_shape(entry, spec.tensor_name, spec.output_width, input_len)?;
+            let layout =
+                dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+            if entry.byte_len as usize != layout.total_bytes
+                || rows != layout.rows
+                || cols != layout.cols
+            {
+                return Ok(None);
+            }
+            let packed_byte_offset = entry.byte_offset;
+            let scales_byte_offset = entry
+                .byte_offset
+                .checked_add(layout.packed_bytes as u64)
+                .context("linear-attention q4 batch scales offset overflow")?;
+            let biases_byte_offset = scales_byte_offset
+                .checked_add(layout.scales_bytes as u64)
+                .context("linear-attention q4 batch biases offset overflow")?;
+            if entry
+                .byte_offset
+                .checked_add(entry.byte_len)
+                .map_or(true, |end| end > self.len)
+            {
+                return Ok(None);
+            }
+            q4_projections.push(DenseQ4MmapMatvecProjection {
+                tensor_name: spec.tensor_name.to_string(),
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                rows,
+                cols,
+                output_width: spec.output_width,
+                row_packed_bytes: layout.row_packed_bytes,
+                groups_per_row: layout.groups_per_row,
+                group_size: *group_size,
+                scale_bias_dtype: scale_bias_dtype.clone(),
+            });
+        }
+        metal.linear_attention_q4_mmap_batch(layer, layout, &q4_projections, input, static_offsets)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_q4_post_attention_prep_with_metal(
+        &self,
+        metal: &MetalExecutor,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        input_specs: &[DenseProjectionRequest<'_>],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        experts: usize,
+        out_proj_name: &str,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        active_experts: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        let residual_len = residual.len();
+        if !metal.has_resident_dense_weights()
+            || input_specs.len() != 4
+            || residual_len != post_norm_weight.len()
+        {
+            return Ok(None);
+        }
+        let input_len = input.len();
+        let mut input_projections = Vec::with_capacity(input_specs.len());
+        for spec in input_specs {
+            let Some(projection) =
+                self.dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
+            else {
+                return Ok(None);
+            };
+            input_projections.push(projection);
+        }
+        let router_name = router_tensor_name(layer);
+        let Some(out_proj) =
+            self.dense_q4_mmap_projection(out_proj_name, residual_len, layout.total_value_width)?
+        else {
+            return Ok(None);
+        };
+        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
+        else {
+            return Ok(None);
+        };
+        metal.linear_attention_q4_post_attention_prep(
+            layer,
+            layout,
+            &input_projections,
+            input,
+            static_offsets,
+            &out_proj,
+            &router,
+            residual,
+            post_norm_weight,
+            active_experts,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn project_dense_tensors_batched_with_metal_input_buffer(
         &self,
         metal: &MetalExecutor,
@@ -13590,6 +16654,20 @@ impl DenseStore {
         output_width: usize,
         input_len: usize,
     ) -> Result<Option<DenseQ4MmapMatvecProjection>> {
+        let key = DenseQ4ProjectionKey {
+            name: tensor_name.to_string(),
+            output_width,
+            input_len,
+        };
+        if let Some(projection) = self
+            .q4_mmap_projections
+            .lock()
+            .expect("dense q4 projection cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some((*projection).clone()));
+        }
         let Some(entry) = self.registry.tensor(tensor_name) else {
             return Ok(None);
         };
@@ -13626,7 +16704,7 @@ impl DenseStore {
         let biases_byte_offset = scales_byte_offset
             .checked_add(layout.scales_bytes as u64)
             .context("dense q4 projection biases offset overflow")?;
-        Ok(Some(DenseQ4MmapMatvecProjection {
+        let projection = Arc::new(DenseQ4MmapMatvecProjection {
             tensor_name: tensor_name.to_string(),
             packed_byte_offset,
             scales_byte_offset,
@@ -13638,7 +16716,17 @@ impl DenseStore {
             groups_per_row: layout.groups_per_row,
             group_size: *group_size,
             scale_bias_dtype: scale_bias_dtype.clone(),
-        }))
+        });
+        let mut cache = self
+            .q4_mmap_projections
+            .lock()
+            .expect("dense q4 projection cache poisoned");
+        if let Some(existing) = cache.get(&key).cloned() {
+            Ok(Some((*existing).clone()))
+        } else {
+            cache.insert(key, projection.clone());
+            Ok(Some((*projection).clone()))
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13693,24 +16781,61 @@ impl DenseStore {
         experts: usize,
         out_proj_name: &str,
         attention_output: &[f32],
-        residual: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
         if !metal.has_resident_dense_weights() {
             return Ok(None);
         }
+        let residual_len = residual.len();
         let router_name = router_tensor_name(layer);
         let Some(out_proj) =
-            self.dense_q4_mmap_projection(out_proj_name, residual.len(), attention_output.len())?
+            self.dense_q4_mmap_projection(out_proj_name, residual_len, attention_output.len())?
         else {
             return Ok(None);
         };
-        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual.len())?
+        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
         else {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk(
+            &out_proj,
+            &router,
+            attention_output,
+            residual,
+            post_norm_weight,
+            active_experts,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn post_attention_q4_prep_with_metal_buffer(
+        &self,
+        metal: &MetalExecutor,
+        layer: usize,
+        experts: usize,
+        out_proj_name: &str,
+        attention_output: &MetalAttentionValues,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        active_experts: usize,
+    ) -> Result<Option<MetalPostAttentionPrep>> {
+        if !metal.has_resident_dense_weights() {
+            return Ok(None);
+        }
+        let residual_len = residual.len();
+        let router_name = router_tensor_name(layer);
+        let Some(out_proj) =
+            self.dense_q4_mmap_projection(out_proj_name, residual_len, attention_output.len)?
+        else {
+            return Ok(None);
+        };
+        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
+        else {
+            return Ok(None);
+        };
+        metal.q4_post_attention_prep_topk_from_buffer(
             &out_proj,
             &router,
             attention_output,
@@ -14997,7 +18122,20 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[derive(Debug, Clone)]
 pub struct ExpertStore {
     root: PathBuf,
+    fixed_q4: FixedQ4ExpertSlotSpec,
+    fixed_q4_buffer_pool: ReusableExpertBytePool,
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
+}
+
+type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+const FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT: usize = ACTIVE_EXPERTS_PER_TOKEN * 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FixedQ4ExpertSlotSpec {
+    layout: QwenMoeQ4ExpertLayout,
+    hidden_size: usize,
+    intermediate_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15034,13 +18172,64 @@ const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
     broad_ssd_gpu_overlap: false,
 };
 
+fn take_reusable_expert_bytes(
+    pool: &ReusableExpertBytePool,
+    min_capacity: usize,
+) -> Option<Vec<u8>> {
+    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
+    let index = pool
+        .iter()
+        .position(|bytes| bytes.capacity() >= min_capacity)?;
+    Some(pool.swap_remove(index))
+}
+
+fn recycle_reusable_expert_bytes(
+    pool: &ReusableExpertBytePool,
+    mut bytes: Vec<u8>,
+    min_capacity: usize,
+) {
+    if bytes.capacity() < min_capacity {
+        return;
+    }
+    bytes.clear();
+    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
+    if pool.len() < FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT {
+        pool.push(bytes);
+    }
+}
+
 impl ExpertStore {
     pub fn open(root: PathBuf) -> Result<Self> {
+        Self::open_with_fixed_q4(
+            root,
+            FixedQ4ExpertSlotSpec {
+                layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
+                hidden_size: HIDDEN_DIM,
+                intermediate_size: 1024,
+            },
+        )
+    }
+
+    pub fn open_with_model_layout(root: PathBuf, layout: &QwenMoeModelLayout) -> Result<Self> {
+        Self::open_with_fixed_q4(
+            root,
+            FixedQ4ExpertSlotSpec {
+                layout: layout.q4_expert_layout,
+                hidden_size: layout.hidden_size,
+                intermediate_size: layout.moe_intermediate_size,
+            },
+        )
+    }
+
+    fn open_with_fixed_q4(root: PathBuf, fixed_q4: FixedQ4ExpertSlotSpec) -> Result<Self> {
         if !root.is_dir() {
             bail!("expert store {} does not exist", root.display());
         }
+        fixed_q4.layout.validate()?;
         Ok(Self {
             root,
+            fixed_q4,
+            fixed_q4_buffer_pool: Arc::new(Mutex::new(Vec::new())),
             layers: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -15075,7 +18264,12 @@ impl ExpertStore {
             return Ok(reader);
         }
 
-        let reader = Arc::new(ExpertLayerReader::open(&self.root, layer)?);
+        let reader = Arc::new(ExpertLayerReader::open(
+            &self.root,
+            layer,
+            self.fixed_q4,
+            Arc::clone(&self.fixed_q4_buffer_pool),
+        )?);
         let mut layers = self.layers.lock().expect("expert layer cache poisoned");
         Ok(layers.entry(layer).or_insert_with(|| reader).clone())
     }
@@ -15087,9 +18281,47 @@ struct ExpertKey {
     expert: usize,
 }
 
+#[derive(Debug)]
 struct PendingExpertRead {
     id: u64,
     rx: mpsc::Receiver<ExpertReadResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExpertRoute {
+    expert: usize,
+    score: f32,
+}
+
+impl ExpertRoute {
+    fn from_pair((expert, score): (usize, f32)) -> Self {
+        Self { expert, score }
+    }
+}
+
+#[derive(Debug)]
+struct PendingExpertSet {
+    layer: usize,
+    routes: Vec<ExpertRoute>,
+    reads: Vec<PendingExpertRead>,
+}
+
+#[derive(Debug)]
+struct ScheduledExpertSet {
+    layer: usize,
+    routes: Vec<ExpertRoute>,
+    weights: Vec<f32>,
+    experts: Arc<[Arc<ExpertWeights>]>,
+}
+
+impl ScheduledExpertSet {
+    fn len(&self) -> usize {
+        self.experts.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.experts.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -15097,10 +18329,17 @@ struct ExpertLayerReader {
     path: PathBuf,
     file: fs::File,
     metadata: ExpertLayerPackMetadata,
+    fixed_q4: FixedQ4ExpertSlotSpec,
+    fixed_q4_buffer_pool: ReusableExpertBytePool,
 }
 
 impl ExpertLayerReader {
-    fn open(root: &Path, layer: usize) -> Result<Self> {
+    fn open(
+        root: &Path,
+        layer: usize,
+        fixed_q4: FixedQ4ExpertSlotSpec,
+        fixed_q4_buffer_pool: ReusableExpertBytePool,
+    ) -> Result<Self> {
         let path = expert_layer_path(root, layer);
         let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
             format!(
@@ -15114,6 +18353,8 @@ impl ExpertLayerReader {
             path,
             file,
             metadata,
+            fixed_q4,
+            fixed_q4_buffer_pool,
         })
     }
 
@@ -15154,6 +18395,17 @@ impl ExpertLayerReader {
         slot_capacity: usize,
         scratch: &mut ReusableExpertBuffer,
     ) -> Result<ExpertReadResult> {
+        if scratch.capacity() < slot_capacity
+            && let Some(bytes) =
+                take_reusable_expert_bytes(&self.fixed_q4_buffer_pool, slot_capacity)
+        {
+            let previous = scratch.adopt_buffer(bytes);
+            recycle_reusable_expert_bytes(
+                &self.fixed_q4_buffer_pool,
+                previous,
+                self.fixed_q4.layout.expert_bytes,
+            );
+        }
         let payload = scratch.prepare_payload(slot_capacity, packed_len)?;
         let read_started = Instant::now();
         read_exact_at_positioned(&self.file, payload, offset).with_context(|| {
@@ -15165,24 +18417,55 @@ impl ExpertLayerReader {
         let read_latency = read_started.elapsed();
         let slot = scratch.slot_view(self.metadata.layer, expert, offset, slot_capacity)?;
         let payload = slot.payload();
-        if !cfg!(test) && !payload.starts_with(PBQ4_EXPERT_MAGIC) {
-            bail!("expert {} is not a pb q4 expert pack", self.path.display());
-        }
-        let records = if payload.starts_with(PBQ4_EXPERT_MAGIC) {
-            parse_pbq4_expert_pack(payload, Some(&metadata))
-                .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?
+        let descriptor = slot.descriptor();
+        let (records, fixed_q4, packed_prefix) = if payload.starts_with(PBQ4_EXPERT_MAGIC) {
+            let records = parse_pbq4_expert_pack(payload, Some(&metadata))
+                .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?;
+            match fixed_q4_payload_from_pbq4_records(
+                self.metadata.layer,
+                expert,
+                self.fixed_q4,
+                &records,
+                Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+            ) {
+                Ok(fixed_q4) => (Vec::new(), Some(fixed_q4), Vec::new()),
+                Err(error) => {
+                    tracing::trace!(
+                        layer = self.metadata.layer,
+                        expert,
+                        error = %error,
+                        "PBQ4 expert pack is not compatible with the fixed Q4 slot layout"
+                    );
+                    (records, None, slot.payload_prefix(4096).to_vec())
+                }
+            }
         } else {
-            Vec::new()
+            FixedQ4ExpertSlotView::new(slot, self.fixed_q4.layout).with_context(|| {
+                format!(
+                    "expert {} is neither a PBQ4 pack nor a fixed Q4 slot matching the model layout",
+                    self.path.display()
+                )
+            })?;
+            let payload = scratch.take_payload();
+            (
+                Vec::new(),
+                Some(FixedQ4ExpertPayload {
+                    spec: self.fixed_q4,
+                    bytes: payload,
+                    decoded: None,
+                    recycle_pool: Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+                }),
+                Vec::new(),
+            )
         };
-        let packed_prefix = slot.payload_prefix(4096).to_vec();
-        let slot = slot.descriptor();
         Ok(ExpertReadResult {
             weights: ExpertWeights {
                 layer: self.metadata.layer,
                 expert,
-                slot,
+                slot: descriptor,
                 packed: packed_prefix,
                 records,
+                fixed_q4,
             },
             read_latency,
             read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
@@ -15271,14 +18554,23 @@ struct ExpertScheduler {
     metrics: ExpertSchedulerMetrics,
     seen_reads: BTreeSet<ExpertKey>,
     next_read_id: u64,
+    routed_expert_scale: f32,
 }
 
 impl ExpertScheduler {
     fn new(store: ExpertStore) -> Self {
+        Self::new_with_routed_expert_scale(store, 1.0)
+    }
+
+    fn new_with_routed_expert_scale(store: ExpertStore, routed_expert_scale: f32) -> Self {
         assert_eq!(
             FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
             ExpertReadPath::PositionedRead,
             "expert files must be read with positioned reads"
+        );
+        assert!(
+            routed_expert_scale.is_finite() && routed_expert_scale > 0.0,
+            "routed expert scale must be positive and finite"
         );
         assert!(
             !FLASHMOE_EXPERT_IO_POLICY.application_expert_cache,
@@ -15302,6 +18594,7 @@ impl ExpertScheduler {
             metrics: ExpertSchedulerMetrics::default(),
             seen_reads: BTreeSet::new(),
             next_read_id: 0,
+            routed_expert_scale,
         }
     }
 
@@ -15343,6 +18636,17 @@ impl ExpertScheduler {
             pending.push(PendingExpertRead { id, rx });
         }
         Ok(pending)
+    }
+
+    fn issue_routes(&mut self, layer: usize, routes: &[(usize, f32)]) -> Result<PendingExpertSet> {
+        let routes: Vec<ExpertRoute> = routes.iter().copied().map(ExpertRoute::from_pair).collect();
+        let experts: Vec<usize> = routes.iter().map(|route| route.expert).collect();
+        let reads = self.issue(layer, &experts)?;
+        Ok(PendingExpertSet {
+            layer,
+            routes,
+            reads,
+        })
     }
 
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
@@ -15393,6 +18697,40 @@ impl ExpertScheduler {
             }
         }
         Ok(out)
+    }
+
+    fn finish_routes(&mut self, pending: PendingExpertSet) -> Result<ScheduledExpertSet> {
+        let mut weights: Vec<f32> = pending.routes.iter().map(|route| route.score).collect();
+        softmax_in_place(&mut weights);
+        for weight in &mut weights {
+            *weight *= self.routed_expert_scale;
+        }
+        let experts = self.finish(pending.reads)?;
+        if experts.len() != pending.routes.len() {
+            bail!(
+                "expert scheduler returned {} experts for {} routed entries on layer {}",
+                experts.len(),
+                pending.routes.len(),
+                pending.layer
+            );
+        }
+        for (route, expert) in pending.routes.iter().zip(experts.iter()) {
+            if expert.layer != pending.layer || expert.expert != route.expert {
+                bail!(
+                    "expert scheduler returned layer {} expert {} for routed layer {} expert {}",
+                    expert.layer,
+                    expert.expert,
+                    pending.layer,
+                    route.expert
+                );
+            }
+        }
+        Ok(ScheduledExpertSet {
+            layer: pending.layer,
+            routes: pending.routes,
+            weights,
+            experts: Arc::from(experts),
+        })
     }
 
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
@@ -15524,6 +18862,315 @@ struct ExpertReadResponse {
     result: Result<ExpertWeights>,
 }
 
+#[derive(Debug)]
+struct FixedQ4ExpertPayload {
+    spec: FixedQ4ExpertSlotSpec,
+    bytes: Vec<u8>,
+    decoded: Option<FixedQ4ExpertPayloadDecoded>,
+    recycle_pool: Option<ReusableExpertBytePool>,
+}
+
+impl Clone for FixedQ4ExpertPayload {
+    fn clone(&self) -> Self {
+        Self {
+            spec: self.spec,
+            bytes: self.bytes.clone(),
+            decoded: self.decoded.clone(),
+            recycle_pool: None,
+        }
+    }
+}
+
+impl PartialEq for FixedQ4ExpertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && self.bytes == other.bytes && self.decoded == other.decoded
+    }
+}
+
+impl Drop for FixedQ4ExpertPayload {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.recycle_pool {
+            recycle_reusable_expert_bytes(
+                pool,
+                std::mem::take(&mut self.bytes),
+                self.spec.layout.expert_bytes,
+            );
+        }
+    }
+}
+
+impl FixedQ4ExpertPayload {
+    fn payload_prefix(&self, max_len: usize) -> &[u8] {
+        &self.bytes[..self.bytes.len().min(max_len)]
+    }
+
+    fn component(&self, kind: QwenMoeExpertComponentKind) -> &[u8] {
+        let component = self.spec.layout.component(kind);
+        &self.bytes[component.offset..component.offset + component.bytes]
+    }
+
+    fn component_source(
+        &self,
+        weight_kind: QwenMoeExpertComponentKind,
+        scale_kind: QwenMoeExpertComponentKind,
+        bias_kind: QwenMoeExpertComponentKind,
+    ) -> Q4MatvecSource<'_> {
+        Q4MatvecSource {
+            bytes: &self.bytes,
+            packed_offset: self.spec.layout.component(weight_kind).offset,
+            scale_offset: self.spec.layout.component(scale_kind).offset,
+            bias_offset: self.spec.layout.component(bias_kind).offset,
+        }
+    }
+
+    fn decoded_scales_biases(
+        &self,
+        scale_kind: QwenMoeExpertComponentKind,
+        bias_kind: QwenMoeExpertComponentKind,
+        needed_groups: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let scales = decode_fixed_q4_bf16_component_bytes(self.component(scale_kind))
+            .with_context(|| format!("failed to decode fixed Q4 {scale_kind:?} scales"))?;
+        let biases = decode_fixed_q4_bf16_component_bytes(self.component(bias_kind))
+            .with_context(|| format!("failed to decode fixed Q4 {bias_kind:?} biases"))?;
+        if scales.len() < needed_groups || biases.len() < needed_groups {
+            bail!(
+                "fixed Q4 expert scale/bias payload is shorter than projection requires: scales={}, biases={}, required={needed_groups}",
+                scales.len(),
+                biases.len()
+            );
+        }
+        Ok((scales, biases))
+    }
+
+    fn project_cpu(
+        &self,
+        projection: FixedQ4ExpertProjection,
+        input: &[f32],
+        output_width: usize,
+    ) -> Result<Vec<f32>> {
+        let payload = self
+            .matvec_payload(projection, input.len(), output_width)
+            .context("fixed Q4 projection metadata is incompatible with input/output shape")?;
+        let (scale_kind, bias_kind) = projection.scale_bias_kinds();
+        let (owned_scales, owned_biases);
+        let (scales, biases) = if payload.scales.len() >= payload.scale_bias_groups
+            && payload.biases.len() >= payload.scale_bias_groups
+        {
+            (payload.scales, payload.biases)
+        } else {
+            (owned_scales, owned_biases) =
+                self.decoded_scales_biases(scale_kind, bias_kind, payload.scale_bias_groups)?;
+            (
+                &owned_scales[..payload.scale_bias_groups],
+                &owned_biases[..payload.scale_bias_groups],
+            )
+        };
+        q4_fma_matvec_with_group_size(
+            payload.packed,
+            &input[..payload.cols],
+            scales,
+            biases,
+            payload.rows,
+            payload.cols,
+            payload.group_size,
+        )
+    }
+
+    fn matvec_payload(
+        &self,
+        projection: FixedQ4ExpertProjection,
+        input_len: usize,
+        output_width: usize,
+    ) -> Option<Q4MatvecPayload<'_>> {
+        if input_len == 0 || output_width == 0 {
+            return None;
+        }
+        let (rows, cols) = match projection {
+            FixedQ4ExpertProjection::Gate | FixedQ4ExpertProjection::Up => (
+                self.spec.intermediate_size.min(output_width).max(1),
+                self.spec.hidden_size.min(input_len).max(1),
+            ),
+            FixedQ4ExpertProjection::Down => (
+                self.spec.hidden_size.min(output_width).max(1),
+                self.spec.intermediate_size.min(input_len).max(1),
+            ),
+        };
+        let groups_per_row = cols.div_ceil(self.spec.layout.group_size).max(1);
+        let needed_groups = rows.checked_mul(groups_per_row)?;
+        let needed_packed = rows.checked_mul(cols.div_ceil(2))?;
+        let decoded = self.decoded.as_ref();
+        let (packed, scale_bytes, bias_bytes, scales, biases, source) = match projection {
+            FixedQ4ExpertProjection::Gate => (
+                self.component(QwenMoeExpertComponentKind::GateWeight),
+                self.component(QwenMoeExpertComponentKind::GateScale),
+                self.component(QwenMoeExpertComponentKind::GateBias),
+                decoded
+                    .map(|decoded| decoded.gate_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.gate_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::GateWeight,
+                    QwenMoeExpertComponentKind::GateScale,
+                    QwenMoeExpertComponentKind::GateBias,
+                ),
+            ),
+            FixedQ4ExpertProjection::Up => (
+                self.component(QwenMoeExpertComponentKind::UpWeight),
+                self.component(QwenMoeExpertComponentKind::UpScale),
+                self.component(QwenMoeExpertComponentKind::UpBias),
+                decoded
+                    .map(|decoded| decoded.up_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.up_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::UpWeight,
+                    QwenMoeExpertComponentKind::UpScale,
+                    QwenMoeExpertComponentKind::UpBias,
+                ),
+            ),
+            FixedQ4ExpertProjection::Down => (
+                self.component(QwenMoeExpertComponentKind::DownWeight),
+                self.component(QwenMoeExpertComponentKind::DownScale),
+                self.component(QwenMoeExpertComponentKind::DownBias),
+                decoded
+                    .map(|decoded| decoded.down_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.down_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::DownWeight,
+                    QwenMoeExpertComponentKind::DownScale,
+                    QwenMoeExpertComponentKind::DownBias,
+                ),
+            ),
+        };
+        if packed.len() < needed_packed
+            || scale_bytes.len() < needed_groups * 2
+            || bias_bytes.len() < needed_groups * 2
+            || (!scales.is_empty() && scales.len() < needed_groups)
+            || (!biases.is_empty() && biases.len() < needed_groups)
+        {
+            return None;
+        }
+        Some(Q4MatvecPayload {
+            rows,
+            cols,
+            group_size: self.spec.layout.group_size,
+            packed: &packed[..needed_packed],
+            scales: if scales.is_empty() {
+                &[]
+            } else {
+                &scales[..needed_groups]
+            },
+            biases: if biases.is_empty() {
+                &[]
+            } else {
+                &biases[..needed_groups]
+            },
+            scale_bias_groups: needed_groups,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16,
+            scale_bytes: &scale_bytes[..needed_groups * 2],
+            bias_bytes: &bias_bytes[..needed_groups * 2],
+            source: Some(source),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FixedQ4ExpertPayloadDecoded {
+    gate_scales: Vec<f32>,
+    gate_biases: Vec<f32>,
+    up_scales: Vec<f32>,
+    up_biases: Vec<f32>,
+    down_scales: Vec<f32>,
+    down_biases: Vec<f32>,
+}
+
+impl FixedQ4ExpertPayloadDecoded {
+    fn from_slot(view: &FixedQ4ExpertSlotView<'_>, spec: FixedQ4ExpertSlotSpec) -> Result<Self> {
+        Ok(Self {
+            gate_scales: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::GateScale,
+            )?,
+            gate_biases: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::GateBias,
+            )?,
+            up_scales: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpScale)?,
+            up_biases: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpBias)?,
+            down_scales: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::DownScale,
+            )?,
+            down_biases: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::DownBias,
+            )?,
+        })
+        .and_then(|decoded| {
+            let groups_per_gate_row = spec.hidden_size.div_ceil(spec.layout.group_size);
+            let groups_per_down_row = spec.intermediate_size.div_ceil(spec.layout.group_size);
+            let gate_groups = spec.intermediate_size * groups_per_gate_row;
+            let down_groups = spec.hidden_size * groups_per_down_row;
+            if decoded.gate_scales.len() < gate_groups
+                || decoded.gate_biases.len() < gate_groups
+                || decoded.up_scales.len() < gate_groups
+                || decoded.up_biases.len() < gate_groups
+                || decoded.down_scales.len() < down_groups
+                || decoded.down_biases.len() < down_groups
+            {
+                bail!("fixed Q4 expert scale/bias payload is shorter than model layout requires");
+            }
+            Ok(decoded)
+        })
+    }
+}
+
+fn decode_fixed_q4_bf16_component(
+    view: &FixedQ4ExpertSlotView<'_>,
+    kind: QwenMoeExpertComponentKind,
+) -> Result<Vec<f32>> {
+    decode_fixed_q4_bf16_component_bytes(view.component(kind))
+}
+
+fn decode_fixed_q4_bf16_component_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    let mut cursor = 0;
+    read_bf16_vec_le(bytes, &mut cursor, bytes.len() / 2)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedQ4ExpertProjection {
+    Gate,
+    Up,
+    Down,
+}
+
+impl FixedQ4ExpertProjection {
+    fn scale_bias_kinds(self) -> (QwenMoeExpertComponentKind, QwenMoeExpertComponentKind) {
+        match self {
+            FixedQ4ExpertProjection::Gate => (
+                QwenMoeExpertComponentKind::GateScale,
+                QwenMoeExpertComponentKind::GateBias,
+            ),
+            FixedQ4ExpertProjection::Up => (
+                QwenMoeExpertComponentKind::UpScale,
+                QwenMoeExpertComponentKind::UpBias,
+            ),
+            FixedQ4ExpertProjection::Down => (
+                QwenMoeExpertComponentKind::DownScale,
+                QwenMoeExpertComponentKind::DownBias,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpertWeights {
     pub layer: usize,
@@ -15531,6 +19178,7 @@ pub struct ExpertWeights {
     pub slot: ExpertSlotDescriptor,
     pub packed: Vec<u8>,
     pub records: Vec<PackedExpertTensor>,
+    fixed_q4: Option<FixedQ4ExpertPayload>,
 }
 
 impl AsRef<ExpertWeights> for ExpertWeights {
@@ -15552,6 +19200,13 @@ impl ExpertWeights {
     }
 
     fn project(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
+        if let Some(fixed_q4) = &self.fixed_q4
+            && fixed_q4
+                .matvec_payload(FixedQ4ExpertProjection::Down, hidden.len(), width)
+                .is_some()
+        {
+            return fixed_q4.project_cpu(FixedQ4ExpertProjection::Down, hidden, width);
+        }
         if !self.records.is_empty() {
             let mut out = vec![0.0f32; width];
             let mut used = 0usize;
@@ -15611,9 +19266,57 @@ impl ExpertWeights {
     }
 
     fn mlp(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
+        if let Some(fixed_q4) = &self.fixed_q4 {
+            return self.fixed_q4_mlp(fixed_q4, hidden, width);
+        }
         self.mlp_with_projector(hidden, width, |tensor, input, output_width| {
             self.project_record(tensor, input, output_width)
         })
+    }
+
+    fn fixed_q4_mlp(
+        &self,
+        fixed_q4: &FixedQ4ExpertPayload,
+        hidden: &[f32],
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let gate = fixed_q4
+            .project_cpu(
+                FixedQ4ExpertProjection::Gate,
+                hidden,
+                fixed_q4.spec.intermediate_size,
+            )
+            .with_context(|| {
+                format!(
+                    "fixed Q4 expert layer {} expert {} has no compatible gate projection",
+                    self.layer, self.expert
+                )
+            })?;
+        let up = fixed_q4
+            .project_cpu(
+                FixedQ4ExpertProjection::Up,
+                hidden,
+                fixed_q4.spec.intermediate_size,
+            )
+            .with_context(|| {
+                format!(
+                    "fixed Q4 expert layer {} expert {} has no compatible up projection",
+                    self.layer, self.expert
+                )
+            })?;
+        let intermediate: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect();
+        fixed_q4
+            .project_cpu(FixedQ4ExpertProjection::Down, &intermediate, width)
+            .with_context(|| {
+                format!(
+                    "fixed Q4 expert layer {} expert {} has no compatible down projection",
+                    self.layer, self.expert
+                )
+            })
     }
 
     fn mlp_with_projector<F>(
@@ -15713,6 +19416,16 @@ impl ExpertWeights {
         allow(dead_code)
     )]
     fn primary_matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
+        if let Some(fixed_q4) = &self.fixed_q4 {
+            return [
+                FixedQ4ExpertProjection::Gate,
+                FixedQ4ExpertProjection::Up,
+                FixedQ4ExpertProjection::Down,
+            ]
+            .into_iter()
+            .filter_map(|projection| fixed_q4.matvec_payload(projection, hidden.len(), width))
+            .max_by_key(|payload| payload.rows.saturating_mul(payload.cols));
+        }
         self.records
             .iter()
             .filter_map(|record| record.matvec_payload(hidden, width))
@@ -15725,6 +19438,8 @@ pub struct PackedExpertTensor {
     pub name: String,
     pub dtype: String,
     pub shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    source_hash: Option<String>,
     pub group_size: usize,
     pub scale_bias_dtype: String,
     pub packed: Vec<u8>,
@@ -15735,6 +19450,10 @@ pub struct PackedExpertTensor {
 }
 
 impl PackedExpertTensor {
+    fn source_offsets(&self) -> [u64; 2] {
+        self.source_offsets
+    }
+
     fn matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
         if hidden.is_empty() || width == 0 || self.packed.is_empty() || self.group_size == 0 {
             return None;
@@ -15759,9 +19478,11 @@ impl PackedExpertTensor {
             packed: &self.packed[..needed_packed],
             scales: &self.scales[..needed_groups],
             biases: &self.biases[..needed_groups],
+            scale_bias_groups: needed_groups,
             scale_bias_dtype: self.scale_bias_dtype.as_str(),
             scale_bytes: &self.scale_bytes,
             bias_bytes: &self.bias_bytes,
+            source: None,
         })
     }
 }
@@ -15774,13 +19495,60 @@ struct Q4MatvecPayload<'a> {
     packed: &'a [u8],
     scales: &'a [f32],
     biases: &'a [f32],
+    scale_bias_groups: usize,
     scale_bias_dtype: &'a str,
     scale_bytes: &'a [u8],
     bias_bytes: &'a [u8],
+    source: Option<Q4MatvecSource<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Q4MatvecSource<'a> {
+    bytes: &'a [u8],
+    packed_offset: usize,
+    scale_offset: usize,
+    bias_offset: usize,
+}
+
+impl<'a> Q4MatvecSource<'a> {
+    fn same_buffer(self, other: Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
+    }
+
+    fn covers(self, payload: &Q4MatvecPayload<'_>) -> bool {
+        self.packed_offset
+            .checked_add(payload.packed.len())
+            .is_some_and(|end| end <= self.bytes.len())
+            && self
+                .scale_offset
+                .checked_add(payload.scale_bytes.len())
+                .is_some_and(|end| end <= self.bytes.len())
+            && self
+                .bias_offset
+                .checked_add(payload.bias_bytes.len())
+                .is_some_and(|end| end <= self.bytes.len())
+    }
+
+    fn offsets_are_metal_aligned(self) -> bool {
+        self.packed_offset % 4 == 0 && self.scale_offset % 4 == 0 && self.bias_offset % 4 == 0
+    }
 }
 
 #[derive(Debug, Clone)]
-struct ExpertPhaseMlpPayload<'a> {
+enum ExpertPhaseMlpPayload<'a> {
+    Q4(Q4ExpertPhaseMlpPayload<'a>),
+}
+
+impl<'a> ExpertPhaseMlpPayload<'a> {
+    fn q4(&self) -> &Q4ExpertPhaseMlpPayload<'a> {
+        match self {
+            Self::Q4(payload) => payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Q4ExpertPhaseMlpPayload<'a> {
     gate: Q4MatvecPayload<'a>,
     up: Q4MatvecPayload<'a>,
     down: Q4MatvecPayload<'a>,
@@ -15790,6 +19558,30 @@ fn expert_phase_mlp_payload<'a>(
     expert: &'a ExpertWeights,
     width: usize,
 ) -> Option<ExpertPhaseMlpPayload<'a>> {
+    if let Some(fixed_q4) = &expert.fixed_q4 {
+        let gate = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Gate,
+            width,
+            fixed_q4.spec.intermediate_size,
+        )?;
+        let up = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Up,
+            width,
+            fixed_q4.spec.intermediate_size,
+        )?;
+        if gate.rows != up.rows {
+            return None;
+        }
+        let down = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)?;
+        if down.cols != gate.rows {
+            return None;
+        }
+        return Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
+            gate,
+            up,
+            down,
+        }));
+    }
     let gate_tensor = expert.record_suffix("gate_proj.weight")?;
     let up_tensor = expert.record_suffix("up_proj.weight")?;
     let down_tensor = expert.record_suffix("down_proj.weight")?;
@@ -15810,7 +19602,11 @@ fn expert_phase_mlp_payload<'a>(
     if down.cols != gate.rows {
         return None;
     }
-    Some(ExpertPhaseMlpPayload { gate, up, down })
+    Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
+        gate,
+        up,
+        down,
+    }))
 }
 
 fn fold_rows_to_width(rows: &[f32], width: usize) -> Vec<f32> {
@@ -16170,6 +19966,123 @@ fn read_expert_layer_pack_metadata(
     Ok(Some(metadata))
 }
 
+fn ensure_fixed_q4_expert_cache(plan: &FlashMoePlan, layout: &QwenMoeModelLayout) -> Result<usize> {
+    let spec = FixedQ4ExpertSlotSpec {
+        layout: layout.q4_expert_layout,
+        hidden_size: layout.hidden_size,
+        intermediate_size: layout.moe_intermediate_size,
+    };
+    spec.layout.validate()?;
+    let mut rewritten = 0usize;
+    for layer in 0..layout.layers {
+        if rewrite_pbq4_layer_to_fixed_q4(&plan.experts_dir, layer, layout.experts_per_layer, spec)
+            .with_context(|| format!("failed to upgrade layer {layer} expert cache to fixed Q4"))?
+        {
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
+}
+
+fn rewrite_pbq4_layer_to_fixed_q4(
+    root: &Path,
+    layer: usize,
+    experts: usize,
+    spec: FixedQ4ExpertSlotSpec,
+) -> Result<bool> {
+    let Some(old_metadata) = read_expert_layer_pack_metadata(root, layer)? else {
+        return Ok(false);
+    };
+    if old_metadata.format == FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+        && old_metadata.expert_size == spec.layout.expert_bytes as u64
+    {
+        return Ok(false);
+    }
+    if old_metadata.experts < experts || old_metadata.expert_size == 0 {
+        return Ok(false);
+    }
+    let layer_path = expert_layer_path(root, layer);
+    let old_file = match fs::File::open(&layer_path) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    if !pbq4_layer_looks_fixed_q4_compatible(&old_file, &old_metadata, spec)? {
+        return Ok(false);
+    }
+
+    let temp_path = temp_pack_path(&layer_path);
+    let out = fs::File::create(&temp_path).with_context(|| {
+        format!(
+            "failed to create temporary fixed Q4 expert layer {}",
+            temp_path.display()
+        )
+    })?;
+    let fixed_slot_size = spec.layout.expert_bytes as u64;
+    out.set_len(
+        (experts as u64)
+            .checked_mul(fixed_slot_size)
+            .context("fixed Q4 expert layer file size overflow")?,
+    )
+    .with_context(|| format!("failed to preallocate {}", temp_path.display()))?;
+
+    let mut packs = Vec::with_capacity(experts);
+    for expert in 0..experts {
+        let metadata = old_metadata
+            .pack_for(expert)
+            .cloned()
+            .with_context(|| format!("expert layer {layer} has no metadata for expert {expert}"))?;
+        let bytes = read_layer_slot_bytes(&layer_path, &old_metadata, expert, &metadata)?;
+        if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
+            bail!("expert layer {layer} expert {expert} is already not PBQ4");
+        }
+        let records = parse_pbq4_expert_pack(&bytes, Some(&metadata))?;
+        let (fixed_bytes, fixed_metadata) =
+            fixed_q4_pack_from_pbq4_records(layer, expert, spec, &records)?;
+        write_all_at_positioned(
+            &out,
+            &fixed_bytes,
+            expert_slot_offset(expert, fixed_slot_size)?,
+        )
+        .with_context(|| {
+            format!(
+                "failed to write fixed Q4 layer {layer} expert {expert} into {}",
+                temp_path.display()
+            )
+        })?;
+        packs.push(fixed_metadata);
+    }
+
+    finish_expert_pack_atomically(out, &temp_path, &layer_path)?;
+    let metadata = ExpertLayerPackMetadata::new_fixed_q4(layer, fixed_slot_size, experts, packs);
+    write_expert_metadata_atomically(root, layer, &metadata)?;
+    Ok(true)
+}
+
+fn pbq4_layer_looks_fixed_q4_compatible(
+    file: &fs::File,
+    metadata: &ExpertLayerPackMetadata,
+    spec: FixedQ4ExpertSlotSpec,
+) -> Result<bool> {
+    let Some(first) = metadata.packs.first() else {
+        return Ok(false);
+    };
+    if first.packed_bytes > metadata.expert_size {
+        return Ok(false);
+    }
+    let offset = expert_slot_offset(first.expert, metadata.expert_size)?;
+    let mut bytes = vec![
+        0u8;
+        usize::try_from(first.packed_bytes)
+            .context("expert pack length does not fit usize")?
+    ];
+    read_exact_at_positioned(file, &mut bytes, offset)?;
+    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
+        return Ok(false);
+    }
+    let records = parse_pbq4_expert_pack(&bytes, Some(first))?;
+    Ok(fixed_q4_pack_from_pbq4_records(metadata.layer, first.expert, spec, &records).is_ok())
+}
+
 fn read_exact_at_positioned(file: &fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
     #[cfg(unix)]
     {
@@ -16251,6 +20164,281 @@ fn validate_expert_pack_metadata(
         );
     }
     Ok(())
+}
+
+fn fixed_q4_expert_records(
+    view: &FixedQ4ExpertSlotView<'_>,
+    spec: FixedQ4ExpertSlotSpec,
+) -> Result<Vec<PackedExpertTensor>> {
+    let descriptor = view.descriptor();
+    Ok(vec![
+        fixed_q4_expert_record(
+            view,
+            spec,
+            QwenMoeExpertComponentKind::GateWeight,
+            QwenMoeExpertComponentKind::GateScale,
+            QwenMoeExpertComponentKind::GateBias,
+            "gate_proj",
+            vec![spec.intermediate_size, spec.hidden_size],
+            descriptor.layer,
+            descriptor.expert,
+        )?,
+        fixed_q4_expert_record(
+            view,
+            spec,
+            QwenMoeExpertComponentKind::UpWeight,
+            QwenMoeExpertComponentKind::UpScale,
+            QwenMoeExpertComponentKind::UpBias,
+            "up_proj",
+            vec![spec.intermediate_size, spec.hidden_size],
+            descriptor.layer,
+            descriptor.expert,
+        )?,
+        fixed_q4_expert_record(
+            view,
+            spec,
+            QwenMoeExpertComponentKind::DownWeight,
+            QwenMoeExpertComponentKind::DownScale,
+            QwenMoeExpertComponentKind::DownBias,
+            "down_proj",
+            vec![spec.hidden_size, spec.intermediate_size],
+            descriptor.layer,
+            descriptor.expert,
+        )?,
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_q4_expert_record(
+    view: &FixedQ4ExpertSlotView<'_>,
+    spec: FixedQ4ExpertSlotSpec,
+    packed_kind: QwenMoeExpertComponentKind,
+    scale_kind: QwenMoeExpertComponentKind,
+    bias_kind: QwenMoeExpertComponentKind,
+    projection: &str,
+    shape: Vec<usize>,
+    layer: usize,
+    expert: usize,
+) -> Result<PackedExpertTensor> {
+    let scale_bytes = view.component(scale_kind).to_vec();
+    let bias_bytes = view.component(bias_kind).to_vec();
+    let mut scale_cursor = 0;
+    let scales = read_bf16_vec_le(&scale_bytes, &mut scale_cursor, scale_bytes.len() / 2)
+        .with_context(|| format!("failed to decode fixed Q4 {projection} scales"))?;
+    let mut bias_cursor = 0;
+    let biases = read_bf16_vec_le(&bias_bytes, &mut bias_cursor, bias_bytes.len() / 2)
+        .with_context(|| format!("failed to decode fixed Q4 {projection} biases"))?;
+    Ok(PackedExpertTensor {
+        name: format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"),
+        dtype: "q4".to_string(),
+        shape,
+        source_offsets: [0, 0],
+        source_hash: None,
+        group_size: spec.layout.group_size,
+        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        packed: view.component(packed_kind).to_vec(),
+        scales,
+        biases,
+        scale_bytes,
+        bias_bytes,
+    })
+}
+
+fn fixed_q4_payload_from_pbq4_records(
+    layer: usize,
+    expert: usize,
+    spec: FixedQ4ExpertSlotSpec,
+    records: &[PackedExpertTensor],
+    recycle_pool: Option<ReusableExpertBytePool>,
+) -> Result<FixedQ4ExpertPayload> {
+    let (bytes, _) = fixed_q4_pack_from_pbq4_records(layer, expert, spec, records)?;
+    Ok(FixedQ4ExpertPayload {
+        spec,
+        bytes,
+        decoded: None,
+        recycle_pool,
+    })
+}
+
+fn fixed_q4_pack_from_pbq4_records(
+    layer: usize,
+    expert: usize,
+    spec: FixedQ4ExpertSlotSpec,
+    records: &[PackedExpertTensor],
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    spec.layout.validate()?;
+    let gate = pbq4_record_by_suffix(records, "gate_proj.weight")?;
+    let up = pbq4_record_by_suffix(records, "up_proj.weight")?;
+    let down = pbq4_record_by_suffix(records, "down_proj.weight")?;
+
+    let mut bytes = vec![0u8; spec.layout.expert_bytes];
+    let mut metadata_records = Vec::with_capacity(3);
+    copy_pbq4_record_to_fixed_q4_component(
+        &mut bytes,
+        &mut metadata_records,
+        spec,
+        gate,
+        &[spec.intermediate_size, spec.hidden_size],
+        QwenMoeExpertComponentKind::GateWeight,
+        QwenMoeExpertComponentKind::GateScale,
+        QwenMoeExpertComponentKind::GateBias,
+    )?;
+    copy_pbq4_record_to_fixed_q4_component(
+        &mut bytes,
+        &mut metadata_records,
+        spec,
+        up,
+        &[spec.intermediate_size, spec.hidden_size],
+        QwenMoeExpertComponentKind::UpWeight,
+        QwenMoeExpertComponentKind::UpScale,
+        QwenMoeExpertComponentKind::UpBias,
+    )?;
+    copy_pbq4_record_to_fixed_q4_component(
+        &mut bytes,
+        &mut metadata_records,
+        spec,
+        down,
+        &[spec.hidden_size, spec.intermediate_size],
+        QwenMoeExpertComponentKind::DownWeight,
+        QwenMoeExpertComponentKind::DownScale,
+        QwenMoeExpertComponentKind::DownBias,
+    )?;
+
+    let slot = ExpertSlotView::new(layer, expert, 0, spec.layout.expert_bytes, &bytes)?;
+    FixedQ4ExpertSlotView::new(slot, spec.layout)?;
+    Ok((
+        bytes,
+        ExpertPackMetadata {
+            layer,
+            expert,
+            packed_bytes: spec.layout.expert_bytes as u64,
+            records: metadata_records,
+        },
+    ))
+}
+
+fn pbq4_record_by_suffix<'a>(
+    records: &'a [PackedExpertTensor],
+    suffix: &str,
+) -> Result<&'a PackedExpertTensor> {
+    let matches: Vec<&PackedExpertTensor> = records
+        .iter()
+        .filter(|record| record.name.ends_with(suffix))
+        .collect();
+    match matches.as_slice() {
+        [record] => Ok(*record),
+        [] => bail!("PBQ4 expert pack is missing {suffix}"),
+        _ => bail!("PBQ4 expert pack has duplicate {suffix} records"),
+    }
+}
+
+fn copy_pbq4_record_to_fixed_q4_component(
+    out: &mut [u8],
+    metadata_records: &mut Vec<ExpertPackRecord>,
+    spec: FixedQ4ExpertSlotSpec,
+    record: &PackedExpertTensor,
+    expected_shape: &[usize],
+    weight_kind: QwenMoeExpertComponentKind,
+    scale_kind: QwenMoeExpertComponentKind,
+    bias_kind: QwenMoeExpertComponentKind,
+) -> Result<()> {
+    if record.shape != expected_shape {
+        bail!(
+            "PBQ4 expert tensor {} has shape {:?}; expected {:?}",
+            record.name,
+            record.shape,
+            expected_shape
+        );
+    }
+    if record.group_size != spec.layout.group_size {
+        bail!(
+            "PBQ4 expert tensor {} has group size {}; expected {}",
+            record.name,
+            record.group_size,
+            spec.layout.group_size
+        );
+    }
+
+    let weight = spec.layout.component(weight_kind);
+    let scale = spec.layout.component(scale_kind);
+    let bias = spec.layout.component(bias_kind);
+    if record.packed.len() != weight.bytes {
+        bail!(
+            "PBQ4 expert tensor {} packed bytes {}; expected {}",
+            record.name,
+            record.packed.len(),
+            weight.bytes
+        );
+    }
+    out[weight.offset..weight.offset + weight.bytes].copy_from_slice(&record.packed);
+
+    let scale_bytes = fixed_q4_bf16_scale_bias_bytes(record, true, scale.bytes)?;
+    let bias_bytes = fixed_q4_bf16_scale_bias_bytes(record, false, bias.bytes)?;
+    out[scale.offset..scale.offset + scale.bytes].copy_from_slice(&scale_bytes);
+    out[bias.offset..bias.offset + bias.bytes].copy_from_slice(&bias_bytes);
+    metadata_records.push(ExpertPackRecord {
+        tensor: record.name.clone(),
+        dtype: record.dtype.clone(),
+        shape: record.shape.clone(),
+        source_offsets: record.source_offsets(),
+        source_hash: record.source_hash.clone(),
+        record_offset: weight.offset as u64,
+        packed_bytes: weight.bytes as u64,
+        groups: record.scales.len(),
+        group_size: spec.layout.group_size,
+        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+    });
+    Ok(())
+}
+
+fn fixed_q4_bf16_scale_bias_bytes(
+    record: &PackedExpertTensor,
+    scales: bool,
+    expected_bytes: usize,
+) -> Result<Vec<u8>> {
+    if !expected_bytes.is_multiple_of(2) {
+        bail!(
+            "fixed Q4 component for {} has odd scale/bias byte length {expected_bytes}",
+            record.name
+        );
+    }
+    let values = if scales {
+        &record.scales
+    } else {
+        &record.biases
+    };
+    let raw = if scales {
+        &record.scale_bytes
+    } else {
+        &record.bias_bytes
+    };
+    let groups = expected_bytes / 2;
+    if values.len() != groups {
+        bail!(
+            "PBQ4 expert tensor {} scale/bias groups {}; expected {groups}",
+            record.name,
+            values.len()
+        );
+    }
+    if record
+        .scale_bias_dtype
+        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        || record.scale_bias_dtype.eq_ignore_ascii_case("BFLOAT16")
+    {
+        if raw.len() != expected_bytes {
+            bail!(
+                "PBQ4 expert tensor {} bf16 scale/bias bytes {}; expected {expected_bytes}",
+                record.name,
+                raw.len()
+            );
+        }
+        return Ok(raw.clone());
+    }
+    let mut out = Vec::with_capacity(expected_bytes);
+    for value in values {
+        out.extend_from_slice(&f32_to_bf16_bits(*value).to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn parse_pbq4_expert_pack(
@@ -16352,6 +20540,8 @@ fn parse_pbq4_expert_pack_with_metadata(
             name: meta.tensor.clone(),
             dtype: meta.dtype.clone(),
             shape: meta.shape.clone(),
+            source_offsets: meta.source_offsets,
+            source_hash: meta.source_hash.clone(),
             group_size: meta.group_size,
             scale_bias_dtype: meta.scale_bias_dtype.clone(),
             packed,
@@ -16446,6 +20636,8 @@ fn parse_pbq4_expert_pack_generic(
                 .map(|record| record.dtype.clone())
                 .unwrap_or_else(|| "q4".to_string()),
             shape: meta.map(|record| record.shape.clone()).unwrap_or_default(),
+            source_offsets: meta.map(|record| record.source_offsets).unwrap_or([0, 0]),
+            source_hash: meta.and_then(|record| record.source_hash.clone()),
             group_size: meta.map(|record| record.group_size).unwrap_or(GROUP_SIZE),
             scale_bias_dtype: scale_bias_dtype.to_string(),
             packed,
@@ -16469,6 +20661,18 @@ fn read_expert_scale_bias_vec_le(
         EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => read_bf16_vec_le(bytes, cursor, len),
         other => bail!("unsupported q4 scale/bias dtype {other}"),
     }
+}
+
+fn decode_expert_scale_bias_bytes(bytes: &[u8], len: usize, dtype: &str) -> Result<Vec<f32>> {
+    let mut cursor = 0;
+    let values = read_expert_scale_bias_vec_le(bytes, &mut cursor, len, dtype)?;
+    if cursor != bytes.len() {
+        bail!(
+            "expert scale/bias payload has {} trailing bytes",
+            bytes.len() - cursor
+        );
+    }
+    Ok(values)
 }
 
 fn read_u32_le(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
@@ -16758,6 +20962,18 @@ unsafe fn read_f32_buffer(buffer: ObjcId, len: usize) -> Vec<f32> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_buffer_barrier(encoder: ObjcId) {
+    unsafe {
+        const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
+        msg_send_void1_u64(
+            encoder,
+            sel("memoryBarrierWithScope:"),
+            MTL_BARRIER_SCOPE_BUFFERS,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
     unsafe {
         let grid = MtlSize {
@@ -16785,6 +21001,29 @@ unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
         const Q4_ROWS_PER_THREADGROUP: u64 = 8;
         let grid = MtlSize {
             width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MtlSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+            grid,
+            threadgroup,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_q4_mmap_threadgroups(encoder: ObjcId, rows: u64) {
+    unsafe {
+        const Q4_MMAP_ROWS_PER_THREADGROUP: u64 = 16;
+        let grid = MtlSize {
+            width: rows.div_ceil(Q4_MMAP_ROWS_PER_THREADGROUP).max(1),
             height: 1,
             depth: 1,
         };
@@ -16855,6 +21094,13 @@ fn u64_as_bytes(value: &u64) -> &[u8] {
             (value as *const u64).cast::<u8>(),
             std::mem::size_of::<u64>(),
         )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn u64_as_bytes_slice(values: &[u64]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -17058,6 +21304,15 @@ unsafe fn msg_send_void0(receiver: ObjcId, selector: Sel) {
 unsafe fn msg_send_void1_id(receiver: ObjcId, selector: Sel, arg: ObjcId) {
     unsafe {
         let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void1_u64(receiver: ObjcId, selector: Sel, arg: u64) {
+    unsafe {
+        let f: unsafe extern "C" fn(ObjcId, Sel, u64) =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector, arg);
     }
@@ -17566,9 +21821,10 @@ kernel void q4_mmap_fma_matvec(
     device const uchar* packed = weight_bytes + packed_byte_offset;
     device const float* scales = reinterpret_cast<device const float*>(weight_bytes + scales_byte_offset);
     device const float* biases = reinterpret_cast<device const float*>(weight_bytes + biases_byte_offset);
-    const uint rows_per_threadgroup = 8;
+    const uint rows_per_threadgroup = 16;
     const uint input_cache_len = 4096;
-    uint row = tile * rows_per_threadgroup + simd_group;
+    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint row1 = row0 + 8;
     uint packed_stride = (cols + 1) / 2;
     bool use_input_cache = cols <= input_cache_len;
     threadgroup float input_cache[4096];
@@ -17578,24 +21834,32 @@ kernel void q4_mmap_fma_matvec(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (row >= rows) {
+    if (row0 >= rows) {
         return;
     }
 
-    float acc = 0.0f;
-    uint packed_row = row * packed_stride;
-    uint scale_row = row * groups_per_row;
+    bool row1_valid = row1 < rows;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    uint packed_row0 = row0 * packed_stride;
+    uint packed_row1 = row1 * packed_stride;
+    uint scale_row0 = row0 * groups_per_row;
+    uint scale_row1 = row1 * groups_per_row;
     bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
     if (use_word_path) {
         device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
         uint packed_words_per_row = cols / 8;
-        uint word_row = row * packed_words_per_row;
+        uint word_row0 = row0 * packed_words_per_row;
+        uint word_row1 = row1 * packed_words_per_row;
         for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
-            uint word = packed_words[word_row + packed_word];
+            uint word0 = packed_words[word_row0 + packed_word];
+            uint word1 = row1_valid ? packed_words[word_row1 + packed_word] : 0u;
             uint col0 = packed_word * 8;
             uint group = col0 / group_size;
-            float scale = scales[scale_row + group];
-            float bias = biases[scale_row + group];
+            float scale0 = scales[scale_row0 + group];
+            float bias0 = biases[scale_row0 + group];
+            float scale1 = row1_valid ? scales[scale_row1 + group] : 0.0f;
+            float bias1 = row1_valid ? biases[scale_row1 + group] : 0.0f;
 
             float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
             float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
@@ -17606,38 +21870,58 @@ kernel void q4_mmap_fma_matvec(
             float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
             float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
 
-            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
-            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
-            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
-            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
-            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
-            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
-            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
-            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+            acc0 += fma(float((word0 >>  0) & 0x0f), scale0 * x0, bias0 * x0);
+            acc0 += fma(float((word0 >>  4) & 0x0f), scale0 * x1, bias0 * x1);
+            acc0 += fma(float((word0 >>  8) & 0x0f), scale0 * x2, bias0 * x2);
+            acc0 += fma(float((word0 >> 12) & 0x0f), scale0 * x3, bias0 * x3);
+            acc0 += fma(float((word0 >> 16) & 0x0f), scale0 * x4, bias0 * x4);
+            acc0 += fma(float((word0 >> 20) & 0x0f), scale0 * x5, bias0 * x5);
+            acc0 += fma(float((word0 >> 24) & 0x0f), scale0 * x6, bias0 * x6);
+            acc0 += fma(float((word0 >> 28) & 0x0f), scale0 * x7, bias0 * x7);
+
+            acc1 += fma(float((word1 >>  0) & 0x0f), scale1 * x0, bias1 * x0);
+            acc1 += fma(float((word1 >>  4) & 0x0f), scale1 * x1, bias1 * x1);
+            acc1 += fma(float((word1 >>  8) & 0x0f), scale1 * x2, bias1 * x2);
+            acc1 += fma(float((word1 >> 12) & 0x0f), scale1 * x3, bias1 * x3);
+            acc1 += fma(float((word1 >> 16) & 0x0f), scale1 * x4, bias1 * x4);
+            acc1 += fma(float((word1 >> 20) & 0x0f), scale1 * x5, bias1 * x5);
+            acc1 += fma(float((word1 >> 24) & 0x0f), scale1 * x6, bias1 * x6);
+            acc1 += fma(float((word1 >> 28) & 0x0f), scale1 * x7, bias1 * x7);
         }
     } else {
         for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
-            uchar byte = packed[packed_row + packed_col];
+            uchar byte0 = packed[packed_row0 + packed_col];
+            uchar byte1 = row1_valid ? packed[packed_row1 + packed_col] : uchar(0);
             uint col0 = packed_col * 2;
             float x0 = use_input_cache ? input_cache[col0] : input[col0];
             uint group0 = col0 / group_size;
-            float scale0 = scales[scale_row + group0];
-            float bias0 = biases[scale_row + group0];
-            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+            float scale00 = scales[scale_row0 + group0];
+            float bias00 = biases[scale_row0 + group0];
+            float scale10 = row1_valid ? scales[scale_row1 + group0] : 0.0f;
+            float bias10 = row1_valid ? biases[scale_row1 + group0] : 0.0f;
+            acc0 += fma(float(byte0 & 0x0f), scale00 * x0, bias00 * x0);
+            acc1 += fma(float(byte1 & 0x0f), scale10 * x0, bias10 * x0);
 
             uint col1 = col0 + 1;
             if (col1 < cols) {
                 float x1 = use_input_cache ? input_cache[col1] : input[col1];
                 uint group1 = col1 / group_size;
-                float scale1 = scales[scale_row + group1];
-                float bias1 = biases[scale_row + group1];
-                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+                float scale01 = scales[scale_row0 + group1];
+                float bias01 = biases[scale_row0 + group1];
+                float scale11 = row1_valid ? scales[scale_row1 + group1] : 0.0f;
+                float bias11 = row1_valid ? biases[scale_row1 + group1] : 0.0f;
+                acc0 += fma(float(byte0 >> 4), scale01 * x1, bias01 * x1);
+                acc1 += fma(float(byte1 >> 4), scale11 * x1, bias11 * x1);
             }
         }
     }
-    float sum = simd_sum(acc);
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        output[row] = sum;
+        output[row0] = sum0;
+        if (row1_valid) {
+            output[row1] = sum1;
+        }
     }
 }
 
@@ -17659,9 +21943,10 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
     device const uchar* packed = weight_bytes + packed_byte_offset;
     device const ushort* scales = reinterpret_cast<device const ushort*>(weight_bytes + scales_byte_offset);
     device const ushort* biases = reinterpret_cast<device const ushort*>(weight_bytes + biases_byte_offset);
-    const uint rows_per_threadgroup = 8;
+    const uint rows_per_threadgroup = 16;
     const uint input_cache_len = 4096;
-    uint row = tile * rows_per_threadgroup + simd_group;
+    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint row1 = row0 + 8;
     uint packed_stride = (cols + 1) / 2;
     bool use_input_cache = cols <= input_cache_len;
     threadgroup float input_cache[4096];
@@ -17671,24 +21956,32 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (row >= rows) {
+    if (row0 >= rows) {
         return;
     }
 
-    float acc = 0.0f;
-    uint packed_row = row * packed_stride;
-    uint scale_row = row * groups_per_row;
+    bool row1_valid = row1 < rows;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    uint packed_row0 = row0 * packed_stride;
+    uint packed_row1 = row1 * packed_stride;
+    uint scale_row0 = row0 * groups_per_row;
+    uint scale_row1 = row1 * groups_per_row;
     bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
     if (use_word_path) {
         device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
         uint packed_words_per_row = cols / 8;
-        uint word_row = row * packed_words_per_row;
+        uint word_row0 = row0 * packed_words_per_row;
+        uint word_row1 = row1 * packed_words_per_row;
         for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
-            uint word = packed_words[word_row + packed_word];
+            uint word0 = packed_words[word_row0 + packed_word];
+            uint word1 = row1_valid ? packed_words[word_row1 + packed_word] : 0u;
             uint col0 = packed_word * 8;
             uint group = col0 / group_size;
-            float scale = bf16_to_float(scales[scale_row + group]);
-            float bias = bf16_to_float(biases[scale_row + group]);
+            float scale0 = bf16_to_float(scales[scale_row0 + group]);
+            float bias0 = bf16_to_float(biases[scale_row0 + group]);
+            float scale1 = row1_valid ? bf16_to_float(scales[scale_row1 + group]) : 0.0f;
+            float bias1 = row1_valid ? bf16_to_float(biases[scale_row1 + group]) : 0.0f;
 
             float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
             float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
@@ -17699,6 +21992,114 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
             float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
             float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
 
+            acc0 += fma(float((word0 >>  0) & 0x0f), scale0 * x0, bias0 * x0);
+            acc0 += fma(float((word0 >>  4) & 0x0f), scale0 * x1, bias0 * x1);
+            acc0 += fma(float((word0 >>  8) & 0x0f), scale0 * x2, bias0 * x2);
+            acc0 += fma(float((word0 >> 12) & 0x0f), scale0 * x3, bias0 * x3);
+            acc0 += fma(float((word0 >> 16) & 0x0f), scale0 * x4, bias0 * x4);
+            acc0 += fma(float((word0 >> 20) & 0x0f), scale0 * x5, bias0 * x5);
+            acc0 += fma(float((word0 >> 24) & 0x0f), scale0 * x6, bias0 * x6);
+            acc0 += fma(float((word0 >> 28) & 0x0f), scale0 * x7, bias0 * x7);
+
+            acc1 += fma(float((word1 >>  0) & 0x0f), scale1 * x0, bias1 * x0);
+            acc1 += fma(float((word1 >>  4) & 0x0f), scale1 * x1, bias1 * x1);
+            acc1 += fma(float((word1 >>  8) & 0x0f), scale1 * x2, bias1 * x2);
+            acc1 += fma(float((word1 >> 12) & 0x0f), scale1 * x3, bias1 * x3);
+            acc1 += fma(float((word1 >> 16) & 0x0f), scale1 * x4, bias1 * x4);
+            acc1 += fma(float((word1 >> 20) & 0x0f), scale1 * x5, bias1 * x5);
+            acc1 += fma(float((word1 >> 24) & 0x0f), scale1 * x6, bias1 * x6);
+            acc1 += fma(float((word1 >> 28) & 0x0f), scale1 * x7, bias1 * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte0 = packed[packed_row0 + packed_col];
+            uchar byte1 = row1_valid ? packed[packed_row1 + packed_col] : uchar(0);
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            uint group0 = col0 / group_size;
+            float scale00 = bf16_to_float(scales[scale_row0 + group0]);
+            float bias00 = bf16_to_float(biases[scale_row0 + group0]);
+            float scale10 = row1_valid ? bf16_to_float(scales[scale_row1 + group0]) : 0.0f;
+            float bias10 = row1_valid ? bf16_to_float(biases[scale_row1 + group0]) : 0.0f;
+            acc0 += fma(float(byte0 & 0x0f), scale00 * x0, bias00 * x0);
+            acc1 += fma(float(byte1 & 0x0f), scale10 * x0, bias10 * x0);
+
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                uint group1 = col1 / group_size;
+                float scale01 = bf16_to_float(scales[scale_row0 + group1]);
+                float bias01 = bf16_to_float(biases[scale_row0 + group1]);
+                float scale11 = row1_valid ? bf16_to_float(scales[scale_row1 + group1]) : 0.0f;
+                float bias11 = row1_valid ? bf16_to_float(biases[scale_row1 + group1]) : 0.0f;
+                acc0 += fma(float(byte0 >> 4), scale01 * x1, bias01 * x1);
+                acc1 += fma(float(byte1 >> 4), scale11 * x1, bias11 * x1);
+            }
+        }
+    }
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+    if (simd_lane == 0) {
+        output[row0] = sum0;
+        if (row1_valid) {
+            output[row1] = sum1;
+        }
+    }
+}
+
+inline uint q4_batch_projection_for_row(
+    uint row,
+    device const uint* row_offsets,
+    device const uint* rows,
+    uint projection_count) {
+    for (uint idx = 0; idx < projection_count; idx++) {
+        uint start = row_offsets[idx];
+        uint end = start + rows[idx];
+        if (row >= start && row < end) {
+            return idx;
+        }
+    }
+    return projection_count;
+}
+
+inline float q4_mmap_fma_row_f32(
+    device const uchar* weight_bytes,
+    device const float* input,
+    threadgroup float* input_cache,
+    ulong packed_byte_offset,
+    ulong scales_byte_offset,
+    ulong biases_byte_offset,
+    uint row,
+    uint cols,
+    uint groups_per_row,
+    uint group_size,
+    uint simd_lane) {
+    device const uchar* packed = weight_bytes + packed_byte_offset;
+    device const float* scales = reinterpret_cast<device const float*>(weight_bytes + scales_byte_offset);
+    device const float* biases = reinterpret_cast<device const float*>(weight_bytes + biases_byte_offset);
+    uint packed_stride = (cols + 1) / 2;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
+    float acc = 0.0f;
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = scales[scale_row + group];
+            float bias = biases[scale_row + group];
+            float x0 = input_cache[col0 + 0];
+            float x1 = input_cache[col0 + 1];
+            float x2 = input_cache[col0 + 2];
+            float x3 = input_cache[col0 + 3];
+            float x4 = input_cache[col0 + 4];
+            float x5 = input_cache[col0 + 5];
+            float x6 = input_cache[col0 + 6];
+            float x7 = input_cache[col0 + 7];
             acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
             acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
             acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
@@ -17712,15 +22113,83 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
         for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
             uchar byte = packed[packed_row + packed_col];
             uint col0 = packed_col * 2;
-            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            float x0 = input_cache[col0];
+            uint group0 = col0 / group_size;
+            float scale0 = scales[scale_row + group0];
+            float bias0 = biases[scale_row + group0];
+            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = input_cache[col1];
+                uint group1 = col1 / group_size;
+                float scale1 = scales[scale_row + group1];
+                float bias1 = biases[scale_row + group1];
+                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
+            }
+        }
+    }
+    return simd_sum(acc);
+}
+
+inline float q4_mmap_fma_row_bf16(
+    device const uchar* weight_bytes,
+    device const float* input,
+    threadgroup float* input_cache,
+    ulong packed_byte_offset,
+    ulong scales_byte_offset,
+    ulong biases_byte_offset,
+    uint row,
+    uint cols,
+    uint groups_per_row,
+    uint group_size,
+    uint simd_lane) {
+    device const uchar* packed = weight_bytes + packed_byte_offset;
+    device const ushort* scales = reinterpret_cast<device const ushort*>(weight_bytes + scales_byte_offset);
+    device const ushort* biases = reinterpret_cast<device const ushort*>(weight_bytes + biases_byte_offset);
+    uint packed_stride = (cols + 1) / 2;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
+    float acc = 0.0f;
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = bf16_to_float(scales[scale_row + group]);
+            float bias = bf16_to_float(biases[scale_row + group]);
+            float x0 = input_cache[col0 + 0];
+            float x1 = input_cache[col0 + 1];
+            float x2 = input_cache[col0 + 2];
+            float x3 = input_cache[col0 + 3];
+            float x4 = input_cache[col0 + 4];
+            float x5 = input_cache[col0 + 5];
+            float x6 = input_cache[col0 + 6];
+            float x7 = input_cache[col0 + 7];
+            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
+            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
+            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
+            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
+            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
+            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
+            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
+            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = input_cache[col0];
             uint group0 = col0 / group_size;
             float scale0 = bf16_to_float(scales[scale_row + group0]);
             float bias0 = bf16_to_float(biases[scale_row + group0]);
             acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
-
             uint col1 = col0 + 1;
             if (col1 < cols) {
-                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                float x1 = input_cache[col1];
                 uint group1 = col1 / group_size;
                 float scale1 = bf16_to_float(scales[scale_row + group1]);
                 float bias1 = bf16_to_float(biases[scale_row + group1]);
@@ -17728,9 +22197,114 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
             }
         }
     }
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        output[row] = sum;
+    return simd_sum(acc);
+}
+
+kernel void q4_mmap_fma_matvec_batch(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device const ulong* packed_byte_offsets [[buffer(3)]],
+    device const ulong* scales_byte_offsets [[buffer(4)]],
+    device const ulong* biases_byte_offsets [[buffer(5)]],
+    device const uint* row_offsets [[buffer(6)]],
+    device const uint* rows [[buffer(7)]],
+    device const uint* groups_per_rows [[buffer(8)]],
+    constant uint& projection_count [[buffer(9)]],
+    constant uint& cols [[buffer(10)]],
+    constant uint& group_size [[buffer(11)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 16;
+    const uint input_cache_len = 4096;
+    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint row1 = row0 + 8;
+    threadgroup float input_cache[4096];
+    for (uint col = lid; col < cols && col < input_cache_len; col += 256) {
+        input_cache[col] = input[col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint projection0 = q4_batch_projection_for_row(row0, row_offsets, rows, projection_count);
+    if (projection0 < projection_count) {
+        uint local_row = row0 - row_offsets[projection0];
+        float sum = q4_mmap_fma_row_f32(
+            weight_bytes, input, input_cache,
+            packed_byte_offsets[projection0],
+            scales_byte_offsets[projection0],
+            biases_byte_offsets[projection0],
+            local_row, cols, groups_per_rows[projection0], group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row0] = sum;
+        }
+    }
+    uint projection1 = q4_batch_projection_for_row(row1, row_offsets, rows, projection_count);
+    if (projection1 < projection_count) {
+        uint local_row = row1 - row_offsets[projection1];
+        float sum = q4_mmap_fma_row_f32(
+            weight_bytes, input, input_cache,
+            packed_byte_offsets[projection1],
+            scales_byte_offsets[projection1],
+            biases_byte_offsets[projection1],
+            local_row, cols, groups_per_rows[projection1], group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row1] = sum;
+        }
+    }
+}
+
+kernel void q4_mmap_fma_matvec_batch_bf16_scale_bias(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device const ulong* packed_byte_offsets [[buffer(3)]],
+    device const ulong* scales_byte_offsets [[buffer(4)]],
+    device const ulong* biases_byte_offsets [[buffer(5)]],
+    device const uint* row_offsets [[buffer(6)]],
+    device const uint* rows [[buffer(7)]],
+    device const uint* groups_per_rows [[buffer(8)]],
+    constant uint& projection_count [[buffer(9)]],
+    constant uint& cols [[buffer(10)]],
+    constant uint& group_size [[buffer(11)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 16;
+    const uint input_cache_len = 4096;
+    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint row1 = row0 + 8;
+    threadgroup float input_cache[4096];
+    for (uint col = lid; col < cols && col < input_cache_len; col += 256) {
+        input_cache[col] = input[col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint projection0 = q4_batch_projection_for_row(row0, row_offsets, rows, projection_count);
+    if (projection0 < projection_count) {
+        uint local_row = row0 - row_offsets[projection0];
+        float sum = q4_mmap_fma_row_bf16(
+            weight_bytes, input, input_cache,
+            packed_byte_offsets[projection0],
+            scales_byte_offsets[projection0],
+            biases_byte_offsets[projection0],
+            local_row, cols, groups_per_rows[projection0], group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row0] = sum;
+        }
+    }
+    uint projection1 = q4_batch_projection_for_row(row1, row_offsets, rows, projection_count);
+    if (projection1 < projection_count) {
+        uint local_row = row1 - row_offsets[projection1];
+        float sum = q4_mmap_fma_row_bf16(
+            weight_bytes, input, input_cache,
+            packed_byte_offsets[projection1],
+            scales_byte_offsets[projection1],
+            biases_byte_offsets[projection1],
+            local_row, cols, groups_per_rows[projection1], group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row1] = sum;
+        }
     }
 }
 
@@ -18223,6 +22797,158 @@ kernel void gqa_kv_read_attention(
         acc = fma(w, v, acc);
     }
     output[idx] = acc;
+}
+
+kernel void linear_conv1d_step(
+    device float* conv_state [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const ushort* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& kernel_size [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= conv_dim || kernel_size == 0) {
+        return;
+    }
+    float acc = 0.0f;
+    uint w_base = idx * kernel_size;
+    for (uint k = 0; k + 1 < kernel_size; ++k) {
+        acc = fma(conv_state[k * conv_dim + idx], bf16_to_float(weights[w_base + k]), acc);
+    }
+    float inp = input[idx];
+    acc = fma(inp, bf16_to_float(weights[w_base + kernel_size - 1]), acc);
+    output[idx] = acc / (1.0f + exp(-acc));
+    for (uint k = 0; k + 2 < kernel_size; ++k) {
+        conv_state[k * conv_dim + idx] = conv_state[(k + 1) * conv_dim + idx];
+    }
+    if (kernel_size > 1) {
+        conv_state[(kernel_size - 2) * conv_dim + idx] = inp;
+    }
+}
+
+kernel void linear_rms_norm_qk(
+    device float* q [[buffer(0)]],
+    device float* k [[buffer(1)]],
+    constant uint& key_dim [[buffer(2)]],
+    constant float& inv_scale [[buffer(3)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    uint base = head * key_dim;
+    threadgroup float partial[256];
+    float qval = (tid < key_dim) ? q[base + tid] : 0.0f;
+    partial[tid] = qval * qval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < key_dim; ++i) {
+            sum += partial[i];
+        }
+        partial[0] = rsqrt(sum / float(max(key_dim, 1u)) + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < key_dim) {
+        q[base + tid] = qval * partial[0] * inv_scale * inv_scale;
+    }
+
+    float kval = (tid < key_dim) ? k[base + tid] : 0.0f;
+    partial[tid] = kval * kval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < key_dim; ++i) {
+            sum += partial[i];
+        }
+        partial[0] = rsqrt(sum / float(max(key_dim, 1u)) + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < key_dim) {
+        k[base + tid] = kval * partial[0] * inv_scale;
+    }
+}
+
+kernel void linear_compute_decay_beta(
+    device const float* alpha [[buffer(0)]],
+    device const float* beta [[buffer(1)]],
+    device const float* a_log [[buffer(2)]],
+    device const ushort* dt_bias [[buffer(3)]],
+    device float* g_decay [[buffer(4)]],
+    device float* beta_gate [[buffer(5)]],
+    constant uint& heads [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= heads) {
+        return;
+    }
+    float softplus_value = log(1.0f + exp(alpha[idx] + bf16_to_float(dt_bias[idx])));
+    g_decay[idx] = exp(-exp(a_log[idx]) * softplus_value);
+    beta_gate[idx] = 1.0f / (1.0f + exp(-beta[idx]));
+}
+
+kernel void linear_gated_delta_step(
+    device float* state [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device const float* k [[buffer(2)]],
+    device const float* v [[buffer(3)]],
+    device const float* g_decay [[buffer(4)]],
+    device const float* beta_gate [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& key_dim [[buffer(7)]],
+    constant uint& value_dim [[buffer(8)]],
+    constant uint& k_heads_per_v [[buffer(9)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint vi [[thread_position_in_threadgroup]]) {
+    if (vi >= value_dim || key_dim > 256) {
+        return;
+    }
+    uint key_head = head / max(k_heads_per_v, 1u);
+    uint state_base = head * value_dim * key_dim + vi * key_dim;
+    uint key_base = key_head * key_dim;
+    uint value_base = head * value_dim;
+    float decay = g_decay[head];
+    float beta = beta_gate[head];
+    float kv_mem = 0.0f;
+    for (uint ki = 0; ki < key_dim; ++ki) {
+        float s = state[state_base + ki] * decay;
+        state[state_base + ki] = s;
+        kv_mem = fma(s, k[key_base + ki], kv_mem);
+    }
+    float delta = (v[value_base + vi] - kv_mem) * beta;
+    for (uint ki = 0; ki < key_dim; ++ki) {
+        state[state_base + ki] = fma(k[key_base + ki], delta, state[state_base + ki]);
+    }
+    float out_value = 0.0f;
+    for (uint ki = 0; ki < key_dim; ++ki) {
+        out_value = fma(state[state_base + ki], q[key_base + ki], out_value);
+    }
+    output[value_base + vi] = out_value;
+}
+
+kernel void linear_gated_rms_norm(
+    device const float* values [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const ushort* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& value_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    uint base = head * value_dim;
+    threadgroup float partial[256];
+    float value = (tid < value_dim) ? values[base + tid] : 0.0f;
+    partial[tid] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < value_dim; ++i) {
+            sum += partial[i];
+        }
+        partial[0] = rsqrt(sum / float(max(value_dim, 1u)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < value_dim) {
+        float zval = z[base + tid];
+        float gate = zval / (1.0f + exp(-zval));
+        output[base + tid] = value * partial[0] * gate * bf16_to_float(weight[tid]);
+    }
 }
 "#;
 
@@ -19148,9 +23874,15 @@ fn pack_aggregate_expert_layer(
             down,
             layout,
         )?;
+        let packed_bytes =
+            if fixed_native_q4_aggregate_layout(aggregate_tensors, down, layout)?.is_some() {
+                QwenMoeQ4ExpertLayout::qwen35_a17b().expert_bytes as u64
+            } else {
+                pbq4_expert_pack_wire_size(&records)?
+            };
         expected.push(ExpectedExpertPack {
             expert,
-            packed_bytes: pbq4_expert_pack_wire_size(&records)?,
+            packed_bytes,
             records,
         });
     }
@@ -19451,6 +24183,24 @@ fn aggregate_native_q4_enabled(
     }
 }
 
+fn fixed_native_q4_aggregate_layout(
+    aggregate_tensors: AggregateExpertTensors<'_>,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+) -> Result<Option<QwenMoeQ4ExpertLayout>> {
+    if !aggregate_native_q4_enabled(aggregate_tensors, down)? {
+        return Ok(None);
+    }
+    let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
+    fixed.validate()?;
+    if layout.hidden == HIDDEN_DIM && layout.intermediate == 1024 && fixed.group_size == GROUP_SIZE
+    {
+        Ok(Some(fixed))
+    } else {
+        Ok(None)
+    }
+}
+
 fn build_native_q4_aggregate_expert_pack(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
@@ -19491,6 +24241,9 @@ fn build_native_q4_aggregate_expert_pack(
             layout.down_expert_values,
         )?,
     ];
+    if let Some(fixed) = fixed_native_q4_aggregate_layout(aggregate_tensors, down, layout)? {
+        return build_fixed_native_q4_expert_pack(layer, expert, fixed, inputs);
+    }
     build_native_q4_expert_pack(layer, expert, inputs)
 }
 
@@ -20338,6 +25091,124 @@ fn build_native_q4_expert_pack(
     Ok((packed, metadata))
 }
 
+fn build_fixed_native_q4_expert_pack(
+    layer: usize,
+    expert: usize,
+    fixed: QwenMoeQ4ExpertLayout,
+    inputs: Vec<NativeQ4ExpertRecordInput>,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    if inputs.len() != 3 {
+        bail!("fixed native q4 expert pack requires gate, up, and down inputs");
+    }
+    let [gate, up, down]: [NativeQ4ExpertRecordInput; 3] =
+        inputs
+            .try_into()
+            .map_err(|inputs: Vec<NativeQ4ExpertRecordInput>| {
+                anyhow::anyhow!(
+                    "fixed native q4 expert pack requires 3 inputs, got {}",
+                    inputs.len()
+                )
+            })?;
+    let mut out = vec![0u8; fixed.expert_bytes];
+    let mut records = Vec::with_capacity(3);
+    write_fixed_native_q4_component(
+        &mut out,
+        &mut records,
+        fixed,
+        gate,
+        QwenMoeExpertComponentKind::GateWeight,
+        QwenMoeExpertComponentKind::GateScale,
+        QwenMoeExpertComponentKind::GateBias,
+    )?;
+    write_fixed_native_q4_component(
+        &mut out,
+        &mut records,
+        fixed,
+        up,
+        QwenMoeExpertComponentKind::UpWeight,
+        QwenMoeExpertComponentKind::UpScale,
+        QwenMoeExpertComponentKind::UpBias,
+    )?;
+    write_fixed_native_q4_component(
+        &mut out,
+        &mut records,
+        fixed,
+        down,
+        QwenMoeExpertComponentKind::DownWeight,
+        QwenMoeExpertComponentKind::DownScale,
+        QwenMoeExpertComponentKind::DownBias,
+    )?;
+    let slot = ExpertSlotView::new(layer, expert, 0, fixed.expert_bytes, &out)?;
+    FixedQ4ExpertSlotView::new(slot, fixed)?;
+    let metadata = ExpertPackMetadata {
+        layer,
+        expert,
+        packed_bytes: out.len() as u64,
+        records,
+    };
+    Ok((out, metadata))
+}
+
+fn write_fixed_native_q4_component(
+    out: &mut [u8],
+    records: &mut Vec<ExpertPackRecord>,
+    layout: QwenMoeQ4ExpertLayout,
+    input: NativeQ4ExpertRecordInput,
+    weight_kind: QwenMoeExpertComponentKind,
+    scale_kind: QwenMoeExpertComponentKind,
+    bias_kind: QwenMoeExpertComponentKind,
+) -> Result<()> {
+    let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
+    let scale_bias_len = input
+        .groups
+        .checked_mul(scale_bias_bytes)
+        .context("fixed native q4 expert scale/bias byte length overflow")?;
+    if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len {
+        bail!(
+            "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
+            input.tensor,
+            input.scale_bytes.len(),
+            input.bias_bytes.len(),
+            input.groups,
+            scale_bias_bytes
+        );
+    }
+    let weight = layout.component(weight_kind);
+    let scale = layout.component(scale_kind);
+    let bias = layout.component(bias_kind);
+    if input.packed.len() != weight.bytes
+        || input.scale_bytes.len() != scale.bytes
+        || input.bias_bytes.len() != bias.bytes
+    {
+        bail!(
+            "native q4 expert tensor {} byte lengths packed/scales/biases {}/{}/{} do not match fixed layout {}/{}/{}",
+            input.tensor,
+            input.packed.len(),
+            input.scale_bytes.len(),
+            input.bias_bytes.len(),
+            weight.bytes,
+            scale.bytes,
+            bias.bytes
+        );
+    }
+    out[weight.offset..weight.offset + weight.bytes].copy_from_slice(&input.packed);
+    out[scale.offset..scale.offset + scale.bytes].copy_from_slice(&input.scale_bytes);
+    out[bias.offset..bias.offset + bias.bytes].copy_from_slice(&input.bias_bytes);
+    records.push(ExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        source_hash: input.source_hash,
+        record_offset: weight.offset as u64,
+        packed_bytes: input.packed.len() as u64,
+        groups: input.groups,
+        group_size: layout.group_size,
+        scale_bias_dtype: input.scale_bias_dtype,
+    });
+    Ok(())
+}
+
 fn write_quantized_expert_record<W: Write + Seek>(
     out: &mut W,
     records: &mut Vec<ExpertPackRecord>,
@@ -20533,12 +25404,29 @@ impl ExpertLayerPackMetadata {
         }
     }
 
+    fn new_fixed_q4(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: FIXED_Q4_EXPERT_LAYER_FORMAT_V1.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
     fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
         self.packs.iter().find(|metadata| metadata.expert == expert)
     }
 
     fn validate(&self, path: &Path, layer: usize) -> Result<()> {
-        if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1 && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
+        if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1
+            && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
+            && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
         {
             bail!(
                 "expert metadata {} has unsupported format {}",
@@ -20591,7 +25479,7 @@ impl ExpertLayerPackMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ExpertPackMetadata {
     layer: usize,
     expert: usize,
@@ -20600,7 +25488,7 @@ struct ExpertPackMetadata {
     records: Vec<ExpertPackRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ExpertPackRecord {
     tensor: String,
     dtype: String,
@@ -22126,7 +27014,9 @@ mod tests {
   "torch_dtype": "bfloat16",
   "num_experts": 512,
   "num_experts_per_tok": 10,
-  "moe_intermediate_size": 1536
+  "moe_intermediate_size": 1024,
+  "num_shared_experts": 1,
+  "shared_expert_intermediate_size": 1024
 }"#
                 }
                 Self::Qwen3Moe => {
@@ -22267,6 +27157,7 @@ mod tests {
             },
             packed: pack,
             records,
+            fixed_q4: None,
         };
         assert_eq!(expert.slot.layer, expert.layer);
         assert_eq!(expert.slot.expert, expert.expert);
@@ -22290,6 +27181,845 @@ mod tests {
         let out = expert.mlp(&hidden, 2).unwrap();
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
+    }
+
+    #[test]
+    fn fixed_q4_expert_slot_records_are_derived_from_layout_offsets() {
+        use crate::inference::flashmoe::{ExpertSlotView, QwenMoeExpertComponentLayout};
+        use QwenMoeExpertComponentKind::*;
+        let layout = QwenMoeQ4ExpertLayout {
+            expert_bytes: 45,
+            group_size: 2,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 8,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 12,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 16,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 24,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 28,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 32,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 40,
+                    bytes: 3,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 43,
+                    bytes: 2,
+                },
+            ],
+        };
+        let mut payload: Vec<u8> = (0..45).collect();
+        payload[8..12].copy_from_slice(
+            &[
+                f32_to_bf16_bits(0.5).to_le_bytes(),
+                f32_to_bf16_bits(1.5).to_le_bytes(),
+            ]
+            .concat(),
+        );
+        payload[12..16].copy_from_slice(
+            &[
+                f32_to_bf16_bits(-1.0).to_le_bytes(),
+                f32_to_bf16_bits(2.0).to_le_bytes(),
+            ]
+            .concat(),
+        );
+        payload[24..28].copy_from_slice(
+            &[
+                f32_to_bf16_bits(3.0).to_le_bytes(),
+                f32_to_bf16_bits(4.0).to_le_bytes(),
+            ]
+            .concat(),
+        );
+        payload[28..32].copy_from_slice(
+            &[
+                f32_to_bf16_bits(5.0).to_le_bytes(),
+                f32_to_bf16_bits(6.0).to_le_bytes(),
+            ]
+            .concat(),
+        );
+
+        let slot = ExpertSlotView::new(2, 9, 128, 45, &payload).unwrap();
+        let view = FixedQ4ExpertSlotView::new(slot, layout).unwrap();
+        let records = fixed_q4_expert_records(
+            &view,
+            FixedQ4ExpertSlotSpec {
+                layout,
+                hidden_size: 2,
+                intermediate_size: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[0].name,
+            "model.layers.2.mlp.experts.9.gate_proj.weight"
+        );
+        assert_eq!(records[0].shape, vec![2, 2]);
+        assert_eq!(records[0].packed, payload[0..8]);
+        assert_eq!(records[0].scales, vec![0.5, 1.5]);
+        assert_eq!(records[0].biases, vec![-1.0, 2.0]);
+        assert_eq!(records[1].packed, payload[16..24]);
+        assert_eq!(records[1].scales, vec![3.0, 4.0]);
+        assert_eq!(records[1].biases, vec![5.0, 6.0]);
+        assert_eq!(records[2].shape, vec![2, 2]);
+        assert_eq!(records[2].scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+    }
+
+    #[test]
+    fn pbq4_records_are_adapted_to_fixed_q4_payload() {
+        use crate::inference::flashmoe::QwenMoeExpertComponentLayout;
+        use QwenMoeExpertComponentKind::*;
+
+        fn bf16_values(values: &[f32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| f32_to_bf16_bits(*value).to_le_bytes())
+                .collect()
+        }
+
+        fn native_record(
+            name: &str,
+            shape: Vec<usize>,
+            packed: Vec<u8>,
+            scales: Vec<u8>,
+            biases: Vec<u8>,
+            groups: usize,
+        ) -> NativeQ4ExpertRecordInput {
+            NativeQ4ExpertRecordInput {
+                tensor: name.to_string(),
+                dtype: "q4".to_string(),
+                shape,
+                source_offsets: [0, 0],
+                source_hash: Some(format!("hash-{name}")),
+                packed,
+                scale_bytes: scales,
+                bias_bytes: biases,
+                groups,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        }
+
+        let layout = QwenMoeQ4ExpertLayout {
+            expert_bytes: 464,
+            group_size: GROUP_SIZE,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 64,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 68,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 72,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 136,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 140,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 144,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 208,
+                    bytes: 128,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 336,
+                    bytes: 128,
+                },
+            ],
+        };
+        let layer = 5;
+        let expert = 7;
+        let gate_name = format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight");
+        let down_name = format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight");
+        let gate_packed = vec![0x10; 64];
+        let up_packed = vec![0x54; 64];
+        let down_packed = vec![0x98; 64];
+        let gate_scales = bf16_values(&[0.5, 0.25]);
+        let gate_biases = bf16_values(&[1.0, -1.0]);
+        let up_scales = bf16_values(&[0.75, 0.125]);
+        let up_biases = bf16_values(&[0.0, 0.5]);
+        let down_scales = bf16_values(&vec![0.25; 64]);
+        let down_biases = bf16_values(&vec![-0.5; 64]);
+        let (pack, metadata) = build_native_q4_expert_pack(
+            layer,
+            expert,
+            vec![
+                native_record(
+                    &gate_name,
+                    vec![2, 64],
+                    gate_packed.clone(),
+                    gate_scales.clone(),
+                    gate_biases.clone(),
+                    2,
+                ),
+                native_record(
+                    &up_name,
+                    vec![2, 64],
+                    up_packed.clone(),
+                    up_scales.clone(),
+                    up_biases.clone(),
+                    2,
+                ),
+                native_record(
+                    &down_name,
+                    vec![64, 2],
+                    down_packed.clone(),
+                    down_scales.clone(),
+                    down_biases.clone(),
+                    64,
+                ),
+            ],
+        )
+        .unwrap();
+        let records = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+        let spec = FixedQ4ExpertSlotSpec {
+            layout,
+            hidden_size: 64,
+            intermediate_size: 2,
+        };
+        let fixed =
+            fixed_q4_payload_from_pbq4_records(layer, expert, spec, &records, None).unwrap();
+
+        assert!(!fixed.bytes.starts_with(PBQ4_EXPERT_MAGIC));
+        assert_eq!(&fixed.bytes[0..64], gate_packed.as_slice());
+        assert_eq!(&fixed.bytes[64..68], gate_scales.as_slice());
+        assert_eq!(&fixed.bytes[68..72], gate_biases.as_slice());
+        assert_eq!(&fixed.bytes[72..136], up_packed.as_slice());
+        assert_eq!(&fixed.bytes[136..140], up_scales.as_slice());
+        assert_eq!(&fixed.bytes[140..144], up_biases.as_slice());
+        assert_eq!(&fixed.bytes[144..208], down_packed.as_slice());
+        assert_eq!(&fixed.bytes[208..336], down_scales.as_slice());
+        assert_eq!(&fixed.bytes[336..464], down_biases.as_slice());
+
+        let parsed_expert = ExpertWeights {
+            layer,
+            expert,
+            slot: ExpertSlotDescriptor {
+                layer,
+                expert,
+                slot_offset: 0,
+                slot_capacity: metadata.packed_bytes as usize,
+                payload_len: metadata.packed_bytes as usize,
+            },
+            packed: pack,
+            records,
+            fixed_q4: None,
+        };
+        let fixed_expert = ExpertWeights {
+            layer,
+            expert,
+            slot: ExpertSlotDescriptor {
+                layer,
+                expert,
+                slot_offset: 0,
+                slot_capacity: layout.expert_bytes,
+                payload_len: layout.expert_bytes,
+            },
+            packed: Vec::new(),
+            records: Vec::new(),
+            fixed_q4: Some(fixed),
+        };
+        let hidden: Vec<f32> = (0..64).map(|value| value as f32 / 8.0 - 4.0).collect();
+        let parsed = parsed_expert.mlp(&hidden, 64).unwrap();
+        let fixed = fixed_expert.mlp(&hidden, 64).unwrap();
+        for (left, right) in parsed.iter().zip(fixed.iter()) {
+            assert!(
+                (*left - *right).abs() <= 1e-4,
+                "parsed PBQ4 MLP {left} did not match fixed Q4 MLP {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn pbq4_layer_cache_rewrites_to_fixed_q4_slots() {
+        use crate::inference::flashmoe::QwenMoeExpertComponentLayout;
+        use QwenMoeExpertComponentKind::*;
+
+        fn bf16_values(values: &[f32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| f32_to_bf16_bits(*value).to_le_bytes())
+                .collect()
+        }
+
+        fn native_record(
+            name: &str,
+            shape: Vec<usize>,
+            packed: Vec<u8>,
+            scales: Vec<u8>,
+            biases: Vec<u8>,
+            groups: usize,
+        ) -> NativeQ4ExpertRecordInput {
+            NativeQ4ExpertRecordInput {
+                tensor: name.to_string(),
+                dtype: "q4".to_string(),
+                shape,
+                source_offsets: [11, 22],
+                source_hash: Some(format!("hash-{name}")),
+                packed,
+                scale_bytes: scales,
+                bias_bytes: biases,
+                groups,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        }
+
+        let layout = QwenMoeQ4ExpertLayout {
+            expert_bytes: 464,
+            group_size: GROUP_SIZE,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 64,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 68,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 72,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 136,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 140,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 144,
+                    bytes: 64,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 208,
+                    bytes: 128,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 336,
+                    bytes: 128,
+                },
+            ],
+        };
+        let layer = 0;
+        let expert = 0;
+        let gate_name = format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight");
+        let down_name = format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight");
+        let (pack, metadata) = build_native_q4_expert_pack(
+            layer,
+            expert,
+            vec![
+                native_record(
+                    &gate_name,
+                    vec![2, 64],
+                    vec![0x10; 64],
+                    bf16_values(&[0.5, 0.25]),
+                    bf16_values(&[1.0, -1.0]),
+                    2,
+                ),
+                native_record(
+                    &up_name,
+                    vec![2, 64],
+                    vec![0x54; 64],
+                    bf16_values(&[0.75, 0.125]),
+                    bf16_values(&[0.0, 0.5]),
+                    2,
+                ),
+                native_record(
+                    &down_name,
+                    vec![64, 2],
+                    vec![0x98; 64],
+                    bf16_values(&vec![0.25; 64]),
+                    bf16_values(&vec![-0.5; 64]),
+                    64,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_expert_layer(tmp.path(), layer, vec![(expert, pack, metadata)], 1).unwrap();
+        let spec = FixedQ4ExpertSlotSpec {
+            layout,
+            hidden_size: 64,
+            intermediate_size: 2,
+        };
+        assert!(rewrite_pbq4_layer_to_fixed_q4(tmp.path(), layer, 1, spec).unwrap());
+        assert!(!rewrite_pbq4_layer_to_fixed_q4(tmp.path(), layer, 1, spec).unwrap());
+
+        let metadata = read_expert_layer_pack_metadata(tmp.path(), layer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.format, FIXED_Q4_EXPERT_LAYER_FORMAT_V1);
+        assert_eq!(metadata.expert_size, layout.expert_bytes as u64);
+        assert_eq!(metadata.packs[0].packed_bytes, layout.expert_bytes as u64);
+        assert_eq!(metadata.packs[0].records[0].record_offset, 0);
+        assert_eq!(metadata.packs[0].records[1].record_offset, 72);
+        assert_eq!(metadata.packs[0].records[2].record_offset, 144);
+
+        let mut prefix = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
+        let file = fs::File::open(expert_layer_path(tmp.path(), layer)).unwrap();
+        read_exact_at_positioned(&file, &mut prefix, 0).unwrap();
+        assert_ne!(prefix, PBQ4_EXPERT_MAGIC);
+
+        let expert = ExpertStore::open_with_fixed_q4(tmp.path().to_path_buf(), spec)
+            .unwrap()
+            .read_many(layer, &[expert])
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(expert.fixed_q4.is_some());
+        assert!(expert.records.is_empty());
+        assert_eq!(
+            expert.fixed_q4.as_ref().unwrap().bytes.len(),
+            layout.expert_bytes
+        );
+    }
+
+    #[test]
+    fn fixed_q4_expert_phase_payload_borrows_whole_slot_bytes() {
+        use crate::inference::flashmoe::{ExpertSlotView, QwenMoeExpertComponentLayout};
+        use QwenMoeExpertComponentKind::*;
+        let layout = QwenMoeQ4ExpertLayout {
+            expert_bytes: 48,
+            group_size: 2,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 8,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 12,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 16,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 24,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 28,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 32,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 40,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 44,
+                    bytes: 4,
+                },
+            ],
+        };
+        let mut payload: Vec<u8> = (0..48).collect();
+        for range in [8..12, 12..16, 24..28, 28..32, 40..44, 44..48] {
+            payload[range].copy_from_slice(
+                &[
+                    f32_to_bf16_bits(1.0).to_le_bytes(),
+                    f32_to_bf16_bits(0.0).to_le_bytes(),
+                ]
+                .concat(),
+            );
+        }
+        let slot = ExpertSlotView::new(3, 4, 2048, 48, &payload).unwrap();
+        let view = FixedQ4ExpertSlotView::new(slot, layout).unwrap();
+        let spec = FixedQ4ExpertSlotSpec {
+            layout,
+            hidden_size: 2,
+            intermediate_size: 2,
+        };
+        let decoded = FixedQ4ExpertPayloadDecoded::from_slot(&view, spec).unwrap();
+        let expert = ExpertWeights {
+            layer: 3,
+            expert: 4,
+            slot: slot.descriptor(),
+            packed: payload[..payload.len().min(4096)].to_vec(),
+            records: Vec::new(),
+            fixed_q4: Some(FixedQ4ExpertPayload {
+                spec,
+                bytes: payload,
+                decoded: Some(decoded),
+                recycle_pool: None,
+            }),
+        };
+
+        let phase = expert_phase_mlp_payload(&expert, 2).unwrap();
+        let phase = phase.q4();
+        let fixed = expert.fixed_q4.as_ref().unwrap();
+        let base = fixed.bytes.as_ptr() as usize;
+        let end = base + fixed.bytes.len();
+        for component in [phase.gate.packed, phase.up.packed, phase.down.packed] {
+            let ptr = component.as_ptr() as usize;
+            assert!(ptr >= base && ptr < end);
+        }
+        assert_eq!(phase.gate.scale_bytes, &fixed.bytes[8..12]);
+        assert_eq!(phase.up.bias_bytes, &fixed.bytes[28..32]);
+        assert_eq!(phase.down.scale_bytes, &fixed.bytes[40..44]);
+        let gate_source = phase.gate.source.unwrap();
+        let up_source = phase.up.source.unwrap();
+        let down_source = phase.down.source.unwrap();
+        assert!(gate_source.same_buffer(up_source));
+        assert!(gate_source.same_buffer(down_source));
+        assert_eq!(gate_source.packed_offset, 0);
+        assert_eq!(gate_source.scale_offset, 8);
+        assert_eq!(gate_source.bias_offset, 12);
+        assert_eq!(up_source.packed_offset, 16);
+        assert_eq!(up_source.scale_offset, 24);
+        assert_eq!(up_source.bias_offset, 28);
+        assert_eq!(down_source.packed_offset, 32);
+        assert_eq!(down_source.scale_offset, 40);
+        assert_eq!(down_source.bias_offset, 44);
+
+        let lazy_expert = ExpertWeights {
+            layer: 3,
+            expert: 4,
+            slot: expert.slot,
+            packed: fixed.payload_prefix(4096).to_vec(),
+            records: Vec::new(),
+            fixed_q4: Some(FixedQ4ExpertPayload {
+                spec,
+                bytes: fixed.bytes.clone(),
+                decoded: None,
+                recycle_pool: None,
+            }),
+        };
+        let hidden = [0.25, -0.5];
+        let eager_out = expert.mlp(&hidden, 2).unwrap();
+        let lazy_out = lazy_expert.mlp(&hidden, 2).unwrap();
+        for (actual, expected) in lazy_out.iter().zip(eager_out.iter()) {
+            assert_close(*actual, *expected);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_q4_source_buffer_cache_reuses_same_fixed_payload_key() {
+        let first = [1u8; 16];
+        let second = [2u8; 16];
+        let buffer = 0x1000usize as ObjcId;
+        let mut cache = MetalQ4SourceBufferCache::default();
+
+        cache.insert(&first, buffer);
+
+        assert_eq!(cache.get(&first), Some(buffer));
+        assert_eq!(cache.get(&second), None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_fixed_q4_expert_phase_matches_cpu_reference() {
+        use crate::inference::flashmoe::{ExpertSlotView, QwenMoeExpertComponentLayout};
+        use QwenMoeExpertComponentKind::*;
+
+        fn write_component(
+            payload: &mut [u8],
+            layout: QwenMoeQ4ExpertLayout,
+            weight: QwenMoeExpertComponentKind,
+            scale: QwenMoeExpertComponentKind,
+            bias: QwenMoeExpertComponentKind,
+            seed: u8,
+        ) {
+            let weight_component = layout.component(weight);
+            for idx in 0..weight_component.bytes {
+                let lo = ((idx as u8).wrapping_add(seed)) & 0x0f;
+                let hi = ((idx as u8).wrapping_mul(3).wrapping_add(seed + 1)) & 0x0f;
+                payload[weight_component.offset + idx] = lo | (hi << 4);
+            }
+
+            let scale_component = layout.component(scale);
+            let bias_component = layout.component(bias);
+            for group in 0..(scale_component.bytes / 2) {
+                let scale = 0.03125 + (seed as f32) * 0.00390625 + (group as f32) * 0.001953125;
+                let bias = -0.125 + (seed as f32) * 0.0078125 - (group as f32) * 0.0009765625;
+                let offset = group * 2;
+                payload[scale_component.offset + offset..scale_component.offset + offset + 2]
+                    .copy_from_slice(&f32_to_bf16_bits(scale).to_le_bytes());
+                payload[bias_component.offset + offset..bias_component.offset + offset + 2]
+                    .copy_from_slice(&f32_to_bf16_bits(bias).to_le_bytes());
+            }
+        }
+
+        let width = 8;
+        let intermediate = 8;
+        let layout = QwenMoeQ4ExpertLayout {
+            expert_bytes: 192,
+            group_size: 8,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 32,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 32,
+                    bytes: 16,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 48,
+                    bytes: 16,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 64,
+                    bytes: 32,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 96,
+                    bytes: 16,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 112,
+                    bytes: 16,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 128,
+                    bytes: 32,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 160,
+                    bytes: 16,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 176,
+                    bytes: 16,
+                },
+            ],
+        };
+        let spec = FixedQ4ExpertSlotSpec {
+            layout,
+            hidden_size: width,
+            intermediate_size: intermediate,
+        };
+        let mut payload = vec![0u8; layout.expert_bytes];
+        write_component(&mut payload, layout, GateWeight, GateScale, GateBias, 1);
+        write_component(&mut payload, layout, UpWeight, UpScale, UpBias, 5);
+        write_component(&mut payload, layout, DownWeight, DownScale, DownBias, 9);
+        let slot = ExpertSlotView::new(0, 0, 1024, layout.expert_bytes, &payload).unwrap();
+        FixedQ4ExpertSlotView::new(slot, layout).unwrap();
+        let expert = Arc::new(ExpertWeights {
+            layer: 0,
+            expert: 0,
+            slot: slot.descriptor(),
+            packed: payload.clone(),
+            records: Vec::new(),
+            fixed_q4: Some(FixedQ4ExpertPayload {
+                spec,
+                bytes: payload,
+                decoded: None,
+                recycle_pool: None,
+            }),
+        });
+        let experts: Arc<[Arc<ExpertWeights>]> = Arc::from(vec![Arc::clone(&expert)]);
+        let weights = [0.625f32];
+        let normed: Vec<f32> = (0..width)
+            .map(|idx| ((idx as f32) * 0.17).sin() - 0.25)
+            .collect();
+        let residual: Vec<f32> = (0..width)
+            .map(|idx| ((idx as f32) * 0.11).cos() * 0.125)
+            .collect();
+        let expected =
+            compute_expert_phase_cpu(experts.as_ref(), &weights, &normed, &residual, None, None)
+                .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(&plan.non_expert_weights, []).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: Vec::new(),
+            expert_tensors: Vec::new(),
+            dense_tensors: Vec::new(),
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let dense = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen3_moe".to_string()),
+            architectures: Some(vec!["Qwen3MoeForCausalLM".to_string()]),
+            num_hidden_layers: 1,
+            hidden_size: width,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: Some(1_000_000.0),
+            partial_rotary_factor: None,
+            torch_dtype: Some("bfloat16".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(intermediate),
+            intermediate_size: None,
+            max_position_embeddings: Some(16),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &dense)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+        let actual = metal
+            .submit_expert_phase(
+                0,
+                0,
+                Arc::clone(&experts),
+                &weights,
+                &normed,
+                &residual,
+                SharedExpertPhaseRef::None,
+                None,
+            )
+            .unwrap()
+            .expect("fixed q4 expert phase should run on Metal")
+            .wait()
+            .unwrap();
+
+        for (idx, (actual, expected)) in
+            actual.hidden.iter().zip(expected.hidden.iter()).enumerate()
+        {
+            assert!(
+                (*actual - *expected).abs() <= 1e-3,
+                "hidden[{idx}] Metal fixed q4 expert phase {actual} diverged from CPU reference {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_q4_expert_payload_recycles_whole_slot_bytes_to_pool() {
+        let spec = FixedQ4ExpertSlotSpec {
+            layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
+            hidden_size: HIDDEN_DIM,
+            intermediate_size: 1024,
+        };
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let mut bytes = Vec::with_capacity(spec.layout.expert_bytes);
+        bytes.resize(spec.layout.expert_bytes, 0);
+
+        {
+            let _payload = FixedQ4ExpertPayload {
+                spec,
+                bytes,
+                decoded: None,
+                recycle_pool: Some(Arc::clone(&pool)),
+            };
+        }
+
+        assert_eq!(pool.lock().unwrap().len(), 1);
+        let returned = take_reusable_expert_bytes(&pool, spec.layout.expert_bytes).unwrap();
+        assert!(returned.capacity() >= spec.layout.expert_bytes);
+        let mut scratch = ReusableExpertBuffer::default();
+        let previous = scratch.adopt_buffer(returned);
+        assert_eq!(previous.capacity(), 0);
+        assert!(scratch.capacity() >= spec.layout.expert_bytes);
     }
 
     #[test]
@@ -23511,6 +29241,11 @@ mod tests {
             "topk_vocab",
             "gqa_attention_scores",
             "gqa_kv_read_attention",
+            "linear_conv1d_step",
+            "linear_rms_norm_qk",
+            "linear_compute_decay_beta",
+            "linear_gated_delta_step",
+            "linear_gated_rms_norm",
         ] {
             assert!(
                 METAL_SHADERS.contains(&format!("kernel void {kernel}")),
@@ -24736,8 +30471,8 @@ mod tests {
             conv_dim: 28,
             conv_kernel_size: 4,
         };
-        let mut q = vec![1.0, 2.0, -3.0, 4.0, -0.5, 0.25, 1.5, -2.0];
-        let mut k = vec![0.5, -1.5, 2.5, -3.5, 4.0, -2.0, 1.0, 0.5];
+        let mut q = vec![1.0, 2.0, -3.0, 4.0, -1e-6, 2e-6, -3e-6, 4e-6];
+        let mut k = vec![0.5, -1.5, 2.5, -3.5, 4e-6, -2e-6, 1e-6, 0.5e-6];
         let mut expected_q = q.clone();
         let mut expected_k = k.clone();
 
@@ -25148,6 +30883,7 @@ mod tests {
             "model_type": "qwen3_5_moe",
             "text_config": {
                 "dtype": "bfloat16",
+                "head_dim": 256,
                 "hidden_size": 4096,
                 "max_position_embeddings": 262144,
                 "model_type": "qwen3_5_moe_text",
@@ -25185,6 +30921,9 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 60);
         assert_eq!(config.hidden_size, 4096);
         assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.head_dim, Some(256));
+        assert_eq!(config.full_attention_head_dim(), 256);
+        assert_eq!(config.derived_attention_head_dim(), 128);
         assert_eq!(config.num_key_value_heads, Some(2));
         assert_eq!(config.vocab_size, 248320);
         assert_eq!(config.rope_theta, Some(10000000.0));
@@ -26501,6 +32240,105 @@ mod tests {
     }
 
     #[test]
+    fn native_q4_qwen35_expert_pack_uses_fixed_slot_layout() {
+        let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
+        let native_input = |tensor: &str,
+                            shape: Vec<usize>,
+                            weight_kind: QwenMoeExpertComponentKind,
+                            scale_kind: QwenMoeExpertComponentKind,
+                            bias_kind: QwenMoeExpertComponentKind,
+                            packed_byte: u8,
+                            scale_byte: u8,
+                            bias_byte: u8| {
+            NativeQ4ExpertRecordInput {
+                tensor: tensor.to_string(),
+                dtype: "U32".to_string(),
+                shape,
+                source_offsets: [0, 1],
+                source_hash: Some(format!("{tensor}:hash")),
+                packed: vec![packed_byte; fixed.component(weight_kind).bytes],
+                scale_bytes: vec![scale_byte; fixed.component(scale_kind).bytes],
+                bias_bytes: vec![bias_byte; fixed.component(bias_kind).bytes],
+                groups: fixed.component(scale_kind).bytes / 2,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        };
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe_text","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"head_dim":256,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":1024,"shared_expert_intermediate_size":1024}"#,
+        )
+        .unwrap();
+        let layout = AggregateExpertLayout::new(&config).unwrap();
+        let (packed, metadata) = build_fixed_native_q4_expert_pack(
+            0,
+            7,
+            fixed,
+            vec![
+                native_input(
+                    "model.layers.0.mlp.experts.7.gate_proj.weight",
+                    vec![1024, 4096],
+                    QwenMoeExpertComponentKind::GateWeight,
+                    QwenMoeExpertComponentKind::GateScale,
+                    QwenMoeExpertComponentKind::GateBias,
+                    0x11,
+                    0x22,
+                    0x33,
+                ),
+                native_input(
+                    "model.layers.0.mlp.experts.7.up_proj.weight",
+                    vec![1024, 4096],
+                    QwenMoeExpertComponentKind::UpWeight,
+                    QwenMoeExpertComponentKind::UpScale,
+                    QwenMoeExpertComponentKind::UpBias,
+                    0x44,
+                    0x55,
+                    0x66,
+                ),
+                native_input(
+                    "model.layers.0.mlp.experts.7.down_proj.weight",
+                    vec![4096, 1024],
+                    QwenMoeExpertComponentKind::DownWeight,
+                    QwenMoeExpertComponentKind::DownScale,
+                    QwenMoeExpertComponentKind::DownBias,
+                    0x77,
+                    0x88,
+                    0x99,
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(layout.hidden, 4096);
+        assert_eq!(layout.intermediate, 1024);
+        assert_eq!(packed.len(), fixed.expert_bytes);
+        assert!(!packed.starts_with(PBQ4_EXPERT_MAGIC));
+        assert_eq!(metadata.layer, 0);
+        assert_eq!(metadata.expert, 7);
+        assert_eq!(metadata.packed_bytes, fixed.expert_bytes as u64);
+        assert_eq!(metadata.records.len(), 3);
+        assert_eq!(
+            &packed[fixed
+                .component(QwenMoeExpertComponentKind::GateWeight)
+                .offset
+                ..fixed
+                    .component(QwenMoeExpertComponentKind::GateWeight)
+                    .offset
+                    + 4],
+            &[0x11; 4]
+        );
+        assert_eq!(
+            &packed[fixed.component(QwenMoeExpertComponentKind::UpScale).offset
+                ..fixed.component(QwenMoeExpertComponentKind::UpScale).offset + 4],
+            &[0x55; 4]
+        );
+        assert_eq!(
+            &packed[fixed.component(QwenMoeExpertComponentKind::DownBias).offset
+                ..fixed.component(QwenMoeExpertComponentKind::DownBias).offset + 4],
+            &[0x99; 4]
+        );
+    }
+
+    #[test]
     fn aggregate_expert_reuse_rejects_changed_source_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
@@ -26800,7 +32638,7 @@ mod tests {
         let dense_path = tmp.path().join("model_weights.bin");
         let manifest_path = tmp.path().join("model_weights.json");
         let tensor_name = "model.layers.0.self_attn.o_proj.weight";
-        let rows = 3;
+        let rows = 19;
         let cols = 7;
         let values: Vec<f32> = (0..rows * cols)
             .map(|idx| ((idx as f32) * 0.37).sin() * 0.75 - ((idx % cols) as f32) * 0.03125)
@@ -27043,6 +32881,7 @@ mod tests {
             num_hidden_layers: 1,
             hidden_size: cols,
             num_attention_heads: 1,
+            head_dim: None,
             num_key_value_heads: Some(1),
             vocab_size: 32,
             rope_theta: None,
@@ -27102,6 +32941,546 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires a local Metal device"]
+    fn arm_macos_dense_q4_mmap_bf16_scale_bias_matches_cpu_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let tensor_name = "model.layers.0.self_attn.k_proj.weight";
+        let rows = 19;
+        let cols = 16;
+        let group_size = 8;
+        let shape = vec![rows, cols];
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|idx| {
+                let wave = ((idx as f32) * 0.23).sin() * 0.625;
+                let slope = ((idx % cols) as f32 - 7.5) * 0.0275;
+                wave - slope
+            })
+            .collect();
+        let quantized = quantize_q4(&values, &shape, group_size).unwrap();
+        let layout = dense_q4_layout(&shape, group_size).unwrap();
+        let mut scale_bytes = Vec::with_capacity(quantized.scales.len() * 2);
+        let mut bias_bytes = Vec::with_capacity(quantized.biases.len() * 2);
+        let mut bf16_scales = Vec::with_capacity(quantized.scales.len());
+        let mut bf16_biases = Vec::with_capacity(quantized.biases.len());
+        for scale in &quantized.scales {
+            let bits = f32_to_bf16_bits(*scale);
+            scale_bytes.extend_from_slice(&bits.to_le_bytes());
+            bf16_scales.push(f32::from_bits((bits as u32) << 16));
+        }
+        for bias in &quantized.biases {
+            let bits = f32_to_bf16_bits(*bias);
+            bias_bytes.extend_from_slice(&bits.to_le_bytes());
+            bf16_biases.push(f32::from_bits((bits as u32) << 16));
+        }
+        let mut bytes = quantized.values.clone();
+        bytes.extend_from_slice(&scale_bytes);
+        bytes.extend_from_slice(&bias_bytes);
+        fs::write(&plan.non_expert_weights, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: shape.clone(),
+                source_offsets: [0, (values.len() * std::mem::size_of::<f32>()) as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::Q4 {
+                    group_size,
+                    format: DENSE_Q4_FORMAT.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                },
+                q4_sources: None,
+            }],
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: cols,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("float32".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+        let input: Vec<f32> = (0..cols)
+            .map(|idx| ((idx as f32) * 0.17).cos() - 0.125)
+            .collect();
+        let expected = q4_fma_matvec_with_group_size(
+            &quantized.values,
+            &input,
+            &bf16_scales,
+            &bf16_biases,
+            rows,
+            cols,
+            group_size,
+        )
+        .unwrap();
+        let (actual, _timing) = metal
+            .q4_mmap_matvec(
+                0,
+                layout.packed_bytes as u64,
+                (layout.packed_bytes + scale_bytes.len()) as u64,
+                &input,
+                rows,
+                cols,
+                layout.row_packed_bytes,
+                layout.groups_per_row,
+                group_size,
+                EXPERT_SCALE_BIAS_DTYPE_BF16,
+            )
+            .unwrap()
+            .expect("resident dense mmap buffer should be available");
+        for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() < 1e-4,
+                "row {row}: Metal q4 bf16 mmap {actual} diverged from CPU reference {expected}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
+        struct BatchTensor {
+            name: String,
+            shape: Vec<usize>,
+            values: Vec<f32>,
+            quantized: QuantizedQ4,
+            runtime_offset: u64,
+            byte_len: u64,
+        }
+
+        fn make_values(rows: usize, cols: usize, seed: f32) -> Vec<f32> {
+            (0..rows * cols)
+                .map(|idx| {
+                    let wave = ((idx as f32 + seed) * 0.17).sin() * 0.625;
+                    let slope = ((idx % cols) as f32 - 7.5) * 0.025;
+                    wave + slope - seed * 0.03125
+                })
+                .collect()
+        }
+
+        fn append_q4_tensor(
+            bytes: &mut Vec<u8>,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+            values: Vec<f32>,
+        ) -> BatchTensor {
+            let shape = vec![rows, cols];
+            let quantized = quantize_q4(&values, &shape, group_size).unwrap();
+            let layout = dense_q4_layout(&shape, group_size).unwrap();
+            let runtime_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&quantized.values);
+            for scale in &quantized.scales {
+                bytes.extend_from_slice(&scale.to_le_bytes());
+            }
+            for bias in &quantized.biases {
+                bytes.extend_from_slice(&bias.to_le_bytes());
+            }
+            let byte_len = bytes.len() as u64 - runtime_offset;
+            assert_eq!(byte_len as usize, layout.total_bytes);
+            BatchTensor {
+                name: name.to_string(),
+                shape,
+                values,
+                quantized,
+                runtime_offset,
+                byte_len,
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let cols = 16;
+        let group_size = 8;
+        let mut bytes = Vec::new();
+        let tensors = vec![
+            append_q4_tensor(
+                &mut bytes,
+                "model.layers.0.self_attn.q_proj.weight",
+                3,
+                cols,
+                group_size,
+                make_values(3, cols, 1.0),
+            ),
+            append_q4_tensor(
+                &mut bytes,
+                "model.layers.0.self_attn.k_proj.weight",
+                5,
+                cols,
+                group_size,
+                make_values(5, cols, 2.0),
+            ),
+            append_q4_tensor(
+                &mut bytes,
+                "model.layers.0.self_attn.v_proj.weight",
+                2,
+                cols,
+                group_size,
+                make_values(2, cols, 3.0),
+            ),
+        ];
+        fs::write(&plan.non_expert_weights, &bytes).unwrap();
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: tensors
+                .iter()
+                .map(|tensor| DenseTensorRef {
+                    tensor: tensor.name.clone(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: tensor.shape.clone(),
+                    source_offsets: [
+                        tensor.runtime_offset,
+                        tensor.runtime_offset
+                            + (tensor.values.len() * std::mem::size_of::<f32>()) as u64,
+                    ],
+                    runtime_offset: tensor.runtime_offset,
+                    byte_len: tensor.byte_len,
+                    quantization: TensorQuantization::Q4 {
+                        group_size,
+                        format: DENSE_Q4_FORMAT.to_string(),
+                        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                    },
+                    q4_sources: None,
+                })
+                .collect(),
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: cols,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("float32".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+        let input: Vec<f32> = (0..cols)
+            .map(|idx| ((idx as f32) * 0.11).cos() - 0.1875)
+            .collect();
+        let projections: Vec<_> = tensors
+            .iter()
+            .map(|tensor| {
+                store
+                    .dense_q4_mmap_projection(&tensor.name, tensor.shape[0], cols)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let (actual, _timing, dispatches) = metal
+            .q4_mmap_matvec_batch(&projections, &input)
+            .unwrap()
+            .expect("resident dense mmap buffer should be available");
+
+        assert_eq!(dispatches, 1);
+        assert_eq!(actual.len(), tensors.len());
+        for (projection_idx, (actual, tensor)) in actual.iter().zip(tensors.iter()).enumerate() {
+            let expected = q4_fma_matvec_with_group_size(
+                &tensor.quantized.values,
+                &input,
+                &tensor.quantized.scales,
+                &tensor.quantized.biases,
+                tensor.shape[0],
+                cols,
+                group_size,
+            )
+            .unwrap();
+            for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (*actual - *expected).abs() < 1e-4,
+                    "projection {projection_idx} row {row}: Metal q4 batch mmap {actual} diverged from CPU reference {expected}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_post_attention_q4_prep_matches_cpu_reference() {
+        fn q4_bytes(
+            values: &[f32],
+            shape: &[usize],
+            group_size: usize,
+        ) -> (Vec<u8>, DenseQ4Layout, QuantizedQ4) {
+            let quantized = quantize_q4(values, shape, group_size).unwrap();
+            let layout = dense_q4_layout(shape, group_size).unwrap();
+            let mut bytes = quantized.values.clone();
+            for scale in &quantized.scales {
+                bytes.extend_from_slice(&scale.to_le_bytes());
+            }
+            for bias in &quantized.biases {
+                bytes.extend_from_slice(&bias.to_le_bytes());
+            }
+            assert_eq!(bytes.len(), layout.total_bytes);
+            (bytes, layout, quantized)
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let layer = 0;
+        let width = 8;
+        let attention_width = 16;
+        let experts = 6;
+        let group_size = 4;
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let router_name = router_tensor_name(layer);
+        let out_shape = vec![width, attention_width];
+        let router_shape = vec![experts, width];
+        let out_values: Vec<f32> = (0..width * attention_width)
+            .map(|idx| ((idx as f32) * 0.17).sin() * 0.625 - ((idx % 5) as f32) * 0.03125)
+            .collect();
+        let router_values: Vec<f32> = (0..experts * width)
+            .map(|idx| ((idx as f32) * 0.23).cos() * 0.375 + ((idx % 3) as f32) * 0.0625)
+            .collect();
+        let (out_bytes, out_layout, out_quantized) = q4_bytes(&out_values, &out_shape, group_size);
+        let (router_bytes, router_layout, router_quantized) =
+            q4_bytes(&router_values, &router_shape, group_size);
+        let router_offset = out_bytes.len();
+        let mut dense_bytes = out_bytes;
+        dense_bytes.extend_from_slice(&router_bytes);
+        fs::write(&plan.non_expert_weights, &dense_bytes).unwrap();
+
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![
+                DenseTensorRef {
+                    tensor: out_proj_name.clone(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: out_shape.clone(),
+                    source_offsets: [0, (out_values.len() * std::mem::size_of::<f32>()) as u64],
+                    runtime_offset: 0,
+                    byte_len: out_layout.total_bytes as u64,
+                    quantization: TensorQuantization::Q4 {
+                        group_size,
+                        format: DENSE_Q4_FORMAT.to_string(),
+                        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                    },
+                    q4_sources: None,
+                },
+                DenseTensorRef {
+                    tensor: router_name.clone(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: router_shape.clone(),
+                    source_offsets: [
+                        (out_values.len() * std::mem::size_of::<f32>()) as u64,
+                        ((out_values.len() + router_values.len()) * std::mem::size_of::<f32>())
+                            as u64,
+                    ],
+                    runtime_offset: router_offset as u64,
+                    byte_len: router_layout.total_bytes as u64,
+                    quantization: TensorQuantization::Q4 {
+                        group_size,
+                        format: DENSE_Q4_FORMAT.to_string(),
+                        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                    },
+                    q4_sources: None,
+                },
+            ],
+        };
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: width,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("float32".to_string()),
+            num_experts: Some(experts),
+            num_experts_per_tok: Some(3),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
+            .unwrap()
+            .expect("Metal executor should initialize on arm64 macOS");
+
+        let attention_output: Vec<f32> = (0..attention_width)
+            .map(|idx| ((idx as f32) * 0.11).sin() - 0.375)
+            .collect();
+        let residual: Vec<f32> = (0..width)
+            .map(|idx| ((idx as f32) * 0.29).cos() * 0.5)
+            .collect();
+        let post_norm_weight: Vec<f32> = (0..width)
+            .map(|idx| 0.75 + (idx as f32) * 0.03125)
+            .collect();
+
+        let expected_projected = q4_fma_matvec_with_group_size(
+            &out_quantized.values,
+            &attention_output,
+            &out_quantized.scales,
+            &out_quantized.biases,
+            width,
+            attention_width,
+            group_size,
+        )
+        .unwrap();
+        let mut expected_residual = residual.clone();
+        add_in_place(&mut expected_residual, &expected_projected);
+        let mut expected_normed = expected_residual.clone();
+        rms_norm_with_weight_in_place(&mut expected_normed, Some(&post_norm_weight));
+        let expected_router = q4_fma_matvec_with_group_size(
+            &router_quantized.values,
+            &expected_normed,
+            &router_quantized.scales,
+            &router_quantized.biases,
+            experts,
+            width,
+            group_size,
+        )
+        .unwrap();
+        let expected_active = top_k(&expected_router, 3);
+
+        let prep = store
+            .post_attention_q4_prep_with_metal(
+                &metal,
+                layer,
+                experts,
+                &out_proj_name,
+                &attention_output,
+                MetalBatchProjectionInput::Cpu(&residual),
+                &post_norm_weight,
+                3,
+            )
+            .unwrap()
+            .expect("resident q4 post-attention prep should run");
+        assert_eq!(prep.width, width);
+        assert_eq!(prep.active.len(), expected_active.len());
+        for (slot, ((actual_id, actual_score), (expected_id, expected_score))) in
+            prep.active.iter().zip(expected_active.iter()).enumerate()
+        {
+            assert_eq!(
+                actual_id, expected_id,
+                "active expert id at slot {slot} diverged"
+            );
+            assert!(
+                (*actual_score - *expected_score).abs() <= 1e-4,
+                "active expert score at slot {slot} diverged: actual={actual_score}, expected={expected_score}"
+            );
+        }
+
+        unsafe {
+            let residual_ptr = msg_send_ptr0(prep.residual_buffer, sel("contents")).cast::<f32>();
+            let normed_ptr = msg_send_ptr0(prep.normed_buffer, sel("contents")).cast::<f32>();
+            let actual_residual = std::slice::from_raw_parts(residual_ptr, width);
+            let actual_normed = std::slice::from_raw_parts(normed_ptr, width);
+            for idx in 0..width {
+                assert!(
+                    (actual_residual[idx] - expected_residual[idx]).abs() <= 1e-4,
+                    "residual[{idx}] diverged: actual={} expected={}",
+                    actual_residual[idx],
+                    expected_residual[idx]
+                );
+                assert!(
+                    (actual_normed[idx] - expected_normed[idx]).abs() <= 1e-4,
+                    "normed[{idx}] diverged: actual={} expected={}",
+                    actual_normed[idx],
+                    expected_normed[idx]
+                );
+            }
+            metal.inner.recycle(prep.residual_buffer);
+            metal.inner.recycle(prep.normed_buffer);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
     fn arm_macos_dense_bf16_mmap_simd_matches_cpu_reference_at_runtime_width() {
         let tmp = tempfile::tempdir().unwrap();
         let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
@@ -27152,6 +33531,7 @@ mod tests {
             num_hidden_layers: 1,
             hidden_size: cols,
             num_attention_heads: 1,
+            head_dim: None,
             num_key_value_heads: Some(1),
             vocab_size: 32,
             rope_theta: None,
@@ -27669,6 +34049,8 @@ mod tests {
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
             linear_attention_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
@@ -27687,6 +34069,242 @@ mod tests {
             .unwrap();
         assert_eq!(contribution.len(), 2);
         assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
+    }
+
+    #[test]
+    fn dense_q4_mmap_projection_descriptors_are_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let shape = vec![2, 4];
+        let group_size = 2;
+        let values = [0.25, -0.5, 1.0, 0.75, -0.125, 0.375, 0.625, -0.875];
+        let quantized = quantize_q4(&values, &shape, group_size).unwrap();
+        let layout = dense_q4_layout(&shape, group_size).unwrap();
+        let mut bytes = quantized.values.clone();
+        for scale in &quantized.scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        for bias in &quantized.biases {
+            bytes.extend_from_slice(&bias.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), layout.total_bytes);
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: tensor_name.to_string(),
+                    shard: "dense.safetensors".to_string(),
+                    dtype: "F32".to_string(),
+                    shape,
+                    source_offsets: [0, bytes.len() as u64],
+                    runtime_offset: 0,
+                    byte_len: bytes.len() as u64,
+                    quantization: TensorQuantization::Q4 {
+                        group_size,
+                        format: DENSE_Q4_FORMAT.to_string(),
+                        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                    },
+                    q4_sources: None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let first = store
+            .dense_q4_mmap_projection(tensor_name, 2, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.q4_mmap_projection_cache_len(), 1);
+        let second = store
+            .dense_q4_mmap_projection(tensor_name, 2, 4)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(store.q4_mmap_projection_cache_len(), 1);
+        assert_eq!(first.tensor_name, second.tensor_name);
+        assert_eq!(first.packed_byte_offset, second.packed_byte_offset);
+        assert_eq!(first.scales_byte_offset, second.scales_byte_offset);
+        assert_eq!(first.biases_byte_offset, second.biases_byte_offset);
+        assert_eq!(first.rows, second.rows);
+        assert_eq!(first.cols, second.cols);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn shared_expert_q4_phase_projections_are_cached_per_layer() {
+        fn append_q4_tensor(
+            bytes: &mut Vec<u8>,
+            dense_tensors: &mut Vec<DenseTensorRef>,
+            name: String,
+            shape: Vec<usize>,
+            values: &[f32],
+            group_size: usize,
+        ) {
+            let quantized = quantize_q4(values, &shape, group_size).unwrap();
+            let layout = dense_q4_layout(&shape, group_size).unwrap();
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(&quantized.values);
+            for scale in &quantized.scales {
+                bytes.extend_from_slice(&scale.to_le_bytes());
+            }
+            for bias in &quantized.biases {
+                bytes.extend_from_slice(&bias.to_le_bytes());
+            }
+            let byte_len = bytes.len() as u64 - offset;
+            assert_eq!(byte_len as usize, layout.total_bytes);
+            dense_tensors.push(DenseTensorRef {
+                tensor: name,
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape,
+                source_offsets: [0, byte_len],
+                runtime_offset: offset,
+                byte_len,
+                quantization: TensorQuantization::Q4 {
+                    group_size,
+                    format: DENSE_Q4_FORMAT.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                },
+                q4_sources: None,
+            });
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_path = tmp.path().join("model_weights.bin");
+        let manifest_path = tmp.path().join("model_weights.json");
+        let experts_dir = tmp.path().join("experts");
+        fs::create_dir_all(&experts_dir).unwrap();
+
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{
+                "model_type":"qwen3_moe",
+                "num_hidden_layers":1,
+                "hidden_size":4,
+                "num_attention_heads":1,
+                "num_key_value_heads":1,
+                "vocab_size":8,
+                "torch_dtype":"float32",
+                "num_experts":1,
+                "num_experts_per_tok":1,
+                "moe_intermediate_size":2,
+                "num_shared_experts":1,
+                "shared_expert_intermediate_size":2
+            }"#,
+        )
+        .unwrap();
+
+        let group_size = 2;
+        let mut bytes = Vec::new();
+        let mut dense_tensors = Vec::new();
+        append_q4_tensor(
+            &mut bytes,
+            &mut dense_tensors,
+            shared_expert_tensor_name(0, "gate_proj"),
+            vec![2, 4],
+            &[0.25, -0.5, 1.0, 0.75, -0.125, 0.375, 0.625, -0.875],
+            group_size,
+        );
+        append_q4_tensor(
+            &mut bytes,
+            &mut dense_tensors,
+            shared_expert_tensor_name(0, "up_proj"),
+            vec![2, 4],
+            &[0.5, 0.25, -0.75, 1.25, -0.25, 0.875, -1.0, 0.125],
+            group_size,
+        );
+        append_q4_tensor(
+            &mut bytes,
+            &mut dense_tensors,
+            shared_expert_tensor_name(0, "down_proj"),
+            vec![4, 2],
+            &[0.125, 0.25, -0.375, 0.5, 0.625, -0.75, 0.875, -1.0],
+            group_size,
+        );
+        append_q4_tensor(
+            &mut bytes,
+            &mut dense_tensors,
+            shared_expert_gate_tensor_name(0),
+            vec![1, 4],
+            &[0.5, -0.25, 0.75, -1.0],
+            group_size,
+        );
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut plan = plan_unchecked_with_routing(
+            QWEN35_MODEL,
+            tmp.path(),
+            FlashMoeRoutingPolicy::new(Some(1), true),
+        );
+        plan.uses_metal = false;
+        plan.non_expert_weights = dense_path;
+        plan.tensor_manifest = manifest_path;
+        plan.experts_dir = experts_dir;
+
+        let dense = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
+        let runtime = DenseTransformerRuntime::new(&config);
+        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
+        let engine = FlashMoeEngine {
+            plan,
+            experts: experts.clone(),
+            scheduler: ExpertScheduler::new(experts),
+            dense,
+            tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
+            metal: None,
+            config,
+            model_layout,
+            routing_policy,
+            runtime,
+            shared_expert_cache: Mutex::new(BTreeMap::new()),
+            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
+            linear_attention_cache: Mutex::new(BTreeMap::new()),
+            vision_encoder: None,
+            session_cache: BTreeMap::new(),
+        };
+
+        let first = engine
+            .shared_expert_q4_phase_projections(0, 4)
+            .unwrap()
+            .unwrap();
+        let second = engine
+            .shared_expert_q4_phase_projections(0, 4)
+            .unwrap()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.shared_experts, 1);
+        assert_eq!(first.intermediate, 2);
+        assert_eq!(first.width, 4);
+        assert_eq!(first.gate.rows, 2);
+        assert_eq!(first.up.rows, 2);
+        assert_eq!(first.down.cols, 2);
+        assert_eq!(first.router.rows, 1);
     }
 
     #[test]
@@ -27918,6 +34536,79 @@ mod tests {
         assert_eq!(snapshot.issued_reads, 3);
         assert_eq!(snapshot.positioned_reads, 3);
         assert_eq!(snapshot.read_failures, 0);
+    }
+
+    #[test]
+    fn expert_scheduler_finishes_routed_set_with_normalized_weights() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let packs: Vec<_> = [1usize, 3, 7]
+            .into_iter()
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
+
+        let mut scheduler =
+            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+        let routes = [(7usize, 2.0f32), (1, 1.0), (3, -1.0)];
+        let pending = scheduler.issue_routes(0, &routes).unwrap();
+        assert_eq!(scheduler.worker_count(), 3);
+        let scheduled = scheduler.finish_routes(pending).unwrap();
+
+        assert_eq!(scheduled.layer, 0);
+        assert_eq!(scheduled.routes.len(), routes.len());
+        let order: Vec<_> = scheduled
+            .experts
+            .iter()
+            .map(|expert| expert.expert)
+            .collect();
+        assert_eq!(order, vec![7, 1, 3]);
+        let mut expected_weights: Vec<f32> = routes.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut expected_weights);
+        for (actual, expected) in scheduled.weights.iter().zip(expected_weights.iter()) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+        let weight_sum: f32 = scheduled.weights.iter().sum();
+        assert!((weight_sum - 1.0).abs() <= 1e-6);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 3);
+        assert_eq!(snapshot.positioned_reads, 3);
+        assert_eq!(snapshot.read_failures, 0);
+    }
+
+    #[test]
+    fn expert_scheduler_applies_configured_routed_expert_scale() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let packs: Vec<_> = [1usize, 3]
+            .into_iter()
+            .map(|expert| {
+                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+                let pack = test_expert_pack(&tensor);
+                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
+                (expert, pack, metadata)
+            })
+            .collect();
+        write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
+
+        let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
+        let mut scheduler = ExpertScheduler::new_with_routed_expert_scale(store, 0.9);
+        let routes = [(3usize, 2.0f32), (1, 1.0)];
+        let pending = scheduler.issue_routes(0, &routes).unwrap();
+        let scheduled = scheduler.finish_routes(pending).unwrap();
+        let mut expected_weights: Vec<f32> = routes.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut expected_weights);
+        for weight in &mut expected_weights {
+            *weight *= 0.9;
+        }
+        for (actual, expected) in scheduled.weights.iter().zip(expected_weights.iter()) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
     }
 
     #[test]
@@ -28610,6 +35301,8 @@ mod tests {
             name: "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
             dtype: "Q4".to_string(),
             shape: vec![2, 4],
+            source_offsets: [0, 0],
+            source_hash: None,
             group_size: 2,
             scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
             packed: vec![0x10, 0x32, 0x54, 0x76],
@@ -28933,6 +35626,8 @@ mod tests {
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
             linear_attention_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
@@ -29370,6 +36065,7 @@ mod flashmoe_rope_tests {
             num_hidden_layers: 1,
             hidden_size: 4096,
             num_attention_heads: 32,
+            head_dim: Some(256),
             num_key_value_heads: Some(2),
             vocab_size: 248320,
             rope_theta: None,

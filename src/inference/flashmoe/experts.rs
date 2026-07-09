@@ -1,5 +1,9 @@
 use anyhow::{Context, Result, bail};
 
+use super::model_family::{
+    QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertSlotDescriptor {
     pub layer: usize,
@@ -42,16 +46,59 @@ impl<'a> ExpertSlotView<'a> {
         })
     }
 
-    pub fn descriptor(self) -> ExpertSlotDescriptor {
+    pub fn descriptor(&self) -> ExpertSlotDescriptor {
         self.descriptor
     }
 
-    pub fn payload(self) -> &'a [u8] {
+    pub fn payload(&self) -> &'a [u8] {
         self.payload
     }
 
-    pub fn payload_prefix(self, max_len: usize) -> &'a [u8] {
+    pub fn payload_prefix(&self, max_len: usize) -> &'a [u8] {
         &self.payload[..self.payload.len().min(max_len)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedQ4ExpertSlotView<'a> {
+    slot: ExpertSlotView<'a>,
+    layout: QwenMoeQ4ExpertLayout,
+}
+
+impl<'a> FixedQ4ExpertSlotView<'a> {
+    pub fn new(slot: ExpertSlotView<'a>, layout: QwenMoeQ4ExpertLayout) -> Result<Self> {
+        layout.validate()?;
+        let payload_len = slot.payload().len();
+        if payload_len < layout.expert_bytes {
+            bail!(
+                "fixed Q4 expert slot payload length {payload_len} is shorter than layout size {}",
+                layout.expert_bytes
+            );
+        }
+        Ok(Self { slot, layout })
+    }
+
+    pub fn descriptor(&self) -> ExpertSlotDescriptor {
+        self.slot.descriptor()
+    }
+
+    pub fn layout(&self) -> QwenMoeQ4ExpertLayout {
+        self.layout
+    }
+
+    pub fn payload(&self) -> &'a [u8] {
+        self.slot.payload()
+    }
+
+    pub fn component(&self, kind: QwenMoeExpertComponentKind) -> &'a [u8] {
+        let component = self.layout.component(kind);
+        self.component_bytes(component)
+    }
+
+    fn component_bytes(&self, component: QwenMoeExpertComponentLayout) -> &'a [u8] {
+        let start = component.offset;
+        let end = start + component.bytes;
+        &self.slot.payload()[start..end]
     }
 }
 
@@ -88,15 +135,78 @@ impl ReusableExpertBuffer {
         ExpertSlotView::new(layer, expert, slot_offset, slot_capacity, &self.bytes)
     }
 
-    #[cfg(test)]
+    pub fn take_payload(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+
     pub fn capacity(&self) -> usize {
         self.bytes.capacity()
+    }
+
+    pub fn adopt_buffer(&mut self, mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes.clear();
+        std::mem::replace(&mut self.bytes, bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
+        use QwenMoeExpertComponentKind::*;
+        QwenMoeQ4ExpertLayout {
+            expert_bytes: 45,
+            group_size: 2,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 8,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 12,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 16,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 24,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 28,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 32,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 40,
+                    bytes: 3,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 43,
+                    bytes: 2,
+                },
+            ],
+        }
+    }
 
     #[test]
     fn reusable_expert_buffer_keeps_capacity_across_smaller_reads() {
@@ -119,6 +229,53 @@ mod tests {
             }
         );
         assert_eq!(slot.payload(), &[3; 8]);
+    }
+
+    #[test]
+    fn reusable_expert_buffer_can_move_a_whole_slot_payload_without_copying() {
+        let mut buffer = ReusableExpertBuffer::default();
+        buffer.prepare_payload(128, 96).unwrap().fill(9);
+        let initial_capacity = buffer.capacity();
+
+        let payload = buffer.take_payload();
+
+        assert_eq!(payload, vec![9; 96]);
+        assert_eq!(payload.capacity(), initial_capacity);
+        assert_eq!(buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn fixed_q4_expert_slot_view_slices_components_from_one_payload() {
+        let payload: Vec<u8> = (0..45).collect();
+        let slot = ExpertSlotView::new(4, 7, 4096, 45, &payload).unwrap();
+        let view = FixedQ4ExpertSlotView::new(slot, tiny_fixed_q4_layout()).unwrap();
+
+        assert_eq!(view.descriptor(), slot.descriptor());
+        assert_eq!(view.payload(), payload.as_slice());
+        assert_eq!(
+            view.component(QwenMoeExpertComponentKind::GateWeight),
+            &payload[0..8]
+        );
+        assert_eq!(
+            view.component(QwenMoeExpertComponentKind::UpScale),
+            &payload[24..28]
+        );
+        assert_eq!(
+            view.component(QwenMoeExpertComponentKind::DownBias),
+            &payload[43..45]
+        );
+    }
+
+    #[test]
+    fn fixed_q4_expert_slot_view_rejects_short_payloads() {
+        let payload = [0u8; 44];
+        let slot = ExpertSlotView::new(0, 0, 0, 45, &payload).unwrap();
+        let err = FixedQ4ExpertSlotView::new(slot, tiny_fixed_q4_layout()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("shorter than layout size 45"),
+            "{err:#}"
+        );
     }
 
     #[test]

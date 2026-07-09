@@ -103,7 +103,7 @@ pub struct QwenMoeExpertComponentLayout {
     pub bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QwenMoeQ4ExpertLayout {
     pub expert_bytes: usize,
     pub group_size: usize,
@@ -209,6 +209,7 @@ pub struct QwenMoeModelLayout {
     pub experts_per_layer: usize,
     pub configured_active_experts: usize,
     pub scheduled_active_experts: usize,
+    pub routed_expert_scale: f32,
     pub moe_intermediate_size: usize,
     pub shared_experts: usize,
     pub shared_expert_intermediate_size: usize,
@@ -223,7 +224,7 @@ impl QwenMoeModelLayout {
     pub fn from_config(model: &str, config: &QwenModelConfig) -> Result<Self> {
         config.validate()?;
         let family = QwenMoeFamily::from_model_and_config(model, config)?;
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config.full_attention_head_dim();
         let configured_active_experts = config.config_active_experts();
         let scheduled_active_experts = match family {
             QwenMoeFamily::Qwen35A17B if config.experts() >= ACTIVE_EXPERTS_PER_TOKEN => {
@@ -231,6 +232,10 @@ impl QwenMoeModelLayout {
             }
             QwenMoeFamily::Qwen35A17B => configured_active_experts,
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => configured_active_experts,
+        };
+        let routed_expert_scale = match family {
+            QwenMoeFamily::Qwen35A17B => 0.9,
+            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => 1.0,
         };
         let layout = Self {
             family,
@@ -244,6 +249,7 @@ impl QwenMoeModelLayout {
             experts_per_layer: config.experts(),
             configured_active_experts,
             scheduled_active_experts,
+            routed_expert_scale,
             moe_intermediate_size: config
                 .moe_intermediate_size
                 .or(config.intermediate_size)
@@ -283,7 +289,9 @@ impl QwenMoeModelLayout {
         {
             bail!("Qwen MoE layout contains zero-valued required dimensions");
         }
-        if self.hidden_size != self.attention_heads * self.head_dim {
+        if self.family != QwenMoeFamily::Qwen35A17B
+            && self.hidden_size != self.attention_heads * self.head_dim
+        {
             bail!(
                 "Qwen MoE hidden size {} does not match attention_heads {} * head_dim {}",
                 self.hidden_size,
@@ -295,12 +303,15 @@ impl QwenMoeModelLayout {
             || self.configured_active_experts == 0
             || self.scheduled_active_experts == 0
             || self.scheduled_active_experts > self.experts_per_layer
+            || !self.routed_expert_scale.is_finite()
+            || self.routed_expert_scale <= 0.0
         {
             bail!(
-                "invalid Qwen MoE expert schedule: experts={}, configured_k={}, scheduled_k={}",
+                "invalid Qwen MoE expert schedule: experts={}, configured_k={}, scheduled_k={}, routed_scale={}",
                 self.experts_per_layer,
                 self.configured_active_experts,
-                self.scheduled_active_experts
+                self.scheduled_active_experts,
+                self.routed_expert_scale
             );
         }
         self.q4_expert_layout.validate()?;
@@ -391,13 +402,16 @@ mod tests {
   "num_hidden_layers": 60,
   "hidden_size": 4096,
   "num_attention_heads": 32,
+  "head_dim": 256,
   "num_key_value_heads": 2,
   "vocab_size": 248320,
   "rope_theta": 10000000.0,
   "torch_dtype": "bfloat16",
   "num_experts": 512,
   "num_experts_per_tok": 10,
-  "moe_intermediate_size": 1536
+  "moe_intermediate_size": 1024,
+  "num_shared_experts": 1,
+  "shared_expert_intermediate_size": 1024
 }"#,
         )
     }
@@ -422,14 +436,18 @@ mod tests {
         assert_eq!(layout.layers, 60);
         assert_eq!(layout.hidden_size, 4096);
         assert_eq!(layout.attention_heads, 32);
+        assert_eq!(layout.head_dim, 256);
         assert_eq!(layout.kv_heads, 2);
         assert_eq!(layout.configured_active_experts, 10);
         assert_eq!(layout.scheduled_active_experts, 4);
+        assert_eq!(layout.routed_expert_scale, 0.9);
         assert_eq!(layout.experts_per_layer, 512);
         assert_eq!(layout.layers, NUM_LAYERS);
         assert_eq!(layout.hidden_size, HIDDEN_DIM);
         assert_eq!(layout.experts_per_layer, NUM_EXPERTS);
-        assert_eq!(layout.moe_intermediate_size, 1536);
+        assert_eq!(layout.moe_intermediate_size, 1024);
+        assert_eq!(layout.shared_experts, 1);
+        assert_eq!(layout.shared_expert_intermediate_size, 1024);
         assert!(!layout.has_vision);
     }
 
@@ -525,6 +543,7 @@ mod tests {
         assert_eq!(layout.execution, QwenMoeExecutionPolicy::UPSTREAM_PARITY);
         assert_eq!(layout.configured_active_experts, 2);
         assert_eq!(layout.scheduled_active_experts, 2);
+        assert_eq!(layout.routed_expert_scale, 1.0);
         assert_eq!(layout.layer_kind(0), QwenMoeLayerKind::FullAttention);
     }
 
@@ -560,6 +579,7 @@ mod tests {
         assert_eq!(layout.family, QwenMoeFamily::Qwen3VlMoe);
         assert_eq!(layout.execution, QwenMoeExecutionPolicy::UPSTREAM_PARITY);
         assert_eq!(layout.scheduled_active_experts, 3);
+        assert_eq!(layout.routed_expert_scale, 1.0);
         assert!(layout.has_vision);
         assert_eq!(layout.mrope_section, Some(DEFAULT_MROPE_SECTION));
     }
