@@ -218,10 +218,12 @@ The validator should reject silent fallbacks such as:
   CMD2 prep topK now submit declared routing-output state before route selection is accepted, and
   Metal post-attention prep must resolve as a scheduler-owned CMD2 output before its routes can feed
   topK validation. That resolved CMD2 output now builds the preselected routing command directly
-  instead of delegating command construction to a legacy Metal prep helper. CPU router score
-  production now consumes a scheduler-built projection command carrying declared routing state,
-  hidden width, and the optional resident projection descriptor before the dense store executes it.
-  Active expert issue now consumes the resulting
+  instead of delegating command construction to a legacy Metal prep helper. The live path now asks
+  the scheduled graph to build CMD2 submissions, rejecting stale descriptors that do not match the
+  current graph capability before post-attention helpers execute. CPU router score production now
+  consumes a scheduler-built projection command carrying declared routing state, hidden width, and
+  the optional resident projection descriptor before the dense store executes it. Active expert issue
+  now consumes the resulting
   `ScheduledRoutingCommand` directly and resolves it into scheduler-owned `ScheduledExpertRoutes`
   before reads are issued. The remaining gap is score production ownership: router score execution
   and any future readback variants are descriptor- and batch-backed by `weights`, but some execution

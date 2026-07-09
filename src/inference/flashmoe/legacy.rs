@@ -90,11 +90,10 @@ use super::scheduler::{
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
     ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
-    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
+    ScheduledCmd3InputSource, ScheduledCmd3OutputState, ScheduledCmd3Submission,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
+    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
@@ -1880,8 +1879,6 @@ struct MetalExecutor {
     inner: Arc<MetalExecutorInner>,
     route_top4_enabled: bool,
 }
-
-type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
@@ -10414,16 +10411,18 @@ impl FlashMoeEngine {
                 cmd2_attention_source,
                 cmd2_residual_source,
             )?;
-            let scheduled_cmd2 = ScheduledPostAttentionPhase::new(
-                scheduled_cmd2,
-                ScheduledCmd2PhaseInputs::new(
-                    cmd2_attention_source,
-                    cmd2_residual_source,
-                    cmd2_attention_len,
-                    cmd2_residual_len,
-                ),
-            )?
-            .into_cmd2_command();
+            let scheduled_cmd2 = self
+                .scheduled_graph
+                .build_cmd2_submission(
+                    scheduled_cmd2,
+                    ScheduledCmd2PhaseInputs::new(
+                        cmd2_attention_source,
+                        cmd2_residual_source,
+                        cmd2_attention_len,
+                        cmd2_residual_len,
+                    ),
+                )?
+                .into_cmd2_command();
             debug_assert_eq!(scheduled_cmd2.input_state().layer(), layer);
             debug_assert_eq!(
                 scheduled_cmd2.input_state().attention().len(),
@@ -32322,17 +32321,18 @@ mod tests {
                 ScheduledCmd2ResidualSource::CpuHidden,
             )
             .unwrap();
-        let scheduled_cmd2 = ScheduledPostAttentionPhase::new(
-            scheduled_cmd2,
-            ScheduledCmd2PhaseInputs::new(
-                ScheduledCmd2AttentionSource::CpuAttentionValues,
-                ScheduledCmd2ResidualSource::CpuHidden,
-                attention_width,
-                width,
-            ),
-        )
-        .unwrap()
-        .into_cmd2_command();
+        let scheduled_cmd2 = scheduled_graph
+            .build_cmd2_submission(
+                scheduled_cmd2,
+                ScheduledCmd2PhaseInputs::new(
+                    ScheduledCmd2AttentionSource::CpuAttentionValues,
+                    ScheduledCmd2ResidualSource::CpuHidden,
+                    attention_width,
+                    width,
+                ),
+            )
+            .unwrap()
+            .into_cmd2_command();
         let cmd2_output = scheduled_cmd2
             .resolve_post_attention_prep(prep.state)
             .unwrap();

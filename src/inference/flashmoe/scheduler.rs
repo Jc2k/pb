@@ -108,6 +108,25 @@ impl FlashMoeScheduledGraph {
         })
     }
 
+    pub fn build_cmd2_submission<TInputs>(
+        &self,
+        cmd2: ScheduledCmd2PostAttention,
+        inputs: TInputs,
+    ) -> Result<ScheduledCmd2Submission<TInputs>>
+    where
+        TInputs: ScheduledCmd2Inputs,
+    {
+        let expected_stage = *self.stage(FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection);
+        if cmd2.stage != expected_stage {
+            bail!(
+                "FlashMoe scheduled CMD2 descriptor stage {:?} does not match scheduled graph CMD2 stage {:?}",
+                cmd2.stage,
+                expected_stage
+            );
+        }
+        ScheduledCmd2Submission::new(cmd2, inputs)
+    }
+
     pub fn build_attention_math(
         &self,
         layer: usize,
@@ -3689,6 +3708,57 @@ mod tests {
         );
         assert_eq!(input_state.residual().len(), 4096);
         assert!(input_state.is_declared_graph_state());
+    }
+
+    #[test]
+    fn scheduled_graph_builds_cmd2_submission_and_rejects_stale_stage() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+
+        graph
+            .build_cmd2_submission(
+                cmd2,
+                ScheduledCmd2PhaseInputs::new(
+                    ScheduledCmd2AttentionSource::MetalAttentionValues,
+                    ScheduledCmd2ResidualSource::MetalBuffer,
+                    4096,
+                    4096,
+                ),
+            )
+            .unwrap();
+
+        let mut stale_graph = graph.clone();
+        stale_graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection)
+            .unwrap()
+            .implementation = "different-cmd2-implementation";
+
+        let err = stale_graph
+            .build_cmd2_submission(
+                cmd2,
+                ScheduledCmd2PhaseInputs::new(
+                    ScheduledCmd2AttentionSource::MetalAttentionValues,
+                    ScheduledCmd2ResidualSource::MetalBuffer,
+                    4096,
+                    4096,
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match scheduled graph CMD2 stage"),
+            "{err:#}"
+        );
     }
 
     #[test]
