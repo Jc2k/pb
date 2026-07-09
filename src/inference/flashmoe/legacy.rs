@@ -9832,9 +9832,7 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                let (hidden, next_normed) = output.into_hidden_and_next_normed();
-                token_state.replace_hidden(hidden);
-                token_state.set_next_layer_normed(next_normed);
+                token_state.apply_expert_phase_output(output);
             }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
@@ -10024,9 +10022,7 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                let (hidden, _) = output.into_hidden_and_next_normed();
-                token_state.replace_hidden(hidden);
-                token_state.clear_next_layer_normed();
+                token_state.apply_expert_phase_hidden_only(output);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
@@ -10115,9 +10111,7 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        let (hidden, _) = output.into_hidden_and_next_normed();
-                        token_state.replace_hidden(hidden);
-                        token_state.clear_next_layer_normed();
+                        token_state.apply_expert_phase_hidden_only(output);
                     }
                     if let Some(metal) = &self.metal {
                         let attention_values = metal.read_and_recycle_attention_values(
@@ -10193,9 +10187,7 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        let (hidden, _) = output.into_hidden_and_next_normed();
-                        token_state.replace_hidden(hidden);
-                        token_state.clear_next_layer_normed();
+                        token_state.apply_expert_phase_hidden_only(output);
                     }
                     let subphase_started = Instant::now();
                     projected = self
@@ -10340,9 +10332,7 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    let (hidden, next_normed) = output.into_hidden_and_next_normed();
-                    token_state.replace_hidden(hidden);
-                    token_state.set_next_layer_normed(next_normed);
+                    token_state.apply_expert_phase_output(output);
                     submitted_deferred = true;
                 }
             }
@@ -10367,9 +10357,7 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    let (hidden, next_normed) = output.into_hidden_and_next_normed();
-                    token_state.replace_hidden(hidden);
-                    token_state.set_next_layer_normed(next_normed);
+                    token_state.apply_expert_phase_output(output);
                     submitted_deferred = true;
                 }
             }
@@ -10389,9 +10377,7 @@ impl FlashMoeEngine {
                     shared_dense_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
-                let (hidden, next_normed) = output.into_hidden_and_next_normed();
-                token_state.replace_hidden(hidden);
-                token_state.set_next_layer_normed(next_normed);
+                token_state.apply_expert_phase_output(output);
             }
             trace_layer_values(position, layer, "moe", token_state.hidden());
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
@@ -10518,9 +10504,7 @@ impl FlashMoeEngine {
                     previous_layer.buckets.total_wall += wait_elapsed;
                 }
             }
-            let (hidden, next_normed) = output.into_hidden_and_next_normed();
-            token_state.replace_hidden(hidden);
-            token_state.set_next_layer_normed(next_normed);
+            token_state.apply_expert_phase_output(output);
         }
         token_state.clear_next_layer_normed();
 
@@ -11375,10 +11359,10 @@ impl FlashMoeEngine {
         };
         let residual = vec![0.0f32; width];
         let experts: &[ExpertWeights] = &[];
-        Ok(
+        let (hidden, _) =
             compute_expert_phase_cpu(experts, &[], normed, &residual, Some(shared.as_ref()), None)?
-                .hidden,
-        )
+                .into_hidden_and_next_normed();
+        Ok(hidden)
     }
 
     fn shared_expert_phase_weights(
@@ -26471,8 +26455,10 @@ mod tests {
             .wait()
             .unwrap();
 
+        let (actual_hidden, _) = actual.into_hidden_and_next_normed();
+        let (expected_hidden, _) = expected.into_hidden_and_next_normed();
         for (idx, (actual, expected)) in
-            actual.hidden.iter().zip(expected.hidden.iter()).enumerate()
+            actual_hidden.iter().zip(expected_hidden.iter()).enumerate()
         {
             assert!(
                 (*actual - *expected).abs() <= 1e-3,
@@ -27843,12 +27829,13 @@ mod tests {
             residual[0] + activated[0] + 2.0 * activated[1],
             residual[1] - activated[0] + 0.5 * activated[1],
         ];
-        for (actual, expected) in out.hidden.iter().zip(expected_hidden.iter()) {
+        let (hidden, next_normed) = out.into_hidden_and_next_normed();
+        for (actual, expected) in hidden.iter().zip(expected_hidden.iter()) {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
         let mut expected_normed = expected_hidden;
         rms_norm_with_weight_in_place(&mut expected_normed, Some(&[1.0, 0.5]));
-        for (actual, expected) in out.next_normed.unwrap().iter().zip(expected_normed.iter()) {
+        for (actual, expected) in next_normed.unwrap().iter().zip(expected_normed.iter()) {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
     }

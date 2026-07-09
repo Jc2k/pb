@@ -217,6 +217,18 @@ impl FlashMoeTokenState {
         self.next_layer_normed = None;
     }
 
+    pub(crate) fn apply_expert_phase_output(&mut self, output: FlashMoeExpertPhaseOutput) {
+        let (hidden, next_normed) = output.into_hidden_and_next_normed();
+        self.replace_hidden(hidden);
+        self.set_next_layer_normed(next_normed);
+    }
+
+    pub(crate) fn apply_expert_phase_hidden_only(&mut self, output: FlashMoeExpertPhaseOutput) {
+        let (hidden, _) = output.into_hidden_and_next_normed();
+        self.replace_hidden(hidden);
+        self.clear_next_layer_normed();
+    }
+
     pub(crate) fn take_next_layer_normed_as_normed(&mut self) -> Option<FlashMoeCpuBuffer> {
         self.next_layer_normed
             .take()
@@ -271,8 +283,8 @@ impl FlashMoeLayerStateRecord {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FlashMoeExpertPhaseOutput {
-    pub(crate) hidden: Vec<f32>,
-    pub(crate) next_normed: Option<Vec<f32>>,
+    hidden: Vec<f32>,
+    next_normed: Option<Vec<f32>>,
 }
 
 impl FlashMoeExpertPhaseOutput {
@@ -459,6 +471,22 @@ mod tests {
         let normed = state.take_next_layer_normed_as_normed().unwrap();
         assert_eq!(normed.role(), FlashMoeStateBufferRole::Normed);
         assert_eq!(&normed[..], &[3.0, 4.0]);
+        assert!(state.take_next_layer_normed_as_normed().is_none());
+
+        state.apply_expert_phase_output(FlashMoeExpertPhaseOutput::new(
+            vec![8.0, 9.0],
+            Some(vec![10.0, 11.0]),
+        ));
+        assert_eq!(&state.hidden()[..], &[8.0, 9.0]);
+        let normed = state.take_next_layer_normed_as_normed().unwrap();
+        assert_eq!(normed.role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(&normed[..], &[10.0, 11.0]);
+
+        state.apply_expert_phase_hidden_only(FlashMoeExpertPhaseOutput::new(
+            vec![12.0],
+            Some(vec![13.0]),
+        ));
+        assert_eq!(&state.hidden()[..], &[12.0]);
         assert!(state.take_next_layer_normed_as_normed().is_none());
 
         state.mix_active_expert(7, 0.0);
