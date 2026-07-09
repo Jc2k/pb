@@ -128,6 +128,8 @@ The validator should reject silent fallbacks such as:
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.
+  Shared expert source and shape are now submitted to CMD3 as one scheduler descriptor, so a Q4 or
+  dense shared expert implementation cannot be accepted without its declared graph shape.
   Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3
   submission retains those scheduled slots instead of adapting them into `ExpertWeights`, and the
   scheduler now builds resolved CMD1/attention/CMD2/routing/CMD3 command objects before the legacy

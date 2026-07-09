@@ -879,6 +879,31 @@ pub enum ScheduledNextNormSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledSharedExpertDescriptor {
+    pub source: ScheduledSharedExpertSource,
+    pub shape: Option<ScheduledSharedExpertShape>,
+}
+
+impl ScheduledSharedExpertDescriptor {
+    pub fn new(
+        source: ScheduledSharedExpertSource,
+        shape: Option<ScheduledSharedExpertShape>,
+    ) -> Result<Self> {
+        match (source, shape) {
+            (ScheduledSharedExpertSource::None, Some(_)) => bail!(
+                "FlashMoe scheduled shared expert descriptor cannot declare a shape for source None"
+            ),
+            (ScheduledSharedExpertSource::DenseCpuWeights, None)
+            | (ScheduledSharedExpertSource::ResidentQ4Projections, None) => bail!(
+                "FlashMoe scheduled shared expert descriptor source {:?} requires a declared shape",
+                source
+            ),
+            _ => Ok(Self { source, shape }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledSharedExpertShape {
     pub width: usize,
     pub shared_experts: usize,
@@ -1040,8 +1065,7 @@ where
 }
 
 pub trait ScheduledSharedExpert {
-    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
-    fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>>;
+    fn scheduled_shared_expert_descriptor(&self) -> Result<ScheduledSharedExpertDescriptor>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1085,21 +1109,20 @@ impl<'a> ScheduledSharedExpertPhaseRef<'a> {
 }
 
 impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
-    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
+    fn scheduled_shared_expert_descriptor(&self) -> Result<ScheduledSharedExpertDescriptor> {
         match self {
-            Self::None => ScheduledSharedExpertSource::None,
-            Self::Dense(_) => ScheduledSharedExpertSource::DenseCpuWeights,
-            Self::Q4(_) => ScheduledSharedExpertSource::ResidentQ4Projections,
+            Self::None => {
+                ScheduledSharedExpertDescriptor::new(ScheduledSharedExpertSource::None, None)
+            }
+            Self::Dense(shared) => ScheduledSharedExpertDescriptor::new(
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                Some(ScheduledSharedExpertShape::from(shared.validated_shape()?)),
+            ),
+            Self::Q4(shared) => ScheduledSharedExpertDescriptor::new(
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                Some(ScheduledSharedExpertShape::from(shared.validated_shape()?)),
+            ),
         }
-    }
-
-    fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>> {
-        let shape = match self {
-            Self::None => return Ok(None),
-            Self::Dense(shared) => ScheduledSharedExpertShape::from(shared.validated_shape()?),
-            Self::Q4(shared) => ScheduledSharedExpertShape::from(shared.validated_shape()?),
-        };
-        Ok(Some(shape))
     }
 }
 
@@ -1175,11 +1198,12 @@ where
                 input.scheduled_cmd3_input_source()
             );
         }
-        if cmd3.shared != shared.scheduled_shared_expert_source() {
+        let shared_descriptor = shared.scheduled_shared_expert_descriptor()?;
+        if cmd3.shared != shared_descriptor.source {
             bail!(
                 "FlashMoe scheduled CMD3 shared source {:?} does not match phase shared source {:?}",
                 cmd3.shared,
-                shared.scheduled_shared_expert_source()
+                shared_descriptor.source
             );
         }
         let input_state = input.scheduled_cmd3_input_state(cmd3.layer);
@@ -1213,7 +1237,7 @@ where
         if input_width == 0 {
             bail!("FlashMoe scheduled CMD3 input width must be non-zero");
         }
-        if let Some(shape) = shared.scheduled_shared_expert_shape()? {
+        if let Some(shape) = shared_descriptor.shape {
             if !shape.is_declared_graph_shape() {
                 bail!(
                     "FlashMoe scheduled CMD3 shared expert shape is not declared graph shape: width={} shared_experts={} intermediate={} total_intermediate={}",
@@ -2124,12 +2148,8 @@ mod tests {
     }
 
     impl ScheduledSharedExpert for DummySharedExpert {
-        fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
-            self.source
-        }
-
-        fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>> {
-            Ok(self.shape)
+        fn scheduled_shared_expert_descriptor(&self) -> Result<ScheduledSharedExpertDescriptor> {
+            ScheduledSharedExpertDescriptor::new(self.source, self.shape)
         }
     }
 
@@ -2234,36 +2254,37 @@ mod tests {
         let q4 = dummy_shared_q4_phase();
 
         let none = ScheduledSharedExpertPhaseRef::from_options(None, None);
-        assert_eq!(
-            none.scheduled_shared_expert_source(),
-            ScheduledSharedExpertSource::None
-        );
+        let none_descriptor = none.scheduled_shared_expert_descriptor().unwrap();
+        assert_eq!(none_descriptor.source, ScheduledSharedExpertSource::None);
+        assert_eq!(none_descriptor.shape, None);
         assert!(!none.is_some());
         assert!(none.dense().is_none());
         assert!(none.q4().is_none());
 
         let dense_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), None);
+        let dense_descriptor = dense_ref.scheduled_shared_expert_descriptor().unwrap();
         assert_eq!(
-            dense_ref.scheduled_shared_expert_source(),
+            dense_descriptor.source,
             ScheduledSharedExpertSource::DenseCpuWeights
         );
         assert!(dense_ref.is_some());
         assert!(dense_ref.dense().is_some());
         assert!(dense_ref.q4().is_none());
         assert_eq!(
-            dense_ref.scheduled_shared_expert_shape().unwrap(),
+            dense_descriptor.shape,
             Some(ScheduledSharedExpertShape::new(1, 1, 2).unwrap())
         );
 
         let q4_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), Some(&q4));
+        let q4_descriptor = q4_ref.scheduled_shared_expert_descriptor().unwrap();
         assert_eq!(
-            q4_ref.scheduled_shared_expert_source(),
+            q4_descriptor.source,
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert!(q4_ref.dense().is_none());
         assert!(q4_ref.q4().is_some());
         assert_eq!(
-            q4_ref.scheduled_shared_expert_shape().unwrap(),
+            q4_descriptor.shape,
             Some(ScheduledSharedExpertShape::new(32, 1, 16).unwrap())
         );
     }
@@ -3330,6 +3351,24 @@ mod tests {
             shared_err
                 .to_string()
                 .contains("does not match phase shared source")
+        );
+
+        let missing_shared_shape_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert_with_shape(
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                None,
+            ),
+            Some(&[1.0; 8]),
+        )
+        .unwrap_err();
+        assert!(
+            missing_shared_shape_err
+                .to_string()
+                .contains("requires a declared shape")
         );
 
         let next_norm_err = ScheduledCmd3Submission::new(

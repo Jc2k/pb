@@ -10646,7 +10646,7 @@ impl FlashMoeEngine {
                 } else {
                     ScheduledCmd3InputSource::CpuNormedResidualUpload
                 },
-                shared_phase.scheduled_shared_expert_source(),
+                shared_phase.scheduled_shared_expert_descriptor()?.source,
                 if next_norm_weight.is_some() {
                     ScheduledNextNormSource::CpuVisibleWeights
                 } else {
