@@ -155,22 +155,6 @@ impl FlashMoeScheduledGraph {
         })
     }
 
-    pub(crate) fn command_from_cmd2_preselected_routes(
-        &self,
-        output: ScheduledCmd2PostAttentionPrepOutput,
-        routes: &[(usize, f32)],
-    ) -> Result<ScheduledRoutingCommand> {
-        let routing_state = output.routing();
-        let routing = self.build_routing_topk(
-            output.layer,
-            routing_state.experts(),
-            output.active_experts,
-            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
-        )?;
-        let routing_output = routing.validate_output_state(routing_state)?;
-        routing.command_from_preselected_output(routing_output, routes)
-    }
-
     pub fn build_cmd1_attention_projections(
         &self,
         layer: usize,
@@ -702,6 +686,22 @@ impl ScheduledCmd2PostAttentionPrepOutput {
 
     pub(crate) fn width(self) -> usize {
         self.state.width()
+    }
+
+    pub(crate) fn command_from_preselected_routes(
+        self,
+        graph: &FlashMoeScheduledGraph,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledRoutingCommand> {
+        let routing_state = self.routing();
+        let routing = graph.build_routing_topk(
+            self.layer,
+            routing_state.experts(),
+            self.active_experts,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+        )?;
+        let routing_output = routing.validate_output_state(routing_state)?;
+        routing.command_from_preselected_output(routing_output, routes)
     }
 }
 
@@ -3677,8 +3677,8 @@ mod tests {
             .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 2))
             .unwrap();
 
-        let routing = graph
-            .command_from_cmd2_preselected_routes(output, &[(7, 0.75), (3, 0.25)])
+        let routing = output
+            .command_from_preselected_routes(&graph, &[(7, 0.75), (3, 0.25)])
             .unwrap();
 
         assert_eq!(routing.layer, 11);
@@ -3717,8 +3717,8 @@ mod tests {
             .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 2))
             .unwrap();
 
-        let err = graph
-            .command_from_cmd2_preselected_routes(output, &[(7, 0.75)])
+        let err = output
+            .command_from_preselected_routes(&graph, &[(7, 0.75)])
             .unwrap_err();
 
         assert!(

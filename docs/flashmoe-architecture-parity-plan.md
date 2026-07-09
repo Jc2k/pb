@@ -142,8 +142,9 @@ The validator should reject silent fallbacks such as:
   scheduled inputs with source, tensor name, and width before the Metal encoder receives the CPU
   slice; when the graph expects the next-layer norm transition, a missing norm tensor is now an
   unsupported scheduled-CMD3 error rather than a silent no-next-norm path. Fused Metal
-  post-attention prep now records the scheduler-approved routing command before the runtime consumes
-  its preselected routes, so CMD2-to-routing handoff is not just a loose active-expert vector.
+  post-attention prep now resolves through the scheduler-owned CMD2 output before recording the
+  approved preselected routing command for the runtime, so CMD2-to-routing handoff is not just a
+  loose active-expert vector.
   Scheduled CMD3 Metal submission now returns a concrete deferred phase from both the wrapper and
   inner scheduled helpers, and treats "no submitted phase" as an unsupported implementation gap
   instead of returning to a fallback-shaped caller path.
@@ -216,9 +217,11 @@ The validator should reject silent fallbacks such as:
   fused-prep preselected routes into a scheduler-owned routing command. CPU router scores and fused
   CMD2 prep topK now submit declared routing-output state before route selection is accepted, and
   Metal post-attention prep must resolve as a scheduler-owned CMD2 output before its routes can feed
-  topK validation. CPU router score production now consumes a scheduler-built projection command
-  carrying declared routing state, hidden width, and the optional resident projection descriptor
-  before the dense store executes it. Active expert issue now consumes the resulting
+  topK validation. That resolved CMD2 output now builds the preselected routing command directly
+  instead of delegating command construction to a legacy Metal prep helper. CPU router score
+  production now consumes a scheduler-built projection command carrying declared routing state,
+  hidden width, and the optional resident projection descriptor before the dense store executes it.
+  Active expert issue now consumes the resulting
   `ScheduledRoutingCommand` directly and resolves it into scheduler-owned `ScheduledExpertRoutes`
   before reads are issued. The remaining gap is score production ownership: router score execution
   and any future readback variants are descriptor- and batch-backed by `weights`, but some execution
