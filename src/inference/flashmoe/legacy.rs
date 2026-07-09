@@ -83,14 +83,14 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
-    ScheduledCmd1Submission, ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs,
-    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Command,
-    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledRoutingScoreView, ScheduledSharedExpert,
+    PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
+    ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
+    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
+    ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
+    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3Submission,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
+    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
+    ScheduledRoutingCandidateSource, ScheduledRoutingScoreView, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -99,7 +99,7 @@ use super::state::{
     FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
     FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
     FlashMoeLayerStateRecord, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
-    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeTokenState,
+    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
     stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
@@ -10956,27 +10956,11 @@ impl FlashMoeEngine {
 
         let subphase_started = Instant::now();
         let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
-        let metal_kv_ready = if let Some(metal) = &self.metal {
-            metal
-                .record_kv(
-                    kv_record.position(),
-                    kv_record.layer(),
-                    layout,
-                    kv_record.key(),
-                    kv_record.value(),
-                )
-                .with_context(|| {
-                    format!(
-                        "Metal full-attention KV record failed for declared attention stage at layer {layer} position {position}"
-                    )
-                })?;
-            true
-        } else {
-            false
-        };
+        let attention_output =
+            self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
         kv_cache.record_kv_record(kv_record)?;
         let mut attended =
-            self.full_attention_cached(kv_cache, position, layer, &q, layout, metal_kv_ready)?;
+            self.full_attention_cached(kv_cache, position, layer, &q, layout, attention_output)?;
 
         if let Some(q_gate) = q_gate {
             for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
@@ -10987,6 +10971,49 @@ impl FlashMoeEngine {
             buckets.attention_kernel += subphase_started.elapsed();
         }
         Ok(attended)
+    }
+
+    fn resolve_full_attention_kv_state(
+        &self,
+        position: usize,
+        layer: usize,
+        layout: FullAttentionLayout,
+        kv_record: &FlashMoeFullAttentionKvRecord,
+    ) -> Result<ScheduledAttentionMathOutput> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.metal {
+            let tokens = position + 1;
+            if metal.attention_backend(tokens) == MetalAttentionBackend::Gpu {
+                let scheduled_attention = self.scheduled_graph.build_attention_math(
+                    layer,
+                    position,
+                    ScheduledAttentionMathImplementation::MetalKvCache,
+                )?;
+                let output = scheduled_attention
+                    .resolve_kv_state(kv_record.state(FlashMoeStatePlacement::GpuResident))?;
+                metal
+                    .record_kv(
+                        kv_record.position(),
+                        kv_record.layer(),
+                        layout,
+                        kv_record.key(),
+                        kv_record.value(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Metal full-attention KV record failed for declared attention stage at layer {layer} position {position}"
+                        )
+                    })?;
+                return Ok(output);
+            }
+        }
+
+        let scheduled_attention = self.scheduled_graph.build_attention_math(
+            layer,
+            position,
+            ScheduledAttentionMathImplementation::CpuKvCache,
+        )?;
+        scheduled_attention.resolve_kv_state(kv_record.state(FlashMoeStatePlacement::CpuVisible))
     }
 
     fn full_attention_projected(
@@ -11102,7 +11129,7 @@ impl FlashMoeEngine {
         layer: usize,
         q: &[f32],
         layout: FullAttentionLayout,
-        metal_kv_ready: bool,
+        attention_output: ScheduledAttentionMathOutput,
     ) -> Result<Vec<f32>> {
         let cpu_attention = |kv_cache: &KvCache| {
             kv_cache.causal_attention(
@@ -11114,18 +11141,28 @@ impl FlashMoeEngine {
                 layout.head_dim,
             )
         };
-
-        let Some(metal) = &self.metal else {
-            return cpu_attention(kv_cache);
-        };
-        if !metal_kv_ready {
-            return cpu_attention(kv_cache);
+        let kv_state = attention_output.state();
+        if kv_state.layer() != layer || kv_state.position() != position {
+            bail!(
+                "FlashMoe resolved attention KV state layer {} position {} does not match execution layer {layer} position {position}",
+                kv_state.layer(),
+                kv_state.position()
+            );
+        }
+        if kv_state.width() != layout.kv_width {
+            bail!(
+                "FlashMoe resolved attention KV width {} does not match layout width {}",
+                kv_state.width(),
+                layout.kv_width
+            );
         }
 
-        let tokens = position + 1;
-        match metal.attention_backend(tokens) {
-            MetalAttentionBackend::Cpu => cpu_attention(kv_cache),
-            MetalAttentionBackend::Gpu => metal
+        match attention_output.implementation() {
+            ScheduledAttentionMathImplementation::CpuKvCache => cpu_attention(kv_cache),
+            ScheduledAttentionMathImplementation::MetalKvCache => self
+                .metal
+                .as_ref()
+                .context("FlashMoe scheduled Metal attention is missing a Metal executor")?
                 .causal_attention_cached(position, layer, q, layout)
                 .with_context(|| {
                     format!(

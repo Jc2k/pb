@@ -9,8 +9,8 @@ use super::experts::{
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
 use super::state::{
-    FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
-    FlashMoeRoutingOutputState,
+    FlashMoeCmd3OutputState, FlashMoeFullAttentionKvState, FlashMoePostAttentionPrepState,
+    FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, FlashMoeStatePlacement,
 };
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
@@ -102,6 +102,29 @@ impl FlashMoeScheduledGraph {
             active_experts,
             attention,
             residual,
+        })
+    }
+
+    pub fn build_attention_math(
+        &self,
+        layer: usize,
+        position: usize,
+        implementation: ScheduledAttentionMathImplementation,
+    ) -> Result<ScheduledAttentionMath, FlashMoeUnsupportedCapability> {
+        let stage = *self.stage(FlashMoeGraphStage::AttentionMath);
+        let expected_placement = implementation.stage_placement();
+        if stage.placement != expected_placement {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                implementation.unsupported_reason(),
+            ));
+        }
+        Ok(ScheduledAttentionMath {
+            stage,
+            layer,
+            position,
+            implementation,
         })
     }
 
@@ -234,6 +257,100 @@ pub struct ScheduledCmd1Command<TInput> {
     pub cmd1: ScheduledCmd1AttentionProjections,
     pub layer: usize,
     pub input: TInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledAttentionMathImplementation {
+    CpuKvCache,
+    MetalKvCache,
+}
+
+impl ScheduledAttentionMathImplementation {
+    fn stage_placement(self) -> FlashMoeStagePlacement {
+        match self {
+            Self::CpuKvCache => FlashMoeStagePlacement::CpuDeclared,
+            Self::MetalKvCache => FlashMoeStagePlacement::Metal,
+        }
+    }
+
+    fn kv_placement(self) -> FlashMoeStatePlacement {
+        match self {
+            Self::CpuKvCache => FlashMoeStatePlacement::CpuVisible,
+            Self::MetalKvCache => FlashMoeStatePlacement::GpuResident,
+        }
+    }
+
+    fn unsupported_reason(self) -> &'static str {
+        match self {
+            Self::CpuKvCache => {
+                "CPU full-attention math is not declared for this graph-stage capability"
+            }
+            Self::MetalKvCache => {
+                "Metal full-attention KV/cache math is not declared for this graph-stage capability"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledAttentionMath {
+    pub stage: FlashMoeStageCapability,
+    pub layer: usize,
+    pub position: usize,
+    pub implementation: ScheduledAttentionMathImplementation,
+}
+
+impl ScheduledAttentionMath {
+    pub(crate) fn resolve_kv_state(
+        self,
+        state: FlashMoeFullAttentionKvState,
+    ) -> Result<ScheduledAttentionMathOutput> {
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled attention KV state is not declared graph state");
+        }
+        if state.layer() != self.layer {
+            bail!(
+                "FlashMoe scheduled attention layer {} does not match KV state layer {}",
+                self.layer,
+                state.layer()
+            );
+        }
+        if state.position() != self.position {
+            bail!(
+                "FlashMoe scheduled attention position {} does not match KV state position {}",
+                self.position,
+                state.position()
+            );
+        }
+        if state.placement() != self.implementation.kv_placement() {
+            bail!(
+                "FlashMoe scheduled attention implementation {:?} requires {:?} KV state, got {:?}",
+                self.implementation,
+                self.implementation.kv_placement(),
+                state.placement()
+            );
+        }
+        Ok(ScheduledAttentionMathOutput {
+            attention: self,
+            state,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledAttentionMathOutput {
+    pub attention: ScheduledAttentionMath,
+    state: FlashMoeFullAttentionKvState,
+}
+
+impl ScheduledAttentionMathOutput {
+    pub(crate) fn implementation(self) -> ScheduledAttentionMathImplementation {
+        self.attention.implementation
+    }
+
+    pub(crate) fn state(&self) -> FlashMoeFullAttentionKvState {
+        self.state
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2281,6 +2398,92 @@ mod tests {
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
+    }
+
+    #[test]
+    fn scheduled_attention_math_resolves_declared_cpu_kv_state() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let attention = graph
+            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::CpuKvCache)
+            .unwrap();
+
+        let output = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 14, 128, 128))
+            .unwrap();
+
+        assert_eq!(
+            output.implementation(),
+            ScheduledAttentionMathImplementation::CpuKvCache
+        );
+        assert_eq!(output.state().position(), 9);
+        assert_eq!(output.state().layer(), 14);
+    }
+
+    #[test]
+    fn scheduled_attention_math_rejects_undeclared_metal_kv_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let err = graph
+            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::MetalKvCache)
+            .unwrap_err();
+
+        assert_eq!(err.stage, FlashMoeGraphStage::AttentionMath);
+        assert!(
+            err.to_string()
+                .contains("Metal full-attention KV/cache math is not declared"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scheduled_attention_math_rejects_mismatched_kv_state_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let attention = graph
+            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::CpuKvCache)
+            .unwrap();
+
+        let placement_err = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::gpu_resident(9, 14, 128, 128))
+            .unwrap_err();
+        assert!(
+            placement_err
+                .to_string()
+                .contains("requires CpuVisible KV state"),
+            "{placement_err:#}"
+        );
+
+        let layer_err = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 15, 128, 128))
+            .unwrap_err();
+        assert!(
+            layer_err
+                .to_string()
+                .contains("does not match KV state layer"),
+            "{layer_err:#}"
+        );
+
+        let position_err = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(8, 14, 128, 128))
+            .unwrap_err();
+        assert!(
+            position_err
+                .to_string()
+                .contains("does not match KV state position"),
+            "{position_err:#}"
+        );
+
+        let width_err = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 14, 128, 127))
+            .unwrap_err();
+        assert!(
+            width_err
+                .to_string()
+                .contains("KV state is not declared graph state"),
+            "{width_err:#}"
+        );
     }
 
     #[test]

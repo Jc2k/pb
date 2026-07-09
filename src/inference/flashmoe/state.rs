@@ -626,8 +626,117 @@ impl FlashMoeFullAttentionKvRecord {
         &self.value
     }
 
+    pub(crate) fn state(&self, placement: FlashMoeStatePlacement) -> FlashMoeFullAttentionKvState {
+        match placement {
+            FlashMoeStatePlacement::CpuVisible => FlashMoeFullAttentionKvState::cpu_visible(
+                self.position,
+                self.layer,
+                self.key.len(),
+                self.value.len(),
+            ),
+            FlashMoeStatePlacement::GpuResident => FlashMoeFullAttentionKvState::gpu_resident(
+                self.position,
+                self.layer,
+                self.key.len(),
+                self.value.len(),
+            ),
+        }
+    }
+
     pub(crate) fn into_key_value(self) -> (Vec<f32>, Vec<f32>) {
         (self.key, self.value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeFullAttentionKvState {
+    position: usize,
+    layer: usize,
+    key_len: usize,
+    value_len: usize,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeFullAttentionKvState {
+    pub(crate) fn new(
+        position: usize,
+        layer: usize,
+        key_len: usize,
+        value_len: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            position,
+            layer,
+            key_len,
+            value_len,
+            placement,
+        }
+    }
+
+    pub(crate) fn cpu_visible(
+        position: usize,
+        layer: usize,
+        key_len: usize,
+        value_len: usize,
+    ) -> Self {
+        Self::new(
+            position,
+            layer,
+            key_len,
+            value_len,
+            FlashMoeStatePlacement::CpuVisible,
+        )
+    }
+
+    pub(crate) fn gpu_resident(
+        position: usize,
+        layer: usize,
+        key_len: usize,
+        value_len: usize,
+    ) -> Self {
+        Self::new(
+            position,
+            layer,
+            key_len,
+            value_len,
+            FlashMoeStatePlacement::GpuResident,
+        )
+    }
+
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.key_len
+    }
+
+    pub(crate) fn key_len(self) -> usize {
+        self.key_len
+    }
+
+    pub(crate) fn value_len(self) -> usize {
+        self.value_len
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        FlashMoeStateBufferRole::Kv
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.width() > 0
+            && self.key_len() == self.value_len()
+            && FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
     }
 }
 
@@ -889,8 +998,32 @@ mod tests {
         assert_eq!(record.layer(), 2);
         assert_eq!(record.key(), &[1.0, 1.5]);
         assert_eq!(record.value(), &[2.0, 2.5]);
+        assert_eq!(
+            record.state(FlashMoeStatePlacement::CpuVisible),
+            FlashMoeFullAttentionKvState::cpu_visible(5, 2, 2, 2)
+        );
         let (key, value) = record.into_key_value();
         assert_eq!(key, vec![1.0, 1.5]);
         assert_eq!(value, vec![2.0, 2.5]);
+    }
+
+    #[test]
+    fn full_attention_kv_state_declares_placement_width_and_role() {
+        let cpu = FlashMoeFullAttentionKvState::cpu_visible(7, 3, 4, 4);
+        assert_eq!(cpu.position(), 7);
+        assert_eq!(cpu.layer(), 3);
+        assert_eq!(cpu.width(), 4);
+        assert_eq!(cpu.key_len(), 4);
+        assert_eq!(cpu.value_len(), 4);
+        assert_eq!(cpu.role(), FlashMoeStateBufferRole::Kv);
+        assert_eq!(cpu.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(cpu.is_declared_graph_state());
+
+        let gpu = FlashMoeFullAttentionKvState::gpu_resident(7, 3, 4, 4);
+        assert_eq!(gpu.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(gpu.is_declared_graph_state());
+
+        assert!(!FlashMoeFullAttentionKvState::cpu_visible(7, 3, 0, 0).is_declared_graph_state());
+        assert!(!FlashMoeFullAttentionKvState::gpu_resident(7, 3, 4, 5).is_declared_graph_state());
     }
 }
