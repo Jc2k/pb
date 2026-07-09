@@ -60,15 +60,20 @@ use tracing::info;
 
 use super::capabilities::FlashMoeCapabilityPlan;
 #[cfg(test)]
+use super::experts::ExpertReadPath;
+#[cfg(test)]
 use super::experts::read_expert_pack_metadata;
+#[cfg(test)]
+use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertReadPath,
-    ExpertSlotDescriptor, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
-    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
-    PBQ4_EXPERT_MAGIC, ReusableExpertBuffer, ReusableExpertBytePool,
-    decode_fixed_q4_bf16_component_bytes, expert_layer_metadata_path, expert_layer_path,
-    read_expert_layer_pack_metadata, recycle_reusable_expert_bytes, take_reusable_expert_bytes,
+    ExpertLayerPackMetadata, ExpertLayerReader, ExpertPackMetadata, ExpertPackRecord,
+    ExpertRawPayload, ExpertRawRead, ExpertReadPlan, ExpertSlotDescriptor, ExpertSlotView,
+    FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertPayload,
+    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, ReusableExpertBuffer,
+    ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes, expert_layer_metadata_path,
+    expert_layer_path, expert_slot_end, expert_slot_offset, read_exact_at_positioned,
+    read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18080,15 +18085,8 @@ impl ExpertStore {
         let mut out = Vec::with_capacity(experts.len());
         for &expert in experts {
             let plan = reader.prepare_read(expert)?;
-            let result = reader.read_prepared_into(
-                expert,
-                plan.metadata,
-                plan.offset,
-                plan.packed_len,
-                plan.slot_capacity,
-                &mut scratch,
-            )?;
-            out.push(result.weights);
+            let raw = reader.read_prepared_into(expert, plan, &mut scratch)?;
+            out.push(ExpertWeights::from_raw_read(raw)?);
         }
         Ok(out)
     }
@@ -18118,169 +18116,6 @@ impl ExpertStore {
 type PendingExpertRead = PendingScheduledRead<ExpertReadResponse>;
 type PendingExpertSet = PendingScheduledExpertSet<ExpertReadResponse>;
 type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ExpertWeights>>;
-
-#[derive(Debug)]
-struct ExpertLayerReader {
-    path: PathBuf,
-    file: fs::File,
-    metadata: ExpertLayerPackMetadata,
-    fixed_q4: FixedQ4ExpertSlotSpec,
-    fixed_q4_buffer_pool: ReusableExpertBytePool,
-}
-
-impl ExpertLayerReader {
-    fn open(
-        root: &Path,
-        layer: usize,
-        fixed_q4: FixedQ4ExpertSlotSpec,
-        fixed_q4_buffer_pool: ReusableExpertBytePool,
-    ) -> Result<Self> {
-        let path = expert_layer_path(root, layer);
-        let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
-            format!(
-                "failed to read expert layer metadata {}",
-                expert_layer_metadata_path(root, layer).display()
-            )
-        })?;
-        let file = fs::File::open(&path)
-            .with_context(|| format!("failed to open expert layer {}", path.display()))?;
-        Ok(Self {
-            path,
-            file,
-            metadata,
-            fixed_q4,
-            fixed_q4_buffer_pool,
-        })
-    }
-
-    fn prepare_read(&self, expert: usize) -> Result<ExpertReadPlan> {
-        let metadata = self.metadata.pack_for(expert).cloned().with_context(|| {
-            format!(
-                "expert layer {} has no metadata for expert {expert}",
-                self.metadata.layer
-            )
-        })?;
-        if metadata.packed_bytes > self.metadata.expert_size {
-            bail!(
-                "expert layer {} expert {expert} metadata length {} exceeds slot size {}",
-                self.metadata.layer,
-                metadata.packed_bytes,
-                self.metadata.expert_size
-            );
-        }
-        let offset = expert_slot_offset(expert, self.metadata.expert_size)?;
-        let packed_len = usize::try_from(metadata.packed_bytes)
-            .context("expert pack length does not fit usize")?;
-        let slot_capacity = usize::try_from(self.metadata.expert_size)
-            .context("expert layer slot size does not fit usize")?;
-        Ok(ExpertReadPlan {
-            metadata,
-            offset,
-            packed_len,
-            slot_capacity,
-        })
-    }
-
-    fn read_prepared_into(
-        &self,
-        expert: usize,
-        metadata: ExpertPackMetadata,
-        offset: u64,
-        packed_len: usize,
-        slot_capacity: usize,
-        scratch: &mut ReusableExpertBuffer,
-    ) -> Result<ExpertReadResult> {
-        if scratch.capacity() < slot_capacity
-            && let Some(bytes) =
-                take_reusable_expert_bytes(&self.fixed_q4_buffer_pool, slot_capacity)
-        {
-            let previous = scratch.adopt_buffer(bytes);
-            recycle_reusable_expert_bytes(
-                &self.fixed_q4_buffer_pool,
-                previous,
-                self.fixed_q4.layout.expert_bytes,
-            );
-        }
-        let payload = scratch.prepare_payload(slot_capacity, packed_len)?;
-        let read_started = Instant::now();
-        read_exact_at_positioned(&self.file, payload, offset).with_context(|| {
-            format!(
-                "failed to read expert {expert} from {}",
-                self.path.display()
-            )
-        })?;
-        let read_latency = read_started.elapsed();
-        let slot = scratch.slot_view(self.metadata.layer, expert, offset, slot_capacity)?;
-        let payload = slot.payload();
-        let descriptor = slot.descriptor();
-        let (records, fixed_q4, packed_prefix) = if payload.starts_with(PBQ4_EXPERT_MAGIC) {
-            let records = parse_pbq4_expert_pack(payload, Some(&metadata))
-                .with_context(|| format!("failed to parse expert pack {}", self.path.display()))?;
-            match fixed_q4_payload_from_pbq4_records(
-                self.metadata.layer,
-                expert,
-                self.fixed_q4,
-                &records,
-                Some(Arc::clone(&self.fixed_q4_buffer_pool)),
-            ) {
-                Ok(fixed_q4) => (Vec::new(), Some(fixed_q4), Vec::new()),
-                Err(error) => {
-                    tracing::trace!(
-                        layer = self.metadata.layer,
-                        expert,
-                        error = %error,
-                        "PBQ4 expert pack is not compatible with the fixed Q4 slot layout"
-                    );
-                    (records, None, slot.payload_prefix(4096).to_vec())
-                }
-            }
-        } else {
-            FixedQ4ExpertSlotView::new(slot, self.fixed_q4.layout).with_context(|| {
-                format!(
-                    "expert {} is neither a PBQ4 pack nor a fixed Q4 slot matching the model layout",
-                    self.path.display()
-                )
-            })?;
-            let payload = scratch.take_payload();
-            (
-                Vec::new(),
-                Some(FixedQ4ExpertPayload::from_whole_slot(
-                    self.fixed_q4,
-                    payload,
-                    Some(Arc::clone(&self.fixed_q4_buffer_pool)),
-                )?),
-                Vec::new(),
-            )
-        };
-        Ok(ExpertReadResult {
-            weights: ExpertWeights {
-                layer: self.metadata.layer,
-                expert,
-                slot: descriptor,
-                packed: packed_prefix,
-                records,
-                fixed_q4,
-            },
-            read_latency,
-            read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ExpertReadPlan {
-    metadata: ExpertPackMetadata,
-    offset: u64,
-    packed_len: usize,
-    slot_capacity: usize,
-}
-
-#[derive(Debug)]
-struct ExpertReadResult {
-    weights: ExpertWeights,
-    read_latency: Duration,
-    read_path: ExpertReadPath,
-}
 
 #[derive(Debug)]
 struct ExpertScheduler {
@@ -18321,10 +18156,7 @@ impl ExpertScheduler {
                 id: issue.id,
                 expert: issue.key.expert,
                 reader: Arc::clone(&reader),
-                metadata: plan.metadata,
-                offset: plan.offset,
-                packed_len: plan.packed_len,
-                slot_capacity: plan.slot_capacity,
+                plan,
                 warm: issue.warm,
                 issued_at: issue.issued_at,
                 tx,
@@ -18396,16 +18228,16 @@ impl ExpertIoWorkerPool {
                 while let Ok(job) = rx.recv() {
                     let started_at = Instant::now();
                     let queue_latency = started_at.saturating_duration_since(job.issued_at);
-                    let result = job.reader.read_prepared_into(
-                        job.expert,
-                        job.metadata,
-                        job.offset,
-                        job.packed_len,
-                        job.slot_capacity,
-                        &mut scratch,
-                    );
+                    let bytes_read = job.plan.packed_len as u64;
+                    let result = job
+                        .reader
+                        .read_prepared_into(job.expert, job.plan, &mut scratch);
                     let (result, read_latency, read_path) = match result {
-                        Ok(result) => (Ok(result.weights), result.read_latency, result.read_path),
+                        Ok(raw) => {
+                            let read_latency = raw.read_latency;
+                            let read_path = raw.read_path;
+                            (ExpertWeights::from_raw_read(raw), read_latency, read_path)
+                        }
                         Err(error) => (
                             Err(error),
                             started_at.elapsed(),
@@ -18417,7 +18249,7 @@ impl ExpertIoWorkerPool {
                         queue_latency,
                         read_path,
                         read_latency,
-                        bytes_read: job.packed_len as u64,
+                        bytes_read,
                         warm: job.warm,
                         result,
                     });
@@ -18458,10 +18290,7 @@ struct ExpertReadJob {
     id: u64,
     expert: usize,
     reader: Arc<ExpertLayerReader>,
-    metadata: ExpertPackMetadata,
-    offset: u64,
-    packed_len: usize,
-    slot_capacity: usize,
+    plan: ExpertReadPlan,
     warm: bool,
     issued_at: Instant,
     tx: mpsc::Sender<ExpertReadResponse>,
@@ -18686,6 +18515,47 @@ impl AsRef<ExpertWeights> for ExpertWeights {
 }
 
 impl ExpertWeights {
+    fn from_raw_read(raw: ExpertRawRead) -> Result<Self> {
+        let (records, fixed_q4, packed_prefix) = match raw.payload {
+            ExpertRawPayload::Pbq4(bytes) => {
+                let records =
+                    parse_pbq4_expert_pack(&bytes, Some(&raw.metadata)).with_context(|| {
+                        format!(
+                            "failed to parse expert pack layer {} expert {}",
+                            raw.layer, raw.expert
+                        )
+                    })?;
+                match fixed_q4_payload_from_pbq4_records(
+                    raw.layer,
+                    raw.expert,
+                    raw.fixed_q4,
+                    &records,
+                    raw.recycle_pool,
+                ) {
+                    Ok(fixed_q4) => (Vec::new(), Some(fixed_q4), Vec::new()),
+                    Err(error) => {
+                        tracing::trace!(
+                            layer = raw.layer,
+                            expert = raw.expert,
+                            error = %error,
+                            "PBQ4 expert pack is not compatible with the fixed Q4 slot layout"
+                        );
+                        (records, None, bytes[..bytes.len().min(4096)].to_vec())
+                    }
+                }
+            }
+            ExpertRawPayload::FixedQ4(fixed_q4) => (Vec::new(), Some(fixed_q4), Vec::new()),
+        };
+        Ok(Self {
+            layer: raw.layer,
+            expert: raw.expert,
+            slot: raw.slot,
+            packed: packed_prefix,
+            records,
+            fixed_q4,
+        })
+    }
+
     pub fn q4_fma_matvec(
         &self,
         input: &[f32],
@@ -19417,33 +19287,6 @@ fn pbq4_layer_looks_fixed_q4_compatible(
     Ok(fixed_q4_pack_from_pbq4_records(metadata.layer, first.expert, spec, &records).is_ok())
 }
 
-fn read_exact_at_positioned(file: &fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut read_total = 0usize;
-        while read_total < buf.len() {
-            let n = file.read_at(
-                &mut buf[read_total..],
-                offset
-                    .checked_add(read_total as u64)
-                    .context("positioned read offset overflow")?,
-            )?;
-            if n == 0 {
-                bail!("short positioned read");
-            }
-            read_total += n;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = file.try_clone().context("failed to clone file for read")?;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        file.read_exact(buf)?;
-        Ok(())
-    }
-}
-
 fn write_all_at_positioned(file: &fs::File, buf: &[u8], offset: u64) -> Result<()> {
     #[cfg(unix)]
     {
@@ -19469,18 +19312,6 @@ fn write_all_at_positioned(file: &fs::File, buf: &[u8], offset: u64) -> Result<(
         file.write_all(buf)?;
         Ok(())
     }
-}
-
-fn expert_slot_offset(expert: usize, expert_size: u64) -> Result<u64> {
-    (expert as u64)
-        .checked_mul(expert_size)
-        .context("expert slot offset overflow")
-}
-
-fn expert_slot_end(expert: usize, expert_size: u64, packed_bytes: u64) -> Result<u64> {
-    expert_slot_offset(expert, expert_size)?
-        .checked_add(packed_bytes)
-        .context("expert slot end overflow")
 }
 
 fn fixed_q4_expert_records(

@@ -2,8 +2,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(not(unix))]
+use std::io::{Read, Seek};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
@@ -237,6 +242,192 @@ pub(crate) fn read_expert_layer_pack_metadata(
     .with_context(|| format!("failed to parse expert metadata {}", path.display()))?;
     metadata.validate(&path, layer)?;
     Ok(Some(metadata))
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpertLayerReader {
+    path: PathBuf,
+    file: fs::File,
+    metadata: ExpertLayerPackMetadata,
+    fixed_q4: FixedQ4ExpertSlotSpec,
+    fixed_q4_buffer_pool: ReusableExpertBytePool,
+}
+
+impl ExpertLayerReader {
+    pub(crate) fn open(
+        root: &Path,
+        layer: usize,
+        fixed_q4: FixedQ4ExpertSlotSpec,
+        fixed_q4_buffer_pool: ReusableExpertBytePool,
+    ) -> Result<Self> {
+        let path = expert_layer_path(root, layer);
+        let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
+            format!(
+                "failed to read expert layer metadata {}",
+                expert_layer_metadata_path(root, layer).display()
+            )
+        })?;
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open expert layer {}", path.display()))?;
+        Ok(Self {
+            path,
+            file,
+            metadata,
+            fixed_q4,
+            fixed_q4_buffer_pool,
+        })
+    }
+
+    pub(crate) fn prepare_read(&self, expert: usize) -> Result<ExpertReadPlan> {
+        let metadata = self.metadata.pack_for(expert).cloned().with_context(|| {
+            format!(
+                "expert layer {} has no metadata for expert {expert}",
+                self.metadata.layer
+            )
+        })?;
+        if metadata.packed_bytes > self.metadata.expert_size {
+            bail!(
+                "expert layer {} expert {expert} metadata length {} exceeds slot size {}",
+                self.metadata.layer,
+                metadata.packed_bytes,
+                self.metadata.expert_size
+            );
+        }
+        let offset = expert_slot_offset(expert, self.metadata.expert_size)?;
+        let packed_len = usize::try_from(metadata.packed_bytes)
+            .context("expert pack length does not fit usize")?;
+        let slot_capacity = usize::try_from(self.metadata.expert_size)
+            .context("expert layer slot size does not fit usize")?;
+        Ok(ExpertReadPlan {
+            metadata,
+            offset,
+            packed_len,
+            slot_capacity,
+        })
+    }
+
+    pub(crate) fn read_prepared_into(
+        &self,
+        expert: usize,
+        plan: ExpertReadPlan,
+        scratch: &mut ReusableExpertBuffer,
+    ) -> Result<ExpertRawRead> {
+        if scratch.capacity() < plan.slot_capacity
+            && let Some(bytes) =
+                take_reusable_expert_bytes(&self.fixed_q4_buffer_pool, plan.slot_capacity)
+        {
+            let previous = scratch.adopt_buffer(bytes);
+            recycle_reusable_expert_bytes(
+                &self.fixed_q4_buffer_pool,
+                previous,
+                self.fixed_q4.layout.expert_bytes,
+            );
+        }
+        let payload = scratch.prepare_payload(plan.slot_capacity, plan.packed_len)?;
+        let read_started = Instant::now();
+        read_exact_at_positioned(&self.file, payload, plan.offset).with_context(|| {
+            format!(
+                "failed to read expert {expert} from {}",
+                self.path.display()
+            )
+        })?;
+        let read_latency = read_started.elapsed();
+        let slot =
+            scratch.slot_view(self.metadata.layer, expert, plan.offset, plan.slot_capacity)?;
+        let descriptor = slot.descriptor();
+        let payload = if slot.payload().starts_with(PBQ4_EXPERT_MAGIC) {
+            ExpertRawPayload::Pbq4(scratch.take_payload())
+        } else {
+            FixedQ4ExpertSlotView::new(slot, self.fixed_q4.layout).with_context(|| {
+                format!(
+                    "expert {} is neither a PBQ4 pack nor a fixed Q4 slot matching the model layout",
+                    self.path.display()
+                )
+            })?;
+            ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_whole_slot(
+                self.fixed_q4,
+                scratch.take_payload(),
+                Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+            )?)
+        };
+        Ok(ExpertRawRead {
+            layer: self.metadata.layer,
+            expert,
+            slot: descriptor,
+            metadata: plan.metadata,
+            fixed_q4: self.fixed_q4,
+            recycle_pool: Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+            payload,
+            read_latency,
+            read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpertReadPlan {
+    pub(crate) metadata: ExpertPackMetadata,
+    pub(crate) offset: u64,
+    pub(crate) packed_len: usize,
+    pub(crate) slot_capacity: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpertRawRead {
+    pub(crate) layer: usize,
+    pub(crate) expert: usize,
+    pub(crate) slot: ExpertSlotDescriptor,
+    pub(crate) metadata: ExpertPackMetadata,
+    pub(crate) fixed_q4: FixedQ4ExpertSlotSpec,
+    pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
+    pub(crate) payload: ExpertRawPayload,
+    pub(crate) read_latency: Duration,
+    pub(crate) read_path: ExpertReadPath,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExpertRawPayload {
+    Pbq4(Vec<u8>),
+    FixedQ4(FixedQ4ExpertPayload),
+}
+
+pub(crate) fn expert_slot_offset(expert: usize, expert_size: u64) -> Result<u64> {
+    (expert as u64)
+        .checked_mul(expert_size)
+        .context("expert slot offset overflow")
+}
+
+pub(crate) fn expert_slot_end(expert: usize, expert_size: u64, packed_bytes: u64) -> Result<u64> {
+    expert_slot_offset(expert, expert_size)?
+        .checked_add(packed_bytes)
+        .context("expert slot end overflow")
+}
+
+pub(crate) fn read_exact_at_positioned(file: &fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut read_total = 0usize;
+        while read_total < buf.len() {
+            let n = file.read_at(
+                &mut buf[read_total..],
+                offset
+                    .checked_add(read_total as u64)
+                    .context("positioned read offset overflow")?,
+            )?;
+            if n == 0 {
+                bail!("short positioned read");
+            }
+            read_total += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file.try_clone().context("failed to clone file for read")?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_exact(buf)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,6 +999,77 @@ mod tests {
             expert_layer_path(tmp.path(), 5),
             tmp.path().join("layer_05.bin")
         );
+    }
+
+    #[test]
+    fn expert_layer_reader_reads_fixed_q4_whole_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tiny_fixed_q4_layout();
+        let spec = FixedQ4ExpertSlotSpec::new(layout, 2, 2).unwrap();
+        let payload: Vec<u8> = (0..45).collect();
+        std::fs::write(expert_layer_path(tmp.path(), 0), &payload).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            layout.expert_bytes as u64,
+            1,
+            vec![tiny_pack_metadata(0, 0, layout.expert_bytes as u64)],
+        );
+        std::fs::write(
+            expert_layer_metadata_path(tmp.path(), 0),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let reader =
+            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        let plan = reader.prepare_read(0).unwrap();
+        let mut scratch = ReusableExpertBuffer::default();
+        let raw = reader.read_prepared_into(0, plan, &mut scratch).unwrap();
+
+        assert_eq!(raw.slot.layer, 0);
+        assert_eq!(raw.slot.expert, 0);
+        assert_eq!(raw.read_path, ExpertReadPath::PositionedRead);
+        match raw.payload {
+            ExpertRawPayload::FixedQ4(fixed) => {
+                assert_eq!(
+                    fixed.component(QwenMoeExpertComponentKind::GateWeight),
+                    &[0, 1, 2, 3, 4, 5, 6, 7]
+                );
+            }
+            ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
+        }
+    }
+
+    #[test]
+    fn expert_layer_reader_keeps_pbq4_as_import_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tiny_fixed_q4_layout();
+        let spec = FixedQ4ExpertSlotSpec::new(layout, 2, 2).unwrap();
+        let mut payload = PBQ4_EXPERT_MAGIC.to_vec();
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(expert_layer_path(tmp.path(), 0), &payload).unwrap();
+        let metadata = ExpertLayerPackMetadata::new(
+            0,
+            payload.len() as u64,
+            1,
+            vec![tiny_pack_metadata(0, 0, payload.len() as u64)],
+        );
+        std::fs::write(
+            expert_layer_metadata_path(tmp.path(), 0),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let reader =
+            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        let plan = reader.prepare_read(0).unwrap();
+        let mut scratch = ReusableExpertBuffer::default();
+        let raw = reader.read_prepared_into(0, plan, &mut scratch).unwrap();
+
+        match raw.payload {
+            ExpertRawPayload::Pbq4(bytes) => assert_eq!(bytes, payload),
+            ExpertRawPayload::FixedQ4(_) => panic!("PBQ4 slot classified as fixed Q4"),
+        }
     }
 
     #[test]
