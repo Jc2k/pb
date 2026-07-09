@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use std::sync::{Arc, Mutex};
 
 use super::model_family::{
-    QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
+    QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
+    QwenMoeQ4ExpertLayout,
 };
-use super::types::ACTIVE_EXPERTS_PER_TOKEN;
+use super::types::{ACTIVE_EXPERTS_PER_TOKEN, HIDDEN_DIM};
 
 pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
 
@@ -43,6 +44,45 @@ pub const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
     speculative_routing: false,
     broad_ssd_gpu_overlap: false,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FixedQ4ExpertSlotSpec {
+    pub(crate) layout: QwenMoeQ4ExpertLayout,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+}
+
+impl FixedQ4ExpertSlotSpec {
+    pub(crate) fn new(
+        layout: QwenMoeQ4ExpertLayout,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        layout.validate()?;
+        if hidden_size == 0 || intermediate_size == 0 {
+            bail!(
+                "fixed Q4 expert slot spec requires non-zero dimensions, hidden_size={hidden_size}, intermediate_size={intermediate_size}"
+            );
+        }
+        Ok(Self {
+            layout,
+            hidden_size,
+            intermediate_size,
+        })
+    }
+
+    pub(crate) fn qwen35_a17b() -> Result<Self> {
+        Self::new(QwenMoeQ4ExpertLayout::qwen35_a17b(), HIDDEN_DIM, 1024)
+    }
+
+    pub(crate) fn from_model_layout(layout: &QwenMoeModelLayout) -> Result<Self> {
+        Self::new(
+            layout.q4_expert_layout,
+            layout.hidden_size,
+            layout.moe_intermediate_size,
+        )
+    }
+}
 
 pub fn take_reusable_expert_bytes(
     pool: &ReusableExpertBytePool,
@@ -340,6 +380,40 @@ mod tests {
 
         assert!(
             err.to_string().contains("shorter than layout size 45"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn fixed_q4_slot_spec_validates_layout_and_dimensions() {
+        let layout = tiny_fixed_q4_layout();
+        let spec = FixedQ4ExpertSlotSpec::new(layout, 8, 4).unwrap();
+
+        assert_eq!(spec.layout, layout);
+        assert_eq!(spec.hidden_size, 8);
+        assert_eq!(spec.intermediate_size, 4);
+    }
+
+    #[test]
+    fn fixed_q4_slot_spec_rejects_invalid_layout_offsets() {
+        let mut layout = tiny_fixed_q4_layout();
+        layout.components[1].offset += 1;
+
+        let err = FixedQ4ExpertSlotSpec::new(layout, 8, 4).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("GateScale starts at 9, expected 8"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn fixed_q4_slot_spec_rejects_zero_dimensions() {
+        let err = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 0, 4).unwrap_err();
+
+        assert!(
+            err.to_string().contains("requires non-zero dimensions"),
             "{err:#}"
         );
     }

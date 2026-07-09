@@ -61,7 +61,7 @@ use tracing::info;
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::{
     ExpertReadPath, ExpertSlotDescriptor, ExpertSlotView, FLASHMOE_EXPERT_IO_POLICY,
-    FixedQ4ExpertSlotView, ReusableExpertBuffer, ReusableExpertBytePool,
+    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, ReusableExpertBuffer, ReusableExpertBytePool,
     recycle_reusable_expert_bytes, take_reusable_expert_bytes,
 };
 use super::math::*;
@@ -18055,41 +18055,19 @@ pub struct ExpertStore {
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FixedQ4ExpertSlotSpec {
-    layout: QwenMoeQ4ExpertLayout,
-    hidden_size: usize,
-    intermediate_size: usize,
-}
-
 impl ExpertStore {
     pub fn open(root: PathBuf) -> Result<Self> {
-        Self::open_with_fixed_q4(
-            root,
-            FixedQ4ExpertSlotSpec {
-                layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
-                hidden_size: HIDDEN_DIM,
-                intermediate_size: 1024,
-            },
-        )
+        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::qwen35_a17b()?)
     }
 
     pub fn open_with_model_layout(root: PathBuf, layout: &QwenMoeModelLayout) -> Result<Self> {
-        Self::open_with_fixed_q4(
-            root,
-            FixedQ4ExpertSlotSpec {
-                layout: layout.q4_expert_layout,
-                hidden_size: layout.hidden_size,
-                intermediate_size: layout.moe_intermediate_size,
-            },
-        )
+        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::from_model_layout(layout)?)
     }
 
     fn open_with_fixed_q4(root: PathBuf, fixed_q4: FixedQ4ExpertSlotSpec) -> Result<Self> {
         if !root.is_dir() {
             bail!("expert store {} does not exist", root.display());
         }
-        fixed_q4.layout.validate()?;
         Ok(Self {
             root,
             fixed_q4,
@@ -19566,12 +19544,7 @@ fn read_expert_layer_pack_metadata(
 }
 
 fn ensure_fixed_q4_expert_cache(plan: &FlashMoePlan, layout: &QwenMoeModelLayout) -> Result<usize> {
-    let spec = FixedQ4ExpertSlotSpec {
-        layout: layout.q4_expert_layout,
-        hidden_size: layout.hidden_size,
-        intermediate_size: layout.moe_intermediate_size,
-    };
-    spec.layout.validate()?;
+    let spec = FixedQ4ExpertSlotSpec::from_model_layout(layout)?;
     let mut rewritten = 0usize;
     for layer in 0..layout.layers {
         if rewrite_pbq4_layer_to_fixed_q4(&plan.experts_dir, layer, layout.experts_per_layer, spec)
