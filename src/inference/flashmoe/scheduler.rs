@@ -3,8 +3,8 @@ use super::capabilities::{
     FlashMoeUnsupportedCapability,
 };
 use super::experts::{
-    ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
-    FLASHMOE_EXPERT_IO_POLICY, Q4MatvecPayload,
+    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
+    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection, Q4MatvecPayload,
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
@@ -1123,6 +1123,70 @@ impl ScheduledExpertSlot {
     }
 }
 
+impl ScheduledCmd3Expert for ScheduledExpertSlot {
+    fn scheduled_expert_layer(&self) -> usize {
+        self.layer()
+    }
+
+    fn scheduled_expert_id(&self) -> usize {
+        self.expert()
+    }
+
+    fn scheduled_expert_slot_descriptor(&self) -> ExpertSlotDescriptor {
+        self.descriptor()
+    }
+}
+
+impl ScheduledCmd3ExpertPayload for ScheduledExpertSlot {
+    fn scheduled_cmd3_expert_phase_payload(
+        &self,
+        width: usize,
+    ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
+        let ExpertRawPayload::FixedQ4(fixed_q4) = &self.raw.payload else {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: scheduler-owned layer {} expert {} slot is not a fixed-Q4 whole-expert payload; PBQ4/component records are import compatibility only",
+                self.layer(),
+                self.expert()
+            );
+        };
+        let gate = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Gate,
+            width,
+            fixed_q4.spec.intermediate_size,
+        );
+        let up = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Up,
+            width,
+            fixed_q4.spec.intermediate_size,
+        );
+        let Some((gate, up)) = gate.zip(up) else {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide gate/up payloads for width {width}",
+                self.layer(),
+                self.expert()
+            );
+        };
+        let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
+        else {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide down payload for width {width}",
+                self.layer(),
+                self.expert()
+            );
+        };
+        Ok(ScheduledExpertPhaseMlpPayload::Q4(
+            ScheduledQ4ExpertPhaseMlpPayload::new(
+                self.layer(),
+                self.expert(),
+                width,
+                gate,
+                up,
+                down,
+            )?,
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ActiveExpertReadScheduler {
     metrics: ExpertSchedulerMetrics,
@@ -1381,7 +1445,10 @@ impl ExpertSchedulerSnapshot {
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{
-        ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertSlotSpec,
+        ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec,
+    };
+    use crate::inference::flashmoe::model_family::{
+        QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
     };
     use crate::inference::flashmoe::weights::{
         DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, RouterScoreProjectionBinding,
@@ -1412,6 +1479,61 @@ mod tests {
         QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap()
     }
 
+    fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
+        use QwenMoeExpertComponentKind::*;
+        QwenMoeQ4ExpertLayout {
+            expert_bytes: 30,
+            group_size: 2,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: GateWeight,
+                    offset: 0,
+                    bytes: 2,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateScale,
+                    offset: 2,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: GateBias,
+                    offset: 6,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpWeight,
+                    offset: 10,
+                    bytes: 2,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 12,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 16,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownWeight,
+                    offset: 20,
+                    bytes: 2,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownScale,
+                    offset: 22,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: DownBias,
+                    offset: 26,
+                    bytes: 4,
+                },
+            ],
+        }
+    }
+
     fn raw_pbq4_read(layer: usize, expert: usize, payload: Vec<u8>) -> ExpertRawRead {
         let layout = qwen35_layout();
         ExpertRawRead {
@@ -1439,6 +1561,38 @@ mod tests {
             recycle_pool: None,
             payload: ExpertRawPayload::Pbq4(payload),
             read_latency: Duration::from_millis(7),
+            read_path: ExpertReadPath::PositionedRead,
+        }
+    }
+
+    fn raw_fixed_q4_read(layer: usize, expert: usize) -> ExpertRawRead {
+        let fixed_q4 = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let payload = FixedQ4ExpertPayload::from_whole_slot(
+            fixed_q4,
+            vec![0; fixed_q4.layout.expert_bytes],
+            None,
+        )
+        .unwrap();
+        ExpertRawRead {
+            layer,
+            expert,
+            slot: ExpertSlotDescriptor {
+                layer,
+                expert,
+                slot_offset: 512,
+                slot_capacity: fixed_q4.layout.expert_bytes,
+                payload_len: fixed_q4.layout.expert_bytes,
+            },
+            metadata: ExpertPackMetadata {
+                layer,
+                expert,
+                packed_bytes: fixed_q4.layout.expert_bytes as u64,
+                records: Vec::new(),
+            },
+            fixed_q4,
+            recycle_pool: None,
+            payload: ExpertRawPayload::FixedQ4(payload),
+            read_latency: Duration::from_millis(3),
             read_path: ExpertReadPath::PositionedRead,
         }
     }
@@ -2388,6 +2542,53 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("scheduled expert batch has 1 experts for 2 routes"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_expert_slot_resolves_cmd3_payload_without_legacy_adapter() {
+        let slot = ScheduledExpertSlot::from_raw(raw_fixed_q4_read(3, 8));
+
+        assert_eq!(slot.scheduled_expert_layer(), 3);
+        assert_eq!(slot.scheduled_expert_id(), 8);
+        assert_eq!(
+            slot.scheduled_expert_slot_descriptor(),
+            ExpertSlotDescriptor {
+                layer: 3,
+                expert: 8,
+                slot_offset: 512,
+                slot_capacity: tiny_fixed_q4_layout().expert_bytes,
+                payload_len: tiny_fixed_q4_layout().expert_bytes,
+            }
+        );
+
+        let payload = slot.scheduled_cmd3_expert_phase_payload(2).unwrap();
+        let q4 = payload.q4();
+        assert_eq!(q4.gate.rows, 2);
+        assert_eq!(q4.gate.cols, 2);
+        assert_eq!(q4.up.rows, 2);
+        assert_eq!(q4.up.cols, 2);
+        assert_eq!(q4.down.rows, 2);
+        assert_eq!(q4.down.cols, 2);
+        let source = q4
+            .gate
+            .source
+            .expect("fixed slot should expose source offsets");
+        assert_eq!(source.packed_offset, 0);
+        assert_eq!(source.scale_offset, 2);
+        assert_eq!(source.bias_offset, 6);
+    }
+
+    #[test]
+    fn scheduled_expert_slot_rejects_pbq4_component_payload_for_cmd3() {
+        let slot = ScheduledExpertSlot::from_raw(raw_pbq4_read(3, 8, vec![1, 2, 3]));
+
+        let err = slot.scheduled_cmd3_expert_phase_payload(2).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("PBQ4/component records are import compatibility only"),
             "{err:#}"
         );
     }
