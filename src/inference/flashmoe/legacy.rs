@@ -99,25 +99,22 @@ use super::scheduler::{
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
-use super::state::FlashMoeRoutingOutputState;
-#[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer,
     FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
     FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState,
     FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
-    FlashMoeRoutingOutputSource, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreBatch,
-    RouterScoreProjectionDescriptor, RuntimeTensorEntry, ScheduledNextNormWeights,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    validate_dense_matvec_shape,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
+    RuntimeTensorEntry, ScheduledNextNormWeights, SharedExpertPhaseQ4Projections,
+    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -11289,19 +11286,8 @@ impl FlashMoeEngine {
             projection,
             normed.len(),
         )?;
-        let scheduled_routing = router_score_command.routing;
-        let router_scores = self.dense.router_scores_with_metal(
-            self.metal.as_ref(),
-            router_score_command,
-            normed,
-        )?;
-        let routing_output = scheduled_routing.validate_output_state(router_scores.state())?;
-        debug_assert_eq!(routing_output.routing, scheduled_routing);
-        debug_assert_eq!(
-            routing_output.state().source(),
-            FlashMoeRoutingOutputSource::CpuRouterScores
-        );
-        scheduled_routing.select_command_from_output_scores(routing_output, &router_scores)
+        self.dense
+            .router_command_with_metal(self.metal.as_ref(), router_score_command, normed)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -16592,12 +16578,12 @@ impl DenseStore {
         Ok(acc)
     }
 
-    fn router_scores_with_metal(
+    fn router_command_with_metal(
         &self,
         metal: Option<&MetalExecutor>,
         command: ScheduledRouterScoreProjectionCommand,
         hidden: &[f32],
-    ) -> Result<RouterScoreBatch> {
+    ) -> Result<ScheduledRoutingCommand> {
         if hidden.len() != command.hidden_width {
             bail!(
                 "FlashMoe scheduled router score projection hidden length {} does not match declared width {}",
@@ -16610,13 +16596,13 @@ impl DenseStore {
         let tensor_name = router_tensor_name(layer);
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
-            return command.into_score_batch(scores);
+            return command.into_routing_command(scores);
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.router_projection(layer, expert, hidden)?;
         }
-        command.into_score_batch(router_scores)
+        command.into_routing_command(router_scores)
     }
 
     fn router_score_projection_descriptor(
@@ -31337,27 +31323,28 @@ mod tests {
             .build_routing_topk(0, 2, 1, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
         let projection = store.router_score_projection_descriptor(0, 2, 3).unwrap();
+        let projection_ref = projection
+            .as_ref()
+            .expect("registered router tensor should produce a typed projection descriptor");
+        assert_eq!(projection_ref.layer, 0);
+        assert_eq!(projection_ref.experts, 2);
+        assert_eq!(projection_ref.hidden_width, 3);
+        assert_eq!(projection_ref.tensor_name, router_tensor_name(0));
         let command = scheduled_routing
             .build_score_projection_command(projection, 3)
             .unwrap();
 
-        let scores = store
-            .router_scores_with_metal(None, command, &[0.5, -1.0, 2.0])
+        let routing_command = store
+            .router_command_with_metal(None, command, &[0.5, -1.0, 2.0])
             .unwrap();
 
         assert_eq!(
-            scores.state(),
-            FlashMoeRoutingOutputState::cpu_router_scores(0, 2, 1)
+            routing_command.source,
+            ScheduledRoutingCandidateSource::CpuRouterScores
         );
-        assert_eq!(scores.scores, vec![4.5, 9.0]);
-        let projection = scores
-            .projection
-            .as_ref()
-            .expect("registered router tensor should produce a typed projection descriptor");
-        assert_eq!(projection.layer, 0);
-        assert_eq!(projection.experts, 2);
-        assert_eq!(projection.hidden_width, 3);
-        assert_eq!(projection.tensor_name, router_tensor_name(0));
+        assert_eq!(routing_command.layer, 0);
+        assert_eq!(routing_command.active_experts, 1);
+        assert_eq!(routing_command.routes, vec![(1, 9.0)]);
         assert_eq!(
             store
                 .decoded_tensor_tiles

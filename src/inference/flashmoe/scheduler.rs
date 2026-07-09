@@ -1009,6 +1009,13 @@ impl ScheduledRouterScoreProjectionCommand {
     pub(crate) fn into_score_batch(self, scores: Vec<f32>) -> Result<RouterScoreBatch> {
         RouterScoreBatch::new(self.state, self.projection, scores)
     }
+
+    pub(crate) fn into_routing_command(self, scores: Vec<f32>) -> Result<ScheduledRoutingCommand> {
+        let routing = self.routing;
+        let batch = self.into_score_batch(scores)?;
+        let output = routing.validate_output_state(batch.state())?;
+        routing.select_command_from_output_scores(output, &batch)
+    }
 }
 
 impl ScheduledRoutingTopK {
@@ -1248,6 +1255,7 @@ pub(crate) struct ScheduledRoutingOutputState {
 }
 
 impl ScheduledRoutingOutputState {
+    #[cfg(test)]
     pub(crate) fn state(self) -> FlashMoeRoutingOutputState {
         self.state
     }
@@ -3542,6 +3550,37 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("has 2 scores for 5 declared experts"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_router_score_projection_command_selects_routing_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+
+        let command = routing.build_score_projection_command(None, 8).unwrap();
+        let routed = command
+            .into_routing_command(vec![0.5, 9.0, -1.0, 4.0, 3.0])
+            .unwrap();
+        assert_eq!(routed.layer, 3);
+        assert_eq!(routed.active_experts, 2);
+        assert_eq!(
+            routed.source,
+            ScheduledRoutingCandidateSource::CpuRouterScores
+        );
+        assert_eq!(routed.routes, vec![(1, 9.0), (3, 4.0)]);
+
+        let err = routing
+            .build_score_projection_command(None, 8)
+            .unwrap()
+            .into_routing_command(vec![0.5, f32::NAN, -1.0, 4.0, 3.0])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("score for expert 1 is not finite"),
             "{err:#}"
         );
     }
