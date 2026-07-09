@@ -66,7 +66,10 @@ use super::experts::{
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
-use super::scheduler::{ExpertRoute, FlashMoeScheduledGraph, ScheduledExpertRoutes};
+use super::scheduler::{
+    ExpertRoute, ExpertSchedulerMetrics, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
+    ScheduledExpertRoutes,
+};
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -18424,65 +18427,6 @@ struct ExpertReadResult {
     read_path: ExpertReadPath,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ExpertSchedulerMetrics {
-    issued_reads: u64,
-    positioned_reads: u64,
-    read_failures: u64,
-    total_queue_latency: Duration,
-    max_queue_latency: Duration,
-    total_read_latency: Duration,
-    max_read_latency: Duration,
-    bytes_read: u64,
-    warm_reads: u64,
-    total_warm_read_latency: Duration,
-    max_warm_read_latency: Duration,
-    warm_bytes_read: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExpertSchedulerSnapshot {
-    pub issued_reads: u64,
-    pub positioned_reads: u64,
-    pub read_failures: u64,
-    pub total_queue_latency: Duration,
-    pub max_queue_latency: Duration,
-    pub total_read_latency: Duration,
-    pub max_read_latency: Duration,
-    pub bytes_read: u64,
-    pub warm_reads: u64,
-    pub total_warm_read_latency: Duration,
-    pub max_warm_read_latency: Duration,
-    pub warm_bytes_read: u64,
-}
-
-impl ExpertSchedulerSnapshot {
-    fn saturating_delta(self, before: Self) -> Self {
-        Self {
-            issued_reads: self.issued_reads.saturating_sub(before.issued_reads),
-            positioned_reads: self
-                .positioned_reads
-                .saturating_sub(before.positioned_reads),
-            read_failures: self.read_failures.saturating_sub(before.read_failures),
-            total_queue_latency: self
-                .total_queue_latency
-                .saturating_sub(before.total_queue_latency),
-            max_queue_latency: self.max_queue_latency,
-            total_read_latency: self
-                .total_read_latency
-                .saturating_sub(before.total_read_latency),
-            max_read_latency: self.max_read_latency,
-            bytes_read: self.bytes_read.saturating_sub(before.bytes_read),
-            warm_reads: self.warm_reads.saturating_sub(before.warm_reads),
-            total_warm_read_latency: self
-                .total_warm_read_latency
-                .saturating_sub(before.total_warm_read_latency),
-            max_warm_read_latency: self.max_warm_read_latency,
-            warm_bytes_read: self.warm_bytes_read.saturating_sub(before.warm_bytes_read),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct ExpertScheduler {
     store: ExpertStore,
@@ -18553,7 +18497,7 @@ impl ExpertScheduler {
             // maintaining a second in-process cache of hot expert packs. Cold expert reads still
             // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
             // evicts them, which matches the behavior described in the upstream notes.
-            self.metrics.issued_reads = self.metrics.issued_reads.saturating_add(1);
+            self.metrics.record_issued_read();
             let id = self.next_read_id;
             self.next_read_id = self.next_read_id.wrapping_add(1);
             let (tx, rx) = mpsc::channel();
@@ -18593,41 +18537,29 @@ impl ExpertScheduler {
                 .recv()
                 .context("expert I/O worker dropped response channel")?;
             if response.id != pending.id {
-                self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
+                self.metrics.record_read_failure();
                 bail!(
                     "expert I/O worker returned response {} for pending read {}",
                     response.id,
                     pending.id
                 );
             }
-            self.metrics.total_queue_latency += response.queue_latency;
-            self.metrics.max_queue_latency =
-                self.metrics.max_queue_latency.max(response.queue_latency);
+            self.metrics.record_queue_latency(response.queue_latency);
             match response.read_path {
                 ExpertReadPath::PositionedRead => {
-                    self.metrics.positioned_reads = self.metrics.positioned_reads.saturating_add(1);
+                    self.metrics.record_positioned_read();
                 }
             }
-            self.metrics.total_read_latency += response.read_latency;
-            self.metrics.max_read_latency =
-                self.metrics.max_read_latency.max(response.read_latency);
-            self.metrics.bytes_read = self.metrics.bytes_read.saturating_add(response.bytes_read);
+            self.metrics.record_read_latency(response.read_latency);
+            self.metrics.record_bytes_read(response.bytes_read);
             if response.warm {
-                self.metrics.warm_reads = self.metrics.warm_reads.saturating_add(1);
-                self.metrics.total_warm_read_latency += response.read_latency;
-                self.metrics.max_warm_read_latency = self
-                    .metrics
-                    .max_warm_read_latency
-                    .max(response.read_latency);
-                self.metrics.warm_bytes_read = self
-                    .metrics
-                    .warm_bytes_read
-                    .saturating_add(response.bytes_read);
+                self.metrics
+                    .record_warm_read(response.read_latency, response.bytes_read);
             }
             match response.result {
                 Ok(expert) => out.push(Arc::new(expert)),
                 Err(error) => {
-                    self.metrics.read_failures = self.metrics.read_failures.saturating_add(1);
+                    self.metrics.record_read_failure();
                     return Err(error);
                 }
             }
@@ -18670,20 +18602,7 @@ impl ExpertScheduler {
     }
 
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
-        ExpertSchedulerSnapshot {
-            issued_reads: self.metrics.issued_reads,
-            positioned_reads: self.metrics.positioned_reads,
-            read_failures: self.metrics.read_failures,
-            total_queue_latency: self.metrics.total_queue_latency,
-            max_queue_latency: self.metrics.max_queue_latency,
-            total_read_latency: self.metrics.total_read_latency,
-            max_read_latency: self.metrics.max_read_latency,
-            bytes_read: self.metrics.bytes_read,
-            warm_reads: self.metrics.warm_reads,
-            total_warm_read_latency: self.metrics.total_warm_read_latency,
-            max_warm_read_latency: self.metrics.max_warm_read_latency,
-            warm_bytes_read: self.metrics.warm_bytes_read,
-        }
+        self.metrics.snapshot()
     }
 
     #[cfg(test)]

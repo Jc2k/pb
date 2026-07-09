@@ -4,6 +4,7 @@ use super::capabilities::{
 };
 use super::math::softmax_in_place;
 use anyhow::{Result, bail};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeScheduledGraph {
@@ -137,6 +138,117 @@ impl ScheduledExpertRoutes {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExpertSchedulerMetrics {
+    issued_reads: u64,
+    positioned_reads: u64,
+    read_failures: u64,
+    total_queue_latency: Duration,
+    max_queue_latency: Duration,
+    total_read_latency: Duration,
+    max_read_latency: Duration,
+    bytes_read: u64,
+    warm_reads: u64,
+    total_warm_read_latency: Duration,
+    max_warm_read_latency: Duration,
+    warm_bytes_read: u64,
+}
+
+impl ExpertSchedulerMetrics {
+    pub(crate) fn record_issued_read(&mut self) {
+        self.issued_reads = self.issued_reads.saturating_add(1);
+    }
+
+    pub(crate) fn record_positioned_read(&mut self) {
+        self.positioned_reads = self.positioned_reads.saturating_add(1);
+    }
+
+    pub(crate) fn record_read_failure(&mut self) {
+        self.read_failures = self.read_failures.saturating_add(1);
+    }
+
+    pub(crate) fn record_queue_latency(&mut self, latency: Duration) {
+        self.total_queue_latency += latency;
+        self.max_queue_latency = self.max_queue_latency.max(latency);
+    }
+
+    pub(crate) fn record_read_latency(&mut self, latency: Duration) {
+        self.total_read_latency += latency;
+        self.max_read_latency = self.max_read_latency.max(latency);
+    }
+
+    pub(crate) fn record_bytes_read(&mut self, bytes: u64) {
+        self.bytes_read = self.bytes_read.saturating_add(bytes);
+    }
+
+    pub(crate) fn record_warm_read(&mut self, latency: Duration, bytes: u64) {
+        self.warm_reads = self.warm_reads.saturating_add(1);
+        self.total_warm_read_latency += latency;
+        self.max_warm_read_latency = self.max_warm_read_latency.max(latency);
+        self.warm_bytes_read = self.warm_bytes_read.saturating_add(bytes);
+    }
+
+    pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        ExpertSchedulerSnapshot {
+            issued_reads: self.issued_reads,
+            positioned_reads: self.positioned_reads,
+            read_failures: self.read_failures,
+            total_queue_latency: self.total_queue_latency,
+            max_queue_latency: self.max_queue_latency,
+            total_read_latency: self.total_read_latency,
+            max_read_latency: self.max_read_latency,
+            bytes_read: self.bytes_read,
+            warm_reads: self.warm_reads,
+            total_warm_read_latency: self.total_warm_read_latency,
+            max_warm_read_latency: self.max_warm_read_latency,
+            warm_bytes_read: self.warm_bytes_read,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertSchedulerSnapshot {
+    pub issued_reads: u64,
+    pub positioned_reads: u64,
+    pub read_failures: u64,
+    pub total_queue_latency: Duration,
+    pub max_queue_latency: Duration,
+    pub total_read_latency: Duration,
+    pub max_read_latency: Duration,
+    pub bytes_read: u64,
+    pub warm_reads: u64,
+    pub total_warm_read_latency: Duration,
+    pub max_warm_read_latency: Duration,
+    pub warm_bytes_read: u64,
+}
+
+impl ExpertSchedulerSnapshot {
+    pub fn saturating_delta(self, before: Self) -> Self {
+        Self {
+            issued_reads: self.issued_reads.saturating_sub(before.issued_reads),
+            positioned_reads: self
+                .positioned_reads
+                .saturating_sub(before.positioned_reads),
+            read_failures: self.read_failures.saturating_sub(before.read_failures),
+            total_queue_latency: self
+                .total_queue_latency
+                .saturating_sub(before.total_queue_latency),
+            max_queue_latency: self.max_queue_latency,
+            total_read_latency: self
+                .total_read_latency
+                .saturating_sub(before.total_read_latency),
+            max_read_latency: self.max_read_latency,
+            bytes_read: self.bytes_read.saturating_sub(before.bytes_read),
+            warm_reads: self.warm_reads.saturating_sub(before.warm_reads),
+            total_warm_read_latency: self
+                .total_warm_read_latency
+                .saturating_sub(before.total_warm_read_latency),
+            max_warm_read_latency: self.max_warm_read_latency,
+            warm_bytes_read: self.warm_bytes_read.saturating_sub(before.warm_bytes_read),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +357,33 @@ mod tests {
                 .contains("expert route score for expert 2 is not finite"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn expert_scheduler_metrics_snapshot_reports_saturating_delta() {
+        let mut metrics = ExpertSchedulerMetrics::default();
+        metrics.record_issued_read();
+        metrics.record_positioned_read();
+        metrics.record_queue_latency(Duration::from_millis(7));
+        metrics.record_read_latency(Duration::from_millis(11));
+        metrics.record_bytes_read(128);
+        let before = metrics.snapshot();
+
+        metrics.record_issued_read();
+        metrics.record_read_failure();
+        metrics.record_queue_latency(Duration::from_millis(3));
+        metrics.record_read_latency(Duration::from_millis(5));
+        metrics.record_bytes_read(32);
+        metrics.record_warm_read(Duration::from_millis(5), 32);
+
+        let delta = metrics.snapshot().saturating_delta(before);
+        assert_eq!(delta.issued_reads, 1);
+        assert_eq!(delta.positioned_reads, 0);
+        assert_eq!(delta.read_failures, 1);
+        assert_eq!(delta.total_queue_latency, Duration::from_millis(3));
+        assert_eq!(delta.total_read_latency, Duration::from_millis(5));
+        assert_eq!(delta.bytes_read, 32);
+        assert_eq!(delta.warm_reads, 1);
+        assert_eq!(delta.warm_bytes_read, 32);
     }
 }
