@@ -96,7 +96,8 @@ use super::state::{
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    RuntimeTensorEntry, TensorQuantization,
+    ExpertTensorRef, FlashMoeManifest, RuntimeTensorEntry, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, canonical_hf_tensor_name,
 };
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -452,28 +453,6 @@ impl FlashMoeTimingBuckets {
 #[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
     weight_map: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FlashMoeManifest {
-    pub model: String,
-    pub cache_version: String,
-    pub dense_shards: Vec<String>,
-    pub expert_tensors: Vec<ExpertTensorRef>,
-    pub dense_tensors: Vec<DenseTensorRef>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExpertTensorRef {
-    pub tensor: String,
-    pub shard: String,
-    pub layer: Option<usize>,
-    pub expert: Option<usize>,
-    pub dtype: Option<String>,
-    pub shape: Vec<usize>,
-    pub source_offsets: Option<[u64; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub q4_sources: Option<DenseQ4SourceRefs>,
 }
 
 #[derive(Debug, Clone)]
@@ -14757,109 +14736,6 @@ fn dense_q4_layout_with_scale_bias_dtype(
     })
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TensorRegistry {
-    tensors: BTreeMap<String, RuntimeTensorEntry>,
-}
-
-impl TensorRegistry {
-    pub fn load(manifest_path: &Path) -> Result<Self> {
-        let manifest: FlashMoeManifest =
-            serde_json::from_slice(&fs::read(manifest_path).with_context(|| {
-                format!(
-                    "failed to read Flash-MoE tensor manifest {}",
-                    manifest_path.display()
-                )
-            })?)
-            .with_context(|| {
-                format!(
-                    "failed to parse Flash-MoE tensor manifest {}",
-                    manifest_path.display()
-                )
-            })?;
-        Ok(Self::from_manifest(&manifest))
-    }
-
-    fn from_manifest(manifest: &FlashMoeManifest) -> Self {
-        let mut tensors = BTreeMap::new();
-        for tensor in &manifest.dense_tensors {
-            insert_tensor_entry_with_aliases(
-                &mut tensors,
-                &tensor.tensor,
-                RuntimeTensorEntry {
-                    name: tensor.tensor.clone(),
-                    dtype: tensor.dtype.clone(),
-                    shape: tensor.shape.clone(),
-                    byte_offset: tensor.runtime_offset,
-                    byte_len: tensor.byte_len,
-                    alignment: TENSOR_ALIGNMENT,
-                    quantization: tensor.quantization.clone(),
-                },
-            );
-        }
-        for tensor in &manifest.expert_tensors {
-            if let Some([start, end]) = tensor.source_offsets {
-                insert_tensor_entry_with_aliases(
-                    &mut tensors,
-                    &tensor.tensor,
-                    RuntimeTensorEntry {
-                        name: tensor.tensor.clone(),
-                        dtype: tensor
-                            .dtype
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        shape: tensor.shape.clone(),
-                        byte_offset: start,
-                        byte_len: end.saturating_sub(start),
-                        alignment: TENSOR_ALIGNMENT,
-                        quantization: TensorQuantization::Q4 {
-                            group_size: GROUP_SIZE,
-                            format: ExpertQuantization::FourBitProduction.as_str().to_string(),
-                            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
-                        },
-                    },
-                );
-            }
-        }
-        Self { tensors }
-    }
-
-    pub fn tensor(&self, canonical_name: &str) -> Option<&RuntimeTensorEntry> {
-        self.tensors.get(canonical_name)
-    }
-
-    fn has_tensor_with_prefix(&self, prefix: &str) -> bool {
-        self.tensors.keys().any(|name| name.starts_with(prefix))
-    }
-
-    pub fn require(&self, canonical_name: &str) -> Result<&RuntimeTensorEntry> {
-        self.tensor(canonical_name)
-            .with_context(|| format!("Flash-MoE tensor registry is missing {canonical_name}"))
-    }
-
-    pub fn len(&self) -> usize {
-        self.tensors.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
-    }
-}
-
-fn insert_tensor_entry_with_aliases(
-    tensors: &mut BTreeMap<String, RuntimeTensorEntry>,
-    name: &str,
-    entry: RuntimeTensorEntry,
-) {
-    tensors
-        .entry(name.to_string())
-        .or_insert_with(|| entry.clone());
-    let canonical_name = canonical_hf_tensor_name(name);
-    if canonical_name != name {
-        tensors.entry(canonical_name).or_insert(entry);
-    }
-}
-
 fn validate_required_tensor_manifest(
     config: &QwenModelConfig,
     registry: &TensorRegistry,
@@ -22441,20 +22317,6 @@ fn dense_tensor_quantization(
         TensorQuantization::None
     }
 }
-
-fn canonical_hf_tensor_name(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
-        format!("model.{rest}")
-    } else if let Some(rest) = name.strip_prefix("language_model.") {
-        rest.to_string()
-    } else if let Some(rest) = name.strip_prefix("model.visual.") {
-        format!("visual.{rest}")
-    } else {
-        name.to_string()
-    }
-}
-
-const TENSOR_ALIGNMENT: u64 = 4096;
 
 fn align_to(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {

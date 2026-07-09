@@ -21,4 +21,7 @@ pub use math::*;
 pub use model_family::*;
 pub use scheduler::*;
 pub use types::*;
-pub use weights::{DenseQ4SourceRefs, DenseTensorRef, RuntimeTensorEntry, TensorQuantization};
+pub use weights::{
+    DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest, RuntimeTensorEntry,
+    TensorQuantization, TensorRegistry,
+};
