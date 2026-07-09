@@ -16611,17 +16611,15 @@ impl DenseStore {
         let layer = command.routing.layer;
         let experts = command.routing.experts;
         let tensor_name = router_tensor_name(layer);
-        let projection = command.projection.clone();
-        let state = command.state;
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
-            return RouterScoreBatch::new(state, projection, scores);
+            return command.into_score_batch(scores);
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.router_projection(layer, expert, hidden)?;
         }
-        RouterScoreBatch::new(state, projection, router_scores)
+        command.into_score_batch(router_scores)
     }
 
     fn router_score_projection_descriptor(

@@ -998,6 +998,10 @@ impl ScheduledRouterScoreProjectionCommand {
             hidden_width,
         })
     }
+
+    pub(crate) fn into_score_batch(self, scores: Vec<f32>) -> Result<RouterScoreBatch> {
+        RouterScoreBatch::new(self.state, self.projection, scores)
+    }
 }
 
 impl ScheduledRoutingTopK {
@@ -3408,6 +3412,39 @@ mod tests {
         );
         assert_eq!(command.projection, Some(projection));
         assert_eq!(command.hidden_width, 8);
+    }
+
+    #[test]
+    fn scheduled_router_score_projection_command_finalizes_declared_batch() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let projection = dummy_router_projection(3, 5, 8);
+
+        let batch = routing
+            .build_score_projection_command(Some(projection.clone()), 8)
+            .unwrap()
+            .into_score_batch(vec![0.0, 1.0, 2.0, 3.0, 4.0])
+            .unwrap();
+        assert_eq!(
+            batch.state(),
+            FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 2)
+        );
+        assert_eq!(batch.projection, Some(projection));
+        assert_eq!(batch.scores, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        let err = routing
+            .build_score_projection_command(None, 8)
+            .unwrap()
+            .into_score_batch(vec![0.0, 1.0])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has 2 scores for 5 declared experts"),
+            "{err:#}"
+        );
     }
 
     #[test]
