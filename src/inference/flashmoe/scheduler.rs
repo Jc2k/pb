@@ -266,10 +266,7 @@ impl<TInput> ScheduledCmd1Command<TInput>
 where
     TInput: ScheduledCmd1Input,
 {
-    pub(crate) fn resolve_input_state(
-        &self,
-        state: FlashMoeCmd1InputState,
-    ) -> Result<ScheduledCmd1InputStateOutput> {
+    fn validate_input_state(&self, state: FlashMoeCmd1InputState) -> Result<()> {
         if !state.is_declared_graph_state() {
             bail!("FlashMoe scheduled CMD1 input is not declared graph state");
         }
@@ -304,25 +301,29 @@ where
                 }
             }
         }
-        Ok(ScheduledCmd1InputStateOutput {
+        Ok(())
+    }
+
+    pub(crate) fn into_resolved_command(
+        self,
+        input_state: FlashMoeCmd1InputState,
+    ) -> Result<ScheduledCmd1ResolvedCommand<TInput>> {
+        self.validate_input_state(input_state)?;
+        Ok(ScheduledCmd1ResolvedCommand {
             cmd1: self.cmd1,
             layer: self.layer,
-            state,
+            input: self.input,
+            input_state,
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScheduledCmd1InputStateOutput {
-    pub cmd1: ScheduledCmd1AttentionProjections,
-    pub layer: usize,
-    state: FlashMoeCmd1InputState,
-}
-
-impl ScheduledCmd1InputStateOutput {
-    pub(crate) fn state(self) -> FlashMoeCmd1InputState {
-        self.state
-    }
+#[derive(Debug)]
+pub(crate) struct ScheduledCmd1ResolvedCommand<TInput> {
+    pub(crate) cmd1: ScheduledCmd1AttentionProjections,
+    pub(crate) layer: usize,
+    pub(crate) input: TInput,
+    pub(crate) input_state: FlashMoeCmd1InputState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2720,6 +2721,25 @@ mod tests {
             command.input.scheduled_cmd1_input_source(),
             ScheduledCmd1InputSource::DeferredMetalNextNormed
         );
+
+        let resolved = command
+            .into_resolved_command(FlashMoeCmd1InputState::gpu_next_layer_normed(
+                14,
+                FlashMoeGpuBufferDescriptor::next_layer_normed(4096),
+            ))
+            .unwrap();
+        assert_eq!(resolved.layer, 14);
+        assert_eq!(resolved.cmd1.layer, 14);
+        assert_eq!(
+            resolved.input.scheduled_cmd1_input_source(),
+            ScheduledCmd1InputSource::DeferredMetalNextNormed
+        );
+        assert_eq!(resolved.input_state.layer(), 14);
+        assert_eq!(resolved.input_state.len(), 4096);
+        assert_eq!(
+            resolved.input_state.placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
     }
 
     #[test]
@@ -2734,11 +2754,15 @@ mod tests {
                 .unwrap()
                 .into_cmd1_command();
 
-        let cpu_output = cpu_command
-            .resolve_input_state(FlashMoeCmd1InputState::cpu_normed(14, 4096))
+        let cpu_resolved = cpu_command
+            .into_resolved_command(FlashMoeCmd1InputState::cpu_normed(14, 4096))
             .unwrap();
-        assert_eq!(cpu_output.layer, 14);
-        assert_eq!(cpu_output.state().len(), 4096);
+        assert_eq!(cpu_resolved.layer, 14);
+        assert_eq!(cpu_resolved.input_state.len(), 4096);
+        assert_eq!(
+            cpu_resolved.input.scheduled_cmd1_input_source(),
+            ScheduledCmd1InputSource::CpuNormedHidden
+        );
 
         let gpu_cmd1 = graph
             .build_cmd1_attention_projections(15, ScheduledCmd1InputSource::DeferredMetalNextNormed)
@@ -2750,15 +2774,15 @@ mod tests {
         .unwrap()
         .into_cmd1_command();
 
-        let gpu_output = gpu_command
-            .resolve_input_state(FlashMoeCmd1InputState::gpu_next_layer_normed(
+        let gpu_resolved = gpu_command
+            .into_resolved_command(FlashMoeCmd1InputState::gpu_next_layer_normed(
                 15,
                 FlashMoeGpuBufferDescriptor::next_layer_normed(4096),
             ))
             .unwrap();
-        assert_eq!(gpu_output.layer, 15);
+        assert_eq!(gpu_resolved.layer, 15);
         assert_eq!(
-            gpu_output.state().placement(),
+            gpu_resolved.input_state.placement(),
             FlashMoeStatePlacement::GpuResident
         );
     }
@@ -2770,13 +2794,14 @@ mod tests {
         let cpu_cmd1 = graph
             .build_cmd1_attention_projections(14, ScheduledCmd1InputSource::CpuNormedHidden)
             .unwrap();
-        let cpu_command =
+        let cpu_command = || {
             ScheduledCmd1Submission::new(cpu_cmd1, ScheduledCmd1InputSource::CpuNormedHidden)
                 .unwrap()
-                .into_cmd1_command();
+                .into_cmd1_command()
+        };
 
-        let layer_err = cpu_command
-            .resolve_input_state(FlashMoeCmd1InputState::cpu_normed(15, 4096))
+        let layer_err = cpu_command()
+            .into_resolved_command(FlashMoeCmd1InputState::cpu_normed(15, 4096))
             .unwrap_err();
         assert!(
             layer_err
@@ -2785,8 +2810,8 @@ mod tests {
             "{layer_err:#}"
         );
 
-        let source_err = cpu_command
-            .resolve_input_state(FlashMoeCmd1InputState::gpu_next_layer_normed(
+        let source_err = cpu_command()
+            .into_resolved_command(FlashMoeCmd1InputState::gpu_next_layer_normed(
                 14,
                 FlashMoeGpuBufferDescriptor::next_layer_normed(4096),
             ))
@@ -2798,8 +2823,8 @@ mod tests {
             "{source_err:#}"
         );
 
-        let empty_err = cpu_command
-            .resolve_input_state(FlashMoeCmd1InputState::cpu_normed(14, 0))
+        let empty_err = cpu_command()
+            .into_resolved_command(FlashMoeCmd1InputState::cpu_normed(14, 0))
             .unwrap_err();
         assert!(
             empty_err
