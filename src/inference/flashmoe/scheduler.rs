@@ -415,8 +415,32 @@ impl ScheduledAttentionMathOutput {
         self.attention.implementation
     }
 
-    pub(crate) fn state(&self) -> FlashMoeFullAttentionKvState {
+    #[cfg(test)]
+    fn state(&self) -> FlashMoeFullAttentionKvState {
         self.state
+    }
+
+    pub(crate) fn validate_execution_state(
+        self,
+        layer: usize,
+        position: usize,
+        kv_width: usize,
+    ) -> Result<Self> {
+        if self.state.layer() != layer || self.state.position() != position {
+            bail!(
+                "FlashMoe scheduled attention KV state layer {} position {} does not match execution layer {layer} position {position}",
+                self.state.layer(),
+                self.state.position()
+            );
+        }
+        if self.state.width() != kv_width {
+            bail!(
+                "FlashMoe scheduled attention KV width {} does not match execution width {}",
+                self.state.width(),
+                kv_width
+            );
+        }
+        Ok(self)
     }
 }
 
@@ -2685,6 +2709,7 @@ mod tests {
         );
         assert_eq!(output.state().position(), 9);
         assert_eq!(output.state().layer(), 14);
+        assert!(output.validate_execution_state(14, 9, 128).is_ok());
     }
 
     #[test]
@@ -2750,6 +2775,17 @@ mod tests {
                 .to_string()
                 .contains("KV state is not declared graph state"),
             "{width_err:#}"
+        );
+
+        let output = attention
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 14, 128, 128))
+            .unwrap();
+        let execution_err = output.validate_execution_state(14, 9, 256).unwrap_err();
+        assert!(
+            execution_err
+                .to_string()
+                .contains("does not match execution width"),
+            "{execution_err:#}"
         );
     }
 

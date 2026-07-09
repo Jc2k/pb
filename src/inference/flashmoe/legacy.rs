@@ -11213,21 +11213,8 @@ impl FlashMoeEngine {
                 layout.head_dim,
             )
         };
-        let kv_state = attention_output.state();
-        if kv_state.layer() != layer || kv_state.position() != position {
-            bail!(
-                "FlashMoe resolved attention KV state layer {} position {} does not match execution layer {layer} position {position}",
-                kv_state.layer(),
-                kv_state.position()
-            );
-        }
-        if kv_state.width() != layout.kv_width {
-            bail!(
-                "FlashMoe resolved attention KV width {} does not match layout width {}",
-                kv_state.width(),
-                layout.kv_width
-            );
-        }
+        let attention_output =
+            attention_output.validate_execution_state(layer, position, layout.kv_width)?;
 
         match attention_output.implementation() {
             ScheduledAttentionMathImplementation::CpuKvCache => cpu_attention(kv_cache),

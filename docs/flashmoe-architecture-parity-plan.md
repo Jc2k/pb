@@ -125,9 +125,9 @@ The validator should reject silent fallbacks such as:
   input-state handoff, and scheduled deferred output resolution carried to the Metal helper
   boundary, routing topK placement validation with retained routing-output handoff into route
   selection, declared CMD1 input-state validation, CMD2 routing-output validation, full-attention KV
-  placement validation for the declared attention math implementation, active expert read issue and
-  finish metrics, route normalization, pending read sets, shared-expert source/shape validation, and
-  the scheduled whole-slot handoff.
+  placement and execution-shape validation for the declared attention math implementation, active
+  expert read issue and finish metrics, route normalization, pending read sets, shared-expert
+  source/shape validation, and the scheduled whole-slot handoff.
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.
