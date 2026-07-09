@@ -85,10 +85,12 @@ use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
     ScheduledCmd2AttentionInput, ScheduledCmd2AttentionSource, ScheduledCmd2ResidualInput,
-    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Expert, ScheduledCmd3Input,
-    ScheduledCmd3InputSource, ScheduledCmd3Submission,
+    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Expert,
+    ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledSharedExpert, ScheduledSharedExpertSource,
+    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledSharedExpert,
+    ScheduledSharedExpertSource,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -2182,31 +2184,86 @@ impl MetalExecutor {
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
         match phase.input {
-            ExpertPhaseInput::Cpu { normed, residual } => self.submit_expert_phase(
-                phase.position,
-                phase.scheduled.layer,
-                phase.scheduled.experts.clone(),
-                &phase.scheduled.weights,
-                normed,
-                residual,
-                phase.shared,
-                phase.next_norm_weight,
-            ),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            ExpertPhaseInput::MetalPostAttention(prep) => self
-                .inner
-                .submit_expert_phase_from_buffers(
+            ExpertPhaseInput::Cpu { normed, residual } => {
+                let payloads = phase.scheduled.cmd3_expert_phase_payloads(residual.len())?;
+                self.submit_expert_phase_with_payloads(
                     phase.position,
                     phase.scheduled.layer,
                     phase.scheduled.experts.clone(),
                     &phase.scheduled.weights,
-                    prep.normed_buffer,
-                    prep.residual_buffer,
-                    prep.width,
+                    normed,
+                    residual,
                     phase.shared,
                     phase.next_norm_weight,
+                    &payloads,
                 )
-                .map(|pending| pending.map(DeferredExpertPhase::Metal)),
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            ExpertPhaseInput::MetalPostAttention(prep) => {
+                let payloads = phase.scheduled.cmd3_expert_phase_payloads(prep.width)?;
+                self.inner
+                    .submit_expert_phase_from_buffers_with_payloads(
+                        phase.position,
+                        phase.scheduled.layer,
+                        phase.scheduled.experts.clone(),
+                        &phase.scheduled.weights,
+                        prep.normed_buffer,
+                        prep.residual_buffer,
+                        prep.width,
+                        phase.shared,
+                        phase.next_norm_weight,
+                        &payloads,
+                    )
+                    .map(|pending| pending.map(DeferredExpertPhase::Metal))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_expert_phase_with_payloads(
+        &self,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: SharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<Option<DeferredExpertPhase>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .submit_expert_phase_with_payloads(
+                    position,
+                    layer,
+                    experts,
+                    weights,
+                    normed,
+                    residual,
+                    shared,
+                    next_norm_weight,
+                    payloads,
+                )
+                .map(|pending| pending.map(DeferredExpertPhase::Metal))
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                position,
+                layer,
+                experts,
+                weights,
+                normed,
+                residual,
+                shared,
+                next_norm_weight,
+                payloads,
+            );
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
+            );
         }
     }
 
@@ -4985,7 +5042,64 @@ impl MetalExecutorInner {
                     return Err(error);
                 }
             };
-            self.submit_expert_phase_from_buffers(
+            let payloads = match experts
+                .iter()
+                .map(|expert| expert.scheduled_cmd3_expert_phase_payload(width))
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(payloads) => payloads,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Err(error);
+                }
+            };
+            self.submit_expert_phase_from_buffers_with_payloads(
+                position,
+                layer,
+                experts.clone(),
+                weights,
+                normed_buffer,
+                residual_buffer,
+                width,
+                shared,
+                next_norm_weight,
+                &payloads,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_expert_phase_with_payloads(
+        self: &Arc<Self>,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ExpertWeights>]>,
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: SharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        let width = residual.len();
+        if width == 0 || normed.len() < width || weights.len() != experts.len() {
+            return Ok(None);
+        }
+        if let Some(weight) = next_norm_weight
+            && weight.len() < width
+        {
+            return Ok(None);
+        }
+        unsafe {
+            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
+            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.recycle(normed_buffer);
+                    return Err(error);
+                }
+            };
+            self.submit_expert_phase_from_buffers_with_payloads(
                 position,
                 layer,
                 experts,
@@ -4995,12 +5109,13 @@ impl MetalExecutorInner {
                 width,
                 shared,
                 next_norm_weight,
+                payloads,
             )
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit_expert_phase_from_buffers(
+    fn submit_expert_phase_from_buffers_with_payloads(
         self: &Arc<Self>,
         position: usize,
         layer: usize,
@@ -5011,8 +5126,9 @@ impl MetalExecutorInner {
         width: usize,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<Option<MetalDeferredExpertPhase>> {
-        if width == 0 || weights.len() != experts.len() {
+        if width == 0 || weights.len() != experts.len() || payloads.len() != experts.len() {
             self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
             return Ok(None);
         }
@@ -5021,17 +5137,6 @@ impl MetalExecutorInner {
         {
             self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
             return Ok(None);
-        }
-        let mut payloads = Vec::with_capacity(experts.len());
-        for expert in experts.iter() {
-            let payload = match expert_phase_mlp_payload(expert, width) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Err(error);
-                }
-            };
-            payloads.push(payload);
         }
         let shared_dense = shared.dense();
         let shared_q4 = shared.q4();
@@ -17717,6 +17822,43 @@ impl ScheduledCmd3Expert for ExpertWeights {
     }
 }
 
+impl ScheduledCmd3ExpertPayload for ExpertWeights {
+    fn scheduled_cmd3_expert_phase_payload(
+        &self,
+        width: usize,
+    ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
+        let fixed_q4 = self.fixed_q4_required()?;
+        let gate = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Gate,
+            width,
+            fixed_q4.spec.intermediate_size,
+        );
+        let up = fixed_q4.matvec_payload(
+            FixedQ4ExpertProjection::Up,
+            width,
+            fixed_q4.spec.intermediate_size,
+        );
+        let Some((gate, up)) = gate.zip(up) else {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide gate/up payloads for width {width}",
+                self.layer,
+                self.expert
+            );
+        };
+        let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
+        else {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide down payload for width {width}",
+                self.layer,
+                self.expert
+            );
+        };
+        Ok(ScheduledExpertPhaseMlpPayload::Q4(
+            ScheduledQ4ExpertPhaseMlpPayload::new(self.layer, self.expert, width, gate, up, down)?,
+        ))
+    }
+}
+
 impl ExpertWeights {
     fn from_scheduled_slot(slot: ScheduledExpertSlot) -> Result<Self> {
         let descriptor = slot.descriptor();
@@ -17974,81 +18116,6 @@ impl PackedExpertTensor {
             source: None,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-enum ExpertPhaseMlpPayload<'a> {
-    Q4(Q4ExpertPhaseMlpPayload<'a>),
-}
-
-impl<'a> ExpertPhaseMlpPayload<'a> {
-    fn q4(&self) -> &Q4ExpertPhaseMlpPayload<'a> {
-        match self {
-            Self::Q4(payload) => payload,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Q4ExpertPhaseMlpPayload<'a> {
-    gate: Q4MatvecPayload<'a>,
-    up: Q4MatvecPayload<'a>,
-    down: Q4MatvecPayload<'a>,
-}
-
-fn expert_phase_mlp_payload<'a>(
-    expert: &'a ExpertWeights,
-    width: usize,
-) -> Result<ExpertPhaseMlpPayload<'a>> {
-    let fixed_q4 = expert.fixed_q4_required()?;
-    let gate = fixed_q4.matvec_payload(
-        FixedQ4ExpertProjection::Gate,
-        width,
-        fixed_q4.spec.intermediate_size,
-    );
-    let up = fixed_q4.matvec_payload(
-        FixedQ4ExpertProjection::Up,
-        width,
-        fixed_q4.spec.intermediate_size,
-    );
-    let Some((gate, up)) = gate.zip(up) else {
-        bail!(
-            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide gate/up payloads for width {width}",
-            expert.layer,
-            expert.expert
-        );
-    };
-    if gate.rows != up.rows {
-        bail!(
-            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has mismatched gate/up rows {} vs {}",
-            expert.layer,
-            expert.expert,
-            gate.rows,
-            up.rows
-        );
-    }
-    let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
-    else {
-        bail!(
-            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide down payload for width {width}",
-            expert.layer,
-            expert.expert
-        );
-    };
-    if down.cols != gate.rows {
-        bail!(
-            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has down cols {} for gate rows {}",
-            expert.layer,
-            expert.expert,
-            down.cols,
-            gate.rows
-        );
-    }
-    Ok(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
-        gate,
-        up,
-        down,
-    }))
 }
 
 fn silu(value: f32) -> f32 {
@@ -25419,7 +25486,9 @@ mod tests {
                 .contains("PBQ4/component records are import compatibility only"),
             "{err:#}"
         );
-        let err = expert_phase_mlp_payload(&parsed_expert, 2).unwrap_err();
+        let err = parsed_expert
+            .scheduled_cmd3_expert_phase_payload(2)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("scheduler-owned fixed-Q4 whole-expert slot is required"),
@@ -25458,8 +25527,8 @@ mod tests {
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
         assert!(matches!(
-            expert_phase_mlp_payload(&fixed_expert, 2).unwrap(),
-            ExpertPhaseMlpPayload::Q4(_)
+            fixed_expert.scheduled_cmd3_expert_phase_payload(2).unwrap(),
+            ScheduledExpertPhaseMlpPayload::Q4(_)
         ));
     }
 
@@ -26014,7 +26083,7 @@ mod tests {
             }),
         };
 
-        let phase = expert_phase_mlp_payload(&expert, 2).unwrap();
+        let phase = expert.scheduled_cmd3_expert_phase_payload(2).unwrap();
         let phase = phase.q4();
         let fixed = expert.fixed_q4.as_ref().unwrap();
         let base = fixed.bytes.as_ptr() as usize;

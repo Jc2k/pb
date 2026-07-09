@@ -4,7 +4,7 @@ use super::capabilities::{
 };
 use super::experts::{
     ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
-    FLASHMOE_EXPERT_IO_POLICY,
+    FLASHMOE_EXPERT_IO_POLICY, Q4MatvecPayload,
 };
 use super::math::softmax_in_place;
 use super::model_family::QwenMoeFamily;
@@ -282,6 +282,89 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ScheduledExpertPhaseMlpPayload<'a> {
+    Q4(ScheduledQ4ExpertPhaseMlpPayload<'a>),
+}
+
+impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
+    pub(crate) fn q4(&self) -> &ScheduledQ4ExpertPhaseMlpPayload<'a> {
+        match self {
+            Self::Q4(payload) => payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledQ4ExpertPhaseMlpPayload<'a> {
+    pub(crate) gate: Q4MatvecPayload<'a>,
+    pub(crate) up: Q4MatvecPayload<'a>,
+    pub(crate) down: Q4MatvecPayload<'a>,
+}
+
+impl<'a> ScheduledQ4ExpertPhaseMlpPayload<'a> {
+    pub(crate) fn new(
+        layer: usize,
+        expert: usize,
+        width: usize,
+        gate: Q4MatvecPayload<'a>,
+        up: Q4MatvecPayload<'a>,
+        down: Q4MatvecPayload<'a>,
+    ) -> Result<Self> {
+        if gate.rows != up.rows {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has mismatched gate/up rows {} vs {}",
+                layer,
+                expert,
+                gate.rows,
+                up.rows
+            );
+        }
+        if down.cols != gate.rows {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has down cols {} for gate rows {}",
+                layer,
+                expert,
+                down.cols,
+                gate.rows
+            );
+        }
+        if gate.cols != width || up.cols != width || down.rows != width {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has payload shape gate={}x{}, up={}x{}, down={}x{} for width {width}",
+                layer,
+                expert,
+                gate.rows,
+                gate.cols,
+                up.rows,
+                up.cols,
+                down.rows,
+                down.cols
+            );
+        }
+        Ok(Self { gate, up, down })
+    }
+}
+
+pub trait ScheduledCmd3ExpertPayload {
+    fn scheduled_cmd3_expert_phase_payload(
+        &self,
+        width: usize,
+    ) -> Result<ScheduledExpertPhaseMlpPayload<'_>>;
+}
+
+impl<T> ScheduledCmd3ExpertPayload for Arc<T>
+where
+    T: ScheduledCmd3ExpertPayload,
+{
+    fn scheduled_cmd3_expert_phase_payload(
+        &self,
+        width: usize,
+    ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
+        self.as_ref().scheduled_cmd3_expert_phase_payload(width)
+    }
+}
+
 pub trait ScheduledSharedExpert {
     fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
 }
@@ -506,6 +589,21 @@ impl<T> ScheduledExpertBatch<T> {
 
     pub fn is_empty(&self) -> bool {
         self.experts.is_empty()
+    }
+}
+
+impl<T> ScheduledExpertBatch<T>
+where
+    T: ScheduledCmd3ExpertPayload,
+{
+    pub(crate) fn cmd3_expert_phase_payloads(
+        &self,
+        width: usize,
+    ) -> Result<Vec<ScheduledExpertPhaseMlpPayload<'_>>> {
+        self.experts
+            .iter()
+            .map(|expert| expert.scheduled_cmd3_expert_phase_payload(width))
+            .collect()
     }
 }
 
@@ -1018,6 +1116,46 @@ mod tests {
         }
     }
 
+    static DUMMY_Q4_PACKED: [u8; 64] = [0; 64];
+    static DUMMY_Q4_SCALES: [f32; 64] = [1.0; 64];
+    static DUMMY_Q4_BIASES: [f32; 64] = [0.0; 64];
+    static DUMMY_Q4_SCALE_BYTES: [u8; 128] = [0; 128];
+    static DUMMY_Q4_BIAS_BYTES: [u8; 128] = [0; 128];
+
+    fn dummy_q4_payload(rows: usize, cols: usize) -> Q4MatvecPayload<'static> {
+        Q4MatvecPayload {
+            rows,
+            cols,
+            group_size: 8,
+            packed: &DUMMY_Q4_PACKED[..rows * cols.div_ceil(2)],
+            scales: &DUMMY_Q4_SCALES[..rows * cols.div_ceil(8)],
+            biases: &DUMMY_Q4_BIASES[..rows * cols.div_ceil(8)],
+            scale_bias_groups: rows * cols.div_ceil(8),
+            scale_bias_dtype: "BF16",
+            scale_bytes: &DUMMY_Q4_SCALE_BYTES[..rows * cols.div_ceil(8) * 2],
+            bias_bytes: &DUMMY_Q4_BIAS_BYTES[..rows * cols.div_ceil(8) * 2],
+            source: None,
+        }
+    }
+
+    impl ScheduledCmd3ExpertPayload for DummyCmd3Expert {
+        fn scheduled_cmd3_expert_phase_payload(
+            &self,
+            width: usize,
+        ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
+            Ok(ScheduledExpertPhaseMlpPayload::Q4(
+                ScheduledQ4ExpertPhaseMlpPayload::new(
+                    self.layer,
+                    self.expert,
+                    width,
+                    dummy_q4_payload(4, width),
+                    dummy_q4_payload(4, width),
+                    dummy_q4_payload(width, 4),
+                )?,
+            ))
+        }
+    }
+
     fn dummy_scheduled_experts(
         layer: usize,
         experts: usize,
@@ -1252,6 +1390,36 @@ mod tests {
         assert_eq!(submission.position, 19);
         assert_eq!(submission.cmd3.layer, 7);
         assert_eq!(submission.scheduled.len(), 2);
+    }
+
+    #[test]
+    fn scheduled_expert_batch_resolves_cmd3_payloads_from_scheduled_experts() {
+        let scheduled = dummy_scheduled_experts(7, 2);
+
+        let payloads = scheduled.cmd3_expert_phase_payloads(8).unwrap();
+
+        assert_eq!(payloads.len(), 2);
+        let payload = payloads[0].q4();
+        assert_eq!(payload.gate.rows, 4);
+        assert_eq!(payload.gate.cols, 8);
+        assert_eq!(payload.up.rows, 4);
+        assert_eq!(payload.down.rows, 8);
+        assert_eq!(payload.down.cols, 4);
+    }
+
+    #[test]
+    fn scheduled_q4_cmd3_payload_rejects_mismatched_shapes_without_fallback() {
+        let err = ScheduledQ4ExpertPhaseMlpPayload::new(
+            7,
+            3,
+            8,
+            dummy_q4_payload(4, 8),
+            dummy_q4_payload(5, 8),
+            dummy_q4_payload(8, 4),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("mismatched gate/up rows"));
     }
 
     #[test]
