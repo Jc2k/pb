@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::experts::EXPERT_SCALE_BIAS_DTYPE_F32;
 use super::types::{ExpertQuantization, GROUP_SIZE};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub(crate) const TENSOR_ALIGNMENT: u64 = 4096;
 
@@ -202,6 +202,98 @@ pub(crate) fn canonical_hf_tensor_name(name: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenseQ4Layout {
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) row_packed_bytes: usize,
+    pub(crate) groups_per_row: usize,
+    pub(crate) packed_bytes: usize,
+    pub(crate) scales_bytes: usize,
+    pub(crate) scale_bias_bytes: usize,
+    pub(crate) total_bytes: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn dense_q4_layout(shape: &[usize], group_size: usize) -> Result<DenseQ4Layout> {
+    dense_q4_layout_with_scale_bias_dtype(shape, group_size, EXPERT_SCALE_BIAS_DTYPE_F32)
+}
+
+pub(crate) fn dense_q4_layout_with_scale_bias_dtype(
+    shape: &[usize],
+    group_size: usize,
+    scale_bias_dtype: &str,
+) -> Result<DenseQ4Layout> {
+    if group_size == 0 {
+        bail!("dense q4 group_size must be positive");
+    }
+    let cols = shape.last().copied().unwrap_or(0);
+    if shape.len() < 2 || cols == 0 {
+        bail!(
+            "dense q4 tensor shape {:?} is not a non-empty matrix",
+            shape
+        );
+    }
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+                .context("dense q4 tensor row count overflow")
+        })?;
+    let row_packed_bytes = cols.div_ceil(2);
+    let groups_per_row = cols.div_ceil(group_size);
+    let packed_bytes = rows
+        .checked_mul(row_packed_bytes)
+        .context("dense q4 packed byte length overflow")?;
+    let groups = rows
+        .checked_mul(groups_per_row)
+        .context("dense q4 group count overflow")?;
+    let scale_bias_bytes = dense_scale_bias_dtype_size(scale_bias_dtype)
+        .with_context(|| format!("unsupported dense q4 scale/bias dtype {scale_bias_dtype}"))?;
+    let scales_bytes = groups
+        .checked_mul(scale_bias_bytes)
+        .context("dense q4 scale byte length overflow")?;
+    let total_bytes = packed_bytes
+        .checked_add(scales_bytes)
+        .and_then(|value| value.checked_add(scales_bytes))
+        .context("dense q4 total byte length overflow")?;
+    Ok(DenseQ4Layout {
+        rows,
+        cols,
+        row_packed_bytes,
+        groups_per_row,
+        packed_bytes,
+        scales_bytes,
+        scale_bias_bytes,
+        total_bytes,
+    })
+}
+
+fn dense_scale_bias_dtype_size(dtype: &str) -> Result<usize> {
+    match dtype.to_ascii_uppercase().as_str() {
+        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => Ok(4),
+        "BF16" | "BFLOAT16" => Ok(2),
+        other => bail!("unsupported q4 scale/bias dtype {other}"),
+    }
+}
+
+pub(crate) fn validate_dense_matvec_shape(
+    entry: &RuntimeTensorEntry,
+    canonical_name: &str,
+    expected_rows: usize,
+    input_len: usize,
+) -> Result<(usize, usize)> {
+    let expected_shape = [expected_rows, input_len];
+    match entry.shape.as_slice() {
+        [rows, cols] if *rows == expected_rows && *cols == input_len => Ok((*rows, *cols)),
+        _ => bail!(
+            "Flash-MoE dense tensor {canonical_name} shape mismatch: expected shape {:?}, actual shape {:?}, input length {input_len}",
+            expected_shape,
+            entry.shape
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DenseMmapMatvecProjection {
     pub(crate) tensor_name: String,
@@ -213,6 +305,45 @@ pub(crate) struct DenseMmapMatvecProjection {
 }
 
 impl DenseMmapMatvecProjection {
+    pub(crate) fn from_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        output_width: usize,
+        input_len: usize,
+        element_size: usize,
+    ) -> Result<Self> {
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, tensor_name, output_width, input_len)?;
+        let row_bytes = cols
+            .checked_mul(element_size)
+            .context("dense tensor resident row byte length overflow")?;
+        let byte_len = rows
+            .checked_mul(row_bytes)
+            .context("dense tensor resident byte length overflow")?;
+        if entry
+            .byte_offset
+            .checked_add(byte_len as u64)
+            .map_or(true, |end| end > store_len)
+        {
+            bail!(
+                "Flash-MoE dense tensor {} byte range {}..{} exceeds dense store length {}",
+                tensor_name,
+                entry.byte_offset,
+                entry.byte_offset.saturating_add(byte_len as u64),
+                store_len
+            );
+        }
+        Ok(Self {
+            tensor_name: tensor_name.to_string(),
+            byte_offset: entry.byte_offset,
+            dtype: entry.dtype.clone(),
+            rows,
+            cols,
+            output_width,
+        })
+    }
+
     pub(crate) fn stride(&self) -> usize {
         self.cols
     }
@@ -231,6 +362,63 @@ pub(crate) struct DenseQ4MmapMatvecProjection {
     pub(crate) groups_per_row: usize,
     pub(crate) group_size: usize,
     pub(crate) scale_bias_dtype: String,
+}
+
+impl DenseQ4MmapMatvecProjection {
+    pub(crate) fn from_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        output_width: usize,
+        input_len: usize,
+    ) -> Result<Option<Self>> {
+        let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        else {
+            return Ok(None);
+        };
+        let (rows, cols) =
+            validate_dense_matvec_shape(entry, tensor_name, output_width, input_len)?;
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+        if entry.byte_len as usize != layout.total_bytes
+            || rows != layout.rows
+            || cols != layout.cols
+        {
+            return Ok(None);
+        }
+        if entry
+            .byte_offset
+            .checked_add(entry.byte_len)
+            .map_or(true, |end| end > store_len)
+        {
+            return Ok(None);
+        }
+        let packed_byte_offset = entry.byte_offset;
+        let scales_byte_offset = entry
+            .byte_offset
+            .checked_add(layout.packed_bytes as u64)
+            .context("dense q4 projection scales offset overflow")?;
+        let biases_byte_offset = scales_byte_offset
+            .checked_add(layout.scales_bytes as u64)
+            .context("dense q4 projection biases offset overflow")?;
+        Ok(Some(Self {
+            tensor_name: tensor_name.to_string(),
+            packed_byte_offset,
+            scales_byte_offset,
+            biases_byte_offset,
+            rows,
+            cols,
+            output_width,
+            row_packed_bytes: layout.row_packed_bytes,
+            groups_per_row: layout.groups_per_row,
+            group_size: *group_size,
+            scale_bias_dtype: scale_bias_dtype.clone(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +549,34 @@ mod tests {
     }
 
     #[test]
+    fn dense_mmap_projection_descriptor_resolves_entry_bounds() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![4, 8],
+            byte_offset: 64,
+            byte_len: 64,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        let projection = DenseMmapMatvecProjection::from_entry(
+            "model.layers.0.self_attn.q_proj.weight",
+            &entry,
+            256,
+            4,
+            8,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(projection.byte_offset, 64);
+        assert_eq!(projection.rows, 4);
+        assert_eq!(projection.cols, 8);
+        assert_eq!(projection.output_width, 4);
+    }
+
+    #[test]
     fn dense_q4_projection_descriptor_carries_one_binding_shape() {
         let projection = DenseQ4MmapMatvecProjection {
             tensor_name: "model.layers.0.mlp.gate_proj.weight".to_string(),
@@ -379,5 +595,81 @@ mod tests {
         assert_eq!(projection.row_packed_bytes, projection.cols.div_ceil(2));
         assert_eq!(projection.groups_per_row, 2);
         assert_eq!(projection.output_width, projection.rows);
+    }
+
+    #[test]
+    fn dense_q4_layout_accounts_for_scale_bias_dtype() {
+        let layout = dense_q4_layout_with_scale_bias_dtype(&[2, 4], 16, "BF16").unwrap();
+
+        assert_eq!(layout.rows, 2);
+        assert_eq!(layout.cols, 4);
+        assert_eq!(layout.row_packed_bytes, 2);
+        assert_eq!(layout.groups_per_row, 1);
+        assert_eq!(layout.packed_bytes, 4);
+        assert_eq!(layout.scales_bytes, 4);
+        assert_eq!(layout.scale_bias_bytes, 2);
+        assert_eq!(layout.total_bytes, 12);
+    }
+
+    #[test]
+    fn dense_q4_projection_descriptor_resolves_offsets_from_entry() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 128,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+
+        let projection = DenseQ4MmapMatvecProjection::from_entry(
+            "model.layers.0.mlp.gate_proj.weight",
+            &entry,
+            256,
+            2,
+            4,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(projection.packed_byte_offset, 128);
+        assert_eq!(projection.scales_byte_offset, 132);
+        assert_eq!(projection.biases_byte_offset, 136);
+        assert_eq!(projection.rows, 2);
+        assert_eq!(projection.cols, 4);
+        assert_eq!(projection.scale_bias_dtype, "BF16");
+    }
+
+    #[test]
+    fn dense_q4_projection_descriptor_rejects_missing_capacity() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 128,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+
+        let projection = DenseQ4MmapMatvecProjection::from_entry(
+            "model.layers.0.mlp.gate_proj.weight",
+            &entry,
+            139,
+            2,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(projection, None);
     }
 }
