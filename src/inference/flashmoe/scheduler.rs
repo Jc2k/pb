@@ -179,6 +179,53 @@ pub struct ScheduledCmd2PostAttention {
     pub residual: ScheduledCmd2ResidualSource,
 }
 
+pub trait ScheduledCmd2AttentionInput {
+    fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource;
+}
+
+pub trait ScheduledCmd2ResidualInput {
+    fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource;
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd2Submission<TAttention, TResidual> {
+    pub cmd2: ScheduledCmd2PostAttention,
+    pub attention: TAttention,
+    pub residual: TResidual,
+}
+
+impl<TAttention, TResidual> ScheduledCmd2Submission<TAttention, TResidual>
+where
+    TAttention: ScheduledCmd2AttentionInput,
+    TResidual: ScheduledCmd2ResidualInput,
+{
+    pub fn new(
+        cmd2: ScheduledCmd2PostAttention,
+        attention: TAttention,
+        residual: TResidual,
+    ) -> Result<Self> {
+        if cmd2.attention != attention.scheduled_cmd2_attention_source() {
+            bail!(
+                "FlashMoe scheduled CMD2 attention source {:?} does not match submitted source {:?}",
+                cmd2.attention,
+                attention.scheduled_cmd2_attention_source()
+            );
+        }
+        if cmd2.residual != residual.scheduled_cmd2_residual_source() {
+            bail!(
+                "FlashMoe scheduled CMD2 residual source {:?} does not match submitted source {:?}",
+                cmd2.residual,
+                residual.scheduled_cmd2_residual_source()
+            );
+        }
+        Ok(Self {
+            cmd2,
+            attention,
+            residual,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledCmd3InputSource {
     MetalPostAttentionPrep,
@@ -838,6 +885,24 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy)]
+    struct DummyCmd2Attention(ScheduledCmd2AttentionSource);
+
+    impl ScheduledCmd2AttentionInput for DummyCmd2Attention {
+        fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct DummyCmd2Residual(ScheduledCmd2ResidualSource);
+
+    impl ScheduledCmd2ResidualInput for DummyCmd2Residual {
+        fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
     struct DummyCmd3Input(ScheduledCmd3InputSource);
 
     impl ScheduledCmd3Input for DummyCmd3Input {
@@ -987,6 +1052,68 @@ mod tests {
             err.to_string()
                 .contains("CMD1 attention projection stage must be implemented"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd2_submission_validates_attention_and_residual_sources() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+
+        let submission = ScheduledCmd2Submission::new(
+            cmd2,
+            DummyCmd2Attention(ScheduledCmd2AttentionSource::MetalAttentionValues),
+            DummyCmd2Residual(ScheduledCmd2ResidualSource::MetalBuffer),
+        )
+        .unwrap();
+
+        assert_eq!(submission.cmd2.layer, 11);
+        assert_eq!(submission.cmd2.active_experts, 4);
+    }
+
+    #[test]
+    fn scheduled_cmd2_submission_rejects_mismatched_sources_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+
+        let attention_err = ScheduledCmd2Submission::new(
+            cmd2,
+            DummyCmd2Attention(ScheduledCmd2AttentionSource::CpuAttentionValues),
+            DummyCmd2Residual(ScheduledCmd2ResidualSource::MetalBuffer),
+        )
+        .unwrap_err();
+        assert!(
+            attention_err
+                .to_string()
+                .contains("does not match submitted source")
+        );
+
+        let residual_err = ScheduledCmd2Submission::new(
+            cmd2,
+            DummyCmd2Attention(ScheduledCmd2AttentionSource::MetalAttentionValues),
+            DummyCmd2Residual(ScheduledCmd2ResidualSource::CpuHidden),
+        )
+        .unwrap_err();
+        assert!(
+            residual_err
+                .to_string()
+                .contains("does not match submitted source")
         );
     }
 

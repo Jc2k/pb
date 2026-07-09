@@ -84,7 +84,8 @@ use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMo
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
-    ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource, ScheduledCmd3Input,
+    ScheduledCmd2AttentionInput, ScheduledCmd2AttentionSource, ScheduledCmd2ResidualInput,
+    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Input,
     ScheduledCmd3InputSource, ScheduledCmd3Submission,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledSharedExpert, ScheduledSharedExpertSource,
@@ -1920,6 +1921,27 @@ impl ScheduledSharedExpert for SharedExpertPhaseRef<'_> {
         self.scheduled_source()
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Cmd2AttentionPhaseSource(ScheduledCmd2AttentionSource);
+
+impl ScheduledCmd2AttentionInput for Cmd2AttentionPhaseSource {
+    fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Cmd2ResidualPhaseSource(ScheduledCmd2ResidualSource);
+
+impl ScheduledCmd2ResidualInput for Cmd2ResidualPhaseSource {
+    fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource {
+        self.0
+    }
+}
+
+type ScheduledPostAttentionPhase =
+    ScheduledCmd2Submission<Cmd2AttentionPhaseSource, Cmd2ResidualPhaseSource>;
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
@@ -10055,6 +10077,12 @@ impl FlashMoeEngine {
                 cmd2_attention_source,
                 cmd2_residual_source,
             )?;
+            let scheduled_cmd2 = ScheduledPostAttentionPhase::new(
+                scheduled_cmd2,
+                Cmd2AttentionPhaseSource(cmd2_attention_source),
+                Cmd2ResidualPhaseSource(cmd2_residual_source),
+            )?
+            .cmd2;
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
