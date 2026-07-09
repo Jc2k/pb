@@ -70,6 +70,11 @@ use super::scheduler::{
     ExpertRoute, ExpertSchedulerMetrics, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     ScheduledExpertBatch, ScheduledExpertRoutes,
 };
+#[cfg(test)]
+use super::state::reusable_session_prefix_len;
+use super::state::{
+    FlashMoeSessionState, stable_session_cache_tokens, take_reusable_session_cache_entry,
+};
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
@@ -1440,14 +1445,7 @@ pub struct FlashMoeEngine {
     linear_attention_cache: Mutex<BTreeMap<usize, Arc<LinearAttentionStaticWeights>>>,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
-    session_cache: BTreeMap<String, FlashMoeSessionState>,
-}
-
-#[derive(Debug, Clone)]
-struct FlashMoeSessionState {
-    tokens: Vec<u32>,
-    kv_cache: KvCache,
-    last_hidden: Vec<f32>,
+    session_cache: BTreeMap<String, FlashMoeSessionState<KvCache>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9284,11 +9282,11 @@ impl FlashMoeEngine {
     ) {
         self.session_cache.insert(
             session_id.to_string(),
-            FlashMoeSessionState {
-                tokens: stable_session_cache_tokens(prompt_tokens),
+            FlashMoeSessionState::new(
+                stable_session_cache_tokens(prompt_tokens),
                 kv_cache,
                 last_hidden,
-            },
+            ),
         );
     }
 
@@ -14439,38 +14437,6 @@ impl KvCache {
         }
         Ok(())
     }
-}
-
-fn common_token_prefix_len(left: &[u32], right: &[u32]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn reusable_session_prefix_len(cached_tokens: &[u32], prompt_tokens: &[u32]) -> Option<usize> {
-    let prefix_len = common_token_prefix_len(cached_tokens, prompt_tokens);
-    (prefix_len == cached_tokens.len()).then_some(prefix_len)
-}
-
-fn take_reusable_session_cache_entry(
-    session_cache: &mut BTreeMap<String, FlashMoeSessionState>,
-    session_id: &str,
-    prompt_tokens: &[u32],
-) -> Option<(usize, FlashMoeSessionState)> {
-    let prefix_len = session_cache
-        .get(session_id)
-        .and_then(|state| reusable_session_prefix_len(&state.tokens, prompt_tokens))?;
-    session_cache
-        .remove(session_id)
-        .map(|state| (prefix_len, state))
-}
-
-fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
-    // Assistant generations can be parsed into structured tool calls and then
-    // re-rendered canonically on the next turn. Cache only rendered prompt
-    // tokens whose exact bytes are already part of the transcript contract.
-    prompt_tokens.to_vec()
 }
 
 fn prefill_expert_strategy(
