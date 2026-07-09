@@ -624,10 +624,18 @@ impl<TInputs> ScheduledCmd2Command<TInputs> {
                 state.width()
             );
         }
+        if state.width() != self.input_state.residual().len() {
+            bail!(
+                "FlashMoe scheduled CMD2 post-attention prep width {} does not match residual input width {}",
+                state.width(),
+                self.input_state.residual().len()
+            );
+        }
         Ok(ScheduledCmd2PostAttentionPrepOutput {
             cmd2: self.cmd2,
             layer: self.layer,
             active_experts: self.active_experts,
+            input_state: self.input_state,
             state,
         })
     }
@@ -638,6 +646,7 @@ pub struct ScheduledCmd2PostAttentionPrepOutput {
     pub cmd2: ScheduledCmd2PostAttention,
     pub layer: usize,
     pub active_experts: usize,
+    pub input_state: FlashMoeCmd2InputState,
     state: FlashMoePostAttentionPrepState,
 }
 
@@ -3175,6 +3184,7 @@ mod tests {
         assert_eq!(output.layer, 11);
         assert_eq!(output.active_experts, 4);
         assert_eq!(output.width(), 4096);
+        assert_eq!(output.input_state, command.input_state());
         assert_eq!(output.routing().layer(), 11);
         assert_eq!(output.routing().experts(), 512);
     }
@@ -3221,6 +3231,16 @@ mod tests {
                 .to_string()
                 .contains("does not match post-attention prep active expert count"),
             "{active_err:#}"
+        );
+
+        let width_err = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 2048, 512, 4))
+            .unwrap_err();
+        assert!(
+            width_err
+                .to_string()
+                .contains("does not match residual input width"),
+            "{width_err:#}"
         );
     }
 
