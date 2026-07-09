@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::math::q4_fma_matvec_with_group_size;
 use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
     QwenMoeQ4ExpertLayout,
@@ -731,6 +732,251 @@ impl FixedQ4ExpertPayload {
         let component = self.spec.layout.component(kind);
         &self.bytes[component.offset..component.offset + component.bytes]
     }
+
+    fn component_source(
+        &self,
+        weight_kind: QwenMoeExpertComponentKind,
+        scale_kind: QwenMoeExpertComponentKind,
+        bias_kind: QwenMoeExpertComponentKind,
+    ) -> Q4MatvecSource<'_> {
+        Q4MatvecSource {
+            bytes: &self.bytes,
+            packed_offset: self.spec.layout.component(weight_kind).offset,
+            scale_offset: self.spec.layout.component(scale_kind).offset,
+            bias_offset: self.spec.layout.component(bias_kind).offset,
+        }
+    }
+
+    fn decoded_scales_biases(
+        &self,
+        scale_kind: QwenMoeExpertComponentKind,
+        bias_kind: QwenMoeExpertComponentKind,
+        needed_groups: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let scales = decode_fixed_q4_bf16_component_bytes(self.component(scale_kind))
+            .with_context(|| format!("failed to decode fixed Q4 {scale_kind:?} scales"))?;
+        let biases = decode_fixed_q4_bf16_component_bytes(self.component(bias_kind))
+            .with_context(|| format!("failed to decode fixed Q4 {bias_kind:?} biases"))?;
+        if scales.len() < needed_groups || biases.len() < needed_groups {
+            bail!(
+                "fixed Q4 expert scale/bias payload is shorter than projection requires: scales={}, biases={}, required={needed_groups}",
+                scales.len(),
+                biases.len()
+            );
+        }
+        Ok((scales, biases))
+    }
+
+    pub(crate) fn project_cpu(
+        &self,
+        projection: FixedQ4ExpertProjection,
+        input: &[f32],
+        output_width: usize,
+    ) -> Result<Vec<f32>> {
+        let payload = self
+            .matvec_payload(projection, input.len(), output_width)
+            .context("fixed Q4 projection metadata is incompatible with input/output shape")?;
+        let (scale_kind, bias_kind) = projection.scale_bias_kinds();
+        let (owned_scales, owned_biases);
+        let (scales, biases) = if payload.scales.len() >= payload.scale_bias_groups
+            && payload.biases.len() >= payload.scale_bias_groups
+        {
+            (payload.scales, payload.biases)
+        } else {
+            (owned_scales, owned_biases) =
+                self.decoded_scales_biases(scale_kind, bias_kind, payload.scale_bias_groups)?;
+            (
+                &owned_scales[..payload.scale_bias_groups],
+                &owned_biases[..payload.scale_bias_groups],
+            )
+        };
+        q4_fma_matvec_with_group_size(
+            payload.packed,
+            &input[..payload.cols],
+            scales,
+            biases,
+            payload.rows,
+            payload.cols,
+            payload.group_size,
+        )
+    }
+
+    pub(crate) fn matvec_payload(
+        &self,
+        projection: FixedQ4ExpertProjection,
+        input_len: usize,
+        output_width: usize,
+    ) -> Option<Q4MatvecPayload<'_>> {
+        if input_len == 0 || output_width == 0 {
+            return None;
+        }
+        let (rows, cols) = match projection {
+            FixedQ4ExpertProjection::Gate | FixedQ4ExpertProjection::Up => (
+                self.spec.intermediate_size.min(output_width).max(1),
+                self.spec.hidden_size.min(input_len).max(1),
+            ),
+            FixedQ4ExpertProjection::Down => (
+                self.spec.hidden_size.min(output_width).max(1),
+                self.spec.intermediate_size.min(input_len).max(1),
+            ),
+        };
+        let groups_per_row = cols.div_ceil(self.spec.layout.group_size).max(1);
+        let needed_groups = rows.checked_mul(groups_per_row)?;
+        let needed_packed = rows.checked_mul(cols.div_ceil(2))?;
+        let decoded = self.decoded.as_ref();
+        let (packed, scale_bytes, bias_bytes, scales, biases, source) = match projection {
+            FixedQ4ExpertProjection::Gate => (
+                self.component(QwenMoeExpertComponentKind::GateWeight),
+                self.component(QwenMoeExpertComponentKind::GateScale),
+                self.component(QwenMoeExpertComponentKind::GateBias),
+                decoded
+                    .map(|decoded| decoded.gate_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.gate_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::GateWeight,
+                    QwenMoeExpertComponentKind::GateScale,
+                    QwenMoeExpertComponentKind::GateBias,
+                ),
+            ),
+            FixedQ4ExpertProjection::Up => (
+                self.component(QwenMoeExpertComponentKind::UpWeight),
+                self.component(QwenMoeExpertComponentKind::UpScale),
+                self.component(QwenMoeExpertComponentKind::UpBias),
+                decoded
+                    .map(|decoded| decoded.up_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.up_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::UpWeight,
+                    QwenMoeExpertComponentKind::UpScale,
+                    QwenMoeExpertComponentKind::UpBias,
+                ),
+            ),
+            FixedQ4ExpertProjection::Down => (
+                self.component(QwenMoeExpertComponentKind::DownWeight),
+                self.component(QwenMoeExpertComponentKind::DownScale),
+                self.component(QwenMoeExpertComponentKind::DownBias),
+                decoded
+                    .map(|decoded| decoded.down_scales.as_slice())
+                    .unwrap_or(&[]),
+                decoded
+                    .map(|decoded| decoded.down_biases.as_slice())
+                    .unwrap_or(&[]),
+                self.component_source(
+                    QwenMoeExpertComponentKind::DownWeight,
+                    QwenMoeExpertComponentKind::DownScale,
+                    QwenMoeExpertComponentKind::DownBias,
+                ),
+            ),
+        };
+        if packed.len() < needed_packed
+            || scale_bytes.len() < needed_groups * 2
+            || bias_bytes.len() < needed_groups * 2
+            || (!scales.is_empty() && scales.len() < needed_groups)
+            || (!biases.is_empty() && biases.len() < needed_groups)
+        {
+            return None;
+        }
+        Some(Q4MatvecPayload {
+            rows,
+            cols,
+            group_size: self.spec.layout.group_size,
+            packed: &packed[..needed_packed],
+            scales: if scales.is_empty() {
+                &[]
+            } else {
+                &scales[..needed_groups]
+            },
+            biases: if biases.is_empty() {
+                &[]
+            } else {
+                &biases[..needed_groups]
+            },
+            scale_bias_groups: needed_groups,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16,
+            scale_bytes: &scale_bytes[..needed_groups * 2],
+            bias_bytes: &bias_bytes[..needed_groups * 2],
+            source: Some(source),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedQ4ExpertProjection {
+    Gate,
+    Up,
+    Down,
+}
+
+impl FixedQ4ExpertProjection {
+    fn scale_bias_kinds(self) -> (QwenMoeExpertComponentKind, QwenMoeExpertComponentKind) {
+        match self {
+            FixedQ4ExpertProjection::Gate => (
+                QwenMoeExpertComponentKind::GateScale,
+                QwenMoeExpertComponentKind::GateBias,
+            ),
+            FixedQ4ExpertProjection::Up => (
+                QwenMoeExpertComponentKind::UpScale,
+                QwenMoeExpertComponentKind::UpBias,
+            ),
+            FixedQ4ExpertProjection::Down => (
+                QwenMoeExpertComponentKind::DownScale,
+                QwenMoeExpertComponentKind::DownBias,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Q4MatvecPayload<'a> {
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) group_size: usize,
+    pub(crate) packed: &'a [u8],
+    pub(crate) scales: &'a [f32],
+    pub(crate) biases: &'a [f32],
+    pub(crate) scale_bias_groups: usize,
+    pub(crate) scale_bias_dtype: &'a str,
+    pub(crate) scale_bytes: &'a [u8],
+    pub(crate) bias_bytes: &'a [u8],
+    pub(crate) source: Option<Q4MatvecSource<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Q4MatvecSource<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) packed_offset: usize,
+    pub(crate) scale_offset: usize,
+    pub(crate) bias_offset: usize,
+}
+
+impl<'a> Q4MatvecSource<'a> {
+    pub(crate) fn same_buffer(self, other: Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
+    }
+
+    pub(crate) fn covers(self, payload: &Q4MatvecPayload<'_>) -> bool {
+        self.packed_offset
+            .checked_add(payload.packed.len())
+            .is_some_and(|end| end <= self.bytes.len())
+            && self
+                .scale_offset
+                .checked_add(payload.scale_bytes.len())
+                .is_some_and(|end| end <= self.bytes.len())
+            && self
+                .bias_offset
+                .checked_add(payload.bias_bytes.len())
+                .is_some_and(|end| end <= self.bytes.len())
+    }
+
+    pub(crate) fn offsets_are_metal_aligned(self) -> bool {
+        self.packed_offset % 4 == 0 && self.scale_offset % 4 == 0 && self.bias_offset % 4 == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1126,6 +1372,53 @@ mod tests {
         assert!(
             err.to_string().contains("whole-slot payload length 44"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn fixed_q4_payload_resolves_typed_matvec_offsets_from_whole_slot() {
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let payload = FixedQ4ExpertPayload::from_whole_slot(spec, (0..45).collect(), None).unwrap();
+
+        let gate = payload
+            .matvec_payload(FixedQ4ExpertProjection::Gate, 2, 2)
+            .unwrap();
+        assert_eq!(gate.rows, 2);
+        assert_eq!(gate.cols, 2);
+        assert_eq!(gate.group_size, 2);
+        assert_eq!(gate.scale_bias_groups, 2);
+        assert_eq!(gate.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        assert_eq!(gate.packed, &[0, 1]);
+        assert_eq!(gate.scale_bytes, &[8, 9, 10, 11]);
+        assert_eq!(gate.bias_bytes, &[12, 13, 14, 15]);
+
+        let source = gate.source.unwrap();
+        assert_eq!(source.bytes, payload.payload_prefix(45));
+        assert_eq!(source.packed_offset, 0);
+        assert_eq!(source.scale_offset, 8);
+        assert_eq!(source.bias_offset, 12);
+        assert!(source.covers(&gate));
+        assert!(source.offsets_are_metal_aligned());
+
+        let up = payload
+            .matvec_payload(FixedQ4ExpertProjection::Up, 2, 2)
+            .unwrap();
+        let up_source = up.source.unwrap();
+        assert!(source.same_buffer(up_source));
+        assert_eq!(up_source.packed_offset, 16);
+        assert_eq!(up_source.scale_offset, 24);
+        assert_eq!(up_source.bias_offset, 28);
+    }
+
+    #[test]
+    fn fixed_q4_payload_rejects_partial_projection_bytes() {
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let payload = FixedQ4ExpertPayload::from_whole_slot(spec, (0..45).collect(), None).unwrap();
+
+        assert!(
+            payload
+                .matvec_payload(FixedQ4ExpertProjection::Down, 2, 2)
+                .is_none()
         );
     }
 
