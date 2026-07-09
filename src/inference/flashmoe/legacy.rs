@@ -87,10 +87,11 @@ use super::scheduler::{
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
     ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
     ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
-    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3Submission,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
-    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
-    ScheduledRoutingCandidateSource, ScheduledRoutingScoreView, ScheduledSharedExpert,
+    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
+    ScheduledRoutingScoreView, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -2162,7 +2163,6 @@ impl MetalExecutor {
         debug_assert_eq!(output.layer, command.layer);
         debug_assert_eq!(output.cmd3, command.cmd3);
         debug_assert_eq!(output.input_state, command.input_state);
-        let output_state = output.state();
         let ScheduledCmd3Command {
             position,
             layer,
@@ -2185,7 +2185,7 @@ impl MetalExecutor {
                         weights,
                         normed,
                         residual,
-                        output_state,
+                        output,
                         shared,
                         next_norm_weight,
                         &payloads,
@@ -2194,14 +2194,7 @@ impl MetalExecutor {
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
-                    let _ = (
-                        normed,
-                        residual,
-                        output_state,
-                        payloads,
-                        shared,
-                        next_norm_weight,
-                    );
+                    let _ = (normed, residual, output, payloads, shared, next_norm_weight);
                     bail!(
                         "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
                     );
@@ -2223,7 +2216,7 @@ impl MetalExecutor {
                         prep.normed_buffer,
                         prep.residual_buffer,
                         prep.width,
-                        output_state,
+                        output,
                         shared,
                         next_norm_weight,
                         &payloads,
@@ -5185,12 +5178,14 @@ impl MetalExecutorInner {
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
-        output_state: FlashMoeCmd3OutputState,
+        output: ScheduledCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<MetalDeferredExpertPhase> {
         let width = residual.len();
+        debug_assert_eq!(output.layer, layer);
+        let output_state = output.state();
         if width == 0 || normed.len() < width || weights.len() != experts.len() {
             bail!(
                 "FlashMoe unsupported scheduled CMD3 path: CPU upload input for layer {layer} is not a declared whole phase, width={} normed_len={} residual_len={} weights={} experts={}",
@@ -5199,6 +5194,13 @@ impl MetalExecutorInner {
                 residual.len(),
                 weights.len(),
                 experts.len()
+            );
+        }
+        if output_state.width() != width {
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 path: output width {} does not match CPU upload input width {} for layer {layer}",
+                output_state.width(),
+                width
             );
         }
         if let Some(weight) = next_norm_weight
@@ -5227,7 +5229,7 @@ impl MetalExecutorInner {
                 normed_buffer,
                 residual_buffer,
                 width,
-                output_state,
+                output,
                 shared,
                 next_norm_weight,
                 payloads,
@@ -5245,11 +5247,13 @@ impl MetalExecutorInner {
         normed_buffer: ObjcId,
         residual_buffer: ObjcId,
         width: usize,
-        output_state: FlashMoeCmd3OutputState,
+        output: ScheduledCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<MetalDeferredExpertPhase> {
+        debug_assert_eq!(output.layer, layer);
+        let output_state = output.state();
         self.submit_expert_phase_from_buffers_with_payloads(
             position,
             layer,
