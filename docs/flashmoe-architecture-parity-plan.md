@@ -197,11 +197,12 @@ The validator should reject silent fallbacks such as:
   reads are now issued from the validated `ScheduledRoutingCommand` produced by CPU router scores or
   CMD2 preselected routes, and the pending read set carries scheduler-normalized
   `ScheduledExpertRoutes` with route weights instead of a loose layer plus route vector. CMD1/CMD2/CMD3
-  submission now resolves scheduler-owned command objects before entering runtime helpers. The
-  remaining gap is to move the Metal command encoding and legacy CPU diagnostic helpers out of
-  `legacy.rs` behind the explicit CMD builder APIs.
+  submission is now built through the scheduled graph and resolves scheduler-owned command objects
+  before entering runtime helpers. The remaining gap is to move the Metal command encoding and legacy
+  CPU diagnostic helpers out of `legacy.rs` behind the explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
-  should become explicit command builders used by every supported variant.
+  descriptor and submission construction now flows through the scheduled graph, but the concrete
+  command encoders should become explicit command builders used by every supported variant.
 - GPU residency is partial. CMD1 CPU normed versus deferred GPU next-layer-normed inputs,
   post-attention residual/normed prep, scheduler-visible routing outputs, CMD3 CPU/GPU input state,
   CMD3 deferred hidden/next-normed outputs, and full-attention KV records now carry typed state

@@ -88,12 +88,12 @@ use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
-    ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
-    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
-    ScheduledCmd3InputSource, ScheduledCmd3OutputState, ScheduledCmd3Submission,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
-    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
+    ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
+    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3OutputState, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
@@ -10194,8 +10194,10 @@ impl FlashMoeEngine {
             let scheduled_cmd1 = self
                 .scheduled_graph
                 .build_cmd1_attention_projections(layer, cmd1_input)?;
-            let scheduled_cmd1 =
-                ScheduledCmd1Submission::new(scheduled_cmd1, cmd1_input)?.into_cmd1_command();
+            let scheduled_cmd1 = self
+                .scheduled_graph
+                .build_cmd1_submission(scheduled_cmd1, cmd1_input)?
+                .into_cmd1_command();
             debug_assert_eq!(scheduled_cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
             let cmd1_input_state = if let Some(input) = deferred_attention_input {

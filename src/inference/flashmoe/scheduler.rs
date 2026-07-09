@@ -194,6 +194,25 @@ impl FlashMoeScheduledGraph {
         })
     }
 
+    pub fn build_cmd1_submission<TInput>(
+        &self,
+        cmd1: ScheduledCmd1AttentionProjections,
+        input: TInput,
+    ) -> Result<ScheduledCmd1Submission<TInput>>
+    where
+        TInput: ScheduledCmd1Input,
+    {
+        let expected_stage = *self.stage(FlashMoeGraphStage::Cmd1AttentionProjections);
+        if cmd1.stage != expected_stage {
+            bail!(
+                "FlashMoe scheduled CMD1 descriptor stage {:?} does not match scheduled graph CMD1 stage {:?}",
+                cmd1.stage,
+                expected_stage
+            );
+        }
+        ScheduledCmd1Submission::new(cmd1, input)
+    }
+
     pub fn build_cmd3_expert_phase(
         &self,
         layer: usize,
@@ -3132,6 +3151,36 @@ mod tests {
         assert_eq!(
             resolved.input_state.placement(),
             FlashMoeStatePlacement::GpuResident
+        );
+    }
+
+    #[test]
+    fn scheduled_graph_builds_cmd1_submission_and_rejects_stale_stage() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd1 = graph
+            .build_cmd1_attention_projections(14, ScheduledCmd1InputSource::CpuNormedHidden)
+            .unwrap();
+
+        graph
+            .build_cmd1_submission(cmd1, ScheduledCmd1InputSource::CpuNormedHidden)
+            .unwrap();
+
+        let mut stale_graph = graph.clone();
+        stale_graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::Cmd1AttentionProjections)
+            .unwrap()
+            .implementation = "different-cmd1-implementation";
+
+        let err = stale_graph
+            .build_cmd1_submission(cmd1, ScheduledCmd1InputSource::CpuNormedHidden)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match scheduled graph CMD1 stage"),
+            "{err:#}"
         );
     }
 
