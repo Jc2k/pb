@@ -1,8 +1,74 @@
 use anyhow::{Context, Result, bail};
+use std::sync::{Arc, Mutex};
 
 use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
 };
+use super::types::ACTIVE_EXPERTS_PER_TOKEN;
+
+pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+const FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT: usize = ACTIVE_EXPERTS_PER_TOKEN * 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertReadPath {
+    PositionedRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertIoPolicy {
+    pub expert_read_path: ExpertReadPath,
+    pub application_expert_cache: bool,
+    pub lz4_expert_compression: bool,
+    pub speculative_routing: bool,
+    pub broad_ssd_gpu_overlap: bool,
+}
+
+// Expert scheduler policy guardrails:
+// - read packed experts with positioned reads, not mmap;
+// - do not add an application-level expert LRU/cache;
+// - do not add LZ4 expert compression;
+// - do not speculate future expert routes;
+// - avoid broad SSD/GPU overlap beyond the existing narrow deferred expert phase.
+//
+// These choices follow Flash-MoE's "Trust the OS" result: the OS page cache plus
+// parallel pread won over custom expert caches, mmap expert files, LZ4, prefetch
+// hints, speculative routing, dispatch_io, and aggressive SSD/GPU overlap.
+// See https://github.com/danveloper/flash-moe, especially the README "Trust the
+// OS" notes and docs/optimization-experiments-q4.md.
+pub const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
+    expert_read_path: ExpertReadPath::PositionedRead,
+    application_expert_cache: false,
+    lz4_expert_compression: false,
+    speculative_routing: false,
+    broad_ssd_gpu_overlap: false,
+};
+
+pub fn take_reusable_expert_bytes(
+    pool: &ReusableExpertBytePool,
+    min_capacity: usize,
+) -> Option<Vec<u8>> {
+    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
+    let index = pool
+        .iter()
+        .position(|bytes| bytes.capacity() >= min_capacity)?;
+    Some(pool.swap_remove(index))
+}
+
+pub fn recycle_reusable_expert_bytes(
+    pool: &ReusableExpertBytePool,
+    mut bytes: Vec<u8>,
+    min_capacity: usize,
+) {
+    if bytes.capacity() < min_capacity {
+        return;
+    }
+    bytes.clear();
+    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
+    if pool.len() < FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT {
+        pool.push(bytes);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertSlotDescriptor {
@@ -287,5 +353,28 @@ mod tests {
                 .contains("payload length 3 exceeds slot capacity 2"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn expert_io_policy_keeps_upstream_positioned_read_guardrails() {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead
+        );
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.application_expert_cache);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.speculative_routing);
+        assert!(!FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap);
+    }
+
+    #[test]
+    fn reusable_expert_byte_pool_reuses_capacity_qualified_buffers() {
+        let pool: ReusableExpertBytePool = Arc::new(Mutex::new(Vec::new()));
+        recycle_reusable_expert_bytes(&pool, Vec::with_capacity(64), 64);
+
+        let returned = take_reusable_expert_bytes(&pool, 32).unwrap();
+
+        assert!(returned.capacity() >= 64);
+        assert!(pool.lock().unwrap().is_empty());
     }
 }

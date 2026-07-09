@@ -60,7 +60,9 @@ use tracing::info;
 
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::{
-    ExpertSlotDescriptor, ExpertSlotView, FixedQ4ExpertSlotView, ReusableExpertBuffer,
+    ExpertReadPath, ExpertSlotDescriptor, ExpertSlotView, FLASHMOE_EXPERT_IO_POLICY,
+    FixedQ4ExpertSlotView, ReusableExpertBuffer, ReusableExpertBytePool,
+    recycle_reusable_expert_bytes, take_reusable_expert_bytes,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18137,75 +18139,11 @@ pub struct ExpertStore {
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
-type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
-
-const FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT: usize = ACTIVE_EXPERTS_PER_TOKEN * 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FixedQ4ExpertSlotSpec {
     layout: QwenMoeQ4ExpertLayout,
     hidden_size: usize,
     intermediate_size: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpertReadPath {
-    PositionedRead,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExpertIoPolicy {
-    expert_read_path: ExpertReadPath,
-    application_expert_cache: bool,
-    lz4_expert_compression: bool,
-    speculative_routing: bool,
-    broad_ssd_gpu_overlap: bool,
-}
-
-// Expert scheduler policy guardrails:
-// - read packed experts with positioned reads, not mmap;
-// - do not add an application-level expert LRU/cache;
-// - do not add LZ4 expert compression;
-// - do not speculate future expert routes;
-// - avoid broad SSD/GPU overlap beyond the existing narrow deferred expert phase.
-//
-// These choices follow Flash-MoE's "Trust the OS" result: the OS page cache plus
-// parallel pread won over custom expert caches, mmap expert files, LZ4, prefetch
-// hints, speculative routing, dispatch_io, and aggressive SSD/GPU overlap.
-// See https://github.com/danveloper/flash-moe, especially the README "Trust the
-// OS" notes and docs/optimization-experiments-q4.md.
-const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
-    expert_read_path: ExpertReadPath::PositionedRead,
-    application_expert_cache: false,
-    lz4_expert_compression: false,
-    speculative_routing: false,
-    broad_ssd_gpu_overlap: false,
-};
-
-fn take_reusable_expert_bytes(
-    pool: &ReusableExpertBytePool,
-    min_capacity: usize,
-) -> Option<Vec<u8>> {
-    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
-    let index = pool
-        .iter()
-        .position(|bytes| bytes.capacity() >= min_capacity)?;
-    Some(pool.swap_remove(index))
-}
-
-fn recycle_reusable_expert_bytes(
-    pool: &ReusableExpertBytePool,
-    mut bytes: Vec<u8>,
-    min_capacity: usize,
-) {
-    if bytes.capacity() < min_capacity {
-        return;
-    }
-    bytes.clear();
-    let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
-    if pool.len() < FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT {
-        pool.push(bytes);
-    }
 }
 
 impl ExpertStore {
