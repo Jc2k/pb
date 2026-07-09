@@ -269,6 +269,25 @@ impl FlashMoeLayerStateRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeExpertPhaseOutput {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) next_normed: Option<Vec<f32>>,
+}
+
+impl FlashMoeExpertPhaseOutput {
+    pub(crate) fn new(hidden: Vec<f32>, next_normed: Option<Vec<f32>>) -> Self {
+        Self {
+            hidden,
+            next_normed,
+        }
+    }
+
+    pub(crate) fn into_hidden_and_next_normed(self) -> (Vec<f32>, Option<Vec<f32>>) {
+        (self.hidden, self.next_normed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FlashMoeGeneratedTokenRecord {
     position: usize,
@@ -454,6 +473,16 @@ mod tests {
         );
         state.replace_hidden(vec![5.0]);
         assert_eq!(state.into_hidden_values(), vec![5.0]);
+    }
+
+    #[test]
+    fn expert_phase_output_owns_hidden_and_optional_next_normed_transition() {
+        let output = FlashMoeExpertPhaseOutput::new(vec![1.0, 2.0], Some(vec![0.5, 1.5]));
+
+        let (hidden, next_normed) = output.into_hidden_and_next_normed();
+
+        assert_eq!(hidden, vec![1.0, 2.0]);
+        assert_eq!(next_normed, Some(vec![0.5, 1.5]));
     }
 
     #[test]

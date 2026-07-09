@@ -92,9 +92,10 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
-    FlashMoeLayerStateRecord, FlashMoePromptTokenRecord, FlashMoeSessionState, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
+    FlashMoeGeneratedTokenRecord, FlashMoeLayerStateRecord, FlashMoePromptTokenRecord,
+    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -1953,21 +1954,15 @@ struct LinearAttentionStaticWeights {
 }
 
 #[derive(Debug)]
-struct ExpertPhaseOutput {
-    hidden: Vec<f32>,
-    next_normed: Option<Vec<f32>>,
-}
-
-#[derive(Debug)]
 enum DeferredExpertPhase {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    Ready(ExpertPhaseOutput),
+    Ready(FlashMoeExpertPhaseOutput),
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Metal(MetalDeferredExpertPhase),
 }
 
 impl DeferredExpertPhase {
-    fn wait(self) -> Result<ExpertPhaseOutput> {
+    fn wait(self) -> Result<FlashMoeExpertPhaseOutput> {
         match self {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             Self::Ready(output) => Ok(output),
@@ -3134,7 +3129,7 @@ impl MetalDeferredExpertPhase {
         }
     }
 
-    fn wait(self) -> Result<ExpertPhaseOutput> {
+    fn wait(self) -> Result<FlashMoeExpertPhaseOutput> {
         unsafe {
             if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
                 release(self.command_buffer);
@@ -3156,10 +3151,7 @@ impl MetalDeferredExpertPhase {
                 }
             }
             drop(self.retained_experts);
-            Ok(ExpertPhaseOutput {
-                hidden,
-                next_normed,
-            })
+            Ok(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
         }
     }
 }
@@ -9840,8 +9832,9 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                token_state.replace_hidden(output.hidden);
-                token_state.set_next_layer_normed(output.next_normed);
+                let (hidden, next_normed) = output.into_hidden_and_next_normed();
+                token_state.replace_hidden(hidden);
+                token_state.set_next_layer_normed(next_normed);
             }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
@@ -10031,7 +10024,8 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                token_state.replace_hidden(output.hidden);
+                let (hidden, _) = output.into_hidden_and_next_normed();
+                token_state.replace_hidden(hidden);
                 token_state.clear_next_layer_normed();
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10121,7 +10115,8 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        token_state.replace_hidden(output.hidden);
+                        let (hidden, _) = output.into_hidden_and_next_normed();
+                        token_state.replace_hidden(hidden);
                         token_state.clear_next_layer_normed();
                     }
                     if let Some(metal) = &self.metal {
@@ -10198,7 +10193,8 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        token_state.replace_hidden(output.hidden);
+                        let (hidden, _) = output.into_hidden_and_next_normed();
+                        token_state.replace_hidden(hidden);
                         token_state.clear_next_layer_normed();
                     }
                     let subphase_started = Instant::now();
@@ -10344,8 +10340,9 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    token_state.replace_hidden(output.hidden);
-                    token_state.set_next_layer_normed(output.next_normed);
+                    let (hidden, next_normed) = output.into_hidden_and_next_normed();
+                    token_state.replace_hidden(hidden);
+                    token_state.set_next_layer_normed(next_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10370,8 +10367,9 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    token_state.replace_hidden(output.hidden);
-                    token_state.set_next_layer_normed(output.next_normed);
+                    let (hidden, next_normed) = output.into_hidden_and_next_normed();
+                    token_state.replace_hidden(hidden);
+                    token_state.set_next_layer_normed(next_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10391,8 +10389,9 @@ impl FlashMoeEngine {
                     shared_dense_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
-                token_state.replace_hidden(output.hidden);
-                token_state.set_next_layer_normed(output.next_normed);
+                let (hidden, next_normed) = output.into_hidden_and_next_normed();
+                token_state.replace_hidden(hidden);
+                token_state.set_next_layer_normed(next_normed);
             }
             trace_layer_values(position, layer, "moe", token_state.hidden());
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
@@ -10519,8 +10518,9 @@ impl FlashMoeEngine {
                     previous_layer.buckets.total_wall += wait_elapsed;
                 }
             }
-            token_state.replace_hidden(output.hidden);
-            token_state.set_next_layer_normed(output.next_normed);
+            let (hidden, next_normed) = output.into_hidden_and_next_normed();
+            token_state.replace_hidden(hidden);
+            token_state.set_next_layer_normed(next_normed);
         }
         token_state.clear_next_layer_normed();
 
@@ -13081,7 +13081,7 @@ fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
     residual: &[f32],
     shared: Option<&SharedExpertPhaseWeights>,
     next_norm_weight: Option<&[f32]>,
-) -> Result<ExpertPhaseOutput> {
+) -> Result<FlashMoeExpertPhaseOutput> {
     let width = residual.len();
     if weights.len() != experts.len() {
         bail!(
@@ -13143,10 +13143,7 @@ fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
         rms_norm_with_weight_in_place(&mut normed, Some(weight));
         normed
     });
-    Ok(ExpertPhaseOutput {
-        hidden,
-        next_normed,
-    })
+    Ok(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
 }
 
 #[derive(Debug, Clone)]
