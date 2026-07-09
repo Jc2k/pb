@@ -73,9 +73,9 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeGeneratedTokenRecord, FlashMoeLayerStateRecord,
-    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeCpuBuffer, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
+    FlashMoeLayerStateRecord, FlashMoePromptTokenRecord, FlashMoeSessionState, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -9208,7 +9208,7 @@ impl FlashMoeEngine {
             .enumerate()
             .skip(start_position)
         {
-            kv_cache.record_prompt_token(position, token)?;
+            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
             let mut token_timing =
                 FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
             let expert_execution =
@@ -9343,7 +9343,7 @@ impl FlashMoeEngine {
         let mut vis_idx = 0usize;
         let mut last_hidden = None;
         for (position, &token) in prompt_tokens.iter().enumerate() {
-            kv_cache.record_prompt_token(position, token)?;
+            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
             let visual_index = if token == image_pad_token {
                 if vis_idx >= visual_embeddings.len() {
                     bail!(
@@ -10658,8 +10658,15 @@ impl FlashMoeEngine {
         }
 
         let subphase_started = Instant::now();
+        let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
         let metal_kv_ready = if let Some(metal) = &self.metal {
-            match metal.record_kv(position, layer, layout, &k, &v) {
+            match metal.record_kv(
+                kv_record.position(),
+                kv_record.layer(),
+                layout,
+                kv_record.key(),
+                kv_record.value(),
+            ) {
                 Ok(()) => true,
                 Err(err) => {
                     tracing::warn!(
@@ -10674,7 +10681,7 @@ impl FlashMoeEngine {
         } else {
             false
         };
-        kv_cache.record_kv(position, layer, k, v)?;
+        kv_cache.record_kv_record(kv_record)?;
         let mut attended =
             self.full_attention_cached(kv_cache, position, layer, &q, layout, metal_kv_ready)?;
 
@@ -14347,6 +14354,10 @@ impl KvCache {
         Ok(())
     }
 
+    fn record_prompt_token_record(&mut self, record: FlashMoePromptTokenRecord) -> Result<()> {
+        self.record_prompt_token(record.position(), record.token())
+    }
+
     fn resize_capacity(&mut self, capacity: usize) {
         if capacity <= self.capacity {
             return;
@@ -14396,6 +14407,13 @@ impl KvCache {
         }
         self.kv[layer][position] = Some((Arc::from(key), Arc::from(value)));
         Ok(())
+    }
+
+    fn record_kv_record(&mut self, record: FlashMoeFullAttentionKvRecord) -> Result<()> {
+        let position = record.position();
+        let layer = record.layer();
+        let (key, value) = record.into_key_value();
+        self.record_kv(position, layer, key, value)
     }
 
     fn causal_attention(

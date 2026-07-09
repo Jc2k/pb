@@ -289,6 +289,65 @@ impl FlashMoeGeneratedTokenRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoePromptTokenRecord {
+    position: usize,
+    token: u32,
+}
+
+impl FlashMoePromptTokenRecord {
+    pub(crate) fn new(position: usize, token: u32) -> Self {
+        Self { position, token }
+    }
+
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn token(self) -> u32 {
+        self.token
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeFullAttentionKvRecord {
+    position: usize,
+    layer: usize,
+    key: Vec<f32>,
+    value: Vec<f32>,
+}
+
+impl FlashMoeFullAttentionKvRecord {
+    pub(crate) fn new(position: usize, layer: usize, key: Vec<f32>, value: Vec<f32>) -> Self {
+        Self {
+            position,
+            layer,
+            key,
+            value,
+        }
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn key(&self) -> &[f32] {
+        &self.key
+    }
+
+    pub(crate) fn value(&self) -> &[f32] {
+        &self.value
+    }
+
+    pub(crate) fn into_key_value(self) -> (Vec<f32>, Vec<f32>) {
+        (self.key, self.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +461,24 @@ mod tests {
         let record = FlashMoeGeneratedTokenRecord::new(12, 99);
         assert_eq!(record.position(), 12);
         assert_eq!(record.token(), 99);
+    }
+
+    #[test]
+    fn prompt_token_record_names_position_and_token() {
+        let record = FlashMoePromptTokenRecord::new(3, 42);
+        assert_eq!(record.position(), 3);
+        assert_eq!(record.token(), 42);
+    }
+
+    #[test]
+    fn full_attention_kv_record_owns_position_layer_and_values() {
+        let record = FlashMoeFullAttentionKvRecord::new(5, 2, vec![1.0, 1.5], vec![2.0, 2.5]);
+        assert_eq!(record.position(), 5);
+        assert_eq!(record.layer(), 2);
+        assert_eq!(record.key(), &[1.0, 1.5]);
+        assert_eq!(record.value(), &[2.0, 2.5]);
+        let (key, value) = record.into_key_value();
+        assert_eq!(key, vec![1.0, 1.5]);
+        assert_eq!(value, vec![2.0, 2.5]);
     }
 }
