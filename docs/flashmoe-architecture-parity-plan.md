@@ -153,9 +153,9 @@ The validator should reject silent fallbacks such as:
   next-layer buffers still cross CPU/GPU boundaries in places that should become explicit state
   transitions.
 - Routing topK placement is now represented as a scheduler graph stage and the runtime validates
-  score-based and fused-prep route candidates through it. The remaining gap is score production:
-  router projection and score readback still live in the legacy dense/runtime loop instead of a typed
-  CMD2 routing-output descriptor.
+  typed score submissions and fused-prep route candidates through it. The remaining gap is score
+  production ownership: router projection and score readback still live in the legacy dense/runtime
+  loop instead of a `weights`/CMD2 builder boundary.
 - Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
   down should become part of the same CMD2/CMD3 model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
@@ -227,10 +227,11 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    sampling output, diagnostics, and declared CPU graph stages.
 
 8. Reconcile routing through the scheduler.
-   For Qwen3.5 parity, model CPU softmax/topK after router projection. Route selection now has a
-   scheduler descriptor; continue by moving router score production/readback into typed CMD2 outputs.
-   If GPU routing is kept or later proven better, it must be selected through the same scheduler
-   policy for all variants, with parity tests proving equivalent logits/topK.
+   For Qwen3.5 parity, model CPU softmax/topK after router projection. Route selection and score
+   source submission now have scheduler descriptors; continue by moving router score
+   production/readback into `weights` and typed CMD2 builders. If GPU routing is kept or later proven
+   better, it must be selected through the same scheduler policy for all variants, with parity tests
+   proving equivalent logits/topK.
 
 9. Fold shared experts into the same command model.
    Treat shared gate/up/down and shared down as scheduled work inside CMD2/CMD3, not as a side cache

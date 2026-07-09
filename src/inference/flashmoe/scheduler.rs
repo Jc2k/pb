@@ -273,6 +273,33 @@ pub enum ScheduledRoutingCandidateSource {
     FusedMetalPostAttentionPrepCpuTopK,
 }
 
+pub trait ScheduledRoutingScores {
+    fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource;
+    fn scheduled_routing_scores(&self) -> &[f32];
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScheduledRoutingScoreView<'a> {
+    source: ScheduledRoutingCandidateSource,
+    scores: &'a [f32],
+}
+
+impl<'a> ScheduledRoutingScoreView<'a> {
+    pub const fn new(source: ScheduledRoutingCandidateSource, scores: &'a [f32]) -> Self {
+        Self { source, scores }
+    }
+}
+
+impl ScheduledRoutingScores for ScheduledRoutingScoreView<'_> {
+    fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource {
+        self.source
+    }
+
+    fn scheduled_routing_scores(&self) -> &[f32] {
+        self.scores
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledRoutingTopK {
     pub stage: FlashMoeStageCapability,
@@ -300,13 +327,24 @@ impl ScheduledRoutingTopK {
         Ok(self.active_experts)
     }
 
-    pub fn select_from_scores(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
+    pub fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
+    where
+        TScores: ScheduledRoutingScores,
+    {
         if self.source == ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
             bail!(
                 "FlashMoe scheduled routing source {:?} must submit preselected CPU topK candidates",
                 self.source
             );
         }
+        if self.source != scores.scheduled_routing_score_source() {
+            bail!(
+                "FlashMoe scheduled routing source {:?} does not match submitted score source {:?}",
+                self.source,
+                scores.scheduled_routing_score_source()
+            );
+        }
+        let scores = scores.scheduled_routing_scores();
         let active_experts = self.validate_bounds()?;
         if scores.len() != self.experts {
             bail!(
@@ -1725,10 +1763,26 @@ mod tests {
             .unwrap();
 
         let selected = routing
-            .select_from_scores(&[0.0, 2.0, 2.0, -1.0, 1.0])
+            .select_from_scores(&ScheduledRoutingScoreView::new(
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &[0.0, 2.0, 2.0, -1.0, 1.0],
+            ))
             .unwrap();
 
         assert_eq!(selected, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
+
+        let source_err = routing
+            .select_from_scores(&ScheduledRoutingScoreView::new(
+                ScheduledRoutingCandidateSource::MetalRouterScoresReadback,
+                &[0.0, 2.0, 2.0, -1.0, 1.0],
+            ))
+            .unwrap_err();
+        assert!(
+            source_err
+                .to_string()
+                .contains("does not match submitted score source"),
+            "{source_err:#}"
+        );
     }
 
     #[test]
@@ -1760,7 +1814,10 @@ mod tests {
         );
 
         let source_err = routing
-            .select_from_scores(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+            .select_from_scores(&ScheduledRoutingScoreView::new(
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            ))
             .unwrap_err();
         assert!(
             source_err
@@ -1797,7 +1854,12 @@ mod tests {
         let routing = graph
             .build_routing_topk(0, 2, 4, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
-        let bounds_err = routing.select_from_scores(&[1.0, 2.0]).unwrap_err();
+        let bounds_err = routing
+            .select_from_scores(&ScheduledRoutingScoreView::new(
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &[1.0, 2.0],
+            ))
+            .unwrap_err();
         assert!(
             bounds_err
                 .to_string()

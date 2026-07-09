@@ -89,7 +89,8 @@ use super::scheduler::{
     ScheduledCmd3InputSource, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledSharedExpert, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledRoutingScoreView, ScheduledSharedExpert,
+    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -10907,11 +10908,7 @@ impl FlashMoeEngine {
         normed: &[f32],
         active_experts: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        let source = if self.metal.is_some() {
-            ScheduledRoutingCandidateSource::MetalRouterScoresReadback
-        } else {
-            ScheduledRoutingCandidateSource::CpuRouterScores
-        };
+        let source = ScheduledRoutingCandidateSource::CpuRouterScores;
         let scheduled_routing = self.scheduled_graph.build_routing_topk(
             layer,
             self.config.experts(),
@@ -10924,7 +10921,8 @@ impl FlashMoeEngine {
             self.config.experts(),
             normed,
         )?;
-        scheduled_routing.select_from_scores(&router_scores)
+        scheduled_routing
+            .select_from_scores(&ScheduledRoutingScoreView::new(source, &router_scores))
     }
 
     fn validate_preselected_routes(
