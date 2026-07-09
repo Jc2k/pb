@@ -1876,6 +1876,17 @@ struct MetalExecutor {
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
 type ScheduledPreselectedRoutingOutput = (FlashMoeRoutingOutputState, Vec<(usize, f32)>);
 
+fn missing_scheduled_cmd3_submission(
+    input: ScheduledCmd3InputSource,
+    layer: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "FlashMoe unsupported scheduled CMD3 path: declared {:?} input for layer {} did not produce a Metal expert phase; missing CMD3 implementation must be represented as an unsupported capability instead of falling back",
+        input,
+        layer
+    )
+}
+
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
     Cpu {
@@ -2160,6 +2171,7 @@ impl MetalExecutor {
         let command = phase.into_cmd3_command()?;
         let output_state = command.resolve_output_state()?;
         let ScheduledCmd3Command {
+            cmd3,
             position,
             layer,
             experts,
@@ -2174,20 +2186,21 @@ impl MetalExecutor {
             ExpertPhaseInput::Cpu { normed, residual } => {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    self.inner
-                        .submit_scheduled_expert_phase_with_payloads(
-                            position,
-                            layer,
-                            experts,
-                            weights,
-                            normed,
-                            residual,
-                            output_state,
-                            shared,
-                            next_norm_weight,
-                            &payloads,
-                        )
-                        .map(|pending| pending.map(DeferredExpertPhase::Metal))
+                    let pending = self.inner.submit_scheduled_expert_phase_with_payloads(
+                        position,
+                        layer,
+                        experts,
+                        weights,
+                        normed,
+                        residual,
+                        output_state,
+                        shared,
+                        next_norm_weight,
+                        &payloads,
+                    )?;
+                    let pending = pending
+                        .ok_or_else(|| missing_scheduled_cmd3_submission(cmd3.input, layer))?;
+                    Ok(Some(DeferredExpertPhase::Metal(pending)))
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
@@ -2210,7 +2223,8 @@ impl MetalExecutor {
                 debug_assert_eq!(prep.state.width(), prep.width);
                 debug_assert_eq!(prep.state.active_experts(), prep.active.len());
                 debug_assert_eq!(prep.state.residual().len(), prep.state.normed().len());
-                self.inner
+                let pending = self
+                    .inner
                     .submit_scheduled_expert_phase_from_buffers_with_payloads(
                         position,
                         layer,
@@ -2223,8 +2237,10 @@ impl MetalExecutor {
                         shared,
                         next_norm_weight,
                         &payloads,
-                    )
-                    .map(|pending| pending.map(DeferredExpertPhase::Metal))
+                    )?;
+                let pending =
+                    pending.ok_or_else(|| missing_scheduled_cmd3_submission(cmd3.input, layer))?;
+                Ok(Some(DeferredExpertPhase::Metal(pending)))
             }
         }
     }
