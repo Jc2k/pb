@@ -40,7 +40,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,18 +62,22 @@ use super::capabilities::FlashMoeCapabilityPlan;
 #[cfg(test)]
 use super::experts::ExpertReadPath;
 #[cfg(test)]
+use super::experts::FLASHMOE_EXPERT_IO_POLICY;
+#[cfg(test)]
+use super::experts::ReusableExpertBuffer;
+#[cfg(test)]
 use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertLayerPackMetadata, ExpertLayerReader, ExpertPackMetadata, ExpertPackRecord,
-    ExpertRawPayload, ExpertRawRead, ExpertReadPlan, ExpertSlotDescriptor, ExpertSlotStore,
-    ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FLASHMOE_EXPERT_IO_POLICY,
+    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadWorkerPool,
+    ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
     FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC,
-    ReusableExpertBuffer, ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes,
-    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
-    read_exact_at_positioned, read_expert_layer_pack_metadata,
+    ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes, expert_layer_metadata_path,
+    expert_layer_path, expert_slot_end, expert_slot_offset, read_exact_at_positioned,
+    read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18087,14 +18091,14 @@ impl ExpertStore {
     }
 }
 
-type PendingExpertRead = PendingScheduledRead<ExpertReadResponse>;
-type PendingExpertSet = PendingScheduledExpertSet<ExpertReadResponse>;
+type PendingExpertRead = PendingScheduledRead<ExpertRawReadResponse>;
+type PendingExpertSet = PendingScheduledExpertSet<ExpertRawReadResponse>;
 type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ExpertWeights>>;
 
 #[derive(Debug)]
 struct ExpertScheduler {
     store: ExpertStore,
-    pool: ExpertIoWorkerPool,
+    pool: ExpertReadWorkerPool,
     core: ActiveExpertReadScheduler,
 }
 
@@ -18106,7 +18110,7 @@ impl ExpertScheduler {
     fn new_with_routed_expert_scale(store: ExpertStore, routed_expert_scale: f32) -> Self {
         Self {
             store,
-            pool: ExpertIoWorkerPool::default(),
+            pool: ExpertReadWorkerPool::default(),
             core: ActiveExpertReadScheduler::new(routed_expert_scale),
         }
     }
@@ -18125,16 +18129,14 @@ impl ExpertScheduler {
             // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
             // evicts them, which matches the behavior described in the upstream notes.
             let issue = self.core.issue_read(layer, *expert);
-            let (tx, rx) = mpsc::channel();
-            self.pool.submit(ExpertReadJob {
-                id: issue.id,
-                expert: issue.key.expert,
-                reader: Arc::clone(&reader),
+            let rx = self.pool.submit_read(
+                issue.id,
+                issue.key.expert,
+                Arc::clone(&reader),
                 plan,
-                warm: issue.warm,
-                issued_at: issue.issued_at,
-                tx,
-            })?;
+                issue.warm,
+                issue.issued_at,
+            )?;
             pending.push(PendingExpertRead::new(issue.id, rx));
         }
         Ok(pending)
@@ -18154,6 +18156,15 @@ impl ExpertScheduler {
             let response = pending
                 .recv()
                 .context("expert I/O worker dropped response channel")?;
+            let response = ScheduledExpertReadResponse {
+                id: response.id,
+                queue_latency: response.queue_latency,
+                read_path: response.read_path,
+                read_latency: response.read_latency,
+                bytes_read: response.bytes_read,
+                warm: response.warm,
+                result: response.result.and_then(ExpertWeights::from_raw_read),
+            };
             out.push(Arc::new(self.core.finish_read(pending_id, response)?));
         }
         Ok(out)
@@ -18176,101 +18187,6 @@ impl ExpertScheduler {
         self.pool.worker_count()
     }
 }
-
-#[derive(Default)]
-struct ExpertIoWorkerPool {
-    workers: Vec<thread::JoinHandle<()>>,
-    senders: Vec<mpsc::Sender<ExpertReadJob>>,
-    next_worker: usize,
-}
-
-impl std::fmt::Debug for ExpertIoWorkerPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExpertIoWorkerPool")
-            .field("workers", &self.workers.len())
-            .field("next_worker", &self.next_worker)
-            .finish()
-    }
-}
-
-impl ExpertIoWorkerPool {
-    fn ensure_workers(&mut self, workers: usize) {
-        while self.workers.len() < workers {
-            let (tx, rx) = mpsc::channel::<ExpertReadJob>();
-            let handle = thread::spawn(move || {
-                let mut scratch = ReusableExpertBuffer::default();
-                while let Ok(job) = rx.recv() {
-                    let started_at = Instant::now();
-                    let queue_latency = started_at.saturating_duration_since(job.issued_at);
-                    let bytes_read = job.plan.packed_len as u64;
-                    let result = job
-                        .reader
-                        .read_prepared_into(job.expert, job.plan, &mut scratch);
-                    let (result, read_latency, read_path) = match result {
-                        Ok(raw) => {
-                            let read_latency = raw.read_latency;
-                            let read_path = raw.read_path;
-                            (ExpertWeights::from_raw_read(raw), read_latency, read_path)
-                        }
-                        Err(error) => (
-                            Err(error),
-                            started_at.elapsed(),
-                            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
-                        ),
-                    };
-                    let _ = job.tx.send(ExpertReadResponse {
-                        id: job.id,
-                        queue_latency,
-                        read_path,
-                        read_latency,
-                        bytes_read,
-                        warm: job.warm,
-                        result,
-                    });
-                }
-            });
-            self.senders.push(tx);
-            self.workers.push(handle);
-        }
-    }
-
-    fn submit(&mut self, job: ExpertReadJob) -> Result<()> {
-        if self.senders.is_empty() {
-            self.ensure_workers(1);
-        }
-        let worker = self.next_worker % self.senders.len();
-        self.next_worker = self.next_worker.wrapping_add(1);
-        self.senders[worker]
-            .send(job)
-            .context("failed to submit expert read to I/O worker")
-    }
-
-    #[cfg(test)]
-    fn worker_count(&self) -> usize {
-        self.workers.len()
-    }
-}
-
-impl Drop for ExpertIoWorkerPool {
-    fn drop(&mut self) {
-        self.senders.clear();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-struct ExpertReadJob {
-    id: u64,
-    expert: usize,
-    reader: Arc<ExpertLayerReader>,
-    plan: ExpertReadPlan,
-    warm: bool,
-    issued_at: Instant,
-    tx: mpsc::Sender<ExpertReadResponse>,
-}
-
-type ExpertReadResponse = ScheduledExpertReadResponse<ExpertWeights>;
 
 impl FixedQ4ExpertPayload {
     fn component_source(

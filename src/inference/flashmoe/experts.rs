@@ -7,7 +7,8 @@ use std::io::{Read, Seek};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::model_family::{
@@ -259,6 +260,128 @@ pub(crate) struct ExpertSlotStore {
     fixed_q4: FixedQ4ExpertSlotSpec,
     fixed_q4_buffer_pool: ReusableExpertBytePool,
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct ExpertReadWorkerPool {
+    workers: Vec<thread::JoinHandle<()>>,
+    senders: Vec<mpsc::Sender<ExpertReadJob>>,
+    next_worker: usize,
+}
+
+impl std::fmt::Debug for ExpertReadWorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertReadWorkerPool")
+            .field("workers", &self.workers.len())
+            .field("next_worker", &self.next_worker)
+            .finish()
+    }
+}
+
+impl ExpertReadWorkerPool {
+    pub(crate) fn submit_read(
+        &mut self,
+        id: u64,
+        expert: usize,
+        reader: Arc<ExpertLayerReader>,
+        plan: ExpertReadPlan,
+        warm: bool,
+        issued_at: Instant,
+    ) -> Result<mpsc::Receiver<ExpertRawReadResponse>> {
+        if self.senders.is_empty() {
+            self.ensure_workers(1);
+        }
+        let (tx, rx) = mpsc::channel();
+        let worker = self.next_worker % self.senders.len();
+        self.next_worker = self.next_worker.wrapping_add(1);
+        self.senders[worker]
+            .send(ExpertReadJob {
+                id,
+                expert,
+                reader,
+                plan,
+                warm,
+                issued_at,
+                tx,
+            })
+            .context("failed to submit expert read to I/O worker")?;
+        Ok(rx)
+    }
+
+    pub(crate) fn ensure_workers(&mut self, workers: usize) {
+        while self.workers.len() < workers {
+            let (tx, rx) = mpsc::channel::<ExpertReadJob>();
+            let handle = thread::spawn(move || {
+                let mut scratch = ReusableExpertBuffer::default();
+                while let Ok(job) = rx.recv() {
+                    let started_at = Instant::now();
+                    let queue_latency = started_at.saturating_duration_since(job.issued_at);
+                    let bytes_read = job.plan.packed_len as u64;
+                    let result = job
+                        .reader
+                        .read_prepared_into(job.expert, job.plan, &mut scratch);
+                    let (result, read_latency, read_path) = match result {
+                        Ok(raw) => {
+                            let read_latency = raw.read_latency;
+                            let read_path = raw.read_path;
+                            (Ok(raw), read_latency, read_path)
+                        }
+                        Err(error) => (
+                            Err(error),
+                            started_at.elapsed(),
+                            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+                        ),
+                    };
+                    let _ = job.tx.send(ExpertRawReadResponse {
+                        id: job.id,
+                        queue_latency,
+                        read_path,
+                        read_latency,
+                        bytes_read,
+                        warm: job.warm,
+                        result,
+                    });
+                }
+            });
+            self.senders.push(tx);
+            self.workers.push(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl Drop for ExpertReadWorkerPool {
+    fn drop(&mut self) {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct ExpertReadJob {
+    id: u64,
+    expert: usize,
+    reader: Arc<ExpertLayerReader>,
+    plan: ExpertReadPlan,
+    warm: bool,
+    issued_at: Instant,
+    tx: mpsc::Sender<ExpertRawReadResponse>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpertRawReadResponse {
+    pub(crate) id: u64,
+    pub(crate) queue_latency: Duration,
+    pub(crate) read_path: ExpertReadPath,
+    pub(crate) read_latency: Duration,
+    pub(crate) bytes_read: u64,
+    pub(crate) warm: bool,
+    pub(crate) result: Result<ExpertRawRead>,
 }
 
 impl ExpertSlotStore {
@@ -1141,6 +1264,54 @@ mod tests {
         match raw.payload {
             ExpertRawPayload::Pbq4(bytes) => assert_eq!(bytes, payload),
             ExpertRawPayload::FixedQ4(_) => panic!("PBQ4 slot classified as fixed Q4"),
+        }
+    }
+
+    #[test]
+    fn expert_read_worker_pool_returns_raw_whole_slot_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tiny_fixed_q4_layout();
+        let spec = FixedQ4ExpertSlotSpec::new(layout, 2, 2).unwrap();
+        let payload: Vec<u8> = (0..45).collect();
+        std::fs::write(expert_layer_path(tmp.path(), 0), &payload).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            layout.expert_bytes as u64,
+            1,
+            vec![tiny_pack_metadata(0, 0, layout.expert_bytes as u64)],
+        );
+        std::fs::write(
+            expert_layer_metadata_path(tmp.path(), 0),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let reader = Arc::new(
+            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap(),
+        );
+        let plan = reader.prepare_read(0).unwrap();
+        let mut pool = ExpertReadWorkerPool::default();
+
+        let rx = pool
+            .submit_read(11, 0, reader, plan, false, Instant::now())
+            .unwrap();
+        let response = rx.recv().unwrap();
+        let raw = response.result.unwrap();
+
+        assert_eq!(pool.worker_count(), 1);
+        assert_eq!(response.id, 11);
+        assert_eq!(response.read_path, ExpertReadPath::PositionedRead);
+        assert_eq!(response.bytes_read, layout.expert_bytes as u64);
+        assert!(!response.warm);
+        assert_eq!(raw.slot.layer, 0);
+        assert_eq!(raw.slot.expert, 0);
+        match raw.payload {
+            ExpertRawPayload::FixedQ4(fixed) => {
+                assert_eq!(
+                    fixed.component(QwenMoeExpertComponentKind::DownBias),
+                    &[43, 44]
+                );
+            }
+            ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
         }
     }
 
