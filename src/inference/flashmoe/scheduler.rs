@@ -266,6 +266,23 @@ where
         }
         Ok(Self { cmd2, inputs })
     }
+
+    pub(crate) fn into_cmd2_command(self) -> ScheduledCmd2Command<TInputs> {
+        ScheduledCmd2Command {
+            cmd2: self.cmd2,
+            layer: self.cmd2.layer,
+            active_experts: self.cmd2.active_experts,
+            inputs: self.inputs,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd2Command<TInputs> {
+    pub cmd2: ScheduledCmd2PostAttention,
+    pub layer: usize,
+    pub active_experts: usize,
+    pub inputs: TInputs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2244,6 +2261,41 @@ mod tests {
 
         assert_eq!(submission.cmd2.layer, 11);
         assert_eq!(submission.cmd2.active_experts, 4);
+    }
+
+    #[test]
+    fn scheduled_cmd2_submission_builds_resolved_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+
+        let command = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+
+        assert_eq!(command.layer, 11);
+        assert_eq!(command.active_experts, 4);
+        assert_eq!(
+            command.inputs.scheduled_cmd2_attention_source(),
+            ScheduledCmd2AttentionSource::MetalAttentionValues
+        );
+        assert_eq!(
+            command.inputs.scheduled_cmd2_residual_source(),
+            ScheduledCmd2ResidualSource::MetalBuffer
+        );
     }
 
     #[test]

@@ -10251,7 +10251,7 @@ impl FlashMoeEngine {
                 scheduled_cmd2,
                 ScheduledCmd2PhaseInputs::new(cmd2_attention_source, cmd2_residual_source),
             )?
-            .cmd2;
+            .into_cmd2_command();
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
