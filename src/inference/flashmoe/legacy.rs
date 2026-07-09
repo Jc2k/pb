@@ -10357,6 +10357,23 @@ impl FlashMoeEngine {
             } else {
                 ScheduledCmd2ResidualSource::CpuHidden
             };
+            let cmd2_attention_len = metal_post_attention_prep
+                .as_ref()
+                .map(|prep| prep.width)
+                .or_else(|| {
+                    metal_post_attention_values_for_prep
+                        .as_ref()
+                        .map(|(_, values)| values.len)
+                })
+                .or_else(|| {
+                    post_attention_values_for_prep
+                        .as_ref()
+                        .map(|(_, values)| values.len())
+                })
+                .unwrap_or(projected.len());
+            let cmd2_residual_len = deferred_residual_input
+                .map(|input| input.len())
+                .unwrap_or_else(|| token_state.hidden().len());
             let scheduled_cmd2 = self.scheduled_graph.build_cmd2_post_attention(
                 layer,
                 self.routing_policy.active_experts,
@@ -10365,7 +10382,12 @@ impl FlashMoeEngine {
             )?;
             let scheduled_cmd2 = ScheduledPostAttentionPhase::new(
                 scheduled_cmd2,
-                ScheduledCmd2PhaseInputs::new(cmd2_attention_source, cmd2_residual_source),
+                ScheduledCmd2PhaseInputs::new(
+                    cmd2_attention_source,
+                    cmd2_residual_source,
+                    cmd2_attention_len,
+                    cmd2_residual_len,
+                ),
             )?
             .into_cmd2_command();
             let combine_started = Instant::now();

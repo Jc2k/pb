@@ -9,9 +9,10 @@ use super::experts::{
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
 use super::state::{
-    FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState,
-    FlashMoeFullAttentionKvState, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
-    FlashMoeRoutingOutputState, FlashMoeStateBufferRole, FlashMoeStatePlacement,
+    FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
+    FlashMoeCmd3OutputState, FlashMoeFullAttentionKvState, FlashMoePostAttentionPrepState,
+    FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, FlashMoeStateBufferRole,
+    FlashMoeStatePlacement,
 };
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
@@ -442,22 +443,29 @@ pub struct ScheduledCmd2PostAttention {
 pub trait ScheduledCmd2Inputs {
     fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource;
     fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource;
+    fn scheduled_cmd2_input_state(&self, layer: usize) -> FlashMoeCmd2InputState;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledCmd2PhaseInputs {
     attention: ScheduledCmd2AttentionSource,
     residual: ScheduledCmd2ResidualSource,
+    attention_len: usize,
+    residual_len: usize,
 }
 
 impl ScheduledCmd2PhaseInputs {
     pub const fn new(
         attention: ScheduledCmd2AttentionSource,
         residual: ScheduledCmd2ResidualSource,
+        attention_len: usize,
+        residual_len: usize,
     ) -> Self {
         Self {
             attention,
             residual,
+            attention_len,
+            residual_len,
         }
     }
 }
@@ -469,6 +477,26 @@ impl ScheduledCmd2Inputs for ScheduledCmd2PhaseInputs {
 
     fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource {
         self.residual
+    }
+
+    fn scheduled_cmd2_input_state(&self, layer: usize) -> FlashMoeCmd2InputState {
+        let attention_placement = match self.attention {
+            ScheduledCmd2AttentionSource::CpuAttentionValues => FlashMoeStatePlacement::CpuVisible,
+            ScheduledCmd2AttentionSource::MetalAttentionValues => {
+                FlashMoeStatePlacement::GpuResident
+            }
+        };
+        let residual_placement = match self.residual {
+            ScheduledCmd2ResidualSource::CpuHidden => FlashMoeStatePlacement::CpuVisible,
+            ScheduledCmd2ResidualSource::MetalBuffer => FlashMoeStatePlacement::GpuResident,
+        };
+        FlashMoeCmd2InputState::new(
+            layer,
+            self.attention_len,
+            attention_placement,
+            self.residual_len,
+            residual_placement,
+        )
     }
 }
 
@@ -495,6 +523,45 @@ where
                 "FlashMoe scheduled CMD2 residual source {:?} does not match submitted source {:?}",
                 cmd2.residual,
                 inputs.scheduled_cmd2_residual_source()
+            );
+        }
+        let input_state = inputs.scheduled_cmd2_input_state(cmd2.layer);
+        if input_state.layer() != cmd2.layer {
+            bail!(
+                "FlashMoe scheduled CMD2 input state layer {} does not match descriptor layer {}",
+                input_state.layer(),
+                cmd2.layer
+            );
+        }
+        if !input_state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe scheduled CMD2 input is not declared graph state: attention={:?} residual={:?}",
+                input_state.attention(),
+                input_state.residual()
+            );
+        }
+        let expected_attention_placement = match cmd2.attention {
+            ScheduledCmd2AttentionSource::CpuAttentionValues => FlashMoeStatePlacement::CpuVisible,
+            ScheduledCmd2AttentionSource::MetalAttentionValues => {
+                FlashMoeStatePlacement::GpuResident
+            }
+        };
+        if input_state.attention().placement() != expected_attention_placement {
+            bail!(
+                "FlashMoe scheduled CMD2 attention placement {:?} does not match source {:?}",
+                input_state.attention().placement(),
+                cmd2.attention
+            );
+        }
+        let expected_residual_placement = match cmd2.residual {
+            ScheduledCmd2ResidualSource::CpuHidden => FlashMoeStatePlacement::CpuVisible,
+            ScheduledCmd2ResidualSource::MetalBuffer => FlashMoeStatePlacement::GpuResident,
+        };
+        if input_state.residual().placement() != expected_residual_placement {
+            bail!(
+                "FlashMoe scheduled CMD2 residual placement {:?} does not match source {:?}",
+                input_state.residual().placement(),
+                cmd2.residual
             );
         }
         Ok(Self { cmd2, inputs })
@@ -3011,6 +3078,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::MetalAttentionValues,
                 ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
             ),
         )
         .unwrap();
@@ -3037,6 +3106,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::MetalAttentionValues,
                 ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
             ),
         )
         .unwrap()
@@ -3052,6 +3123,14 @@ mod tests {
             command.inputs.scheduled_cmd2_residual_source(),
             ScheduledCmd2ResidualSource::MetalBuffer
         );
+        let input_state = command.inputs.scheduled_cmd2_input_state(command.layer);
+        assert_eq!(input_state.attention().len(), 4096);
+        assert_eq!(
+            input_state.attention().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert_eq!(input_state.residual().len(), 4096);
+        assert!(input_state.is_declared_graph_state());
     }
 
     #[test]
@@ -3071,6 +3150,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::MetalAttentionValues,
                 ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
             ),
         )
         .unwrap()
@@ -3104,6 +3185,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::CpuAttentionValues,
                 ScheduledCmd2ResidualSource::CpuHidden,
+                4096,
+                4096,
             ),
         )
         .unwrap()
@@ -3148,6 +3231,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::CpuAttentionValues,
                 ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
             ),
         )
         .unwrap_err();
@@ -3162,6 +3247,8 @@ mod tests {
             ScheduledCmd2PhaseInputs::new(
                 ScheduledCmd2AttentionSource::MetalAttentionValues,
                 ScheduledCmd2ResidualSource::CpuHidden,
+                4096,
+                4096,
             ),
         )
         .unwrap_err();
@@ -3169,6 +3256,22 @@ mod tests {
             residual_err
                 .to_string()
                 .contains("does not match submitted source")
+        );
+
+        let invalid_state_err = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+                0,
+                4096,
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            invalid_state_err
+                .to_string()
+                .contains("input is not declared graph state")
         );
     }
 

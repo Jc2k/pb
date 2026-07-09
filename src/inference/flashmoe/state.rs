@@ -65,6 +65,7 @@ impl FlashMoeStatePlacement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlashMoeStateBufferRole {
+    AttentionValues,
     Hidden,
     Residual,
     Normed,
@@ -76,7 +77,8 @@ pub(crate) enum FlashMoeStateBufferRole {
 }
 
 impl FlashMoeStateBufferRole {
-    pub(crate) const GENERATION_ROLES: [Self; 8] = [
+    pub(crate) const GENERATION_ROLES: [Self; 9] = [
+        Self::AttentionValues,
         Self::Hidden,
         Self::Residual,
         Self::Normed,
@@ -240,6 +242,56 @@ impl FlashMoeStateBufferDescriptor {
         FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
             && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
             && self.len() > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashMoeCmd2InputState {
+    layer: usize,
+    attention: FlashMoeStateBufferDescriptor,
+    residual: FlashMoeStateBufferDescriptor,
+}
+
+impl FlashMoeCmd2InputState {
+    pub(crate) fn new(
+        layer: usize,
+        attention_len: usize,
+        attention_placement: FlashMoeStatePlacement,
+        residual_len: usize,
+        residual_placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            layer,
+            attention: FlashMoeStateBufferDescriptor::new(
+                FlashMoeStateBufferRole::AttentionValues,
+                attention_len,
+                attention_placement,
+            ),
+            residual: FlashMoeStateBufferDescriptor::new(
+                FlashMoeStateBufferRole::Residual,
+                residual_len,
+                residual_placement,
+            ),
+        }
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn attention(self) -> FlashMoeStateBufferDescriptor {
+        self.attention
+    }
+
+    pub(crate) fn residual(self) -> FlashMoeStateBufferDescriptor {
+        self.residual
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.attention.is_declared_graph_state()
+            && self.residual.is_declared_graph_state()
+            && self.attention.role() == FlashMoeStateBufferRole::AttentionValues
+            && self.residual.role() == FlashMoeStateBufferRole::Residual
     }
 }
 
@@ -1238,6 +1290,71 @@ mod tests {
         assert!(
             !FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(2, 2, 4)
                 .is_declared_graph_state()
+        );
+    }
+
+    #[test]
+    fn cmd2_input_state_declares_attention_and_residual_placements() {
+        let cpu = FlashMoeCmd2InputState::new(
+            3,
+            2048,
+            FlashMoeStatePlacement::CpuVisible,
+            4096,
+            FlashMoeStatePlacement::CpuVisible,
+        );
+        assert_eq!(cpu.layer(), 3);
+        assert_eq!(
+            cpu.attention().role(),
+            FlashMoeStateBufferRole::AttentionValues
+        );
+        assert_eq!(cpu.residual().role(), FlashMoeStateBufferRole::Residual);
+        assert_eq!(cpu.attention().len(), 2048);
+        assert_eq!(cpu.residual().len(), 4096);
+        assert_eq!(
+            cpu.attention().placement(),
+            FlashMoeStatePlacement::CpuVisible
+        );
+        assert!(cpu.is_declared_graph_state());
+
+        let gpu = FlashMoeCmd2InputState::new(
+            3,
+            2048,
+            FlashMoeStatePlacement::GpuResident,
+            4096,
+            FlashMoeStatePlacement::GpuResident,
+        );
+        assert_eq!(
+            gpu.attention().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert_eq!(
+            gpu.residual().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert!(gpu.is_declared_graph_state());
+    }
+
+    #[test]
+    fn cmd2_input_state_rejects_empty_attention_or_residual() {
+        assert!(
+            !FlashMoeCmd2InputState::new(
+                3,
+                0,
+                FlashMoeStatePlacement::CpuVisible,
+                4096,
+                FlashMoeStatePlacement::CpuVisible,
+            )
+            .is_declared_graph_state()
+        );
+        assert!(
+            !FlashMoeCmd2InputState::new(
+                3,
+                2048,
+                FlashMoeStatePlacement::CpuVisible,
+                0,
+                FlashMoeStatePlacement::CpuVisible,
+            )
+            .is_declared_graph_state()
         );
     }
 
