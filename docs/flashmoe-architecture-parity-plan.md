@@ -121,9 +121,10 @@ The validator should reject silent fallbacks such as:
   import/build compatibility; execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, CMD2 post-attention prep
   output resolution, CMD3 deferred output resolution, routing topK placement validation, declared
-  CMD2 routing-output validation, full-attention KV placement validation for the declared attention
-  math implementation, active expert read issue and finish metrics, route normalization, pending
-  read sets, shared-expert source/shape validation, and the scheduled whole-slot handoff.
+  CMD1 input-state validation, CMD2 routing-output validation, full-attention KV placement
+  validation for the declared attention math implementation, active expert read issue and finish
+  metrics, route normalization, pending read sets, shared-expert source/shape validation, and the
+  scheduled whole-slot handoff.
   Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3
   submission retains those scheduled slots instead of adapting them into `ExpertWeights`, and the
   scheduler now builds resolved CMD1/attention/CMD2/routing/CMD3 command objects before the legacy
@@ -140,12 +141,14 @@ The validator should reject silent fallbacks such as:
   still flows through `legacy.rs` shims.
 - `state.rs` owns CPU-visible hidden/residual/normed/next-normed buffers and now also describes
   GPU-resident hidden, residual, normed, and next-layer normed buffers with typed roles and lengths.
-  CMD2 post-attention prep also declares its CPU-visible routing output as either router scores or
-  preselected topK, with layer, expert count, active count, source, and placement. CMD3 deferred
-  output now declares GPU-resident hidden plus optional next-layer normed output before Metal
-  readback or next-layer reuse. Full-attention KV records now expose CPU-visible or GPU-resident
-  state descriptors with layer, position, width, and placement, and the runtime resolves those
-  descriptors through the scheduler before using CPU attention or writing the Metal KV cache.
+  CMD1 now declares its actual input as either CPU-visible normed state or GPU-resident
+  next-layer-normed state before attention projection. CMD2 post-attention prep also declares its
+  CPU-visible routing output as either router scores or preselected topK, with layer, expert count,
+  active count, source, and placement. CMD3 deferred output now declares GPU-resident hidden plus
+  optional next-layer normed output before Metal readback or next-layer reuse. Full-attention KV
+  records now expose CPU-visible or GPU-resident state descriptors with layer, position, width, and
+  placement, and the runtime resolves those descriptors through the scheduler before using CPU
+  attention or writing the Metal KV cache.
   Recurrent per-layer records now expose CPU-visible recurrent state descriptors before they are
   recorded into the session/cache state. Linear-attention cache state now exposes CPU-visible and
   GPU-resident descriptors for conv state, SSM state, conv output, and value output lengths before
@@ -173,16 +176,16 @@ The validator should reject silent fallbacks such as:
   `legacy.rs` behind the explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
-- GPU residency is partial. Deferred hidden/next-layer normed inputs, post-attention residual/normed
-  prep, scheduler-visible routing outputs, CMD3 deferred hidden/next-normed outputs, and
-  full-attention KV records now carry typed state descriptors. Full-attention CPU versus Metal KV
-  execution is resolved as a declared attention graph-stage implementation, so Metal KV writes are
-  not an implicit fallback path. Per-layer recurrent records now declare CPU-visible placement
-  before cache/session recording. Linear-attention cache state now declares CPU-visible or
-  GPU-resident placement before cache mutation or Metal allocation, but the actual Metal cache
-  object ownership and command encoding still live in `legacy.rs`. Many next-layer buffer
-  transitions still cross CPU/GPU boundaries in places that should become explicit state
-  transitions.
+- GPU residency is partial. CMD1 CPU normed versus deferred GPU next-layer-normed inputs,
+  post-attention residual/normed prep, scheduler-visible routing outputs, CMD3 deferred
+  hidden/next-normed outputs, and full-attention KV records now carry typed state descriptors.
+  Full-attention CPU versus Metal KV execution is resolved as a declared attention graph-stage
+  implementation, so Metal KV writes are not an implicit fallback path. Per-layer recurrent records
+  now declare CPU-visible placement before cache/session recording. Linear-attention cache state now
+  declares CPU-visible or GPU-resident placement before cache mutation or Metal allocation, but the
+  actual Metal cache object ownership and command encoding still live in `legacy.rs`. Many
+  next-layer buffer transitions still cross CPU/GPU boundaries in places that should become
+  explicit state transitions.
 - Routing topK placement is now represented as a scheduler graph stage and resolves score-based or
   fused-prep preselected routes into a scheduler-owned routing command. CPU router scores and fused
   CMD2 prep topK now submit declared routing-output state before route selection is accepted, and
@@ -305,10 +308,9 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    a conversion/input format, not a runtime branch.
 6. Extract dense projection descriptors and resident blob ownership into `weights`.
 7. Turn the current fused post-attention prep and expert phase helpers into named CMD2/CMD3 builder
-   calls with typed inputs. CMD2 routing outputs now have typed state metadata, scheduler
-   validation, and a scheduler-resolved post-attention prep output. CMD3 deferred hidden/next-normed
-   outputs now have scheduler-resolved state metadata; continue by moving the Metal command encoding
-   behind builder calls that produce those state objects directly.
+   calls with typed inputs. CMD1 input state, CMD2 routing outputs, and CMD3 deferred
+   hidden/next-normed outputs now have typed state metadata and scheduler validation; continue by
+   moving the Metal command encoding behind builder calls that produce those state objects directly.
 8. Move state ownership for full-attention KV, recurrent, and next-layer buffers out of the
    generation loop. Full-attention KV now has typed CPU/GPU placement and scheduler validation;
    recurrent layer records now have typed CPU-visible placement; linear-attention cache records now

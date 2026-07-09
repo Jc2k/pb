@@ -394,6 +394,83 @@ impl FlashMoeCmd3OutputState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeCmd1InputState {
+    layer: usize,
+    role: FlashMoeStateBufferRole,
+    len: usize,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeCmd1InputState {
+    pub(crate) fn new(
+        layer: usize,
+        role: FlashMoeStateBufferRole,
+        len: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            layer,
+            role,
+            len,
+            placement,
+        }
+    }
+
+    pub(crate) fn cpu_normed(layer: usize, len: usize) -> Self {
+        Self::new(
+            layer,
+            FlashMoeStateBufferRole::Normed,
+            len,
+            FlashMoeStatePlacement::CpuVisible,
+        )
+    }
+
+    pub(crate) fn gpu_next_layer_normed(
+        layer: usize,
+        descriptor: FlashMoeGpuBufferDescriptor,
+    ) -> Self {
+        Self::new(
+            layer,
+            descriptor.role(),
+            descriptor.len(),
+            descriptor.placement(),
+        )
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.len() > 0
+            && matches!(
+                (self.role(), self.placement()),
+                (
+                    FlashMoeStateBufferRole::Normed,
+                    FlashMoeStatePlacement::CpuVisible
+                ) | (
+                    FlashMoeStateBufferRole::NextLayerNormed,
+                    FlashMoeStatePlacement::GpuResident
+                )
+            )
+            && FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
+}
+
 impl Deref for FlashMoeCpuBuffer {
     type Target = [f32];
 
@@ -1074,6 +1151,35 @@ mod tests {
 
         assert_eq!(output.width(), 0);
         assert!(!output.is_declared_graph_state());
+    }
+
+    #[test]
+    fn cmd1_input_state_declares_cpu_normed_or_gpu_next_normed() {
+        let cpu = FlashMoeCmd1InputState::cpu_normed(12, 4096);
+        assert_eq!(cpu.layer(), 12);
+        assert_eq!(cpu.role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(cpu.len(), 4096);
+        assert_eq!(cpu.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(cpu.is_declared_graph_state());
+
+        let gpu = FlashMoeCmd1InputState::gpu_next_layer_normed(
+            12,
+            FlashMoeGpuBufferDescriptor::next_layer_normed(4096),
+        );
+        assert_eq!(gpu.layer(), 12);
+        assert_eq!(gpu.role(), FlashMoeStateBufferRole::NextLayerNormed);
+        assert_eq!(gpu.len(), 4096);
+        assert_eq!(gpu.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(gpu.is_declared_graph_state());
+
+        assert!(!FlashMoeCmd1InputState::cpu_normed(12, 0).is_declared_graph_state());
+        assert!(
+            !FlashMoeCmd1InputState::gpu_next_layer_normed(
+                12,
+                FlashMoeGpuBufferDescriptor::hidden(4096),
+            )
+            .is_declared_graph_state()
+        );
     }
 
     #[test]

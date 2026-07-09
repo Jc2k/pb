@@ -96,7 +96,7 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
+    FlashMoeCmd1InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
     FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
     FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState, FlashMoePostAttentionPrepState,
     FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState, FlashMoeRoutingOutputState,
@@ -10147,6 +10147,14 @@ impl FlashMoeEngine {
                 ScheduledCmd1Submission::new(scheduled_cmd1, cmd1_input)?.into_cmd1_command();
             debug_assert_eq!(scheduled_cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
+            let cmd1_input_state = if let Some(input) = deferred_attention_input {
+                FlashMoeCmd1InputState::gpu_next_layer_normed(layer, input.state())
+            } else {
+                FlashMoeCmd1InputState::cpu_normed(layer, normed.len())
+            };
+            let cmd1_input_state = scheduled_cmd1.resolve_input_state(cmd1_input_state)?;
+            debug_assert_eq!(cmd1_input_state.layer, layer);
+            debug_assert!(cmd1_input_state.state().is_declared_graph_state());
             let mut post_attention_values_for_prep = None;
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
