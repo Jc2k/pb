@@ -10921,8 +10921,11 @@ impl FlashMoeEngine {
             self.config.experts(),
             normed,
         )?;
-        scheduled_routing
-            .select_from_scores(&ScheduledRoutingScoreView::new(source, &router_scores))
+        scheduled_routing.select_from_scores(&ScheduledRoutingScoreView::new(
+            layer,
+            source,
+            &router_scores,
+        ))
     }
 
     fn validate_preselected_routes(

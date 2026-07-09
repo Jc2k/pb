@@ -274,23 +274,37 @@ pub enum ScheduledRoutingCandidateSource {
 }
 
 pub trait ScheduledRoutingScores {
+    fn scheduled_routing_score_layer(&self) -> usize;
     fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource;
     fn scheduled_routing_scores(&self) -> &[f32];
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScheduledRoutingScoreView<'a> {
+    layer: usize,
     source: ScheduledRoutingCandidateSource,
     scores: &'a [f32],
 }
 
 impl<'a> ScheduledRoutingScoreView<'a> {
-    pub const fn new(source: ScheduledRoutingCandidateSource, scores: &'a [f32]) -> Self {
-        Self { source, scores }
+    pub const fn new(
+        layer: usize,
+        source: ScheduledRoutingCandidateSource,
+        scores: &'a [f32],
+    ) -> Self {
+        Self {
+            layer,
+            source,
+            scores,
+        }
     }
 }
 
 impl ScheduledRoutingScores for ScheduledRoutingScoreView<'_> {
+    fn scheduled_routing_score_layer(&self) -> usize {
+        self.layer
+    }
+
     fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource {
         self.source
     }
@@ -335,6 +349,13 @@ impl ScheduledRoutingTopK {
             bail!(
                 "FlashMoe scheduled routing source {:?} must submit preselected CPU topK candidates",
                 self.source
+            );
+        }
+        if self.layer != scores.scheduled_routing_score_layer() {
+            bail!(
+                "FlashMoe scheduled routing layer {} does not match submitted score layer {}",
+                self.layer,
+                scores.scheduled_routing_score_layer()
             );
         }
         if self.source != scores.scheduled_routing_score_source() {
@@ -1764,6 +1785,7 @@ mod tests {
 
         let selected = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
+                3,
                 ScheduledRoutingCandidateSource::CpuRouterScores,
                 &[0.0, 2.0, 2.0, -1.0, 1.0],
             ))
@@ -1771,8 +1793,23 @@ mod tests {
 
         assert_eq!(selected, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
 
+        let layer_err = routing
+            .select_from_scores(&ScheduledRoutingScoreView::new(
+                4,
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &[0.0, 2.0, 2.0, -1.0, 1.0],
+            ))
+            .unwrap_err();
+        assert!(
+            layer_err
+                .to_string()
+                .contains("does not match submitted score layer"),
+            "{layer_err:#}"
+        );
+
         let source_err = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
+                3,
                 ScheduledRoutingCandidateSource::MetalRouterScoresReadback,
                 &[0.0, 2.0, 2.0, -1.0, 1.0],
             ))
@@ -1815,6 +1852,7 @@ mod tests {
 
         let source_err = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
+                3,
                 ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
             ))
@@ -1856,6 +1894,7 @@ mod tests {
             .unwrap();
         let bounds_err = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
+                0,
                 ScheduledRoutingCandidateSource::CpuRouterScores,
                 &[1.0, 2.0],
             ))
