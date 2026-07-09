@@ -52,6 +52,27 @@ pub(crate) fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
     prompt_tokens.to_vec()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeRecurrentState {
+    value: u64,
+}
+
+impl FlashMoeRecurrentState {
+    pub(crate) fn new(value: u64) -> Self {
+        Self { value }
+    }
+
+    pub(crate) fn mix_active_expert(&mut self, expert_hash: u64, weight: f32) {
+        self.value = self
+            .value
+            .wrapping_add(expert_hash.wrapping_mul((weight.to_bits() as u64).max(1)));
+    }
+
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +109,20 @@ mod tests {
     #[test]
     fn stable_session_cache_tokens_keep_prompt_only() {
         assert_eq!(stable_session_cache_tokens(&[4, 5, 6]), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn recurrent_state_mixes_active_experts_with_wrapping_math() {
+        let mut state = FlashMoeRecurrentState::new(u64::MAX - 4);
+        state.mix_active_expert(3, 1.0);
+        let expected = (u64::MAX - 4).wrapping_add(3_u64.wrapping_mul(1.0f32.to_bits() as u64));
+        assert_eq!(state.value(), expected);
+    }
+
+    #[test]
+    fn recurrent_state_uses_nonzero_multiplier_for_zero_weight_bits() {
+        let mut state = FlashMoeRecurrentState::new(10);
+        state.mix_active_expert(7, 0.0);
+        assert_eq!(state.value(), 17);
     }
 }

@@ -73,7 +73,8 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeSessionState, stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeRecurrentState, FlashMoeSessionState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -9797,7 +9798,9 @@ impl FlashMoeEngine {
         } else {
             self.dense.embedding(previous, runtime.width)?
         };
-        let mut state = self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64);
+        let mut recurrent_state = FlashMoeRecurrentState::new(
+            self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
+        );
         let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
         let mut next_layer_normed: Option<Vec<f32>> = None;
 
@@ -10239,7 +10242,7 @@ impl FlashMoeEngine {
             let cpu_mlp_residual = Some(hidden.clone());
             layer_timing.active_experts = active.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
-                kv_cache.record_layer_state(position, layer, state)?;
+                kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.buckets.add(layer_timing.buckets);
@@ -10295,11 +10298,7 @@ impl FlashMoeEngine {
                 .iter()
                 .zip(scheduled_experts.weights.iter().copied())
             {
-                state = state.wrapping_add(
-                    expert
-                        .mix_hash()
-                        .wrapping_mul((weight.to_bits() as u64).max(1)),
-                );
+                recurrent_state.mix_active_expert(expert.mix_hash(), weight);
             }
             let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
                 .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
@@ -10381,7 +10380,7 @@ impl FlashMoeEngine {
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
-                kv_cache.record_layer_state(position, layer, state)?;
+                kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 info!(
@@ -10443,7 +10442,7 @@ impl FlashMoeEngine {
                 }
                 add_in_place(&mut hidden, feature);
             }
-            kv_cache.record_layer_state(position, layer, state)?;
+            kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
             info!(
