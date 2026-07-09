@@ -73,7 +73,8 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
+    FlashMoeCpuBuffer, FlashMoeGeneratedTokenRecord, FlashMoeLayerStateRecord,
+    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
     take_reusable_session_cache_entry,
 };
 use super::types::*;
@@ -10253,7 +10254,8 @@ impl FlashMoeEngine {
             let cpu_mlp_residual = Some(token_state.residual_snapshot());
             layer_timing.active_experts = active.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
-                kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
+                kv_cache
+                    .record_layer_state_record(token_state.layer_state_record(position, layer))?;
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.buckets.add(layer_timing.buckets);
@@ -10391,7 +10393,8 @@ impl FlashMoeEngine {
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
-                kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
+                kv_cache
+                    .record_layer_state_record(token_state.layer_state_record(position, layer))?;
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 info!(
@@ -10453,7 +10456,7 @@ impl FlashMoeEngine {
                 }
                 add_in_place(token_state.hidden_mut(), feature);
             }
-            kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
+            kv_cache.record_layer_state_record(token_state.layer_state_record(position, layer))?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
             info!(
@@ -10521,7 +10524,9 @@ impl FlashMoeEngine {
             self.rms_norm_with_model_weight("model.norm.weight", token_state.hidden())?,
         );
         if record_generated {
-            kv_cache.record_generated_token(position, previous)?;
+            kv_cache.record_generated_token_record(FlashMoeGeneratedTokenRecord::new(
+                position, previous,
+            ))?;
         }
         if let Some(timing) = timing {
             timing.buckets.combine_norm += combine_started.elapsed();
@@ -14358,6 +14363,13 @@ impl KvCache {
         Ok(())
     }
 
+    fn record_generated_token_record(
+        &mut self,
+        record: FlashMoeGeneratedTokenRecord,
+    ) -> Result<()> {
+        self.record_generated_token(record.position(), record.token())
+    }
+
     fn record_layer_state(&mut self, position: usize, layer: usize, state: u64) -> Result<()> {
         self.ensure_position(position)?;
         if layer >= self.layers {
@@ -14365,6 +14377,10 @@ impl KvCache {
         }
         self.layer_states.push((position, layer, state));
         Ok(())
+    }
+
+    fn record_layer_state_record(&mut self, record: FlashMoeLayerStateRecord) -> Result<()> {
+        self.record_layer_state(record.position(), record.layer(), record.recurrent_value())
     }
 
     fn record_kv(

@@ -231,8 +231,61 @@ impl FlashMoeTokenState {
         self.recurrent.value()
     }
 
+    pub(crate) fn layer_state_record(
+        &self,
+        position: usize,
+        layer: usize,
+    ) -> FlashMoeLayerStateRecord {
+        FlashMoeLayerStateRecord {
+            position,
+            layer,
+            recurrent_value: self.recurrent_value(),
+        }
+    }
+
     pub(crate) fn into_hidden_values(self) -> Vec<f32> {
         self.hidden.into_values()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeLayerStateRecord {
+    position: usize,
+    layer: usize,
+    recurrent_value: u64,
+}
+
+impl FlashMoeLayerStateRecord {
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn recurrent_value(self) -> u64 {
+        self.recurrent_value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeGeneratedTokenRecord {
+    position: usize,
+    token: u32,
+}
+
+impl FlashMoeGeneratedTokenRecord {
+    pub(crate) fn new(position: usize, token: u32) -> Self {
+        Self { position, token }
+    }
+
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn token(self) -> u32 {
+        self.token
     }
 }
 
@@ -332,7 +385,22 @@ mod tests {
 
         state.mix_active_expert(7, 0.0);
         assert_eq!(state.recurrent_value(), 17);
+        assert_eq!(
+            state.layer_state_record(5, 2),
+            FlashMoeLayerStateRecord {
+                position: 5,
+                layer: 2,
+                recurrent_value: 17
+            }
+        );
         state.replace_hidden(vec![5.0]);
         assert_eq!(state.into_hidden_values(), vec![5.0]);
+    }
+
+    #[test]
+    fn generated_token_record_names_position_and_token() {
+        let record = FlashMoeGeneratedTokenRecord::new(12, 99);
+        assert_eq!(record.position(), 12);
+        assert_eq!(record.token(), 99);
     }
 }
