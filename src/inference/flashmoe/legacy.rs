@@ -11059,7 +11059,9 @@ impl FlashMoeEngine {
         } else {
             ScheduledRoutingScoreView::new(layer, source, &router_scores.scores)
         };
-        scheduled_routing.select_from_scores(&score_view)
+        scheduled_routing
+            .select_command_from_scores(&score_view)
+            .map(|command| command.routes)
     }
 
     fn validate_preselected_routes(
@@ -11074,7 +11076,9 @@ impl FlashMoeEngine {
             active_experts,
             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
         )?;
-        scheduled_routing.validate_preselected(&active)
+        scheduled_routing
+            .command_from_preselected(&active)
+            .map(|command| command.routes)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

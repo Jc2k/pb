@@ -412,6 +412,16 @@ pub struct ScheduledRoutingTopK {
 }
 
 impl ScheduledRoutingTopK {
+    fn command_from_routes(&self, routes: Vec<(usize, f32)>) -> ScheduledRoutingCommand {
+        ScheduledRoutingCommand {
+            routing: *self,
+            layer: self.layer,
+            active_experts: self.active_experts,
+            source: self.source,
+            routes,
+        }
+    }
+
     fn validate_bounds(&self) -> Result<usize> {
         if self.experts == 0 {
             bail!("FlashMoe scheduled routing requires at least one expert");
@@ -490,6 +500,17 @@ impl ScheduledRoutingTopK {
         Ok(top_k(scores, active_experts))
     }
 
+    pub(crate) fn select_command_from_scores<TScores>(
+        &self,
+        scores: &TScores,
+    ) -> Result<ScheduledRoutingCommand>
+    where
+        TScores: ScheduledRoutingScores,
+    {
+        let routes = self.select_from_scores(scores)?;
+        Ok(self.command_from_routes(routes))
+    }
+
     pub fn validate_preselected(&self, routes: &[(usize, f32)]) -> Result<Vec<(usize, f32)>> {
         if self.source != ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
             bail!(
@@ -527,6 +548,23 @@ impl ScheduledRoutingTopK {
         }
         Ok(routes.to_vec())
     }
+
+    pub(crate) fn command_from_preselected(
+        &self,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledRoutingCommand> {
+        let routes = self.validate_preselected(routes)?;
+        Ok(self.command_from_routes(routes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledRoutingCommand {
+    pub routing: ScheduledRoutingTopK,
+    pub layer: usize,
+    pub active_experts: usize,
+    pub source: ScheduledRoutingCandidateSource,
+    pub routes: Vec<(usize, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2212,6 +2250,33 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_routing_builds_command_from_declared_scores() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+
+        let command = routing
+            .select_command_from_scores(&ScheduledRoutingScoreView::new(
+                3,
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &[0.1, 0.9, 0.2, 1.5, -0.2],
+            ))
+            .unwrap();
+
+        assert_eq!(command.layer, 3);
+        assert_eq!(command.active_experts, 3);
+        assert_eq!(
+            command.source,
+            ScheduledRoutingCandidateSource::CpuRouterScores
+        );
+        assert_eq!(command.routing.layer, 3);
+        assert_eq!(command.routes.len(), 3);
+        assert_eq!(command.routes[0].0, 3);
+    }
+
+    #[test]
     fn scheduled_routing_validates_preselected_fused_prep_candidates() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
@@ -2252,6 +2317,32 @@ mod tests {
                 .contains("must submit preselected CPU topK candidates"),
             "{source_err:#}"
         );
+    }
+
+    #[test]
+    fn scheduled_routing_builds_command_from_preselected_candidates() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(
+                4,
+                8,
+                2,
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )
+            .unwrap();
+
+        let command = routing
+            .command_from_preselected(&[(7, 0.75), (1, 0.25)])
+            .unwrap();
+
+        assert_eq!(command.layer, 4);
+        assert_eq!(command.active_experts, 2);
+        assert_eq!(
+            command.source,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+        );
+        assert_eq!(command.routes, vec![(7, 0.75), (1, 0.25)]);
     }
 
     #[test]
