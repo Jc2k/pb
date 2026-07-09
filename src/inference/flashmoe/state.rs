@@ -353,6 +353,47 @@ impl FlashMoePostAttentionPrepState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeCmd3OutputState {
+    hidden: FlashMoeGpuBufferDescriptor,
+    next_normed: Option<FlashMoeGpuBufferDescriptor>,
+}
+
+impl FlashMoeCmd3OutputState {
+    pub(crate) fn gpu_resident(width: usize, next_normed: bool) -> Self {
+        Self {
+            hidden: FlashMoeGpuBufferDescriptor::hidden(width),
+            next_normed: next_normed.then(|| FlashMoeGpuBufferDescriptor::next_layer_normed(width)),
+        }
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.hidden.len()
+    }
+
+    pub(crate) fn hidden(self) -> FlashMoeGpuBufferDescriptor {
+        self.hidden
+    }
+
+    pub(crate) fn next_normed(self) -> Option<FlashMoeGpuBufferDescriptor> {
+        self.next_normed
+    }
+
+    pub(crate) fn has_next_normed(self) -> bool {
+        self.next_normed.is_some()
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.hidden.is_declared_graph_state()
+            && self.hidden.role() == FlashMoeStateBufferRole::Hidden
+            && self.next_normed.map_or(true, |next_normed| {
+                next_normed.is_declared_graph_state()
+                    && next_normed.role() == FlashMoeStateBufferRole::NextLayerNormed
+                    && next_normed.len() == self.hidden.len()
+            })
+    }
+}
+
 impl Deref for FlashMoeCpuBuffer {
     type Target = [f32];
 
@@ -724,6 +765,36 @@ mod tests {
             !FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(2, 2, 4)
                 .is_declared_graph_state()
         );
+    }
+
+    #[test]
+    fn cmd3_output_state_declares_gpu_hidden_and_optional_next_normed() {
+        let output = FlashMoeCmd3OutputState::gpu_resident(4096, true);
+
+        assert_eq!(output.width(), 4096);
+        assert_eq!(output.hidden().role(), FlashMoeStateBufferRole::Hidden);
+        assert_eq!(
+            output.hidden().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        let next_normed = output.next_normed().unwrap();
+        assert_eq!(next_normed.role(), FlashMoeStateBufferRole::NextLayerNormed);
+        assert_eq!(next_normed.len(), 4096);
+        assert!(output.has_next_normed());
+        assert!(output.is_declared_graph_state());
+
+        let hidden_only = FlashMoeCmd3OutputState::gpu_resident(4096, false);
+        assert!(!hidden_only.has_next_normed());
+        assert!(hidden_only.next_normed().is_none());
+        assert!(hidden_only.is_declared_graph_state());
+    }
+
+    #[test]
+    fn cmd3_output_state_rejects_zero_width() {
+        let output = FlashMoeCmd3OutputState::gpu_resident(0, true);
+
+        assert_eq!(output.width(), 0);
+        assert!(!output.is_declared_graph_state());
     }
 
     #[test]

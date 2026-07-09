@@ -9,7 +9,8 @@ use super::experts::{
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
 use super::state::{
-    FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState,
+    FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
+    FlashMoeRoutingOutputState,
 };
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
@@ -1090,6 +1091,38 @@ pub struct ScheduledCmd3Command<'a, TExpert, TInput, TShared> {
     pub shared: TShared,
     pub next_norm_weight: Option<&'a [f32]>,
     pub payloads: Vec<ScheduledExpertPhaseMlpPayload<'a>>,
+}
+
+impl<TExpert, TInput, TShared> ScheduledCmd3Command<'_, TExpert, TInput, TShared>
+where
+    TInput: ScheduledCmd3Input,
+{
+    pub(crate) fn resolve_output_state(&self) -> Result<FlashMoeCmd3OutputState> {
+        let width = self.input.scheduled_cmd3_input_width();
+        let state = FlashMoeCmd3OutputState::gpu_resident(
+            width,
+            self.cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights,
+        );
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled CMD3 output is not declared graph state");
+        }
+        if state.width() != width {
+            bail!(
+                "FlashMoe scheduled CMD3 output width {} does not match input width {}",
+                state.width(),
+                width
+            );
+        }
+        if state.has_next_normed()
+            != (self.cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights)
+        {
+            bail!(
+                "FlashMoe scheduled CMD3 output next-norm state does not match descriptor {:?}",
+                self.cmd3.next_norm
+            );
+        }
+        Ok(state)
+    }
 }
 
 impl<'a, TExpert, TInput, TShared> ScheduledCmd3Submission<'a, TExpert, TInput, TShared>
@@ -2825,6 +2858,45 @@ mod tests {
         );
         assert_eq!(command.next_norm_weight.unwrap().len(), 8);
         assert_eq!(command.payloads[0].q4().gate.cols, 8);
+
+        let output_state = command.resolve_output_state().unwrap();
+        assert_eq!(output_state.width(), 8);
+        assert!(output_state.has_next_normed());
+        assert_eq!(output_state.hidden().len(), 8);
+        assert_eq!(output_state.next_normed().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn scheduled_cmd3_output_state_tracks_absent_next_norm() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap();
+        let command = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            None,
+        )
+        .unwrap()
+        .into_cmd3_command()
+        .unwrap();
+
+        let output_state = command.resolve_output_state().unwrap();
+
+        assert_eq!(output_state.width(), 8);
+        assert!(!output_state.has_next_normed());
+        assert!(output_state.next_normed().is_none());
     }
 
     #[test]

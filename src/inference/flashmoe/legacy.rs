@@ -96,11 +96,11 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
-    FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRoutingOutputState,
-    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
+    FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
+    FlashMoeLayerStateRecord, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
+    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -2152,6 +2152,8 @@ impl MetalExecutor {
         &self,
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
+        let command = phase.into_cmd3_command()?;
+        let output_state = command.resolve_output_state()?;
         let ScheduledCmd3Command {
             position,
             layer,
@@ -2162,7 +2164,7 @@ impl MetalExecutor {
             next_norm_weight,
             payloads,
             ..
-        } = phase.into_cmd3_command()?;
+        } = command;
         match input {
             ExpertPhaseInput::Cpu { normed, residual } => {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2175,6 +2177,7 @@ impl MetalExecutor {
                             weights,
                             normed,
                             residual,
+                            output_state,
                             shared,
                             next_norm_weight,
                             &payloads,
@@ -2183,7 +2186,14 @@ impl MetalExecutor {
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
-                    let _ = (normed, residual, payloads, shared, next_norm_weight);
+                    let _ = (
+                        normed,
+                        residual,
+                        output_state,
+                        payloads,
+                        shared,
+                        next_norm_weight,
+                    );
                     bail!(
                         "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
                     );
@@ -2204,6 +2214,7 @@ impl MetalExecutor {
                         prep.normed_buffer,
                         prep.residual_buffer,
                         prep.width,
+                        output_state,
                         shared,
                         next_norm_weight,
                         &payloads,
@@ -3201,21 +3212,27 @@ struct MetalDeferredExpertPhase {
     hidden_buffer: ObjcId,
     next_normed_buffer: Option<ObjcId>,
     context: MetalCommandContext,
+    output_state: FlashMoeCmd3OutputState,
     width: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalDeferredExpertPhase {
     fn next_normed_input(&self) -> Option<DeferredMetalInput> {
-        self.next_normed_buffer.map(|buffer| {
-            let input = DeferredMetalInput::next_layer_normed(buffer, self.width);
-            debug_assert!(input.state().is_declared_graph_state());
-            input
-        })
+        self.next_normed_buffer
+            .zip(self.output_state.next_normed())
+            .map(|(buffer, next_normed)| {
+                let input = DeferredMetalInput::next_layer_normed(buffer, next_normed.len());
+                debug_assert_eq!(input.state(), next_normed);
+                debug_assert!(input.state().is_declared_graph_state());
+                input
+            })
     }
 
     fn hidden_input(&self) -> DeferredMetalInput {
-        let input = DeferredMetalInput::hidden(self.hidden_buffer, self.width);
+        let hidden = self.output_state.hidden();
+        let input = DeferredMetalInput::hidden(self.hidden_buffer, hidden.len());
+        debug_assert_eq!(input.state(), hidden);
         debug_assert!(input.state().is_declared_graph_state());
         input
     }
@@ -3251,10 +3268,11 @@ impl MetalDeferredExpertPhase {
                 }
                 return Err(error.into());
             }
-            let hidden = read_f32_buffer(self.hidden_buffer, self.width);
+            let hidden = read_f32_buffer(self.hidden_buffer, self.output_state.hidden().len());
             let next_normed = self
                 .next_normed_buffer
-                .map(|buffer| read_f32_buffer(buffer, self.width));
+                .zip(self.output_state.next_normed())
+                .map(|(buffer, next_normed)| read_f32_buffer(buffer, next_normed.len()));
             release(self.command_buffer);
             for buffer in self.buffers {
                 if buffer.recycle {
@@ -3268,7 +3286,6 @@ impl MetalDeferredExpertPhase {
         }
     }
 }
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for MetalExecutorInner {}
 
@@ -5095,6 +5112,7 @@ impl MetalExecutorInner {
                 normed_buffer,
                 residual_buffer,
                 width,
+                FlashMoeCmd3OutputState::gpu_resident(width, next_norm_weight.is_some()),
                 shared,
                 next_norm_weight,
                 &payloads,
@@ -5141,6 +5159,7 @@ impl MetalExecutorInner {
                 normed_buffer,
                 residual_buffer,
                 width,
+                FlashMoeCmd3OutputState::gpu_resident(width, next_norm_weight.is_some()),
                 shared,
                 next_norm_weight,
                 payloads,
@@ -5157,6 +5176,7 @@ impl MetalExecutorInner {
         weights: &[f32],
         normed: &[f32],
         residual: &[f32],
+        output_state: FlashMoeCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
@@ -5187,6 +5207,7 @@ impl MetalExecutorInner {
                 normed_buffer,
                 residual_buffer,
                 width,
+                output_state,
                 shared,
                 next_norm_weight,
                 payloads,
@@ -5204,6 +5225,7 @@ impl MetalExecutorInner {
         normed_buffer: ObjcId,
         residual_buffer: ObjcId,
         width: usize,
+        output_state: FlashMoeCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
@@ -5216,6 +5238,7 @@ impl MetalExecutorInner {
             normed_buffer,
             residual_buffer,
             width,
+            output_state,
             shared,
             next_norm_weight,
             payloads,
@@ -5232,12 +5255,20 @@ impl MetalExecutorInner {
         normed_buffer: ObjcId,
         residual_buffer: ObjcId,
         width: usize,
+        output_state: FlashMoeCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         let expert_count = retained_experts.len();
         if width == 0 || weights.len() != expert_count || payloads.len() != expert_count {
+            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+            return Ok(None);
+        }
+        if !output_state.is_declared_graph_state()
+            || output_state.width() != width
+            || output_state.has_next_normed() != next_norm_weight.is_some()
+        {
             self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
             return Ok(None);
         }
@@ -5591,6 +5622,7 @@ impl MetalExecutorInner {
                 hidden_buffer,
                 next_normed_buffer,
                 context,
+                output_state,
                 width,
             }))
         }
