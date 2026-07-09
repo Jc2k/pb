@@ -531,6 +531,75 @@ impl FlashMoeLayerStateRecord {
     pub(crate) fn recurrent_value(self) -> u64 {
         self.recurrent_value
     }
+
+    pub(crate) fn state(self, placement: FlashMoeStatePlacement) -> FlashMoeRecurrentLayerState {
+        match placement {
+            FlashMoeStatePlacement::CpuVisible => FlashMoeRecurrentLayerState::cpu_visible(
+                self.position(),
+                self.layer(),
+                self.recurrent_value(),
+            ),
+            FlashMoeStatePlacement::GpuResident => FlashMoeRecurrentLayerState::new(
+                self.position(),
+                self.layer(),
+                self.recurrent_value(),
+                placement,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeRecurrentLayerState {
+    position: usize,
+    layer: usize,
+    value: u64,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeRecurrentLayerState {
+    pub(crate) fn new(
+        position: usize,
+        layer: usize,
+        value: u64,
+        placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            position,
+            layer,
+            value,
+            placement,
+        }
+    }
+
+    pub(crate) fn cpu_visible(position: usize, layer: usize, value: u64) -> Self {
+        Self::new(position, layer, value, FlashMoeStatePlacement::CpuVisible)
+    }
+
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        FlashMoeStateBufferRole::Recurrent
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -965,6 +1034,24 @@ mod tests {
         );
         state.replace_hidden(vec![5.0]);
         assert_eq!(state.into_hidden_values(), vec![5.0]);
+    }
+
+    #[test]
+    fn recurrent_layer_state_declares_cpu_visible_layer_transition() {
+        let record = FlashMoeLayerStateRecord {
+            position: 5,
+            layer: 2,
+            recurrent_value: 17,
+        };
+        let state = record.state(FlashMoeStatePlacement::CpuVisible);
+
+        assert_eq!(state, FlashMoeRecurrentLayerState::cpu_visible(5, 2, 17));
+        assert_eq!(state.position(), 5);
+        assert_eq!(state.layer(), 2);
+        assert_eq!(state.value(), 17);
+        assert_eq!(state.role(), FlashMoeStateBufferRole::Recurrent);
+        assert_eq!(state.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(state.is_declared_graph_state());
     }
 
     #[test]

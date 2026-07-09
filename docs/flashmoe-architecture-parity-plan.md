@@ -145,10 +145,11 @@ The validator should reject silent fallbacks such as:
   output now declares GPU-resident hidden plus optional next-layer normed output before Metal
   readback or next-layer reuse. Full-attention KV records now expose CPU-visible or GPU-resident
   state descriptors with layer, position, width, and placement, and the runtime resolves those
-  descriptors through the scheduler before using CPU attention or writing the Metal KV cache. The
-  Metal object handles still live in `legacy.rs`, but deferred GPU inputs, post-attention prep,
-  deferred expert outputs, and full-attention KV updates now carry state descriptors instead of raw
-  anonymous lengths.
+  descriptors through the scheduler before using CPU attention or writing the Metal KV cache.
+  Recurrent per-layer records now expose CPU-visible recurrent state descriptors before they are
+  recorded into the session/cache state. The Metal object handles still live in `legacy.rs`, but
+  deferred GPU inputs, post-attention prep, deferred expert outputs, full-attention KV updates, and
+  recurrent layer records now carry state descriptors instead of raw anonymous lengths.
 - Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
   verification tools, not the work queue.
 
@@ -173,8 +174,9 @@ The validator should reject silent fallbacks such as:
   prep, scheduler-visible routing outputs, CMD3 deferred hidden/next-normed outputs, and
   full-attention KV records now carry typed state descriptors. Full-attention CPU versus Metal KV
   execution is resolved as a declared attention graph-stage implementation, so Metal KV writes are
-  not an implicit fallback path. Recurrent state, linear-attention cache state, and many next-layer
-  buffer transitions still cross CPU/GPU boundaries in places that should become explicit state
+  not an implicit fallback path. Per-layer recurrent records now declare CPU-visible placement
+  before cache/session recording. Linear-attention cache state and many next-layer buffer
+  transitions still cross CPU/GPU boundaries in places that should become explicit state
   transitions.
 - Routing topK placement is now represented as a scheduler graph stage and resolves score-based or
   fused-prep preselected routes into a scheduler-owned routing command. CPU router scores and fused
@@ -252,8 +254,9 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    Represent hidden, residual, normed, KV, recurrent, and next-layer buffers as state objects with
    clear CPU-visible and GPU-resident transitions. CPU vectors are allowed for tokenizer input,
    sampling output, diagnostics, and declared CPU graph stages. Full-attention KV records now carry
-   typed CPU/GPU placement and are resolved by the scheduler; continue by moving recurrent,
-   linear-attention cache, and remaining next-layer transitions into the same model.
+   typed CPU/GPU placement and are resolved by the scheduler; recurrent layer records now carry
+   CPU-visible placement before session/cache recording. Continue by moving linear-attention cache
+   and remaining next-layer transitions into the same model.
 
 8. Reconcile routing through the scheduler.
    For Qwen3.5 parity, model CPU softmax/topK after router projection. Route selection and score
@@ -302,7 +305,8 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    behind builder calls that produce those state objects directly.
 8. Move state ownership for full-attention KV, recurrent, and next-layer buffers out of the
    generation loop. Full-attention KV now has typed CPU/GPU placement and scheduler validation;
-   continue with recurrent, linear-attention cache, and remaining next-layer buffer transitions.
+   recurrent layer records now have typed CPU-visible placement; continue with linear-attention
+   cache and remaining next-layer buffer transitions.
 9. Add parity and capability tests around every extraction so behavior moves without hidden semantic
    changes or fallback paths.
 10. Revisit the `2+2=` K=4 drift by comparing logits/state through the unified path. Do not revert

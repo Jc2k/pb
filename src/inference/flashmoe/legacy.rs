@@ -99,8 +99,9 @@ use super::state::{
     FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
     FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
     FlashMoeLayerStateRecord, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
-    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeRecurrentLayerState, FlashMoeRoutingOutputState, FlashMoeSessionState,
+    FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -14732,7 +14733,20 @@ impl KvCache {
     }
 
     fn record_layer_state_record(&mut self, record: FlashMoeLayerStateRecord) -> Result<()> {
-        self.record_layer_state(record.position(), record.layer(), record.recurrent_value())
+        self.record_recurrent_layer_state(record.state(FlashMoeStatePlacement::CpuVisible))
+    }
+
+    fn record_recurrent_layer_state(&mut self, state: FlashMoeRecurrentLayerState) -> Result<()> {
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe recurrent layer state is not declared graph state");
+        }
+        if state.placement() != FlashMoeStatePlacement::CpuVisible {
+            bail!(
+                "FlashMoe recurrent layer state recording requires CpuVisible placement, got {:?}",
+                state.placement()
+            );
+        }
+        self.record_layer_state(state.position(), state.layer(), state.value())
     }
 
     fn record_kv(
@@ -28722,6 +28736,29 @@ mod tests {
         assert!(!Arc::ptr_eq(&live_linear.inner, &snapshot_linear.inner));
         assert_eq!(snapshot_linear.conv_state, expected_conv_state);
         assert_eq!(snapshot_linear.ssm_state, expected_ssm_state);
+    }
+
+    #[test]
+    fn recurrent_layer_state_recording_rejects_gpu_placement_without_fallback() {
+        let mut cache = KvCache::new(2, 2);
+
+        cache
+            .record_recurrent_layer_state(FlashMoeRecurrentLayerState::cpu_visible(1, 0, 99))
+            .unwrap();
+        assert_eq!(cache.layer_states, vec![(1, 0, 99)]);
+
+        let err = cache
+            .record_recurrent_layer_state(FlashMoeRecurrentLayerState::new(
+                1,
+                0,
+                99,
+                FlashMoeStatePlacement::GpuResident,
+            ))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires CpuVisible placement"),
+            "{err:#}"
+        );
     }
 
     #[test]
