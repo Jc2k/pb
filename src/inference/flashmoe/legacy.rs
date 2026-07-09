@@ -98,8 +98,9 @@ use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeSessionState,
-    FlashMoeTokenState, stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRoutingOutputState,
+    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -1872,6 +1873,7 @@ struct MetalExecutor {
 }
 
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
+type ScheduledPreselectedRoutingOutput = (FlashMoeRoutingOutputState, Vec<(usize, f32)>);
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
@@ -2549,6 +2551,7 @@ impl MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn q4_post_attention_prep_topk(
         &self,
+        layer: usize,
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &[f32],
@@ -2557,6 +2560,7 @@ impl MetalExecutor {
         top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
         self.inner.q4_post_attention_prep_topk(
+            layer,
             out_proj,
             router,
             attention_output,
@@ -2569,6 +2573,7 @@ impl MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn q4_post_attention_prep_topk_from_buffer(
         &self,
+        layer: usize,
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &MetalAttentionValues,
@@ -2577,6 +2582,7 @@ impl MetalExecutor {
         top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
         self.inner.q4_post_attention_prep_topk_from_buffer(
+            layer,
             out_proj,
             router,
             attention_output,
@@ -4706,7 +4712,8 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             drop(state_guard);
-            let state = FlashMoePostAttentionPrepState::new(residual_len, active.len());
+            let state =
+                FlashMoePostAttentionPrepState::new(layer, residual_len, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
@@ -7441,6 +7448,7 @@ impl MetalExecutorInner {
     #[allow(clippy::too_many_arguments)]
     fn q4_post_attention_prep_topk(
         &self,
+        layer: usize,
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &[f32],
@@ -7618,7 +7626,8 @@ impl MetalExecutorInner {
             ] {
                 self.recycle(buffer);
             }
-            let state = FlashMoePostAttentionPrepState::new(width, active.len());
+            let state =
+                FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
@@ -7632,6 +7641,7 @@ impl MetalExecutorInner {
 
     fn q4_post_attention_prep_topk_from_buffer(
         &self,
+        layer: usize,
         out_proj: &DenseQ4MmapMatvecProjection,
         router: &DenseQ4MmapMatvecProjection,
         attention_output: &MetalAttentionValues,
@@ -7806,7 +7816,8 @@ impl MetalExecutorInner {
             for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
                 self.recycle(buffer);
             }
-            let state = FlashMoePostAttentionPrepState::new(width, active.len());
+            let state =
+                FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
@@ -10108,7 +10119,7 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut early_active: Option<Vec<(usize, f32)>> = None;
+            let mut early_active: Option<ScheduledPreselectedRoutingOutput> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_values_for_prep: Option<(
                 String,
@@ -10145,7 +10156,7 @@ impl FlashMoeEngine {
                             {
                                 pending.finish_without_readback()?;
                             }
-                            early_active = Some(prep.active.clone());
+                            early_active = Some((prep.state.routing(), prep.active.clone()));
                             early_metal_post_attention_prep = Some(prep);
                         } else if let Some(values) = self.linear_attention_output_values_buffer(
                             layer,
@@ -10298,9 +10309,9 @@ impl FlashMoeEngine {
             .into_cmd2_command();
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
+            let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = early_active;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let mut precomputed_active: Option<Vec<(usize, f32)>> = None;
+            let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some((out_proj_name, attention_values)) =
                 metal_post_attention_values_for_prep.take()
@@ -10334,7 +10345,7 @@ impl FlashMoeEngine {
                     {
                         pending.finish_without_readback()?;
                     }
-                    let active = prep.active.clone();
+                    let active = (prep.state.routing(), prep.active.clone());
                     metal_post_attention_prep = Some(prep);
                     precomputed_active = Some(active);
                     if let Some(attention_values) = attention_values.take() {
@@ -10376,9 +10387,14 @@ impl FlashMoeEngine {
                     }
                 }
             }
-            let active = if let Some(active) = precomputed_active {
+            let active = if let Some((routing_state, active)) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                self.validate_preselected_routes(layer, scheduled_cmd2.active_experts, active)?
+                self.validate_preselected_routes(
+                    layer,
+                    scheduled_cmd2.active_experts,
+                    routing_state,
+                    active,
+                )?
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
@@ -10410,14 +10426,19 @@ impl FlashMoeEngine {
                         {
                             pending.finish_without_readback()?;
                         }
-                        let active = prep.active.clone();
+                        let active = (prep.state.routing(), prep.active.clone());
                         metal_post_attention_prep = Some(prep);
                         prepared = Some(active);
                     }
                 }
-                if let Some(active) = prepared {
+                if let Some((routing_state, active)) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    self.validate_preselected_routes(layer, scheduled_cmd2.active_experts, active)?
+                    self.validate_preselected_routes(
+                        layer,
+                        scheduled_cmd2.active_experts,
+                        routing_state,
+                        active,
+                    )?
                 } else {
                     if deferred_attention_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -11085,6 +11106,11 @@ impl FlashMoeEngine {
             active_experts,
             source,
         )?;
+        scheduled_routing.validate_output_state(FlashMoeRoutingOutputState::cpu_router_scores(
+            layer,
+            self.config.experts(),
+            active_experts,
+        ))?;
         let router_scores = self.dense.router_scores_with_metal(
             self.metal.as_ref(),
             layer,
@@ -11109,6 +11135,7 @@ impl FlashMoeEngine {
         &self,
         layer: usize,
         active_experts: usize,
+        routing_state: FlashMoeRoutingOutputState,
         active: Vec<(usize, f32)>,
     ) -> Result<Vec<(usize, f32)>> {
         let scheduled_routing = self.scheduled_graph.build_routing_topk(
@@ -11117,6 +11144,7 @@ impl FlashMoeEngine {
             active_experts,
             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
         )?;
+        scheduled_routing.validate_output_state(routing_state)?;
         scheduled_routing
             .command_from_preselected(&active)
             .map(|command| command.routes)
@@ -16485,6 +16513,7 @@ impl DenseStore {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk(
+            layer,
             &out_proj,
             &router,
             attention_output,
@@ -16521,6 +16550,7 @@ impl DenseStore {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk_from_buffer(
+            layer,
             &out_proj,
             &router,
             attention_output,

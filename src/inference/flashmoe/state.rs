@@ -69,16 +69,20 @@ pub(crate) enum FlashMoeStateBufferRole {
     Residual,
     Normed,
     NextLayerNormed,
+    RouterScores,
+    RoutingTopK,
     Kv,
     Recurrent,
 }
 
 impl FlashMoeStateBufferRole {
-    pub(crate) const GENERATION_ROLES: [Self; 6] = [
+    pub(crate) const GENERATION_ROLES: [Self; 8] = [
         Self::Hidden,
         Self::Residual,
         Self::Normed,
         Self::NextLayerNormed,
+        Self::RouterScores,
+        Self::RoutingTopK,
         Self::Kv,
         Self::Recurrent,
     ];
@@ -189,18 +193,133 @@ impl FlashMoeGpuBufferDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeRoutingOutputSource {
+    CpuRouterScores,
+    FusedMetalPostAttentionPrepCpuTopK,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeRoutingOutputState {
+    layer: usize,
+    experts: usize,
+    active_experts: usize,
+    source: FlashMoeRoutingOutputSource,
+    role: FlashMoeStateBufferRole,
+    len: usize,
+}
+
+impl FlashMoeRoutingOutputState {
+    pub(crate) fn cpu_router_scores(layer: usize, experts: usize, active_experts: usize) -> Self {
+        Self::new(
+            layer,
+            experts,
+            active_experts,
+            FlashMoeRoutingOutputSource::CpuRouterScores,
+            FlashMoeStateBufferRole::RouterScores,
+            experts,
+        )
+    }
+
+    pub(crate) fn fused_metal_post_attention_cpu_topk(
+        layer: usize,
+        experts: usize,
+        active_experts: usize,
+    ) -> Self {
+        Self::new(
+            layer,
+            experts,
+            active_experts,
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK,
+            FlashMoeStateBufferRole::RoutingTopK,
+            active_experts,
+        )
+    }
+
+    fn new(
+        layer: usize,
+        experts: usize,
+        active_experts: usize,
+        source: FlashMoeRoutingOutputSource,
+        role: FlashMoeStateBufferRole,
+        len: usize,
+    ) -> Self {
+        Self {
+            layer,
+            experts,
+            active_experts,
+            source,
+            role,
+            len,
+        }
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn experts(self) -> usize {
+        self.experts
+    }
+
+    pub(crate) fn active_experts(self) -> usize {
+        self.active_experts
+    }
+
+    pub(crate) fn source(self) -> FlashMoeRoutingOutputSource {
+        self.source
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        FlashMoeStatePlacement::CpuVisible
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        let expected_role = match self.source {
+            FlashMoeRoutingOutputSource::CpuRouterScores => FlashMoeStateBufferRole::RouterScores,
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK => {
+                FlashMoeStateBufferRole::RoutingTopK
+            }
+        };
+        self.experts > 0
+            && self.active_experts > 0
+            && self.active_experts <= self.experts
+            && self.role() == expected_role
+            && self.len()
+                == match expected_role {
+                    FlashMoeStateBufferRole::RouterScores => self.experts,
+                    FlashMoeStateBufferRole::RoutingTopK => self.active_experts,
+                    _ => 0,
+                }
+            && FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FlashMoePostAttentionPrepState {
     residual: FlashMoeGpuBufferDescriptor,
     normed: FlashMoeGpuBufferDescriptor,
-    active_experts: usize,
+    routing: FlashMoeRoutingOutputState,
 }
 
 impl FlashMoePostAttentionPrepState {
-    pub(crate) fn new(width: usize, active_experts: usize) -> Self {
+    pub(crate) fn new(layer: usize, width: usize, experts: usize, active_experts: usize) -> Self {
         Self {
             residual: FlashMoeGpuBufferDescriptor::residual(width),
             normed: FlashMoeGpuBufferDescriptor::normed(width),
-            active_experts,
+            routing: FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(
+                layer,
+                experts,
+                active_experts,
+            ),
         }
     }
 
@@ -217,7 +336,11 @@ impl FlashMoePostAttentionPrepState {
     }
 
     pub(crate) fn active_experts(self) -> usize {
-        self.active_experts
+        self.routing.active_experts()
+    }
+
+    pub(crate) fn routing(self) -> FlashMoeRoutingOutputState {
+        self.routing
     }
 
     pub(crate) fn is_declared_graph_state(self) -> bool {
@@ -226,7 +349,7 @@ impl FlashMoePostAttentionPrepState {
             && self.residual.role() == FlashMoeStateBufferRole::Residual
             && self.normed.role() == FlashMoeStateBufferRole::Normed
             && self.residual.len() == self.normed.len()
-            && self.active_experts > 0
+            && self.routing.is_declared_graph_state()
     }
 }
 
@@ -553,10 +676,16 @@ mod tests {
 
     #[test]
     fn post_attention_prep_state_names_gpu_residual_normed_and_routes() {
-        let state = FlashMoePostAttentionPrepState::new(4096, 4);
+        let state = FlashMoePostAttentionPrepState::new(12, 4096, 128, 4);
 
         assert_eq!(state.width(), 4096);
         assert_eq!(state.active_experts(), 4);
+        assert_eq!(state.routing().layer(), 12);
+        assert_eq!(state.routing().experts(), 128);
+        assert_eq!(
+            state.routing().source(),
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK
+        );
         assert_eq!(state.residual().role(), FlashMoeStateBufferRole::Residual);
         assert_eq!(state.normed().role(), FlashMoeStateBufferRole::Normed);
         assert_eq!(
@@ -568,8 +697,33 @@ mod tests {
 
     #[test]
     fn post_attention_prep_state_rejects_empty_width_or_routes() {
-        assert!(!FlashMoePostAttentionPrepState::new(0, 4).is_declared_graph_state());
-        assert!(!FlashMoePostAttentionPrepState::new(4096, 0).is_declared_graph_state());
+        assert!(!FlashMoePostAttentionPrepState::new(12, 0, 128, 4).is_declared_graph_state());
+        assert!(!FlashMoePostAttentionPrepState::new(12, 4096, 128, 0).is_declared_graph_state());
+        assert!(!FlashMoePostAttentionPrepState::new(12, 4096, 2, 4).is_declared_graph_state());
+    }
+
+    #[test]
+    fn routing_output_state_declares_cpu_visible_scores_and_topk() {
+        let scores = FlashMoeRoutingOutputState::cpu_router_scores(2, 8, 4);
+        assert_eq!(scores.role(), FlashMoeStateBufferRole::RouterScores);
+        assert_eq!(scores.len(), 8);
+        assert_eq!(scores.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(scores.is_declared_graph_state());
+
+        let topk = FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(2, 8, 4);
+        assert_eq!(topk.role(), FlashMoeStateBufferRole::RoutingTopK);
+        assert_eq!(topk.len(), 4);
+        assert_eq!(topk.active_experts(), 4);
+        assert!(topk.is_declared_graph_state());
+    }
+
+    #[test]
+    fn routing_output_state_rejects_empty_or_oversized_active_routes() {
+        assert!(!FlashMoeRoutingOutputState::cpu_router_scores(2, 0, 0).is_declared_graph_state());
+        assert!(
+            !FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(2, 2, 4)
+                .is_declared_graph_state()
+        );
     }
 
     #[test]

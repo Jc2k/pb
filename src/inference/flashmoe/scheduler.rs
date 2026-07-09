@@ -8,6 +8,7 @@ use super::experts::{
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
+use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
 };
@@ -339,6 +340,17 @@ pub enum ScheduledRoutingCandidateSource {
     FusedMetalPostAttentionPrepCpuTopK,
 }
 
+impl From<FlashMoeRoutingOutputSource> for ScheduledRoutingCandidateSource {
+    fn from(source: FlashMoeRoutingOutputSource) -> Self {
+        match source {
+            FlashMoeRoutingOutputSource::CpuRouterScores => Self::CpuRouterScores,
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK => {
+                Self::FusedMetalPostAttentionPrepCpuTopK
+            }
+        }
+    }
+}
+
 pub(crate) trait ScheduledRoutingScores {
     fn scheduled_routing_score_layer(&self) -> usize;
     fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource;
@@ -437,6 +449,42 @@ impl ScheduledRoutingTopK {
             );
         }
         Ok(self.active_experts)
+    }
+
+    pub(crate) fn validate_output_state(&self, state: FlashMoeRoutingOutputState) -> Result<()> {
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled routing output is not declared graph state");
+        }
+        if self.layer != state.layer() {
+            bail!(
+                "FlashMoe scheduled routing layer {} does not match submitted routing output layer {}",
+                self.layer,
+                state.layer()
+            );
+        }
+        if self.experts != state.experts() {
+            bail!(
+                "FlashMoe scheduled routing expert count {} does not match submitted routing output experts {}",
+                self.experts,
+                state.experts()
+            );
+        }
+        if self.active_experts != state.active_experts() {
+            bail!(
+                "FlashMoe scheduled routing active expert count {} does not match submitted routing output active expert count {}",
+                self.active_experts,
+                state.active_experts()
+            );
+        }
+        let source = ScheduledRoutingCandidateSource::from(state.source());
+        if self.source != source {
+            bail!(
+                "FlashMoe scheduled routing source {:?} does not match submitted routing output source {:?}",
+                self.source,
+                source
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
@@ -2315,6 +2363,48 @@ mod tests {
             source_err
                 .to_string()
                 .contains("must submit preselected CPU topK candidates"),
+            "{source_err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_routing_validates_declared_cmd2_output_state() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(
+                3,
+                8,
+                4,
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )
+            .unwrap();
+
+        routing
+            .validate_output_state(
+                FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(3, 8, 4),
+            )
+            .unwrap();
+
+        let layer_err = routing
+            .validate_output_state(
+                FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(4, 8, 4),
+            )
+            .unwrap_err();
+        assert!(
+            layer_err
+                .to_string()
+                .contains("does not match submitted routing output layer"),
+            "{layer_err:#}"
+        );
+
+        let source_err = routing
+            .validate_output_state(FlashMoeRoutingOutputState::cpu_router_scores(3, 8, 4))
+            .unwrap_err();
+        assert!(
+            source_err
+                .to_string()
+                .contains("does not match submitted routing output source"),
             "{source_err:#}"
         );
     }
