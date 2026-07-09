@@ -2156,7 +2156,7 @@ impl MetalExecutor {
     fn submit_scheduled_expert_phase(
         &self,
         phase: ScheduledExpertPhase<'_>,
-    ) -> Result<Option<DeferredExpertPhase>> {
+    ) -> Result<DeferredExpertPhase> {
         let command = phase.into_cmd3_command()?;
         let output_state = command.resolve_output_state()?;
         let ScheduledCmd3Command {
@@ -2186,7 +2186,7 @@ impl MetalExecutor {
                         next_norm_weight,
                         &payloads,
                     )?;
-                    Ok(Some(DeferredExpertPhase::Metal(pending)))
+                    Ok(DeferredExpertPhase::Metal(pending))
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
@@ -2224,7 +2224,7 @@ impl MetalExecutor {
                         next_norm_weight,
                         &payloads,
                     )?;
-                Ok(Some(DeferredExpertPhase::Metal(pending)))
+                Ok(DeferredExpertPhase::Metal(pending))
             }
         }
     }
@@ -10668,9 +10668,7 @@ impl FlashMoeEngine {
                     shared_phase,
                     next_norm_weight.as_deref(),
                 )?;
-                let Some(pending) = metal.submit_scheduled_expert_phase(phase)? else {
-                    bail!("Flash-MoE Metal post-attention prep could not submit expert phase");
-                };
+                let pending = metal.submit_scheduled_expert_phase(phase)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;
@@ -10683,19 +10681,18 @@ impl FlashMoeEngine {
             if !submitted_deferred
                 && let Some(metal) = &self.metal
                 && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
-                && let Some(pending) =
-                    metal.submit_scheduled_expert_phase(ScheduledExpertPhase::new(
-                        position,
-                        scheduled_cmd3,
-                        &scheduled_experts,
-                        ExpertPhaseInput::Cpu {
-                            normed: &normed,
-                            residual: mlp_residual,
-                        },
-                        shared_phase,
-                        next_norm_weight.as_deref(),
-                    )?)?
             {
+                let pending = metal.submit_scheduled_expert_phase(ScheduledExpertPhase::new(
+                    position,
+                    scheduled_cmd3,
+                    &scheduled_experts,
+                    ExpertPhaseInput::Cpu {
+                        normed: &normed,
+                        residual: mlp_residual,
+                    },
+                    shared_phase,
+                    next_norm_weight.as_deref(),
+                )?)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;

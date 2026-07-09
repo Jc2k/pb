@@ -129,8 +129,9 @@ The validator should reject silent fallbacks such as:
   submission retains those scheduled slots instead of adapting them into `ExpertWeights`, and the
   scheduler now builds resolved CMD1/attention/CMD2/routing/CMD3 command objects before the legacy
   Metal encoder or runtime helpers are called. Scheduled CMD3 Metal submission now returns a
-  concrete deferred phase from the inner scheduled helpers and treats "no submitted phase" as an
-  unsupported implementation gap instead of returning to a fallback-shaped caller path.
+  concrete deferred phase from both the wrapper and inner scheduled helpers, and treats "no
+  submitted phase" as an unsupported implementation gap instead of returning to a fallback-shaped
+  caller path.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
