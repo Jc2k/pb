@@ -64,7 +64,7 @@ use super::experts::{
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
-use super::scheduler::FlashMoeScheduledGraph;
+use super::scheduler::{ExpertRoute, FlashMoeScheduledGraph, ScheduledExpertRoutes};
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -18297,18 +18297,6 @@ struct PendingExpertRead {
     rx: mpsc::Receiver<ExpertReadResponse>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ExpertRoute {
-    expert: usize,
-    score: f32,
-}
-
-impl ExpertRoute {
-    fn from_pair((expert, score): (usize, f32)) -> Self {
-        Self { expert, score }
-    }
-}
-
 #[derive(Debug)]
 struct PendingExpertSet {
     layer: usize,
@@ -18710,35 +18698,35 @@ impl ExpertScheduler {
     }
 
     fn finish_routes(&mut self, pending: PendingExpertSet) -> Result<ScheduledExpertSet> {
-        let mut weights: Vec<f32> = pending.routes.iter().map(|route| route.score).collect();
-        softmax_in_place(&mut weights);
-        for weight in &mut weights {
-            *weight *= self.routed_expert_scale;
-        }
+        let scheduled_routes = ScheduledExpertRoutes::from_routes(
+            pending.layer,
+            pending.routes,
+            self.routed_expert_scale,
+        )?;
         let experts = self.finish(pending.reads)?;
-        if experts.len() != pending.routes.len() {
+        if experts.len() != scheduled_routes.routes.len() {
             bail!(
                 "expert scheduler returned {} experts for {} routed entries on layer {}",
                 experts.len(),
-                pending.routes.len(),
-                pending.layer
+                scheduled_routes.routes.len(),
+                scheduled_routes.layer
             );
         }
-        for (route, expert) in pending.routes.iter().zip(experts.iter()) {
-            if expert.layer != pending.layer || expert.expert != route.expert {
+        for (route, expert) in scheduled_routes.routes.iter().zip(experts.iter()) {
+            if expert.layer != scheduled_routes.layer || expert.expert != route.expert {
                 bail!(
                     "expert scheduler returned layer {} expert {} for routed layer {} expert {}",
                     expert.layer,
                     expert.expert,
-                    pending.layer,
+                    scheduled_routes.layer,
                     route.expert
                 );
             }
         }
         Ok(ScheduledExpertSet {
-            layer: pending.layer,
-            routes: pending.routes,
-            weights,
+            layer: scheduled_routes.layer,
+            routes: scheduled_routes.routes,
+            weights: scheduled_routes.weights,
             experts: Arc::from(experts),
         })
     }

@@ -2,6 +2,8 @@ use super::capabilities::{
     FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
     FlashMoeUnsupportedCapability,
 };
+use super::math::softmax_in_place;
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeScheduledGraph {
@@ -53,6 +55,85 @@ impl FlashMoeScheduledGraph {
 
     pub fn declares_scheduler_owned_expert_reads(&self) -> bool {
         self.active_expert_reads().placement == FlashMoeStagePlacement::SchedulerIo
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpertRoute {
+    pub expert: usize,
+    pub score: f32,
+}
+
+impl ExpertRoute {
+    pub fn from_pair((expert, score): (usize, f32)) -> Self {
+        Self { expert, score }
+    }
+
+    pub fn from_scores(routes: &[(usize, f32)]) -> Result<Vec<Self>> {
+        routes
+            .iter()
+            .copied()
+            .map(|route| {
+                let route = Self::from_pair(route);
+                route.validate()?;
+                Ok(route)
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.score.is_finite() {
+            bail!(
+                "expert route score for expert {} is not finite: {}",
+                self.expert,
+                self.score
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledExpertRoutes {
+    pub layer: usize,
+    pub routes: Vec<ExpertRoute>,
+    pub weights: Vec<f32>,
+}
+
+impl ScheduledExpertRoutes {
+    pub fn from_routes(
+        layer: usize,
+        routes: Vec<ExpertRoute>,
+        routed_expert_scale: f32,
+    ) -> Result<Self> {
+        if !(routed_expert_scale.is_finite() && routed_expert_scale > 0.0) {
+            bail!("routed expert scale must be positive and finite");
+        }
+        for route in &routes {
+            route.validate()?;
+        }
+        let mut weights: Vec<f32> = routes.iter().map(|route| route.score).collect();
+        softmax_in_place(&mut weights);
+        for weight in &mut weights {
+            *weight *= routed_expert_scale;
+        }
+        Ok(Self {
+            layer,
+            routes,
+            weights,
+        })
+    }
+
+    pub fn from_scores(
+        layer: usize,
+        routes: &[(usize, f32)],
+        routed_expert_scale: f32,
+    ) -> Result<Self> {
+        Self::from_routes(
+            layer,
+            ExpertRoute::from_scores(routes)?,
+            routed_expert_scale,
+        )
     }
 }
 
@@ -118,6 +199,51 @@ mod tests {
                 .stage(FlashMoeGraphStage::RoutingSoftmaxTopK)
                 .placement,
             FlashMoeStagePlacement::CpuDeclared
+        );
+    }
+
+    #[test]
+    fn scheduled_expert_routes_normalize_and_scale_scores() {
+        let scheduled =
+            ScheduledExpertRoutes::from_scores(12, &[(7, 1.0), (3, 2.0), (9, -1.0)], 0.25).unwrap();
+        let mut expected = vec![1.0, 2.0, -1.0];
+        softmax_in_place(&mut expected);
+        for weight in &mut expected {
+            *weight *= 0.25;
+        }
+
+        assert_eq!(scheduled.layer, 12);
+        assert_eq!(
+            scheduled.routes,
+            vec![
+                ExpertRoute {
+                    expert: 7,
+                    score: 1.0,
+                },
+                ExpertRoute {
+                    expert: 3,
+                    score: 2.0,
+                },
+                ExpertRoute {
+                    expert: 9,
+                    score: -1.0,
+                },
+            ]
+        );
+        assert_eq!(scheduled.weights.len(), expected.len());
+        for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn scheduled_expert_routes_reject_non_finite_scores() {
+        let err = ScheduledExpertRoutes::from_scores(0, &[(2, f32::NAN)], 1.0).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("expert route score for expert 2 is not finite"),
+            "{err:#}"
         );
     }
 }
