@@ -59,11 +59,16 @@ use tokenizers::Tokenizer;
 use tracing::info;
 
 use super::capabilities::FlashMoeCapabilityPlan;
+#[cfg(test)]
+use super::experts::read_expert_pack_metadata;
 use super::experts::{
-    ExpertReadPath, ExpertSlotDescriptor, ExpertSlotView, FLASHMOE_EXPERT_IO_POLICY,
-    FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, ReusableExpertBuffer,
-    ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes, recycle_reusable_expert_bytes,
-    take_reusable_expert_bytes,
+    EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
+    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertReadPath,
+    ExpertSlotDescriptor, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
+    PBQ4_EXPERT_MAGIC, ReusableExpertBuffer, ReusableExpertBytePool,
+    decode_fixed_q4_bf16_component_bytes, expert_layer_metadata_path, expert_layer_path,
+    read_expert_layer_pack_metadata, recycle_reusable_expert_bytes, take_reusable_expert_bytes,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -98,14 +103,6 @@ const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
-const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
-const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
-const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
-const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
-const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
-const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
-
 #[cfg(target_os = "macos")]
 const CBLAS_ROW_MAJOR: c_int = 101;
 #[cfg(target_os = "macos")]
@@ -19308,34 +19305,6 @@ fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWei
         .with_context(|| format!("expert layer {layer} returned no expert {expert}"))
 }
 
-fn read_expert_pack_metadata(
-    root: &Path,
-    layer: usize,
-    expert: usize,
-) -> Result<Option<ExpertPackMetadata>> {
-    let Some(metadata) = read_expert_layer_pack_metadata(root, layer)? else {
-        return Ok(None);
-    };
-    Ok(metadata.pack_for(expert).cloned())
-}
-
-fn read_expert_layer_pack_metadata(
-    root: &Path,
-    layer: usize,
-) -> Result<Option<ExpertLayerPackMetadata>> {
-    let path = expert_layer_metadata_path(root, layer);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let metadata: ExpertLayerPackMetadata = serde_json::from_slice(
-        &fs::read(&path)
-            .with_context(|| format!("failed to read expert metadata {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to parse expert metadata {}", path.display()))?;
-    metadata.validate(&path, layer)?;
-    Ok(Some(metadata))
-}
-
 fn ensure_fixed_q4_expert_cache(plan: &FlashMoePlan, layout: &QwenMoeModelLayout) -> Result<usize> {
     let spec = FixedQ4ExpertSlotSpec::from_model_layout(layout)?;
     let mut rewritten = 0usize;
@@ -19512,23 +19481,6 @@ fn expert_slot_end(expert: usize, expert_size: u64, packed_bytes: u64) -> Result
     expert_slot_offset(expert, expert_size)?
         .checked_add(packed_bytes)
         .context("expert slot end overflow")
-}
-
-fn validate_expert_pack_metadata(
-    path: &Path,
-    metadata: &ExpertPackMetadata,
-    layer: usize,
-    expert: usize,
-) -> Result<()> {
-    if metadata.layer != layer || metadata.expert != expert {
-        bail!(
-            "expert metadata {} describes layer {} expert {}, expected layer {layer} expert {expert}",
-            path.display(),
-            metadata.layer,
-            metadata.expert
-        );
-    }
-    Ok(())
 }
 
 fn fixed_q4_expert_records(
@@ -20116,10 +20068,6 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
     ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
-}
-
-fn expert_layer_path(root: &Path, layer: usize) -> PathBuf {
-    root.join(format!("layer_{layer:02}.bin"))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -24744,126 +24692,6 @@ fn validate_expert_matrix_shape(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExpertLayerPackMetadata {
-    format: String,
-    layer: usize,
-    expert_size: u64,
-    experts: usize,
-    packs: Vec<ExpertPackMetadata>,
-}
-
-impl ExpertLayerPackMetadata {
-    fn new(layer: usize, expert_size: u64, experts: usize, packs: Vec<ExpertPackMetadata>) -> Self {
-        Self {
-            format: PBQ4_EXPERT_LAYER_FORMAT_V2.to_string(),
-            layer,
-            expert_size,
-            experts,
-            packs,
-        }
-    }
-
-    fn new_fixed_q4(
-        layer: usize,
-        expert_size: u64,
-        experts: usize,
-        packs: Vec<ExpertPackMetadata>,
-    ) -> Self {
-        Self {
-            format: FIXED_Q4_EXPERT_LAYER_FORMAT_V1.to_string(),
-            layer,
-            expert_size,
-            experts,
-            packs,
-        }
-    }
-
-    fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
-        self.packs.iter().find(|metadata| metadata.expert == expert)
-    }
-
-    fn validate(&self, path: &Path, layer: usize) -> Result<()> {
-        if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1
-            && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
-            && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
-        {
-            bail!(
-                "expert metadata {} has unsupported format {}",
-                path.display(),
-                self.format
-            );
-        }
-        if self.layer != layer {
-            bail!(
-                "expert metadata {} describes layer {}, expected layer {layer}",
-                path.display(),
-                self.layer
-            );
-        }
-        if self.expert_size == 0 {
-            bail!("expert metadata {} has zero expert_size", path.display());
-        }
-        if self.experts == 0 {
-            bail!("expert metadata {} has zero experts", path.display());
-        }
-        let mut seen = BTreeSet::new();
-        for pack in &self.packs {
-            validate_expert_pack_metadata(path, pack, layer, pack.expert)?;
-            if pack.expert >= self.experts {
-                bail!(
-                    "expert metadata {} describes expert {} outside 0..{}",
-                    path.display(),
-                    pack.expert,
-                    self.experts
-                );
-            }
-            if !seen.insert(pack.expert) {
-                bail!(
-                    "expert metadata {} has duplicate expert {}",
-                    path.display(),
-                    pack.expert
-                );
-            }
-            if pack.packed_bytes > self.expert_size {
-                bail!(
-                    "expert metadata {} expert {} length {} exceeds slot size {}",
-                    path.display(),
-                    pack.expert,
-                    pack.packed_bytes,
-                    self.expert_size
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct ExpertPackMetadata {
-    layer: usize,
-    expert: usize,
-    #[serde(default)]
-    packed_bytes: u64,
-    records: Vec<ExpertPackRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct ExpertPackRecord {
-    tensor: String,
-    dtype: String,
-    shape: Vec<usize>,
-    source_offsets: [u64; 2],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_hash: Option<String>,
-    record_offset: u64,
-    packed_bytes: u64,
-    groups: usize,
-    group_size: usize,
-    #[serde(default = "default_expert_scale_bias_dtype")]
-    scale_bias_dtype: String,
-}
-
 #[derive(Debug, Clone)]
 struct ExpectedExpertPackRecord {
     tensor: String,
@@ -24875,10 +24703,6 @@ struct ExpectedExpertPackRecord {
     groups: usize,
     group_size: usize,
     scale_bias_dtype: String,
-}
-
-fn default_expert_scale_bias_dtype() -> String {
-    EXPERT_SCALE_BIAS_DTYPE_F32.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -25098,10 +24922,6 @@ fn sha256_hex_parts(parts: &[&[u8]]) -> String {
         write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
     }
     out
-}
-
-fn expert_layer_metadata_path(root: &Path, layer: usize) -> PathBuf {
-    root.join(format!("layer_{layer:02}.json"))
 }
 
 fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<Option<PathBuf>> {

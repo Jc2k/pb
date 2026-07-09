@@ -1,4 +1,8 @@
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::model_family::{
@@ -10,6 +14,13 @@ use super::types::{ACTIVE_EXPERTS_PER_TOKEN, HIDDEN_DIM};
 pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
 
 const FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT: usize = ACTIVE_EXPERTS_PER_TOKEN * 4;
+pub(crate) const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
+pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
+pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
+pub(crate) const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
+pub(crate) const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
+pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
+pub(crate) const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertReadPath {
@@ -44,6 +55,189 @@ pub const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
     speculative_routing: false,
     broad_ssd_gpu_overlap: false,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExpertLayerPackMetadata {
+    pub(crate) format: String,
+    pub(crate) layer: usize,
+    pub(crate) expert_size: u64,
+    pub(crate) experts: usize,
+    pub(crate) packs: Vec<ExpertPackMetadata>,
+}
+
+impl ExpertLayerPackMetadata {
+    pub(crate) fn new(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: PBQ4_EXPERT_LAYER_FORMAT_V2.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
+    pub(crate) fn new_fixed_q4(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: FIXED_Q4_EXPERT_LAYER_FORMAT_V1.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
+    pub(crate) fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
+        self.packs.iter().find(|metadata| metadata.expert == expert)
+    }
+
+    pub(crate) fn validate(&self, path: &Path, layer: usize) -> Result<()> {
+        if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1
+            && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
+            && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+        {
+            bail!(
+                "expert metadata {} has unsupported format {}",
+                path.display(),
+                self.format
+            );
+        }
+        if self.layer != layer {
+            bail!(
+                "expert metadata {} describes layer {}, expected layer {layer}",
+                path.display(),
+                self.layer
+            );
+        }
+        if self.expert_size == 0 {
+            bail!("expert metadata {} has zero expert_size", path.display());
+        }
+        if self.experts == 0 {
+            bail!("expert metadata {} has zero experts", path.display());
+        }
+        let mut seen = BTreeSet::new();
+        for pack in &self.packs {
+            validate_expert_pack_metadata(path, pack, layer, pack.expert)?;
+            if pack.expert >= self.experts {
+                bail!(
+                    "expert metadata {} describes expert {} outside 0..{}",
+                    path.display(),
+                    pack.expert,
+                    self.experts
+                );
+            }
+            if !seen.insert(pack.expert) {
+                bail!(
+                    "expert metadata {} has duplicate expert {}",
+                    path.display(),
+                    pack.expert
+                );
+            }
+            if pack.packed_bytes > self.expert_size {
+                bail!(
+                    "expert metadata {} expert {} length {} exceeds slot size {}",
+                    path.display(),
+                    pack.expert,
+                    pack.packed_bytes,
+                    self.expert_size
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ExpertPackMetadata {
+    pub(crate) layer: usize,
+    pub(crate) expert: usize,
+    #[serde(default)]
+    pub(crate) packed_bytes: u64,
+    pub(crate) records: Vec<ExpertPackRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ExpertPackRecord {
+    pub(crate) tensor: String,
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) source_offsets: [u64; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_hash: Option<String>,
+    pub(crate) record_offset: u64,
+    pub(crate) packed_bytes: u64,
+    pub(crate) groups: usize,
+    pub(crate) group_size: usize,
+    #[serde(default = "default_expert_scale_bias_dtype")]
+    pub(crate) scale_bias_dtype: String,
+}
+
+pub(crate) fn default_expert_scale_bias_dtype() -> String {
+    EXPERT_SCALE_BIAS_DTYPE_F32.to_string()
+}
+
+pub(crate) fn validate_expert_pack_metadata(
+    path: &Path,
+    metadata: &ExpertPackMetadata,
+    layer: usize,
+    expert: usize,
+) -> Result<()> {
+    if metadata.layer != layer || metadata.expert != expert {
+        bail!(
+            "expert metadata {} describes layer {} expert {}, expected layer {layer} expert {expert}",
+            path.display(),
+            metadata.layer,
+            metadata.expert
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn expert_layer_path(root: &Path, layer: usize) -> PathBuf {
+    root.join(format!("layer_{layer:02}.bin"))
+}
+
+pub(crate) fn expert_layer_metadata_path(root: &Path, layer: usize) -> PathBuf {
+    root.join(format!("layer_{layer:02}.json"))
+}
+
+#[cfg(test)]
+pub(crate) fn read_expert_pack_metadata(
+    root: &Path,
+    layer: usize,
+    expert: usize,
+) -> Result<Option<ExpertPackMetadata>> {
+    let Some(metadata) = read_expert_layer_pack_metadata(root, layer)? else {
+        return Ok(None);
+    };
+    Ok(metadata.pack_for(expert).cloned())
+}
+
+pub(crate) fn read_expert_layer_pack_metadata(
+    root: &Path,
+    layer: usize,
+) -> Result<Option<ExpertLayerPackMetadata>> {
+    let path = expert_layer_metadata_path(root, layer);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata: ExpertLayerPackMetadata = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("failed to read expert metadata {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse expert metadata {}", path.display()))?;
+    metadata.validate(&path, layer)?;
+    Ok(Some(metadata))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FixedQ4ExpertSlotSpec {
@@ -546,6 +740,73 @@ mod tests {
         assert!(
             err.to_string().contains("whole-slot payload length 44"),
             "{err:#}"
+        );
+    }
+
+    fn tiny_pack_metadata(layer: usize, expert: usize, packed_bytes: u64) -> ExpertPackMetadata {
+        ExpertPackMetadata {
+            layer,
+            expert,
+            packed_bytes,
+            records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn expert_layer_metadata_validates_supported_formats_and_slots() {
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            3,
+            128,
+            2,
+            vec![tiny_pack_metadata(3, 0, 128), tiny_pack_metadata(3, 1, 64)],
+        );
+        metadata.validate(Path::new("layer_03.json"), 3).unwrap();
+
+        let duplicate = ExpertLayerPackMetadata::new_fixed_q4(
+            3,
+            128,
+            2,
+            vec![tiny_pack_metadata(3, 0, 128), tiny_pack_metadata(3, 0, 64)],
+        );
+        let err = duplicate
+            .validate(Path::new("layer_03.json"), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate expert 0"), "{err:#}");
+
+        let oversized =
+            ExpertLayerPackMetadata::new_fixed_q4(3, 128, 2, vec![tiny_pack_metadata(3, 1, 129)]);
+        let err = oversized
+            .validate(Path::new("layer_03.json"), 3)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("length 129 exceeds slot size 128"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn expert_metadata_reader_uses_expert_owned_paths_and_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata = ExpertLayerPackMetadata::new(5, 256, 4, vec![tiny_pack_metadata(5, 2, 200)]);
+        std::fs::write(
+            expert_layer_metadata_path(tmp.path(), 5),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let read_layer = read_expert_layer_pack_metadata(tmp.path(), 5)
+            .unwrap()
+            .unwrap();
+        let read_pack = read_expert_pack_metadata(tmp.path(), 5, 2)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(read_layer.format, PBQ4_EXPERT_LAYER_FORMAT_V2);
+        assert_eq!(read_layer.pack_for(2), Some(&read_pack));
+        assert_eq!(read_pack.packed_bytes, 200);
+        assert_eq!(
+            expert_layer_path(tmp.path(), 5),
+            tmp.path().join("layer_05.bin")
         );
     }
 
