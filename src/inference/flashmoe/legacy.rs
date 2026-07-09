@@ -85,11 +85,11 @@ use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
     ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledCmd2Submission, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
-    ScheduledCmd3InputSource, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledRoutingScoreView, ScheduledSharedExpert,
+    ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
+    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3Submission,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
+    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
+    ScheduledRoutingCandidateSource, ScheduledRoutingScoreView, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -2122,57 +2122,59 @@ impl MetalExecutor {
         &self,
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
-        match phase.input {
+        let ScheduledCmd3Command {
+            position,
+            layer,
+            experts,
+            weights,
+            input,
+            shared,
+            next_norm_weight,
+            payloads,
+            ..
+        } = phase.into_cmd3_command()?;
+        match input {
             ExpertPhaseInput::Cpu { normed, residual } => {
-                let payloads = phase.scheduled.cmd3_expert_phase_payloads(residual.len())?;
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     self.inner
                         .submit_scheduled_expert_phase_with_payloads(
-                            phase.position,
-                            phase.scheduled.layer,
-                            phase.scheduled.experts.clone(),
-                            &phase.scheduled.weights,
+                            position,
+                            layer,
+                            experts,
+                            weights,
                             normed,
                             residual,
-                            phase.shared,
-                            phase.next_norm_weight,
+                            shared,
+                            next_norm_weight,
                             &payloads,
                         )
                         .map(|pending| pending.map(DeferredExpertPhase::Metal))
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
-                    let _ = (
-                        normed,
-                        residual,
-                        payloads,
-                        phase.shared,
-                        phase.next_norm_weight,
-                    );
+                    let _ = (normed, residual, payloads, shared, next_norm_weight);
                     bail!(
                         "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
                     );
                 }
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            ExpertPhaseInput::MetalPostAttention(prep) => {
-                let payloads = phase.scheduled.cmd3_expert_phase_payloads(prep.width)?;
-                self.inner
-                    .submit_scheduled_expert_phase_from_buffers_with_payloads(
-                        phase.position,
-                        phase.scheduled.layer,
-                        phase.scheduled.experts.clone(),
-                        &phase.scheduled.weights,
-                        prep.normed_buffer,
-                        prep.residual_buffer,
-                        prep.width,
-                        phase.shared,
-                        phase.next_norm_weight,
-                        &payloads,
-                    )
-                    .map(|pending| pending.map(DeferredExpertPhase::Metal))
-            }
+            ExpertPhaseInput::MetalPostAttention(prep) => self
+                .inner
+                .submit_scheduled_expert_phase_from_buffers_with_payloads(
+                    position,
+                    layer,
+                    experts,
+                    weights,
+                    prep.normed_buffer,
+                    prep.residual_buffer,
+                    prep.width,
+                    shared,
+                    next_norm_weight,
+                    &payloads,
+                )
+                .map(|pending| pending.map(DeferredExpertPhase::Metal)),
         }
     }
 

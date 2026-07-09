@@ -122,8 +122,9 @@ The validator should reject silent fallbacks such as:
 - `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, routing topK placement
   validation, active expert read issue and finish metrics, route normalization, pending read sets,
   shared-expert source/shape validation, and the scheduled whole-slot handoff. Scheduler-owned
-  fixed-Q4 slots now resolve typed CMD3 expert payloads directly, and runtime CMD3 submission
-  retains those scheduled slots instead of adapting them into `ExpertWeights`.
+  fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3 submission retains
+  those scheduled slots instead of adapting them into `ExpertWeights`, and the scheduler now builds
+  a resolved CMD3 command object before the legacy Metal encoder is called.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -148,9 +149,10 @@ The validator should reject silent fallbacks such as:
   made explicit.
 - Expert reads now follow the upstream positioned-read policy under `experts`, and the scheduler
   owns issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
-  CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. The remaining
-  gap is to move the remaining Metal command encoding and legacy CPU diagnostic helpers out of
-  `legacy.rs` behind explicit CMD3 builder APIs.
+  CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. CMD3 submission
+  now resolves a scheduler-owned command before entering the Metal helper. The remaining gap is to
+  move the Metal command encoding and legacy CPU diagnostic helpers out of `legacy.rs` behind the
+  explicit CMD3 builder API.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
 - GPU residency is partial. Hidden, residual, normed, KV/recurrent state, router outputs, and

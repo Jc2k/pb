@@ -868,6 +868,44 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct ScheduledCmd3Command<'a, TExpert, TInput, TShared> {
+    pub cmd3: ScheduledCmd3ExpertPhase,
+    pub position: usize,
+    pub layer: usize,
+    pub experts: Arc<[TExpert]>,
+    pub weights: &'a [f32],
+    pub input: TInput,
+    pub shared: TShared,
+    pub next_norm_weight: Option<&'a [f32]>,
+    pub payloads: Vec<ScheduledExpertPhaseMlpPayload<'a>>,
+}
+
+impl<'a, TExpert, TInput, TShared> ScheduledCmd3Submission<'a, TExpert, TInput, TShared>
+where
+    TExpert: ScheduledCmd3Expert + ScheduledCmd3ExpertPayload,
+    TInput: ScheduledCmd3Input,
+    TShared: ScheduledSharedExpert,
+{
+    pub(crate) fn into_cmd3_command(
+        self,
+    ) -> Result<ScheduledCmd3Command<'a, TExpert, TInput, TShared>> {
+        let input_width = self.input.scheduled_cmd3_input_width();
+        let payloads = self.scheduled.cmd3_expert_phase_payloads(input_width)?;
+        Ok(ScheduledCmd3Command {
+            cmd3: self.cmd3,
+            position: self.position,
+            layer: self.scheduled.layer,
+            experts: self.scheduled.experts.clone(),
+            weights: &self.scheduled.weights,
+            input: self.input,
+            shared: self.shared,
+            next_norm_weight: self.next_norm_weight,
+            payloads,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExpertRoute {
     pub expert: usize,
@@ -2293,6 +2331,47 @@ mod tests {
         assert_eq!(payload.up.rows, 4);
         assert_eq!(payload.down.rows, 8);
         assert_eq!(payload.down.cols, 4);
+    }
+
+    #[test]
+    fn scheduled_cmd3_submission_builds_resolved_command_payloads() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let next_norm = [1.0; 8];
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::CpuVisibleWeights,
+            )
+            .unwrap();
+        let submission = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            Some(&next_norm),
+        )
+        .unwrap();
+
+        let command = submission.into_cmd3_command().unwrap();
+
+        assert_eq!(command.position, 19);
+        assert_eq!(command.layer, 7);
+        assert_eq!(command.cmd3.layer, 7);
+        assert_eq!(command.experts.len(), 2);
+        assert_eq!(command.weights.len(), 2);
+        assert_eq!(command.payloads.len(), 2);
+        assert_eq!(
+            command.input.scheduled_cmd3_input_source(),
+            ScheduledCmd3InputSource::CpuNormedResidualUpload
+        );
+        assert_eq!(command.next_norm_weight.unwrap().len(), 8);
+        assert_eq!(command.payloads[0].q4().gate.cols, 8);
     }
 
     #[test]
