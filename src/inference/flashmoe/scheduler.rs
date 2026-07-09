@@ -816,7 +816,79 @@ pub struct ScheduledRoutingTopK {
     pub source: ScheduledRoutingCandidateSource,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScheduledRouterScoreProjectionCommand {
+    pub(crate) routing: ScheduledRoutingTopK,
+    pub(crate) state: FlashMoeRoutingOutputState,
+    pub(crate) projection: Option<RouterScoreProjectionDescriptor>,
+    pub(crate) hidden_width: usize,
+}
+
+impl ScheduledRouterScoreProjectionCommand {
+    pub(crate) fn new(
+        routing: ScheduledRoutingTopK,
+        projection: Option<RouterScoreProjectionDescriptor>,
+        hidden_width: usize,
+    ) -> Result<Self> {
+        if routing.source != ScheduledRoutingCandidateSource::CpuRouterScores {
+            bail!(
+                "FlashMoe scheduled router score projection requires CPU router-score routing, got {:?}",
+                routing.source
+            );
+        }
+        if hidden_width == 0 {
+            bail!("FlashMoe scheduled router score projection requires non-zero hidden width");
+        }
+        routing.validate_bounds()?;
+        if let Some(projection) = projection.as_ref() {
+            if projection.layer != routing.layer {
+                bail!(
+                    "FlashMoe scheduled router score projection layer {} does not match routing layer {}",
+                    projection.layer,
+                    routing.layer
+                );
+            }
+            if projection.experts != routing.experts {
+                bail!(
+                    "FlashMoe scheduled router score projection experts {} does not match routing experts {}",
+                    projection.experts,
+                    routing.experts
+                );
+            }
+            if projection.hidden_width != hidden_width {
+                bail!(
+                    "FlashMoe scheduled router score projection hidden width {} does not match submitted hidden width {}",
+                    projection.hidden_width,
+                    hidden_width
+                );
+            }
+        }
+        let state = FlashMoeRoutingOutputState::cpu_router_scores(
+            routing.layer,
+            routing.experts,
+            routing.active_experts,
+        );
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled router score projection did not declare graph state");
+        }
+        Ok(Self {
+            routing,
+            state,
+            projection,
+            hidden_width,
+        })
+    }
+}
+
 impl ScheduledRoutingTopK {
+    pub(crate) fn build_score_projection_command(
+        self,
+        projection: Option<RouterScoreProjectionDescriptor>,
+        hidden_width: usize,
+    ) -> Result<ScheduledRouterScoreProjectionCommand> {
+        ScheduledRouterScoreProjectionCommand::new(self, projection, hidden_width)
+    }
+
     fn command_from_routes(&self, routes: Vec<(usize, f32)>) -> ScheduledRoutingCommand {
         ScheduledRoutingCommand {
             routing: *self,
@@ -3081,6 +3153,65 @@ mod tests {
                 .to_string()
                 .contains("does not match submitted router projection experts"),
             "{projection_err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_router_score_projection_command_declares_score_state() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let projection = dummy_router_projection(3, 5, 8);
+
+        let command = routing
+            .build_score_projection_command(Some(projection.clone()), 8)
+            .unwrap();
+
+        assert_eq!(command.routing, routing);
+        assert_eq!(
+            command.state,
+            FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 2)
+        );
+        assert_eq!(command.projection, Some(projection));
+        assert_eq!(command.hidden_width, 8);
+    }
+
+    #[test]
+    fn scheduled_router_score_projection_command_rejects_mismatched_projection() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+
+        let width_err = routing
+            .build_score_projection_command(Some(dummy_router_projection(3, 5, 4)), 8)
+            .unwrap_err();
+        assert!(
+            width_err
+                .to_string()
+                .contains("hidden width 4 does not match submitted hidden width 8"),
+            "{width_err:#}"
+        );
+
+        let preselected = graph
+            .build_routing_topk(
+                3,
+                5,
+                2,
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )
+            .unwrap();
+        let source_err = preselected
+            .build_score_projection_command(None, 8)
+            .unwrap_err();
+        assert!(
+            source_err
+                .to_string()
+                .contains("requires CPU router-score routing"),
+            "{source_err:#}"
         );
     }
 

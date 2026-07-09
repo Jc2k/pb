@@ -213,9 +213,12 @@ The validator should reject silent fallbacks such as:
   fused-prep preselected routes into a scheduler-owned routing command. CPU router scores and fused
   CMD2 prep topK now submit declared routing-output state before route selection is accepted, and
   Metal post-attention prep must resolve as a scheduler-owned CMD2 output before its routes can feed
-  topK validation. The remaining gap is score production ownership: router projection and score
-  readback are descriptor- and batch-backed by `weights`, but still executed through the legacy
-  dense/runtime loop instead of a typed CMD2 builder boundary.
+  topK validation. CPU router score production now consumes a scheduler-built projection command
+  carrying declared routing state, hidden width, and the optional resident projection descriptor
+  before the dense store executes it. The remaining gap is score production ownership: router score
+  execution and any future readback variants are descriptor- and batch-backed by `weights`, but some
+  execution still flows through legacy dense/runtime helpers instead of a typed CMD2 builder
+  boundary.
 - Shared experts are still grafted onto the older phase structure after descriptor validation.
   Shared gate/up/down and shared down should become part of the same CMD2/CMD3 model as routed
   experts.

@@ -90,10 +90,13 @@ use super::scheduler::{
     ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
     ScheduledCmd3OutputState, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
+    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
+    ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
     ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
+#[cfg(test)]
+use super::state::FlashMoeRoutingOutputState;
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
@@ -101,9 +104,8 @@ use super::state::{
     FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
     FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState,
     FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
-    FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, FlashMoeSessionState,
-    FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeRoutingOutputSource, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -11292,11 +11294,16 @@ impl FlashMoeEngine {
             active_experts,
             source,
         )?;
-        let router_scores = self.dense.router_scores_with_metal(
-            self.metal.as_ref(),
+        let projection = self.dense.router_score_projection_descriptor(
             layer,
             self.config.experts(),
-            active_experts,
+            normed.len(),
+        )?;
+        let router_score_command =
+            scheduled_routing.build_score_projection_command(projection, normed.len())?;
+        let router_scores = self.dense.router_scores_with_metal(
+            self.metal.as_ref(),
+            router_score_command,
             normed,
         )?;
         let routing_output = scheduled_routing.validate_output_state(router_scores.state())?;
@@ -16601,14 +16608,21 @@ impl DenseStore {
     fn router_scores_with_metal(
         &self,
         metal: Option<&MetalExecutor>,
-        layer: usize,
-        experts: usize,
-        active_experts: usize,
+        command: ScheduledRouterScoreProjectionCommand,
         hidden: &[f32],
     ) -> Result<RouterScoreBatch> {
+        if hidden.len() != command.hidden_width {
+            bail!(
+                "FlashMoe scheduled router score projection hidden length {} does not match declared width {}",
+                hidden.len(),
+                command.hidden_width
+            );
+        }
+        let layer = command.routing.layer;
+        let experts = command.routing.experts;
         let tensor_name = router_tensor_name(layer);
-        let projection = self.router_score_projection_descriptor(layer, experts, hidden.len())?;
-        let state = FlashMoeRoutingOutputState::cpu_router_scores(layer, experts, active_experts);
+        let projection = command.projection.clone();
+        let state = command.state;
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
             return RouterScoreBatch::new(state, projection, scores);
@@ -31306,9 +31320,42 @@ mod tests {
         };
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: 3,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 16,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("float32".to_string()),
+            num_experts: Some(2),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(8),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let model_layout = QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap();
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
+        let scheduled_routing = scheduled_graph
+            .build_routing_topk(0, 2, 1, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let projection = store.router_score_projection_descriptor(0, 2, 3).unwrap();
+        let command = scheduled_routing
+            .build_score_projection_command(projection, 3)
+            .unwrap();
 
         let scores = store
-            .router_scores_with_metal(None, 0, 2, 1, &[0.5, -1.0, 2.0])
+            .router_scores_with_metal(None, command, &[0.5, -1.0, 2.0])
             .unwrap();
 
         assert_eq!(
