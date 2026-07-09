@@ -783,7 +783,10 @@ impl ScheduledRoutingTopK {
         Ok(self.active_experts)
     }
 
-    pub(crate) fn validate_output_state(&self, state: FlashMoeRoutingOutputState) -> Result<()> {
+    pub(crate) fn validate_output_state(
+        &self,
+        state: FlashMoeRoutingOutputState,
+    ) -> Result<ScheduledRoutingOutputState> {
         if !state.is_declared_graph_state() {
             bail!("FlashMoe scheduled routing output is not declared graph state");
         }
@@ -816,7 +819,10 @@ impl ScheduledRoutingTopK {
                 source
             );
         }
-        Ok(())
+        Ok(ScheduledRoutingOutputState {
+            routing: *self,
+            state,
+        })
     }
 
     pub(crate) fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
@@ -935,6 +941,18 @@ impl ScheduledRoutingTopK {
     ) -> Result<ScheduledRoutingCommand> {
         let routes = self.validate_preselected(routes)?;
         Ok(self.command_from_routes(routes))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduledRoutingOutputState {
+    pub(crate) routing: ScheduledRoutingTopK,
+    state: FlashMoeRoutingOutputState,
+}
+
+impl ScheduledRoutingOutputState {
+    pub(crate) fn state(self) -> FlashMoeRoutingOutputState {
+        self.state
     }
 }
 
@@ -3004,11 +3022,16 @@ mod tests {
             )
             .unwrap();
 
-        routing
+        let output = routing
             .validate_output_state(
                 FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(3, 8, 4),
             )
             .unwrap();
+        assert_eq!(output.routing, routing);
+        assert_eq!(
+            output.state().source(),
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK
+        );
 
         let layer_err = routing
             .validate_output_state(

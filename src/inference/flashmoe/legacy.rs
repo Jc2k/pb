@@ -101,8 +101,9 @@ use super::state::{
     FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
     FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState,
     FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
-    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, FlashMoeSessionState,
+    FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -11256,11 +11257,18 @@ impl FlashMoeEngine {
             active_experts,
             source,
         )?;
-        scheduled_routing.validate_output_state(FlashMoeRoutingOutputState::cpu_router_scores(
-            layer,
-            self.config.experts(),
-            active_experts,
-        ))?;
+        let routing_output = scheduled_routing.validate_output_state(
+            FlashMoeRoutingOutputState::cpu_router_scores(
+                layer,
+                self.config.experts(),
+                active_experts,
+            ),
+        )?;
+        debug_assert_eq!(routing_output.routing, scheduled_routing);
+        debug_assert_eq!(
+            routing_output.state().source(),
+            FlashMoeRoutingOutputSource::CpuRouterScores
+        );
         let router_scores = self.dense.router_scores_with_metal(
             self.metal.as_ref(),
             layer,
@@ -11294,7 +11302,12 @@ impl FlashMoeEngine {
             active_experts,
             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
         )?;
-        scheduled_routing.validate_output_state(routing_state)?;
+        let routing_output = scheduled_routing.validate_output_state(routing_state)?;
+        debug_assert_eq!(routing_output.routing, scheduled_routing);
+        debug_assert_eq!(
+            routing_output.state().source(),
+            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK
+        );
         scheduled_routing
             .command_from_preselected(&active)
             .map(|command| command.routes)
