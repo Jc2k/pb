@@ -2161,15 +2161,19 @@ impl MetalExecutor {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (position, layer);
-            Ok(Some(DeferredExpertPhase::Ready(compute_expert_phase_cpu(
-                experts.as_ref(),
+            let _ = (
+                position,
+                layer,
+                experts,
                 weights,
                 normed,
                 residual,
-                shared.dense(),
+                shared,
                 next_norm_weight,
-            )?)))
+            );
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
+            );
         }
     }
 
@@ -10404,18 +10408,14 @@ impl FlashMoeEngine {
                 if has_metal_post_attention_prep {
                     bail!("Flash-MoE Metal post-attention prep fell through to CPU expert phase");
                 }
-                let mlp_residual = cpu_mlp_residual
-                    .as_deref()
-                    .context("missing CPU residual for Flash-MoE expert phase")?;
-                let output = compute_expert_phase_cpu(
-                    scheduled_experts.experts.as_ref(),
-                    &scheduled_experts.weights,
-                    &normed,
-                    mlp_residual,
-                    shared_dense_phase.as_deref(),
-                    next_norm_weight.as_deref(),
-                )?;
-                token_state.apply_expert_phase_output(output);
+                bail!(
+                    "FlashMoe unsupported {:?} path: {} is not implemented: scheduled graph declares {} implementation '{}' for layer {}, but no submitted CMD3 phase was produced; CPU expert phase fallback is not a declared graph-stage implementation",
+                    self.model_layout.family,
+                    scheduled_cmd3.stage.stage,
+                    scheduled_cmd3.stage.placement.as_str(),
+                    scheduled_cmd3.stage.implementation,
+                    layer
+                );
             }
             trace_layer_values(position, layer, "moe", token_state.hidden());
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
@@ -33797,7 +33797,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_runs_prefill_decode_sample_and_text_decode_loop() {
+    fn generate_without_declared_cmd3_implementation_errors_instead_of_cpu_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
         std::fs::create_dir_all(&snapshot).unwrap();
@@ -33978,7 +33978,7 @@ mod tests {
             vision_encoder: None,
             session_cache: BTreeMap::new(),
         };
-        let output = engine
+        let err = engine
             .generate(&GenerationRequest {
                 prompt: "hello".to_string(),
                 max_tokens: 16,
@@ -33986,28 +33986,16 @@ mod tests {
                 top_k: 1,
                 seed: 1,
             })
-            .unwrap();
-        assert_eq!(output.generated_tokens, 16);
-        assert!(!output.content.is_empty());
-
-        let timed = engine
-            .generate_timed(&GenerationRequest {
-                prompt: "hello".to_string(),
-                max_tokens: 2,
-                temperature: 0.0,
-                top_k: 1,
-                seed: 1,
-            })
-            .unwrap();
-        assert_eq!(timed.output.generated_tokens, 2);
-        assert_eq!(timed.timing.dimensions.hidden_size, 8);
-        assert!(!timed.timing.tokens.is_empty());
+            .unwrap_err();
         assert!(
-            timed
-                .timing
-                .tokens
-                .iter()
-                .any(|token| !token.layers.is_empty())
+            err.to_string()
+                .contains("CPU expert phase fallback is not a declared graph-stage implementation"),
+            "{err:#}"
+        );
+        assert!(
+            err.to_string()
+                .contains("CMD3 expert/shared combine is not implemented"),
+            "{err:#}"
         );
     }
 
