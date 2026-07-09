@@ -10119,8 +10119,6 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut early_active: Option<ScheduledPreselectedRoutingOutput> = None;
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_values_for_prep: Option<(
                 String,
                 MetalAttentionValues,
@@ -10156,7 +10154,6 @@ impl FlashMoeEngine {
                             {
                                 pending.finish_without_readback()?;
                             }
-                            early_active = Some((prep.state.routing(), prep.active.clone()));
                             early_metal_post_attention_prep = Some(prep);
                         } else if let Some(values) = self.linear_attention_output_values_buffer(
                             layer,
@@ -10309,9 +10306,16 @@ impl FlashMoeEngine {
             .into_cmd2_command();
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = early_active;
+            let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = None;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = None;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(prep) = metal_post_attention_prep.as_ref() {
+                let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
+                debug_assert_eq!(cmd2_output.width(), prep.width);
+                debug_assert_eq!(cmd2_output.state(), prep.state);
+                precomputed_active = Some((cmd2_output.routing(), prep.active.clone()));
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some((out_proj_name, attention_values)) =
                 metal_post_attention_values_for_prep.take()
@@ -10345,7 +10349,10 @@ impl FlashMoeEngine {
                     {
                         pending.finish_without_readback()?;
                     }
-                    let active = (prep.state.routing(), prep.active.clone());
+                    let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
+                    debug_assert_eq!(cmd2_output.width(), prep.width);
+                    debug_assert_eq!(cmd2_output.state(), prep.state);
+                    let active = (cmd2_output.routing(), prep.active.clone());
                     metal_post_attention_prep = Some(prep);
                     precomputed_active = Some(active);
                     if let Some(attention_values) = attention_values.take() {
@@ -10426,7 +10433,10 @@ impl FlashMoeEngine {
                         {
                             pending.finish_without_readback()?;
                         }
-                        let active = (prep.state.routing(), prep.active.clone());
+                        let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
+                        debug_assert_eq!(cmd2_output.width(), prep.width);
+                        debug_assert_eq!(cmd2_output.state(), prep.state);
+                        let active = (cmd2_output.routing(), prep.active.clone());
                         metal_post_attention_prep = Some(prep);
                         prepared = Some(active);
                     }

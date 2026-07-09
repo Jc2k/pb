@@ -119,13 +119,14 @@ The validator should reject silent fallbacks such as:
 - `experts.rs` now owns fixed-slot metadata, layer reader opening, positioned reads, reusable
   whole-expert buffers, raw expert payload responses, and the expert read worker pool. PBQ4 remains
   import/build compatibility; execution reads are moving toward fixed whole-expert slots.
-- `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, routing topK placement
-  validation, declared CMD2 routing-output validation, active expert read issue and finish metrics,
-  route normalization, pending read sets, shared-expert source/shape validation, and the scheduled
-  whole-slot handoff. Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads
-  directly, runtime CMD3 submission retains those scheduled slots instead of adapting them into
-  `ExpertWeights`, and the scheduler now builds resolved CMD1/CMD2/routing/CMD3 command objects
-  before the legacy Metal encoder or runtime helpers are called.
+- `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, CMD2 post-attention prep
+  output resolution, routing topK placement validation, declared CMD2 routing-output validation,
+  active expert read issue and finish metrics, route normalization, pending read sets, shared-expert
+  source/shape validation, and the scheduled whole-slot handoff. Scheduler-owned fixed-Q4 slots now
+  resolve typed CMD3 expert payloads directly, runtime CMD3 submission retains those scheduled slots
+  instead of adapting them into `ExpertWeights`, and the scheduler now builds resolved
+  CMD1/CMD2/routing/CMD3 command objects before the legacy Metal encoder or runtime helpers are
+  called.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -168,10 +169,11 @@ The validator should reject silent fallbacks such as:
   become explicit state transitions.
 - Routing topK placement is now represented as a scheduler graph stage and resolves score-based or
   fused-prep preselected routes into a scheduler-owned routing command. CPU router scores and fused
-  CMD2 prep topK now submit declared routing-output state before route selection is accepted. The
-  remaining gap is score production ownership: router projection and score readback are descriptor-
-  and batch-backed by `weights`, but still executed through the legacy dense/runtime loop instead of
-  a typed CMD2 builder boundary.
+  CMD2 prep topK now submit declared routing-output state before route selection is accepted, and
+  Metal post-attention prep must resolve as a scheduler-owned CMD2 output before its routes can feed
+  topK validation. The remaining gap is score production ownership: router projection and score
+  readback are descriptor- and batch-backed by `weights`, but still executed through the legacy
+  dense/runtime loop instead of a typed CMD2 builder boundary.
 - Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
   down should become part of the same CMD2/CMD3 model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
@@ -283,9 +285,9 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    a conversion/input format, not a runtime branch.
 6. Extract dense projection descriptors and resident blob ownership into `weights`.
 7. Turn the current fused post-attention prep and expert phase helpers into named CMD2/CMD3 builder
-   calls with typed inputs. CMD2 routing outputs now have typed state metadata and scheduler
-   validation; continue by moving the Metal command encoding behind builder calls that produce those
-   state objects directly.
+   calls with typed inputs. CMD2 routing outputs now have typed state metadata, scheduler
+   validation, and a scheduler-resolved post-attention prep output; continue by moving the Metal
+   command encoding behind builder calls that produce those state objects directly.
 8. Add parity and capability tests around every extraction so behavior moves without hidden semantic
    changes or fallback paths.
 9. Revisit the `2+2=` K=4 drift by comparing logits/state through the unified path. Do not revert

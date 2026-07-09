@@ -8,7 +8,9 @@ use super::experts::{
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
-use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
+use super::state::{
+    FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState,
+};
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
 };
@@ -331,6 +333,65 @@ pub struct ScheduledCmd2Command<TInputs> {
     pub layer: usize,
     pub active_experts: usize,
     pub inputs: TInputs,
+}
+
+impl<TInputs> ScheduledCmd2Command<TInputs> {
+    pub(crate) fn resolve_post_attention_prep(
+        &self,
+        state: FlashMoePostAttentionPrepState,
+    ) -> Result<ScheduledCmd2PostAttentionPrepOutput> {
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled CMD2 post-attention prep is not declared graph state");
+        }
+        if state.routing().layer() != self.layer {
+            bail!(
+                "FlashMoe scheduled CMD2 layer {} does not match post-attention prep layer {}",
+                self.layer,
+                state.routing().layer()
+            );
+        }
+        if state.active_experts() != self.active_experts {
+            bail!(
+                "FlashMoe scheduled CMD2 active expert count {} does not match post-attention prep active expert count {}",
+                self.active_experts,
+                state.active_experts()
+            );
+        }
+        if state.residual().len() != state.normed().len() || state.width() == 0 {
+            bail!(
+                "FlashMoe scheduled CMD2 post-attention prep has invalid residual/normed width {}",
+                state.width()
+            );
+        }
+        Ok(ScheduledCmd2PostAttentionPrepOutput {
+            cmd2: self.cmd2,
+            layer: self.layer,
+            active_experts: self.active_experts,
+            state,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCmd2PostAttentionPrepOutput {
+    pub cmd2: ScheduledCmd2PostAttention,
+    pub layer: usize,
+    pub active_experts: usize,
+    state: FlashMoePostAttentionPrepState,
+}
+
+impl ScheduledCmd2PostAttentionPrepOutput {
+    pub(crate) fn state(self) -> FlashMoePostAttentionPrepState {
+        self.state
+    }
+
+    pub(crate) fn routing(self) -> FlashMoeRoutingOutputState {
+        self.state.routing()
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.state.width()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2559,6 +2620,82 @@ mod tests {
         assert_eq!(
             command.inputs.scheduled_cmd2_residual_source(),
             ScheduledCmd2ResidualSource::MetalBuffer
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd2_resolves_declared_post_attention_prep_output() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+        let command = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+
+        let output = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 4))
+            .unwrap();
+
+        assert_eq!(output.layer, 11);
+        assert_eq!(output.active_experts, 4);
+        assert_eq!(output.width(), 4096);
+        assert_eq!(output.routing().layer(), 11);
+        assert_eq!(output.routing().experts(), 512);
+    }
+
+    #[test]
+    fn scheduled_cmd2_rejects_mismatched_post_attention_prep_output() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                4,
+                ScheduledCmd2AttentionSource::CpuAttentionValues,
+                ScheduledCmd2ResidualSource::CpuHidden,
+            )
+            .unwrap();
+        let command = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::CpuAttentionValues,
+                ScheduledCmd2ResidualSource::CpuHidden,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+
+        let layer_err = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(12, 4096, 512, 4))
+            .unwrap_err();
+        assert!(
+            layer_err
+                .to_string()
+                .contains("does not match post-attention prep layer"),
+            "{layer_err:#}"
+        );
+
+        let active_err = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 3))
+            .unwrap_err();
+        assert!(
+            active_err
+                .to_string()
+                .contains("does not match post-attention prep active expert count"),
+            "{active_err:#}"
         );
     }
 
