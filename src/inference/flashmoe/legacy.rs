@@ -84,12 +84,13 @@ use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMo
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
-    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
-    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3Submission,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
-    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
-    ScheduledRoutingCandidateSource, ScheduledRoutingScoreView, ScheduledSharedExpert,
+    ScheduledCmd1Submission, ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs,
+    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Command,
+    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
+    ScheduledRoutingScoreView, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -10057,6 +10058,8 @@ impl FlashMoeEngine {
             let scheduled_cmd1 = self
                 .scheduled_graph
                 .build_cmd1_attention_projections(layer, cmd1_input)?;
+            let scheduled_cmd1 =
+                ScheduledCmd1Submission::new(scheduled_cmd1, cmd1_input)?.into_cmd1_command();
             debug_assert_eq!(scheduled_cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
             let mut post_attention_values_for_prep = None;

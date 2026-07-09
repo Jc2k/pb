@@ -185,6 +185,53 @@ pub struct ScheduledCmd1AttentionProjections {
     pub input: ScheduledCmd1InputSource,
 }
 
+pub trait ScheduledCmd1Input {
+    fn scheduled_cmd1_input_source(&self) -> ScheduledCmd1InputSource;
+}
+
+impl ScheduledCmd1Input for ScheduledCmd1InputSource {
+    fn scheduled_cmd1_input_source(&self) -> ScheduledCmd1InputSource {
+        *self
+    }
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd1Submission<TInput> {
+    pub cmd1: ScheduledCmd1AttentionProjections,
+    pub input: TInput,
+}
+
+impl<TInput> ScheduledCmd1Submission<TInput>
+where
+    TInput: ScheduledCmd1Input,
+{
+    pub fn new(cmd1: ScheduledCmd1AttentionProjections, input: TInput) -> Result<Self> {
+        if cmd1.input != input.scheduled_cmd1_input_source() {
+            bail!(
+                "FlashMoe scheduled CMD1 input {:?} does not match submitted input {:?}",
+                cmd1.input,
+                input.scheduled_cmd1_input_source()
+            );
+        }
+        Ok(Self { cmd1, input })
+    }
+
+    pub(crate) fn into_cmd1_command(self) -> ScheduledCmd1Command<TInput> {
+        ScheduledCmd1Command {
+            cmd1: self.cmd1,
+            layer: self.cmd1.layer,
+            input: self.input,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd1Command<TInput> {
+    pub cmd1: ScheduledCmd1AttentionProjections,
+    pub layer: usize,
+    pub input: TInput,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledCmd2AttentionSource {
     CpuAttentionValues,
@@ -2054,6 +2101,42 @@ mod tests {
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
+    }
+
+    #[test]
+    fn scheduled_cmd1_submission_builds_resolved_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd1 = graph
+            .build_cmd1_attention_projections(14, ScheduledCmd1InputSource::DeferredMetalNextNormed)
+            .unwrap();
+
+        let command =
+            ScheduledCmd1Submission::new(cmd1, ScheduledCmd1InputSource::DeferredMetalNextNormed)
+                .unwrap()
+                .into_cmd1_command();
+
+        assert_eq!(command.layer, 14);
+        assert_eq!(command.cmd1.layer, 14);
+        assert_eq!(
+            command.input.scheduled_cmd1_input_source(),
+            ScheduledCmd1InputSource::DeferredMetalNextNormed
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd1_submission_rejects_mismatched_input_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd1 = graph
+            .build_cmd1_attention_projections(14, ScheduledCmd1InputSource::CpuNormedHidden)
+            .unwrap();
+
+        let err =
+            ScheduledCmd1Submission::new(cmd1, ScheduledCmd1InputSource::DeferredMetalNextNormed)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("does not match submitted input"));
     }
 
     #[test]
