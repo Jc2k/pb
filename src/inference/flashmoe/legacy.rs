@@ -58,11 +58,13 @@ use std::os::unix::fs::FileExt;
 use tokenizers::Tokenizer;
 use tracing::info;
 
+use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::{
     ExpertSlotDescriptor, ExpertSlotView, FixedQ4ExpertSlotView, ReusableExpertBuffer,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+use super::scheduler::FlashMoeScheduledGraph;
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -1367,6 +1369,10 @@ where
     let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
+    let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout)?;
+    let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
+    progress("capability_graph", phase_started.elapsed());
+    phase_started = Instant::now();
     let upgraded_expert_layers = ensure_fixed_q4_expert_cache(plan, &model_layout)?;
     if upgraded_expert_layers > 0 {
         tracing::info!(
@@ -1417,6 +1423,8 @@ where
         vision_encoder,
         config,
         model_layout,
+        capability_plan,
+        scheduled_graph,
         routing_policy,
         runtime,
         shared_expert_cache: Mutex::new(BTreeMap::new()),
@@ -1437,6 +1445,8 @@ pub struct FlashMoeEngine {
     metal: Option<MetalExecutor>,
     config: QwenModelConfig,
     model_layout: QwenMoeModelLayout,
+    capability_plan: FlashMoeCapabilityPlan,
+    scheduled_graph: FlashMoeScheduledGraph,
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
     shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
@@ -34037,6 +34047,8 @@ mod tests {
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::new(&config);
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
         let engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -34046,6 +34058,8 @@ mod tests {
             metal: None,
             config,
             model_layout,
+            capability_plan,
+            scheduled_graph,
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
@@ -34270,6 +34284,8 @@ mod tests {
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::new(&config);
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
         let engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -34279,6 +34295,8 @@ mod tests {
             metal: None,
             config,
             model_layout,
+            capability_plan,
+            scheduled_graph,
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
@@ -35614,6 +35632,8 @@ mod tests {
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
         let mut engine = FlashMoeEngine {
             plan,
             experts: experts.clone(),
@@ -35623,6 +35643,8 @@ mod tests {
             metal: None,
             config,
             model_layout,
+            capability_plan,
+            scheduled_graph,
             routing_policy,
             runtime,
             shared_expert_cache: Mutex::new(BTreeMap::new()),
