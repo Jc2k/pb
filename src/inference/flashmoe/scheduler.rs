@@ -259,6 +259,29 @@ pub trait ScheduledCmd3Input {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource;
 }
 
+pub trait ScheduledCmd3Expert {
+    fn scheduled_expert_layer(&self) -> usize;
+    fn scheduled_expert_id(&self) -> usize;
+    fn scheduled_expert_slot_descriptor(&self) -> ExpertSlotDescriptor;
+}
+
+impl<T> ScheduledCmd3Expert for Arc<T>
+where
+    T: ScheduledCmd3Expert,
+{
+    fn scheduled_expert_layer(&self) -> usize {
+        self.as_ref().scheduled_expert_layer()
+    }
+
+    fn scheduled_expert_id(&self) -> usize {
+        self.as_ref().scheduled_expert_id()
+    }
+
+    fn scheduled_expert_slot_descriptor(&self) -> ExpertSlotDescriptor {
+        self.as_ref().scheduled_expert_slot_descriptor()
+    }
+}
+
 pub trait ScheduledSharedExpert {
     fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
 }
@@ -275,6 +298,7 @@ pub struct ScheduledCmd3Submission<'a, TExpert, TInput, TShared> {
 
 impl<'a, TExpert, TInput, TShared> ScheduledCmd3Submission<'a, TExpert, TInput, TShared>
 where
+    TExpert: ScheduledCmd3Expert,
     TInput: ScheduledCmd3Input,
     TShared: ScheduledSharedExpert,
 {
@@ -294,6 +318,38 @@ where
                 scheduled.layer,
                 scheduled.len()
             );
+        }
+        for (route, expert) in scheduled.routes.iter().zip(scheduled.experts.iter()) {
+            let expert_layer = expert.scheduled_expert_layer();
+            let expert_id = expert.scheduled_expert_id();
+            if expert_layer != scheduled.layer || expert_id != route.expert {
+                bail!(
+                    "FlashMoe scheduled CMD3 expert layer {} expert {} does not match routed layer {} expert {}",
+                    expert_layer,
+                    expert_id,
+                    scheduled.layer,
+                    route.expert
+                );
+            }
+            let descriptor = expert.scheduled_expert_slot_descriptor();
+            if descriptor.layer != scheduled.layer || descriptor.expert != route.expert {
+                bail!(
+                    "FlashMoe scheduled CMD3 expert slot descriptor layer {} expert {} does not match routed layer {} expert {}",
+                    descriptor.layer,
+                    descriptor.expert,
+                    scheduled.layer,
+                    route.expert
+                );
+            }
+            if descriptor.slot_capacity == 0 || descriptor.payload_len != descriptor.slot_capacity {
+                bail!(
+                    "FlashMoe scheduled CMD3 expert slot layer {} expert {} must be a whole-expert slot, payload_len={} slot_capacity={}",
+                    descriptor.layer,
+                    descriptor.expert,
+                    descriptor.payload_len,
+                    descriptor.slot_capacity
+                );
+            }
         }
         if cmd3.input != input.scheduled_cmd3_input_source() {
             bail!(
@@ -920,7 +976,52 @@ mod tests {
         }
     }
 
-    fn dummy_scheduled_experts(layer: usize, experts: usize) -> ScheduledExpertSet<usize> {
+    #[derive(Debug, Clone)]
+    struct DummyCmd3Expert {
+        layer: usize,
+        expert: usize,
+        descriptor: ExpertSlotDescriptor,
+    }
+
+    impl DummyCmd3Expert {
+        fn whole_slot(layer: usize, expert: usize) -> Self {
+            Self {
+                layer,
+                expert,
+                descriptor: ExpertSlotDescriptor {
+                    layer,
+                    expert,
+                    slot_offset: (expert as u64) * 128,
+                    slot_capacity: 128,
+                    payload_len: 128,
+                },
+            }
+        }
+
+        fn with_descriptor(mut self, descriptor: ExpertSlotDescriptor) -> Self {
+            self.descriptor = descriptor;
+            self
+        }
+    }
+
+    impl ScheduledCmd3Expert for DummyCmd3Expert {
+        fn scheduled_expert_layer(&self) -> usize {
+            self.layer
+        }
+
+        fn scheduled_expert_id(&self) -> usize {
+            self.expert
+        }
+
+        fn scheduled_expert_slot_descriptor(&self) -> ExpertSlotDescriptor {
+            self.descriptor
+        }
+    }
+
+    fn dummy_scheduled_experts(
+        layer: usize,
+        experts: usize,
+    ) -> ScheduledExpertSet<DummyCmd3Expert> {
         let routes = (0..experts)
             .map(|expert| ExpertRoute {
                 expert,
@@ -928,7 +1029,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let scheduled_routes = ScheduledExpertRoutes::from_routes(layer, routes, 1.0).unwrap();
-        ScheduledExpertSet::from_parts(scheduled_routes, (0..experts).collect()).unwrap()
+        ScheduledExpertSet::from_parts(
+            scheduled_routes,
+            (0..experts)
+                .map(|expert| DummyCmd3Expert::whole_slot(layer, expert))
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1202,6 +1309,64 @@ mod tests {
                 .to_string()
                 .contains("requires next-norm weights")
         );
+    }
+
+    #[test]
+    fn scheduled_cmd3_submission_rejects_mismatched_or_partial_expert_slots() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                1,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap();
+        let routes = ScheduledExpertRoutes::from_routes(
+            7,
+            vec![ExpertRoute {
+                expert: 0,
+                score: 1.0,
+            }],
+            1.0,
+        )
+        .unwrap();
+        let wrong_expert =
+            ScheduledExpertSet::from_parts(routes.clone(), vec![DummyCmd3Expert::whole_slot(7, 9)])
+                .unwrap();
+
+        let err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &wrong_expert,
+            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match routed layer"));
+
+        let partial_slot =
+            DummyCmd3Expert::whole_slot(7, 0).with_descriptor(ExpertSlotDescriptor {
+                layer: 7,
+                expert: 0,
+                slot_offset: 0,
+                slot_capacity: 128,
+                payload_len: 64,
+            });
+        let partial_expert = ScheduledExpertSet::from_parts(routes, vec![partial_slot]).unwrap();
+        let err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &partial_expert,
+            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be a whole-expert slot"));
     }
 
     #[test]

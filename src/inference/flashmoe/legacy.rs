@@ -85,7 +85,7 @@ use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
     ScheduledCmd2AttentionInput, ScheduledCmd2AttentionSource, ScheduledCmd2ResidualInput,
-    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Input,
+    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Expert, ScheduledCmd3Input,
     ScheduledCmd3InputSource, ScheduledCmd3Submission,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledSharedExpert, ScheduledSharedExpertSource,
@@ -17900,6 +17900,20 @@ pub struct ExpertWeights {
 impl AsRef<ExpertWeights> for ExpertWeights {
     fn as_ref(&self) -> &ExpertWeights {
         self
+    }
+}
+
+impl ScheduledCmd3Expert for ExpertWeights {
+    fn scheduled_expert_layer(&self) -> usize {
+        self.layer
+    }
+
+    fn scheduled_expert_id(&self) -> usize {
+        self.expert
+    }
+
+    fn scheduled_expert_slot_descriptor(&self) -> ExpertSlotDescriptor {
+        self.slot
     }
 }
 
