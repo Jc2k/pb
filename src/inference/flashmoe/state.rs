@@ -964,6 +964,14 @@ impl FlashMoeExpertPhaseOutput {
         }
     }
 
+    pub(crate) fn hidden_len(&self) -> usize {
+        self.hidden.len()
+    }
+
+    pub(crate) fn next_normed_len(&self) -> Option<usize> {
+        self.next_normed.as_ref().map(Vec::len)
+    }
+
     pub(crate) fn into_hidden_and_next_normed(self) -> (Vec<f32>, Option<Vec<f32>>) {
         (self.hidden, self.next_normed)
     }

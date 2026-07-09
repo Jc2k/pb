@@ -3215,6 +3215,7 @@ struct MetalDeferredExpertPhase {
     next_normed_buffer: Option<ObjcId>,
     context: MetalCommandContext,
     output_state: FlashMoeCmd3OutputState,
+    scheduled_output: Option<ScheduledCmd3OutputState>,
     width: usize,
 }
 
@@ -3284,7 +3285,12 @@ impl MetalDeferredExpertPhase {
                 }
             }
             drop(self.retained_experts);
-            Ok(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
+            let output = FlashMoeExpertPhaseOutput::new(hidden, next_normed);
+            if let Some(scheduled_output) = self.scheduled_output {
+                scheduled_output.validate_expert_phase_output(output)
+            } else {
+                Ok(output)
+            }
         }
     }
 }
@@ -5254,6 +5260,7 @@ impl MetalExecutorInner {
     ) -> Result<MetalDeferredExpertPhase> {
         debug_assert_eq!(output.layer, layer);
         let output_state = output.state();
+        let scheduled_output = output;
         self.submit_expert_phase_from_buffers_with_payloads(
             position,
             layer,
@@ -5268,7 +5275,11 @@ impl MetalExecutorInner {
             payloads,
         )
         .and_then(|pending| {
-            pending.ok_or_else(|| {
+            pending.map(|mut pending| {
+                pending.scheduled_output = Some(scheduled_output);
+                pending
+            })
+            .ok_or_else(|| {
                 anyhow::anyhow!(
                     "FlashMoe unsupported scheduled CMD3 path: layer {} did not produce a Metal expert phase; missing CMD3 implementation must be represented as an unsupported capability instead of falling back",
                     layer
@@ -5655,6 +5666,7 @@ impl MetalExecutorInner {
                 next_normed_buffer,
                 context,
                 output_state,
+                scheduled_output: None,
                 width,
             }))
         }
