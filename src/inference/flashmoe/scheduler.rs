@@ -9,9 +9,9 @@ use super::experts::{
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
 use super::state::{
-    FlashMoeCmd1InputState, FlashMoeCmd3OutputState, FlashMoeFullAttentionKvState,
-    FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState,
-    FlashMoeStateBufferRole, FlashMoeStatePlacement,
+    FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState,
+    FlashMoeFullAttentionKvState, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
+    FlashMoeRoutingOutputState, FlashMoeStateBufferRole, FlashMoeStatePlacement,
 };
 use super::weights::{
     RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
@@ -895,7 +895,7 @@ pub struct ScheduledCmd3ExpertPhase {
 
 pub trait ScheduledCmd3Input {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource;
-    fn scheduled_cmd3_input_width(&self) -> usize;
+    fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState;
 }
 
 pub trait ScheduledCmd3Expert {
@@ -1217,7 +1217,34 @@ where
                 shared.scheduled_shared_expert_source()
             );
         }
-        let input_width = input.scheduled_cmd3_input_width();
+        let input_state = input.scheduled_cmd3_input_state(cmd3.layer);
+        if input_state.layer() != cmd3.layer {
+            bail!(
+                "FlashMoe scheduled CMD3 input state layer {} does not match descriptor layer {}",
+                input_state.layer(),
+                cmd3.layer
+            );
+        }
+        if !input_state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe scheduled CMD3 input is not declared graph state: placement={:?} residual={:?} normed={:?}",
+                input_state.placement(),
+                input_state.residual(),
+                input_state.normed()
+            );
+        }
+        let expected_placement = match cmd3.input {
+            ScheduledCmd3InputSource::CpuNormedResidualUpload => FlashMoeStatePlacement::CpuVisible,
+            ScheduledCmd3InputSource::MetalPostAttentionPrep => FlashMoeStatePlacement::GpuResident,
+        };
+        if input_state.placement() != expected_placement {
+            bail!(
+                "FlashMoe scheduled CMD3 input placement {:?} does not match source {:?}",
+                input_state.placement(),
+                cmd3.input
+            );
+        }
+        let input_width = input_state.width();
         if input_width == 0 {
             bail!("FlashMoe scheduled CMD3 input width must be non-zero");
         }
@@ -1279,7 +1306,11 @@ where
     TInput: ScheduledCmd3Input,
 {
     pub(crate) fn resolve_output_state(&self) -> Result<FlashMoeCmd3OutputState> {
-        let width = self.input.scheduled_cmd3_input_width();
+        let input_state = self.input.scheduled_cmd3_input_state(self.layer);
+        if !input_state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled CMD3 output cannot resolve from undeclared input state");
+        }
+        let width = input_state.width();
         let state = FlashMoeCmd3OutputState::gpu_resident(
             width,
             self.cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights,
@@ -1315,7 +1346,10 @@ where
     pub(crate) fn into_cmd3_command(
         self,
     ) -> Result<ScheduledCmd3Command<'a, TExpert, TInput, TShared>> {
-        let input_width = self.input.scheduled_cmd3_input_width();
+        let input_width = self
+            .input
+            .scheduled_cmd3_input_state(self.cmd3.layer)
+            .width();
         let payloads = self.scheduled.cmd3_expert_phase_payloads(input_width)?;
         Ok(ScheduledCmd3Command {
             cmd3: self.cmd3,
@@ -2076,13 +2110,39 @@ mod tests {
         width: usize,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct DummyCmd3InputState {
+        source: ScheduledCmd3InputSource,
+        state: FlashMoeCmd3InputState,
+    }
+
     impl ScheduledCmd3Input for DummyCmd3Input {
         fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
             self.source
         }
 
-        fn scheduled_cmd3_input_width(&self) -> usize {
-            self.width
+        fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState {
+            match self.source {
+                ScheduledCmd3InputSource::CpuNormedResidualUpload => {
+                    FlashMoeCmd3InputState::cpu_normed_residual(layer, self.width, self.width)
+                }
+                ScheduledCmd3InputSource::MetalPostAttentionPrep => {
+                    FlashMoeCmd3InputState::metal_post_attention_prep(
+                        layer,
+                        FlashMoePostAttentionPrepState::new(layer, self.width, 16, 4),
+                    )
+                }
+            }
+        }
+    }
+
+    impl ScheduledCmd3Input for DummyCmd3InputState {
+        fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+            self.source
+        }
+
+        fn scheduled_cmd3_input_state(&self, _layer: usize) -> FlashMoeCmd3InputState {
+            self.state
         }
     }
 
@@ -3359,6 +3419,24 @@ mod tests {
             next_norm_width_err
                 .to_string()
                 .contains("smaller than input width")
+        );
+
+        let invalid_input_state_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            DummyCmd3InputState {
+                source: ScheduledCmd3InputSource::MetalPostAttentionPrep,
+                state: FlashMoeCmd3InputState::cpu_normed_residual(7, 8, 4),
+            },
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            Some(&[1.0; 8]),
+        )
+        .unwrap_err();
+        assert!(
+            invalid_input_state_err
+                .to_string()
+                .contains("input is not declared graph state")
         );
     }
 

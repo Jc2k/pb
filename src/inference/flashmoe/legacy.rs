@@ -96,12 +96,12 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCmd1InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
-    FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
-    FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState, FlashMoePostAttentionPrepState,
-    FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState, FlashMoeRoutingOutputState,
-    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer,
+    FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
+    FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState,
+    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
+    FlashMoeRoutingOutputState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -1895,11 +1895,15 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
         }
     }
 
-    fn scheduled_cmd3_input_width(&self) -> usize {
+    fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState {
         match self {
-            Self::Cpu { residual, .. } => residual.len(),
+            Self::Cpu { normed, residual } => {
+                FlashMoeCmd3InputState::cpu_normed_residual(layer, normed.len(), residual.len())
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Self::MetalPostAttention(prep) => prep.width,
+            Self::MetalPostAttention(prep) => {
+                FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep.state)
+            }
         }
     }
 }

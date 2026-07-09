@@ -193,6 +193,57 @@ impl FlashMoeGpuBufferDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashMoeStateBufferDescriptor {
+    role: FlashMoeStateBufferRole,
+    len: usize,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeStateBufferDescriptor {
+    pub(crate) fn new(
+        role: FlashMoeStateBufferRole,
+        len: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            role,
+            len,
+            placement,
+        }
+    }
+
+    pub(crate) fn cpu(role: FlashMoeStateBufferRole, len: usize) -> Self {
+        Self::new(role, len, FlashMoeStatePlacement::CpuVisible)
+    }
+
+    pub(crate) fn gpu(descriptor: FlashMoeGpuBufferDescriptor) -> Self {
+        Self::new(
+            descriptor.role(),
+            descriptor.len(),
+            FlashMoeStatePlacement::GpuResident,
+        )
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+            && self.len() > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlashMoeRoutingOutputSource {
     CpuRouterScores,
     FusedMetalPostAttentionPrepCpuTopK,
@@ -350,6 +401,73 @@ impl FlashMoePostAttentionPrepState {
             && self.normed.role() == FlashMoeStateBufferRole::Normed
             && self.residual.len() == self.normed.len()
             && self.routing.is_declared_graph_state()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashMoeCmd3InputState {
+    layer: usize,
+    residual: FlashMoeStateBufferDescriptor,
+    normed: FlashMoeStateBufferDescriptor,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeCmd3InputState {
+    pub(crate) fn cpu_normed_residual(
+        layer: usize,
+        normed_len: usize,
+        residual_len: usize,
+    ) -> Self {
+        Self {
+            layer,
+            residual: FlashMoeStateBufferDescriptor::cpu(
+                FlashMoeStateBufferRole::Residual,
+                residual_len,
+            ),
+            normed: FlashMoeStateBufferDescriptor::cpu(FlashMoeStateBufferRole::Normed, normed_len),
+            placement: FlashMoeStatePlacement::CpuVisible,
+        }
+    }
+
+    pub(crate) fn metal_post_attention_prep(
+        layer: usize,
+        prep: FlashMoePostAttentionPrepState,
+    ) -> Self {
+        Self {
+            layer,
+            residual: FlashMoeStateBufferDescriptor::gpu(prep.residual()),
+            normed: FlashMoeStateBufferDescriptor::gpu(prep.normed()),
+            placement: FlashMoeStatePlacement::GpuResident,
+        }
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.residual.len()
+    }
+
+    pub(crate) fn residual(self) -> FlashMoeStateBufferDescriptor {
+        self.residual
+    }
+
+    pub(crate) fn normed(self) -> FlashMoeStateBufferDescriptor {
+        self.normed
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.residual.is_declared_graph_state()
+            && self.normed.is_declared_graph_state()
+            && self.residual.role() == FlashMoeStateBufferRole::Residual
+            && self.normed.role() == FlashMoeStateBufferRole::Normed
+            && self.residual.len() == self.normed.len()
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
     }
 }
 
@@ -1151,6 +1269,43 @@ mod tests {
 
         assert_eq!(output.width(), 0);
         assert!(!output.is_declared_graph_state());
+    }
+
+    #[test]
+    fn cmd3_input_state_declares_cpu_or_gpu_normed_residual_pair() {
+        let cpu = FlashMoeCmd3InputState::cpu_normed_residual(5, 4096, 4096);
+        assert_eq!(cpu.layer(), 5);
+        assert_eq!(cpu.width(), 4096);
+        assert_eq!(cpu.residual().role(), FlashMoeStateBufferRole::Residual);
+        assert_eq!(cpu.normed().role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(cpu.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(cpu.is_declared_graph_state());
+
+        let prep = FlashMoePostAttentionPrepState::new(5, 4096, 128, 4);
+        let gpu = FlashMoeCmd3InputState::metal_post_attention_prep(5, prep);
+        assert_eq!(gpu.width(), 4096);
+        assert_eq!(
+            gpu.residual().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert_eq!(
+            gpu.normed().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert_eq!(gpu.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(gpu.is_declared_graph_state());
+    }
+
+    #[test]
+    fn cmd3_input_state_rejects_zero_or_mismatched_buffers() {
+        assert!(!FlashMoeCmd3InputState::cpu_normed_residual(5, 0, 0).is_declared_graph_state());
+        assert!(
+            !FlashMoeCmd3InputState::cpu_normed_residual(5, 4096, 2048).is_declared_graph_state()
+        );
+        let prep = FlashMoePostAttentionPrepState::new(5, 0, 128, 4);
+        assert!(
+            !FlashMoeCmd3InputState::metal_post_attention_prep(5, prep).is_declared_graph_state()
+        );
     }
 
     #[test]

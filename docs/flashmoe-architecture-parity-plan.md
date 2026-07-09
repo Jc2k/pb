@@ -120,8 +120,8 @@ The validator should reject silent fallbacks such as:
   whole-expert buffers, raw expert payload responses, and the expert read worker pool. PBQ4 remains
   import/build compatibility; execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, CMD2 post-attention prep
-  output resolution, CMD3 deferred output resolution, routing topK placement validation, declared
-  CMD1 input-state validation, CMD2 routing-output validation, full-attention KV placement
+  output resolution, CMD3 input and deferred output resolution, routing topK placement validation,
+  declared CMD1 input-state validation, CMD2 routing-output validation, full-attention KV placement
   validation for the declared attention math implementation, active expert read issue and finish
   metrics, route normalization, pending read sets, shared-expert source/shape validation, and the
   scheduled whole-slot handoff.
@@ -144,18 +144,19 @@ The validator should reject silent fallbacks such as:
   CMD1 now declares its actual input as either CPU-visible normed state or GPU-resident
   next-layer-normed state before attention projection. CMD2 post-attention prep also declares its
   CPU-visible routing output as either router scores or preselected topK, with layer, expert count,
-  active count, source, and placement. CMD3 deferred output now declares GPU-resident hidden plus
-  optional next-layer normed output before Metal readback or next-layer reuse. Full-attention KV
-  records now expose CPU-visible or GPU-resident state descriptors with layer, position, width, and
-  placement, and the runtime resolves those descriptors through the scheduler before using CPU
-  attention or writing the Metal KV cache.
+  active count, source, and placement. CMD3 now declares its actual CPU-visible normed/residual input
+  or GPU-resident post-attention-prep input before scheduled submission, and declares GPU-resident
+  hidden plus optional next-layer normed output before Metal readback or next-layer reuse.
+  Full-attention KV records now expose CPU-visible or GPU-resident state descriptors with layer,
+  position, width, and placement, and the runtime resolves those descriptors through the scheduler
+  before using CPU attention or writing the Metal KV cache.
   Recurrent per-layer records now expose CPU-visible recurrent state descriptors before they are
   recorded into the session/cache state. Linear-attention cache state now exposes CPU-visible and
   GPU-resident descriptors for conv state, SSM state, conv output, and value output lengths before
   cache mutation or Metal allocation. The Metal object handles still live in `legacy.rs`, but
-  deferred GPU inputs, post-attention prep, deferred expert outputs, full-attention KV updates,
-  recurrent layer records, and linear-attention cache updates now carry state descriptors instead of
-  raw anonymous lengths.
+  deferred GPU inputs, post-attention prep, CMD3 inputs and deferred expert outputs,
+  full-attention KV updates, recurrent layer records, and linear-attention cache updates now carry
+  state descriptors instead of raw anonymous lengths.
 - Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
   verification tools, not the work queue.
 
@@ -177,8 +178,9 @@ The validator should reject silent fallbacks such as:
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
 - GPU residency is partial. CMD1 CPU normed versus deferred GPU next-layer-normed inputs,
-  post-attention residual/normed prep, scheduler-visible routing outputs, CMD3 deferred
-  hidden/next-normed outputs, and full-attention KV records now carry typed state descriptors.
+  post-attention residual/normed prep, scheduler-visible routing outputs, CMD3 CPU/GPU input state,
+  CMD3 deferred hidden/next-normed outputs, and full-attention KV records now carry typed state
+  descriptors.
   Full-attention CPU versus Metal KV execution is resolved as a declared attention graph-stage
   implementation, so Metal KV writes are not an implicit fallback path. Per-layer recurrent records
   now declare CPU-visible placement before cache/session recording. Linear-attention cache state now
@@ -308,9 +310,10 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    a conversion/input format, not a runtime branch.
 6. Extract dense projection descriptors and resident blob ownership into `weights`.
 7. Turn the current fused post-attention prep and expert phase helpers into named CMD2/CMD3 builder
-   calls with typed inputs. CMD1 input state, CMD2 routing outputs, and CMD3 deferred
-   hidden/next-normed outputs now have typed state metadata and scheduler validation; continue by
-   moving the Metal command encoding behind builder calls that produce those state objects directly.
+   calls with typed inputs. CMD1 input state, CMD2 routing outputs, CMD3 CPU/GPU inputs, and CMD3
+   deferred hidden/next-normed outputs now have typed state metadata and scheduler validation;
+   continue by moving the Metal command encoding behind builder calls that produce those state
+   objects directly.
 8. Move state ownership for full-attention KV, recurrent, and next-layer buffers out of the
    generation loop. Full-attention KV now has typed CPU/GPU placement and scheduler validation;
    recurrent layer records now have typed CPU-visible placement; linear-attention cache records now
