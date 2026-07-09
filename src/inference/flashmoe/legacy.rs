@@ -10743,7 +10743,7 @@ impl FlashMoeEngine {
             if let Some(metal) = &self.metal
                 && let Some(prep) = metal_post_attention_prep.take()
             {
-                let phase = ScheduledExpertPhase::new(
+                let phase = self.scheduled_graph.build_cmd3_submission(
                     position,
                     scheduled_cmd3,
                     &scheduled_experts,
@@ -10765,17 +10765,19 @@ impl FlashMoeEngine {
                 && let Some(metal) = &self.metal
                 && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
             {
-                let pending = metal.submit_scheduled_expert_phase(ScheduledExpertPhase::new(
-                    position,
-                    scheduled_cmd3,
-                    &scheduled_experts,
-                    ExpertPhaseInput::Cpu {
-                        normed: &normed,
-                        residual: mlp_residual,
-                    },
-                    shared_phase,
-                    next_norm_weights,
-                )?)?;
+                let pending = metal.submit_scheduled_expert_phase(
+                    self.scheduled_graph.build_cmd3_submission(
+                        position,
+                        scheduled_cmd3,
+                        &scheduled_experts,
+                        ExpertPhaseInput::Cpu {
+                            normed: &normed,
+                            residual: mlp_residual,
+                        },
+                        shared_phase,
+                        next_norm_weights,
+                    )?,
+                )?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;

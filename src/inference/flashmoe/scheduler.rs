@@ -232,6 +232,31 @@ impl FlashMoeScheduledGraph {
             ScheduledNextNormSource::from_weights(next_norm_weights),
         )
     }
+
+    pub fn build_cmd3_submission<'a, TExpert, TInput, TShared>(
+        &self,
+        position: usize,
+        cmd3: ScheduledCmd3ExpertPhase,
+        scheduled: &'a ScheduledExpertSet<TExpert>,
+        input: TInput,
+        shared: TShared,
+        next_norm_weights: ScheduledNextNormWeights<'a>,
+    ) -> Result<ScheduledCmd3Submission<'a, TExpert, TInput, TShared>>
+    where
+        TExpert: ScheduledCmd3Expert,
+        TInput: ScheduledCmd3Input,
+        TShared: ScheduledSharedExpert,
+    {
+        let expected_stage = *self.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+        if cmd3.stage != expected_stage {
+            bail!(
+                "FlashMoe scheduled CMD3 descriptor stage {:?} does not match scheduled graph CMD3 stage {:?}",
+                cmd3.stage,
+                expected_stage
+            );
+        }
+        ScheduledCmd3Submission::new(position, cmd3, scheduled, input, shared, next_norm_weights)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4440,6 +4465,57 @@ mod tests {
         assert_eq!(
             cpu_next_norm.next_norm,
             ScheduledNextNormSource::CpuVisibleWeights
+        );
+    }
+
+    #[test]
+    fn scheduled_graph_builds_cmd3_submission_and_rejects_stale_stage() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap();
+
+        graph
+            .build_cmd3_submission(
+                19,
+                cmd3,
+                &scheduled,
+                dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                ScheduledNextNormWeights::none(),
+            )
+            .unwrap();
+
+        let mut stale_graph = graph.clone();
+        stale_graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
+            .unwrap()
+            .implementation = "different-cmd3-implementation";
+
+        let err = stale_graph
+            .build_cmd3_submission(
+                19,
+                cmd3,
+                &scheduled,
+                dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                ScheduledNextNormWeights::none(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match scheduled graph CMD3 stage"),
+            "{err:#}"
         );
     }
 
