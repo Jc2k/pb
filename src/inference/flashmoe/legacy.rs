@@ -112,9 +112,10 @@ use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
-    RuntimeTensorEntry, ScheduledNextNormWeights, SharedExpertPhaseQ4Projections,
-    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
+    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, ScheduledNextNormWeights,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -16557,9 +16558,13 @@ impl DenseStore {
         Ok(Some(weight))
     }
 
-    fn router_projection(&self, layer: usize, expert: usize, hidden: &[f32]) -> Result<f32> {
-        let tensor_name = router_tensor_name(layer);
-        if let Some(row) = self.read_tensor_row_f32(&tensor_name, expert, hidden.len())? {
+    fn declared_router_projection(
+        &self,
+        tensor_name: &str,
+        expert: usize,
+        hidden: &[f32],
+    ) -> Result<f32> {
+        if let Some(row) = self.read_tensor_row_f32(tensor_name, expert, hidden.len())? {
             let acc = row
                 .iter()
                 .zip(hidden)
@@ -16567,15 +16572,9 @@ impl DenseStore {
                 .sum::<f32>();
             return Ok(acc);
         }
-        ensure_synthetic_runtime_allowed(&tensor_name)?;
-        let salt = self.tensor_seed(&tensor_name, ((layer as u64) << 32) ^ expert as u64);
-        let mut acc = 0.0f32;
-        for (idx, value) in hidden.iter().enumerate() {
-            let bits = self.read_u64(salt ^ idx as u64)?;
-            let weight = ((bits >> 40) as f32 / ((1u64 << 24) as f32)) * 2.0 - 1.0;
-            acc = value.mul_add(weight, acc);
-        }
-        Ok(acc)
+        bail!(
+            "FlashMoe declared router projection {tensor_name} cannot provide row {expert}; refusing synthetic router fallback"
+        )
     }
 
     fn router_command_with_metal(
@@ -16591,16 +16590,19 @@ impl DenseStore {
                 command.hidden_width
             );
         }
-        let layer = command.routing.layer;
-        let experts = command.routing.experts;
-        let tensor_name = router_tensor_name(layer);
+        let execution = command.projection_execution()?;
+        let experts = execution.experts;
+        let tensor_name = execution.tensor_name.to_string();
         let _ = metal;
-        if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
+        if execution.kind == RouterScoreProjectionExecutionKind::ResidentDense
+            && let Some(scores) =
+                self.router_scores_with_accelerate(&tensor_name, experts, hidden)?
+        {
             return command.into_routing_command(scores);
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
-            *score = self.router_projection(layer, expert, hidden)?;
+            *score = self.declared_router_projection(&tensor_name, expert, hidden)?;
         }
         command.into_routing_command(router_scores)
     }

@@ -311,6 +311,21 @@ pub(crate) struct RouterScoreProjectionDescriptor {
     pub(crate) binding: RouterScoreProjectionBinding,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouterScoreProjectionExecutionKind {
+    ResidentDense,
+    ResidentQ4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouterScoreProjectionExecution<'a> {
+    pub(crate) layer: usize,
+    pub(crate) tensor_name: &'a str,
+    pub(crate) experts: usize,
+    pub(crate) hidden_width: usize,
+    pub(crate) kind: RouterScoreProjectionExecutionKind,
+}
+
 impl RouterScoreProjectionDescriptor {
     pub(crate) fn from_entry(
         layer: usize,
@@ -367,6 +382,50 @@ impl RouterScoreProjectionDescriptor {
                 })
             }
         }
+    }
+
+    pub(crate) fn execution(
+        &self,
+        layer: usize,
+        experts: usize,
+        hidden_width: usize,
+    ) -> Result<RouterScoreProjectionExecution<'_>> {
+        if self.layer != layer {
+            bail!(
+                "Flash-MoE router score projection execution layer {} does not match scheduled layer {}",
+                self.layer,
+                layer
+            );
+        }
+        if self.experts != experts {
+            bail!(
+                "Flash-MoE router score projection execution experts {} does not match scheduled experts {}",
+                self.experts,
+                experts
+            );
+        }
+        if self.hidden_width != hidden_width {
+            bail!(
+                "Flash-MoE router score projection execution hidden width {} does not match scheduled hidden width {}",
+                self.hidden_width,
+                hidden_width
+            );
+        }
+        let kind = match self.binding {
+            RouterScoreProjectionBinding::ResidentDense(_) => {
+                RouterScoreProjectionExecutionKind::ResidentDense
+            }
+            RouterScoreProjectionBinding::ResidentQ4(_) => {
+                RouterScoreProjectionExecutionKind::ResidentQ4
+            }
+        };
+        Ok(RouterScoreProjectionExecution {
+            layer: self.layer,
+            tensor_name: &self.tensor_name,
+            experts: self.experts,
+            hidden_width: self.hidden_width,
+            kind,
+        })
     }
 }
 
@@ -1019,6 +1078,38 @@ mod tests {
             }
             RouterScoreProjectionBinding::ResidentDense(_) => panic!("expected q4 binding"),
         }
+    }
+
+    #[test]
+    fn router_score_projection_execution_declares_binding_without_fallback() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 64,
+            byte_len: 32,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 128, 2, 4).unwrap();
+
+        let execution = descriptor.execution(3, 2, 4).unwrap();
+        assert_eq!(execution.layer, 3);
+        assert_eq!(execution.tensor_name, entry.name);
+        assert_eq!(execution.experts, 2);
+        assert_eq!(execution.hidden_width, 4);
+        assert_eq!(
+            execution.kind,
+            RouterScoreProjectionExecutionKind::ResidentDense
+        );
+
+        let err = descriptor.execution(3, 3, 4).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("experts 2 does not match scheduled experts 3"),
+            "{err:#}"
+        );
     }
 
     #[test]

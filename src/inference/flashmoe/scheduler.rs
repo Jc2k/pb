@@ -15,8 +15,9 @@ use super::state::{
     FlashMoeStateBufferRole, FlashMoeStatePlacement,
 };
 use super::weights::{
-    RouterScoreBatch, RouterScoreProjectionDescriptor, ScheduledNextNormWeights,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseShape, SharedExpertPhaseWeights,
+    RouterScoreBatch, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
+    ScheduledNextNormWeights, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
+    SharedExpertPhaseWeights,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
@@ -1008,6 +1009,17 @@ impl ScheduledRouterScoreProjectionCommand {
 
     pub(crate) fn into_score_batch(self, scores: Vec<f32>) -> Result<RouterScoreBatch> {
         RouterScoreBatch::new(self.state, self.projection, scores)
+    }
+
+    pub(crate) fn projection_execution(&self) -> Result<RouterScoreProjectionExecution<'_>> {
+        let Some(projection) = self.projection.as_ref() else {
+            bail!(
+                "FlashMoe scheduled router score projection for layer {} has no declared resident projection implementation for stage {:?}",
+                self.routing.layer,
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
+            );
+        };
+        projection.execution(self.routing.layer, self.routing.experts, self.hidden_width)
     }
 
     pub(crate) fn into_routing_command(self, scores: Vec<f32>) -> Result<ScheduledRoutingCommand> {
@@ -3539,11 +3551,11 @@ mod tests {
             batch.state(),
             FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 2)
         );
-        assert_eq!(batch.projection, Some(projection));
+        assert_eq!(batch.projection, Some(projection.clone()));
         assert_eq!(batch.scores, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
 
         let err = routing
-            .build_score_projection_command(None, 8)
+            .build_score_projection_command(Some(projection), 8)
             .unwrap()
             .into_score_batch(vec![0.0, 1.0])
             .unwrap_err();
@@ -3561,8 +3573,17 @@ mod tests {
         let routing = graph
             .build_routing_topk(3, 5, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
+        let projection = dummy_router_projection(3, 5, 8);
 
-        let command = routing.build_score_projection_command(None, 8).unwrap();
+        let command = routing
+            .build_score_projection_command(Some(projection.clone()), 8)
+            .unwrap();
+        let execution = command.projection_execution().unwrap();
+        assert_eq!(execution.layer, 3);
+        assert_eq!(execution.experts, 5);
+        assert_eq!(execution.hidden_width, 8);
+        assert_eq!(execution.tensor_name, projection.tensor_name);
+
         let routed = command
             .into_routing_command(vec![0.5, 9.0, -1.0, 4.0, 3.0])
             .unwrap();
@@ -3575,13 +3596,25 @@ mod tests {
         assert_eq!(routed.routes, vec![(1, 9.0), (3, 4.0)]);
 
         let err = routing
-            .build_score_projection_command(None, 8)
+            .build_score_projection_command(Some(projection), 8)
             .unwrap()
             .into_routing_command(vec![0.5, f32::NAN, -1.0, 4.0, 3.0])
             .unwrap_err();
         assert!(
             err.to_string().contains("score for expert 1 is not finite"),
             "{err:#}"
+        );
+
+        let missing_projection_err = routing
+            .build_score_projection_command(None, 8)
+            .unwrap()
+            .projection_execution()
+            .unwrap_err();
+        assert!(
+            missing_projection_err
+                .to_string()
+                .contains("has no declared resident projection implementation"),
+            "{missing_projection_err:#}"
         );
     }
 

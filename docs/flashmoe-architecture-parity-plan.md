@@ -231,10 +231,12 @@ The validator should reject silent fallbacks such as:
   post-attention prep state plus preselected routes into a scheduled routing command, so the runtime
   no longer stitches those graph stages together manually. The scheduled router score command now
   owns raw score finalization into a declared batch, routing-output validation, and score-based topK
-  selection before the runtime receives a `ScheduledRoutingCommand`. The remaining gap is score
-  production ownership: router score execution and any future readback variants are descriptor- and
-  batch-backed by `weights`, but projection execution still flows through legacy dense/runtime
-  helpers instead of a typed CMD2 builder boundary.
+  selection before the runtime receives a `ScheduledRoutingCommand`. Router projection execution now
+  requires a declared resident dense/Q4 descriptor before the legacy bridge can run it, so missing
+  router storage is an unsupported implementation error rather than a synthetic fallback. The
+  remaining gap is score production ownership: projection execution still flows through legacy
+  dense/runtime helpers instead of a typed CMD2 builder boundary, even though the inputs and
+  capability checks are now descriptor-backed.
 - Shared experts now enter CMD3 through a scheduler descriptor that carries source and graph shape,
   and the live CMD3 builder derives next-norm source from typed `ScheduledNextNormWeights` instead
   of a separate legacy-owned branch. The live path now asks the scheduled graph to build CMD3
