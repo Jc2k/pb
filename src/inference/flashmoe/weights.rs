@@ -296,6 +296,80 @@ pub(crate) fn validate_dense_matvec_shape(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouterScoreProjectionBinding {
+    ResidentDense(DenseMmapMatvecProjection),
+    ResidentQ4(DenseQ4MmapMatvecProjection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouterScoreProjectionDescriptor {
+    pub(crate) layer: usize,
+    pub(crate) tensor_name: String,
+    pub(crate) experts: usize,
+    pub(crate) hidden_width: usize,
+    pub(crate) binding: RouterScoreProjectionBinding,
+}
+
+impl RouterScoreProjectionDescriptor {
+    pub(crate) fn from_entry(
+        layer: usize,
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        experts: usize,
+        hidden_width: usize,
+    ) -> Result<Self> {
+        match &entry.quantization {
+            TensorQuantization::None => {
+                let Some(element_size) = dense_dtype_size(&entry.dtype) else {
+                    bail!(
+                        "Flash-MoE router tensor {} has unsupported dtype {}",
+                        tensor_name,
+                        entry.dtype
+                    );
+                };
+                let projection = DenseMmapMatvecProjection::from_entry(
+                    tensor_name,
+                    entry,
+                    store_len,
+                    experts,
+                    hidden_width,
+                    element_size,
+                )?;
+                Ok(Self {
+                    layer,
+                    tensor_name: tensor_name.to_string(),
+                    experts,
+                    hidden_width,
+                    binding: RouterScoreProjectionBinding::ResidentDense(projection),
+                })
+            }
+            TensorQuantization::Q4 { .. } => {
+                let Some(projection) = DenseQ4MmapMatvecProjection::from_entry(
+                    tensor_name,
+                    entry,
+                    store_len,
+                    experts,
+                    hidden_width,
+                )?
+                else {
+                    bail!(
+                        "Flash-MoE router tensor {tensor_name} cannot resolve a resident Q4 projection descriptor for shape [{experts}, {hidden_width}]"
+                    );
+                };
+                Ok(Self {
+                    layer,
+                    tensor_name: tensor_name.to_string(),
+                    experts,
+                    hidden_width,
+                    binding: RouterScoreProjectionBinding::ResidentQ4(projection),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentStaticTensorRef {
     pub(crate) tensor_name: String,
     pub(crate) byte_offset: u64,
@@ -660,6 +734,81 @@ mod tests {
         assert_eq!(projection.rows, 4);
         assert_eq!(projection.cols, 8);
         assert_eq!(projection.output_width, 4);
+    }
+
+    #[test]
+    fn router_score_projection_descriptor_resolves_dense_binding() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 64,
+            byte_len: 32,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 128, 2, 4).unwrap();
+
+        assert_eq!(descriptor.layer, 3);
+        assert_eq!(descriptor.experts, 2);
+        assert_eq!(descriptor.hidden_width, 4);
+        match descriptor.binding {
+            RouterScoreProjectionBinding::ResidentDense(projection) => {
+                assert_eq!(projection.tensor_name, entry.name);
+                assert_eq!(projection.byte_offset, 64);
+                assert_eq!(projection.output_width, 2);
+            }
+            RouterScoreProjectionBinding::ResidentQ4(_) => panic!("expected dense binding"),
+        }
+    }
+
+    #[test]
+    fn router_score_projection_descriptor_resolves_q4_binding() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 128,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 256, 2, 4).unwrap();
+
+        match descriptor.binding {
+            RouterScoreProjectionBinding::ResidentQ4(projection) => {
+                assert_eq!(projection.packed_byte_offset, 128);
+                assert_eq!(projection.output_width, 2);
+                assert_eq!(projection.cols, 4);
+            }
+            RouterScoreProjectionBinding::ResidentDense(_) => panic!("expected q4 binding"),
+        }
+    }
+
+    #[test]
+    fn router_score_projection_descriptor_rejects_wrong_shape_without_fallback() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![3, 4],
+            byte_offset: 0,
+            byte_len: 48,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        let err = RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 64, 2, 4)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("shape mismatch"), "{err:#}");
     }
 
     #[test]

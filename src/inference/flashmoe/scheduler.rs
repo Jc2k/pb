@@ -8,7 +8,9 @@ use super::experts::{
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
-use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
+use super::weights::{
+    RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+};
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -273,21 +275,25 @@ pub enum ScheduledRoutingCandidateSource {
     FusedMetalPostAttentionPrepCpuTopK,
 }
 
-pub trait ScheduledRoutingScores {
+pub(crate) trait ScheduledRoutingScores {
     fn scheduled_routing_score_layer(&self) -> usize;
     fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource;
     fn scheduled_routing_scores(&self) -> &[f32];
+    fn scheduled_routing_projection(&self) -> Option<&RouterScoreProjectionDescriptor> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ScheduledRoutingScoreView<'a> {
+pub(crate) struct ScheduledRoutingScoreView<'a> {
     layer: usize,
     source: ScheduledRoutingCandidateSource,
     scores: &'a [f32],
+    projection: Option<&'a RouterScoreProjectionDescriptor>,
 }
 
 impl<'a> ScheduledRoutingScoreView<'a> {
-    pub const fn new(
+    pub(crate) const fn new(
         layer: usize,
         source: ScheduledRoutingCandidateSource,
         scores: &'a [f32],
@@ -296,6 +302,20 @@ impl<'a> ScheduledRoutingScoreView<'a> {
             layer,
             source,
             scores,
+            projection: None,
+        }
+    }
+
+    pub(crate) const fn from_router_projection(
+        source: ScheduledRoutingCandidateSource,
+        projection: &'a RouterScoreProjectionDescriptor,
+        scores: &'a [f32],
+    ) -> Self {
+        Self {
+            layer: projection.layer,
+            source,
+            scores,
+            projection: Some(projection),
         }
     }
 }
@@ -311,6 +331,10 @@ impl ScheduledRoutingScores for ScheduledRoutingScoreView<'_> {
 
     fn scheduled_routing_scores(&self) -> &[f32] {
         self.scores
+    }
+
+    fn scheduled_routing_projection(&self) -> Option<&RouterScoreProjectionDescriptor> {
+        self.projection
     }
 }
 
@@ -341,7 +365,7 @@ impl ScheduledRoutingTopK {
         Ok(self.active_experts)
     }
 
-    pub fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
+    pub(crate) fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
     where
         TScores: ScheduledRoutingScores,
     {
@@ -364,6 +388,22 @@ impl ScheduledRoutingTopK {
                 self.source,
                 scores.scheduled_routing_score_source()
             );
+        }
+        if let Some(projection) = scores.scheduled_routing_projection() {
+            if projection.layer != self.layer {
+                bail!(
+                    "FlashMoe scheduled routing layer {} does not match submitted router projection layer {}",
+                    self.layer,
+                    projection.layer
+                );
+            }
+            if projection.experts != self.experts {
+                bail!(
+                    "FlashMoe scheduled routing expert count {} does not match submitted router projection experts {}",
+                    self.experts,
+                    projection.experts
+                );
+            }
         }
         let scores = scores.scheduled_routing_scores();
         let active_experts = self.validate_bounds()?;
@@ -1344,7 +1384,8 @@ mod tests {
         ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertSlotSpec,
     };
     use crate::inference::flashmoe::weights::{
-        DenseQ4MmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+        DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, RouterScoreProjectionBinding,
+        RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
     };
     use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
 
@@ -1495,6 +1536,28 @@ mod tests {
             groups_per_row: cols.div_ceil(16),
             group_size: 16,
             scale_bias_dtype: "BF16".to_string(),
+        }
+    }
+
+    fn dummy_router_projection(
+        layer: usize,
+        experts: usize,
+        hidden_width: usize,
+    ) -> RouterScoreProjectionDescriptor {
+        let tensor_name = format!("model.layers.{layer}.mlp.gate.weight");
+        RouterScoreProjectionDescriptor {
+            layer,
+            tensor_name: tensor_name.clone(),
+            experts,
+            hidden_width,
+            binding: RouterScoreProjectionBinding::ResidentDense(DenseMmapMatvecProjection {
+                tensor_name,
+                byte_offset: 4096,
+                dtype: "F32".to_string(),
+                rows: experts,
+                cols: hidden_width,
+                output_width: experts,
+            }),
         }
     }
 
@@ -1819,6 +1882,31 @@ mod tests {
                 .to_string()
                 .contains("does not match submitted score source"),
             "{source_err:#}"
+        );
+
+        let projection = dummy_router_projection(3, 5, 4096);
+        let projected_selected = routing
+            .select_from_scores(&ScheduledRoutingScoreView::from_router_projection(
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &projection,
+                &[0.0, 2.0, 2.0, -1.0, 1.0],
+            ))
+            .unwrap();
+        assert_eq!(projected_selected, selected);
+
+        let wrong_experts = dummy_router_projection(3, 4, 4096);
+        let projection_err = routing
+            .select_from_scores(&ScheduledRoutingScoreView::from_router_projection(
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+                &wrong_experts,
+                &[0.0, 2.0, 2.0, -1.0, 1.0],
+            ))
+            .unwrap_err();
+        assert!(
+            projection_err
+                .to_string()
+                .contains("does not match submitted router projection experts"),
+            "{projection_err:#}"
         );
     }
 

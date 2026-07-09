@@ -103,10 +103,10 @@ use super::state::{
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RuntimeTensorEntry,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    validate_dense_matvec_shape,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
+    RuntimeTensorEntry, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT,
+    TensorQuantization, TensorRegistry, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -10921,11 +10921,16 @@ impl FlashMoeEngine {
             self.config.experts(),
             normed,
         )?;
-        scheduled_routing.select_from_scores(&ScheduledRoutingScoreView::new(
-            layer,
-            source,
-            &router_scores,
-        ))
+        let score_view = if let Some(projection) = router_scores.projection.as_ref() {
+            ScheduledRoutingScoreView::from_router_projection(
+                source,
+                projection,
+                &router_scores.scores,
+            )
+        } else {
+            ScheduledRoutingScoreView::new(layer, source, &router_scores.scores)
+        };
+        scheduled_routing.select_from_scores(&score_view)
     }
 
     fn validate_preselected_routes(
@@ -15082,6 +15087,12 @@ pub struct DenseStore {
     decoded_tensor_tiles: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[derive(Debug, Clone)]
+struct DenseRouterScores {
+    projection: Option<RouterScoreProjectionDescriptor>,
+    scores: Vec<f32>,
+}
+
 #[derive(Debug, Default)]
 struct DenseTensorCache {
     tensors: BTreeMap<String, Arc<Vec<f32>>>,
@@ -16159,17 +16170,42 @@ impl DenseStore {
         layer: usize,
         experts: usize,
         hidden: &[f32],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<DenseRouterScores> {
         let tensor_name = router_tensor_name(layer);
+        let projection = self.router_score_projection_descriptor(layer, experts, hidden.len())?;
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
-            return Ok(scores);
+            return Ok(DenseRouterScores { projection, scores });
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.router_projection(layer, expert, hidden)?;
         }
-        Ok(router_scores)
+        Ok(DenseRouterScores {
+            projection,
+            scores: router_scores,
+        })
+    }
+
+    fn router_score_projection_descriptor(
+        &self,
+        layer: usize,
+        experts: usize,
+        hidden_width: usize,
+    ) -> Result<Option<RouterScoreProjectionDescriptor>> {
+        let tensor_name = router_tensor_name(layer);
+        let Some(entry) = self.registry.tensor(&tensor_name) else {
+            return Ok(None);
+        };
+        RouterScoreProjectionDescriptor::from_entry(
+            layer,
+            &tensor_name,
+            entry,
+            self.len,
+            experts,
+            hidden_width,
+        )
+        .map(Some)
     }
 
     fn dense_q4_mmap_projection(
@@ -30800,7 +30836,15 @@ mod tests {
             .router_scores_with_metal(None, 0, 2, &[0.5, -1.0, 2.0])
             .unwrap();
 
-        assert_eq!(scores, vec![4.5, 9.0]);
+        assert_eq!(scores.scores, vec![4.5, 9.0]);
+        let projection = scores
+            .projection
+            .as_ref()
+            .expect("registered router tensor should produce a typed projection descriptor");
+        assert_eq!(projection.layer, 0);
+        assert_eq!(projection.experts, 2);
+        assert_eq!(projection.hidden_width, 3);
+        assert_eq!(projection.tensor_name, router_tensor_name(0));
         assert_eq!(
             store
                 .decoded_tensor_tiles

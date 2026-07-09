@@ -129,8 +129,9 @@ The validator should reject silent fallbacks such as:
 - Production behavior can still silently use older CPU/component paths when a Q4 or Metal-shaped
   implementation is missing. Those paths need to become either typed graph-stage implementations or
   explicit unsupported-capability errors.
-- Dense weights are closer to the upstream resident-blob model than experts are, but the code is not
-  yet separated into a `weights` ownership boundary.
+- Dense weights are closer to the upstream resident-blob model than experts are. `weights` now owns
+  typed resident projection descriptors for dense, Q4, shared expert, and router score bindings, but
+  command construction and much of runtime score execution still flows through `legacy.rs` shims.
 - Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
   verification tools, not the work queue.
 
@@ -153,9 +154,10 @@ The validator should reject silent fallbacks such as:
   next-layer buffers still cross CPU/GPU boundaries in places that should become explicit state
   transitions.
 - Routing topK placement is now represented as a scheduler graph stage and the runtime validates
-  typed score submissions and fused-prep route candidates through it. The remaining gap is score
-  production ownership: router projection and score readback still live in the legacy dense/runtime
-  loop instead of a `weights`/CMD2 builder boundary.
+  typed score submissions, fused-prep route candidates, and router projection descriptors through
+  it. The remaining gap is score production ownership: router projection and score readback are
+  descriptor-backed by `weights`, but still executed through the legacy dense/runtime loop instead
+  of a typed CMD2 builder boundary.
 - Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
   down should become part of the same CMD2/CMD3 model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
@@ -228,8 +230,9 @@ The refactor should break the current monolith by ownership boundary, not by "fa
 
 8. Reconcile routing through the scheduler.
    For Qwen3.5 parity, model CPU softmax/topK after router projection. Route selection and score
-   source submission now have scheduler descriptors; continue by moving router score
-   production/readback into `weights` and typed CMD2 builders. If GPU routing is kept or later proven
+   source submission now have scheduler descriptors, and router score production now resolves a
+   `weights`-owned projection descriptor before scores are submitted. Continue by moving the actual
+   projection/readback execution into typed CMD2 builders. If GPU routing is kept or later proven
    better, it must be selected through the same scheduler policy for all variants, with parity tests
    proving equivalent logits/topK.
 
