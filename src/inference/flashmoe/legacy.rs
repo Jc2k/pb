@@ -17773,6 +17773,7 @@ impl ExpertWeights {
         })
     }
 
+    #[cfg(test)]
     pub fn q4_fma_matvec(
         &self,
         input: &[f32],
@@ -17854,12 +17855,14 @@ impl ExpertWeights {
             })
     }
 
+    #[cfg(test)]
     fn record_suffix(&self, suffix: &str) -> Option<&PackedExpertTensor> {
         self.records
             .iter()
             .find(|record| record.name.ends_with(suffix))
     }
 
+    #[cfg(test)]
     fn project_record(
         &self,
         tensor: &PackedExpertTensor,
@@ -17939,6 +17942,7 @@ impl PackedExpertTensor {
         self.source_offsets
     }
 
+    #[cfg(test)]
     fn matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
         if hidden.is_empty() || width == 0 || self.packed.is_empty() || self.group_size == 0 {
             return None;
