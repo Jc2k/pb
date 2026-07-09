@@ -602,6 +602,107 @@ impl FlashMoeRecurrentLayerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeLinearAttentionCacheState {
+    layer: usize,
+    conv_state_len: usize,
+    ssm_state_len: usize,
+    conv_output_len: usize,
+    output_len: usize,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeLinearAttentionCacheState {
+    pub(crate) fn new(
+        layer: usize,
+        conv_state_len: usize,
+        ssm_state_len: usize,
+        conv_output_len: usize,
+        output_len: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> Self {
+        Self {
+            layer,
+            conv_state_len,
+            ssm_state_len,
+            conv_output_len,
+            output_len,
+            placement,
+        }
+    }
+
+    pub(crate) fn cpu_visible(
+        layer: usize,
+        conv_state_len: usize,
+        ssm_state_len: usize,
+        conv_output_len: usize,
+        output_len: usize,
+    ) -> Self {
+        Self::new(
+            layer,
+            conv_state_len,
+            ssm_state_len,
+            conv_output_len,
+            output_len,
+            FlashMoeStatePlacement::CpuVisible,
+        )
+    }
+
+    pub(crate) fn gpu_resident(
+        layer: usize,
+        conv_state_len: usize,
+        ssm_state_len: usize,
+        conv_output_len: usize,
+        output_len: usize,
+    ) -> Self {
+        Self::new(
+            layer,
+            conv_state_len,
+            ssm_state_len,
+            conv_output_len,
+            output_len,
+            FlashMoeStatePlacement::GpuResident,
+        )
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn conv_state_len(self) -> usize {
+        self.conv_state_len
+    }
+
+    pub(crate) fn ssm_state_len(self) -> usize {
+        self.ssm_state_len
+    }
+
+    pub(crate) fn conv_output_len(self) -> usize {
+        self.conv_output_len
+    }
+
+    pub(crate) fn output_len(self) -> usize {
+        self.output_len
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        FlashMoeStateBufferRole::Recurrent
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.conv_state_len() > 0
+            && self.ssm_state_len() > 0
+            && self.conv_output_len() > 0
+            && self.output_len() > 0
+            && FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FlashMoeExpertPhaseOutput {
     hidden: Vec<f32>,
@@ -1052,6 +1153,40 @@ mod tests {
         assert_eq!(state.role(), FlashMoeStateBufferRole::Recurrent);
         assert_eq!(state.placement(), FlashMoeStatePlacement::CpuVisible);
         assert!(state.is_declared_graph_state());
+    }
+
+    #[test]
+    fn linear_attention_cache_state_declares_lengths_and_placement() {
+        let cpu = FlashMoeLinearAttentionCacheState::cpu_visible(3, 8, 16, 4, 6);
+        assert_eq!(cpu.layer(), 3);
+        assert_eq!(cpu.conv_state_len(), 8);
+        assert_eq!(cpu.ssm_state_len(), 16);
+        assert_eq!(cpu.conv_output_len(), 4);
+        assert_eq!(cpu.output_len(), 6);
+        assert_eq!(cpu.role(), FlashMoeStateBufferRole::Recurrent);
+        assert_eq!(cpu.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(cpu.is_declared_graph_state());
+
+        let gpu = FlashMoeLinearAttentionCacheState::gpu_resident(3, 8, 16, 4, 6);
+        assert_eq!(gpu.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(gpu.is_declared_graph_state());
+
+        assert!(
+            !FlashMoeLinearAttentionCacheState::cpu_visible(3, 0, 16, 4, 6)
+                .is_declared_graph_state()
+        );
+        assert!(
+            !FlashMoeLinearAttentionCacheState::gpu_resident(3, 8, 0, 4, 6)
+                .is_declared_graph_state()
+        );
+        assert!(
+            !FlashMoeLinearAttentionCacheState::cpu_visible(3, 8, 16, 0, 6)
+                .is_declared_graph_state()
+        );
+        assert!(
+            !FlashMoeLinearAttentionCacheState::gpu_resident(3, 8, 16, 4, 0)
+                .is_declared_graph_state()
+        );
     }
 
     #[test]

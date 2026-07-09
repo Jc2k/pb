@@ -98,9 +98,9 @@ use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCmd3OutputState, FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput,
     FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor,
-    FlashMoeLayerStateRecord, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
-    FlashMoeRecurrentLayerState, FlashMoeRoutingOutputState, FlashMoeSessionState,
-    FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
+    FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState, FlashMoePostAttentionPrepState,
+    FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState, FlashMoeRoutingOutputState,
+    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
     take_reusable_session_cache_entry,
 };
 use super::types::*;
@@ -13129,9 +13129,27 @@ fn allocate_metal_linear_attention_state(
         };
         let conv_state_len = layout.conv_state_len();
         let ssm_state_len = layout.ssm_state_len();
+        let state = FlashMoeLinearAttentionCacheState::gpu_resident(
+            layer,
+            conv_state_len,
+            ssm_state_len,
+            layout.conv_dim,
+            layout.total_value_width,
+        );
+        if state.layer() != layer {
+            bail!(
+                "FlashMoe Metal linear-attention cache state layer {} does not match allocation layer {layer}",
+                state.layer()
+            );
+        }
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe Metal linear-attention cache state is not declared graph state");
+        }
         let conv_state = allocate_zeroed_metal_buffer(
             device,
-            conv_state_len.saturating_mul(std::mem::size_of::<f32>()),
+            state
+                .conv_state_len()
+                .saturating_mul(std::mem::size_of::<f32>()),
             "linear conv state",
         )
         .with_context(|| {
@@ -13139,7 +13157,9 @@ fn allocate_metal_linear_attention_state(
         })?;
         let ssm_state = match allocate_zeroed_metal_buffer(
             device,
-            ssm_state_len.saturating_mul(std::mem::size_of::<f32>()),
+            state
+                .ssm_state_len()
+                .saturating_mul(std::mem::size_of::<f32>()),
             "linear SSM state",
         ) {
             Ok(buffer) => buffer,
@@ -13152,7 +13172,9 @@ fn allocate_metal_linear_attention_state(
         };
         let conv_output = match allocate_zeroed_metal_buffer(
             device,
-            layout.conv_dim.saturating_mul(std::mem::size_of::<f32>()),
+            state
+                .conv_output_len()
+                .saturating_mul(std::mem::size_of::<f32>()),
             "linear conv output",
         ) {
             Ok(buffer) => buffer,
@@ -13168,8 +13190,8 @@ fn allocate_metal_linear_attention_state(
         };
         let delta_output = match allocate_zeroed_metal_buffer(
             device,
-            layout
-                .total_value_width
+            state
+                .output_len()
                 .saturating_mul(std::mem::size_of::<f32>()),
             "linear delta output",
         ) {
@@ -14636,6 +14658,44 @@ impl LinearAttentionState {
         }
     }
 
+    fn expected_state(
+        layer: usize,
+        layout: LinearAttentionLayout,
+        placement: FlashMoeStatePlacement,
+    ) -> FlashMoeLinearAttentionCacheState {
+        match placement {
+            FlashMoeStatePlacement::CpuVisible => FlashMoeLinearAttentionCacheState::cpu_visible(
+                layer,
+                layout.conv_state_len(),
+                layout.ssm_state_len(),
+                layout.conv_dim,
+                layout.total_value_width,
+            ),
+            FlashMoeStatePlacement::GpuResident => FlashMoeLinearAttentionCacheState::gpu_resident(
+                layer,
+                layout.conv_state_len(),
+                layout.ssm_state_len(),
+                layout.conv_dim,
+                layout.total_value_width,
+            ),
+        }
+    }
+
+    fn state(
+        &self,
+        layer: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> FlashMoeLinearAttentionCacheState {
+        FlashMoeLinearAttentionCacheState::new(
+            layer,
+            self.conv_state.len(),
+            self.ssm_state.len(),
+            self.conv_out.len(),
+            self.out_values.len(),
+            placement,
+        )
+    }
+
     fn matches_layout(&self, layout: LinearAttentionLayout) -> bool {
         self.conv_state.len() == layout.conv_state_len()
             && self.ssm_state.len() == layout.ssm_state_len()
@@ -14806,12 +14866,22 @@ impl KvCache {
         if layer >= self.layers {
             bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
         }
+        let expected_state =
+            LinearAttentionState::expected_state(layer, layout, FlashMoeStatePlacement::CpuVisible);
+        if !expected_state.is_declared_graph_state() {
+            bail!("FlashMoe linear-attention cache state is not declared graph state");
+        }
         let state = self
             .linear_states
             .entry(layer)
             .or_insert_with(|| LinearAttentionState::new(layout));
-        if !state.matches_layout(layout) {
+        if !state.matches_layout(layout)
+            || state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state
+        {
             *state = LinearAttentionState::new(layout);
+        }
+        if state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state {
+            bail!("FlashMoe linear-attention cache state does not match declared layout");
         }
         Ok(state)
     }
@@ -28757,6 +28827,37 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("requires CpuVisible placement"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn linear_attention_cache_state_rejects_undeclared_layout_without_fallback() {
+        let mut cache = KvCache::new(2, 2);
+        let valid = LinearAttentionLayout {
+            num_value_heads: 1,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 2,
+            conv_dim: 6,
+            conv_kernel_size: 3,
+        };
+        let state = cache.linear_state_mut(1, valid).unwrap();
+        assert_eq!(
+            state.state(1, FlashMoeStatePlacement::CpuVisible),
+            FlashMoeLinearAttentionCacheState::cpu_visible(1, 12, 4, 6, 2)
+        );
+
+        let invalid = LinearAttentionLayout {
+            conv_dim: 0,
+            ..valid
+        };
+        let err = cache.linear_state_mut(1, invalid).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("linear-attention cache state is not declared graph state"),
             "{err:#}"
         );
     }
