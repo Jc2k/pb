@@ -111,15 +111,19 @@ The validator should reject silent fallbacks such as:
 ## Current State
 
 - `src/inference/flashmoe/mod.rs` is only a facade. Most production behavior is still exported from
-  `legacy.rs`, including planning, cache build, runtime, Metal command construction, expert readers,
-  state, tests, and Qwen-VL preprocessing.
+  `legacy.rs`, including planning, cache build, runtime, Metal command construction, dense-store
+  execution, state, tests, and Qwen-VL preprocessing.
 - `model_family.rs` now contains useful parity metadata: Qwen family detection, layer schedule,
   configured K versus scheduled K, shared expert dimensions, Qwen-VL metadata, Qwen3.5 Q4 expert
   offsets, and an `UPSTREAM_PARITY` execution policy.
-- `experts.rs` now contains reusable byte-buffer and fixed-slot view types that represent one expert
-  payload plus typed offsets. This is the right data-model direction, but the scheduler/runtime
-  boundary is not yet clean.
-- Existing code has moved some fixed-slot and Q4 handling toward whole-expert payload ownership, but
+- `experts.rs` now owns fixed-slot metadata, layer reader opening, positioned reads, reusable
+  whole-expert buffers, raw expert payload responses, and the expert read worker pool. PBQ4 remains
+  import/build compatibility; execution reads are moving toward fixed whole-expert slots.
+- `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, active expert read issue
+  and finish metrics, route normalization, pending read sets, and the scheduled whole-slot handoff.
+  `legacy.rs` still adapts those scheduled slots into `ExpertWeights` until CMD3 consumes typed
+  slots directly.
+- Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
 - Production behavior can still silently use older CPU/component paths when a Q4 or Metal-shaped
@@ -139,9 +143,10 @@ The validator should reject silent fallbacks such as:
 - Fallbacks are not yet consistently modeled as errors. Any branch that silently changes dtype,
   buffer ownership, scheduler, or CPU/GPU placement hides missing implementation work and must be
   made explicit.
-- Expert reads are close to upstream policy in spirit, but the scheduler boundary is incomplete.
-  Reads, reusable storage, pending read completion, metrics, and active expert binding should live
-  under a scheduler-owned API.
+- Expert reads now follow the upstream positioned-read policy under `experts`, and the scheduler
+  owns issue/finish metrics plus scheduled slot completion. The remaining gap is active expert
+  execution: CMD3 still consumes legacy `ExpertWeights` instead of scheduler-owned typed slot
+  leases and typed offsets.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
 - GPU residency is partial. Hidden, residual, normed, KV/recurrent state, router outputs, and
