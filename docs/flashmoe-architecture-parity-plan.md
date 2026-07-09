@@ -121,11 +121,11 @@ The validator should reject silent fallbacks such as:
   import/build compatibility; execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, CMD2 typed input-state
   validation and resolved input-state handoff, CMD2 post-attention prep output resolution tied to
-  that input state, CMD3 input and deferred output resolution, routing topK placement validation,
-  declared CMD1 input-state validation, CMD2 routing-output validation, full-attention KV placement
-  validation for the declared attention math implementation, active expert read issue and finish
-  metrics, route normalization, pending read sets, shared-expert source/shape validation, and the
-  scheduled whole-slot handoff.
+  that input state, CMD3 input validation, retained input-state handoff, and deferred output
+  resolution, routing topK placement validation, declared CMD1 input-state validation, CMD2
+  routing-output validation, full-attention KV placement validation for the declared attention math
+  implementation, active expert read issue and finish metrics, route normalization, pending read
+  sets, shared-expert source/shape validation, and the scheduled whole-slot handoff.
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.

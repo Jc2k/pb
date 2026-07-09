@@ -1219,6 +1219,7 @@ pub struct ScheduledCmd3Submission<'a, TExpert, TInput, TShared> {
     pub position: usize,
     pub scheduled: &'a ScheduledExpertSet<TExpert>,
     pub input: TInput,
+    input_state: FlashMoeCmd3InputState,
     pub shared: TShared,
     pub next_norm_weight: Option<&'a [f32]>,
 }
@@ -1364,6 +1365,7 @@ where
             position,
             scheduled,
             input,
+            input_state,
             shared,
             next_norm_weight,
         })
@@ -1378,6 +1380,7 @@ pub struct ScheduledCmd3Command<'a, TExpert, TInput, TShared> {
     pub experts: Arc<[TExpert]>,
     pub weights: &'a [f32],
     pub input: TInput,
+    pub input_state: FlashMoeCmd3InputState,
     pub shared: TShared,
     pub next_norm_weight: Option<&'a [f32]>,
     pub payloads: Vec<ScheduledExpertPhaseMlpPayload<'a>>,
@@ -1388,7 +1391,7 @@ where
     TInput: ScheduledCmd3Input,
 {
     pub(crate) fn resolve_output_state(&self) -> Result<FlashMoeCmd3OutputState> {
-        let input_state = self.input.scheduled_cmd3_input_state(self.layer);
+        let input_state = self.input_state;
         if !input_state.is_declared_graph_state() {
             bail!("FlashMoe scheduled CMD3 output cannot resolve from undeclared input state");
         }
@@ -1428,10 +1431,7 @@ where
     pub(crate) fn into_cmd3_command(
         self,
     ) -> Result<ScheduledCmd3Command<'a, TExpert, TInput, TShared>> {
-        let input_width = self
-            .input
-            .scheduled_cmd3_input_state(self.cmd3.layer)
-            .width();
+        let input_width = self.input_state.width();
         let payloads = self.scheduled.cmd3_expert_phase_payloads(input_width)?;
         Ok(ScheduledCmd3Command {
             cmd3: self.cmd3,
@@ -1440,6 +1440,7 @@ where
             experts: self.scheduled.experts.clone(),
             weights: &self.scheduled.weights,
             input: self.input,
+            input_state: self.input_state,
             shared: self.shared,
             next_norm_weight: self.next_norm_weight,
             payloads,
@@ -3334,6 +3335,11 @@ mod tests {
         assert_eq!(submission.position, 19);
         assert_eq!(submission.cmd3.layer, 7);
         assert_eq!(submission.scheduled.len(), 2);
+        assert_eq!(submission.input_state.width(), 8);
+        assert_eq!(
+            submission.input_state.placement(),
+            FlashMoeStatePlacement::CpuVisible
+        );
     }
 
     #[test]
@@ -3387,6 +3393,12 @@ mod tests {
         assert_eq!(
             command.input.scheduled_cmd3_input_source(),
             ScheduledCmd3InputSource::CpuNormedResidualUpload
+        );
+        assert_eq!(command.input_state.layer(), 7);
+        assert_eq!(command.input_state.width(), 8);
+        assert_eq!(
+            command.input_state.placement(),
+            FlashMoeStatePlacement::CpuVisible
         );
         assert_eq!(command.next_norm_weight.unwrap().len(), 8);
         assert_eq!(command.payloads[0].q4().gate.cols, 8);
