@@ -98,8 +98,8 @@ use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoePromptTokenRecord, FlashMoeSessionState, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeSessionState,
+    FlashMoeTokenState, stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -2043,6 +2043,7 @@ impl DeferredMetalInput {
 struct MetalPostAttentionPrep {
     residual_buffer: ObjcId,
     normed_buffer: ObjcId,
+    state: FlashMoePostAttentionPrepState,
     width: usize,
     active: Vec<(usize, f32)>,
 }
@@ -2187,21 +2188,26 @@ impl MetalExecutor {
                 }
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            ExpertPhaseInput::MetalPostAttention(prep) => self
-                .inner
-                .submit_scheduled_expert_phase_from_buffers_with_payloads(
-                    position,
-                    layer,
-                    experts,
-                    weights,
-                    prep.normed_buffer,
-                    prep.residual_buffer,
-                    prep.width,
-                    shared,
-                    next_norm_weight,
-                    &payloads,
-                )
-                .map(|pending| pending.map(DeferredExpertPhase::Metal)),
+            ExpertPhaseInput::MetalPostAttention(prep) => {
+                debug_assert!(prep.state.is_declared_graph_state());
+                debug_assert_eq!(prep.state.width(), prep.width);
+                debug_assert_eq!(prep.state.active_experts(), prep.active.len());
+                debug_assert_eq!(prep.state.residual().len(), prep.state.normed().len());
+                self.inner
+                    .submit_scheduled_expert_phase_from_buffers_with_payloads(
+                        position,
+                        layer,
+                        experts,
+                        weights,
+                        prep.normed_buffer,
+                        prep.residual_buffer,
+                        prep.width,
+                        shared,
+                        next_norm_weight,
+                        &payloads,
+                    )
+                    .map(|pending| pending.map(DeferredExpertPhase::Metal))
+            }
         }
     }
 
@@ -4700,9 +4706,12 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             drop(state_guard);
+            let state = FlashMoePostAttentionPrepState::new(residual_len, active.len());
+            debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                state,
                 width: residual_len,
                 active,
             }))
@@ -7609,9 +7618,12 @@ impl MetalExecutorInner {
             ] {
                 self.recycle(buffer);
             }
+            let state = FlashMoePostAttentionPrepState::new(width, active.len());
+            debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                state,
                 width,
                 active,
             }))
@@ -7794,9 +7806,12 @@ impl MetalExecutorInner {
             for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
                 self.recycle(buffer);
             }
+            let state = FlashMoePostAttentionPrepState::new(width, active.len());
+            debug_assert!(state.is_declared_graph_state());
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                state,
                 width,
                 active,
             }))

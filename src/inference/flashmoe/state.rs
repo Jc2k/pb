@@ -157,6 +157,14 @@ impl FlashMoeGpuBufferDescriptor {
         Self::new(FlashMoeStateBufferRole::Hidden, len)
     }
 
+    pub(crate) fn residual(len: usize) -> Self {
+        Self::new(FlashMoeStateBufferRole::Residual, len)
+    }
+
+    pub(crate) fn normed(len: usize) -> Self {
+        Self::new(FlashMoeStateBufferRole::Normed, len)
+    }
+
     pub(crate) fn next_layer_normed(len: usize) -> Self {
         Self::new(FlashMoeStateBufferRole::NextLayerNormed, len)
     }
@@ -177,6 +185,48 @@ impl FlashMoeGpuBufferDescriptor {
         FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
             && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
             && self.len() > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoePostAttentionPrepState {
+    residual: FlashMoeGpuBufferDescriptor,
+    normed: FlashMoeGpuBufferDescriptor,
+    active_experts: usize,
+}
+
+impl FlashMoePostAttentionPrepState {
+    pub(crate) fn new(width: usize, active_experts: usize) -> Self {
+        Self {
+            residual: FlashMoeGpuBufferDescriptor::residual(width),
+            normed: FlashMoeGpuBufferDescriptor::normed(width),
+            active_experts,
+        }
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.residual.len()
+    }
+
+    pub(crate) fn residual(self) -> FlashMoeGpuBufferDescriptor {
+        self.residual
+    }
+
+    pub(crate) fn normed(self) -> FlashMoeGpuBufferDescriptor {
+        self.normed
+    }
+
+    pub(crate) fn active_experts(self) -> usize {
+        self.active_experts
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.residual.is_declared_graph_state()
+            && self.normed.is_declared_graph_state()
+            && self.residual.role() == FlashMoeStateBufferRole::Residual
+            && self.normed.role() == FlashMoeStateBufferRole::Normed
+            && self.residual.len() == self.normed.len()
+            && self.active_experts > 0
     }
 }
 
@@ -499,6 +549,27 @@ mod tests {
 
         assert_eq!(hidden.len(), 0);
         assert!(!hidden.is_declared_graph_state());
+    }
+
+    #[test]
+    fn post_attention_prep_state_names_gpu_residual_normed_and_routes() {
+        let state = FlashMoePostAttentionPrepState::new(4096, 4);
+
+        assert_eq!(state.width(), 4096);
+        assert_eq!(state.active_experts(), 4);
+        assert_eq!(state.residual().role(), FlashMoeStateBufferRole::Residual);
+        assert_eq!(state.normed().role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(
+            state.residual().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert!(state.is_declared_graph_state());
+    }
+
+    #[test]
+    fn post_attention_prep_state_rejects_empty_width_or_routes() {
+        assert!(!FlashMoePostAttentionPrepState::new(0, 4).is_declared_graph_state());
+        assert!(!FlashMoePostAttentionPrepState::new(4096, 0).is_declared_graph_state());
     }
 
     #[test]

@@ -137,9 +137,9 @@ The validator should reject silent fallbacks such as:
   the router score batch data model, but command construction and much of runtime score execution
   still flows through `legacy.rs` shims.
 - `state.rs` owns CPU-visible hidden/residual/normed/next-normed buffers and now also describes
-  GPU-resident hidden and next-layer normed buffers with typed roles and lengths. The Metal object
-  handles still live in `legacy.rs`, but deferred GPU inputs now carry state descriptors instead of
-  raw anonymous lengths.
+  GPU-resident hidden, residual, normed, and next-layer normed buffers with typed roles and lengths.
+  The Metal object handles still live in `legacy.rs`, but deferred GPU inputs and post-attention
+  prep now carry state descriptors instead of raw anonymous lengths.
 - Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
   verification tools, not the work queue.
 
@@ -160,10 +160,10 @@ The validator should reject silent fallbacks such as:
   `legacy.rs` behind the explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
-- GPU residency is partial. Deferred hidden and next-layer normed inputs now carry typed GPU state
-  descriptors, but residual, normed, KV/recurrent state, router outputs, and many next-layer buffer
-  transitions still cross CPU/GPU boundaries in places that should become explicit state
-  transitions.
+- GPU residency is partial. Deferred hidden/next-layer normed inputs and post-attention
+  residual/normed prep now carry typed GPU state descriptors, but KV/recurrent state, router
+  outputs, and many next-layer buffer transitions still cross CPU/GPU boundaries in places that
+  should become explicit state transitions.
 - Routing topK placement is now represented as a scheduler graph stage and resolves score-based or
   fused-prep preselected routes into a scheduler-owned routing command. The remaining gap is score
   production ownership: router projection and score readback are descriptor- and batch-backed by
