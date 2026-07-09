@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeSessionState<K> {
@@ -50,6 +51,91 @@ pub(crate) fn stable_session_cache_tokens(prompt_tokens: &[u32]) -> Vec<u32> {
     // re-rendered canonically on the next turn. Cache only rendered prompt
     // tokens whose exact bytes are already part of the transcript contract.
     prompt_tokens.to_vec()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeStatePlacement {
+    CpuVisible,
+    GpuResident,
+}
+
+impl FlashMoeStatePlacement {
+    pub(crate) const GRAPH_PLACEMENTS: [Self; 2] = [Self::CpuVisible, Self::GpuResident];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeStateBufferRole {
+    Hidden,
+    Residual,
+    Normed,
+    NextLayerNormed,
+    Kv,
+    Recurrent,
+}
+
+impl FlashMoeStateBufferRole {
+    pub(crate) const GENERATION_ROLES: [Self; 6] = [
+        Self::Hidden,
+        Self::Residual,
+        Self::Normed,
+        Self::NextLayerNormed,
+        Self::Kv,
+        Self::Recurrent,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeCpuBuffer {
+    role: FlashMoeStateBufferRole,
+    values: Vec<f32>,
+}
+
+impl FlashMoeCpuBuffer {
+    pub(crate) fn hidden(values: Vec<f32>) -> Self {
+        Self {
+            role: FlashMoeStateBufferRole::Hidden,
+            values,
+        }
+    }
+
+    pub(crate) fn role(&self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn placement(&self) -> FlashMoeStatePlacement {
+        FlashMoeStatePlacement::CpuVisible
+    }
+
+    pub(crate) fn is_declared_graph_state(&self) -> bool {
+        FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
+
+    pub(crate) fn replace_values(&mut self, values: Vec<f32>) {
+        self.values = values;
+    }
+
+    pub(crate) fn clone_values(&self) -> Vec<f32> {
+        self.values.clone()
+    }
+
+    pub(crate) fn into_values(self) -> Vec<f32> {
+        self.values
+    }
+}
+
+impl Deref for FlashMoeCpuBuffer {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for FlashMoeCpuBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +195,18 @@ mod tests {
     #[test]
     fn stable_session_cache_tokens_keep_prompt_only() {
         assert_eq!(stable_session_cache_tokens(&[4, 5, 6]), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn cpu_hidden_buffer_declares_role_and_cpu_visibility() {
+        let mut hidden = FlashMoeCpuBuffer::hidden(vec![1.0, 2.0]);
+        assert_eq!(hidden.role(), FlashMoeStateBufferRole::Hidden);
+        assert_eq!(hidden.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert_eq!(&hidden[..], &[1.0, 2.0]);
+
+        hidden[1] = 3.0;
+        assert_eq!(hidden.clone_values(), vec![1.0, 3.0]);
+        assert_eq!(hidden.into_values(), vec![1.0, 3.0]);
     }
 
     #[test]

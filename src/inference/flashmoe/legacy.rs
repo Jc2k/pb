@@ -73,7 +73,7 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeRecurrentState, FlashMoeSessionState, stable_session_cache_tokens,
+    FlashMoeCpuBuffer, FlashMoeRecurrentState, FlashMoeSessionState, stable_session_cache_tokens,
     take_reusable_session_cache_entry,
 };
 use super::types::*;
@@ -9785,7 +9785,7 @@ impl FlashMoeEngine {
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
         let token_started = Instant::now();
-        let mut hidden = if let Some(mut emb) = embedding_override {
+        let hidden_values = if let Some(mut emb) = embedding_override {
             if emb.len() != runtime.width {
                 tracing::warn!(
                     got = emb.len(),
@@ -9798,6 +9798,8 @@ impl FlashMoeEngine {
         } else {
             self.dense.embedding(previous, runtime.width)?
         };
+        let mut hidden = FlashMoeCpuBuffer::hidden(hidden_values);
+        debug_assert!(hidden.is_declared_graph_state());
         let mut recurrent_state = FlashMoeRecurrentState::new(
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
         );
@@ -9862,7 +9864,7 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                hidden = output.hidden;
+                hidden.replace_values(output.hidden);
                 next_layer_normed = output.next_normed;
             }
             let layer_started = Instant::now();
@@ -10049,7 +10051,7 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                hidden = output.hidden;
+                hidden.replace_values(output.hidden);
                 next_layer_normed = None;
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10124,7 +10126,7 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        hidden = output.hidden;
+                        hidden.replace_values(output.hidden);
                         next_layer_normed = None;
                     }
                     if let Some(metal) = &self.metal {
@@ -10201,7 +10203,7 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        hidden = output.hidden;
+                        hidden.replace_values(output.hidden);
                         next_layer_normed = None;
                     }
                     let subphase_started = Instant::now();
@@ -10237,9 +10239,9 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let cpu_mlp_residual = (!has_metal_post_attention_prep).then(|| hidden.clone());
+            let cpu_mlp_residual = (!has_metal_post_attention_prep).then(|| hidden.clone_values());
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let cpu_mlp_residual = Some(hidden.clone());
+            let cpu_mlp_residual = Some(hidden.clone_values());
             layer_timing.active_experts = active.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
                 kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
@@ -10327,7 +10329,7 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    hidden = output.hidden;
+                    hidden.replace_values(output.hidden);
                     next_layer_normed = output.next_normed;
                     submitted_deferred = true;
                 }
@@ -10352,7 +10354,7 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    hidden = output.hidden;
+                    hidden.replace_values(output.hidden);
                     next_layer_normed = output.next_normed;
                     submitted_deferred = true;
                 }
@@ -10373,7 +10375,7 @@ impl FlashMoeEngine {
                     shared_dense_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
-                hidden = output.hidden;
+                hidden.replace_values(output.hidden);
                 next_layer_normed = output.next_normed;
             }
             trace_layer_values(position, layer, "moe", &hidden);
@@ -10500,13 +10502,13 @@ impl FlashMoeEngine {
                     previous_layer.buckets.total_wall += wait_elapsed;
                 }
             }
-            hidden = output.hidden;
+            hidden.replace_values(output.hidden);
             next_layer_normed = output.next_normed;
         }
         drop(next_layer_normed);
 
         let combine_started = Instant::now();
-        hidden = self.rms_norm_with_model_weight("model.norm.weight", &hidden)?;
+        hidden.replace_values(self.rms_norm_with_model_weight("model.norm.weight", &hidden)?);
         if record_generated {
             kv_cache.record_generated_token(position, previous)?;
         }
@@ -10514,7 +10516,7 @@ impl FlashMoeEngine {
             timing.buckets.combine_norm += combine_started.elapsed();
             timing.buckets.total_wall = token_started.elapsed();
         }
-        Ok(hidden)
+        Ok(hidden.into_values())
     }
 
     fn full_attention_output_values(
