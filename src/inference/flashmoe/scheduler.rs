@@ -1420,6 +1420,50 @@ pub trait ScheduledCmd3Input {
     fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState;
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScheduledCmd3CpuInput<'a> {
+    pub(crate) normed: &'a [f32],
+    pub(crate) residual: &'a [f32],
+    state: FlashMoeCmd3InputState,
+}
+
+impl<'a> ScheduledCmd3CpuInput<'a> {
+    pub(crate) fn new(layer: usize, normed: &'a [f32], residual: &'a [f32]) -> Result<Self> {
+        let state =
+            FlashMoeCmd3InputState::cpu_normed_residual(layer, normed.len(), residual.len());
+        if !state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 CPU input for layer {layer}: normed_len={} residual_len={} is not a declared graph state",
+                normed.len(),
+                residual.len()
+            );
+        }
+        Ok(Self {
+            normed,
+            residual,
+            state,
+        })
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.state.width()
+    }
+
+    pub(crate) fn state(self) -> FlashMoeCmd3InputState {
+        self.state
+    }
+}
+
+impl ScheduledCmd3Input for ScheduledCmd3CpuInput<'_> {
+    fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+        ScheduledCmd3InputSource::CpuNormedResidualUpload
+    }
+
+    fn scheduled_cmd3_input_state(&self, _layer: usize) -> FlashMoeCmd3InputState {
+        self.state
+    }
+}
+
 pub trait ScheduledCmd3Expert {
     fn scheduled_expert_layer(&self) -> usize;
     fn scheduled_expert_id(&self) -> usize;
@@ -4134,6 +4178,36 @@ mod tests {
             invalid_state_err
                 .to_string()
                 .contains("input is not declared graph state")
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd3_cpu_input_declares_whole_phase_or_errors() {
+        let normed = [1.0f32, 2.0, 3.0];
+        let residual = [4.0f32, 5.0, 6.0];
+        let input = ScheduledCmd3CpuInput::new(9, &normed, &residual).unwrap();
+        assert_eq!(input.width(), 3);
+        assert_eq!(
+            input.scheduled_cmd3_input_source(),
+            ScheduledCmd3InputSource::CpuNormedResidualUpload
+        );
+        assert_eq!(
+            input.scheduled_cmd3_input_state(9),
+            FlashMoeCmd3InputState::cpu_normed_residual(9, 3, 3)
+        );
+
+        let mismatched = ScheduledCmd3CpuInput::new(9, &normed, &residual[..2]).unwrap_err();
+        assert!(
+            mismatched
+                .to_string()
+                .contains("is not a declared graph state"),
+            "{mismatched:#}"
+        );
+
+        let empty = ScheduledCmd3CpuInput::new(9, &[], &[]).unwrap_err();
+        assert!(
+            empty.to_string().contains("is not a declared graph state"),
+            "{empty:#}"
         );
     }
 

@@ -90,10 +90,10 @@ use super::scheduler::{
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
-    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
-    ScheduledCmd3OutputState, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledCmd3CpuInput, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
+    ScheduledCmd3InputSource, ScheduledCmd3OutputState, ScheduledCmd3Submission,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
+    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
@@ -1882,10 +1882,7 @@ struct MetalExecutor {
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
-    Cpu {
-        normed: &'a [f32],
-        residual: &'a [f32],
-    },
+    Cpu(ScheduledCmd3CpuInput<'a>),
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MetalPostAttention(MetalPostAttentionPrep),
 }
@@ -1893,7 +1890,7 @@ enum ExpertPhaseInput<'a> {
 impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
         match self {
-            Self::Cpu { .. } => ScheduledCmd3InputSource::CpuNormedResidualUpload,
+            Self::Cpu(input) => input.scheduled_cmd3_input_source(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::MetalPostAttention(_) => ScheduledCmd3InputSource::MetalPostAttentionPrep,
         }
@@ -1901,9 +1898,7 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
 
     fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState {
         match self {
-            Self::Cpu { normed, residual } => {
-                FlashMoeCmd3InputState::cpu_normed_residual(layer, normed.len(), residual.len())
-            }
+            Self::Cpu(input) => input.scheduled_cmd3_input_state(layer),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::MetalPostAttention(prep) => {
                 FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep.state)
@@ -2180,7 +2175,7 @@ impl MetalExecutor {
         } = command;
         let next_norm_weight = next_norm_weights.values();
         match input {
-            ExpertPhaseInput::Cpu { normed, residual } => {
+            ExpertPhaseInput::Cpu(cpu_input) => {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     let pending = self.inner.submit_scheduled_expert_phase_with_payloads(
@@ -2188,8 +2183,7 @@ impl MetalExecutor {
                         layer,
                         experts,
                         weights,
-                        normed,
-                        residual,
+                        cpu_input,
                         output,
                         shared,
                         next_norm_weight,
@@ -2199,7 +2193,7 @@ impl MetalExecutor {
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
-                    let _ = (normed, residual, output, payloads, shared, next_norm_weight);
+                    let _ = (cpu_input, output, payloads, shared, next_norm_weight);
                     bail!(
                         "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
                     );
@@ -5188,22 +5182,19 @@ impl MetalExecutorInner {
         layer: usize,
         experts: Arc<[Arc<ScheduledExpertSlot>]>,
         weights: &[f32],
-        normed: &[f32],
-        residual: &[f32],
+        input: ScheduledCmd3CpuInput<'_>,
         output: ScheduledCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<MetalDeferredExpertPhase> {
-        let width = residual.len();
+        let width = input.width();
         debug_assert_eq!(output.layer, layer);
+        debug_assert_eq!(input.state().layer(), layer);
         let output_state = output.state();
-        if width == 0 || normed.len() < width || weights.len() != experts.len() {
+        if weights.len() != experts.len() {
             bail!(
-                "FlashMoe unsupported scheduled CMD3 path: CPU upload input for layer {layer} is not a declared whole phase, width={} normed_len={} residual_len={} weights={} experts={}",
-                width,
-                normed.len(),
-                residual.len(),
+                "FlashMoe unsupported scheduled CMD3 path: CPU upload input for layer {layer} has weights={} experts={}",
                 weights.len(),
                 experts.len()
             );
@@ -5225,8 +5216,8 @@ impl MetalExecutorInner {
             );
         }
         unsafe {
-            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
-            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
+            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(input.normed))?;
+            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(input.residual)) {
                 Ok(buffer) => buffer,
                 Err(error) => {
                     self.recycle(normed_buffer);
@@ -10771,10 +10762,11 @@ impl FlashMoeEngine {
                         position,
                         scheduled_cmd3,
                         &scheduled_experts,
-                        ExpertPhaseInput::Cpu {
-                            normed: &normed,
-                            residual: mlp_residual,
-                        },
+                        ExpertPhaseInput::Cpu(ScheduledCmd3CpuInput::new(
+                            layer,
+                            &normed,
+                            mlp_residual,
+                        )?),
                         shared_phase,
                         next_norm_weights,
                     )?,

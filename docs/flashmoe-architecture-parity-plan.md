@@ -233,10 +233,12 @@ The validator should reject silent fallbacks such as:
 - Shared experts now enter CMD3 through a scheduler descriptor that carries source and graph shape,
   and the live CMD3 builder derives next-norm source from typed `ScheduledNextNormWeights` instead
   of a separate legacy-owned branch. The live path now asks the scheduled graph to build CMD3
-  submissions, rejecting stale descriptors that do not match the current graph capability. The actual
-  shared gate/up/down, next-norm application, and shared down execution still live in the older
-  Metal/CPU phase helpers. That execution should become part of the same CMD2/CMD3 builder model as
-  routed experts.
+  submissions, rejecting stale descriptors that do not match the current graph capability. CPU
+  upload inputs for CMD3 now materialize as scheduler-typed whole-phase inputs before Metal buffer
+  allocation, so mismatched normed/residual state is an explicit unsupported input instead of a
+  silent no-op/fallback. The actual shared gate/up/down, next-norm application, and shared down
+  execution still live in the older Metal/CPU phase helpers. That execution should become part of the
+  same CMD2/CMD3 builder model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
   plans should feed the same text/MoE runtime rather than spreading multimodal branches through the
   execution loop.
