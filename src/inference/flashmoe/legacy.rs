@@ -68,7 +68,8 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ExpertRoute, ExpertSchedulerMetrics, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    ScheduledExpertBatch, ScheduledExpertRoutes,
+    PendingScheduledExpertSet, PendingScheduledRead, ScheduledExpertRoutes,
+    ScheduledExpertSet as SchedulerScheduledExpertSet,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -18154,20 +18155,9 @@ struct ExpertKey {
     expert: usize,
 }
 
-#[derive(Debug)]
-struct PendingExpertRead {
-    id: u64,
-    rx: mpsc::Receiver<ExpertReadResponse>,
-}
-
-#[derive(Debug)]
-struct PendingExpertSet {
-    layer: usize,
-    routes: Vec<ExpertRoute>,
-    reads: Vec<PendingExpertRead>,
-}
-
-type ScheduledExpertSet = ScheduledExpertBatch<Arc<ExpertWeights>>;
+type PendingExpertRead = PendingScheduledRead<ExpertReadResponse>;
+type PendingExpertSet = PendingScheduledExpertSet<ExpertReadResponse>;
+type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ExpertWeights>>;
 
 #[derive(Debug)]
 struct ExpertLayerReader {
@@ -18419,7 +18409,7 @@ impl ExpertScheduler {
                 issued_at,
                 tx,
             })?;
-            pending.push(PendingExpertRead { id, rx });
+            pending.push(PendingExpertRead::new(id, rx));
         }
         Ok(pending)
     }
@@ -18428,26 +18418,22 @@ impl ExpertScheduler {
         let routes = ExpertRoute::from_scores(routes)?;
         let experts: Vec<usize> = routes.iter().map(|route| route.expert).collect();
         let reads = self.issue(layer, &experts)?;
-        Ok(PendingExpertSet {
-            layer,
-            routes,
-            reads,
-        })
+        Ok(PendingExpertSet::new(layer, routes, reads))
     }
 
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
+            let pending_id = pending.id();
             let response = pending
-                .rx
                 .recv()
                 .context("expert I/O worker dropped response channel")?;
-            if response.id != pending.id {
+            if response.id != pending_id {
                 self.metrics.record_read_failure();
                 bail!(
                     "expert I/O worker returned response {} for pending read {}",
                     response.id,
-                    pending.id
+                    pending_id
                 );
             }
             self.metrics.record_queue_latency(response.queue_latency);
@@ -18474,12 +18460,10 @@ impl ExpertScheduler {
     }
 
     fn finish_routes(&mut self, pending: PendingExpertSet) -> Result<ScheduledExpertSet> {
-        let scheduled_routes = ScheduledExpertRoutes::from_routes(
-            pending.layer,
-            pending.routes,
-            self.routed_expert_scale,
-        )?;
-        let experts = self.finish(pending.reads)?;
+        let (layer, routes, reads) = pending.into_parts();
+        let scheduled_routes =
+            ScheduledExpertRoutes::from_routes(layer, routes, self.routed_expert_scale)?;
+        let experts = self.finish(reads)?;
         if experts.len() != scheduled_routes.routes.len() {
             bail!(
                 "expert scheduler returned {} experts for {} routed entries on layer {}",

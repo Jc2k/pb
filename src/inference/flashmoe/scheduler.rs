@@ -5,7 +5,8 @@ use super::capabilities::{
 use super::math::softmax_in_place;
 use super::model_family::QwenMoeFamily;
 use anyhow::{Result, bail};
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +246,69 @@ impl<T> ScheduledExpertBatch<T> {
 
     pub fn is_empty(&self) -> bool {
         self.experts.is_empty()
+    }
+}
+
+pub type ScheduledExpertSet<T> = ScheduledExpertBatch<T>;
+
+pub(crate) struct PendingScheduledRead<T> {
+    id: u64,
+    rx: mpsc::Receiver<T>,
+}
+
+impl<T> fmt::Debug for PendingScheduledRead<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingScheduledRead")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> PendingScheduledRead<T> {
+    pub(crate) fn new(id: u64, rx: mpsc::Receiver<T>) -> Self {
+        Self { id, rx }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn recv(self) -> Result<T, mpsc::RecvError> {
+        self.rx.recv()
+    }
+}
+
+pub(crate) struct PendingScheduledExpertSet<T> {
+    layer: usize,
+    routes: Vec<ExpertRoute>,
+    reads: Vec<PendingScheduledRead<T>>,
+}
+
+impl<T> fmt::Debug for PendingScheduledExpertSet<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingScheduledExpertSet")
+            .field("layer", &self.layer)
+            .field("routes", &self.routes)
+            .field("read_count", &self.reads.len())
+            .finish()
+    }
+}
+
+impl<T> PendingScheduledExpertSet<T> {
+    pub(crate) fn new(
+        layer: usize,
+        routes: Vec<ExpertRoute>,
+        reads: Vec<PendingScheduledRead<T>>,
+    ) -> Self {
+        Self {
+            layer,
+            routes,
+            reads,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (usize, Vec<ExpertRoute>, Vec<PendingScheduledRead<T>>) {
+        (self.layer, self.routes, self.reads)
     }
 }
 
@@ -531,6 +595,38 @@ mod tests {
             err.to_string()
                 .contains("scheduled expert batch has 1 experts for 2 routes"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn pending_scheduled_expert_set_owns_read_receivers_and_routes() {
+        let (tx, rx) = mpsc::channel();
+        let read = PendingScheduledRead::new(77, rx);
+        assert_eq!(read.id(), 77);
+        let pending = PendingScheduledExpertSet::new(
+            5,
+            vec![ExpertRoute {
+                expert: 9,
+                score: 1.25,
+            }],
+            vec![read],
+        );
+
+        tx.send("expert-9").unwrap();
+        let (layer, routes, reads) = pending.into_parts();
+
+        assert_eq!(layer, 5);
+        assert_eq!(
+            routes,
+            vec![ExpertRoute {
+                expert: 9,
+                score: 1.25
+            }]
+        );
+        assert_eq!(reads.len(), 1);
+        assert_eq!(
+            reads.into_iter().next().unwrap().recv().unwrap(),
+            "expert-9"
         );
     }
 
