@@ -222,9 +222,9 @@ The validator should reject silent fallbacks such as:
   instead of delegating command construction to a legacy Metal prep helper. The live path now asks
   the scheduled graph to build CMD2 submissions, rejecting stale descriptors that do not match the
   current graph capability before post-attention helpers execute. CPU router score production now
-  consumes a scheduler-built projection command carrying declared routing state, hidden width, and
-  the optional resident projection descriptor before the dense store executes it. Active expert issue
-  now consumes the resulting
+  asks the scheduled graph to build the projection command carrying declared routing state, hidden
+  width, and the optional resident projection descriptor before the dense store executes it. Active
+  expert issue now consumes the resulting
   `ScheduledRoutingCommand` directly and resolves it into scheduler-owned `ScheduledExpertRoutes`
   before reads are issued. The remaining gap is score production ownership: router score execution
   and any future readback variants are descriptor- and batch-backed by `weights`, but some execution

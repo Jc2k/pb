@@ -11280,20 +11280,19 @@ impl FlashMoeEngine {
         normed: &[f32],
         active_experts: usize,
     ) -> Result<ScheduledRoutingCommand> {
-        let source = ScheduledRoutingCandidateSource::CpuRouterScores;
-        let scheduled_routing = self.scheduled_graph.build_routing_topk(
-            layer,
-            self.config.experts(),
-            active_experts,
-            source,
-        )?;
         let projection = self.dense.router_score_projection_descriptor(
             layer,
             self.config.experts(),
             normed.len(),
         )?;
-        let router_score_command =
-            scheduled_routing.build_score_projection_command(projection, normed.len())?;
+        let router_score_command = self.scheduled_graph.build_router_score_projection(
+            layer,
+            self.config.experts(),
+            active_experts,
+            projection,
+            normed.len(),
+        )?;
+        let scheduled_routing = router_score_command.routing;
         let router_scores = self.dense.router_scores_with_metal(
             self.metal.as_ref(),
             router_score_command,

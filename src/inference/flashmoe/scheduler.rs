@@ -174,6 +174,31 @@ impl FlashMoeScheduledGraph {
         })
     }
 
+    pub(crate) fn build_router_score_projection(
+        &self,
+        layer: usize,
+        experts: usize,
+        active_experts: usize,
+        projection: Option<RouterScoreProjectionDescriptor>,
+        hidden_width: usize,
+    ) -> Result<ScheduledRouterScoreProjectionCommand, FlashMoeUnsupportedCapability> {
+        let routing = self.build_routing_topk(
+            layer,
+            experts,
+            active_experts,
+            ScheduledRoutingCandidateSource::CpuRouterScores,
+        )?;
+        routing
+            .build_score_projection_command(projection, hidden_width)
+            .map_err(|_| {
+                FlashMoeUnsupportedCapability::new(
+                    self.family,
+                    routing.stage.stage,
+                    "invalid scheduled router score projection",
+                )
+            })
+    }
+
     pub fn build_cmd1_attention_projections(
         &self,
         layer: usize,
@@ -3383,6 +3408,40 @@ mod tests {
         );
         assert_eq!(command.projection, Some(projection));
         assert_eq!(command.hidden_width, 8);
+    }
+
+    #[test]
+    fn scheduled_graph_builds_router_score_projection_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let projection = dummy_router_projection(3, 5, 8);
+
+        let command = graph
+            .build_router_score_projection(3, 5, 2, Some(projection.clone()), 8)
+            .unwrap();
+
+        assert_eq!(command.routing.layer, 3);
+        assert_eq!(command.routing.experts, 5);
+        assert_eq!(command.routing.active_experts, 2);
+        assert_eq!(
+            command.routing.source,
+            ScheduledRoutingCandidateSource::CpuRouterScores
+        );
+        assert_eq!(
+            command.state,
+            FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 2)
+        );
+        assert_eq!(command.projection, Some(projection));
+
+        let err = graph
+            .build_router_score_projection(3, 5, 2, Some(dummy_router_projection(3, 5, 4)), 8)
+            .unwrap_err();
+        assert_eq!(err.stage, FlashMoeGraphStage::RoutingSoftmaxTopK);
+        assert!(
+            err.to_string()
+                .contains("invalid scheduled router score projection"),
+            "{err:#}"
+        );
     }
 
     #[test]
