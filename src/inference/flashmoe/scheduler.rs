@@ -2,12 +2,14 @@ use super::capabilities::{
     FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
     FlashMoeUnsupportedCapability,
 };
+use super::experts::{ExpertReadPath, FLASHMOE_EXPERT_IO_POLICY};
 use super::math::softmax_in_place;
 use super::model_family::QwenMoeFamily;
 use anyhow::{Result, bail};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeScheduledGraph {
@@ -309,6 +311,155 @@ impl<T> PendingScheduledExpertSet<T> {
 
     pub(crate) fn into_parts(self) -> (usize, Vec<ExpertRoute>, Vec<PendingScheduledRead<T>>) {
         (self.layer, self.routes, self.reads)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ExpertReadKey {
+    pub(crate) layer: usize,
+    pub(crate) expert: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduledExpertReadIssue {
+    pub(crate) id: u64,
+    pub(crate) key: ExpertReadKey,
+    pub(crate) warm: bool,
+    pub(crate) issued_at: Instant,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledExpertReadResponse<T> {
+    pub(crate) id: u64,
+    pub(crate) queue_latency: Duration,
+    pub(crate) read_path: ExpertReadPath,
+    pub(crate) read_latency: Duration,
+    pub(crate) bytes_read: u64,
+    pub(crate) warm: bool,
+    pub(crate) result: Result<T>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveExpertReadScheduler {
+    metrics: ExpertSchedulerMetrics,
+    seen_reads: BTreeSet<ExpertReadKey>,
+    next_read_id: u64,
+    routed_expert_scale: f32,
+}
+
+impl ActiveExpertReadScheduler {
+    pub(crate) fn new(routed_expert_scale: f32) -> Self {
+        assert_eq!(
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            ExpertReadPath::PositionedRead,
+            "expert files must be read with positioned reads"
+        );
+        assert!(
+            routed_expert_scale.is_finite() && routed_expert_scale > 0.0,
+            "routed expert scale must be positive and finite"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.application_expert_cache,
+            "do not add an application-level expert cache; trust the OS page cache"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression,
+            "do not add LZ4 expert compression"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.speculative_routing,
+            "do not add speculative expert routing"
+        );
+        assert!(
+            !FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap,
+            "do not broadly overlap SSD expert reads with GPU compute"
+        );
+        Self {
+            metrics: ExpertSchedulerMetrics::default(),
+            seen_reads: BTreeSet::new(),
+            next_read_id: 0,
+            routed_expert_scale,
+        }
+    }
+
+    pub(crate) fn issue_read(&mut self, layer: usize, expert: usize) -> ScheduledExpertReadIssue {
+        let key = ExpertReadKey { layer, expert };
+        let warm = !self.seen_reads.insert(key);
+        self.metrics.record_issued_read();
+        let id = self.next_read_id;
+        self.next_read_id = self.next_read_id.wrapping_add(1);
+        ScheduledExpertReadIssue {
+            id,
+            key,
+            warm,
+            issued_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn finish_read<T>(
+        &mut self,
+        pending_id: u64,
+        response: ScheduledExpertReadResponse<T>,
+    ) -> Result<T> {
+        if response.id != pending_id {
+            self.metrics.record_read_failure();
+            bail!(
+                "expert I/O worker returned response {} for pending read {}",
+                response.id,
+                pending_id
+            );
+        }
+        self.metrics.record_queue_latency(response.queue_latency);
+        match response.read_path {
+            ExpertReadPath::PositionedRead => {
+                self.metrics.record_positioned_read();
+            }
+        }
+        self.metrics.record_read_latency(response.read_latency);
+        self.metrics.record_bytes_read(response.bytes_read);
+        if response.warm {
+            self.metrics
+                .record_warm_read(response.read_latency, response.bytes_read);
+        }
+        response.result.inspect_err(|_| {
+            self.metrics.record_read_failure();
+        })
+    }
+
+    pub(crate) fn finish_routes<T>(
+        &mut self,
+        layer: usize,
+        routes: Vec<ExpertRoute>,
+        experts: Vec<T>,
+        mut identify: impl FnMut(&T) -> (usize, usize),
+    ) -> Result<ScheduledExpertSet<T>> {
+        let scheduled_routes =
+            ScheduledExpertRoutes::from_routes(layer, routes, self.routed_expert_scale)?;
+        if experts.len() != scheduled_routes.routes.len() {
+            bail!(
+                "expert scheduler returned {} experts for {} routed entries on layer {}",
+                experts.len(),
+                scheduled_routes.routes.len(),
+                scheduled_routes.layer
+            );
+        }
+        for (route, expert) in scheduled_routes.routes.iter().zip(experts.iter()) {
+            let (expert_layer, expert_id) = identify(expert);
+            if expert_layer != scheduled_routes.layer || expert_id != route.expert {
+                bail!(
+                    "expert scheduler returned layer {} expert {} for routed layer {} expert {}",
+                    expert_layer,
+                    expert_id,
+                    scheduled_routes.layer,
+                    route.expert
+                );
+            }
+        }
+        ScheduledExpertSet::from_parts(scheduled_routes, experts)
+    }
+
+    pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        self.metrics.snapshot()
     }
 }
 
@@ -628,6 +779,77 @@ mod tests {
             reads.into_iter().next().unwrap().recv().unwrap(),
             "expert-9"
         );
+    }
+
+    #[test]
+    fn active_expert_scheduler_issues_ids_and_marks_repeated_reads_warm() {
+        let mut scheduler = ActiveExpertReadScheduler::new(1.0);
+
+        let cold = scheduler.issue_read(4, 7);
+        let warm = scheduler.issue_read(4, 7);
+
+        assert_eq!(cold.id, 0);
+        assert_eq!(
+            cold.key,
+            ExpertReadKey {
+                layer: 4,
+                expert: 7
+            }
+        );
+        assert!(!cold.warm);
+        assert_eq!(warm.id, 1);
+        assert_eq!(warm.key, cold.key);
+        assert!(warm.warm);
+        assert_eq!(scheduler.snapshot().issued_reads, 2);
+    }
+
+    #[test]
+    fn active_expert_scheduler_finishes_responses_and_records_failures() {
+        let mut scheduler = ActiveExpertReadScheduler::new(0.5);
+        let first = scheduler.issue_read(2, 9);
+        let value = scheduler
+            .finish_read(
+                first.id,
+                ScheduledExpertReadResponse {
+                    id: first.id,
+                    queue_latency: Duration::from_millis(2),
+                    read_path: ExpertReadPath::PositionedRead,
+                    read_latency: Duration::from_millis(5),
+                    bytes_read: 128,
+                    warm: first.warm,
+                    result: Ok("expert-9"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(value, "expert-9");
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.positioned_reads, 1);
+        assert_eq!(snapshot.bytes_read, 128);
+        assert_eq!(snapshot.read_failures, 0);
+
+        let second = scheduler.issue_read(2, 10);
+        let err = scheduler
+            .finish_read(
+                second.id,
+                ScheduledExpertReadResponse {
+                    id: second.id + 1,
+                    queue_latency: Duration::ZERO,
+                    read_path: ExpertReadPath::PositionedRead,
+                    read_latency: Duration::ZERO,
+                    bytes_read: 0,
+                    warm: false,
+                    result: Ok("wrong-id"),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("returned response 2 for pending read 1"),
+            "{err:#}"
+        );
+        assert_eq!(scheduler.snapshot().read_failures, 1);
     }
 
     #[test]
