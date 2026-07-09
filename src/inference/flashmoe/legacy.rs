@@ -73,8 +73,8 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeRecurrentState, FlashMoeSessionState, FlashMoeStateBufferRole,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeCpuBuffer, FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -9798,13 +9798,12 @@ impl FlashMoeEngine {
         } else {
             self.dense.embedding(previous, runtime.width)?
         };
-        let mut hidden = FlashMoeCpuBuffer::hidden(hidden_values);
-        debug_assert!(hidden.is_declared_graph_state());
-        let mut recurrent_state = FlashMoeRecurrentState::new(
+        let mut token_state = FlashMoeTokenState::new(
+            hidden_values,
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
         );
+        debug_assert!(token_state.hidden().is_declared_graph_state());
         let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
-        let mut next_layer_normed: Option<FlashMoeCpuBuffer> = None;
 
         for layer in 0..self.config.num_hidden_layers {
             let report_layer_progress = progress.is_some()
@@ -9864,8 +9863,8 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                hidden.replace_values(output.hidden);
-                next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
+                token_state.replace_hidden(output.hidden);
+                token_state.set_next_layer_normed(output.next_normed);
             }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
@@ -9877,15 +9876,17 @@ impl FlashMoeEngine {
             };
             let combine_started = Instant::now();
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
-            let mut normed = if deferred_attention_input.is_some() {
-                FlashMoeCpuBuffer::normed(Vec::new())
-            } else if let Some(normed) = next_layer_normed.take() {
-                normed.into_role(FlashMoeStateBufferRole::Normed)
-            } else {
-                FlashMoeCpuBuffer::normed(
-                    self.rms_norm_with_model_weight(input_norm_name.as_str(), &hidden)?,
-                )
-            };
+            let mut normed =
+                if deferred_attention_input.is_some() {
+                    FlashMoeCpuBuffer::normed(Vec::new())
+                } else if let Some(normed) = token_state.take_next_layer_normed_as_normed() {
+                    normed
+                } else {
+                    FlashMoeCpuBuffer::normed(self.rms_norm_with_model_weight(
+                        input_norm_name.as_str(),
+                        token_state.hidden(),
+                    )?)
+                };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
             let mut post_attention_values_for_prep = None;
@@ -9911,7 +9912,7 @@ impl FlashMoeEngine {
                                 buffer: input.buffer,
                                 len: input.len,
                             })
-                            .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
+                            .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                         if let Some(post_norm_weight) =
                             self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
                             && let Some(prep) = self
@@ -10053,8 +10054,8 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                hidden.replace_values(output.hidden);
-                next_layer_normed = None;
+                token_state.replace_hidden(output.hidden);
+                token_state.clear_next_layer_normed();
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
@@ -10078,7 +10079,7 @@ impl FlashMoeEngine {
                         buffer: input.buffer,
                         len: input.len,
                     })
-                    .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
+                    .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                 if let Some(metal) = &self.metal
                     && let Some(post_norm_weight) =
                         self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
@@ -10128,8 +10129,8 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        hidden.replace_values(output.hidden);
-                        next_layer_normed = None;
+                        token_state.replace_hidden(output.hidden);
+                        token_state.clear_next_layer_normed();
                     }
                     if let Some(metal) = &self.metal {
                         let attention_values = metal.read_and_recycle_attention_values(
@@ -10157,7 +10158,7 @@ impl FlashMoeEngine {
                             buffer: input.buffer,
                             len: input.len,
                         })
-                        .unwrap_or(MetalBatchProjectionInput::Cpu(&hidden));
+                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                     if let Some(metal) = &self.metal
                         && let Some(post_norm_weight) =
                             self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
@@ -10205,8 +10206,8 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        hidden.replace_values(output.hidden);
-                        next_layer_normed = None;
+                        token_state.replace_hidden(output.hidden);
+                        token_state.clear_next_layer_normed();
                     }
                     let subphase_started = Instant::now();
                     projected = self
@@ -10219,10 +10220,11 @@ impl FlashMoeEngine {
                         )?
                         .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
                     layer_timing.buckets.attention_output_projection += subphase_started.elapsed();
-                    add_in_place(&mut hidden, &projected);
-                    normed = FlashMoeCpuBuffer::normed(
-                        self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?,
-                    );
+                    add_in_place(token_state.hidden_mut(), &projected);
+                    normed = FlashMoeCpuBuffer::normed(self.rms_norm_with_model_weight(
+                        post_norm_name.as_str(),
+                        token_state.hidden(),
+                    )?);
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     let routing_started = Instant::now();
                     let active =
@@ -10231,9 +10233,9 @@ impl FlashMoeEngine {
                     active
                 }
             } else {
-                add_in_place(&mut hidden, &projected);
+                add_in_place(token_state.hidden_mut(), &projected);
                 normed = FlashMoeCpuBuffer::normed(
-                    self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?,
+                    self.rms_norm_with_model_weight(post_norm_name.as_str(), token_state.hidden())?,
                 );
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 let routing_started = Instant::now();
@@ -10245,13 +10247,13 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let cpu_mlp_residual = (!has_metal_post_attention_prep)
-                .then(|| FlashMoeCpuBuffer::residual(hidden.clone_values()));
+            let cpu_mlp_residual =
+                (!has_metal_post_attention_prep).then(|| token_state.residual_snapshot());
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let cpu_mlp_residual = Some(FlashMoeCpuBuffer::residual(hidden.clone_values()));
+            let cpu_mlp_residual = Some(token_state.residual_snapshot());
             layer_timing.active_experts = active.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
-                kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
+                kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.buckets.add(layer_timing.buckets);
@@ -10307,7 +10309,7 @@ impl FlashMoeEngine {
                 .iter()
                 .zip(scheduled_experts.weights.iter().copied())
             {
-                recurrent_state.mix_active_expert(expert.mix_hash(), weight);
+                token_state.mix_active_expert(expert.mix_hash(), weight);
             }
             let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
                 .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
@@ -10336,9 +10338,8 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    hidden.replace_values(output.hidden);
-                    next_layer_normed =
-                        output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
+                    token_state.replace_hidden(output.hidden);
+                    token_state.set_next_layer_normed(output.next_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10362,9 +10363,8 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    hidden.replace_values(output.hidden);
-                    next_layer_normed =
-                        output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
+                    token_state.replace_hidden(output.hidden);
+                    token_state.set_next_layer_normed(output.next_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10384,14 +10384,14 @@ impl FlashMoeEngine {
                     shared_dense_phase.as_deref(),
                     next_norm_weight.as_deref(),
                 )?;
-                hidden.replace_values(output.hidden);
-                next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
+                token_state.replace_hidden(output.hidden);
+                token_state.set_next_layer_normed(output.next_normed);
             }
-            trace_layer_values(position, layer, "moe", &hidden);
+            trace_layer_values(position, layer, "moe", token_state.hidden());
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
-                kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
+                kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 layer_timing.buckets.total_wall = layer_started.elapsed();
                 info!(
@@ -10444,16 +10444,16 @@ impl FlashMoeEngine {
                             context.visual_index
                         )
                     })?;
-                if feature.len() != hidden.len() {
+                if feature.len() != token_state.hidden().len() {
                     bail!(
                         "deepstack feature for layer {layer} has len {}; expected {}",
                         feature.len(),
-                        hidden.len()
+                        token_state.hidden().len()
                     );
                 }
-                add_in_place(&mut hidden, feature);
+                add_in_place(token_state.hidden_mut(), feature);
             }
-            kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
+            kv_cache.record_layer_state(position, layer, token_state.recurrent_value())?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
             info!(
@@ -10511,13 +10511,15 @@ impl FlashMoeEngine {
                     previous_layer.buckets.total_wall += wait_elapsed;
                 }
             }
-            hidden.replace_values(output.hidden);
-            next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
+            token_state.replace_hidden(output.hidden);
+            token_state.set_next_layer_normed(output.next_normed);
         }
-        drop(next_layer_normed);
+        token_state.clear_next_layer_normed();
 
         let combine_started = Instant::now();
-        hidden.replace_values(self.rms_norm_with_model_weight("model.norm.weight", &hidden)?);
+        token_state.replace_hidden(
+            self.rms_norm_with_model_weight("model.norm.weight", token_state.hidden())?,
+        );
         if record_generated {
             kv_cache.record_generated_token(position, previous)?;
         }
@@ -10525,7 +10527,7 @@ impl FlashMoeEngine {
             timing.buckets.combine_norm += combine_started.elapsed();
             timing.buckets.total_wall = token_started.elapsed();
         }
-        Ok(hidden.into_values())
+        Ok(token_state.into_hidden_values())
     }
 
     fn full_attention_output_values(

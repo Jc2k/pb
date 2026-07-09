@@ -177,6 +177,65 @@ impl FlashMoeRecurrentState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeTokenState {
+    hidden: FlashMoeCpuBuffer,
+    next_layer_normed: Option<FlashMoeCpuBuffer>,
+    recurrent: FlashMoeRecurrentState,
+}
+
+impl FlashMoeTokenState {
+    pub(crate) fn new(hidden_values: Vec<f32>, recurrent_seed: u64) -> Self {
+        Self {
+            hidden: FlashMoeCpuBuffer::hidden(hidden_values),
+            next_layer_normed: None,
+            recurrent: FlashMoeRecurrentState::new(recurrent_seed),
+        }
+    }
+
+    pub(crate) fn hidden(&self) -> &FlashMoeCpuBuffer {
+        &self.hidden
+    }
+
+    pub(crate) fn hidden_mut(&mut self) -> &mut FlashMoeCpuBuffer {
+        &mut self.hidden
+    }
+
+    pub(crate) fn replace_hidden(&mut self, values: Vec<f32>) {
+        self.hidden.replace_values(values);
+    }
+
+    pub(crate) fn residual_snapshot(&self) -> FlashMoeCpuBuffer {
+        FlashMoeCpuBuffer::residual(self.hidden.clone_values())
+    }
+
+    pub(crate) fn set_next_layer_normed(&mut self, values: Option<Vec<f32>>) {
+        self.next_layer_normed = values.map(FlashMoeCpuBuffer::next_layer_normed);
+    }
+
+    pub(crate) fn clear_next_layer_normed(&mut self) {
+        self.next_layer_normed = None;
+    }
+
+    pub(crate) fn take_next_layer_normed_as_normed(&mut self) -> Option<FlashMoeCpuBuffer> {
+        self.next_layer_normed
+            .take()
+            .map(|buffer| buffer.into_role(FlashMoeStateBufferRole::Normed))
+    }
+
+    pub(crate) fn mix_active_expert(&mut self, expert_hash: u64, weight: f32) {
+        self.recurrent.mix_active_expert(expert_hash, weight);
+    }
+
+    pub(crate) fn recurrent_value(&self) -> u64 {
+        self.recurrent.value()
+    }
+
+    pub(crate) fn into_hidden_values(self) -> Vec<f32> {
+        self.hidden.into_values()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +312,27 @@ mod tests {
         let mut state = FlashMoeRecurrentState::new(10);
         state.mix_active_expert(7, 0.0);
         assert_eq!(state.value(), 17);
+    }
+
+    #[test]
+    fn token_state_owns_hidden_next_normed_and_recurrent_values() {
+        let mut state = FlashMoeTokenState::new(vec![1.0, 2.0], 10);
+        assert_eq!(state.hidden().role(), FlashMoeStateBufferRole::Hidden);
+        assert_eq!(&state.hidden()[..], &[1.0, 2.0]);
+
+        let residual = state.residual_snapshot();
+        assert_eq!(residual.role(), FlashMoeStateBufferRole::Residual);
+        assert_eq!(&residual[..], &[1.0, 2.0]);
+
+        state.set_next_layer_normed(Some(vec![3.0, 4.0]));
+        let normed = state.take_next_layer_normed_as_normed().unwrap();
+        assert_eq!(normed.role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(&normed[..], &[3.0, 4.0]);
+        assert!(state.take_next_layer_normed_as_normed().is_none());
+
+        state.mix_active_expert(7, 0.0);
+        assert_eq!(state.recurrent_value(), 17);
+        state.replace_hidden(vec![5.0]);
+        assert_eq!(state.into_hidden_values(), vec![5.0]);
     }
 }
