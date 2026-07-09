@@ -83,11 +83,11 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd2AttentionSource,
-    ScheduledCmd2ResidualSource, ScheduledCmd3Input, ScheduledCmd3InputSource,
-    ScheduledCmd3Submission, ScheduledExpertSet as SchedulerScheduledExpertSet,
-    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledSharedExpert,
-    ScheduledSharedExpertSource,
+    PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd1InputSource,
+    ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource, ScheduledCmd3Input,
+    ScheduledCmd3InputSource, ScheduledCmd3Submission,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledNextNormSource, ScheduledSharedExpert, ScheduledSharedExpertSource,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -9857,6 +9857,16 @@ impl FlashMoeEngine {
                 };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
+            let cmd1_input = if deferred_attention_input.is_some() {
+                ScheduledCmd1InputSource::DeferredMetalNextNormed
+            } else {
+                ScheduledCmd1InputSource::CpuNormedHidden
+            };
+            let scheduled_cmd1 = self
+                .scheduled_graph
+                .build_cmd1_attention_projections(layer, cmd1_input)?;
+            debug_assert_eq!(scheduled_cmd1.layer, layer);
+            debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
             let mut post_attention_values_for_prep = None;
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

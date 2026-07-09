@@ -98,6 +98,26 @@ impl FlashMoeScheduledGraph {
         })
     }
 
+    pub fn build_cmd1_attention_projections(
+        &self,
+        layer: usize,
+        input: ScheduledCmd1InputSource,
+    ) -> Result<ScheduledCmd1AttentionProjections, FlashMoeUnsupportedCapability> {
+        let stage = *self.stage(FlashMoeGraphStage::Cmd1AttentionProjections);
+        if stage.placement != FlashMoeStagePlacement::Metal {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                "CMD1 attention projection stage must be implemented as a declared Metal command",
+            ));
+        }
+        Ok(ScheduledCmd1AttentionProjections {
+            stage,
+            layer,
+            input,
+        })
+    }
+
     pub fn build_cmd3_expert_phase(
         &self,
         layer: usize,
@@ -123,6 +143,19 @@ impl FlashMoeScheduledGraph {
             next_norm,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd1InputSource {
+    CpuNormedHidden,
+    DeferredMetalNextNormed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCmd1AttentionProjections {
+    pub stage: FlashMoeStageCapability,
+    pub layer: usize,
+    pub input: ScheduledCmd1InputSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,10 +904,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_graph_builds_explicit_cmd2_and_cmd3_descriptors() {
+    fn scheduled_graph_builds_explicit_cmd1_cmd2_and_cmd3_descriptors() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
 
+        let cmd1 = graph
+            .build_cmd1_attention_projections(14, ScheduledCmd1InputSource::DeferredMetalNextNormed)
+            .unwrap();
         let cmd2 = graph
             .build_cmd2_post_attention(
                 14,
@@ -893,6 +929,16 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(
+            cmd1.stage.stage,
+            FlashMoeGraphStage::Cmd1AttentionProjections
+        );
+        assert_eq!(cmd1.stage.placement, FlashMoeStagePlacement::Metal);
+        assert_eq!(cmd1.layer, 14);
+        assert_eq!(
+            cmd1.input,
+            ScheduledCmd1InputSource::DeferredMetalNextNormed
+        );
         assert_eq!(
             cmd2.stage.stage,
             FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
@@ -918,6 +964,30 @@ mod tests {
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
+    }
+
+    #[test]
+    fn scheduled_graph_rejects_non_metal_cmd1_builder() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let mut graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd1 = graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::Cmd1AttentionProjections)
+            .unwrap();
+        cmd1.placement = FlashMoeStagePlacement::CpuDeclared;
+
+        let err = graph
+            .build_cmd1_attention_projections(0, ScheduledCmd1InputSource::CpuNormedHidden)
+            .unwrap_err();
+
+        assert_eq!(err.family, graph.family());
+        assert_eq!(err.stage, FlashMoeGraphStage::Cmd1AttentionProjections);
+        assert!(
+            err.to_string()
+                .contains("CMD1 attention projection stage must be implemented"),
+            "{err:#}"
+        );
     }
 
     #[test]
