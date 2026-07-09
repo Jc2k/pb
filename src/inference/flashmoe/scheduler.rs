@@ -175,6 +175,79 @@ pub struct ScheduledCmd3ExpertPhase {
     pub next_norm: ScheduledNextNormSource,
 }
 
+pub trait ScheduledCmd3Input {
+    fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource;
+}
+
+pub trait ScheduledSharedExpert {
+    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd3Submission<'a, TExpert, TInput, TShared> {
+    pub cmd3: ScheduledCmd3ExpertPhase,
+    pub position: usize,
+    pub scheduled: &'a ScheduledExpertSet<TExpert>,
+    pub input: TInput,
+    pub shared: TShared,
+    pub next_norm_weight: Option<&'a [f32]>,
+}
+
+impl<'a, TExpert, TInput, TShared> ScheduledCmd3Submission<'a, TExpert, TInput, TShared>
+where
+    TInput: ScheduledCmd3Input,
+    TShared: ScheduledSharedExpert,
+{
+    pub fn new(
+        position: usize,
+        cmd3: ScheduledCmd3ExpertPhase,
+        scheduled: &'a ScheduledExpertSet<TExpert>,
+        input: TInput,
+        shared: TShared,
+        next_norm_weight: Option<&'a [f32]>,
+    ) -> Result<Self> {
+        if cmd3.layer != scheduled.layer || cmd3.expert_count != scheduled.len() {
+            bail!(
+                "FlashMoe scheduled CMD3 descriptor layer {} experts {} does not match scheduled expert set layer {} experts {}",
+                cmd3.layer,
+                cmd3.expert_count,
+                scheduled.layer,
+                scheduled.len()
+            );
+        }
+        if cmd3.input != input.scheduled_cmd3_input_source() {
+            bail!(
+                "FlashMoe scheduled CMD3 input {:?} does not match phase input {:?}",
+                cmd3.input,
+                input.scheduled_cmd3_input_source()
+            );
+        }
+        if cmd3.shared != shared.scheduled_shared_expert_source() {
+            bail!(
+                "FlashMoe scheduled CMD3 shared source {:?} does not match phase shared source {:?}",
+                cmd3.shared,
+                shared.scheduled_shared_expert_source()
+            );
+        }
+        if cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
+            && next_norm_weight.is_none()
+        {
+            bail!("FlashMoe scheduled CMD3 requires next-norm weights but none were provided");
+        }
+        if cmd3.next_norm == ScheduledNextNormSource::None && next_norm_weight.is_some() {
+            bail!("FlashMoe scheduled CMD3 received next-norm weights for a no-next-norm stage");
+        }
+        Ok(Self {
+            cmd3,
+            position,
+            scheduled,
+            input,
+            shared,
+            next_norm_weight,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExpertRoute {
     pub expert: usize,
@@ -731,6 +804,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct DummyCmd3Input(ScheduledCmd3InputSource);
+
+    impl ScheduledCmd3Input for DummyCmd3Input {
+        fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct DummySharedExpert(ScheduledSharedExpertSource);
+
+    impl ScheduledSharedExpert for DummySharedExpert {
+        fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
+            self.0
+        }
+    }
+
+    fn dummy_scheduled_experts(layer: usize, experts: usize) -> ScheduledExpertSet<usize> {
+        let routes = (0..experts)
+            .map(|expert| ExpertRoute {
+                expert,
+                score: expert as f32,
+            })
+            .collect::<Vec<_>>();
+        let scheduled_routes = ScheduledExpertRoutes::from_routes(layer, routes, 1.0).unwrap();
+        ScheduledExpertSet::from_parts(scheduled_routes, (0..experts).collect()).unwrap()
+    }
+
     #[test]
     fn scheduled_graph_preserves_the_declared_stage_order() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
@@ -816,6 +918,93 @@ mod tests {
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
+    }
+
+    #[test]
+    fn scheduled_cmd3_submission_validates_batch_and_sources() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap();
+
+        let submission = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(submission.position, 19);
+        assert_eq!(submission.cmd3.layer, 7);
+        assert_eq!(submission.scheduled.len(), 2);
+    }
+
+    #[test]
+    fn scheduled_cmd3_submission_rejects_mismatched_sources_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::MetalPostAttentionPrep,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledNextNormSource::CpuVisibleWeights,
+            )
+            .unwrap();
+
+        let input_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            DummySharedExpert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            Some(&[1.0]),
+        )
+        .unwrap_err();
+        assert!(input_err.to_string().contains("does not match phase input"));
+
+        let shared_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            DummyCmd3Input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            Some(&[1.0]),
+        )
+        .unwrap_err();
+        assert!(
+            shared_err
+                .to_string()
+                .contains("does not match phase shared source")
+        );
+
+        let next_norm_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            DummyCmd3Input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            DummySharedExpert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            next_norm_err
+                .to_string()
+                .contains("requires next-norm weights")
+        );
     }
 
     #[test]

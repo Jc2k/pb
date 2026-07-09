@@ -84,9 +84,10 @@ use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMo
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd2AttentionSource,
-    ScheduledCmd2ResidualSource, ScheduledCmd3ExpertPhase, ScheduledCmd3InputSource,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledSharedExpertSource,
+    ScheduledCmd2ResidualSource, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3Submission, ScheduledExpertSet as SchedulerScheduledExpertSet,
+    ScheduledExpertSlot, ScheduledNextNormSource, ScheduledSharedExpert,
+    ScheduledSharedExpertSource,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -1913,6 +1914,12 @@ impl<'a> SharedExpertPhaseRef<'a> {
     }
 }
 
+impl ScheduledSharedExpert for SharedExpertPhaseRef<'_> {
+    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
+        self.scheduled_source()
+    }
+}
+
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
     Cpu {
@@ -1923,15 +1930,18 @@ enum ExpertPhaseInput<'a> {
     MetalPostAttention(MetalPostAttentionPrep),
 }
 
-#[derive(Debug)]
-struct ScheduledExpertPhase<'a> {
-    cmd3: ScheduledCmd3ExpertPhase,
-    position: usize,
-    scheduled: &'a ScheduledExpertSet,
-    input: ExpertPhaseInput<'a>,
-    shared: SharedExpertPhaseRef<'a>,
-    next_norm_weight: Option<&'a [f32]>,
+impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
+    fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+        match self {
+            Self::Cpu { .. } => ScheduledCmd3InputSource::CpuNormedResidualUpload,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MetalPostAttention(_) => ScheduledCmd3InputSource::MetalPostAttentionPrep,
+        }
+    }
 }
+
+type ScheduledExpertPhase<'a> =
+    ScheduledCmd3Submission<'a, Arc<ExpertWeights>, ExpertPhaseInput<'a>, SharedExpertPhaseRef<'a>>;
 
 #[derive(Debug, Clone)]
 struct LinearAttentionStaticWeights {
@@ -2150,45 +2160,6 @@ impl MetalExecutor {
         &self,
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
-        if phase.cmd3.layer != phase.scheduled.layer
-            || phase.cmd3.expert_count != phase.scheduled.len()
-        {
-            bail!(
-                "FlashMoe scheduled CMD3 descriptor layer {} experts {} does not match scheduled expert set layer {} experts {}",
-                phase.cmd3.layer,
-                phase.cmd3.expert_count,
-                phase.scheduled.layer,
-                phase.scheduled.len()
-            );
-        }
-        if phase.cmd3.shared != phase.shared.scheduled_source() {
-            bail!(
-                "FlashMoe scheduled CMD3 shared source {:?} does not match phase shared source {:?}",
-                phase.cmd3.shared,
-                phase.shared.scheduled_source()
-            );
-        }
-        if phase.cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
-            && phase.next_norm_weight.is_none()
-        {
-            bail!("FlashMoe scheduled CMD3 requires next-norm weights but none were provided");
-        }
-        if phase.cmd3.next_norm == ScheduledNextNormSource::None && phase.next_norm_weight.is_some()
-        {
-            bail!("FlashMoe scheduled CMD3 received next-norm weights for a no-next-norm stage");
-        }
-        match (&phase.input, phase.cmd3.input) {
-            (ExpertPhaseInput::Cpu { .. }, ScheduledCmd3InputSource::CpuNormedResidualUpload) => {}
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            (
-                ExpertPhaseInput::MetalPostAttention(_),
-                ScheduledCmd3InputSource::MetalPostAttentionPrep,
-            ) => {}
-            _ => bail!(
-                "FlashMoe scheduled CMD3 input {:?} does not match phase input",
-                phase.cmd3.input
-            ),
-        }
         match phase.input {
             ExpertPhaseInput::Cpu { normed, residual } => self.submit_expert_phase(
                 phase.position,
@@ -10357,14 +10328,14 @@ impl FlashMoeEngine {
             if let Some(metal) = &self.metal
                 && let Some(prep) = metal_post_attention_prep.take()
             {
-                let phase = ScheduledExpertPhase {
-                    cmd3: scheduled_cmd3,
+                let phase = ScheduledExpertPhase::new(
                     position,
-                    scheduled: &scheduled_experts,
-                    input: ExpertPhaseInput::MetalPostAttention(prep),
-                    shared: shared_phase,
-                    next_norm_weight: next_norm_weight.as_deref(),
-                };
+                    scheduled_cmd3,
+                    &scheduled_experts,
+                    ExpertPhaseInput::MetalPostAttention(prep),
+                    shared_phase,
+                    next_norm_weight.as_deref(),
+                )?;
                 let Some(pending) = metal.submit_scheduled_expert_phase(phase)? else {
                     bail!("Flash-MoE Metal post-attention prep could not submit expert phase");
                 };
@@ -10382,17 +10353,17 @@ impl FlashMoeEngine {
                 && let Some(metal) = &self.metal
                 && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
                 && let Some(pending) =
-                    metal.submit_scheduled_expert_phase(ScheduledExpertPhase {
-                        cmd3: scheduled_cmd3,
+                    metal.submit_scheduled_expert_phase(ScheduledExpertPhase::new(
                         position,
-                        scheduled: &scheduled_experts,
-                        input: ExpertPhaseInput::Cpu {
+                        scheduled_cmd3,
+                        &scheduled_experts,
+                        ExpertPhaseInput::Cpu {
                             normed: &normed,
                             residual: mlp_residual,
                         },
-                        shared: shared_phase,
-                        next_norm_weight: next_norm_weight.as_deref(),
-                    })?
+                        shared_phase,
+                        next_norm_weight.as_deref(),
+                    )?)?
             {
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
