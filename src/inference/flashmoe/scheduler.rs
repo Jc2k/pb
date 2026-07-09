@@ -2095,6 +2095,7 @@ impl ScheduledExpertRoutes {
         Self::from_scores(command.layer, &command.routes, routed_expert_scale)
     }
 
+    #[cfg(test)]
     pub(crate) fn expert_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.routes.iter().map(|route| route.expert)
     }
@@ -2212,6 +2213,34 @@ impl<T> PendingScheduledExpertSet<T> {
 
     pub(crate) fn into_parts(self) -> (ScheduledExpertRoutes, Vec<PendingScheduledRead<T>>) {
         (self.routes, self.reads)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledExpertReadSet {
+    routes: ScheduledExpertRoutes,
+    issues: Vec<ScheduledExpertReadIssue>,
+}
+
+impl ScheduledExpertReadSet {
+    pub(crate) fn layer(&self) -> usize {
+        self.routes.layer
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.issues.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    pub(crate) fn issues(&self) -> &[ScheduledExpertReadIssue] {
+        &self.issues
+    }
+
+    pub(crate) fn into_routes(self) -> ScheduledExpertRoutes {
+        self.routes
     }
 }
 
@@ -2451,6 +2480,19 @@ impl ActiveExpertReadScheduler {
         command: &ScheduledRoutingCommand,
     ) -> Result<ScheduledExpertRoutes> {
         ScheduledExpertRoutes::from_routing_command(command, self.routed_expert_scale)
+    }
+
+    pub(crate) fn issue_routed_reads(
+        &mut self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<ScheduledExpertReadSet> {
+        let routes = self.scheduled_routes_from_command(command)?;
+        let issues = routes
+            .routes
+            .iter()
+            .map(|route| self.issue_read(routes.layer, route.expert))
+            .collect();
+        Ok(ScheduledExpertReadSet { routes, issues })
     }
 
     pub(crate) fn finish_routes<T>(
@@ -5165,6 +5207,43 @@ mod tests {
         for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn active_expert_scheduler_issues_routed_read_set_from_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(12, 10, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let command = routing.command_from_routes(vec![(7, 1.0), (3, 2.0)]);
+        let mut scheduler = ActiveExpertReadScheduler::new(0.25);
+
+        let issued = scheduler.issue_routed_reads(&command).unwrap();
+        assert_eq!(issued.layer(), 12);
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued.issues()[0].id, 0);
+        assert_eq!(issued.issues()[0].key.expert, 7);
+        assert_eq!(issued.issues()[1].id, 1);
+        assert_eq!(issued.issues()[1].key.expert, 3);
+        assert!(!issued.issues()[0].warm);
+        assert!(!issued.issues()[1].warm);
+        let routes = issued.into_routes();
+        let mut expected = vec![1.0, 2.0];
+        softmax_in_place(&mut expected);
+        for weight in &mut expected {
+            *weight *= 0.25;
+        }
+        for (actual, expected) in routes.weights.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+
+        let repeated = scheduler.issue_routed_reads(&command).unwrap();
+        assert_eq!(repeated.issues()[0].id, 2);
+        assert_eq!(repeated.issues()[1].id, 3);
+        assert!(repeated.issues()[0].warm);
+        assert!(repeated.issues()[1].warm);
+        assert_eq!(scheduler.snapshot().issued_reads, 4);
     }
 
     #[test]

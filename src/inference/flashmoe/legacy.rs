@@ -92,7 +92,7 @@ use super::scheduler::{
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
     ScheduledCmd3InputSource, ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload, ScheduledExpertReadSet,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
@@ -18158,10 +18158,37 @@ impl ExpertScheduler {
         &mut self,
         command: &ScheduledRoutingCommand,
     ) -> Result<PendingExpertSet> {
-        let routes = self.core.scheduled_routes_from_command(command)?;
-        let experts: Vec<usize> = routes.expert_ids().collect();
-        let reads = self.issue(routes.layer, &experts)?;
+        let issued = self.core.issue_routed_reads(command)?;
+        let reads = self.submit_issued_reads(&issued)?;
+        let routes = issued.into_routes();
         Ok(PendingExpertSet::new(routes, reads))
+    }
+
+    fn submit_issued_reads(
+        &mut self,
+        issued: &ScheduledExpertReadSet,
+    ) -> Result<Vec<PendingExpertRead>> {
+        if issued.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pool.ensure_workers(issued.len().max(1));
+        let reader = self.store.layer_reader(issued.layer())?;
+        let mut pending = Vec::with_capacity(issued.len());
+        for issue in issued.issues() {
+            let plan = reader.prepare_read(issue.key.expert)?;
+            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
+            // maintaining a second in-process cache of hot expert packs.
+            let rx = self.pool.submit_read(
+                issue.id,
+                issue.key.expert,
+                Arc::clone(&reader),
+                plan,
+                issue.warm,
+                issue.issued_at,
+            )?;
+            pending.push(PendingExpertRead::new(issue.id, rx));
+        }
+        Ok(pending)
     }
 
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
