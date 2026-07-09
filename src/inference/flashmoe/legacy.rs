@@ -71,6 +71,7 @@ use super::scheduler::{
     ScheduledExpertBatch, ScheduledExpertRoutes,
 };
 use super::types::*;
+use super::weights::{DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection};
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
 type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
@@ -2090,37 +2091,6 @@ struct MetalPostAttentionPrep {
     normed_buffer: ObjcId,
     width: usize,
     active: Vec<(usize, f32)>,
-}
-
-#[derive(Debug, Clone)]
-struct DenseMmapMatvecProjection {
-    tensor_name: String,
-    byte_offset: u64,
-    dtype: String,
-    rows: usize,
-    cols: usize,
-    output_width: usize,
-}
-
-impl DenseMmapMatvecProjection {
-    fn stride(&self) -> usize {
-        self.cols
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DenseQ4MmapMatvecProjection {
-    tensor_name: String,
-    packed_byte_offset: u64,
-    scales_byte_offset: u64,
-    biases_byte_offset: u64,
-    rows: usize,
-    cols: usize,
-    output_width: usize,
-    row_packed_bytes: usize,
-    groups_per_row: usize,
-    group_size: usize,
-    scale_bias_dtype: String,
 }
 
 impl MetalExecutor {

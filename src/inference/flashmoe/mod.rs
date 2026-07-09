@@ -11,6 +11,7 @@ mod math;
 mod model_family;
 mod scheduler;
 mod types;
+mod weights;
 
 pub use capabilities::*;
 pub use experts::*;
