@@ -10680,7 +10680,11 @@ impl FlashMoeEngine {
             let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
                 .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
             let next_norm_weight = if let Some(name) = next_norm_name.as_deref() {
-                self.model_norm_weight(name, runtime.width)?
+                Some(self.model_norm_weight(name, runtime.width)?.with_context(|| {
+                    format!(
+                        "FlashMoe unsupported scheduled CMD3 path: missing next-layer norm weight {name} for layer {layer}"
+                    )
+                })?)
             } else {
                 None
             };
