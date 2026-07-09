@@ -84,6 +84,134 @@ impl FixedQ4ExpertSlotSpec {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FixedQ4ExpertPayload {
+    pub(crate) spec: FixedQ4ExpertSlotSpec,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) decoded: Option<FixedQ4ExpertPayloadDecoded>,
+    pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
+}
+
+impl Clone for FixedQ4ExpertPayload {
+    fn clone(&self) -> Self {
+        Self {
+            spec: self.spec,
+            bytes: self.bytes.clone(),
+            decoded: self.decoded.clone(),
+            recycle_pool: None,
+        }
+    }
+}
+
+impl PartialEq for FixedQ4ExpertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && self.bytes == other.bytes && self.decoded == other.decoded
+    }
+}
+
+impl Drop for FixedQ4ExpertPayload {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.recycle_pool {
+            recycle_reusable_expert_bytes(
+                pool,
+                std::mem::take(&mut self.bytes),
+                self.spec.layout.expert_bytes,
+            );
+        }
+    }
+}
+
+impl FixedQ4ExpertPayload {
+    #[cfg(test)]
+    pub(crate) fn payload_prefix(&self, max_len: usize) -> &[u8] {
+        &self.bytes[..self.bytes.len().min(max_len)]
+    }
+
+    pub(crate) fn component(&self, kind: QwenMoeExpertComponentKind) -> &[u8] {
+        let component = self.spec.layout.component(kind);
+        &self.bytes[component.offset..component.offset + component.bytes]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FixedQ4ExpertPayloadDecoded {
+    pub(crate) gate_scales: Vec<f32>,
+    pub(crate) gate_biases: Vec<f32>,
+    pub(crate) up_scales: Vec<f32>,
+    pub(crate) up_biases: Vec<f32>,
+    pub(crate) down_scales: Vec<f32>,
+    pub(crate) down_biases: Vec<f32>,
+}
+
+impl FixedQ4ExpertPayloadDecoded {
+    #[cfg(test)]
+    pub(crate) fn from_slot(
+        view: &FixedQ4ExpertSlotView<'_>,
+        spec: FixedQ4ExpertSlotSpec,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_scales: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::GateScale,
+            )?,
+            gate_biases: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::GateBias,
+            )?,
+            up_scales: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpScale)?,
+            up_biases: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpBias)?,
+            down_scales: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::DownScale,
+            )?,
+            down_biases: decode_fixed_q4_bf16_component(
+                view,
+                QwenMoeExpertComponentKind::DownBias,
+            )?,
+        })
+        .and_then(|decoded| {
+            let groups_per_gate_row = spec.hidden_size.div_ceil(spec.layout.group_size);
+            let groups_per_down_row = spec.intermediate_size.div_ceil(spec.layout.group_size);
+            let gate_groups = spec.intermediate_size * groups_per_gate_row;
+            let down_groups = spec.hidden_size * groups_per_down_row;
+            if decoded.gate_scales.len() < gate_groups
+                || decoded.gate_biases.len() < gate_groups
+                || decoded.up_scales.len() < gate_groups
+                || decoded.up_biases.len() < gate_groups
+                || decoded.down_scales.len() < down_groups
+                || decoded.down_biases.len() < down_groups
+            {
+                bail!("fixed Q4 expert scale/bias payload is shorter than model layout requires");
+            }
+            Ok(decoded)
+        })
+    }
+}
+
+#[cfg(test)]
+fn decode_fixed_q4_bf16_component(
+    view: &FixedQ4ExpertSlotView<'_>,
+    kind: QwenMoeExpertComponentKind,
+) -> Result<Vec<f32>> {
+    decode_fixed_q4_bf16_component_bytes(view.component(kind))
+}
+
+pub(crate) fn decode_fixed_q4_bf16_component_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        bail!(
+            "fixed Q4 bf16 component has odd byte length {}",
+            bytes.len()
+        );
+    }
+    Ok(chunks
+        .map(|chunk| {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            f32::from_bits(u32::from(bits) << 16)
+        })
+        .collect())
+}
+
 pub fn take_reusable_expert_bytes(
     pool: &ReusableExpertBytePool,
     min_capacity: usize,
