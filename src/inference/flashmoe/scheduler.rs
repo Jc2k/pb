@@ -179,50 +179,65 @@ pub struct ScheduledCmd2PostAttention {
     pub residual: ScheduledCmd2ResidualSource,
 }
 
-pub trait ScheduledCmd2AttentionInput {
+pub trait ScheduledCmd2Inputs {
     fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource;
-}
-
-pub trait ScheduledCmd2ResidualInput {
     fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource;
 }
 
-#[derive(Debug)]
-pub struct ScheduledCmd2Submission<TAttention, TResidual> {
-    pub cmd2: ScheduledCmd2PostAttention,
-    pub attention: TAttention,
-    pub residual: TResidual,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCmd2PhaseInputs {
+    attention: ScheduledCmd2AttentionSource,
+    residual: ScheduledCmd2ResidualSource,
 }
 
-impl<TAttention, TResidual> ScheduledCmd2Submission<TAttention, TResidual>
+impl ScheduledCmd2PhaseInputs {
+    pub const fn new(
+        attention: ScheduledCmd2AttentionSource,
+        residual: ScheduledCmd2ResidualSource,
+    ) -> Self {
+        Self {
+            attention,
+            residual,
+        }
+    }
+}
+
+impl ScheduledCmd2Inputs for ScheduledCmd2PhaseInputs {
+    fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource {
+        self.attention
+    }
+
+    fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource {
+        self.residual
+    }
+}
+
+#[derive(Debug)]
+pub struct ScheduledCmd2Submission<TInputs> {
+    pub cmd2: ScheduledCmd2PostAttention,
+    pub inputs: TInputs,
+}
+
+impl<TInputs> ScheduledCmd2Submission<TInputs>
 where
-    TAttention: ScheduledCmd2AttentionInput,
-    TResidual: ScheduledCmd2ResidualInput,
+    TInputs: ScheduledCmd2Inputs,
 {
-    pub fn new(
-        cmd2: ScheduledCmd2PostAttention,
-        attention: TAttention,
-        residual: TResidual,
-    ) -> Result<Self> {
-        if cmd2.attention != attention.scheduled_cmd2_attention_source() {
+    pub fn new(cmd2: ScheduledCmd2PostAttention, inputs: TInputs) -> Result<Self> {
+        if cmd2.attention != inputs.scheduled_cmd2_attention_source() {
             bail!(
                 "FlashMoe scheduled CMD2 attention source {:?} does not match submitted source {:?}",
                 cmd2.attention,
-                attention.scheduled_cmd2_attention_source()
+                inputs.scheduled_cmd2_attention_source()
             );
         }
-        if cmd2.residual != residual.scheduled_cmd2_residual_source() {
+        if cmd2.residual != inputs.scheduled_cmd2_residual_source() {
             bail!(
                 "FlashMoe scheduled CMD2 residual source {:?} does not match submitted source {:?}",
                 cmd2.residual,
-                residual.scheduled_cmd2_residual_source()
+                inputs.scheduled_cmd2_residual_source()
             );
         }
-        Ok(Self {
-            cmd2,
-            attention,
-            residual,
-        })
+        Ok(Self { cmd2, inputs })
     }
 }
 
@@ -1039,24 +1054,6 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy)]
-    struct DummyCmd2Attention(ScheduledCmd2AttentionSource);
-
-    impl ScheduledCmd2AttentionInput for DummyCmd2Attention {
-        fn scheduled_cmd2_attention_source(&self) -> ScheduledCmd2AttentionSource {
-            self.0
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct DummyCmd2Residual(ScheduledCmd2ResidualSource);
-
-    impl ScheduledCmd2ResidualInput for DummyCmd2Residual {
-        fn scheduled_cmd2_residual_source(&self) -> ScheduledCmd2ResidualSource {
-            self.0
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
     struct DummyCmd3Input(ScheduledCmd3InputSource);
 
     impl ScheduledCmd3Input for DummyCmd3Input {
@@ -1315,8 +1312,10 @@ mod tests {
 
         let submission = ScheduledCmd2Submission::new(
             cmd2,
-            DummyCmd2Attention(ScheduledCmd2AttentionSource::MetalAttentionValues),
-            DummyCmd2Residual(ScheduledCmd2ResidualSource::MetalBuffer),
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            ),
         )
         .unwrap();
 
@@ -1339,8 +1338,10 @@ mod tests {
 
         let attention_err = ScheduledCmd2Submission::new(
             cmd2,
-            DummyCmd2Attention(ScheduledCmd2AttentionSource::CpuAttentionValues),
-            DummyCmd2Residual(ScheduledCmd2ResidualSource::MetalBuffer),
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::CpuAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            ),
         )
         .unwrap_err();
         assert!(
@@ -1351,8 +1352,10 @@ mod tests {
 
         let residual_err = ScheduledCmd2Submission::new(
             cmd2,
-            DummyCmd2Attention(ScheduledCmd2AttentionSource::MetalAttentionValues),
-            DummyCmd2Residual(ScheduledCmd2ResidualSource::CpuHidden),
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::CpuHidden,
+            ),
         )
         .unwrap_err();
         assert!(
