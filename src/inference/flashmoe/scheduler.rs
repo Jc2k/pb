@@ -880,7 +880,30 @@ pub enum ScheduledNextNormSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledSharedExpertShape {
     pub width: usize,
+    pub shared_experts: usize,
+    pub intermediate: usize,
     pub total_intermediate: usize,
+}
+
+impl ScheduledSharedExpertShape {
+    pub fn new(width: usize, shared_experts: usize, intermediate: usize) -> Result<Self> {
+        let total_intermediate = shared_experts
+            .checked_mul(intermediate)
+            .ok_or_else(|| anyhow::anyhow!("shared expert intermediate width overflow"))?;
+        Ok(Self {
+            width,
+            shared_experts,
+            intermediate,
+            total_intermediate,
+        })
+    }
+
+    pub fn is_declared_graph_shape(self) -> bool {
+        self.width > 0
+            && self.shared_experts > 0
+            && self.intermediate > 0
+            && self.total_intermediate == self.shared_experts.saturating_mul(self.intermediate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,10 +1115,11 @@ impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
                         shared.router.len()
                     );
                 }
-                ScheduledSharedExpertShape {
-                    width: shared.width,
-                    total_intermediate: total,
-                }
+                ScheduledSharedExpertShape::new(
+                    shared.width,
+                    shared.shared_experts,
+                    shared.intermediate,
+                )?
             }
             Self::Q4(shared) => {
                 let total = shared
@@ -1128,10 +1152,11 @@ impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
                         shared.router.cols
                     );
                 }
-                ScheduledSharedExpertShape {
-                    width: shared.width,
-                    total_intermediate: total,
-                }
+                ScheduledSharedExpertShape::new(
+                    shared.width,
+                    shared.shared_experts,
+                    shared.intermediate,
+                )?
             }
         };
         Ok(Some(shape))
@@ -1249,15 +1274,21 @@ where
             bail!("FlashMoe scheduled CMD3 input width must be non-zero");
         }
         if let Some(shape) = shared.scheduled_shared_expert_shape()? {
+            if !shape.is_declared_graph_shape() {
+                bail!(
+                    "FlashMoe scheduled CMD3 shared expert shape is not declared graph shape: width={} shared_experts={} intermediate={} total_intermediate={}",
+                    shape.width,
+                    shape.shared_experts,
+                    shape.intermediate,
+                    shape.total_intermediate
+                );
+            }
             if shape.width != input_width {
                 bail!(
                     "FlashMoe scheduled CMD3 shared expert width {} does not match input width {}",
                     shape.width,
                     input_width
                 );
-            }
-            if shape.total_intermediate == 0 {
-                bail!("FlashMoe scheduled CMD3 shared expert intermediate width must be non-zero");
             }
         }
         if cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
@@ -2178,10 +2209,7 @@ mod tests {
             ScheduledSharedExpertSource::None => None,
             ScheduledSharedExpertSource::DenseCpuWeights
             | ScheduledSharedExpertSource::ResidentQ4Projections => {
-                Some(ScheduledSharedExpertShape {
-                    width: 8,
-                    total_intermediate: 4,
-                })
+                Some(ScheduledSharedExpertShape::new(8, 2, 2).unwrap())
             }
         };
         DummySharedExpert { source, shape }
@@ -2284,10 +2312,7 @@ mod tests {
         assert!(dense_ref.q4().is_none());
         assert_eq!(
             dense_ref.scheduled_shared_expert_shape().unwrap(),
-            Some(ScheduledSharedExpertShape {
-                width: 1,
-                total_intermediate: 2
-            })
+            Some(ScheduledSharedExpertShape::new(1, 1, 2).unwrap())
         );
 
         let q4_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), Some(&q4));
@@ -2299,10 +2324,7 @@ mod tests {
         assert!(q4_ref.q4().is_some());
         assert_eq!(
             q4_ref.scheduled_shared_expert_shape().unwrap(),
-            Some(ScheduledSharedExpertShape {
-                width: 32,
-                total_intermediate: 16
-            })
+            Some(ScheduledSharedExpertShape::new(32, 1, 16).unwrap())
         );
     }
 
@@ -3392,10 +3414,7 @@ mod tests {
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert_with_shape(
                 ScheduledSharedExpertSource::ResidentQ4Projections,
-                Some(ScheduledSharedExpertShape {
-                    width: 4,
-                    total_intermediate: 4,
-                }),
+                Some(ScheduledSharedExpertShape::new(4, 2, 2).unwrap()),
             ),
             Some(&[1.0; 8]),
         )
@@ -3404,6 +3423,29 @@ mod tests {
             shared_width_err
                 .to_string()
                 .contains("does not match input width")
+        );
+
+        let shared_shape_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert_with_shape(
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                Some(ScheduledSharedExpertShape {
+                    width: 8,
+                    shared_experts: 2,
+                    intermediate: 2,
+                    total_intermediate: 5,
+                }),
+            ),
+            Some(&[1.0; 8]),
+        )
+        .unwrap_err();
+        assert!(
+            shared_shape_err
+                .to_string()
+                .contains("not declared graph shape")
         );
 
         let next_norm_width_err = ScheduledCmd3Submission::new(
