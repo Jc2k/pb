@@ -3491,24 +3491,7 @@ impl MetalExecutorInner {
         if hidden.is_empty() || width == 0 {
             return Ok(vec![0.0; width]);
         }
-        expert.mlp_with_projector(hidden, width, |tensor, input, output_width| {
-            let Some(payload) = tensor.matvec_payload(
-                input,
-                output_width.max(tensor.shape.first().copied().unwrap_or(output_width)),
-            ) else {
-                return Ok(None);
-            };
-            let output = self.dispatch_q4_matvec(
-                &payload.packed,
-                &input[..payload.cols],
-                &payload.scales,
-                &payload.biases,
-                payload.rows,
-                payload.cols,
-                payload.group_size,
-            )?;
-            Ok(Some(output))
-        })
+        expert.project(hidden, width)
     }
 
     fn reset_linear_attention_state(&self) {
@@ -5034,9 +5017,16 @@ impl MetalExecutorInner {
         }
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts.iter() {
-            let Some(payload) = expert_phase_mlp_payload(expert, width) else {
-                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                return Ok(None);
+            let payload = match expert_phase_mlp_payload(expert, width) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Err(error);
+                }
             };
             payloads.push(payload);
         }
@@ -18940,77 +18930,27 @@ impl ExpertWeights {
     }
 
     fn project(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
-        if let Some(fixed_q4) = &self.fixed_q4
-            && fixed_q4
-                .matvec_payload(FixedQ4ExpertProjection::Down, hidden.len(), width)
-                .is_some()
-        {
-            return fixed_q4.project_cpu(FixedQ4ExpertProjection::Down, hidden, width);
-        }
-        if !self.records.is_empty() {
-            let mut out = vec![0.0f32; width];
-            let mut used = 0usize;
-            for tensor in &self.records {
-                let Some(payload) = tensor.matvec_payload(hidden, width) else {
-                    continue;
-                };
-                let projected = q4_fma_matvec_with_group_size(
-                    payload.packed,
-                    &hidden[..payload.cols],
-                    payload.scales,
-                    payload.biases,
-                    payload.rows,
-                    payload.cols,
-                    payload.group_size,
+        let fixed_q4 = self.fixed_q4_required()?;
+        fixed_q4
+            .project_cpu(FixedQ4ExpertProjection::Down, hidden, width)
+            .with_context(|| {
+                format!(
+                    "fixed Q4 expert layer {} expert {} has no compatible down projection",
+                    self.layer, self.expert
                 )
-                .with_context(|| {
-                    format!(
-                        "failed to run q4 matvec for expert tensor {} (layer {}, expert {})",
-                        tensor.name, self.layer, self.expert
-                    )
-                })?;
-                add_in_place(&mut out, &fold_rows_to_width(&projected, width));
-                used += 1;
-            }
-            if used > 0 {
-                let scale = 1.0 / (used as f32).sqrt();
-                for value in &mut out {
-                    *value *= scale;
-                }
-                return Ok(out);
-            }
-            if !cfg!(test) {
-                bail!(
-                    "expert layer {} expert {} has no q4 tensor compatible with hidden width {}",
-                    self.layer,
-                    self.expert,
-                    hidden.len()
-                );
-            }
-        }
-        let hash = self.mix_hash();
-        let mut out = vec![0.0f32; width];
-        for (row, slot) in out.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            for (col, value) in hidden.iter().enumerate() {
-                let idx = (row.wrapping_mul(31).wrapping_add(col)) % self.packed.len().max(1);
-                let byte = self.packed.get(idx).copied().unwrap_or(0);
-                let nibble = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
-                let centered = (nibble / 7.5) - 1.0;
-                acc = value.mul_add(centered, acc);
-            }
-            *slot = acc / (hidden.len().max(1) as f32).sqrt()
-                + ((hash.rotate_left((row % 63) as u32) & 0xff) as f32 / 255.0) * 0.01;
-        }
-        Ok(out)
+            })
     }
 
     fn mlp(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
-        if let Some(fixed_q4) = &self.fixed_q4 {
-            return self.fixed_q4_mlp(fixed_q4, hidden, width);
-        }
-        self.mlp_with_projector(hidden, width, |tensor, input, output_width| {
-            self.project_record(tensor, input, output_width)
+        self.fixed_q4_mlp(self.fixed_q4_required()?, hidden, width)
+    }
+
+    fn fixed_q4_required(&self) -> Result<&FixedQ4ExpertPayload> {
+        self.fixed_q4.as_ref().with_context(|| {
+            format!(
+                "FlashMoe unsupported active expert execution for layer {} expert {}: scheduler-owned fixed-Q4 whole-expert slot is required; PBQ4/component records are import compatibility only",
+                self.layer, self.expert
+            )
         })
     }
 
@@ -19057,53 +18997,6 @@ impl ExpertWeights {
                     self.layer, self.expert
                 )
             })
-    }
-
-    fn mlp_with_projector<F>(
-        &self,
-        hidden: &[f32],
-        width: usize,
-        mut project: F,
-    ) -> Result<Vec<f32>>
-    where
-        F: FnMut(&PackedExpertTensor, &[f32], usize) -> Result<Option<Vec<f32>>>,
-    {
-        let gate_tensor = self.record_suffix("gate_proj.weight");
-        let up_tensor = self.record_suffix("up_proj.weight");
-        let down_tensor = self.record_suffix("down_proj.weight");
-        let gate = if let Some(tensor) = gate_tensor {
-            project(
-                tensor,
-                hidden,
-                width.max(tensor.shape.first().copied().unwrap_or(width)),
-            )?
-        } else {
-            None
-        };
-        let up = if let Some(tensor) = up_tensor {
-            project(
-                tensor,
-                hidden,
-                width.max(tensor.shape.first().copied().unwrap_or(width)),
-            )?
-        } else {
-            None
-        };
-        let Some((gate, up)) = gate.zip(up) else {
-            return self.project(hidden, width);
-        };
-        let intermediate: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(gate, up)| silu(*gate) * up)
-            .collect();
-        if let Some(down_tensor) = down_tensor
-            && let Some(down) = project(down_tensor, &intermediate, width)?
-        {
-            Ok(down)
-        } else {
-            Ok(fold_rows_to_width(&intermediate, width))
-        }
     }
 
     fn record_suffix(&self, suffix: &str) -> Option<&PackedExpertTensor> {
@@ -19166,10 +19059,7 @@ impl ExpertWeights {
             .filter_map(|projection| fixed_q4.matvec_payload(projection, hidden.len(), width))
             .max_by_key(|payload| payload.rows.saturating_mul(payload.cols));
         }
-        self.records
-            .iter()
-            .filter_map(|record| record.matvec_payload(hidden, width))
-            .max_by_key(|payload| payload.rows.saturating_mul(payload.cols))
+        None
     }
 }
 
@@ -19297,67 +19187,36 @@ struct Q4ExpertPhaseMlpPayload<'a> {
 fn expert_phase_mlp_payload<'a>(
     expert: &'a ExpertWeights,
     width: usize,
-) -> Option<ExpertPhaseMlpPayload<'a>> {
-    if let Some(fixed_q4) = &expert.fixed_q4 {
-        let gate = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Gate,
-            width,
-            fixed_q4.spec.intermediate_size,
-        )?;
-        let up = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Up,
-            width,
-            fixed_q4.spec.intermediate_size,
-        )?;
-        if gate.rows != up.rows {
-            return None;
-        }
-        let down = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)?;
-        if down.cols != gate.rows {
-            return None;
-        }
-        return Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
-            gate,
-            up,
-            down,
-        }));
-    }
-    let gate_tensor = expert.record_suffix("gate_proj.weight")?;
-    let up_tensor = expert.record_suffix("up_proj.weight")?;
-    let down_tensor = expert.record_suffix("down_proj.weight")?;
-    let intermediate = gate_tensor
-        .shape
-        .first()
-        .copied()
-        .or_else(|| up_tensor.shape.first().copied())
-        .unwrap_or(width);
-    let fake_hidden = vec![0.0f32; width];
-    let gate = gate_tensor.matvec_payload(&fake_hidden, intermediate)?;
-    let up = up_tensor.matvec_payload(&fake_hidden, intermediate)?;
+) -> Result<Option<ExpertPhaseMlpPayload<'a>>> {
+    let fixed_q4 = expert.fixed_q4_required()?;
+    let gate = fixed_q4.matvec_payload(
+        FixedQ4ExpertProjection::Gate,
+        width,
+        fixed_q4.spec.intermediate_size,
+    );
+    let up = fixed_q4.matvec_payload(
+        FixedQ4ExpertProjection::Up,
+        width,
+        fixed_q4.spec.intermediate_size,
+    );
+    let Some((gate, up)) = gate.zip(up) else {
+        return Ok(None);
+    };
     if gate.rows != up.rows {
-        return None;
+        return Ok(None);
     }
-    let fake_intermediate = vec![0.0f32; gate.rows];
-    let down = down_tensor.matvec_payload(&fake_intermediate, width)?;
+    let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
+    else {
+        return Ok(None);
+    };
     if down.cols != gate.rows {
-        return None;
+        return Ok(None);
     }
-    Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
+    Ok(Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
         gate,
         up,
         down,
-    }))
-}
-
-fn fold_rows_to_width(rows: &[f32], width: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; width];
-    if width == 0 {
-        return out;
-    }
-    for (idx, value) in rows.iter().enumerate() {
-        out[idx % width] += *value;
-    }
-    out
+    })))
 }
 
 fn silu(value: f32) -> f32 {
@@ -26844,6 +26703,46 @@ mod tests {
         .unwrap()
     }
 
+    fn fixed_q4_test_layout(
+        hidden_size: usize,
+        intermediate_size: usize,
+        group_size: usize,
+    ) -> QwenMoeQ4ExpertLayout {
+        use crate::inference::flashmoe::QwenMoeExpertComponentLayout;
+        use QwenMoeExpertComponentKind::*;
+
+        let packed_gate_up = intermediate_size * hidden_size.div_ceil(2);
+        let gate_up_scale_bias = intermediate_size * hidden_size.div_ceil(group_size) * 2;
+        let packed_down = hidden_size * intermediate_size.div_ceil(2);
+        let down_scale_bias = hidden_size * intermediate_size.div_ceil(group_size) * 2;
+        let mut offset = 0usize;
+        let mut component = |kind, bytes| {
+            let layout = QwenMoeExpertComponentLayout {
+                kind,
+                offset,
+                bytes,
+            };
+            offset += bytes;
+            layout
+        };
+        let components = [
+            component(GateWeight, packed_gate_up),
+            component(GateScale, gate_up_scale_bias),
+            component(GateBias, gate_up_scale_bias),
+            component(UpWeight, packed_gate_up),
+            component(UpScale, gate_up_scale_bias),
+            component(UpBias, gate_up_scale_bias),
+            component(DownWeight, packed_down),
+            component(DownScale, down_scale_bias),
+            component(DownBias, down_scale_bias),
+        ];
+        QwenMoeQ4ExpertLayout {
+            expert_bytes: offset,
+            group_size,
+            components,
+        }
+    }
+
     #[test]
     fn flashmoe_parity_tokenizer_chat_template_and_routing_goldens() {
         let tokenizer = QwenTokenizer::from_json_bytes_with_config(
@@ -26885,7 +26784,7 @@ mod tests {
         assert_eq!(records[1].packed, vec![0x00, 0x00]);
         assert_eq!(records[1].biases, vec![15.0, 15.0]);
 
-        let expert = ExpertWeights {
+        let parsed_expert = ExpertWeights {
             layer: 0,
             expert: 1,
             slot: ExpertSlotDescriptor {
@@ -26899,26 +26798,64 @@ mod tests {
             records,
             fixed_q4: None,
         };
-        assert_eq!(expert.slot.layer, expert.layer);
-        assert_eq!(expert.slot.expert, expert.expert);
+        assert_eq!(parsed_expert.slot.layer, parsed_expert.layer);
+        assert_eq!(parsed_expert.slot.expert, parsed_expert.expert);
         let hidden = [1.0, 2.0];
-        let gate = expert
+        let gate = parsed_expert
             .project_record(
-                expert.record_suffix("gate_proj.weight").unwrap(),
+                parsed_expert.record_suffix("gate_proj.weight").unwrap(),
                 &hidden,
                 2,
             )
             .unwrap()
             .unwrap();
-        let up = expert
-            .project_record(expert.record_suffix("up_proj.weight").unwrap(), &hidden, 2)
+        let up = parsed_expert
+            .project_record(
+                parsed_expert.record_suffix("up_proj.weight").unwrap(),
+                &hidden,
+                2,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(gate, vec![30.0, 15.0]);
         assert_eq!(up, vec![45.0, 45.0]);
 
+        let err = parsed_expert.mlp(&hidden, 2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PBQ4/component records are import compatibility only"),
+            "{err:#}"
+        );
+
+        let spec = FixedQ4ExpertSlotSpec {
+            layout: fixed_q4_test_layout(2, 2, GROUP_SIZE),
+            hidden_size: 2,
+            intermediate_size: 2,
+        };
+        let fixed_q4 = fixed_q4_payload_from_pbq4_records(
+            parsed_expert.layer,
+            parsed_expert.expert,
+            spec,
+            &parsed_expert.records,
+            None,
+        )
+        .unwrap();
+        let fixed_expert = ExpertWeights {
+            layer: parsed_expert.layer,
+            expert: parsed_expert.expert,
+            slot: ExpertSlotDescriptor {
+                layer: parsed_expert.layer,
+                expert: parsed_expert.expert,
+                slot_offset: 0,
+                slot_capacity: spec.layout.expert_bytes,
+                payload_len: spec.layout.expert_bytes,
+            },
+            packed: Vec::new(),
+            records: Vec::new(),
+            fixed_q4: Some(fixed_q4),
+        };
         let intermediate = [silu(gate[0]) * up[0], silu(gate[1]) * up[1]];
-        let out = expert.mlp(&hidden, 2).unwrap();
+        let out = fixed_expert.mlp(&hidden, 2).unwrap();
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
     }
@@ -27215,14 +27152,15 @@ mod tests {
             fixed_q4: Some(fixed),
         };
         let hidden: Vec<f32> = (0..64).map(|value| value as f32 / 8.0 - 4.0).collect();
-        let parsed = parsed_expert.mlp(&hidden, 64).unwrap();
+        let err = parsed_expert.mlp(&hidden, 64).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PBQ4/component records are import compatibility only"),
+            "{err:#}"
+        );
         let fixed = fixed_expert.mlp(&hidden, 64).unwrap();
-        for (left, right) in parsed.iter().zip(fixed.iter()) {
-            assert!(
-                (*left - *right).abs() <= 1e-4,
-                "parsed PBQ4 MLP {left} did not match fixed Q4 MLP {right}"
-            );
-        }
+        assert_eq!(fixed.len(), 64);
+        assert!(fixed.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -27473,7 +27411,7 @@ mod tests {
             }),
         };
 
-        let phase = expert_phase_mlp_payload(&expert, 2).unwrap();
+        let phase = expert_phase_mlp_payload(&expert, 2).unwrap().unwrap();
         let phase = phase.q4();
         let fixed = expert.fixed_q4.as_ref().unwrap();
         let base = fixed.bytes.as_ptr() as usize;
@@ -34409,7 +34347,7 @@ mod tests {
     }
 
     #[test]
-    fn expert_store_parses_pbq4expert_records_and_projects_with_scales() {
+    fn expert_store_parses_pbq4expert_records_as_import_data_only() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path()).unwrap();
         let tensor = "model.layers.0.mlp.experts.2.down_proj.weight";
@@ -34454,12 +34392,22 @@ mod tests {
         assert_eq!(expert.records[0].name, tensor);
         assert_eq!(expert.records[0].scales, vec![0.5]);
         assert_eq!(expert.records[0].biases, vec![1.0]);
-        let out = expert.project(&[1.0, 2.0, 3.0, 4.0], 1).unwrap();
+        let out = expert
+            .project_record(&expert.records[0], &[1.0, 2.0, 3.0, 4.0], 1)
+            .unwrap()
+            .unwrap();
         let expected = (1.0 * 0.5 + 1.0) * 1.0
             + (2.0 * 0.5 + 1.0) * 2.0
             + (3.0 * 0.5 + 1.0) * 3.0
             + (4.0 * 0.5 + 1.0) * 4.0;
         assert!((out[0] - expected).abs() < 1e-6);
+
+        let err = expert.mlp(&[1.0, 2.0, 3.0, 4.0], 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scheduler-owned fixed-Q4 whole-expert slot is required"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -35370,14 +35318,35 @@ mod tests {
         .unwrap();
         let mut plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
         plan.routing_policy = FlashMoeRoutingPolicy::new(Some(1), true);
-        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
+        let fixed_layout = fixed_q4_test_layout(8, 16, 8);
+        let fixed_spec = FixedQ4ExpertSlotSpec {
+            layout: fixed_layout,
+            hidden_size: 8,
+            intermediate_size: 16,
+        };
+        let fixed_slot = vec![0u8; fixed_layout.expert_bytes];
+        std::fs::write(expert_layer_path(&plan.experts_dir, 0), &fixed_slot).unwrap();
+        let fixed_metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            fixed_layout.expert_bytes as u64,
+            8,
+            vec![ExpertPackMetadata {
+                layer: 0,
+                expert: 0,
+                packed_bytes: fixed_layout.expert_bytes as u64,
+                records: Vec::new(),
+            }],
+        );
+        write_expert_metadata_atomically(&plan.experts_dir, 0, &fixed_metadata).unwrap();
+        let experts =
+            ExpertStore::open_with_fixed_q4(plan.experts_dir.clone(), fixed_spec).unwrap();
         let dense = DenseStore::open(
             plan.non_expert_weights.clone(),
             plan.tensor_manifest.clone(),
         )
         .unwrap();
         let tokenizer = QwenTokenizer::from_file(&plan.tokenizer).unwrap();
-        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
