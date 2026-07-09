@@ -1823,6 +1823,18 @@ impl ScheduledExpertRoutes {
             routed_expert_scale,
         )
     }
+
+    pub(crate) fn from_routing_command(
+        command: &ScheduledRoutingCommand,
+        routed_expert_scale: f32,
+    ) -> Result<Self> {
+        command.validate_for_active_expert_issue()?;
+        Self::from_scores(command.layer, &command.routes, routed_expert_scale)
+    }
+
+    pub(crate) fn expert_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.routes.iter().map(|route| route.expert)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1916,15 +1928,14 @@ impl<T> PendingScheduledRead<T> {
 }
 
 pub(crate) struct PendingScheduledExpertSet<T> {
-    layer: usize,
-    routes: Vec<ExpertRoute>,
+    routes: ScheduledExpertRoutes,
     reads: Vec<PendingScheduledRead<T>>,
 }
 
 impl<T> fmt::Debug for PendingScheduledExpertSet<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingScheduledExpertSet")
-            .field("layer", &self.layer)
+            .field("layer", &self.routes.layer)
             .field("routes", &self.routes)
             .field("read_count", &self.reads.len())
             .finish()
@@ -1932,20 +1943,12 @@ impl<T> fmt::Debug for PendingScheduledExpertSet<T> {
 }
 
 impl<T> PendingScheduledExpertSet<T> {
-    pub(crate) fn new(
-        layer: usize,
-        routes: Vec<ExpertRoute>,
-        reads: Vec<PendingScheduledRead<T>>,
-    ) -> Self {
-        Self {
-            layer,
-            routes,
-            reads,
-        }
+    pub(crate) fn new(routes: ScheduledExpertRoutes, reads: Vec<PendingScheduledRead<T>>) -> Self {
+        Self { routes, reads }
     }
 
-    pub(crate) fn into_parts(self) -> (usize, Vec<ExpertRoute>, Vec<PendingScheduledRead<T>>) {
-        (self.layer, self.routes, self.reads)
+    pub(crate) fn into_parts(self) -> (ScheduledExpertRoutes, Vec<PendingScheduledRead<T>>) {
+        (self.routes, self.reads)
     }
 }
 
@@ -2180,15 +2183,19 @@ impl ActiveExpertReadScheduler {
         )
     }
 
+    pub(crate) fn scheduled_routes_from_command(
+        &self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<ScheduledExpertRoutes> {
+        ScheduledExpertRoutes::from_routing_command(command, self.routed_expert_scale)
+    }
+
     pub(crate) fn finish_routes<T>(
         &mut self,
-        layer: usize,
-        routes: Vec<ExpertRoute>,
+        scheduled_routes: ScheduledExpertRoutes,
         experts: Vec<T>,
         mut identify: impl FnMut(&T) -> (usize, usize),
     ) -> Result<ScheduledExpertSet<T>> {
-        let scheduled_routes =
-            ScheduledExpertRoutes::from_routes(layer, routes, self.routed_expert_scale)?;
         if experts.len() != scheduled_routes.routes.len() {
             bail!(
                 "expert scheduler returned {} experts for {} routed entries on layer {}",
@@ -4403,6 +4410,29 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_expert_routes_resolve_from_routing_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(12, 10, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let command = routing.command_from_routes(vec![(7, 1.0), (3, 2.0), (9, -1.0)]);
+
+        let scheduled = ScheduledExpertRoutes::from_routing_command(&command, 0.25).unwrap();
+
+        assert_eq!(scheduled.layer, 12);
+        assert_eq!(scheduled.expert_ids().collect::<Vec<_>>(), vec![7, 3, 9]);
+        let mut expected = vec![1.0, 2.0, -1.0];
+        softmax_in_place(&mut expected);
+        for weight in &mut expected {
+            *weight *= 0.25;
+        }
+        for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn scheduled_expert_routes_reject_non_finite_scores() {
         let err = ScheduledExpertRoutes::from_scores(0, &[(2, f32::NAN)], 1.0).unwrap_err();
 
@@ -4484,21 +4514,23 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let read = PendingScheduledRead::new(77, rx);
         assert_eq!(read.id(), 77);
-        let pending = PendingScheduledExpertSet::new(
+        let scheduled_routes = ScheduledExpertRoutes::from_routes(
             5,
             vec![ExpertRoute {
                 expert: 9,
                 score: 1.25,
             }],
-            vec![read],
-        );
+            1.0,
+        )
+        .unwrap();
+        let pending = PendingScheduledExpertSet::new(scheduled_routes, vec![read]);
 
         tx.send("expert-9").unwrap();
-        let (layer, routes, reads) = pending.into_parts();
+        let (routes, reads) = pending.into_parts();
 
-        assert_eq!(layer, 5);
+        assert_eq!(routes.layer, 5);
         assert_eq!(
-            routes,
+            routes.routes,
             vec![ExpertRoute {
                 expert: 9,
                 score: 1.25

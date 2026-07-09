@@ -86,7 +86,7 @@ use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMo
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
-    ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
+    ActiveExpertReadScheduler, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
     ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2PostAttentionPrepOutput,
@@ -18187,11 +18187,10 @@ impl ExpertScheduler {
         &mut self,
         command: &ScheduledRoutingCommand,
     ) -> Result<PendingExpertSet> {
-        command.validate_for_active_expert_issue()?;
-        let routes = ExpertRoute::from_scores(&command.routes)?;
-        let experts: Vec<usize> = routes.iter().map(|route| route.expert).collect();
-        let reads = self.issue(command.layer, &experts)?;
-        Ok(PendingExpertSet::new(command.layer, routes, reads))
+        let routes = self.core.scheduled_routes_from_command(command)?;
+        let experts: Vec<usize> = routes.expert_ids().collect();
+        let reads = self.issue(routes.layer, &experts)?;
+        Ok(PendingExpertSet::new(routes, reads))
     }
 
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
@@ -18208,11 +18207,10 @@ impl ExpertScheduler {
     }
 
     fn finish_routes(&mut self, pending: PendingExpertSet) -> Result<ScheduledExpertSet> {
-        let (layer, routes, reads) = pending.into_parts();
+        let (routes, reads) = pending.into_parts();
         let experts = self.finish(reads)?;
-        self.core.finish_routes(layer, routes, experts, |expert| {
-            (expert.layer(), expert.expert())
-        })
+        self.core
+            .finish_routes(routes, experts, |expert| (expert.layer(), expert.expert()))
     }
 
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
