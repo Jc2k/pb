@@ -96,9 +96,9 @@ use super::state::{
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, RuntimeTensorEntry, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    validate_dense_matvec_shape,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RuntimeTensorEntry,
+    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -15598,33 +15598,14 @@ impl DenseStore {
         let Some(entry) = self.registry.tensor(tensor_name) else {
             return Ok(None);
         };
-        if entry.quantization != TensorQuantization::None {
-            return Ok(None);
-        }
-        let dtype = entry.dtype.to_ascii_uppercase();
-        if !allowed_dtypes.iter().any(|allowed| dtype == *allowed) {
-            return Ok(None);
-        }
-        let Some(element_size) = dtype_size(&entry.dtype) else {
-            return Ok(None);
-        };
-        let expected_bytes = expected_values
-            .checked_mul(element_size)
-            .context("linear-attention static tensor byte length overflow")?;
-        if entry.byte_len as usize != expected_bytes {
-            return Ok(None);
-        }
-        if entry
-            .byte_offset
-            .checked_add(entry.byte_len)
-            .map_or(true, |end| end > self.len)
-        {
-            return Ok(None);
-        }
-        if entry.byte_offset % element_size as u64 != 0 {
-            return Ok(None);
-        }
-        Ok(Some(entry.byte_offset))
+        Ok(ResidentStaticTensorRef::from_entry(
+            tensor_name,
+            entry,
+            self.len,
+            expected_values,
+            allowed_dtypes,
+        )?
+        .map(|resident| resident.byte_offset))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -295,6 +295,69 @@ pub(crate) fn validate_dense_matvec_shape(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentStaticTensorRef {
+    pub(crate) tensor_name: String,
+    pub(crate) byte_offset: u64,
+    pub(crate) dtype: String,
+    pub(crate) values: usize,
+    pub(crate) element_size: usize,
+}
+
+impl ResidentStaticTensorRef {
+    pub(crate) fn from_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        expected_values: usize,
+        allowed_dtypes: &[&str],
+    ) -> Result<Option<Self>> {
+        if entry.quantization != TensorQuantization::None {
+            return Ok(None);
+        }
+        if !allowed_dtypes
+            .iter()
+            .any(|allowed| entry.dtype.eq_ignore_ascii_case(allowed))
+        {
+            return Ok(None);
+        }
+        let Some(element_size) = dense_dtype_size(&entry.dtype) else {
+            return Ok(None);
+        };
+        let expected_bytes = expected_values
+            .checked_mul(element_size)
+            .context("resident static tensor byte length overflow")?;
+        if entry.byte_len as usize != expected_bytes {
+            return Ok(None);
+        }
+        if entry
+            .byte_offset
+            .checked_add(entry.byte_len)
+            .map_or(true, |end| end > store_len)
+        {
+            return Ok(None);
+        }
+        if entry.byte_offset % element_size as u64 != 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            tensor_name: tensor_name.to_string(),
+            byte_offset: entry.byte_offset,
+            dtype: entry.dtype.clone(),
+            values: expected_values,
+            element_size,
+        }))
+    }
+}
+
+fn dense_dtype_size(dtype: &str) -> Option<usize> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "BF16" | "BFLOAT16" | "F16" | "FLOAT16" | "FP16" => Some(2),
+        "F32" | "FLOAT32" | "FP32" => Some(4),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DenseMmapMatvecProjection {
     pub(crate) tensor_name: String,
     pub(crate) byte_offset: u64,
@@ -574,6 +637,67 @@ mod tests {
         assert_eq!(projection.rows, 4);
         assert_eq!(projection.cols, 8);
         assert_eq!(projection.output_width, 4);
+    }
+
+    #[test]
+    fn resident_static_tensor_descriptor_resolves_offsets_and_dtype() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.0.self_attn.conv1d.weight".to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![8],
+            byte_offset: 16,
+            byte_len: 16,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        let resident =
+            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 64, 8, &["BF16", "BFLOAT16"])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(resident.tensor_name, entry.name);
+        assert_eq!(resident.byte_offset, 16);
+        assert_eq!(resident.values, 8);
+        assert_eq!(resident.element_size, 2);
+    }
+
+    #[test]
+    fn resident_static_tensor_descriptor_rejects_wrong_layout_without_fallback() {
+        let mut entry = RuntimeTensorEntry {
+            name: "model.layers.0.self_attn.A_log".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![4],
+            byte_offset: 4,
+            byte_len: 16,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        assert!(
+            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
+                .unwrap()
+                .is_some()
+        );
+
+        entry.byte_len = 12;
+        assert!(
+            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
+                .unwrap()
+                .is_none()
+        );
+
+        entry.byte_len = 16;
+        entry.quantization = TensorQuantization::Q4 {
+            group_size: GROUP_SIZE,
+            format: "mlx".to_string(),
+            scale_bias_dtype: "F32".to_string(),
+        };
+        assert!(
+            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
