@@ -15,8 +15,8 @@ use super::state::{
     FlashMoeStatePlacement,
 };
 use super::weights::{
-    RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
-    SharedExpertPhaseWeights,
+    RouterScoreBatch, RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections,
+    SharedExpertPhaseShape, SharedExpertPhaseWeights,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
@@ -717,6 +717,7 @@ pub(crate) trait ScheduledRoutingScores {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub(crate) struct ScheduledRoutingScoreView<'a> {
     layer: usize,
     source: ScheduledRoutingCandidateSource,
@@ -724,6 +725,7 @@ pub(crate) struct ScheduledRoutingScoreView<'a> {
     projection: Option<&'a RouterScoreProjectionDescriptor>,
 }
 
+#[cfg(test)]
 impl<'a> ScheduledRoutingScoreView<'a> {
     pub(crate) const fn new(
         layer: usize,
@@ -752,6 +754,7 @@ impl<'a> ScheduledRoutingScoreView<'a> {
     }
 }
 
+#[cfg(test)]
 impl ScheduledRoutingScores for ScheduledRoutingScoreView<'_> {
     fn scheduled_routing_score_layer(&self) -> usize {
         self.layer
@@ -767,6 +770,24 @@ impl ScheduledRoutingScores for ScheduledRoutingScoreView<'_> {
 
     fn scheduled_routing_projection(&self) -> Option<&RouterScoreProjectionDescriptor> {
         self.projection
+    }
+}
+
+impl ScheduledRoutingScores for RouterScoreBatch {
+    fn scheduled_routing_score_layer(&self) -> usize {
+        self.state().layer()
+    }
+
+    fn scheduled_routing_score_source(&self) -> ScheduledRoutingCandidateSource {
+        ScheduledRoutingCandidateSource::from(self.state().source())
+    }
+
+    fn scheduled_routing_scores(&self) -> &[f32] {
+        &self.scores
+    }
+
+    fn scheduled_routing_projection(&self) -> Option<&RouterScoreProjectionDescriptor> {
+        self.projection.as_ref()
     }
 }
 

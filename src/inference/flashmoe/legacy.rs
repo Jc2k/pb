@@ -91,8 +91,7 @@ use super::scheduler::{
     ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledRoutingScoreView, ScheduledSharedExpert,
-    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledSharedExpert, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -11244,35 +11243,21 @@ impl FlashMoeEngine {
             active_experts,
             source,
         )?;
-        let routing_output = scheduled_routing.validate_output_state(
-            FlashMoeRoutingOutputState::cpu_router_scores(
-                layer,
-                self.config.experts(),
-                active_experts,
-            ),
+        let router_scores = self.dense.router_scores_with_metal(
+            self.metal.as_ref(),
+            layer,
+            self.config.experts(),
+            active_experts,
+            normed,
         )?;
+        let routing_output = scheduled_routing.validate_output_state(router_scores.state())?;
         debug_assert_eq!(routing_output.routing, scheduled_routing);
         debug_assert_eq!(
             routing_output.state().source(),
             FlashMoeRoutingOutputSource::CpuRouterScores
         );
-        let router_scores = self.dense.router_scores_with_metal(
-            self.metal.as_ref(),
-            layer,
-            self.config.experts(),
-            normed,
-        )?;
-        let score_view = if let Some(projection) = router_scores.projection.as_ref() {
-            ScheduledRoutingScoreView::from_router_projection(
-                source,
-                projection,
-                &router_scores.scores,
-            )
-        } else {
-            ScheduledRoutingScoreView::new(layer, source, &router_scores.scores)
-        };
         scheduled_routing
-            .select_command_from_output_scores(routing_output, &score_view)
+            .select_command_from_output_scores(routing_output, &router_scores)
             .map(|command| command.routes)
     }
 
@@ -16593,19 +16578,21 @@ impl DenseStore {
         metal: Option<&MetalExecutor>,
         layer: usize,
         experts: usize,
+        active_experts: usize,
         hidden: &[f32],
     ) -> Result<RouterScoreBatch> {
         let tensor_name = router_tensor_name(layer);
         let projection = self.router_score_projection_descriptor(layer, experts, hidden.len())?;
+        let state = FlashMoeRoutingOutputState::cpu_router_scores(layer, experts, active_experts);
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
-            return Ok(RouterScoreBatch::new(projection, scores));
+            return RouterScoreBatch::new(state, projection, scores);
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.router_projection(layer, expert, hidden)?;
         }
-        Ok(RouterScoreBatch::new(projection, router_scores))
+        RouterScoreBatch::new(state, projection, router_scores)
     }
 
     fn router_score_projection_descriptor(
@@ -31296,9 +31283,13 @@ mod tests {
         let store = DenseStore::open(dense_path, manifest_path).unwrap();
 
         let scores = store
-            .router_scores_with_metal(None, 0, 2, &[0.5, -1.0, 2.0])
+            .router_scores_with_metal(None, 0, 2, 1, &[0.5, -1.0, 2.0])
             .unwrap();
 
+        assert_eq!(
+            scores.state(),
+            FlashMoeRoutingOutputState::cpu_router_scores(0, 2, 1)
+        );
         assert_eq!(scores.scores, vec![4.5, 9.0]);
         let projection = scores
             .projection

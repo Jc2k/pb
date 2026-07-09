@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::experts::EXPERT_SCALE_BIAS_DTYPE_F32;
+use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
 use super::types::{ExpertQuantization, GROUP_SIZE};
 use anyhow::{Context, Result, bail};
 
@@ -371,16 +372,58 @@ impl RouterScoreProjectionDescriptor {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RouterScoreBatch {
+    state: FlashMoeRoutingOutputState,
     pub(crate) projection: Option<RouterScoreProjectionDescriptor>,
     pub(crate) scores: Vec<f32>,
 }
 
 impl RouterScoreBatch {
     pub(crate) fn new(
+        state: FlashMoeRoutingOutputState,
         projection: Option<RouterScoreProjectionDescriptor>,
         scores: Vec<f32>,
-    ) -> Self {
-        Self { projection, scores }
+    ) -> Result<Self> {
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe router score batch is not declared graph state");
+        }
+        if state.source() != FlashMoeRoutingOutputSource::CpuRouterScores {
+            bail!(
+                "FlashMoe router score batch source {:?} is not CPU router scores",
+                state.source()
+            );
+        }
+        if scores.len() != state.experts() {
+            bail!(
+                "FlashMoe router score batch has {} scores for {} declared experts",
+                scores.len(),
+                state.experts()
+            );
+        }
+        if let Some(projection) = projection.as_ref() {
+            if projection.layer != state.layer() {
+                bail!(
+                    "FlashMoe router score batch layer {} does not match projection layer {}",
+                    state.layer(),
+                    projection.layer
+                );
+            }
+            if projection.experts != state.experts() {
+                bail!(
+                    "FlashMoe router score batch expert count {} does not match projection experts {}",
+                    state.experts(),
+                    projection.experts
+                );
+            }
+        }
+        Ok(Self {
+            state,
+            projection,
+            scores,
+        })
+    }
+
+    pub(crate) fn state(&self) -> FlashMoeRoutingOutputState {
+        self.state
     }
 }
 
@@ -931,11 +974,28 @@ mod tests {
         let projection =
             RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 128, 2, 4).unwrap();
 
-        let batch = RouterScoreBatch::new(Some(projection), vec![1.0, -2.0]);
+        let state = FlashMoeRoutingOutputState::cpu_router_scores(3, 2, 1);
+        let batch = RouterScoreBatch::new(state, Some(projection), vec![1.0, -2.0]).unwrap();
 
+        assert_eq!(batch.state(), state);
         assert_eq!(batch.scores, vec![1.0, -2.0]);
         assert_eq!(batch.projection.as_ref().unwrap().layer, 3);
         assert_eq!(batch.projection.as_ref().unwrap().experts, 2);
+    }
+
+    #[test]
+    fn router_score_batch_rejects_scores_outside_declared_state() {
+        let err = RouterScoreBatch::new(
+            FlashMoeRoutingOutputState::cpu_router_scores(3, 2, 1),
+            None,
+            vec![1.0],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("1 scores for 2 declared experts"),
+            "{err:#}"
+        );
     }
 
     #[test]
