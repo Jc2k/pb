@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(not(unix))]
 use std::io::{Read, Seek};
@@ -251,6 +251,78 @@ pub(crate) struct ExpertLayerReader {
     metadata: ExpertLayerPackMetadata,
     fixed_q4: FixedQ4ExpertSlotSpec,
     fixed_q4_buffer_pool: ReusableExpertBytePool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpertSlotStore {
+    root: PathBuf,
+    fixed_q4: FixedQ4ExpertSlotSpec,
+    fixed_q4_buffer_pool: ReusableExpertBytePool,
+    layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
+}
+
+impl ExpertSlotStore {
+    pub(crate) fn open(root: PathBuf) -> Result<Self> {
+        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::qwen35_a17b()?)
+    }
+
+    pub(crate) fn open_with_model_layout(
+        root: PathBuf,
+        layout: &QwenMoeModelLayout,
+    ) -> Result<Self> {
+        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::from_model_layout(layout)?)
+    }
+
+    pub(crate) fn open_with_fixed_q4(
+        root: PathBuf,
+        fixed_q4: FixedQ4ExpertSlotSpec,
+    ) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("expert store {} does not exist", root.display());
+        }
+        Ok(Self {
+            root,
+            fixed_q4,
+            fixed_q4_buffer_pool: Arc::new(Mutex::new(Vec::new())),
+            layers: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub(crate) fn read_many_raw(
+        &self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<ExpertRawRead>> {
+        let reader = self.layer_reader(layer)?;
+        let mut scratch = ReusableExpertBuffer::default();
+        let mut out = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            let plan = reader.prepare_read(expert)?;
+            out.push(reader.read_prepared_into(expert, plan, &mut scratch)?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn layer_reader(&self, layer: usize) -> Result<Arc<ExpertLayerReader>> {
+        if let Some(reader) = self
+            .layers
+            .lock()
+            .expect("expert layer cache poisoned")
+            .get(&layer)
+            .cloned()
+        {
+            return Ok(reader);
+        }
+
+        let reader = Arc::new(ExpertLayerReader::open(
+            &self.root,
+            layer,
+            self.fixed_q4,
+            Arc::clone(&self.fixed_q4_buffer_pool),
+        )?);
+        let mut layers = self.layers.lock().expect("expert layer cache poisoned");
+        Ok(layers.entry(layer).or_insert_with(|| reader).clone())
+    }
 }
 
 impl ExpertLayerReader {
@@ -1070,6 +1142,36 @@ mod tests {
             ExpertRawPayload::Pbq4(bytes) => assert_eq!(bytes, payload),
             ExpertRawPayload::FixedQ4(_) => panic!("PBQ4 slot classified as fixed Q4"),
         }
+    }
+
+    #[test]
+    fn expert_slot_store_owns_layer_reader_cache_and_raw_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tiny_fixed_q4_layout();
+        let spec = FixedQ4ExpertSlotSpec::new(layout, 2, 2).unwrap();
+        let payload: Vec<u8> = (0..45).collect();
+        std::fs::write(expert_layer_path(tmp.path(), 0), &payload).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            layout.expert_bytes as u64,
+            1,
+            vec![tiny_pack_metadata(0, 0, layout.expert_bytes as u64)],
+        );
+        std::fs::write(
+            expert_layer_metadata_path(tmp.path(), 0),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let store = ExpertSlotStore::open_with_fixed_q4(tmp.path().to_path_buf(), spec).unwrap();
+        let first_reader = store.layer_reader(0).unwrap();
+        let second_reader = store.layer_reader(0).unwrap();
+        let reads = store.read_many_raw(0, &[0]).unwrap();
+
+        assert!(Arc::ptr_eq(&first_reader, &second_reader));
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].slot.payload_len, layout.expert_bytes);
+        assert!(matches!(reads[0].payload, ExpertRawPayload::FixedQ4(_)));
     }
 
     #[test]

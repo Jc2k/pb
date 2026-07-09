@@ -68,12 +68,12 @@ use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertLayerPackMetadata, ExpertLayerReader, ExpertPackMetadata, ExpertPackRecord,
-    ExpertRawPayload, ExpertRawRead, ExpertReadPlan, ExpertSlotDescriptor, ExpertSlotView,
-    FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertPayload,
-    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, ReusableExpertBuffer,
-    ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes, expert_layer_metadata_path,
-    expert_layer_path, expert_slot_end, expert_slot_offset, read_exact_at_positioned,
-    read_expert_layer_pack_metadata,
+    ExpertRawPayload, ExpertRawRead, ExpertReadPlan, ExpertSlotDescriptor, ExpertSlotStore,
+    ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FLASHMOE_EXPERT_IO_POLICY,
+    FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC,
+    ReusableExpertBuffer, ReusableExpertBytePool, decode_fixed_q4_bf16_component_bytes,
+    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
+    read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18052,64 +18052,38 @@ fn f16_to_f32(bits: u16) -> f32 {
 
 #[derive(Debug, Clone)]
 pub struct ExpertStore {
-    root: PathBuf,
-    fixed_q4: FixedQ4ExpertSlotSpec,
-    fixed_q4_buffer_pool: ReusableExpertBytePool,
-    layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
+    raw: ExpertSlotStore,
 }
 
 impl ExpertStore {
     pub fn open(root: PathBuf) -> Result<Self> {
-        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::qwen35_a17b()?)
+        Ok(Self {
+            raw: ExpertSlotStore::open(root)?,
+        })
     }
 
     pub fn open_with_model_layout(root: PathBuf, layout: &QwenMoeModelLayout) -> Result<Self> {
-        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::from_model_layout(layout)?)
+        Ok(Self {
+            raw: ExpertSlotStore::open_with_model_layout(root, layout)?,
+        })
     }
 
     fn open_with_fixed_q4(root: PathBuf, fixed_q4: FixedQ4ExpertSlotSpec) -> Result<Self> {
-        if !root.is_dir() {
-            bail!("expert store {} does not exist", root.display());
-        }
         Ok(Self {
-            root,
-            fixed_q4,
-            fixed_q4_buffer_pool: Arc::new(Mutex::new(Vec::new())),
-            layers: Arc::new(Mutex::new(BTreeMap::new())),
+            raw: ExpertSlotStore::open_with_fixed_q4(root, fixed_q4)?,
         })
     }
 
     pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
-        let reader = self.layer_reader(layer)?;
-        let mut scratch = ReusableExpertBuffer::default();
-        let mut out = Vec::with_capacity(experts.len());
-        for &expert in experts {
-            let plan = reader.prepare_read(expert)?;
-            let raw = reader.read_prepared_into(expert, plan, &mut scratch)?;
-            out.push(ExpertWeights::from_raw_read(raw)?);
-        }
-        Ok(out)
+        self.raw
+            .read_many_raw(layer, experts)?
+            .into_iter()
+            .map(ExpertWeights::from_raw_read)
+            .collect()
     }
 
     fn layer_reader(&self, layer: usize) -> Result<Arc<ExpertLayerReader>> {
-        if let Some(reader) = self
-            .layers
-            .lock()
-            .expect("expert layer cache poisoned")
-            .get(&layer)
-            .cloned()
-        {
-            return Ok(reader);
-        }
-
-        let reader = Arc::new(ExpertLayerReader::open(
-            &self.root,
-            layer,
-            self.fixed_q4,
-            Arc::clone(&self.fixed_q4_buffer_pool),
-        )?);
-        let mut layers = self.layers.lock().expect("expert layer cache poisoned");
-        Ok(layers.entry(layer).or_insert_with(|| reader).clone())
+        self.raw.layer_reader(layer)
     }
 }
 
