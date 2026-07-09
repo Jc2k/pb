@@ -9,6 +9,7 @@ mod experts;
 mod legacy;
 mod math;
 mod model_family;
+mod scheduler;
 mod types;
 
 pub use capabilities::*;
@@ -16,4 +17,5 @@ pub use experts::*;
 pub use legacy::*;
 pub use math::*;
 pub use model_family::*;
+pub use scheduler::*;
 pub use types::*;
