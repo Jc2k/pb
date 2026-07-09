@@ -215,6 +215,23 @@ impl FlashMoeScheduledGraph {
         cmd3.shared_descriptor = Some(shared);
         Ok(cmd3)
     }
+
+    pub fn build_cmd3_expert_phase_from_descriptors(
+        &self,
+        layer: usize,
+        expert_count: usize,
+        input: ScheduledCmd3InputSource,
+        shared: ScheduledSharedExpertDescriptor,
+        next_norm_weights: ScheduledNextNormWeights<'_>,
+    ) -> Result<ScheduledCmd3ExpertPhase, FlashMoeUnsupportedCapability> {
+        self.build_cmd3_expert_phase_with_shared_descriptor(
+            layer,
+            expert_count,
+            input,
+            shared,
+            ScheduledNextNormSource::from_weights(next_norm_weights),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1218,6 +1235,16 @@ pub enum ScheduledSharedExpertSource {
 pub enum ScheduledNextNormSource {
     None,
     CpuVisibleWeights,
+}
+
+impl ScheduledNextNormSource {
+    pub(crate) fn from_weights(weights: ScheduledNextNormWeights<'_>) -> Self {
+        if weights.is_cpu_visible() {
+            Self::CpuVisibleWeights
+        } else {
+            Self::None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4372,6 +4399,47 @@ mod tests {
         assert!(
             mismatch.to_string().contains("shared descriptor"),
             "{mismatch:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd3_builder_derives_next_norm_source_from_weights() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let shared_descriptor = ScheduledSharedExpertDescriptor::new(
+            ScheduledSharedExpertSource::DenseCpuWeights,
+            Some(ScheduledSharedExpertShape::new(8, 1, 2).unwrap()),
+        )
+        .unwrap();
+
+        let no_next_norm = graph
+            .build_cmd3_expert_phase_from_descriptors(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                shared_descriptor,
+                ScheduledNextNormWeights::none(),
+            )
+            .unwrap();
+        assert_eq!(no_next_norm.next_norm, ScheduledNextNormSource::None);
+
+        let cpu_next_norm = graph
+            .build_cmd3_expert_phase_from_descriptors(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                shared_descriptor,
+                ScheduledNextNormWeights::cpu_visible(
+                    "model.layers.8.input_layernorm.weight",
+                    &[1.0; 8],
+                    8,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            cpu_next_norm.next_norm,
+            ScheduledNextNormSource::CpuVisibleWeights
         );
     }
 

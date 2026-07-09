@@ -94,9 +94,8 @@ use super::scheduler::{
     ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
     ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload,
-    ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
-    ScheduledRoutingCommand, ScheduledSharedExpert,
+    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -10726,7 +10725,7 @@ impl FlashMoeEngine {
             let shared_descriptor = shared_phase.scheduled_shared_expert_descriptor()?;
             let scheduled_cmd3 = self
                 .scheduled_graph
-                .build_cmd3_expert_phase_with_shared_descriptor(
+                .build_cmd3_expert_phase_from_descriptors(
                     layer,
                     scheduled_experts.len(),
                     if has_metal_post_attention_prep {
@@ -10735,11 +10734,7 @@ impl FlashMoeEngine {
                         ScheduledCmd3InputSource::CpuNormedResidualUpload
                     },
                     shared_descriptor,
-                    if next_norm_weight.is_some() {
-                        ScheduledNextNormSource::CpuVisibleWeights
-                    } else {
-                        ScheduledNextNormSource::None
-                    },
+                    next_norm_weights,
                 )?;
             debug_assert_eq!(scheduled_cmd3.layer, layer);
             debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
