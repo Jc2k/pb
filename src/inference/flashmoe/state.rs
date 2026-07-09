@@ -142,6 +142,44 @@ impl FlashMoeCpuBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeGpuBufferDescriptor {
+    role: FlashMoeStateBufferRole,
+    len: usize,
+}
+
+impl FlashMoeGpuBufferDescriptor {
+    pub(crate) fn new(role: FlashMoeStateBufferRole, len: usize) -> Self {
+        Self { role, len }
+    }
+
+    pub(crate) fn hidden(len: usize) -> Self {
+        Self::new(FlashMoeStateBufferRole::Hidden, len)
+    }
+
+    pub(crate) fn next_layer_normed(len: usize) -> Self {
+        Self::new(FlashMoeStateBufferRole::NextLayerNormed, len)
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        FlashMoeStatePlacement::GpuResident
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+            && self.len() > 0
+    }
+}
+
 impl Deref for FlashMoeCpuBuffer {
     type Target = [f32];
 
@@ -440,6 +478,27 @@ mod tests {
         let normed = next_normed.into_role(FlashMoeStateBufferRole::Normed);
         assert_eq!(normed.role(), FlashMoeStateBufferRole::Normed);
         assert_eq!(&normed[..], &[2.0, 4.0]);
+    }
+
+    #[test]
+    fn gpu_buffer_descriptor_declares_role_length_and_residency() {
+        let hidden = FlashMoeGpuBufferDescriptor::hidden(4096);
+        assert_eq!(hidden.role(), FlashMoeStateBufferRole::Hidden);
+        assert_eq!(hidden.len(), 4096);
+        assert_eq!(hidden.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(hidden.is_declared_graph_state());
+
+        let next_normed = FlashMoeGpuBufferDescriptor::next_layer_normed(4096);
+        assert_eq!(next_normed.role(), FlashMoeStateBufferRole::NextLayerNormed);
+        assert_eq!(next_normed.placement(), FlashMoeStatePlacement::GpuResident);
+    }
+
+    #[test]
+    fn gpu_buffer_descriptor_rejects_zero_length_graph_state() {
+        let hidden = FlashMoeGpuBufferDescriptor::hidden(0);
+
+        assert_eq!(hidden.len(), 0);
+        assert!(!hidden.is_declared_graph_state());
     }
 
     #[test]

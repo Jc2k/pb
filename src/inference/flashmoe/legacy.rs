@@ -97,9 +97,9 @@ use super::scheduler::{
 use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCpuBuffer, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
-    FlashMoeGeneratedTokenRecord, FlashMoeLayerStateRecord, FlashMoePromptTokenRecord,
-    FlashMoeSessionState, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
+    FlashMoePromptTokenRecord, FlashMoeSessionState, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -2009,7 +2009,33 @@ struct MetalAttentionValues {
 struct DeferredMetalInput {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     buffer: ObjcId,
-    len: usize,
+    state: FlashMoeGpuBufferDescriptor,
+}
+
+impl DeferredMetalInput {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hidden(buffer: ObjcId, len: usize) -> Self {
+        Self {
+            buffer,
+            state: FlashMoeGpuBufferDescriptor::hidden(len),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn next_layer_normed(buffer: ObjcId, len: usize) -> Self {
+        Self {
+            buffer,
+            state: FlashMoeGpuBufferDescriptor::next_layer_normed(len),
+        }
+    }
+
+    fn len(self) -> usize {
+        self.state.len()
+    }
+
+    fn state(self) -> FlashMoeGpuBufferDescriptor {
+        self.state
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3169,17 +3195,17 @@ struct MetalDeferredExpertPhase {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalDeferredExpertPhase {
     fn next_normed_input(&self) -> Option<DeferredMetalInput> {
-        self.next_normed_buffer.map(|buffer| DeferredMetalInput {
-            buffer,
-            len: self.width,
+        self.next_normed_buffer.map(|buffer| {
+            let input = DeferredMetalInput::next_layer_normed(buffer, self.width);
+            debug_assert!(input.state().is_declared_graph_state());
+            input
         })
     }
 
     fn hidden_input(&self) -> DeferredMetalInput {
-        DeferredMetalInput {
-            buffer: self.hidden_buffer,
-            len: self.width,
-        }
+        let input = DeferredMetalInput::hidden(self.hidden_buffer, self.width);
+        debug_assert!(input.state().is_declared_graph_state());
+        input
     }
 
     fn finish_without_readback(self) -> Result<()> {
@@ -10083,7 +10109,7 @@ impl FlashMoeEngine {
                         let residual_input = deferred_residual_input
                             .map(|input| MetalBatchProjectionInput::Buffer {
                                 buffer: input.buffer,
-                                len: input.len,
+                                len: input.len(),
                             })
                             .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                         if let Some(post_norm_weight) =
@@ -10269,7 +10295,7 @@ impl FlashMoeEngine {
                 let residual_input = deferred_residual_input
                     .map(|input| MetalBatchProjectionInput::Buffer {
                         buffer: input.buffer,
-                        len: input.len,
+                        len: input.len(),
                     })
                     .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                 if let Some(metal) = &self.metal
@@ -10347,7 +10373,7 @@ impl FlashMoeEngine {
                     let residual_input = deferred_residual_input
                         .map(|input| MetalBatchProjectionInput::Buffer {
                             buffer: input.buffer,
-                            len: input.len,
+                            len: input.len(),
                         })
                         .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                     if let Some(metal) = &self.metal
@@ -10768,7 +10794,7 @@ impl FlashMoeEngine {
                     metal,
                     &input_specs,
                     input.buffer,
-                    input.len,
+                    input.len(),
                 )?;
         }
         if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
@@ -11131,7 +11157,7 @@ impl FlashMoeEngine {
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
                 buffer: input.buffer,
-                len: input.len,
+                len: input.len(),
             }
         } else if !normed.is_empty() {
             MetalBatchProjectionInput::Cpu(normed)
@@ -11212,7 +11238,7 @@ impl FlashMoeEngine {
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
                 buffer: input.buffer,
-                len: input.len,
+                len: input.len(),
             }
         } else if !normed.is_empty() {
             MetalBatchProjectionInput::Cpu(normed)
@@ -11290,7 +11316,7 @@ impl FlashMoeEngine {
             let projection_input = if let Some(input) = deferred_input {
                 MetalBatchProjectionInput::Buffer {
                     buffer: input.buffer,
-                    len: input.len,
+                    len: input.len(),
                 }
             } else if !normed.is_empty() {
                 MetalBatchProjectionInput::Cpu(normed)
@@ -11323,7 +11349,7 @@ impl FlashMoeEngine {
                     metal,
                     &input_specs,
                     input.buffer,
-                    input.len,
+                    input.len(),
                 )?;
         }
         if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
