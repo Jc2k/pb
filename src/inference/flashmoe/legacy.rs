@@ -10723,21 +10723,24 @@ impl FlashMoeEngine {
             } else {
                 ScheduledNextNormWeights::none()
             };
-            let scheduled_cmd3 = self.scheduled_graph.build_cmd3_expert_phase(
-                layer,
-                scheduled_experts.len(),
-                if has_metal_post_attention_prep {
-                    ScheduledCmd3InputSource::MetalPostAttentionPrep
-                } else {
-                    ScheduledCmd3InputSource::CpuNormedResidualUpload
-                },
-                shared_phase.scheduled_shared_expert_descriptor()?.source,
-                if next_norm_weight.is_some() {
-                    ScheduledNextNormSource::CpuVisibleWeights
-                } else {
-                    ScheduledNextNormSource::None
-                },
-            )?;
+            let shared_descriptor = shared_phase.scheduled_shared_expert_descriptor()?;
+            let scheduled_cmd3 = self
+                .scheduled_graph
+                .build_cmd3_expert_phase_with_shared_descriptor(
+                    layer,
+                    scheduled_experts.len(),
+                    if has_metal_post_attention_prep {
+                        ScheduledCmd3InputSource::MetalPostAttentionPrep
+                    } else {
+                        ScheduledCmd3InputSource::CpuNormedResidualUpload
+                    },
+                    shared_descriptor,
+                    if next_norm_weight.is_some() {
+                        ScheduledNextNormSource::CpuVisibleWeights
+                    } else {
+                        ScheduledNextNormSource::None
+                    },
+                )?;
             debug_assert_eq!(scheduled_cmd3.layer, layer);
             debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
             let mut submitted_deferred = false;

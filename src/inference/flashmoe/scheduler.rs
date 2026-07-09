@@ -197,8 +197,23 @@ impl FlashMoeScheduledGraph {
             expert_count,
             input,
             shared,
+            shared_descriptor: None,
             next_norm,
         })
+    }
+
+    pub fn build_cmd3_expert_phase_with_shared_descriptor(
+        &self,
+        layer: usize,
+        expert_count: usize,
+        input: ScheduledCmd3InputSource,
+        shared: ScheduledSharedExpertDescriptor,
+        next_norm: ScheduledNextNormSource,
+    ) -> Result<ScheduledCmd3ExpertPhase, FlashMoeUnsupportedCapability> {
+        let mut cmd3 =
+            self.build_cmd3_expert_phase(layer, expert_count, input, shared.source, next_norm)?;
+        cmd3.shared_descriptor = Some(shared);
+        Ok(cmd3)
     }
 }
 
@@ -1277,6 +1292,7 @@ pub struct ScheduledCmd3ExpertPhase {
     pub expert_count: usize,
     pub input: ScheduledCmd3InputSource,
     pub shared: ScheduledSharedExpertSource,
+    pub shared_descriptor: Option<ScheduledSharedExpertDescriptor>,
     pub next_norm: ScheduledNextNormSource,
 }
 
@@ -1532,6 +1548,15 @@ where
                 "FlashMoe scheduled CMD3 shared source {:?} does not match phase shared source {:?}",
                 cmd3.shared,
                 shared_descriptor.source
+            );
+        }
+        if let Some(expected_shared) = cmd3.shared_descriptor
+            && expected_shared != shared_descriptor
+        {
+            bail!(
+                "FlashMoe scheduled CMD3 shared descriptor {:?} does not match phase shared descriptor {:?}",
+                expected_shared,
+                shared_descriptor
             );
         }
         let input_state = input.scheduled_cmd3_input_state(cmd3.layer);
@@ -4284,6 +4309,69 @@ mod tests {
             invalid_input_state_err
                 .to_string()
                 .contains("input is not declared graph state")
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd3_descriptor_carries_shared_expert_shape() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let shared_descriptor = ScheduledSharedExpertDescriptor::new(
+            ScheduledSharedExpertSource::ResidentQ4Projections,
+            Some(ScheduledSharedExpertShape::new(8, 2, 2).unwrap()),
+        )
+        .unwrap();
+        let cmd3 = graph
+            .build_cmd3_expert_phase_with_shared_descriptor(
+                7,
+                2,
+                ScheduledCmd3InputSource::MetalPostAttentionPrep,
+                shared_descriptor,
+                ScheduledNextNormSource::CpuVisibleWeights,
+            )
+            .unwrap();
+
+        assert_eq!(
+            cmd3.shared,
+            ScheduledSharedExpertSource::ResidentQ4Projections
+        );
+        assert_eq!(cmd3.shared_descriptor, Some(shared_descriptor));
+        ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mismatch = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert_with_shape(
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                Some(ScheduledSharedExpertShape::new(8, 1, 4).unwrap()),
+            ),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("shared descriptor"),
+            "{mismatch:#}"
         );
     }
 
