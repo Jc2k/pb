@@ -85,10 +85,10 @@ use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd1Submission,
-    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledCmd2Submission, ScheduledCmd3Command, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload,
-    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2PostAttentionPrepOutput,
+    ScheduledCmd2ResidualSource, ScheduledCmd2Submission, ScheduledCmd3Command,
+    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3OutputState, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
     ScheduledSharedExpert, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
@@ -1875,7 +1875,7 @@ struct MetalExecutor {
 }
 
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
-type ScheduledPreselectedRoutingOutput = (FlashMoeRoutingOutputState, Vec<(usize, f32)>);
+type ScheduledPreselectedRoutingOutput = (ScheduledCmd2PostAttentionPrepOutput, Vec<(usize, f32)>);
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
@@ -10420,7 +10420,7 @@ impl FlashMoeEngine {
                 let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                 debug_assert_eq!(cmd2_output.width(), prep.width);
                 debug_assert_eq!(cmd2_output.state(), prep.state);
-                precomputed_active = Some((cmd2_output.routing(), prep.active.clone()));
+                precomputed_active = Some((cmd2_output, prep.active.clone()));
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some((out_proj_name, attention_values)) =
@@ -10458,7 +10458,7 @@ impl FlashMoeEngine {
                     let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                     debug_assert_eq!(cmd2_output.width(), prep.width);
                     debug_assert_eq!(cmd2_output.state(), prep.state);
-                    let active = (cmd2_output.routing(), prep.active.clone());
+                    let active = (cmd2_output, prep.active.clone());
                     metal_post_attention_prep = Some(prep);
                     precomputed_active = Some(active);
                     if let Some(attention_values) = attention_values.take() {
@@ -10500,14 +10500,9 @@ impl FlashMoeEngine {
                     }
                 }
             }
-            let active = if let Some((routing_state, active)) = precomputed_active {
+            let active = if let Some((cmd2_output, active)) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                self.validate_preselected_routes(
-                    layer,
-                    scheduled_cmd2.active_experts,
-                    routing_state,
-                    active,
-                )?
+                self.validate_preselected_routes(cmd2_output, active)?
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
@@ -10542,19 +10537,14 @@ impl FlashMoeEngine {
                         let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                         debug_assert_eq!(cmd2_output.width(), prep.width);
                         debug_assert_eq!(cmd2_output.state(), prep.state);
-                        let active = (cmd2_output.routing(), prep.active.clone());
+                        let active = (cmd2_output, prep.active.clone());
                         metal_post_attention_prep = Some(prep);
                         prepared = Some(active);
                     }
                 }
-                if let Some((routing_state, active)) = prepared {
+                if let Some((cmd2_output, active)) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    self.validate_preselected_routes(
-                        layer,
-                        scheduled_cmd2.active_experts,
-                        routing_state,
-                        active,
-                    )?
+                    self.validate_preselected_routes(cmd2_output, active)?
                 } else {
                     if deferred_attention_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -11263,26 +11253,17 @@ impl FlashMoeEngine {
 
     fn validate_preselected_routes(
         &self,
-        layer: usize,
-        active_experts: usize,
-        routing_state: FlashMoeRoutingOutputState,
+        cmd2_output: ScheduledCmd2PostAttentionPrepOutput,
         active: Vec<(usize, f32)>,
     ) -> Result<Vec<(usize, f32)>> {
-        let scheduled_routing = self.scheduled_graph.build_routing_topk(
-            layer,
-            self.config.experts(),
-            active_experts,
-            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
-        )?;
-        let routing_output = scheduled_routing.validate_output_state(routing_state)?;
-        debug_assert_eq!(routing_output.routing, scheduled_routing);
+        let routing_command = self
+            .scheduled_graph
+            .command_from_cmd2_preselected_routes(cmd2_output, &active)?;
         debug_assert_eq!(
-            routing_output.state().source(),
-            FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK
+            routing_command.source,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
         );
-        scheduled_routing
-            .command_from_preselected_output(routing_output, &active)
-            .map(|command| command.routes)
+        Ok(routing_command.routes)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -155,6 +155,22 @@ impl FlashMoeScheduledGraph {
         })
     }
 
+    pub(crate) fn command_from_cmd2_preselected_routes(
+        &self,
+        output: ScheduledCmd2PostAttentionPrepOutput,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledRoutingCommand> {
+        let routing_state = output.routing();
+        let routing = self.build_routing_topk(
+            output.layer,
+            routing_state.experts(),
+            output.active_experts,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+        )?;
+        let routing_output = routing.validate_output_state(routing_state)?;
+        routing.command_from_preselected_output(routing_output, routes)
+    }
+
     pub fn build_cmd1_attention_projections(
         &self,
         layer: usize,
@@ -3356,6 +3372,84 @@ mod tests {
         assert_eq!(output.input_state, command.input_state());
         assert_eq!(output.routing().layer(), 11);
         assert_eq!(output.routing().experts(), 512);
+    }
+
+    #[test]
+    fn scheduled_cmd2_output_builds_preselected_routing_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                2,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+        let command = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+        let output = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 2))
+            .unwrap();
+
+        let routing = graph
+            .command_from_cmd2_preselected_routes(output, &[(7, 0.75), (3, 0.25)])
+            .unwrap();
+
+        assert_eq!(routing.layer, 11);
+        assert_eq!(routing.active_experts, 2);
+        assert_eq!(
+            routing.source,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+        );
+        assert_eq!(routing.routes, vec![(7, 0.75), (3, 0.25)]);
+    }
+
+    #[test]
+    fn scheduled_cmd2_output_rejects_mismatched_preselected_routes() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                11,
+                2,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+        let command = ScheduledCmd2Submission::new(
+            cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+                4096,
+                4096,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+        let output = command
+            .resolve_post_attention_prep(FlashMoePostAttentionPrepState::new(11, 4096, 512, 2))
+            .unwrap();
+
+        let err = graph
+            .command_from_cmd2_preselected_routes(output, &[(7, 0.75)])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("received 1 preselected experts; expected 2"),
+            "{err:#}"
+        );
     }
 
     #[test]
