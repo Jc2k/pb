@@ -3,12 +3,14 @@ use super::capabilities::{
     FlashMoeUnsupportedCapability,
 };
 use super::math::softmax_in_place;
+use super::model_family::QwenMoeFamily;
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeScheduledGraph {
+    family: QwenMoeFamily,
     stages: Vec<FlashMoeStageCapability>,
 }
 
@@ -29,7 +31,14 @@ impl FlashMoeScheduledGraph {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { stages })
+        Ok(Self {
+            family: capabilities.family,
+            stages,
+        })
+    }
+
+    pub fn family(&self) -> QwenMoeFamily {
+        self.family
     }
 
     pub fn stages(&self) -> &[FlashMoeStageCapability] {
@@ -58,6 +67,60 @@ impl FlashMoeScheduledGraph {
     pub fn declares_scheduler_owned_expert_reads(&self) -> bool {
         self.active_expert_reads().placement == FlashMoeStagePlacement::SchedulerIo
     }
+
+    pub fn build_cmd2_post_attention(
+        &self,
+        layer: usize,
+        active_experts: usize,
+    ) -> Result<ScheduledCmd2PostAttention, FlashMoeUnsupportedCapability> {
+        let stage = *self.stage(FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection);
+        if stage.placement != FlashMoeStagePlacement::Metal {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                "CMD2 post-attention stage must be implemented as a declared Metal command",
+            ));
+        }
+        Ok(ScheduledCmd2PostAttention {
+            stage,
+            layer,
+            active_experts,
+        })
+    }
+
+    pub fn build_cmd3_expert_phase(
+        &self,
+        layer: usize,
+        expert_count: usize,
+    ) -> Result<ScheduledCmd3ExpertPhase, FlashMoeUnsupportedCapability> {
+        let stage = *self.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+        if stage.placement != FlashMoeStagePlacement::Metal {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                "CMD3 expert/shared combine must be implemented as a declared Metal command",
+            ));
+        }
+        Ok(ScheduledCmd3ExpertPhase {
+            stage,
+            layer,
+            expert_count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCmd2PostAttention {
+    pub stage: FlashMoeStageCapability,
+    pub layer: usize,
+    pub active_experts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCmd3ExpertPhase {
+    pub stage: FlashMoeStageCapability,
+    pub layer: usize,
+    pub expert_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -358,6 +421,52 @@ mod tests {
                 .stage(FlashMoeGraphStage::RoutingSoftmaxTopK)
                 .placement,
             FlashMoeStagePlacement::CpuDeclared
+        );
+    }
+
+    #[test]
+    fn scheduled_graph_builds_explicit_cmd2_and_cmd3_descriptors() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let cmd2 = graph.build_cmd2_post_attention(14, 4).unwrap();
+        let cmd3 = graph.build_cmd3_expert_phase(14, 4).unwrap();
+
+        assert_eq!(
+            cmd2.stage.stage,
+            FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
+        );
+        assert_eq!(cmd2.stage.placement, FlashMoeStagePlacement::Metal);
+        assert_eq!(cmd2.layer, 14);
+        assert_eq!(cmd2.active_experts, 4);
+        assert_eq!(
+            cmd3.stage.stage,
+            FlashMoeGraphStage::Cmd3ExpertAndSharedCombine
+        );
+        assert_eq!(cmd3.stage.placement, FlashMoeStagePlacement::Metal);
+        assert_eq!(cmd3.layer, 14);
+        assert_eq!(cmd3.expert_count, 4);
+    }
+
+    #[test]
+    fn scheduled_graph_rejects_non_metal_cmd3_builder() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let mut graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let cmd3 = graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
+            .unwrap();
+        cmd3.placement = FlashMoeStagePlacement::CpuDeclared;
+
+        let err = graph.build_cmd3_expert_phase(0, 4).unwrap_err();
+
+        assert_eq!(err.family, graph.family());
+        assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+        assert!(
+            err.to_string()
+                .contains("CMD3 expert/shared combine must be implemented"),
+            "{err:#}"
         );
     }
 

@@ -10054,6 +10054,9 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
                 early_metal_post_attention_prep;
+            let scheduled_cmd2 = self
+                .scheduled_graph
+                .build_cmd2_post_attention(layer, self.routing_policy.active_experts)?;
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
@@ -10084,7 +10087,7 @@ impl FlashMoeEngine {
                             .context("missing Metal attention values for Q4 prep")?,
                         residual_input,
                         &post_norm_weight,
-                        self.routing_policy.active_experts,
+                        scheduled_cmd2.active_experts,
                     )?
                 {
                     if deferred_residual_input.is_some()
@@ -10161,7 +10164,7 @@ impl FlashMoeEngine {
                             &attention_values,
                             residual_input,
                             &post_norm_weight,
-                            self.routing_policy.active_experts,
+                            scheduled_cmd2.active_experts,
                         )?
                     {
                         if deferred_residual_input.is_some()
@@ -10215,12 +10218,8 @@ impl FlashMoeEngine {
                     normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     let routing_started = Instant::now();
-                    let active = self.route_layer(
-                        position,
-                        layer,
-                        &normed,
-                        self.routing_policy.active_experts,
-                    )?;
+                    let active =
+                        self.route_layer(position, layer, &normed, scheduled_cmd2.active_experts)?;
                     layer_timing.buckets.routing += routing_started.elapsed();
                     active
                 }
@@ -10230,7 +10229,7 @@ impl FlashMoeEngine {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 let routing_started = Instant::now();
                 let active =
-                    self.route_layer(position, layer, &normed, self.routing_policy.active_experts)?;
+                    self.route_layer(position, layer, &normed, scheduled_cmd2.active_experts)?;
                 layer_timing.buckets.routing += routing_started.elapsed();
                 active
             };
@@ -10288,6 +10287,11 @@ impl FlashMoeEngine {
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.routes.len());
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.weights.len());
             debug_assert_eq!(scheduled_experts.is_empty(), active.is_empty());
+            let scheduled_cmd3 = self
+                .scheduled_graph
+                .build_cmd3_expert_phase(layer, scheduled_experts.len())?;
+            debug_assert_eq!(scheduled_cmd3.layer, layer);
+            debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
             for (expert, weight) in scheduled_experts
                 .experts
                 .iter()
