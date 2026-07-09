@@ -88,8 +88,8 @@ use super::scheduler::{
     ScheduledCmd2Submission, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
     ScheduledCmd3InputSource, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
-    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledSharedExpert,
-    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
+    ScheduledSharedExpert, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -10207,7 +10207,7 @@ impl FlashMoeEngine {
             }
             let active = if let Some(active) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                active
+                self.validate_preselected_routes(layer, scheduled_cmd2.active_experts, active)?
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
@@ -10246,7 +10246,7 @@ impl FlashMoeEngine {
                 }
                 if let Some(active) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    active
+                    self.validate_preselected_routes(layer, scheduled_cmd2.active_experts, active)?
                 } else {
                     if deferred_attention_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -10287,8 +10287,7 @@ impl FlashMoeEngine {
                     )?);
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     let routing_started = Instant::now();
-                    let active =
-                        self.route_layer(position, layer, &normed, scheduled_cmd2.active_experts)?;
+                    let active = self.route_layer(layer, &normed, scheduled_cmd2.active_experts)?;
                     layer_timing.buckets.routing += routing_started.elapsed();
                     active
                 }
@@ -10299,8 +10298,7 @@ impl FlashMoeEngine {
                 );
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 let routing_started = Instant::now();
-                let active =
-                    self.route_layer(position, layer, &normed, scheduled_cmd2.active_experts)?;
+                let active = self.route_layer(layer, &normed, scheduled_cmd2.active_experts)?;
                 layer_timing.buckets.routing += routing_started.elapsed();
                 active
             };
@@ -10905,33 +10903,43 @@ impl FlashMoeEngine {
 
     fn route_layer(
         &self,
-        position: usize,
         layer: usize,
         normed: &[f32],
         active_experts: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        if let Some(metal) = &self.metal
-            && let Some(active) = self.dense.router_topk_with_metal(
-                metal,
-                layer,
-                self.config.experts(),
-                normed,
-                active_experts,
-            )?
-        {
-            return Ok(active);
-        }
+        let source = if self.metal.is_some() {
+            ScheduledRoutingCandidateSource::MetalRouterScoresReadback
+        } else {
+            ScheduledRoutingCandidateSource::CpuRouterScores
+        };
+        let scheduled_routing = self.scheduled_graph.build_routing_topk(
+            layer,
+            self.config.experts(),
+            active_experts,
+            source,
+        )?;
         let router_scores = self.dense.router_scores_with_metal(
             self.metal.as_ref(),
             layer,
             self.config.experts(),
             normed,
         )?;
-        if let Some(metal) = &self.metal {
-            metal.route_topk(position, layer, &router_scores, active_experts)
-        } else {
-            Ok(top_k(&router_scores, active_experts))
-        }
+        scheduled_routing.select_from_scores(&router_scores)
+    }
+
+    fn validate_preselected_routes(
+        &self,
+        layer: usize,
+        active_experts: usize,
+        active: Vec<(usize, f32)>,
+    ) -> Result<Vec<(usize, f32)>> {
+        let scheduled_routing = self.scheduled_graph.build_routing_topk(
+            layer,
+            self.config.experts(),
+            active_experts,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+        )?;
+        scheduled_routing.validate_preselected(&active)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

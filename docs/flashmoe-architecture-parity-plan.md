@@ -119,10 +119,10 @@ The validator should reject silent fallbacks such as:
 - `experts.rs` now owns fixed-slot metadata, layer reader opening, positioned reads, reusable
   whole-expert buffers, raw expert payload responses, and the expert read worker pool. PBQ4 remains
   import/build compatibility; execution reads are moving toward fixed whole-expert slots.
-- `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, active expert read issue
-  and finish metrics, route normalization, pending read sets, and the scheduled whole-slot handoff.
-  `legacy.rs` still adapts those scheduled slots into `ExpertWeights` until CMD3 consumes typed
-  slots directly.
+- `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, routing topK placement
+  validation, active expert read issue and finish metrics, route normalization, pending read sets,
+  shared-expert source/shape validation, and the scheduled whole-slot handoff. `legacy.rs` still
+  adapts those scheduled slots into `ExpertWeights` until CMD3 consumes typed slots directly.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -152,9 +152,10 @@ The validator should reject silent fallbacks such as:
 - GPU residency is partial. Hidden, residual, normed, KV/recurrent state, router outputs, and
   next-layer buffers still cross CPU/GPU boundaries in places that should become explicit state
   transitions.
-- Routing policy is not yet a scheduler-level decision. For Qwen3.5 parity, router projection may
-  stay GPU-resident, but softmax/topK policy must be represented as part of the unified execution
-  plan rather than as incidental branch code.
+- Routing topK placement is now represented as a scheduler graph stage and the runtime validates
+  score-based and fused-prep route candidates through it. The remaining gap is score production:
+  router projection and score readback still live in the legacy dense/runtime loop instead of a typed
+  CMD2 routing-output descriptor.
 - Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
   down should become part of the same CMD2/CMD3 model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
@@ -226,9 +227,10 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    sampling output, diagnostics, and declared CPU graph stages.
 
 8. Reconcile routing through the scheduler.
-   For Qwen3.5 parity, model CPU softmax/topK after router projection. If GPU routing is kept or
-   later proven better, it must be selected through the same scheduler policy for all variants, with
-   parity tests proving equivalent logits/topK.
+   For Qwen3.5 parity, model CPU softmax/topK after router projection. Route selection now has a
+   scheduler descriptor; continue by moving router score production/readback into typed CMD2 outputs.
+   If GPU routing is kept or later proven better, it must be selected through the same scheduler
+   policy for all variants, with parity tests proving equivalent logits/topK.
 
 9. Fold shared experts into the same command model.
    Treat shared gate/up/down and shared down as scheduled work inside CMD2/CMD3, not as a side cache
@@ -263,7 +265,7 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    a conversion/input format, not a runtime branch.
 6. Extract dense projection descriptors and resident blob ownership into `weights`.
 7. Turn the current fused post-attention prep and expert phase helpers into named CMD2/CMD3 builder
-   calls with typed inputs.
+   calls with typed inputs, including a typed routing-score output from CMD2.
 8. Add parity and capability tests around every extraction so behavior moves without hidden semantic
    changes or fallback paths.
 9. Revisit the `2+2=` K=4 drift by comparing logits/state through the unified path. Do not revert

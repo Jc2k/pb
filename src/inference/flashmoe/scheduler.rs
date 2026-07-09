@@ -6,7 +6,7 @@ use super::experts::{
     ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
     FLASHMOE_EXPERT_IO_POLICY, Q4MatvecPayload,
 };
-use super::math::softmax_in_place;
+use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
 use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
 use anyhow::{Result, bail};
@@ -96,6 +96,30 @@ impl FlashMoeScheduledGraph {
             active_experts,
             attention,
             residual,
+        })
+    }
+
+    pub fn build_routing_topk(
+        &self,
+        layer: usize,
+        experts: usize,
+        active_experts: usize,
+        source: ScheduledRoutingCandidateSource,
+    ) -> Result<ScheduledRoutingTopK, FlashMoeUnsupportedCapability> {
+        let stage = *self.stage(FlashMoeGraphStage::RoutingSoftmaxTopK);
+        if stage.placement != FlashMoeStagePlacement::CpuDeclared {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                "routing softmax/topK stage must be implemented as a declared CPU routing command",
+            ));
+        }
+        Ok(ScheduledRoutingTopK {
+            stage,
+            layer,
+            experts,
+            active_experts,
+            source,
         })
     }
 
@@ -239,6 +263,106 @@ where
             );
         }
         Ok(Self { cmd2, inputs })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRoutingCandidateSource {
+    CpuRouterScores,
+    MetalRouterScoresReadback,
+    FusedMetalPostAttentionPrepCpuTopK,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledRoutingTopK {
+    pub stage: FlashMoeStageCapability,
+    pub layer: usize,
+    pub experts: usize,
+    pub active_experts: usize,
+    pub source: ScheduledRoutingCandidateSource,
+}
+
+impl ScheduledRoutingTopK {
+    fn validate_bounds(&self) -> Result<usize> {
+        if self.experts == 0 {
+            bail!("FlashMoe scheduled routing requires at least one expert");
+        }
+        if self.active_experts == 0 {
+            bail!("FlashMoe scheduled routing active expert count must be non-zero");
+        }
+        if self.active_experts > self.experts {
+            bail!(
+                "FlashMoe scheduled routing active expert count {} exceeds expert count {}",
+                self.active_experts,
+                self.experts
+            );
+        }
+        Ok(self.active_experts)
+    }
+
+    pub fn select_from_scores(&self, scores: &[f32]) -> Result<Vec<(usize, f32)>> {
+        if self.source == ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
+            bail!(
+                "FlashMoe scheduled routing source {:?} must submit preselected CPU topK candidates",
+                self.source
+            );
+        }
+        let active_experts = self.validate_bounds()?;
+        if scores.len() != self.experts {
+            bail!(
+                "FlashMoe scheduled routing received {} router scores for {} experts",
+                scores.len(),
+                self.experts
+            );
+        }
+        for (expert, score) in scores.iter().copied().enumerate() {
+            if !score.is_finite() {
+                bail!(
+                    "FlashMoe scheduled routing score for expert {} is not finite: {}",
+                    expert,
+                    score
+                );
+            }
+        }
+        Ok(top_k(scores, active_experts))
+    }
+
+    pub fn validate_preselected(&self, routes: &[(usize, f32)]) -> Result<Vec<(usize, f32)>> {
+        if self.source != ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
+            bail!(
+                "FlashMoe scheduled routing source {:?} must submit router scores, not preselected candidates",
+                self.source
+            );
+        }
+        let active_experts = self.validate_bounds()?;
+        if routes.len() != active_experts {
+            bail!(
+                "FlashMoe scheduled routing received {} preselected experts; expected {}",
+                routes.len(),
+                active_experts
+            );
+        }
+        let mut seen = BTreeSet::new();
+        for (expert, score) in routes.iter().copied() {
+            if expert >= self.experts {
+                bail!(
+                    "FlashMoe scheduled routing selected expert {} outside expert count {}",
+                    expert,
+                    self.experts
+                );
+            }
+            if !score.is_finite() {
+                bail!(
+                    "FlashMoe scheduled routing selected expert {} has non-finite score {}",
+                    expert,
+                    score
+                );
+            }
+            if !seen.insert(expert) {
+                bail!("FlashMoe scheduled routing selected expert {expert} more than once");
+            }
+        }
+        Ok(routes.to_vec())
     }
 }
 
@@ -1528,6 +1652,14 @@ mod tests {
                 ScheduledCmd2ResidualSource::MetalBuffer,
             )
             .unwrap();
+        let routing = graph
+            .build_routing_topk(
+                14,
+                512,
+                4,
+                ScheduledRoutingCandidateSource::MetalRouterScoresReadback,
+            )
+            .unwrap();
         let cmd3 = graph
             .build_cmd3_expert_phase(
                 14,
@@ -1560,6 +1692,15 @@ mod tests {
             ScheduledCmd2AttentionSource::MetalAttentionValues
         );
         assert_eq!(cmd2.residual, ScheduledCmd2ResidualSource::MetalBuffer);
+        assert_eq!(routing.stage.stage, FlashMoeGraphStage::RoutingSoftmaxTopK);
+        assert_eq!(routing.stage.placement, FlashMoeStagePlacement::CpuDeclared);
+        assert_eq!(routing.layer, 14);
+        assert_eq!(routing.experts, 512);
+        assert_eq!(routing.active_experts, 4);
+        assert_eq!(
+            routing.source,
+            ScheduledRoutingCandidateSource::MetalRouterScoresReadback
+        );
         assert_eq!(
             cmd3.stage.stage,
             FlashMoeGraphStage::Cmd3ExpertAndSharedCombine
@@ -1573,6 +1714,96 @@ mod tests {
             ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
+    }
+
+    #[test]
+    fn scheduled_routing_selects_cpu_topk_from_declared_scores() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+
+        let selected = routing
+            .select_from_scores(&[0.0, 2.0, 2.0, -1.0, 1.0])
+            .unwrap();
+
+        assert_eq!(selected, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
+    }
+
+    #[test]
+    fn scheduled_routing_validates_preselected_fused_prep_candidates() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(
+                3,
+                8,
+                4,
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )
+            .unwrap();
+
+        let selected = routing
+            .validate_preselected(&[(7, 3.0), (1, 2.0), (3, 1.0), (5, 0.0)])
+            .unwrap();
+        assert_eq!(selected, vec![(7, 3.0), (1, 2.0), (3, 1.0), (5, 0.0)]);
+
+        let duplicate_err = routing
+            .validate_preselected(&[(7, 3.0), (1, 2.0), (7, 1.0), (5, 0.0)])
+            .unwrap_err();
+        assert!(
+            duplicate_err
+                .to_string()
+                .contains("selected expert 7 more than once"),
+            "{duplicate_err:#}"
+        );
+
+        let source_err = routing
+            .select_from_scores(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+            .unwrap_err();
+        assert!(
+            source_err
+                .to_string()
+                .contains("must submit preselected CPU topK candidates"),
+            "{source_err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_routing_rejects_wrong_stage_placement_or_bounds() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let mut graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::RoutingSoftmaxTopK)
+            .unwrap();
+        routing.placement = FlashMoeStagePlacement::Metal;
+
+        let err = graph
+            .build_routing_topk(0, 8, 4, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap_err();
+        assert_eq!(err.family, graph.family());
+        assert_eq!(err.stage, FlashMoeGraphStage::RoutingSoftmaxTopK);
+        assert!(
+            err.to_string()
+                .contains("routing softmax/topK stage must be implemented"),
+            "{err:#}"
+        );
+
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(0, 2, 4, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let bounds_err = routing.select_from_scores(&[1.0, 2.0]).unwrap_err();
+        assert!(
+            bounds_err
+                .to_string()
+                .contains("active expert count 4 exceeds expert count 2"),
+            "{bounds_err:#}"
+        );
     }
 
     #[test]
