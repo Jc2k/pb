@@ -25,13 +25,14 @@
 2. **Update `src/init.rs`** when adding new per-project configuration fields
 3. **Web UI requirements**: Must include `viewport-fit=cover`, `env(safe-area-inset-*)` CSS, and PWA meta tags
 4. **Web UI tests**: Add or update `webui/src/**/*.test.ts` tests for web UI behavior changes, and run `deno task test:web` before committing
-5. **FlashMoe experiments**: When changing `src/inference/flashmoe/mod.rs` or `pb flashmoe` performance/correctness behavior, update `docs/flashmoe-experiments.md` with what was tried, the benchmark or test evidence, and whether to keep, retry, or avoid it.
+5. **FlashMoe architecture**: When changing FlashMoe data flow, scheduling, expert I/O, Metal kernels, or model-family behavior, keep `docs/flashmoe-architecture-parity-plan.md` aligned with the target architecture and current migration status.
 
 ## FlashMoe guidance
 
-- Treat `docs/flashmoe-experiments.md` as the regression ledger for FlashMoe work.
-- Keep the upstream `danveloper/flash-moe` lessons visible: 4-bit quality is the production target, K=4 routing is the Qwen3.5 baseline, expert I/O should stream through parallel `pread`, and the OS page cache should be trusted unless a measured experiment proves otherwise.
-- Do not reintroduce deleted FlashMoe environment toggles or cache migrations without documenting the reason and adding a row to the experiment ledger.
+- Treat `docs/flashmoe-architecture-parity-plan.md` as the source of truth for FlashMoe work.
+- Keep the upstream `danveloper/flash-moe` data flow visible: 4-bit quality is the production target, K=4 routing is the Qwen3.5 baseline, expert I/O should stream through scheduler-owned parallel `pread`, and the OS page cache should be trusted.
+- Do not chase isolated FlashMoe microbenchmarks or add Q4-only fast paths without a plan for all supported Qwen MoE variants to use the same data flow, scheduling, and CPU/GPU handoff.
+- Do not reintroduce hidden FlashMoe environment toggles, application expert caches, cache migrations, or alternate runtimes without updating the architecture plan first.
 - After FlashMoe backend changes, run the narrow smoke at minimum: `target/aarch64-apple-darwin/release/pb flashmoe infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`. It must exit 0 and print a sensible answer.
 
 ## Release process

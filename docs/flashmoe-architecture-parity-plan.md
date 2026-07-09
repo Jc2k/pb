@@ -10,6 +10,15 @@ lifetime, expert scheduling, command-buffer structure, read scheduling, and CPU/
 for every supported Qwen MoE variant. Model-family traits describe dimensions, tensor naming,
 quantized layouts, vision adapters, and dtype variants without forking that execution flow.
 
+"One path" means one scheduled execution graph. Q4, BF16, F16, Qwen3.5, Qwen MoE, and Qwen-VL may
+provide different typed implementations for graph stages, but they must not create separate runtimes,
+silent fallbacks, or alternate data-flow paths. If a required implementation is missing for a model
+variant, loading or planning must fail with an explicit unsupported-capability error so the gap can be
+implemented deliberately.
+
+This document replaces the old experiment ledger. Work should be judged by movement toward the
+target architecture and correctness parity, not by isolated tok/s experiments.
+
 ## Principles
 
 - FlashMoe is the backend for supported Qwen-family MoE models. llama.cpp is reserved for
@@ -18,10 +27,20 @@ quantized layouts, vision adapters, and dtype variants without forking that exec
   state, command-buffer sequencing, and read scheduling.
 - Model variants supply metadata through typed layouts and traits. They do not get a separate slow
   execution pipeline.
-- Rust generics and enums should express dtype/layout variation without changing the execution flow.
-- Qwen3.5-A17B parity is the first concrete target, but the shape should also carry Qwen MoE and
+- Rust generics, typed layout structs, and closed enums should express dtype/layout variation without
+  changing the execution flow. Avoid `dyn` traits in hot loops.
+- CPU and GPU placement is part of the execution policy, not a fallback mechanism. CPU attention math
+  or CPU softmax/topK is valid when it is the declared upstream-parity placement for that graph
+  stage; CPU execution because a Metal implementation is missing is an unsupported capability.
+- Q4-specific kernels, offsets, and packing are acceptable only when they fit the shared scheduler,
+  state, and command topology and have a clear route for BF16/F16 or future quantized variants.
+- Missing variant support must be an error, not a silent fallback. Reference CPU code belongs in
+  tests, diagnostics, and explicit unsupported-development tools, not in production execution.
+- Qwen3.5-A17B parity is the first concrete target, but the shape must also carry Qwen MoE and
   Qwen-VL through the same scheduler and buffer lifecycle.
-- Correctness must be proven with parity tests before full-model throughput claims.
+- Correctness must be proven with parity tests before full-model throughput claims. If a parity
+  alignment causes `2+2=` to produce the wrong answer, debug the math/state drift instead of
+  treating the alignment as a failed speed experiment.
 
 ## Upstream Behaviors To Mirror
 
@@ -32,7 +51,8 @@ Source of truth: `danveloper/flash-moe`, especially `metal_infer/infer.m`,
 - Non-expert weights are stored in one 64-byte-aligned binary blob and mapped once.
 - Experts are packed as fixed per-layer files. For Qwen3.5-A17B Q4 each expert is exactly
   7,077,888 bytes with fixed gate/up/down packed-weight, scale, and bias offsets.
-- Active experts are read with parallel positioned reads into reusable whole-expert buffers.
+- Active experts are read with parallel positioned reads into scheduler-owned reusable whole-expert
+  slots.
 - The OS page cache is the cache. Avoid application LRU caches, LZ4, mmap expert reads, broad
   prefetch, speculative expert reads, and dispatch_io.
 - Each layer follows one command-buffer topology:
@@ -44,84 +64,282 @@ Source of truth: `danveloper/flash-moe`, especially `metal_infer/infer.m`,
 - Expert Q4 matvec uses the upstream FMA dequant form. Gate/up/SwiGLU and down are encoded in the
   upstream-shaped expert command, not as independent upload-heavy component paths.
 
-## Current pb Architectural Gaps
+## Execution Graph And Capabilities
 
-- PBQ4 record parsing and per-component upload still sit inside runtime expert reads. This copies and
-  splits what should be one whole-expert buffer owned by the MoE scheduler.
-- The fixed upstream expert layout was tested only as a cache-format/parser change; it did not change
-  runtime buffer ownership, so it was not a real parity implementation.
-- The current execution loop still has CPU-owned hidden/residual vectors and clone/readback seams in
-  places where the backend should carry GPU-owned buffers between command buffers.
-- Routing has GPU topK machinery in some paths, while upstream kept CPU softmax/topK for the measured
-  Qwen3.5 path. The unified engine should make this an explicit scheduling decision, not an
-  accidental side branch.
-- Shared-expert Q4 handling is closer to upstream, but it is still grafted onto the existing
-  component-buffer expert phase instead of living inside a single MoE command structure.
-- Qwen-VL support currently encourages conditional flow in the runtime. Vision-specific work should
-  happen before text/MoE execution, then hand the same execution engine a typed sequence, position
-  plan, and model layout.
+Every supported model resolves to a single scheduled graph before inference starts. The graph
+contains the same conceptual stages for all variants:
 
-## Proposed Modules
+1. Token/position input preparation, including any vision adapter output.
+2. CMD3 completion from the previous layer when deferred work exists.
+3. CMD1 attention projections.
+4. Declared attention math placement.
+5. CMD2 output projection, residual update, post-attention norm, router projection, and shared
+   gate/up work.
+6. Declared routing placement, including softmax/topK.
+7. Scheduler-owned active expert reads into whole-expert slots.
+8. CMD3 active expert gate/up/down, shared down, combine, residual update, and next-layer input norm.
+9. LM-head/topK or sampling output.
 
-The refactor should break the current monolith by ownership boundary, not by "fast" versus "generic".
+Variant-specific behavior is expressed as typed capabilities attached to those stages. Examples:
+
+- `ExpertLayout::FixedQ4` can provide fixed packed-weight/scale/bias offsets and a Q4 FMA Metal
+  kernel for CMD3.
+- `DenseLayout::ResidentQ4` and `DenseLayout::ResidentBf16` can provide different projection
+  descriptors while sharing the same `weights` ownership and scheduler binding flow.
+- `RoutingPlacement::CpuSoftmaxTopK` and a future `RoutingPlacement::GpuSoftmaxTopK` can be two
+  implementations of the same scheduler stage, not separate execution paths.
+- Qwen-VL can provide a `vision` adapter and MRoPE/position plan, then hand the same runtime graph a
+  typed token sequence.
+
+Before loading, FlashMoe should validate that every graph stage has an implementation for the model
+family, dtype/layout, quantization, device placement, and execution policy. Missing support should
+produce a precise error, for example:
+
+```text
+FlashMoe unsupported Qwen3-VL Q4 path: CMD3 shared expert down projection is not implemented for
+FixedQ4 experts.
+```
+
+The validator should reject silent fallbacks such as:
+
+- Falling from fixed whole-expert slots to component-buffer expert execution.
+- Falling from a missing Metal kernel to production CPU math.
+- Falling from GPU-resident state to CPU vector clones/readbacks except at declared graph boundaries.
+- Falling from the unified scheduler to legacy direct calls.
+- Falling from FlashMoe to llama.cpp for a model that claims FlashMoe support.
+
+## Current State
+
+- `src/inference/flashmoe/mod.rs` is only a facade. Most production behavior is still exported from
+  `legacy.rs`, including planning, cache build, runtime, Metal command construction, expert readers,
+  state, tests, and Qwen-VL preprocessing.
+- `model_family.rs` now contains useful parity metadata: Qwen family detection, layer schedule,
+  configured K versus scheduled K, shared expert dimensions, Qwen-VL metadata, Qwen3.5 Q4 expert
+  offsets, and an `UPSTREAM_PARITY` execution policy.
+- `experts.rs` now contains reusable byte-buffer and fixed-slot view types that represent one expert
+  payload plus typed offsets. This is the right data-model direction, but the scheduler/runtime
+  boundary is not yet clean.
+- Existing code has moved some fixed-slot and Q4 handling toward whole-expert payload ownership, but
+  runtime behavior still lives in the historical monolith and still has fallbacks and component
+  pathways that can bypass the target data flow.
+- Production behavior can still silently use older CPU/component paths when a Q4 or Metal-shaped
+  implementation is missing. Those paths need to become either typed graph-stage implementations or
+  explicit unsupported-capability errors.
+- Dense weights are closer to the upstream resident-blob model than experts are, but the code is not
+  yet separated into a `weights` ownership boundary.
+- Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
+  verification tools, not the work queue.
+
+## Architectural Gaps
+
+- `legacy.rs` remains the center of gravity. New architecture work should extract ownership
+  boundaries from it instead of adding more production paths inside it.
+- The runtime has both fixed-slot Q4 concepts and older PBQ4/component concepts. PBQ4 should become
+  import/build compatibility only; execution should consume typed whole-expert slots.
+- Fallbacks are not yet consistently modeled as errors. Any branch that silently changes dtype,
+  buffer ownership, scheduler, or CPU/GPU placement hides missing implementation work and must be
+  made explicit.
+- Expert reads are close to upstream policy in spirit, but the scheduler boundary is incomplete.
+  Reads, reusable storage, pending read completion, metrics, and active expert binding should live
+  under a scheduler-owned API.
+- Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
+  should become explicit command builders used by every supported variant.
+- GPU residency is partial. Hidden, residual, normed, KV/recurrent state, router outputs, and
+  next-layer buffers still cross CPU/GPU boundaries in places that should become explicit state
+  transitions.
+- Routing policy is not yet a scheduler-level decision. For Qwen3.5 parity, router projection may
+  stay GPU-resident, but softmax/topK policy must be represented as part of the unified execution
+  plan rather than as incidental branch code.
+- Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
+  down should become part of the same CMD2/CMD3 model as routed experts.
+- Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
+  plans should feed the same text/MoE runtime rather than spreading multimodal branches through the
+  execution loop.
+
+## Target Modules
+
+The refactor should break the current monolith by ownership boundary, not by "fast" versus
+"generic".
 
 - `model_family`: Qwen-family traits and structs for tensor names, dimensions, attention schedule,
-  RoPE/MRoPE, expert layout, shared expert layout, and quantized dtype support.
-- `weights`: resident dense weight blob, manifest, typed tensor handles, and pull-time conversion.
+  RoPE/MRoPE, expert layout, shared expert layout, and dtype/quantized layout support.
+- `weights`: resident dense weight blob, manifest, typed tensor handles, alignment validation, and
+  pull-time conversion.
 - `experts`: fixed-slot expert pack layouts, validation, cache build, layer file handles, reusable
-  whole-expert read buffers, and read metrics.
-- `scheduler`: per-token/per-layer execution scheduler that owns the serial GPU -> SSD -> GPU policy.
+  whole-expert read buffers, optional Metal-backed slot storage, and read metrics.
+- `capabilities`: graph-stage capability resolution and explicit unsupported errors for missing
+  family/dtype/layout/device implementations.
+- `scheduler`: per-token/per-layer execution scheduler that owns the serial GPU -> SSD -> GPU policy,
+  active expert issue/finish, routing placement, capability-selected stage implementations, and CMD
+  sequencing.
 - `metal`: command-buffer builders and kernels for CMD1, CMD2, CMD3, LM-head/topK, KV cache, and
   recurrent-state operations.
-- `state`: KV cache, linear-attention recurrent state, token position state, and multimodal position
-  plans.
+- `state`: KV cache, linear-attention recurrent state, hidden/residual/normed buffer ownership,
+  token position state, and multimodal position plans.
 - `runtime`: model-family-agnostic generation loop that composes scheduler, weights, experts, metal,
   tokenizer output, and sampling.
+- `vision`: Qwen-VL preprocessing and image/token position adaptation that hands typed inputs to
+  `runtime`.
 
 ## Implementation Phases
 
-1. Define typed Qwen MoE layout traits.
-   Capture Qwen3.5-A17B constants as one implementation. Add tests for tensor names, layer schedule,
-   dimensions, expert offsets, shared expert dimensions, and Qwen-VL position-plan compatibility.
+1. Lock the typed model layout surface.
+   Keep `QwenMoeModelLayout` as the source for dimensions, K policy, layer kind, shared expert
+   shape, and Q4 fixed-slot offsets. Add only generic/typed extensions needed by BF16/F16/future Q
+   variants. Do not add new Qwen3.5-only execution branches.
 
-2. Replace runtime PBQ4 parsing with whole-expert layout handles.
-   Keep PBQ4 only as an import/build compatibility format if needed. Runtime expert reads should
-   return typed `ExpertSlot` handles containing one owned/reusable byte buffer or Metal buffer plus
-   layout offsets.
+2. Add graph capability validation.
+   Define the stage graph and validate every required stage at plan/load time. Unsupported
+   family/dtype/layout/device combinations must fail with named missing stages instead of silently
+   falling back to older CPU/component/direct-call paths.
 
-3. Move expert reads into scheduler-owned reusable buffers.
-   Allocate K reusable whole-expert slots per layer step, read directly into their storage, and bind
-   gate/up/down by offsets. The scheduler, not ad hoc layer code, decides when reads are issued and
-   finished.
+3. Extract expert storage and readers from `legacy.rs`.
+   Move fixed-slot layout validation, layer reader opening, positioned read helpers, reusable
+   buffers, read metrics, and PBQ4 import compatibility into `experts`. Runtime reads should return
+   typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split gate/up/down owners.
 
-4. Port the upstream command topology as the only MoE topology.
-   Build explicit CMD1/CMD2/CMD3 command builders. Remove alternate component-upload expert command
-   paths once parity tests cover dtype/layout variants.
+4. Introduce the scheduler API before optimizing it.
+   Create a scheduler that owns per-token/per-layer state: active expert IDs, pending read jobs,
+   reusable slot leases, routing placement, graph-stage implementations, and the order of
+   CMD1/CMD2/CMD3. Initially call existing Metal/runtime helpers through it, then shrink the old
+   direct calls. Direct calls that cannot be represented as graph stages should become unsupported
+   errors until implemented.
 
-5. Make GPU residency the normal handoff.
-   Carry hidden, residual, normed, KV/recurrent state, and next-layer normed buffers through the MoE
-   runtime with explicit ownership. CPU vectors should exist for tokenizer input, sampling output,
-   diagnostics, and fallback-only unsupported operations.
+5. Extract dense weights into `weights`.
+   Make the resident dense blob and typed projection descriptors a module-level data model. Keep Q4
+   and BF16/F32 projection descriptors parameterized by dtype/layout while sharing the same runtime
+   binding flow.
 
-6. Reconcile routing with upstream.
-   For Qwen3.5 parity, use CPU softmax/topK after the router projection. If later GPU routing wins
-   with the unified command structure, it must replace the policy for all supported variants through
-   the same scheduler interface.
+6. Make CMD1/CMD2/CMD3 explicit.
+   Move Metal command construction behind builders whose inputs are typed state and typed weight or
+   expert handles. Remove component-upload expert commands once fixed-slot and dtype/layout
+   capability tests cover the shared path.
 
-7. Add parity tests before benchmark claims.
-   Synthetic fixed expert layout, Q4 FMA dequant, active expert gate/up/down, shared expert, routing,
-   residual/norm handoff, linear attention recurrence, full attention, and per-layer golden fixtures.
+7. Move state ownership out of the generation loop.
+   Represent hidden, residual, normed, KV, recurrent, and next-layer buffers as state objects with
+   clear CPU-visible and GPU-resident transitions. CPU vectors are allowed for tokenizer input,
+   sampling output, diagnostics, and declared CPU graph stages.
 
-8. Benchmark sustained decode.
-   Compare pb `decode_tok_s` against upstream generation tok/s. Report TTFT/prefill separately.
+8. Reconcile routing through the scheduler.
+   For Qwen3.5 parity, model CPU softmax/topK after router projection. If GPU routing is kept or
+   later proven better, it must be selected through the same scheduler policy for all variants, with
+   parity tests proving equivalent logits/topK.
+
+9. Fold shared experts into the same command model.
+   Treat shared gate/up/down and shared down as scheduled work inside CMD2/CMD3, not as a side cache
+   or separate phase with different ownership.
+
+10. Isolate Qwen-VL as an adapter.
+   Move image preprocessing, vision tensor handling, MRoPE, and multimodal position planning into a
+   `vision` boundary that emits the same runtime inputs used by text-only MoE.
+
+11. Add parity and capability tests before benchmark claims.
+    Required coverage: fixed expert layout, Q4 FMA dequant, active expert gate/up/down, shared
+    expert, routing logits/topK, residual/norm handoff, linear attention recurrence, full attention,
+    KV/recurrent state updates, CMD buffer inputs/outputs, and per-layer golden fixtures where
+    available. Capability tests should prove supported models fully resolve and unsupported
+    variants fail with precise missing-stage errors.
+
+12. Benchmark sustained decode last.
+    Compare pb `decode_tok_s` against upstream generation tok/s only after correctness and data-flow
+    parity are in place. Report TTFT/prefill separately.
+
+## Immediate Work Queue
+
+1. Stop adding runtime behavior to `legacy.rs` except small call-through shims needed during
+   extraction.
+2. Add the graph capability validator and start converting silent fallbacks into explicit
+   unsupported errors.
+3. Move the expert reader/read-policy block from `legacy.rs` into `experts`, keeping tests with the
+   moved code.
+4. Add a scheduler module with a narrow API for "issue active expert reads" and "finish active
+   expert slots", then route current runtime expert reads through it.
+5. Convert active expert execution to consume scheduler-owned whole-expert slots only. Keep PBQ4 as
+   a conversion/input format, not a runtime branch.
+6. Extract dense projection descriptors and resident blob ownership into `weights`.
+7. Turn the current fused post-attention prep and expert phase helpers into named CMD2/CMD3 builder
+   calls with typed inputs.
+8. Add parity and capability tests around every extraction so behavior moves without hidden semantic
+   changes or fallback paths.
+9. Revisit the `2+2=` K=4 drift by comparing logits/state through the unified path. Do not revert
+   architecture-aligned data flow because the current math is wrong; fix the math.
+
+## Verification Discipline
+
+- Run focused unit/parity tests for the module being extracted.
+- Add capability tests whenever a new model family, dtype, layout, CPU/GPU placement, or graph stage
+  is introduced. Supported combinations must fully resolve; unsupported combinations must fail with
+  precise errors.
+- Run `cargo test --all-targets` after behavior-affecting Rust changes when feasible.
+- After FlashMoe backend changes, run:
+  `target/aarch64-apple-darwin/release/pb flashmoe infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`
+- Treat benchmarks as final confirmation, not as the driver for what to build next. Do not run
+  FlashMoe microbenchmarks until the bulk of the ownership-boundary refactor is complete and the
+  unified graph is compiling with parity/capability tests.
 
 ## Non-Goals
 
 - No second-class Qwen MoE execution path with different buffer ownership, scheduling, or CPU/GPU
   handoff behavior.
+- No silent fallback from missing implementation to a different dtype, buffer shape, scheduler,
+  runtime, CPU/GPU placement, or backend.
 - No hidden environment toggles for scheduler behavior.
 - No application expert cache, LZ4 main path, mmap expert reads, dispatch_io, broad prefetch, or
-  speculative expert reads unless a fresh architectural reason invalidates upstream's measured
-  failures.
+  speculative expert reads unless a fresh architectural reason invalidates upstream's design.
 - No Qwen3.5-only runtime fork that prevents Qwen/Qwen-VL from using the same scheduler and buffer
   lifecycle.
+- No isolated microbenchmark work that does not move data flow, scheduling, I/O, or CPU/GPU
+  ownership toward this plan.
+
+## Goal Prompt For Follow-On Work
+
+Use this prompt to drive implementation quickly without drifting back into experiments:
+
+```text
+We are implementing docs/flashmoe-architecture-parity-plan.md now. Move code toward the target
+architecture quickly, make it compile, and make the tests/smoke work. Do not stop at another plan.
+
+North star:
+- One scheduled FlashMoe execution graph for Qwen-family MoE models.
+- Q4/BF16/F16 and Qwen3.5/Qwen/Qwen-VL differences are typed implementations of graph stages, not
+  separate runtimes.
+- Missing support is an explicit unsupported-capability error, never silent fallback.
+- No isolated tok/s experiments, microbenchmarks, or Q4-only fast paths until the bulk of the
+  refactor is complete.
+
+Start by inspecting git status and the current FlashMoe modules. Treat existing changes as live user
+work. Do not revert them. Avoid adding new production behavior to src/inference/flashmoe/legacy.rs
+except narrow shims needed to extract code safely.
+
+Implement in this order:
+1. Add the graph/capability model: define the scheduled stages, supported placements, and explicit
+   unsupported errors for missing family/dtype/layout/Metal/CPU-GPU implementations.
+2. Move expert storage/read policy out of legacy.rs into experts: fixed-slot layouts, positioned
+   reads, reusable whole-expert slots, read metrics, and PBQ4 import compatibility.
+3. Add scheduler as the owner of active expert issue/finish, slot leases, routing placement, and
+   CMD1/CMD2/CMD3 sequencing. Route the current runtime through it.
+4. Convert active expert execution to consume scheduler-owned whole-expert slots with typed offsets.
+   Component-buffer or CPU/component fallback should become an unsupported error unless represented
+   as a declared graph-stage implementation.
+5. Extract resident dense weight/projection descriptors into weights with one binding flow across
+   Q4/BF16/F32 layouts.
+6. Turn the current fused post-attention prep and expert phase helpers into explicit CMD2/CMD3
+   builder calls with typed inputs.
+7. Move state ownership out of the generation loop: hidden, residual, normed, KV, recurrent, and
+   next-layer buffers should have clear CPU-visible and GPU-resident transitions.
+8. Keep Qwen-VL as a pre-MoE adapter that emits typed runtime inputs instead of branching through
+   the MoE execution loop.
+
+For every extraction, add focused parity or capability tests. Supported combinations must fully
+resolve. Unsupported combinations must fail with precise missing-stage errors. If a parity-aligned
+change makes `2+2=` wrong, debug logits/state/math through the unified path instead of reverting the
+architecture.
+
+Verification:
+- Run focused tests for each moved module.
+- Run cargo test --all-targets after significant behavior changes.
+- After FlashMoe backend changes, run:
+  target/aarch64-apple-darwin/release/pb flashmoe infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="
+- Do not run FlashMoe benchmarks or chase tok/s until the main ownership-boundary refactor,
+  capability validation, scheduler path, and CMD graph are in place and compiling.
+```
