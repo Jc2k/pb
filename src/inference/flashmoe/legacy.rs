@@ -10660,24 +10660,20 @@ impl FlashMoeEngine {
         let subphase_started = Instant::now();
         let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
         let metal_kv_ready = if let Some(metal) = &self.metal {
-            match metal.record_kv(
-                kv_record.position(),
-                kv_record.layer(),
-                layout,
-                kv_record.key(),
-                kv_record.value(),
-            ) {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(
-                        layer,
-                        position,
-                        error = %err,
-                        "falling back to CPU full-attention KV cache"
-                    );
-                    false
-                }
-            }
+            metal
+                .record_kv(
+                    kv_record.position(),
+                    kv_record.layer(),
+                    layout,
+                    kv_record.key(),
+                    kv_record.value(),
+                )
+                .with_context(|| {
+                    format!(
+                        "Metal full-attention KV record failed for declared attention stage at layer {layer} position {position}"
+                    )
+                })?;
+            true
         } else {
             false
         };
@@ -10832,20 +10828,13 @@ impl FlashMoeEngine {
         let tokens = position + 1;
         match metal.attention_backend(tokens) {
             MetalAttentionBackend::Cpu => cpu_attention(kv_cache),
-            MetalAttentionBackend::Gpu => {
-                match metal.causal_attention_cached(position, layer, q, layout) {
-                    Ok(output) => Ok(output),
-                    Err(err) => {
-                        tracing::warn!(
-                            layer,
-                            position,
-                            error = %err,
-                            "falling back to CPU full-attention after Metal attention failure"
-                        );
-                        cpu_attention(kv_cache)
-                    }
-                }
-            }
+            MetalAttentionBackend::Gpu => metal
+                .causal_attention_cached(position, layer, q, layout)
+                .with_context(|| {
+                    format!(
+                        "Metal full-attention execution failed for declared attention stage at layer {layer} position {position}"
+                    )
+                }),
         }
     }
 
