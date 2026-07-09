@@ -2,7 +2,10 @@ use super::capabilities::{
     FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
     FlashMoeUnsupportedCapability,
 };
-use super::experts::{ExpertReadPath, FLASHMOE_EXPERT_IO_POLICY};
+use super::experts::{
+    ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
+    FLASHMOE_EXPERT_IO_POLICY,
+};
 use super::math::softmax_in_place;
 use super::model_family::QwenMoeFamily;
 use anyhow::{Result, bail};
@@ -340,6 +343,33 @@ pub(crate) struct ScheduledExpertReadResponse<T> {
 }
 
 #[derive(Debug)]
+pub(crate) struct ScheduledExpertSlot {
+    raw: ExpertRawRead,
+}
+
+impl ScheduledExpertSlot {
+    fn from_raw(raw: ExpertRawRead) -> Self {
+        Self { raw }
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.raw.layer
+    }
+
+    pub(crate) fn expert(&self) -> usize {
+        self.raw.expert
+    }
+
+    pub(crate) fn descriptor(&self) -> ExpertSlotDescriptor {
+        self.raw.slot
+    }
+
+    pub(crate) fn into_raw(self) -> ExpertRawRead {
+        self.raw
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ActiveExpertReadScheduler {
     metrics: ExpertSchedulerMetrics,
     seen_reads: BTreeSet<ExpertReadKey>,
@@ -424,6 +454,25 @@ impl ActiveExpertReadScheduler {
         response.result.inspect_err(|_| {
             self.metrics.record_read_failure();
         })
+    }
+
+    pub(crate) fn finish_slot_read(
+        &mut self,
+        pending_id: u64,
+        response: ExpertRawReadResponse,
+    ) -> Result<ScheduledExpertSlot> {
+        self.finish_read(
+            pending_id,
+            ScheduledExpertReadResponse {
+                id: response.id,
+                queue_latency: response.queue_latency,
+                read_path: response.read_path,
+                read_latency: response.read_latency,
+                bytes_read: response.bytes_read,
+                warm: response.warm,
+                result: response.result.map(ScheduledExpertSlot::from_raw),
+            },
+        )
     }
 
     pub(crate) fn finish_routes<T>(
@@ -577,6 +626,9 @@ impl ExpertSchedulerSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::flashmoe::experts::{
+        ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertSlotSpec,
+    };
     use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
 
     fn qwen35_layout() -> QwenMoeModelLayout {
@@ -600,6 +652,37 @@ mod tests {
         )
         .unwrap();
         QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap()
+    }
+
+    fn raw_pbq4_read(layer: usize, expert: usize, payload: Vec<u8>) -> ExpertRawRead {
+        let layout = qwen35_layout();
+        ExpertRawRead {
+            layer,
+            expert,
+            slot: ExpertSlotDescriptor {
+                layer,
+                expert,
+                slot_offset: 1024,
+                slot_capacity: payload.len(),
+                payload_len: payload.len(),
+            },
+            metadata: ExpertPackMetadata {
+                layer,
+                expert,
+                packed_bytes: payload.len() as u64,
+                records: Vec::new(),
+            },
+            fixed_q4: FixedQ4ExpertSlotSpec::new(
+                layout.q4_expert_layout,
+                layout.hidden_size,
+                layout.moe_intermediate_size,
+            )
+            .unwrap(),
+            recycle_pool: None,
+            payload: ExpertRawPayload::Pbq4(payload),
+            read_latency: Duration::from_millis(7),
+            read_path: ExpertReadPath::PositionedRead,
+        }
     }
 
     #[test]
@@ -850,6 +933,47 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(scheduler.snapshot().read_failures, 1);
+    }
+
+    #[test]
+    fn active_expert_scheduler_finishes_raw_reads_as_scheduled_slots() {
+        let mut scheduler = ActiveExpertReadScheduler::new(1.0);
+        let issue = scheduler.issue_read(3, 8);
+
+        let slot = scheduler
+            .finish_slot_read(
+                issue.id,
+                ExpertRawReadResponse {
+                    id: issue.id,
+                    queue_latency: Duration::from_millis(1),
+                    read_path: ExpertReadPath::PositionedRead,
+                    read_latency: Duration::from_millis(7),
+                    bytes_read: 3,
+                    warm: issue.warm,
+                    result: Ok(raw_pbq4_read(3, 8, vec![1, 2, 3])),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(slot.layer(), 3);
+        assert_eq!(slot.expert(), 8);
+        assert_eq!(
+            slot.descriptor(),
+            ExpertSlotDescriptor {
+                layer: 3,
+                expert: 8,
+                slot_offset: 1024,
+                slot_capacity: 3,
+                payload_len: 3,
+            }
+        );
+        let raw = slot.into_raw();
+        assert!(matches!(raw.payload, ExpertRawPayload::Pbq4(_)));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 1);
+        assert_eq!(snapshot.positioned_reads, 1);
+        assert_eq!(snapshot.bytes_read, 3);
+        assert_eq!(snapshot.read_failures, 0);
     }
 
     #[test]

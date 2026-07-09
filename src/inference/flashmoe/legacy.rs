@@ -83,8 +83,8 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    PendingScheduledExpertSet, PendingScheduledRead, ScheduledExpertReadResponse,
-    ScheduledExpertSet as SchedulerScheduledExpertSet,
+    PendingScheduledExpertSet, PendingScheduledRead,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -18156,16 +18156,8 @@ impl ExpertScheduler {
             let response = pending
                 .recv()
                 .context("expert I/O worker dropped response channel")?;
-            let response = ScheduledExpertReadResponse {
-                id: response.id,
-                queue_latency: response.queue_latency,
-                read_path: response.read_path,
-                read_latency: response.read_latency,
-                bytes_read: response.bytes_read,
-                warm: response.warm,
-                result: response.result.and_then(ExpertWeights::from_raw_read),
-            };
-            out.push(Arc::new(self.core.finish_read(pending_id, response)?));
+            let slot = self.core.finish_slot_read(pending_id, response)?;
+            out.push(Arc::new(ExpertWeights::from_scheduled_slot(slot)?));
         }
         Ok(out)
     }
@@ -18405,6 +18397,20 @@ impl AsRef<ExpertWeights> for ExpertWeights {
 }
 
 impl ExpertWeights {
+    fn from_scheduled_slot(slot: ScheduledExpertSlot) -> Result<Self> {
+        let descriptor = slot.descriptor();
+        if descriptor.layer != slot.layer() || descriptor.expert != slot.expert() {
+            bail!(
+                "scheduled expert slot descriptor layer {} expert {} does not match slot key layer {} expert {}",
+                descriptor.layer,
+                descriptor.expert,
+                slot.layer(),
+                slot.expert()
+            );
+        }
+        Self::from_raw_read(slot.into_raw())
+    }
+
     fn from_raw_read(raw: ExpertRawRead) -> Result<Self> {
         let (records, fixed_q4, packed_prefix) = match raw.payload {
             ExpertRawPayload::Pbq4(bytes) => {
