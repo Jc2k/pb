@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
+use anyhow::{Result, bail};
+
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeSessionState<K> {
     pub(crate) tokens: Vec<u32>,
@@ -728,6 +730,28 @@ impl FlashMoeTokenState {
         self.clear_next_layer_normed();
     }
 
+    pub(crate) fn apply_declared_expert_phase_output(
+        &mut self,
+        output: FlashMoeExpertPhaseOutput,
+    ) -> Result<()> {
+        if output.declared_cmd3_output().is_none() {
+            bail!("FlashMoe token state refused undeclared expert phase output");
+        }
+        self.apply_expert_phase_output(output);
+        Ok(())
+    }
+
+    pub(crate) fn apply_declared_expert_phase_hidden_only(
+        &mut self,
+        output: FlashMoeExpertPhaseOutput,
+    ) -> Result<()> {
+        if output.declared_cmd3_output().is_none() {
+            bail!("FlashMoe token state refused undeclared expert phase hidden output");
+        }
+        self.apply_expert_phase_hidden_only(output);
+        Ok(())
+    }
+
     pub(crate) fn take_next_layer_normed_as_normed(&mut self) -> Option<FlashMoeCpuBuffer> {
         self.next_layer_normed
             .take()
@@ -954,6 +978,7 @@ impl FlashMoeLinearAttentionCacheState {
 pub(crate) struct FlashMoeExpertPhaseOutput {
     hidden: Vec<f32>,
     next_normed: Option<Vec<f32>>,
+    declared_cmd3_output: Option<FlashMoeCmd3OutputState>,
 }
 
 impl FlashMoeExpertPhaseOutput {
@@ -961,6 +986,7 @@ impl FlashMoeExpertPhaseOutput {
         Self {
             hidden,
             next_normed,
+            declared_cmd3_output: None,
         }
     }
 
@@ -970,6 +996,15 @@ impl FlashMoeExpertPhaseOutput {
 
     pub(crate) fn next_normed_len(&self) -> Option<usize> {
         self.next_normed.as_ref().map(Vec::len)
+    }
+
+    pub(crate) fn with_declared_cmd3_output(mut self, state: FlashMoeCmd3OutputState) -> Self {
+        self.declared_cmd3_output = Some(state);
+        self
+    }
+
+    pub(crate) fn declared_cmd3_output(&self) -> Option<FlashMoeCmd3OutputState> {
+        self.declared_cmd3_output
     }
 
     pub(crate) fn into_hidden_and_next_normed(self) -> (Vec<f32>, Option<Vec<f32>>) {
@@ -1521,6 +1556,39 @@ mod tests {
         );
         state.replace_hidden(vec![5.0]);
         assert_eq!(state.into_hidden_values(), vec![5.0]);
+    }
+
+    #[test]
+    fn token_state_requires_declared_expert_output_for_scheduled_application() {
+        let mut state = FlashMoeTokenState::new(vec![1.0, 2.0], 10);
+        let raw_err = state
+            .apply_declared_expert_phase_output(FlashMoeExpertPhaseOutput::new(
+                vec![3.0, 4.0],
+                Some(vec![5.0, 6.0]),
+            ))
+            .unwrap_err();
+        assert!(
+            raw_err
+                .to_string()
+                .contains("refused undeclared expert phase output"),
+            "{raw_err:#}"
+        );
+
+        let declared = FlashMoeExpertPhaseOutput::new(vec![3.0, 4.0], Some(vec![5.0, 6.0]))
+            .with_declared_cmd3_output(FlashMoeCmd3OutputState::gpu_resident(2, true));
+        state.apply_declared_expert_phase_output(declared).unwrap();
+        assert_eq!(&state.hidden()[..], &[3.0, 4.0]);
+        let normed = state.take_next_layer_normed_as_normed().unwrap();
+        assert_eq!(&normed[..], &[5.0, 6.0]);
+
+        let declared_hidden_only =
+            FlashMoeExpertPhaseOutput::new(vec![7.0, 8.0], Some(vec![9.0, 10.0]))
+                .with_declared_cmd3_output(FlashMoeCmd3OutputState::gpu_resident(2, true));
+        state
+            .apply_declared_expert_phase_hidden_only(declared_hidden_only)
+            .unwrap();
+        assert_eq!(&state.hidden()[..], &[7.0, 8.0]);
+        assert!(state.take_next_layer_normed_as_normed().is_none());
     }
 
     #[test]

@@ -126,10 +126,10 @@ The validator should reject silent fallbacks such as:
   boundary, routing topK placement validation with retained routing-output handoff into route
   selection, declared router-score batches for CPU routing output, scheduler-built preselected
   routing commands from CMD2 post-attention prep output, declared CMD1 input-state validation, CMD2
-  routing-output validation, scheduled CMD3 output readback validation, full-attention KV placement
-  and execution-shape validation for the declared attention math implementation, active expert read
-  issue and finish metrics, route normalization, pending read sets, shared-expert source/shape
-  validation, and the scheduled whole-slot handoff.
+  routing-output validation, scheduled CMD3 output readback validation with declared token-state
+  application, full-attention KV placement and execution-shape validation for the declared attention
+  math implementation, active expert read issue and finish metrics, route normalization, pending
+  read sets, shared-expert source/shape validation, and the scheduled whole-slot handoff.
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.

@@ -1589,7 +1589,7 @@ impl ScheduledCmd3OutputState {
             }
             _ => {}
         }
-        Ok(output)
+        Ok(output.with_declared_cmd3_output(state))
     }
 }
 
@@ -3781,7 +3781,8 @@ mod tests {
 
         let output = FlashMoeExpertPhaseOutput::new(vec![0.0; 8], Some(vec![1.0; 8]));
 
-        assert!(output_state.validate_expert_phase_output(output).is_ok());
+        let output = output_state.validate_expert_phase_output(output).unwrap();
+        assert_eq!(output.declared_cmd3_output(), Some(output_state.state()));
     }
 
     #[test]
