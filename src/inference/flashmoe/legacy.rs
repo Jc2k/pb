@@ -91,7 +91,8 @@ use super::scheduler::{
     ScheduledCmd3OutputState, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledSharedExpert, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledRoutingCommand, ScheduledSharedExpert,
+    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -1876,7 +1877,7 @@ struct MetalExecutor {
 }
 
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
-type ScheduledPreselectedRoutingOutput = (ScheduledCmd2PostAttentionPrepOutput, Vec<(usize, f32)>);
+type ScheduledPreselectedRoutingOutput = ScheduledRoutingCommand;
 
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
@@ -2055,6 +2056,31 @@ struct MetalPostAttentionPrep {
     state: FlashMoePostAttentionPrepState,
     width: usize,
     active: Vec<(usize, f32)>,
+    routing_command: Option<ScheduledRoutingCommand>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalPostAttentionPrep {
+    fn declare_routing_command(
+        &mut self,
+        graph: &FlashMoeScheduledGraph,
+        cmd2_output: ScheduledCmd2PostAttentionPrepOutput,
+    ) -> Result<ScheduledRoutingCommand> {
+        if cmd2_output.state() != self.state {
+            bail!(
+                "FlashMoe scheduled CMD2 prep state does not match Metal prep state for layer {}",
+                cmd2_output.layer
+            );
+        }
+        let routing_command =
+            graph.command_from_cmd2_preselected_routes(cmd2_output, &self.active)?;
+        debug_assert_eq!(
+            routing_command.source,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+        );
+        self.routing_command = Some(routing_command.clone());
+        Ok(routing_command)
+    }
 }
 
 impl MetalExecutor {
@@ -4748,6 +4774,7 @@ impl MetalExecutorInner {
                 state,
                 width: residual_len,
                 active,
+                routing_command: None,
             }))
         }
     }
@@ -7713,6 +7740,7 @@ impl MetalExecutorInner {
                 state,
                 width,
                 active,
+                routing_command: None,
             }))
         }
     }
@@ -7903,6 +7931,7 @@ impl MetalExecutorInner {
                 state,
                 width,
                 active,
+                routing_command: None,
             }))
         }
     }
@@ -10430,11 +10459,12 @@ impl FlashMoeEngine {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if let Some(prep) = metal_post_attention_prep.as_ref() {
+            if let Some(prep) = metal_post_attention_prep.as_mut() {
                 let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                 debug_assert_eq!(cmd2_output.width(), prep.width);
                 debug_assert_eq!(cmd2_output.state(), prep.state);
-                precomputed_active = Some((cmd2_output, prep.active.clone()));
+                precomputed_active =
+                    Some(prep.declare_routing_command(&self.scheduled_graph, cmd2_output)?);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some((out_proj_name, attention_values)) =
@@ -10469,12 +10499,14 @@ impl FlashMoeEngine {
                     {
                         pending.finish_without_readback()?;
                     }
+                    let mut prep = prep;
                     let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                     debug_assert_eq!(cmd2_output.width(), prep.width);
                     debug_assert_eq!(cmd2_output.state(), prep.state);
-                    let active = (cmd2_output, prep.active.clone());
+                    let routing_command =
+                        prep.declare_routing_command(&self.scheduled_graph, cmd2_output)?;
                     metal_post_attention_prep = Some(prep);
-                    precomputed_active = Some(active);
+                    precomputed_active = Some(routing_command);
                     if let Some(attention_values) = attention_values.take() {
                         metal.recycle_attention_values(attention_values);
                     }
@@ -10514,9 +10546,9 @@ impl FlashMoeEngine {
                     }
                 }
             }
-            let active = if let Some((cmd2_output, active)) = precomputed_active {
+            let active = if let Some(routing_command) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                self.validate_preselected_routes(cmd2_output, active)?
+                routing_command.routes
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
@@ -10548,17 +10580,19 @@ impl FlashMoeEngine {
                         {
                             pending.finish_without_readback()?;
                         }
+                        let mut prep = prep;
                         let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
                         debug_assert_eq!(cmd2_output.width(), prep.width);
                         debug_assert_eq!(cmd2_output.state(), prep.state);
-                        let active = (cmd2_output, prep.active.clone());
+                        let routing_command =
+                            prep.declare_routing_command(&self.scheduled_graph, cmd2_output)?;
                         metal_post_attention_prep = Some(prep);
-                        prepared = Some(active);
+                        prepared = Some(routing_command);
                     }
                 }
-                if let Some((cmd2_output, active)) = prepared {
+                if let Some(routing_command) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    self.validate_preselected_routes(cmd2_output, active)?
+                    routing_command.routes
                 } else {
                     if deferred_attention_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -11274,21 +11308,6 @@ impl FlashMoeEngine {
         scheduled_routing
             .select_command_from_output_scores(routing_output, &router_scores)
             .map(|command| command.routes)
-    }
-
-    fn validate_preselected_routes(
-        &self,
-        cmd2_output: ScheduledCmd2PostAttentionPrepOutput,
-        active: Vec<(usize, f32)>,
-    ) -> Result<Vec<(usize, f32)>> {
-        let routing_command = self
-            .scheduled_graph
-            .command_from_cmd2_preselected_routes(cmd2_output, &active)?;
-        debug_assert_eq!(
-            routing_command.source,
-            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
-        );
-        Ok(routing_command.routes)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -32225,7 +32244,7 @@ mod tests {
         .unwrap();
         let expected_active = top_k(&expected_router, 3);
 
-        let prep = store
+        let mut prep = store
             .post_attention_q4_prep_with_metal(
                 &metal,
                 layer,
@@ -32252,6 +32271,41 @@ mod tests {
                 "active expert score at slot {slot} diverged: actual={actual_score}, expected={expected_score}"
             );
         }
+        assert!(prep.routing_command.is_none());
+        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
+        let scheduled_cmd2 = scheduled_graph
+            .build_cmd2_post_attention(
+                layer,
+                3,
+                ScheduledCmd2AttentionSource::CpuAttentionValues,
+                ScheduledCmd2ResidualSource::CpuHidden,
+            )
+            .unwrap();
+        let scheduled_cmd2 = ScheduledPostAttentionPhase::new(
+            scheduled_cmd2,
+            ScheduledCmd2PhaseInputs::new(
+                ScheduledCmd2AttentionSource::CpuAttentionValues,
+                ScheduledCmd2ResidualSource::CpuHidden,
+                attention_width,
+                width,
+            ),
+        )
+        .unwrap()
+        .into_cmd2_command();
+        let cmd2_output = scheduled_cmd2
+            .resolve_post_attention_prep(prep.state)
+            .unwrap();
+        let routing_command = prep
+            .declare_routing_command(&scheduled_graph, cmd2_output)
+            .unwrap();
+        assert_eq!(
+            routing_command.source,
+            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+        );
+        assert_eq!(routing_command.routes, expected_active);
+        assert_eq!(prep.routing_command, Some(routing_command));
 
         unsafe {
             let residual_ptr = msg_send_ptr0(prep.residual_buffer, sel("contents")).cast::<f32>();

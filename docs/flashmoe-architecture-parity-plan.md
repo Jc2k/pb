@@ -141,10 +141,12 @@ The validator should reject silent fallbacks such as:
   Metal encoder or runtime helpers are called. CMD3 next-layer norm weights are declared as typed
   scheduled inputs with source, tensor name, and width before the Metal encoder receives the CPU
   slice; when the graph expects the next-layer norm transition, a missing norm tensor is now an
-  unsupported scheduled-CMD3 error rather than a silent no-next-norm path. Scheduled CMD3 Metal
-  submission now returns a concrete deferred phase from both the wrapper and inner scheduled helpers,
-  and treats "no submitted phase" as an unsupported implementation gap instead of returning to a
-  fallback-shaped caller path.
+  unsupported scheduled-CMD3 error rather than a silent no-next-norm path. Fused Metal
+  post-attention prep now records the scheduler-approved routing command before the runtime consumes
+  its preselected routes, so CMD2-to-routing handoff is not just a loose active-expert vector.
+  Scheduled CMD3 Metal submission now returns a concrete deferred phase from both the wrapper and
+  inner scheduled helpers, and treats "no submitted phase" as an unsupported implementation gap
+  instead of returning to a fallback-shaped caller path.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
