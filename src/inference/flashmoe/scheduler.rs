@@ -504,6 +504,7 @@ impl ScheduledCmd2Inputs for ScheduledCmd2PhaseInputs {
 pub struct ScheduledCmd2Submission<TInputs> {
     pub cmd2: ScheduledCmd2PostAttention,
     pub inputs: TInputs,
+    input_state: FlashMoeCmd2InputState,
 }
 
 impl<TInputs> ScheduledCmd2Submission<TInputs>
@@ -564,7 +565,11 @@ where
                 cmd2.residual
             );
         }
-        Ok(Self { cmd2, inputs })
+        Ok(Self {
+            cmd2,
+            inputs,
+            input_state,
+        })
     }
 
     pub(crate) fn into_cmd2_command(self) -> ScheduledCmd2Command<TInputs> {
@@ -573,6 +578,7 @@ where
             layer: self.cmd2.layer,
             active_experts: self.cmd2.active_experts,
             inputs: self.inputs,
+            input_state: self.input_state,
         }
     }
 }
@@ -583,9 +589,14 @@ pub struct ScheduledCmd2Command<TInputs> {
     pub layer: usize,
     pub active_experts: usize,
     pub inputs: TInputs,
+    input_state: FlashMoeCmd2InputState,
 }
 
 impl<TInputs> ScheduledCmd2Command<TInputs> {
+    pub(crate) fn input_state(&self) -> FlashMoeCmd2InputState {
+        self.input_state
+    }
+
     pub(crate) fn resolve_post_attention_prep(
         &self,
         state: FlashMoePostAttentionPrepState,
@@ -3123,7 +3134,7 @@ mod tests {
             command.inputs.scheduled_cmd2_residual_source(),
             ScheduledCmd2ResidualSource::MetalBuffer
         );
-        let input_state = command.inputs.scheduled_cmd2_input_state(command.layer);
+        let input_state = command.input_state();
         assert_eq!(input_state.attention().len(), 4096);
         assert_eq!(
             input_state.attention().placement(),

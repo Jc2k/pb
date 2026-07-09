@@ -10390,6 +10390,15 @@ impl FlashMoeEngine {
                 ),
             )?
             .into_cmd2_command();
+            debug_assert_eq!(scheduled_cmd2.input_state().layer(), layer);
+            debug_assert_eq!(
+                scheduled_cmd2.input_state().attention().len(),
+                cmd2_attention_len
+            );
+            debug_assert_eq!(
+                scheduled_cmd2.input_state().residual().len(),
+                cmd2_residual_len
+            );
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut precomputed_active: Option<ScheduledPreselectedRoutingOutput> = None;
