@@ -78,6 +78,8 @@ impl FlashMoeScheduledGraph {
         &self,
         layer: usize,
         active_experts: usize,
+        attention: ScheduledCmd2AttentionSource,
+        residual: ScheduledCmd2ResidualSource,
     ) -> Result<ScheduledCmd2PostAttention, FlashMoeUnsupportedCapability> {
         let stage = *self.stage(FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection);
         if stage.placement != FlashMoeStagePlacement::Metal {
@@ -91,6 +93,8 @@ impl FlashMoeScheduledGraph {
             stage,
             layer,
             active_experts,
+            attention,
+            residual,
         })
     }
 
@@ -98,6 +102,9 @@ impl FlashMoeScheduledGraph {
         &self,
         layer: usize,
         expert_count: usize,
+        input: ScheduledCmd3InputSource,
+        shared: ScheduledSharedExpertSource,
+        next_norm: ScheduledNextNormSource,
     ) -> Result<ScheduledCmd3ExpertPhase, FlashMoeUnsupportedCapability> {
         let stage = *self.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
         if stage.placement != FlashMoeStagePlacement::Metal {
@@ -111,8 +118,23 @@ impl FlashMoeScheduledGraph {
             stage,
             layer,
             expert_count,
+            input,
+            shared,
+            next_norm,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd2AttentionSource {
+    CpuAttentionValues,
+    MetalAttentionValues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd2ResidualSource {
+    CpuHidden,
+    MetalBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +142,27 @@ pub struct ScheduledCmd2PostAttention {
     pub stage: FlashMoeStageCapability,
     pub layer: usize,
     pub active_experts: usize,
+    pub attention: ScheduledCmd2AttentionSource,
+    pub residual: ScheduledCmd2ResidualSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd3InputSource {
+    MetalPostAttentionPrep,
+    CpuNormedResidualUpload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledSharedExpertSource {
+    None,
+    DenseCpuWeights,
+    ResidentQ4Projections,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledNextNormSource {
+    None,
+    CpuVisibleWeights,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +170,9 @@ pub struct ScheduledCmd3ExpertPhase {
     pub stage: FlashMoeStageCapability,
     pub layer: usize,
     pub expert_count: usize,
+    pub input: ScheduledCmd3InputSource,
+    pub shared: ScheduledSharedExpertSource,
+    pub next_norm: ScheduledNextNormSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -727,8 +773,23 @@ mod tests {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
 
-        let cmd2 = graph.build_cmd2_post_attention(14, 4).unwrap();
-        let cmd3 = graph.build_cmd3_expert_phase(14, 4).unwrap();
+        let cmd2 = graph
+            .build_cmd2_post_attention(
+                14,
+                4,
+                ScheduledCmd2AttentionSource::MetalAttentionValues,
+                ScheduledCmd2ResidualSource::MetalBuffer,
+            )
+            .unwrap();
+        let cmd3 = graph
+            .build_cmd3_expert_phase(
+                14,
+                4,
+                ScheduledCmd3InputSource::MetalPostAttentionPrep,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledNextNormSource::CpuVisibleWeights,
+            )
+            .unwrap();
 
         assert_eq!(
             cmd2.stage.stage,
@@ -738,12 +799,23 @@ mod tests {
         assert_eq!(cmd2.layer, 14);
         assert_eq!(cmd2.active_experts, 4);
         assert_eq!(
+            cmd2.attention,
+            ScheduledCmd2AttentionSource::MetalAttentionValues
+        );
+        assert_eq!(cmd2.residual, ScheduledCmd2ResidualSource::MetalBuffer);
+        assert_eq!(
             cmd3.stage.stage,
             FlashMoeGraphStage::Cmd3ExpertAndSharedCombine
         );
         assert_eq!(cmd3.stage.placement, FlashMoeStagePlacement::Metal);
         assert_eq!(cmd3.layer, 14);
         assert_eq!(cmd3.expert_count, 4);
+        assert_eq!(cmd3.input, ScheduledCmd3InputSource::MetalPostAttentionPrep);
+        assert_eq!(
+            cmd3.shared,
+            ScheduledSharedExpertSource::ResidentQ4Projections
+        );
+        assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
     }
 
     #[test]
@@ -757,7 +829,15 @@ mod tests {
             .unwrap();
         cmd3.placement = FlashMoeStagePlacement::CpuDeclared;
 
-        let err = graph.build_cmd3_expert_phase(0, 4).unwrap_err();
+        let err = graph
+            .build_cmd3_expert_phase(
+                0,
+                4,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap_err();
 
         assert_eq!(err.family, graph.family());
         assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);

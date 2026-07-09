@@ -83,8 +83,10 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    PendingScheduledExpertSet, PendingScheduledRead,
+    PendingScheduledExpertSet, PendingScheduledRead, ScheduledCmd2AttentionSource,
+    ScheduledCmd2ResidualSource, ScheduledCmd3ExpertPhase, ScheduledCmd3InputSource,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledNextNormSource, ScheduledSharedExpertSource,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -1922,6 +1924,14 @@ impl<'a> SharedExpertPhaseRef<'a> {
     fn is_some(self) -> bool {
         !matches!(self, Self::None)
     }
+
+    fn scheduled_source(self) -> ScheduledSharedExpertSource {
+        match self {
+            Self::None => ScheduledSharedExpertSource::None,
+            Self::Dense(_) => ScheduledSharedExpertSource::DenseCpuWeights,
+            Self::Q4(_) => ScheduledSharedExpertSource::ResidentQ4Projections,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1936,6 +1946,7 @@ enum ExpertPhaseInput<'a> {
 
 #[derive(Debug)]
 struct ScheduledExpertPhase<'a> {
+    cmd3: ScheduledCmd3ExpertPhase,
     position: usize,
     scheduled: &'a ScheduledExpertSet,
     input: ExpertPhaseInput<'a>,
@@ -2160,6 +2171,45 @@ impl MetalExecutor {
         &self,
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<Option<DeferredExpertPhase>> {
+        if phase.cmd3.layer != phase.scheduled.layer
+            || phase.cmd3.expert_count != phase.scheduled.len()
+        {
+            bail!(
+                "FlashMoe scheduled CMD3 descriptor layer {} experts {} does not match scheduled expert set layer {} experts {}",
+                phase.cmd3.layer,
+                phase.cmd3.expert_count,
+                phase.scheduled.layer,
+                phase.scheduled.len()
+            );
+        }
+        if phase.cmd3.shared != phase.shared.scheduled_source() {
+            bail!(
+                "FlashMoe scheduled CMD3 shared source {:?} does not match phase shared source {:?}",
+                phase.cmd3.shared,
+                phase.shared.scheduled_source()
+            );
+        }
+        if phase.cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
+            && phase.next_norm_weight.is_none()
+        {
+            bail!("FlashMoe scheduled CMD3 requires next-norm weights but none were provided");
+        }
+        if phase.cmd3.next_norm == ScheduledNextNormSource::None && phase.next_norm_weight.is_some()
+        {
+            bail!("FlashMoe scheduled CMD3 received next-norm weights for a no-next-norm stage");
+        }
+        match (&phase.input, phase.cmd3.input) {
+            (ExpertPhaseInput::Cpu { .. }, ScheduledCmd3InputSource::CpuNormedResidualUpload) => {}
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            (
+                ExpertPhaseInput::MetalPostAttention(_),
+                ScheduledCmd3InputSource::MetalPostAttentionPrep,
+            ) => {}
+            _ => bail!(
+                "FlashMoe scheduled CMD3 input {:?} does not match phase input",
+                phase.cmd3.input
+            ),
+        }
         match phase.input {
             ExpertPhaseInput::Cpu { normed, residual } => self.submit_expert_phase(
                 phase.position,
@@ -10037,9 +10087,24 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
                 early_metal_post_attention_prep;
-            let scheduled_cmd2 = self
-                .scheduled_graph
-                .build_cmd2_post_attention(layer, self.routing_policy.active_experts)?;
+            let cmd2_attention_source = if metal_post_attention_prep.is_some()
+                || metal_post_attention_values_for_prep.is_some()
+            {
+                ScheduledCmd2AttentionSource::MetalAttentionValues
+            } else {
+                ScheduledCmd2AttentionSource::CpuAttentionValues
+            };
+            let cmd2_residual_source = if deferred_residual_input.is_some() {
+                ScheduledCmd2ResidualSource::MetalBuffer
+            } else {
+                ScheduledCmd2ResidualSource::CpuHidden
+            };
+            let scheduled_cmd2 = self.scheduled_graph.build_cmd2_post_attention(
+                layer,
+                self.routing_policy.active_experts,
+                cmd2_attention_source,
+                cmd2_residual_source,
+            )?;
             let combine_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut precomputed_active: Option<Vec<(usize, f32)>> = early_active;
@@ -10277,11 +10342,6 @@ impl FlashMoeEngine {
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.routes.len());
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.weights.len());
             debug_assert_eq!(scheduled_experts.is_empty(), active.is_empty());
-            let scheduled_cmd3 = self
-                .scheduled_graph
-                .build_cmd3_expert_phase(layer, scheduled_experts.len())?;
-            debug_assert_eq!(scheduled_cmd3.layer, layer);
-            debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
             for (expert, weight) in scheduled_experts
                 .experts
                 .iter()
@@ -10296,12 +10356,30 @@ impl FlashMoeEngine {
             } else {
                 None
             };
+            let scheduled_cmd3 = self.scheduled_graph.build_cmd3_expert_phase(
+                layer,
+                scheduled_experts.len(),
+                if has_metal_post_attention_prep {
+                    ScheduledCmd3InputSource::MetalPostAttentionPrep
+                } else {
+                    ScheduledCmd3InputSource::CpuNormedResidualUpload
+                },
+                shared_phase.scheduled_source(),
+                if next_norm_weight.is_some() {
+                    ScheduledNextNormSource::CpuVisibleWeights
+                } else {
+                    ScheduledNextNormSource::None
+                },
+            )?;
+            debug_assert_eq!(scheduled_cmd3.layer, layer);
+            debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
             let mut submitted_deferred = false;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(metal) = &self.metal
                 && let Some(prep) = metal_post_attention_prep.take()
             {
                 let phase = ScheduledExpertPhase {
+                    cmd3: scheduled_cmd3,
                     position,
                     scheduled: &scheduled_experts,
                     input: ExpertPhaseInput::MetalPostAttention(prep),
@@ -10326,6 +10404,7 @@ impl FlashMoeEngine {
                 && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
                 && let Some(pending) =
                     metal.submit_scheduled_expert_phase(ScheduledExpertPhase {
+                        cmd3: scheduled_cmd3,
                         position,
                         scheduled: &scheduled_experts,
                         input: ExpertPhaseInput::Cpu {
