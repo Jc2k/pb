@@ -8,6 +8,7 @@ use super::experts::{
 };
 use super::math::softmax_in_place;
 use super::model_family::QwenMoeFamily;
+use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -382,6 +383,56 @@ where
 
 pub trait ScheduledSharedExpert {
     fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScheduledSharedExpertPhaseRef<'a> {
+    None,
+    Dense(&'a SharedExpertPhaseWeights),
+    Q4(&'a SharedExpertPhaseQ4Projections),
+}
+
+impl<'a> ScheduledSharedExpertPhaseRef<'a> {
+    pub(crate) fn from_options(
+        dense: Option<&'a SharedExpertPhaseWeights>,
+        q4: Option<&'a SharedExpertPhaseQ4Projections>,
+    ) -> Self {
+        if let Some(q4) = q4 {
+            Self::Q4(q4)
+        } else if let Some(dense) = dense {
+            Self::Dense(dense)
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn dense(self) -> Option<&'a SharedExpertPhaseWeights> {
+        match self {
+            Self::Dense(shared) => Some(shared),
+            Self::None | Self::Q4(_) => None,
+        }
+    }
+
+    pub(crate) fn q4(self) -> Option<&'a SharedExpertPhaseQ4Projections> {
+        match self {
+            Self::Q4(shared) => Some(shared),
+            Self::None | Self::Dense(_) => None,
+        }
+    }
+
+    pub(crate) fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
+    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
+        match self {
+            Self::None => ScheduledSharedExpertSource::None,
+            Self::Dense(_) => ScheduledSharedExpertSource::DenseCpuWeights,
+            Self::Q4(_) => ScheduledSharedExpertSource::ResidentQ4Projections,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -997,6 +1048,9 @@ mod tests {
     use crate::inference::flashmoe::experts::{
         ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertSlotSpec,
     };
+    use crate::inference::flashmoe::weights::{
+        DenseQ4MmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    };
     use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
 
     fn qwen35_layout() -> QwenMoeModelLayout {
@@ -1069,6 +1123,78 @@ mod tests {
         fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
             self.0
         }
+    }
+
+    fn dummy_shared_dense_phase() -> SharedExpertPhaseWeights {
+        SharedExpertPhaseWeights {
+            gate: Arc::new(vec![1.0, 2.0]),
+            up: Arc::new(vec![3.0, 4.0]),
+            down: Arc::new(vec![5.0, 6.0]),
+            router: Arc::new(vec![7.0, 8.0]),
+            shared_experts: 1,
+            intermediate: 2,
+            width: 1,
+        }
+    }
+
+    fn dummy_q4_projection(name: &str) -> DenseQ4MmapMatvecProjection {
+        DenseQ4MmapMatvecProjection {
+            tensor_name: name.to_string(),
+            packed_byte_offset: 128,
+            scales_byte_offset: 256,
+            biases_byte_offset: 512,
+            rows: 16,
+            cols: 32,
+            output_width: 16,
+            row_packed_bytes: 16,
+            groups_per_row: 2,
+            group_size: 16,
+            scale_bias_dtype: "BF16".to_string(),
+        }
+    }
+
+    fn dummy_shared_q4_phase() -> SharedExpertPhaseQ4Projections {
+        SharedExpertPhaseQ4Projections {
+            gate: dummy_q4_projection("shared.gate"),
+            up: dummy_q4_projection("shared.up"),
+            down: dummy_q4_projection("shared.down"),
+            router: dummy_q4_projection("shared.router"),
+            shared_experts: 1,
+            intermediate: 16,
+            width: 32,
+        }
+    }
+
+    #[test]
+    fn shared_expert_phase_ref_resolves_scheduler_source() {
+        let dense = dummy_shared_dense_phase();
+        let q4 = dummy_shared_q4_phase();
+
+        let none = ScheduledSharedExpertPhaseRef::from_options(None, None);
+        assert_eq!(
+            none.scheduled_shared_expert_source(),
+            ScheduledSharedExpertSource::None
+        );
+        assert!(!none.is_some());
+        assert!(none.dense().is_none());
+        assert!(none.q4().is_none());
+
+        let dense_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), None);
+        assert_eq!(
+            dense_ref.scheduled_shared_expert_source(),
+            ScheduledSharedExpertSource::DenseCpuWeights
+        );
+        assert!(dense_ref.is_some());
+        assert!(dense_ref.dense().is_some());
+        assert!(dense_ref.q4().is_none());
+
+        let q4_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), Some(&q4));
+        assert_eq!(
+            q4_ref.scheduled_shared_expert_source(),
+            ScheduledSharedExpertSource::ResidentQ4Projections
+        );
+        assert!(q4_ref.dense().is_none());
+        assert!(q4_ref.q4().is_some());
     }
 
     #[derive(Debug, Clone)]

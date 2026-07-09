@@ -89,7 +89,7 @@ use super::scheduler::{
     ScheduledCmd3InputSource, ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
     ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
     ScheduledNextNormSource, ScheduledQ4ExpertPhaseMlpPayload, ScheduledSharedExpert,
-    ScheduledSharedExpertSource,
+    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -1867,60 +1867,6 @@ struct MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     inner: Arc<MetalExecutorInner>,
     route_top4_enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SharedExpertPhaseRef<'a> {
-    None,
-    Dense(&'a SharedExpertPhaseWeights),
-    Q4(&'a SharedExpertPhaseQ4Projections),
-}
-
-impl<'a> SharedExpertPhaseRef<'a> {
-    fn from_options(
-        dense: Option<&'a SharedExpertPhaseWeights>,
-        q4: Option<&'a SharedExpertPhaseQ4Projections>,
-    ) -> Self {
-        if let Some(q4) = q4 {
-            Self::Q4(q4)
-        } else if let Some(dense) = dense {
-            Self::Dense(dense)
-        } else {
-            Self::None
-        }
-    }
-
-    fn dense(self) -> Option<&'a SharedExpertPhaseWeights> {
-        match self {
-            Self::Dense(shared) => Some(shared),
-            Self::None | Self::Q4(_) => None,
-        }
-    }
-
-    fn q4(self) -> Option<&'a SharedExpertPhaseQ4Projections> {
-        match self {
-            Self::Q4(shared) => Some(shared),
-            Self::None | Self::Dense(_) => None,
-        }
-    }
-
-    fn is_some(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    fn scheduled_source(self) -> ScheduledSharedExpertSource {
-        match self {
-            Self::None => ScheduledSharedExpertSource::None,
-            Self::Dense(_) => ScheduledSharedExpertSource::DenseCpuWeights,
-            Self::Q4(_) => ScheduledSharedExpertSource::ResidentQ4Projections,
-        }
-    }
-}
-
-impl ScheduledSharedExpert for SharedExpertPhaseRef<'_> {
-    fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
-        self.scheduled_source()
-    }
 }
 
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
@@ -10428,7 +10374,7 @@ impl FlashMoeEngine {
                 } else {
                     ScheduledCmd3InputSource::CpuNormedResidualUpload
                 },
-                shared_phase.scheduled_source(),
+                shared_phase.scheduled_shared_expert_source(),
                 if next_norm_weight.is_some() {
                     ScheduledNextNormSource::CpuVisibleWeights
                 } else {
