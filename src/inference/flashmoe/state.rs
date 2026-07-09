@@ -91,11 +91,29 @@ pub(crate) struct FlashMoeCpuBuffer {
 }
 
 impl FlashMoeCpuBuffer {
+    fn new(role: FlashMoeStateBufferRole, values: Vec<f32>) -> Self {
+        Self { role, values }
+    }
+
     pub(crate) fn hidden(values: Vec<f32>) -> Self {
-        Self {
-            role: FlashMoeStateBufferRole::Hidden,
-            values,
-        }
+        Self::new(FlashMoeStateBufferRole::Hidden, values)
+    }
+
+    pub(crate) fn residual(values: Vec<f32>) -> Self {
+        Self::new(FlashMoeStateBufferRole::Residual, values)
+    }
+
+    pub(crate) fn normed(values: Vec<f32>) -> Self {
+        Self::new(FlashMoeStateBufferRole::Normed, values)
+    }
+
+    pub(crate) fn next_layer_normed(values: Vec<f32>) -> Self {
+        Self::new(FlashMoeStateBufferRole::NextLayerNormed, values)
+    }
+
+    pub(crate) fn into_role(mut self, role: FlashMoeStateBufferRole) -> Self {
+        self.role = role;
+        self
     }
 
     pub(crate) fn role(&self) -> FlashMoeStateBufferRole {
@@ -207,6 +225,19 @@ mod tests {
         hidden[1] = 3.0;
         assert_eq!(hidden.clone_values(), vec![1.0, 3.0]);
         assert_eq!(hidden.into_values(), vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn cpu_buffers_cover_normed_residual_and_next_layer_transitions() {
+        let residual = FlashMoeCpuBuffer::residual(vec![0.5, -1.0]);
+        assert_eq!(residual.role(), FlashMoeStateBufferRole::Residual);
+        assert!(residual.is_declared_graph_state());
+
+        let next_normed = FlashMoeCpuBuffer::next_layer_normed(vec![2.0, 4.0]);
+        assert_eq!(next_normed.role(), FlashMoeStateBufferRole::NextLayerNormed);
+        let normed = next_normed.into_role(FlashMoeStateBufferRole::Normed);
+        assert_eq!(normed.role(), FlashMoeStateBufferRole::Normed);
+        assert_eq!(&normed[..], &[2.0, 4.0]);
     }
 
     #[test]

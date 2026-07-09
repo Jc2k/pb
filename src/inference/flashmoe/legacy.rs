@@ -73,8 +73,8 @@ use super::scheduler::{
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCpuBuffer, FlashMoeRecurrentState, FlashMoeSessionState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeCpuBuffer, FlashMoeRecurrentState, FlashMoeSessionState, FlashMoeStateBufferRole,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 use super::weights::{
@@ -9804,7 +9804,7 @@ impl FlashMoeEngine {
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
         );
         let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
-        let mut next_layer_normed: Option<Vec<f32>> = None;
+        let mut next_layer_normed: Option<FlashMoeCpuBuffer> = None;
 
         for layer in 0..self.config.num_hidden_layers {
             let report_layer_progress = progress.is_some()
@@ -9865,7 +9865,7 @@ impl FlashMoeEngine {
                     }
                 }
                 hidden.replace_values(output.hidden);
-                next_layer_normed = output.next_normed;
+                next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
             }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
@@ -9878,11 +9878,13 @@ impl FlashMoeEngine {
             let combine_started = Instant::now();
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
             let mut normed = if deferred_attention_input.is_some() {
-                Vec::new()
+                FlashMoeCpuBuffer::normed(Vec::new())
             } else if let Some(normed) = next_layer_normed.take() {
-                normed
+                normed.into_role(FlashMoeStateBufferRole::Normed)
             } else {
-                self.rms_norm_with_model_weight(input_norm_name.as_str(), &hidden)?
+                FlashMoeCpuBuffer::normed(
+                    self.rms_norm_with_model_weight(input_norm_name.as_str(), &hidden)?,
+                )
             };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             let attention_started = Instant::now();
@@ -10218,7 +10220,9 @@ impl FlashMoeEngine {
                         .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
                     layer_timing.buckets.attention_output_projection += subphase_started.elapsed();
                     add_in_place(&mut hidden, &projected);
-                    normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
+                    normed = FlashMoeCpuBuffer::normed(
+                        self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?,
+                    );
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     let routing_started = Instant::now();
                     let active =
@@ -10228,7 +10232,9 @@ impl FlashMoeEngine {
                 }
             } else {
                 add_in_place(&mut hidden, &projected);
-                normed = self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?;
+                normed = FlashMoeCpuBuffer::normed(
+                    self.rms_norm_with_model_weight(post_norm_name.as_str(), &hidden)?,
+                );
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 let routing_started = Instant::now();
                 let active =
@@ -10239,9 +10245,10 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let cpu_mlp_residual = (!has_metal_post_attention_prep).then(|| hidden.clone_values());
+            let cpu_mlp_residual = (!has_metal_post_attention_prep)
+                .then(|| FlashMoeCpuBuffer::residual(hidden.clone_values()));
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let cpu_mlp_residual = Some(hidden.clone_values());
+            let cpu_mlp_residual = Some(FlashMoeCpuBuffer::residual(hidden.clone_values()));
             layer_timing.active_experts = active.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
                 kv_cache.record_layer_state(position, layer, recurrent_state.value())?;
@@ -10330,7 +10337,8 @@ impl FlashMoeEngine {
                 } else {
                     let output = pending.wait()?;
                     hidden.replace_values(output.hidden);
-                    next_layer_normed = output.next_normed;
+                    next_layer_normed =
+                        output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10355,7 +10363,8 @@ impl FlashMoeEngine {
                 } else {
                     let output = pending.wait()?;
                     hidden.replace_values(output.hidden);
-                    next_layer_normed = output.next_normed;
+                    next_layer_normed =
+                        output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
                     submitted_deferred = true;
                 }
             }
@@ -10376,7 +10385,7 @@ impl FlashMoeEngine {
                     next_norm_weight.as_deref(),
                 )?;
                 hidden.replace_values(output.hidden);
-                next_layer_normed = output.next_normed;
+                next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
             }
             trace_layer_values(position, layer, "moe", &hidden);
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
@@ -10503,7 +10512,7 @@ impl FlashMoeEngine {
                 }
             }
             hidden.replace_values(output.hidden);
-            next_layer_normed = output.next_normed;
+            next_layer_normed = output.next_normed.map(FlashMoeCpuBuffer::next_layer_normed);
         }
         drop(next_layer_normed);
 
