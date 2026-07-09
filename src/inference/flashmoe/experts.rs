@@ -122,6 +122,26 @@ impl Drop for FixedQ4ExpertPayload {
 }
 
 impl FixedQ4ExpertPayload {
+    pub(crate) fn from_whole_slot(
+        spec: FixedQ4ExpertSlotSpec,
+        bytes: Vec<u8>,
+        recycle_pool: Option<ReusableExpertBytePool>,
+    ) -> Result<Self> {
+        if bytes.len() < spec.layout.expert_bytes {
+            bail!(
+                "fixed Q4 expert whole-slot payload length {} is shorter than layout size {}",
+                bytes.len(),
+                spec.layout.expert_bytes
+            );
+        }
+        Ok(Self {
+            spec,
+            bytes,
+            decoded: None,
+            recycle_pool,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn payload_prefix(&self, max_len: usize) -> &[u8] {
         &self.bytes[..self.bytes.len().min(max_len)]
@@ -508,6 +528,23 @@ mod tests {
 
         assert!(
             err.to_string().contains("shorter than layout size 45"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn fixed_q4_payload_requires_whole_slot_bytes() {
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let payload = FixedQ4ExpertPayload::from_whole_slot(spec, (0..45).collect(), None).unwrap();
+
+        assert_eq!(
+            payload.component(QwenMoeExpertComponentKind::GateWeight),
+            &[0, 1, 2, 3, 4, 5, 6, 7]
+        );
+
+        let err = FixedQ4ExpertPayload::from_whole_slot(spec, vec![0; 44], None).unwrap_err();
+        assert!(
+            err.to_string().contains("whole-slot payload length 44"),
             "{err:#}"
         );
     }

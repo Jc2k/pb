@@ -18247,12 +18247,11 @@ impl ExpertLayerReader {
             let payload = scratch.take_payload();
             (
                 Vec::new(),
-                Some(FixedQ4ExpertPayload {
-                    spec: self.fixed_q4,
-                    bytes: payload,
-                    decoded: None,
-                    recycle_pool: Some(Arc::clone(&self.fixed_q4_buffer_pool)),
-                }),
+                Some(FixedQ4ExpertPayload::from_whole_slot(
+                    self.fixed_q4,
+                    payload,
+                    Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+                )?),
                 Vec::new(),
             )
         };
@@ -19618,12 +19617,7 @@ fn fixed_q4_payload_from_pbq4_records(
     recycle_pool: Option<ReusableExpertBytePool>,
 ) -> Result<FixedQ4ExpertPayload> {
     let (bytes, _) = fixed_q4_pack_from_pbq4_records(layer, expert, spec, records)?;
-    Ok(FixedQ4ExpertPayload {
-        spec,
-        bytes,
-        decoded: None,
-        recycle_pool,
-    })
+    FixedQ4ExpertPayload::from_whole_slot(spec, bytes, recycle_pool)
 }
 
 fn fixed_q4_pack_from_pbq4_records(
