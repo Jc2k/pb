@@ -1900,8 +1900,12 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
     }
 }
 
-type ScheduledExpertPhase<'a> =
-    ScheduledCmd3Submission<'a, Arc<ExpertWeights>, ExpertPhaseInput<'a>, SharedExpertPhaseRef<'a>>;
+type ScheduledExpertPhase<'a> = ScheduledCmd3Submission<
+    'a,
+    Arc<ScheduledExpertSlot>,
+    ExpertPhaseInput<'a>,
+    SharedExpertPhaseRef<'a>,
+>;
 
 #[derive(Debug, Clone)]
 struct LinearAttentionStaticWeights {
@@ -2121,23 +2125,41 @@ impl MetalExecutor {
         match phase.input {
             ExpertPhaseInput::Cpu { normed, residual } => {
                 let payloads = phase.scheduled.cmd3_expert_phase_payloads(residual.len())?;
-                self.submit_expert_phase_with_payloads(
-                    phase.position,
-                    phase.scheduled.layer,
-                    phase.scheduled.experts.clone(),
-                    &phase.scheduled.weights,
-                    normed,
-                    residual,
-                    phase.shared,
-                    phase.next_norm_weight,
-                    &payloads,
-                )
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    self.inner
+                        .submit_scheduled_expert_phase_with_payloads(
+                            phase.position,
+                            phase.scheduled.layer,
+                            phase.scheduled.experts.clone(),
+                            &phase.scheduled.weights,
+                            normed,
+                            residual,
+                            phase.shared,
+                            phase.next_norm_weight,
+                            &payloads,
+                        )
+                        .map(|pending| pending.map(DeferredExpertPhase::Metal))
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    let _ = (
+                        normed,
+                        residual,
+                        payloads,
+                        phase.shared,
+                        phase.next_norm_weight,
+                    );
+                    bail!(
+                        "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
+                    );
+                }
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             ExpertPhaseInput::MetalPostAttention(prep) => {
                 let payloads = phase.scheduled.cmd3_expert_phase_payloads(prep.width)?;
                 self.inner
-                    .submit_expert_phase_from_buffers_with_payloads(
+                    .submit_scheduled_expert_phase_from_buffers_with_payloads(
                         phase.position,
                         phase.scheduled.layer,
                         phase.scheduled.experts.clone(),
@@ -3098,11 +3120,43 @@ impl MetalQ4SourceBufferCache {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+enum MetalExpertRetention {
+    LegacyWeights(Arc<[Arc<ExpertWeights>]>),
+    ScheduledSlots(Arc<[Arc<ScheduledExpertSlot>]>),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalExpertRetention {
+    fn len(&self) -> usize {
+        match self {
+            Self::LegacyWeights(experts) => experts.len(),
+            Self::ScheduledSlots(slots) => slots.len(),
+        }
+    }
+
+    fn expert_ids(&self) -> String {
+        match self {
+            Self::LegacyWeights(experts) => experts
+                .iter()
+                .map(|expert| expert.expert.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            Self::ScheduledSlots(slots) => slots
+                .iter()
+                .map(|slot| slot.expert().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 struct MetalDeferredExpertPhase {
     inner: Arc<MetalExecutorInner>,
     command_buffer: ObjcId,
     buffers: Vec<MetalPhaseBuffer>,
-    retained_experts: Arc<[Arc<ExpertWeights>]>,
+    retained_experts: MetalExpertRetention,
     hidden_buffer: ObjcId,
     next_normed_buffer: Option<ObjcId>,
     context: MetalCommandContext,
@@ -4991,7 +5045,7 @@ impl MetalExecutorInner {
             self.submit_expert_phase_from_buffers_with_payloads(
                 position,
                 layer,
-                experts.clone(),
+                MetalExpertRetention::LegacyWeights(experts.clone()),
                 weights,
                 normed_buffer,
                 residual_buffer,
@@ -5037,6 +5091,52 @@ impl MetalExecutorInner {
             self.submit_expert_phase_from_buffers_with_payloads(
                 position,
                 layer,
+                MetalExpertRetention::LegacyWeights(experts),
+                weights,
+                normed_buffer,
+                residual_buffer,
+                width,
+                shared,
+                next_norm_weight,
+                payloads,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_scheduled_expert_phase_with_payloads(
+        self: &Arc<Self>,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
+        weights: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        shared: SharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        let width = residual.len();
+        if width == 0 || normed.len() < width || weights.len() != experts.len() {
+            return Ok(None);
+        }
+        if let Some(weight) = next_norm_weight
+            && weight.len() < width
+        {
+            return Ok(None);
+        }
+        unsafe {
+            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
+            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.recycle(normed_buffer);
+                    return Err(error);
+                }
+            };
+            self.submit_scheduled_expert_phase_from_buffers_with_payloads(
+                position,
+                layer,
                 experts,
                 weights,
                 normed_buffer,
@@ -5050,11 +5150,11 @@ impl MetalExecutorInner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit_expert_phase_from_buffers_with_payloads(
+    fn submit_scheduled_expert_phase_from_buffers_with_payloads(
         self: &Arc<Self>,
         position: usize,
         layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
         weights: &[f32],
         normed_buffer: ObjcId,
         residual_buffer: ObjcId,
@@ -5063,7 +5163,36 @@ impl MetalExecutorInner {
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<Option<MetalDeferredExpertPhase>> {
-        if width == 0 || weights.len() != experts.len() || payloads.len() != experts.len() {
+        self.submit_expert_phase_from_buffers_with_payloads(
+            position,
+            layer,
+            MetalExpertRetention::ScheduledSlots(experts),
+            weights,
+            normed_buffer,
+            residual_buffer,
+            width,
+            shared,
+            next_norm_weight,
+            payloads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_expert_phase_from_buffers_with_payloads(
+        self: &Arc<Self>,
+        position: usize,
+        layer: usize,
+        retained_experts: MetalExpertRetention,
+        weights: &[f32],
+        normed_buffer: ObjcId,
+        residual_buffer: ObjcId,
+        width: usize,
+        shared: SharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<Option<MetalDeferredExpertPhase>> {
+        let expert_count = retained_experts.len();
+        if width == 0 || weights.len() != expert_count || payloads.len() != expert_count {
             self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
             return Ok(None);
         }
@@ -5129,8 +5258,7 @@ impl MetalExecutorInner {
             let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
             buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
             let expert_outputs_buffer = self.buffer_with_len(
-                experts
-                    .len()
+                expert_count
                     .max(1)
                     .checked_mul(width)
                     .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
@@ -5364,7 +5492,7 @@ impl MetalExecutorInner {
                 )?;
             }
 
-            let active_u32 = experts.len() as u32;
+            let active_u32 = expert_count as u32;
             let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
             msg_send_void1_id(
@@ -5398,15 +5526,11 @@ impl MetalExecutorInner {
             }
 
             msg_send_void0(encoder, sel("endEncoding"));
-            let expert_ids = experts
-                .iter()
-                .map(|expert| expert.expert.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+            let expert_ids = retained_experts.expert_ids();
             let context = MetalCommandContext::new("deferred_expert_phase_from_buffers")
                 .with("position", position)
                 .with("layer", layer)
-                .with("active_experts", experts.len())
+                .with("active_experts", expert_count)
                 .with("experts", expert_ids)
                 .with("width", width)
                 .with("shared", shared.is_some())
@@ -5418,7 +5542,7 @@ impl MetalExecutorInner {
                 inner: self.clone(),
                 command_buffer,
                 buffers,
-                retained_experts: experts,
+                retained_experts,
                 hidden_buffer,
                 next_normed_buffer,
                 context,
@@ -11624,12 +11748,7 @@ impl FlashMoeEngine {
         layer: usize,
         experts: &[usize],
     ) -> Result<Vec<ExpertWeights>> {
-        let pending = self.scheduler.issue(layer, experts)?;
-        let experts = self.scheduler.finish(pending)?;
-        Ok(experts
-            .iter()
-            .map(|expert| expert.as_ref().clone())
-            .collect())
+        self.experts.read_many(layer, experts)
     }
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
@@ -17674,7 +17793,7 @@ impl ExpertStore {
 
 type PendingExpertRead = PendingScheduledRead<ExpertRawReadResponse>;
 type PendingExpertSet = PendingScheduledExpertSet<ExpertRawReadResponse>;
-type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ExpertWeights>>;
+type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ScheduledExpertSlot>>;
 
 #[derive(Debug)]
 struct ExpertScheduler {
@@ -17730,7 +17849,7 @@ impl ExpertScheduler {
         Ok(PendingExpertSet::new(layer, routes, reads))
     }
 
-    fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ExpertWeights>>> {
+    fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
         let mut out = Vec::with_capacity(pending.len());
         for pending in pending {
             let pending_id = pending.id();
@@ -17738,7 +17857,7 @@ impl ExpertScheduler {
                 .recv()
                 .context("expert I/O worker dropped response channel")?;
             let slot = self.core.finish_slot_read(pending_id, response)?;
-            out.push(Arc::new(ExpertWeights::from_scheduled_slot(slot)?));
+            out.push(Arc::new(slot));
         }
         Ok(out)
     }
@@ -17747,7 +17866,7 @@ impl ExpertScheduler {
         let (layer, routes, reads) = pending.into_parts();
         let experts = self.finish(reads)?;
         self.core.finish_routes(layer, routes, experts, |expert| {
-            (expert.layer, expert.expert)
+            (expert.layer(), expert.expert())
         })
     }
 
@@ -17829,20 +17948,6 @@ impl ScheduledCmd3ExpertPayload for ExpertWeights {
 }
 
 impl ExpertWeights {
-    fn from_scheduled_slot(slot: ScheduledExpertSlot) -> Result<Self> {
-        let descriptor = slot.descriptor();
-        if descriptor.layer != slot.layer() || descriptor.expert != slot.expert() {
-            bail!(
-                "scheduled expert slot descriptor layer {} expert {} does not match slot key layer {} expert {}",
-                descriptor.layer,
-                descriptor.expert,
-                slot.layer(),
-                slot.expert()
-            );
-        }
-        Self::from_raw_read(slot.into_raw())
-    }
-
     fn from_raw_read(raw: ExpertRawRead) -> Result<Self> {
         let (records, fixed_q4, packed_prefix) = match raw.payload {
             ExpertRawPayload::Pbq4(bytes) => {
@@ -32796,9 +32901,9 @@ mod tests {
         assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
-        assert!(experts.iter().all(|expert| expert.layer == 0));
-        assert_eq!(experts[0].expert, 1);
-        assert_eq!(experts[1].expert, 3);
+        assert!(experts.iter().all(|expert| expert.layer() == 0));
+        assert_eq!(experts[0].expert(), 1);
+        assert_eq!(experts[1].expert(), 3);
         let first = scheduler.snapshot();
         assert_eq!(first.issued_reads, 2);
         assert_eq!(first.positioned_reads, 2);
@@ -32812,8 +32917,8 @@ mod tests {
         assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 2);
-        assert_eq!(experts[0].expert, 3);
-        assert_eq!(experts[1].expert, 7);
+        assert_eq!(experts[0].expert(), 3);
+        assert_eq!(experts[1].expert(), 7);
         let second = scheduler.snapshot();
         assert_eq!(second.issued_reads, 4);
         assert_eq!(second.positioned_reads, 4);
@@ -32827,7 +32932,7 @@ mod tests {
         assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
         assert_eq!(experts.len(), 1);
-        assert_eq!(experts[0].expert, 3);
+        assert_eq!(experts[0].expert(), 3);
         let third = scheduler.snapshot();
         assert_eq!(third.issued_reads, 5);
         assert_eq!(third.positioned_reads, 5);
@@ -32868,7 +32973,7 @@ mod tests {
         let pending = scheduler.issue(0, &[7, 1, 3]).unwrap();
         assert_eq!(scheduler.worker_count(), 3);
         let experts = scheduler.finish(pending).unwrap();
-        let order: Vec<_> = experts.iter().map(|expert| expert.expert).collect();
+        let order: Vec<_> = experts.iter().map(|expert| expert.expert()).collect();
         assert_eq!(order, vec![7, 1, 3]);
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.issued_reads, 3);
@@ -32903,7 +33008,7 @@ mod tests {
         let order: Vec<_> = scheduled
             .experts
             .iter()
-            .map(|expert| expert.expert)
+            .map(|expert| expert.expert())
             .collect();
         assert_eq!(order, vec![7, 1, 3]);
         let mut expected_weights: Vec<f32> = routes.iter().map(|(_, score)| *score).collect();

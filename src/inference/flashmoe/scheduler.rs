@@ -1118,8 +1118,17 @@ impl ScheduledExpertSlot {
         self.raw.slot
     }
 
-    pub(crate) fn into_raw(self) -> ExpertRawRead {
-        self.raw
+    pub(crate) fn mix_hash(&self) -> u64 {
+        let mut hash = ((self.layer() as u64) << 32) ^ self.expert() as u64;
+        let prefix = match &self.raw.payload {
+            ExpertRawPayload::Pbq4(bytes) => bytes.as_slice(),
+            ExpertRawPayload::FixedQ4(fixed_q4) => fixed_q4.bytes.as_slice(),
+        };
+        for byte in prefix.iter().take(4096) {
+            hash = hash.rotate_left(5) ^ u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
     }
 }
 
@@ -2728,8 +2737,12 @@ mod tests {
                 payload_len: 3,
             }
         );
-        let raw = slot.into_raw();
-        assert!(matches!(raw.payload, ExpertRawPayload::Pbq4(_)));
+        assert!(
+            slot.scheduled_cmd3_expert_phase_payload(2)
+                .unwrap_err()
+                .to_string()
+                .contains("PBQ4/component records are import compatibility only")
+        );
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.issued_reads, 1);
         assert_eq!(snapshot.positioned_reads, 1);

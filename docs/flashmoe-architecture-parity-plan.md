@@ -122,8 +122,8 @@ The validator should reject silent fallbacks such as:
 - `scheduler.rs` now owns graph-stage resolution, CMD2/CMD3 descriptors, routing topK placement
   validation, active expert read issue and finish metrics, route normalization, pending read sets,
   shared-expert source/shape validation, and the scheduled whole-slot handoff. Scheduler-owned
-  fixed-Q4 slots can now resolve typed CMD3 expert payloads directly, but `legacy.rs` still adapts
-  those slots into `ExpertWeights` before runtime CMD3 submission.
+  fixed-Q4 slots now resolve typed CMD3 expert payloads directly, and runtime CMD3 submission
+  retains those scheduled slots instead of adapting them into `ExpertWeights`.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -149,8 +149,8 @@ The validator should reject silent fallbacks such as:
 - Expert reads now follow the upstream positioned-read policy under `experts`, and the scheduler
   owns issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
   CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. The remaining
-  gap is runtime wiring: CMD3 submission still receives legacy `ExpertWeights` instead of the
-  scheduler-owned slot type.
+  gap is to move the remaining Metal command encoding and legacy CPU diagnostic helpers out of
+  `legacy.rs` behind explicit CMD3 builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
 - GPU residency is partial. Hidden, residual, normed, KV/recurrent state, router outputs, and
