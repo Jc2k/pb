@@ -227,9 +227,12 @@ The validator should reject silent fallbacks such as:
   scheduled command now finalizes raw scores into the declared `RouterScoreBatch`. Active expert
   issue now consumes the resulting
   `ScheduledRoutingCommand` directly and resolves it into scheduler-owned `ScheduledExpertRoutes`
-  before reads are issued. The remaining gap is score production ownership: router score execution
-  and any future readback variants are descriptor- and batch-backed by `weights`, but some execution
-  still flows through legacy dense/runtime helpers instead of a typed CMD2 builder boundary.
+  before reads are issued. The CMD2 command now owns the handoff from declared Metal
+  post-attention prep state plus preselected routes into a scheduled routing command, so the runtime
+  no longer stitches those graph stages together manually. The remaining gap is score production
+  ownership: router score execution and any future readback variants are descriptor- and
+  batch-backed by `weights`, but some execution still flows through legacy dense/runtime helpers
+  instead of a typed CMD2 builder boundary.
 - Shared experts now enter CMD3 through a scheduler descriptor that carries source and graph shape,
   and the live CMD3 builder derives next-norm source from typed `ScheduledNextNormWeights` instead
   of a separate legacy-owned branch. The live path now asks the scheduled graph to build CMD3

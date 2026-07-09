@@ -10433,11 +10433,11 @@ impl FlashMoeEngine {
             let mut precomputed_active: Option<ScheduledRoutingCommand> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(prep) = metal_post_attention_prep.as_mut() {
-                let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
-                debug_assert_eq!(cmd2_output.width(), prep.width);
-                debug_assert_eq!(cmd2_output.state(), prep.state);
-                let routing_command = cmd2_output
-                    .command_from_preselected_routes(&self.scheduled_graph, &prep.active)?;
+                let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
+                    &self.scheduled_graph,
+                    prep.state,
+                    &prep.active,
+                )?;
                 debug_assert_eq!(
                     routing_command.source,
                     ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
@@ -10479,11 +10479,11 @@ impl FlashMoeEngine {
                         pending.finish_without_readback()?;
                     }
                     let mut prep = prep;
-                    let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
-                    debug_assert_eq!(cmd2_output.width(), prep.width);
-                    debug_assert_eq!(cmd2_output.state(), prep.state);
-                    let routing_command = cmd2_output
-                        .command_from_preselected_routes(&self.scheduled_graph, &prep.active)?;
+                    let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
+                        &self.scheduled_graph,
+                        prep.state,
+                        &prep.active,
+                    )?;
                     debug_assert_eq!(
                         routing_command.source,
                         ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
@@ -10565,11 +10565,12 @@ impl FlashMoeEngine {
                             pending.finish_without_readback()?;
                         }
                         let mut prep = prep;
-                        let cmd2_output = scheduled_cmd2.resolve_post_attention_prep(prep.state)?;
-                        debug_assert_eq!(cmd2_output.width(), prep.width);
-                        debug_assert_eq!(cmd2_output.state(), prep.state);
-                        let routing_command = cmd2_output
-                            .command_from_preselected_routes(&self.scheduled_graph, &prep.active)?;
+                        let routing_command = scheduled_cmd2
+                            .command_from_post_attention_prep_routes(
+                                &self.scheduled_graph,
+                                prep.state,
+                                &prep.active,
+                            )?;
                         debug_assert_eq!(
                             routing_command.source,
                             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
@@ -32328,11 +32329,8 @@ mod tests {
             )
             .unwrap()
             .into_cmd2_command();
-        let cmd2_output = scheduled_cmd2
-            .resolve_post_attention_prep(prep.state)
-            .unwrap();
-        let routing_command = cmd2_output
-            .command_from_preselected_routes(&scheduled_graph, &prep.active)
+        let routing_command = scheduled_cmd2
+            .command_from_post_attention_prep_routes(&scheduled_graph, prep.state, &prep.active)
             .unwrap();
         assert_eq!(
             routing_command.source,
