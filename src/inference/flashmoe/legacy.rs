@@ -2158,7 +2158,11 @@ impl MetalExecutor {
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<DeferredExpertPhase> {
         let command = phase.into_cmd3_command()?;
-        let output_state = command.resolve_output_state()?;
+        let output = command.resolve_output_state()?;
+        debug_assert_eq!(output.layer, command.layer);
+        debug_assert_eq!(output.cmd3, command.cmd3);
+        debug_assert_eq!(output.input_state, command.input_state);
+        let output_state = output.state();
         let ScheduledCmd3Command {
             position,
             layer,

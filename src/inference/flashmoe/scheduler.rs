@@ -1390,7 +1390,7 @@ impl<TExpert, TInput, TShared> ScheduledCmd3Command<'_, TExpert, TInput, TShared
 where
     TInput: ScheduledCmd3Input,
 {
-    pub(crate) fn resolve_output_state(&self) -> Result<FlashMoeCmd3OutputState> {
+    pub(crate) fn resolve_output_state(&self) -> Result<ScheduledCmd3OutputState> {
         let input_state = self.input_state;
         if !input_state.is_declared_graph_state() {
             bail!("FlashMoe scheduled CMD3 output cannot resolve from undeclared input state");
@@ -1418,7 +1418,26 @@ where
                 self.cmd3.next_norm
             );
         }
-        Ok(state)
+        Ok(ScheduledCmd3OutputState {
+            cmd3: self.cmd3,
+            layer: self.layer,
+            input_state,
+            state,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduledCmd3OutputState {
+    pub cmd3: ScheduledCmd3ExpertPhase,
+    pub layer: usize,
+    pub input_state: FlashMoeCmd3InputState,
+    state: FlashMoeCmd3OutputState,
+}
+
+impl ScheduledCmd3OutputState {
+    pub(crate) fn state(self) -> FlashMoeCmd3OutputState {
+        self.state
     }
 }
 
@@ -3403,7 +3422,11 @@ mod tests {
         assert_eq!(command.next_norm_weight.unwrap().len(), 8);
         assert_eq!(command.payloads[0].q4().gate.cols, 8);
 
-        let output_state = command.resolve_output_state().unwrap();
+        let output = command.resolve_output_state().unwrap();
+        assert_eq!(output.cmd3, command.cmd3);
+        assert_eq!(output.layer, 7);
+        assert_eq!(output.input_state, command.input_state);
+        let output_state = output.state();
         assert_eq!(output_state.width(), 8);
         assert!(output_state.has_next_normed());
         assert_eq!(output_state.hidden().len(), 8);
@@ -3436,7 +3459,11 @@ mod tests {
         .into_cmd3_command()
         .unwrap();
 
-        let output_state = command.resolve_output_state().unwrap();
+        let output = command.resolve_output_state().unwrap();
+        assert_eq!(output.cmd3, command.cmd3);
+        assert_eq!(output.layer, 7);
+        assert_eq!(output.input_state, command.input_state);
+        let output_state = output.state();
 
         assert_eq!(output_state.width(), 8);
         assert!(!output_state.has_next_normed());
