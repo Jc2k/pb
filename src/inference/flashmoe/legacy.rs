@@ -11285,7 +11285,7 @@ impl FlashMoeEngine {
             ScheduledRoutingScoreView::new(layer, source, &router_scores.scores)
         };
         scheduled_routing
-            .select_command_from_scores(&score_view)
+            .select_command_from_output_scores(routing_output, &score_view)
             .map(|command| command.routes)
     }
 
@@ -11309,7 +11309,7 @@ impl FlashMoeEngine {
             FlashMoeRoutingOutputSource::FusedMetalPostAttentionPrepCpuTopK
         );
         scheduled_routing
-            .command_from_preselected(&active)
+            .command_from_preselected_output(routing_output, &active)
             .map(|command| command.routes)
     }
 

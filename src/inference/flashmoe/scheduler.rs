@@ -897,6 +897,24 @@ impl ScheduledRoutingTopK {
         Ok(self.command_from_routes(routes))
     }
 
+    pub(crate) fn select_command_from_output_scores<TScores>(
+        &self,
+        output: ScheduledRoutingOutputState,
+        scores: &TScores,
+    ) -> Result<ScheduledRoutingCommand>
+    where
+        TScores: ScheduledRoutingScores,
+    {
+        if output.routing != *self {
+            bail!(
+                "FlashMoe scheduled routing output for layer {} does not match routing command layer {}",
+                output.routing.layer,
+                self.layer
+            );
+        }
+        self.select_command_from_scores(scores)
+    }
+
     pub fn validate_preselected(&self, routes: &[(usize, f32)]) -> Result<Vec<(usize, f32)>> {
         if self.source != ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
             bail!(
@@ -941,6 +959,21 @@ impl ScheduledRoutingTopK {
     ) -> Result<ScheduledRoutingCommand> {
         let routes = self.validate_preselected(routes)?;
         Ok(self.command_from_routes(routes))
+    }
+
+    pub(crate) fn command_from_preselected_output(
+        &self,
+        output: ScheduledRoutingOutputState,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledRoutingCommand> {
+        if output.routing != *self {
+            bail!(
+                "FlashMoe scheduled routing output for layer {} does not match routing command layer {}",
+                output.routing.layer,
+                self.layer
+            );
+        }
+        self.command_from_preselected(routes)
     }
 }
 
@@ -2946,13 +2979,19 @@ mod tests {
         let routing = graph
             .build_routing_topk(3, 5, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
+        let output = routing
+            .validate_output_state(FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 3))
+            .unwrap();
 
         let command = routing
-            .select_command_from_scores(&ScheduledRoutingScoreView::new(
-                3,
-                ScheduledRoutingCandidateSource::CpuRouterScores,
-                &[0.1, 0.9, 0.2, 1.5, -0.2],
-            ))
+            .select_command_from_output_scores(
+                output,
+                &ScheduledRoutingScoreView::new(
+                    3,
+                    ScheduledRoutingCandidateSource::CpuRouterScores,
+                    &[0.1, 0.9, 0.2, 1.5, -0.2],
+                ),
+            )
             .unwrap();
 
         assert_eq!(command.layer, 3);
@@ -3068,9 +3107,14 @@ mod tests {
                 ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
             )
             .unwrap();
+        let output = routing
+            .validate_output_state(
+                FlashMoeRoutingOutputState::fused_metal_post_attention_cpu_topk(4, 8, 2),
+            )
+            .unwrap();
 
         let command = routing
-            .command_from_preselected(&[(7, 0.75), (1, 0.25)])
+            .command_from_preselected_output(output, &[(7, 0.75), (1, 0.25)])
             .unwrap();
 
         assert_eq!(command.layer, 4);
