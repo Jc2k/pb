@@ -5025,11 +5025,7 @@ impl MetalExecutorInner {
         let mut payloads = Vec::with_capacity(experts.len());
         for expert in experts.iter() {
             let payload = match expert_phase_mlp_payload(expert, width) {
-                Ok(Some(payload)) => payload,
-                Ok(None) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Ok(None);
-                }
+                Ok(payload) => payload,
                 Err(error) => {
                     self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
                     return Err(error);
@@ -18721,7 +18717,7 @@ struct Q4ExpertPhaseMlpPayload<'a> {
 fn expert_phase_mlp_payload<'a>(
     expert: &'a ExpertWeights,
     width: usize,
-) -> Result<Option<ExpertPhaseMlpPayload<'a>>> {
+) -> Result<ExpertPhaseMlpPayload<'a>> {
     let fixed_q4 = expert.fixed_q4_required()?;
     let gate = fixed_q4.matvec_payload(
         FixedQ4ExpertProjection::Gate,
@@ -18734,23 +18730,43 @@ fn expert_phase_mlp_payload<'a>(
         fixed_q4.spec.intermediate_size,
     );
     let Some((gate, up)) = gate.zip(up) else {
-        return Ok(None);
+        bail!(
+            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide gate/up payloads for width {width}",
+            expert.layer,
+            expert.expert
+        );
     };
     if gate.rows != up.rows {
-        return Ok(None);
+        bail!(
+            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has mismatched gate/up rows {} vs {}",
+            expert.layer,
+            expert.expert,
+            gate.rows,
+            up.rows
+        );
     }
     let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
     else {
-        return Ok(None);
+        bail!(
+            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide down payload for width {width}",
+            expert.layer,
+            expert.expert
+        );
     };
     if down.cols != gate.rows {
-        return Ok(None);
+        bail!(
+            "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} has down cols {} for gate rows {}",
+            expert.layer,
+            expert.expert,
+            down.cols,
+            gate.rows
+        );
     }
-    Ok(Some(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
+    Ok(ExpertPhaseMlpPayload::Q4(Q4ExpertPhaseMlpPayload {
         gate,
         up,
         down,
-    })))
+    }))
 }
 
 fn silu(value: f32) -> f32 {
@@ -26135,6 +26151,12 @@ mod tests {
                 .contains("PBQ4/component records are import compatibility only"),
             "{err:#}"
         );
+        let err = expert_phase_mlp_payload(&parsed_expert, 2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scheduler-owned fixed-Q4 whole-expert slot is required"),
+            "{err:#}"
+        );
 
         let spec = FixedQ4ExpertSlotSpec {
             layout: fixed_q4_test_layout(2, 2, GROUP_SIZE),
@@ -26167,6 +26189,10 @@ mod tests {
         let out = fixed_expert.mlp(&hidden, 2).unwrap();
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
+        assert!(matches!(
+            expert_phase_mlp_payload(&fixed_expert, 2).unwrap(),
+            ExpertPhaseMlpPayload::Q4(_)
+        ));
     }
 
     #[test]
@@ -26720,7 +26746,7 @@ mod tests {
             }),
         };
 
-        let phase = expert_phase_mlp_payload(&expert, 2).unwrap().unwrap();
+        let phase = expert_phase_mlp_payload(&expert, 2).unwrap();
         let phase = phase.q4();
         let fixed = expert.fixed_q4.as_ref().unwrap();
         let base = fixed.bytes.as_ptr() as usize;
