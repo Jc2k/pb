@@ -143,8 +143,9 @@ The validator should reject silent fallbacks such as:
   explicit unsupported-capability errors.
 - Dense weights are closer to the upstream resident-blob model than experts are. `weights` now owns
   typed resident projection descriptors for dense, Q4, shared expert, and router score bindings plus
-  the router score batch data model, but command construction and much of runtime score execution
-  still flows through `legacy.rs` shims.
+  the router score batch data model. Shared expert dense/Q4 descriptor groups now validate and
+  expose their graph shape before the scheduler accepts them, but command construction and much of
+  runtime score execution still flows through `legacy.rs` shims.
 - `state.rs` owns CPU-visible hidden/residual/normed/next-normed buffers and now also describes
   GPU-resident hidden, residual, normed, and next-layer normed buffers with typed roles and lengths.
   CMD1 now declares its actual input as either CPU-visible normed state or GPU-resident
@@ -201,8 +202,9 @@ The validator should reject silent fallbacks such as:
   topK validation. The remaining gap is score production ownership: router projection and score
   readback are descriptor- and batch-backed by `weights`, but still executed through the legacy
   dense/runtime loop instead of a typed CMD2 builder boundary.
-- Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
-  down should become part of the same CMD2/CMD3 model as routed experts.
+- Shared experts are still grafted onto the older phase structure after descriptor validation.
+  Shared gate/up/down and shared down should become part of the same CMD2/CMD3 model as routed
+  experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
   plans should feed the same text/MoE runtime rather than spreading multimodal branches through the
   execution loop.

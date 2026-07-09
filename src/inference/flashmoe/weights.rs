@@ -574,6 +574,33 @@ impl DenseQ4MmapMatvecProjection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedExpertPhaseShape {
+    pub(crate) width: usize,
+    pub(crate) shared_experts: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) total_intermediate: usize,
+}
+
+impl SharedExpertPhaseShape {
+    pub(crate) fn new(width: usize, shared_experts: usize, intermediate: usize) -> Result<Self> {
+        if width == 0 || shared_experts == 0 || intermediate == 0 {
+            bail!(
+                "shared expert graph shape requires non-zero width, shared expert count, and intermediate width"
+            );
+        }
+        let total_intermediate = shared_experts
+            .checked_mul(intermediate)
+            .context("shared expert intermediate width overflow")?;
+        Ok(Self {
+            width,
+            shared_experts,
+            intermediate,
+            total_intermediate,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SharedExpertPhaseWeights {
     pub(crate) gate: Arc<Vec<f32>>,
@@ -585,6 +612,38 @@ pub(crate) struct SharedExpertPhaseWeights {
     pub(crate) width: usize,
 }
 
+impl SharedExpertPhaseWeights {
+    pub(crate) fn validated_shape(&self) -> Result<SharedExpertPhaseShape> {
+        let shape =
+            SharedExpertPhaseShape::new(self.width, self.shared_experts, self.intermediate)?;
+        let dense_len = shape
+            .total_intermediate
+            .checked_mul(shape.width)
+            .context("shared expert dense projection width overflow")?;
+        let router_len = shape
+            .shared_experts
+            .checked_mul(shape.width)
+            .context("shared expert router projection width overflow")?;
+        if self.gate.len() != dense_len
+            || self.up.len() != dense_len
+            || self.down.len() != dense_len
+            || self.router.len() != router_len
+        {
+            bail!(
+                "FlashMoe scheduled shared dense expert shape is invalid: width={} shared_experts={} intermediate={} gate={} up={} down={} router={}",
+                self.width,
+                self.shared_experts,
+                self.intermediate,
+                self.gate.len(),
+                self.up.len(),
+                self.down.len(),
+                self.router.len()
+            );
+        }
+        Ok(shape)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SharedExpertPhaseQ4Projections {
     pub(crate) gate: DenseQ4MmapMatvecProjection,
@@ -594,6 +653,38 @@ pub(crate) struct SharedExpertPhaseQ4Projections {
     pub(crate) shared_experts: usize,
     pub(crate) intermediate: usize,
     pub(crate) width: usize,
+}
+
+impl SharedExpertPhaseQ4Projections {
+    pub(crate) fn validated_shape(&self) -> Result<SharedExpertPhaseShape> {
+        let shape =
+            SharedExpertPhaseShape::new(self.width, self.shared_experts, self.intermediate)?;
+        if self.gate.cols != shape.width
+            || self.up.cols != shape.width
+            || self.router.cols != shape.width
+            || self.down.cols != shape.total_intermediate
+            || self.gate.output_width != shape.total_intermediate
+            || self.up.output_width != shape.total_intermediate
+            || self.down.output_width != shape.width
+            || self.router.output_width != shape.shared_experts
+        {
+            bail!(
+                "FlashMoe scheduled shared Q4 expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
+                self.width,
+                self.shared_experts,
+                self.intermediate,
+                self.gate.output_width,
+                self.gate.cols,
+                self.up.output_width,
+                self.up.cols,
+                self.down.output_width,
+                self.down.cols,
+                self.router.output_width,
+                self.router.cols
+            );
+        }
+        Ok(shape)
+    }
 }
 
 #[cfg(test)]
@@ -935,7 +1026,7 @@ mod tests {
             gate: Arc::new(vec![1.0, 2.0]),
             up: Arc::new(vec![3.0, 4.0]),
             down: Arc::new(vec![5.0, 6.0]),
-            router: Arc::new(vec![7.0, 8.0]),
+            router: Arc::new(vec![7.0]),
             shared_experts: 1,
             intermediate: 2,
             width: 1,
@@ -945,12 +1036,16 @@ mod tests {
         assert_eq!(shared.intermediate, 2);
         assert_eq!(shared.width, 1);
         assert_eq!(shared.gate.as_slice(), &[1.0, 2.0]);
-        assert_eq!(shared.router.as_slice(), &[7.0, 8.0]);
+        assert_eq!(shared.router.as_slice(), &[7.0]);
+        assert_eq!(
+            shared.validated_shape().unwrap(),
+            SharedExpertPhaseShape::new(1, 1, 2).unwrap()
+        );
     }
 
     #[test]
     fn shared_expert_q4_descriptor_groups_resident_projection_bindings() {
-        let projection = DenseQ4MmapMatvecProjection {
+        let gate = DenseQ4MmapMatvecProjection {
             tensor_name: "model.layers.0.mlp.shared_expert.gate_proj.weight".to_string(),
             packed_byte_offset: 128,
             scales_byte_offset: 256,
@@ -963,22 +1058,61 @@ mod tests {
             group_size: 16,
             scale_bias_dtype: "BF16".to_string(),
         };
+        let up = DenseQ4MmapMatvecProjection {
+            tensor_name: "model.layers.0.mlp.shared_expert.up_proj.weight".to_string(),
+            ..gate.clone()
+        };
+        let down = DenseQ4MmapMatvecProjection {
+            tensor_name: "model.layers.0.mlp.shared_expert.down_proj.weight".to_string(),
+            rows: 32,
+            cols: 16,
+            output_width: 32,
+            row_packed_bytes: 8,
+            groups_per_row: 1,
+            ..gate.clone()
+        };
+        let router = DenseQ4MmapMatvecProjection {
+            tensor_name: "model.layers.0.mlp.shared_expert_gate.weight".to_string(),
+            rows: 1,
+            output_width: 1,
+            ..gate.clone()
+        };
         let shared = SharedExpertPhaseQ4Projections {
-            gate: projection.clone(),
-            up: projection.clone(),
-            down: projection.clone(),
-            router: projection,
+            gate,
+            up,
+            down,
+            router,
             shared_experts: 1,
             intermediate: 16,
             width: 32,
         };
 
         assert_eq!(shared.gate.packed_byte_offset, 128);
-        assert_eq!(shared.down.output_width, 16);
+        assert_eq!(shared.down.output_width, 32);
         assert_eq!(shared.router.cols, 32);
         assert_eq!(shared.shared_experts, 1);
         assert_eq!(shared.intermediate, 16);
         assert_eq!(shared.width, 32);
+        assert_eq!(
+            shared.validated_shape().unwrap(),
+            SharedExpertPhaseShape::new(32, 1, 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_expert_descriptors_reject_mismatched_graph_shape() {
+        let shared = SharedExpertPhaseWeights {
+            gate: Arc::new(vec![1.0, 2.0]),
+            up: Arc::new(vec![3.0, 4.0]),
+            down: Arc::new(vec![5.0, 6.0]),
+            router: Arc::new(vec![7.0]),
+            shared_experts: 1,
+            intermediate: 2,
+            width: 2,
+        };
+
+        let err = shared.validated_shape().unwrap_err();
+        assert!(err.to_string().contains("shape is invalid"));
     }
 
     #[test]

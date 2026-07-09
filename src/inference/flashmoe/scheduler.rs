@@ -14,7 +14,8 @@ use super::state::{
     FlashMoeRoutingOutputState, FlashMoeStateBufferRole, FlashMoeStatePlacement,
 };
 use super::weights::{
-    RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
+    SharedExpertPhaseWeights,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
@@ -906,6 +907,17 @@ impl ScheduledSharedExpertShape {
     }
 }
 
+impl From<SharedExpertPhaseShape> for ScheduledSharedExpertShape {
+    fn from(shape: SharedExpertPhaseShape) -> Self {
+        Self {
+            width: shape.width,
+            shared_experts: shape.shared_experts,
+            intermediate: shape.intermediate,
+            total_intermediate: shape.total_intermediate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledCmd3ExpertPhase {
     pub stage: FlashMoeStageCapability,
@@ -1084,80 +1096,8 @@ impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
     fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>> {
         let shape = match self {
             Self::None => return Ok(None),
-            Self::Dense(shared) => {
-                let total = shared
-                    .shared_experts
-                    .checked_mul(shared.intermediate)
-                    .ok_or_else(|| anyhow::anyhow!("shared expert intermediate width overflow"))?;
-                let dense_len = total.checked_mul(shared.width).ok_or_else(|| {
-                    anyhow::anyhow!("shared expert dense projection width overflow")
-                })?;
-                let router_len =
-                    shared
-                        .shared_experts
-                        .checked_mul(shared.width)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("shared expert router projection width overflow")
-                        })?;
-                if shared.gate.len() != dense_len
-                    || shared.up.len() != dense_len
-                    || shared.down.len() != dense_len
-                    || shared.router.len() != router_len
-                {
-                    bail!(
-                        "FlashMoe scheduled shared dense expert shape is invalid: width={} shared_experts={} intermediate={} gate={} up={} down={} router={}",
-                        shared.width,
-                        shared.shared_experts,
-                        shared.intermediate,
-                        shared.gate.len(),
-                        shared.up.len(),
-                        shared.down.len(),
-                        shared.router.len()
-                    );
-                }
-                ScheduledSharedExpertShape::new(
-                    shared.width,
-                    shared.shared_experts,
-                    shared.intermediate,
-                )?
-            }
-            Self::Q4(shared) => {
-                let total = shared
-                    .shared_experts
-                    .checked_mul(shared.intermediate)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("shared expert Q4 intermediate width overflow")
-                    })?;
-                if shared.gate.cols != shared.width
-                    || shared.up.cols != shared.width
-                    || shared.router.cols != shared.width
-                    || shared.down.cols != total
-                    || shared.gate.output_width != total
-                    || shared.up.output_width != total
-                    || shared.down.output_width != shared.width
-                    || shared.router.output_width != shared.shared_experts
-                {
-                    bail!(
-                        "FlashMoe scheduled shared Q4 expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
-                        shared.width,
-                        shared.shared_experts,
-                        shared.intermediate,
-                        shared.gate.output_width,
-                        shared.gate.cols,
-                        shared.up.output_width,
-                        shared.up.cols,
-                        shared.down.output_width,
-                        shared.down.cols,
-                        shared.router.output_width,
-                        shared.router.cols
-                    );
-                }
-                ScheduledSharedExpertShape::new(
-                    shared.width,
-                    shared.shared_experts,
-                    shared.intermediate,
-                )?
-            }
+            Self::Dense(shared) => ScheduledSharedExpertShape::from(shared.validated_shape()?),
+            Self::Q4(shared) => ScheduledSharedExpertShape::from(shared.validated_shape()?),
         };
         Ok(Some(shape))
     }
