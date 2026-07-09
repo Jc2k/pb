@@ -1464,6 +1464,54 @@ impl ScheduledCmd3Input for ScheduledCmd3CpuInput<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScheduledCmd3MetalPostAttentionInput {
+    state: FlashMoePostAttentionPrepState,
+    input_state: FlashMoeCmd3InputState,
+}
+
+impl ScheduledCmd3MetalPostAttentionInput {
+    pub(crate) fn new(state: FlashMoePostAttentionPrepState, active_routes: usize) -> Result<Self> {
+        let layer = state.routing().layer();
+        if !state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 Metal post-attention input for layer {layer}: prep state is not a declared graph state"
+            );
+        }
+        if state.active_experts() != active_routes {
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 Metal post-attention input for layer {layer}: state declares {} active experts but prep carries {active_routes} routes",
+                state.active_experts()
+            );
+        }
+        let input_state = FlashMoeCmd3InputState::metal_post_attention_prep(layer, state);
+        if !input_state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 Metal post-attention input for layer {layer}: input state is not a declared graph state"
+            );
+        }
+        Ok(Self { state, input_state })
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.state.width()
+    }
+
+    pub(crate) fn state(self) -> FlashMoePostAttentionPrepState {
+        self.state
+    }
+}
+
+impl ScheduledCmd3Input for ScheduledCmd3MetalPostAttentionInput {
+    fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+        ScheduledCmd3InputSource::MetalPostAttentionPrep
+    }
+
+    fn scheduled_cmd3_input_state(&self, _layer: usize) -> FlashMoeCmd3InputState {
+        self.input_state
+    }
+}
+
 pub trait ScheduledCmd3Expert {
     fn scheduled_expert_layer(&self) -> usize;
     fn scheduled_expert_id(&self) -> usize;
@@ -4208,6 +4256,39 @@ mod tests {
         assert!(
             empty.to_string().contains("is not a declared graph state"),
             "{empty:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_cmd3_metal_post_attention_input_declares_prep_state_or_errors() {
+        let state = FlashMoePostAttentionPrepState::new(4, 8, 16, 2);
+        let input = ScheduledCmd3MetalPostAttentionInput::new(state, 2).unwrap();
+        assert_eq!(input.width(), 8);
+        assert_eq!(input.state(), state);
+        assert_eq!(
+            input.scheduled_cmd3_input_source(),
+            ScheduledCmd3InputSource::MetalPostAttentionPrep
+        );
+        assert_eq!(
+            input.scheduled_cmd3_input_state(4),
+            FlashMoeCmd3InputState::metal_post_attention_prep(4, state)
+        );
+
+        let route_err = ScheduledCmd3MetalPostAttentionInput::new(state, 1).unwrap_err();
+        assert!(
+            route_err
+                .to_string()
+                .contains("state declares 2 active experts but prep carries 1 routes"),
+            "{route_err:#}"
+        );
+
+        let empty = FlashMoePostAttentionPrepState::new(4, 0, 16, 2);
+        let empty_err = ScheduledCmd3MetalPostAttentionInput::new(empty, 2).unwrap_err();
+        assert!(
+            empty_err
+                .to_string()
+                .contains("prep state is not a declared graph state"),
+            "{empty_err:#}"
         );
     }
 

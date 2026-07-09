@@ -91,9 +91,10 @@ use super::scheduler::{
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
-    ScheduledCmd3InputSource, ScheduledCmd3OutputState, ScheduledCmd3Submission,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet as SchedulerScheduledExpertSet,
-    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledCmd3InputSource, ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
@@ -1900,9 +1901,7 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
         match self {
             Self::Cpu(input) => input.scheduled_cmd3_input_state(layer),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Self::MetalPostAttention(prep) => {
-                FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep.state)
-            }
+            Self::MetalPostAttention(prep) => prep.input.scheduled_cmd3_input_state(layer),
         }
     }
 }
@@ -2049,6 +2048,7 @@ impl DeferredMetalInput {
 struct MetalPostAttentionPrep {
     residual_buffer: ObjcId,
     normed_buffer: ObjcId,
+    input: ScheduledCmd3MetalPostAttentionInput,
     state: FlashMoePostAttentionPrepState,
     width: usize,
     active: Vec<(usize, f32)>,
@@ -2201,10 +2201,8 @@ impl MetalExecutor {
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             ExpertPhaseInput::MetalPostAttention(prep) => {
-                debug_assert!(prep.state.is_declared_graph_state());
-                debug_assert_eq!(prep.state.width(), prep.width);
-                debug_assert_eq!(prep.state.active_experts(), prep.active.len());
-                debug_assert_eq!(prep.state.residual().len(), prep.state.normed().len());
+                debug_assert_eq!(prep.input.state(), prep.state);
+                debug_assert_eq!(prep.input.width(), prep.width);
                 let pending = self
                     .inner
                     .submit_scheduled_expert_phase_from_buffers_with_payloads(
@@ -2214,7 +2212,7 @@ impl MetalExecutor {
                         weights,
                         prep.normed_buffer,
                         prep.residual_buffer,
-                        prep.width,
+                        prep.input.width(),
                         output,
                         shared,
                         next_norm_weight,
@@ -4739,9 +4737,11 @@ impl MetalExecutorInner {
             let state =
                 FlashMoePostAttentionPrepState::new(layer, residual_len, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
+            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                input,
                 state,
                 width: residual_len,
                 active,
@@ -7702,9 +7702,11 @@ impl MetalExecutorInner {
             let state =
                 FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
+            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                input,
                 state,
                 width,
                 active,
@@ -7893,9 +7895,11 @@ impl MetalExecutorInner {
             let state =
                 FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
             debug_assert!(state.is_declared_graph_state());
+            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
             Ok(Some(MetalPostAttentionPrep {
                 residual_buffer,
                 normed_buffer,
+                input,
                 state,
                 width,
                 active,
