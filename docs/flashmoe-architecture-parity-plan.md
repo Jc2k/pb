@@ -130,8 +130,9 @@ The validator should reject silent fallbacks such as:
   implementation is missing. Those paths need to become either typed graph-stage implementations or
   explicit unsupported-capability errors.
 - Dense weights are closer to the upstream resident-blob model than experts are. `weights` now owns
-  typed resident projection descriptors for dense, Q4, shared expert, and router score bindings, but
-  command construction and much of runtime score execution still flows through `legacy.rs` shims.
+  typed resident projection descriptors for dense, Q4, shared expert, and router score bindings plus
+  the router score batch data model, but command construction and much of runtime score execution
+  still flows through `legacy.rs` shims.
 - Timing, benchmark, cache cleanup, pull-time conversion, and smoke tooling exist. They are useful
   verification tools, not the work queue.
 
@@ -156,8 +157,8 @@ The validator should reject silent fallbacks such as:
 - Routing topK placement is now represented as a scheduler graph stage and the runtime validates
   typed score submissions, fused-prep route candidates, and router projection descriptors through
   it. The remaining gap is score production ownership: router projection and score readback are
-  descriptor-backed by `weights`, but still executed through the legacy dense/runtime loop instead
-  of a typed CMD2 builder boundary.
+  descriptor- and batch-backed by `weights`, but still executed through the legacy dense/runtime
+  loop instead of a typed CMD2 builder boundary.
 - Shared experts are still grafted onto the older phase structure. Shared gate/up/down and shared
   down should become part of the same CMD2/CMD3 model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position

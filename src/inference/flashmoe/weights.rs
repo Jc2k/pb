@@ -369,6 +369,21 @@ impl RouterScoreProjectionDescriptor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RouterScoreBatch {
+    pub(crate) projection: Option<RouterScoreProjectionDescriptor>,
+    pub(crate) scores: Vec<f32>,
+}
+
+impl RouterScoreBatch {
+    pub(crate) fn new(
+        projection: Option<RouterScoreProjectionDescriptor>,
+        scores: Vec<f32>,
+    ) -> Self {
+        Self { projection, scores }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentStaticTensorRef {
     pub(crate) tensor_name: String,
@@ -809,6 +824,27 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("shape mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn router_score_batch_keeps_projection_with_scores() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 64,
+            byte_len: 32,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+        let projection =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 128, 2, 4).unwrap();
+
+        let batch = RouterScoreBatch::new(Some(projection), vec![1.0, -2.0]);
+
+        assert_eq!(batch.scores, vec![1.0, -2.0]);
+        assert_eq!(batch.projection.as_ref().unwrap().layer, 3);
+        assert_eq!(batch.projection.as_ref().unwrap().experts, 2);
     }
 
     #[test]

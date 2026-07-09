@@ -103,10 +103,10 @@ use super::state::{
 use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
-    RuntimeTensorEntry, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT,
-    TensorQuantization, TensorRegistry, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreBatch,
+    RouterScoreProjectionDescriptor, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
+    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -15087,12 +15087,6 @@ pub struct DenseStore {
     decoded_tensor_tiles: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[derive(Debug, Clone)]
-struct DenseRouterScores {
-    projection: Option<RouterScoreProjectionDescriptor>,
-    scores: Vec<f32>,
-}
-
 #[derive(Debug, Default)]
 struct DenseTensorCache {
     tensors: BTreeMap<String, Arc<Vec<f32>>>,
@@ -16170,21 +16164,18 @@ impl DenseStore {
         layer: usize,
         experts: usize,
         hidden: &[f32],
-    ) -> Result<DenseRouterScores> {
+    ) -> Result<RouterScoreBatch> {
         let tensor_name = router_tensor_name(layer);
         let projection = self.router_score_projection_descriptor(layer, experts, hidden.len())?;
         let _ = metal;
         if let Some(scores) = self.router_scores_with_accelerate(&tensor_name, experts, hidden)? {
-            return Ok(DenseRouterScores { projection, scores });
+            return Ok(RouterScoreBatch::new(projection, scores));
         }
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.router_projection(layer, expert, hidden)?;
         }
-        Ok(DenseRouterScores {
-            projection,
-            scores: router_scores,
-        })
+        Ok(RouterScoreBatch::new(projection, router_scores))
     }
 
     fn router_score_projection_descriptor(
