@@ -1876,17 +1876,6 @@ struct MetalExecutor {
 type ScheduledPostAttentionPhase = ScheduledCmd2Submission<ScheduledCmd2PhaseInputs>;
 type ScheduledPreselectedRoutingOutput = (FlashMoeRoutingOutputState, Vec<(usize, f32)>);
 
-fn missing_scheduled_cmd3_submission(
-    input: ScheduledCmd3InputSource,
-    layer: usize,
-) -> anyhow::Error {
-    anyhow::anyhow!(
-        "FlashMoe unsupported scheduled CMD3 path: declared {:?} input for layer {} did not produce a Metal expert phase; missing CMD3 implementation must be represented as an unsupported capability instead of falling back",
-        input,
-        layer
-    )
-}
-
 #[derive(Debug)]
 enum ExpertPhaseInput<'a> {
     Cpu {
@@ -2171,7 +2160,6 @@ impl MetalExecutor {
         let command = phase.into_cmd3_command()?;
         let output_state = command.resolve_output_state()?;
         let ScheduledCmd3Command {
-            cmd3,
             position,
             layer,
             experts,
@@ -2198,8 +2186,6 @@ impl MetalExecutor {
                         next_norm_weight,
                         &payloads,
                     )?;
-                    let pending = pending
-                        .ok_or_else(|| missing_scheduled_cmd3_submission(cmd3.input, layer))?;
                     Ok(Some(DeferredExpertPhase::Metal(pending)))
                 }
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2238,8 +2224,6 @@ impl MetalExecutor {
                         next_norm_weight,
                         &payloads,
                     )?;
-                let pending =
-                    pending.ok_or_else(|| missing_scheduled_cmd3_submission(cmd3.input, layer))?;
                 Ok(Some(DeferredExpertPhase::Metal(pending)))
             }
         }
@@ -5201,15 +5185,26 @@ impl MetalExecutorInner {
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<Option<MetalDeferredExpertPhase>> {
+    ) -> Result<MetalDeferredExpertPhase> {
         let width = residual.len();
         if width == 0 || normed.len() < width || weights.len() != experts.len() {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 path: CPU upload input for layer {layer} is not a declared whole phase, width={} normed_len={} residual_len={} weights={} experts={}",
+                width,
+                normed.len(),
+                residual.len(),
+                weights.len(),
+                experts.len()
+            );
         }
         if let Some(weight) = next_norm_weight
             && weight.len() < width
         {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled CMD3 path: next-norm weight length {} is smaller than width {} for layer {layer}",
+                weight.len(),
+                width
+            );
         }
         unsafe {
             let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
@@ -5250,7 +5245,7 @@ impl MetalExecutorInner {
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<Option<MetalDeferredExpertPhase>> {
+    ) -> Result<MetalDeferredExpertPhase> {
         self.submit_expert_phase_from_buffers_with_payloads(
             position,
             layer,
@@ -5264,6 +5259,14 @@ impl MetalExecutorInner {
             next_norm_weight,
             payloads,
         )
+        .and_then(|pending| {
+            pending.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FlashMoe unsupported scheduled CMD3 path: layer {} did not produce a Metal expert phase; missing CMD3 implementation must be represented as an unsupported capability instead of falling back",
+                    layer
+                )
+            })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
