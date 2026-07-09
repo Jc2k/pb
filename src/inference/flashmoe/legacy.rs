@@ -68,7 +68,7 @@ use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::{
     ExpertRoute, ExpertSchedulerMetrics, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    ScheduledExpertRoutes,
+    ScheduledExpertBatch, ScheduledExpertRoutes,
 };
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
@@ -18245,23 +18245,7 @@ struct PendingExpertSet {
     reads: Vec<PendingExpertRead>,
 }
 
-#[derive(Debug)]
-struct ScheduledExpertSet {
-    layer: usize,
-    routes: Vec<ExpertRoute>,
-    weights: Vec<f32>,
-    experts: Arc<[Arc<ExpertWeights>]>,
-}
-
-impl ScheduledExpertSet {
-    fn len(&self) -> usize {
-        self.experts.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.experts.is_empty()
-    }
-}
+type ScheduledExpertSet = ScheduledExpertBatch<Arc<ExpertWeights>>;
 
 #[derive(Debug)]
 struct ExpertLayerReader {
@@ -18519,7 +18503,7 @@ impl ExpertScheduler {
     }
 
     fn issue_routes(&mut self, layer: usize, routes: &[(usize, f32)]) -> Result<PendingExpertSet> {
-        let routes: Vec<ExpertRoute> = routes.iter().copied().map(ExpertRoute::from_pair).collect();
+        let routes = ExpertRoute::from_scores(routes)?;
         let experts: Vec<usize> = routes.iter().map(|route| route.expert).collect();
         let reads = self.issue(layer, &experts)?;
         Ok(PendingExpertSet {
@@ -18593,12 +18577,7 @@ impl ExpertScheduler {
                 );
             }
         }
-        Ok(ScheduledExpertSet {
-            layer: scheduled_routes.layer,
-            routes: scheduled_routes.routes,
-            weights: scheduled_routes.weights,
-            experts: Arc::from(experts),
-        })
+        ScheduledExpertSet::from_parts(scheduled_routes, experts)
     }
 
     fn snapshot(&self) -> ExpertSchedulerSnapshot {
@@ -34472,6 +34451,25 @@ mod tests {
         for (actual, expected) in scheduled.weights.iter().zip(expected_weights.iter()) {
             assert!((actual - expected).abs() <= 1e-6);
         }
+    }
+
+    #[test]
+    fn expert_scheduler_rejects_invalid_routes_before_issuing_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
+        let mut scheduler = ExpertScheduler::new(store);
+
+        let err = scheduler
+            .issue_routes(0, &[(3usize, f32::INFINITY)])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("expert route score for expert 3 is not finite"),
+            "{err:#}"
+        );
+        assert_eq!(scheduler.snapshot().issued_reads, 0);
     }
 
     #[test]

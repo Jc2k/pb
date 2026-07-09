@@ -4,6 +4,7 @@ use super::capabilities::{
 };
 use super::math::softmax_in_place;
 use anyhow::{Result, bail};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +136,52 @@ impl ScheduledExpertRoutes {
             ExpertRoute::from_scores(routes)?,
             routed_expert_scale,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledExpertBatch<T> {
+    pub layer: usize,
+    pub routes: Vec<ExpertRoute>,
+    pub weights: Vec<f32>,
+    pub experts: Arc<[T]>,
+}
+
+impl<T> ScheduledExpertBatch<T> {
+    pub fn from_parts(
+        routes: ScheduledExpertRoutes,
+        experts: Vec<T>,
+    ) -> Result<ScheduledExpertBatch<T>> {
+        if experts.len() != routes.routes.len() {
+            bail!(
+                "scheduled expert batch has {} experts for {} routes on layer {}",
+                experts.len(),
+                routes.routes.len(),
+                routes.layer
+            );
+        }
+        if routes.weights.len() != routes.routes.len() {
+            bail!(
+                "scheduled expert batch has {} weights for {} routes on layer {}",
+                routes.weights.len(),
+                routes.routes.len(),
+                routes.layer
+            );
+        }
+        Ok(Self {
+            layer: routes.layer,
+            routes: routes.routes,
+            weights: routes.weights,
+            experts: Arc::from(experts),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.experts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.experts.is_empty()
     }
 }
 
@@ -355,6 +402,25 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("expert route score for expert 2 is not finite"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_expert_batch_validates_route_weight_and_expert_counts() {
+        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 2.0), (4, 1.0)], 1.0).unwrap();
+        let batch = ScheduledExpertBatch::from_parts(routes, vec!["expert-8", "expert-4"]).unwrap();
+
+        assert_eq!(batch.layer, 3);
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.experts.as_ref(), ["expert-8", "expert-4"]);
+
+        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 2.0), (4, 1.0)], 1.0).unwrap();
+        let err = ScheduledExpertBatch::from_parts(routes, vec!["expert-8"]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scheduled expert batch has 1 experts for 2 routes"),
             "{err:#}"
         );
     }
