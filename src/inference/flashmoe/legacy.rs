@@ -99,8 +99,9 @@ use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RuntimeTensorEntry,
-    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -1862,28 +1863,6 @@ struct MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     inner: Arc<MetalExecutorInner>,
     route_top4_enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-struct SharedExpertPhaseWeights {
-    gate: Arc<Vec<f32>>,
-    up: Arc<Vec<f32>>,
-    down: Arc<Vec<f32>>,
-    router: Arc<Vec<f32>>,
-    shared_experts: usize,
-    intermediate: usize,
-    width: usize,
-}
-
-#[derive(Debug, Clone)]
-struct SharedExpertPhaseQ4Projections {
-    gate: DenseQ4MmapMatvecProjection,
-    up: DenseQ4MmapMatvecProjection,
-    down: DenseQ4MmapMatvecProjection,
-    router: DenseQ4MmapMatvecProjection,
-    shared_experts: usize,
-    intermediate: usize,
-    width: usize,
 }
 
 #[derive(Debug, Clone, Copy)]

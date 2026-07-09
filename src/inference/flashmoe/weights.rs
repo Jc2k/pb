@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::experts::EXPERT_SCALE_BIAS_DTYPE_F32;
 use super::types::{ExpertQuantization, GROUP_SIZE};
@@ -484,6 +485,28 @@ impl DenseQ4MmapMatvecProjection {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SharedExpertPhaseWeights {
+    pub(crate) gate: Arc<Vec<f32>>,
+    pub(crate) up: Arc<Vec<f32>>,
+    pub(crate) down: Arc<Vec<f32>>,
+    pub(crate) router: Arc<Vec<f32>>,
+    pub(crate) shared_experts: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) width: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SharedExpertPhaseQ4Projections {
+    pub(crate) gate: DenseQ4MmapMatvecProjection,
+    pub(crate) up: DenseQ4MmapMatvecProjection,
+    pub(crate) down: DenseQ4MmapMatvecProjection,
+    pub(crate) router: DenseQ4MmapMatvecProjection,
+    pub(crate) shared_experts: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) width: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +742,58 @@ mod tests {
         assert_eq!(projection.row_packed_bytes, projection.cols.div_ceil(2));
         assert_eq!(projection.groups_per_row, 2);
         assert_eq!(projection.output_width, projection.rows);
+    }
+
+    #[test]
+    fn shared_expert_dense_descriptor_groups_projection_weights() {
+        let shared = SharedExpertPhaseWeights {
+            gate: Arc::new(vec![1.0, 2.0]),
+            up: Arc::new(vec![3.0, 4.0]),
+            down: Arc::new(vec![5.0, 6.0]),
+            router: Arc::new(vec![7.0, 8.0]),
+            shared_experts: 1,
+            intermediate: 2,
+            width: 1,
+        };
+
+        assert_eq!(shared.shared_experts, 1);
+        assert_eq!(shared.intermediate, 2);
+        assert_eq!(shared.width, 1);
+        assert_eq!(shared.gate.as_slice(), &[1.0, 2.0]);
+        assert_eq!(shared.router.as_slice(), &[7.0, 8.0]);
+    }
+
+    #[test]
+    fn shared_expert_q4_descriptor_groups_resident_projection_bindings() {
+        let projection = DenseQ4MmapMatvecProjection {
+            tensor_name: "model.layers.0.mlp.shared_expert.gate_proj.weight".to_string(),
+            packed_byte_offset: 128,
+            scales_byte_offset: 256,
+            biases_byte_offset: 512,
+            rows: 16,
+            cols: 32,
+            output_width: 16,
+            row_packed_bytes: 16,
+            groups_per_row: 2,
+            group_size: 16,
+            scale_bias_dtype: "BF16".to_string(),
+        };
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: projection.clone(),
+            up: projection.clone(),
+            down: projection.clone(),
+            router: projection,
+            shared_experts: 1,
+            intermediate: 16,
+            width: 32,
+        };
+
+        assert_eq!(shared.gate.packed_byte_offset, 128);
+        assert_eq!(shared.down.output_width, 16);
+        assert_eq!(shared.router.cols, 32);
+        assert_eq!(shared.shared_experts, 1);
+        assert_eq!(shared.intermediate, 16);
+        assert_eq!(shared.width, 32);
     }
 
     #[test]
