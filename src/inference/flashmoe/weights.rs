@@ -427,6 +427,85 @@ impl RouterScoreBatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuVisibleNextNormWeights<'a> {
+    pub(crate) tensor_name: &'a str,
+    pub(crate) width: usize,
+    values: &'a [f32],
+}
+
+impl<'a> CpuVisibleNextNormWeights<'a> {
+    pub(crate) fn new(tensor_name: &'a str, values: &'a [f32], width: usize) -> Result<Self> {
+        if tensor_name.is_empty() {
+            bail!("FlashMoe scheduled next-norm weights require a tensor name");
+        }
+        if width == 0 {
+            bail!("FlashMoe scheduled next-norm weights require non-zero width");
+        }
+        if values.len() < width {
+            bail!(
+                "FlashMoe scheduled next-norm weight tensor {tensor_name} length {} is smaller than width {width}",
+                values.len()
+            );
+        }
+        Ok(Self {
+            tensor_name,
+            width,
+            values,
+        })
+    }
+
+    pub(crate) fn values(self) -> &'a [f32] {
+        &self.values[..self.width]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScheduledNextNormWeights<'a> {
+    None,
+    CpuVisible(CpuVisibleNextNormWeights<'a>),
+}
+
+impl<'a> ScheduledNextNormWeights<'a> {
+    pub(crate) fn none() -> Self {
+        Self::None
+    }
+
+    pub(crate) fn cpu_visible(
+        tensor_name: &'a str,
+        values: &'a [f32],
+        width: usize,
+    ) -> Result<Self> {
+        Ok(Self::CpuVisible(CpuVisibleNextNormWeights::new(
+            tensor_name,
+            values,
+            width,
+        )?))
+    }
+
+    pub(crate) fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) fn is_cpu_visible(self) -> bool {
+        matches!(self, Self::CpuVisible(_))
+    }
+
+    pub(crate) fn width(self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::CpuVisible(weights) => Some(weights.width),
+        }
+    }
+
+    pub(crate) fn values(self) -> Option<&'a [f32]> {
+        match self {
+            Self::None => None,
+            Self::CpuVisible(weights) => Some(weights.values()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentStaticTensorRef {
     pub(crate) tensor_name: String,
@@ -1173,6 +1252,33 @@ mod tests {
 
         let err = shared.validated_shape().unwrap_err();
         assert!(err.to_string().contains("shape is invalid"));
+    }
+
+    #[test]
+    fn scheduled_next_norm_weights_declare_cpu_visible_width() {
+        let values = [1.0, 0.5, 0.25, 0.125];
+        let weights = ScheduledNextNormWeights::cpu_visible(
+            "model.layers.1.input_layernorm.weight",
+            &values,
+            3,
+        )
+        .unwrap();
+
+        assert!(weights.is_cpu_visible());
+        assert_eq!(weights.width(), Some(3));
+        assert_eq!(weights.values().unwrap(), &[1.0, 0.5, 0.25]);
+        assert!(ScheduledNextNormWeights::none().is_none());
+
+        let empty_name_err = ScheduledNextNormWeights::cpu_visible("", &values, 3).unwrap_err();
+        assert!(empty_name_err.to_string().contains("require a tensor name"));
+
+        let short_err = ScheduledNextNormWeights::cpu_visible(
+            "model.layers.1.input_layernorm.weight",
+            &values[..2],
+            3,
+        )
+        .unwrap_err();
+        assert!(short_err.to_string().contains("smaller than width 3"));
     }
 
     #[test]

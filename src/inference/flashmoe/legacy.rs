@@ -108,9 +108,10 @@ use super::types::*;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreBatch,
-    RouterScoreProjectionDescriptor, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
-    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, validate_dense_matvec_shape,
+    RouterScoreProjectionDescriptor, RuntimeTensorEntry, ScheduledNextNormWeights,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -2170,10 +2171,11 @@ impl MetalExecutor {
             weights,
             input,
             shared,
-            next_norm_weight,
+            next_norm_weights,
             payloads,
             ..
         } = command;
+        let next_norm_weight = next_norm_weights.values();
         match input {
             ExpertPhaseInput::Cpu { normed, residual } => {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10682,6 +10684,13 @@ impl FlashMoeEngine {
             } else {
                 None
             };
+            let next_norm_weights = if let (Some(name), Some(weight)) =
+                (next_norm_name.as_deref(), next_norm_weight.as_deref())
+            {
+                ScheduledNextNormWeights::cpu_visible(name, weight, runtime.width)?
+            } else {
+                ScheduledNextNormWeights::none()
+            };
             let scheduled_cmd3 = self.scheduled_graph.build_cmd3_expert_phase(
                 layer,
                 scheduled_experts.len(),
@@ -10710,7 +10719,7 @@ impl FlashMoeEngine {
                     &scheduled_experts,
                     ExpertPhaseInput::MetalPostAttention(prep),
                     shared_phase,
-                    next_norm_weight.as_deref(),
+                    next_norm_weights,
                 )?;
                 let pending = metal.submit_scheduled_expert_phase(phase)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
@@ -10735,7 +10744,7 @@ impl FlashMoeEngine {
                         residual: mlp_residual,
                     },
                     shared_phase,
-                    next_norm_weight.as_deref(),
+                    next_norm_weights,
                 )?)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);

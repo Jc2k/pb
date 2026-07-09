@@ -15,8 +15,8 @@ use super::state::{
     FlashMoeStateBufferRole, FlashMoeStatePlacement,
 };
 use super::weights::{
-    RouterScoreBatch, RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections,
-    SharedExpertPhaseShape, SharedExpertPhaseWeights,
+    RouterScoreBatch, RouterScoreProjectionDescriptor, ScheduledNextNormWeights,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseShape, SharedExpertPhaseWeights,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
@@ -1334,7 +1334,7 @@ pub struct ScheduledCmd3Submission<'a, TExpert, TInput, TShared> {
     pub input: TInput,
     input_state: FlashMoeCmd3InputState,
     pub shared: TShared,
-    pub next_norm_weight: Option<&'a [f32]>,
+    pub next_norm_weights: ScheduledNextNormWeights<'a>,
 }
 
 impl<'a, TExpert, TInput, TShared> ScheduledCmd3Submission<'a, TExpert, TInput, TShared>
@@ -1349,7 +1349,7 @@ where
         scheduled: &'a ScheduledExpertSet<TExpert>,
         input: TInput,
         shared: TShared,
-        next_norm_weight: Option<&'a [f32]>,
+        next_norm_weights: ScheduledNextNormWeights<'a>,
     ) -> Result<Self> {
         if cmd3.layer != scheduled.layer || cmd3.expert_count != scheduled.len() {
             bail!(
@@ -1457,20 +1457,20 @@ where
             }
         }
         if cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
-            && next_norm_weight.is_none()
+            && !next_norm_weights.is_cpu_visible()
         {
             bail!("FlashMoe scheduled CMD3 requires next-norm weights but none were provided");
         }
-        if let Some(weight) = next_norm_weight
-            && weight.len() < input_width
+        if let Some(width) = next_norm_weights.width()
+            && width != input_width
         {
             bail!(
-                "FlashMoe scheduled CMD3 next-norm weight length {} is smaller than input width {}",
-                weight.len(),
+                "FlashMoe scheduled CMD3 next-norm weight width {} does not match input width {}",
+                width,
                 input_width
             );
         }
-        if cmd3.next_norm == ScheduledNextNormSource::None && next_norm_weight.is_some() {
+        if cmd3.next_norm == ScheduledNextNormSource::None && !next_norm_weights.is_none() {
             bail!("FlashMoe scheduled CMD3 received next-norm weights for a no-next-norm stage");
         }
         Ok(Self {
@@ -1480,7 +1480,7 @@ where
             input,
             input_state,
             shared,
-            next_norm_weight,
+            next_norm_weights,
         })
     }
 }
@@ -1495,7 +1495,7 @@ pub struct ScheduledCmd3Command<'a, TExpert, TInput, TShared> {
     pub input: TInput,
     pub input_state: FlashMoeCmd3InputState,
     pub shared: TShared,
-    pub next_norm_weight: Option<&'a [f32]>,
+    pub next_norm_weights: ScheduledNextNormWeights<'a>,
     pub payloads: Vec<ScheduledExpertPhaseMlpPayload<'a>>,
 }
 
@@ -1613,7 +1613,7 @@ where
             input: self.input,
             input_state: self.input_state,
             shared: self.shared,
-            next_norm_weight: self.next_norm_weight,
+            next_norm_weights: self.next_norm_weights,
             payloads,
         })
     }
@@ -3629,7 +3629,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            None,
+            ScheduledNextNormWeights::none(),
         )
         .unwrap();
 
@@ -3679,7 +3679,12 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            Some(&next_norm),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &next_norm,
+                8,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -3701,7 +3706,7 @@ mod tests {
             command.input_state.placement(),
             FlashMoeStatePlacement::CpuVisible
         );
-        assert_eq!(command.next_norm_weight.unwrap().len(), 8);
+        assert_eq!(command.next_norm_weights.values().unwrap().len(), 8);
         assert_eq!(command.payloads[0].q4().gate.cols, 8);
 
         let output = command.resolve_output_state().unwrap();
@@ -3735,7 +3740,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            None,
+            ScheduledNextNormWeights::none(),
         )
         .unwrap()
         .into_cmd3_command()
@@ -3772,7 +3777,12 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap()
         .into_cmd3_command()
@@ -3805,7 +3815,12 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap()
         .into_cmd3_command()
@@ -3872,7 +3887,12 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
-            Some(&[1.0]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0],
+                1,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(input_err.to_string().contains("does not match phase input"));
@@ -3883,7 +3903,12 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            Some(&[1.0]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0],
+                1,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -3901,7 +3926,12 @@ mod tests {
                 ScheduledSharedExpertSource::ResidentQ4Projections,
                 None,
             ),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -3916,7 +3946,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
-            None,
+            ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
         assert!(
@@ -3934,7 +3964,12 @@ mod tests {
                 ScheduledSharedExpertSource::ResidentQ4Projections,
                 Some(ScheduledSharedExpertShape::new(4, 2, 2).unwrap()),
             ),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -3957,7 +3992,12 @@ mod tests {
                     total_intermediate: 5,
                 }),
             ),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -3972,13 +4012,18 @@ mod tests {
             &scheduled,
             dummy_cmd3_input_with_width(ScheduledCmd3InputSource::MetalPostAttentionPrep, 8),
             dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
-            Some(&[1.0; 4]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 4],
+                4,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
             next_norm_width_err
                 .to_string()
-                .contains("smaller than input width")
+                .contains("width 4 does not match input width 8")
         );
 
         let invalid_input_state_err = ScheduledCmd3Submission::new(
@@ -3990,7 +4035,12 @@ mod tests {
                 state: FlashMoeCmd3InputState::cpu_normed_residual(7, 8, 4),
             },
             dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
-            Some(&[1.0; 8]),
+            ScheduledNextNormWeights::cpu_visible(
+                "model.layers.8.input_layernorm.weight",
+                &[1.0; 8],
+                8,
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -4032,7 +4082,7 @@ mod tests {
             &wrong_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            None,
+            ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("does not match routed layer"));
@@ -4052,7 +4102,7 @@ mod tests {
             &partial_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
             dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
-            None,
+            ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("must be a whole-expert slot"));
