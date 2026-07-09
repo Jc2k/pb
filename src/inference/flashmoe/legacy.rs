@@ -60,6 +60,8 @@ use tracing::info;
 
 use super::capabilities::FlashMoeCapabilityPlan;
 #[cfg(test)]
+use super::capabilities::{FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement};
+#[cfg(test)]
 use super::experts::ExpertReadPath;
 #[cfg(test)]
 use super::experts::FLASHMOE_EXPERT_IO_POLICY;
@@ -81,6 +83,8 @@ use super::experts::{
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+#[cfg(test)]
+use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
     ActiveExpertReadScheduler, ExpertRoute, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
     PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
@@ -10550,7 +10554,7 @@ impl FlashMoeEngine {
             }
             let active = if let Some(routing_command) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                routing_command.routes
+                routing_command
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
@@ -10594,7 +10598,7 @@ impl FlashMoeEngine {
                 }
                 if let Some(routing_command) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    routing_command.routes
+                    routing_command
                 } else {
                     if deferred_attention_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -10657,7 +10661,7 @@ impl FlashMoeEngine {
                 (!has_metal_post_attention_prep).then(|| token_state.residual_snapshot());
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let cpu_mlp_residual = Some(token_state.residual_snapshot());
-            layer_timing.active_experts = active.len();
+            layer_timing.active_experts = active.routes.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
                 kv_cache
                     .record_layer_state_record(token_state.layer_state_record(position, layer))?;
@@ -10670,7 +10674,7 @@ impl FlashMoeEngine {
             }
             let expert_metrics_before = self.scheduler.snapshot();
             let expert_io_started = Instant::now();
-            let pending_experts = self.scheduler.issue_routes(layer, &active)?;
+            let pending_experts = self.scheduler.issue_routing_command(&active)?;
             layer_timing.buckets.expert_io += expert_io_started.elapsed();
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
@@ -10705,7 +10709,7 @@ impl FlashMoeEngine {
             debug_assert_eq!(scheduled_experts.layer, layer);
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.routes.len());
             debug_assert_eq!(scheduled_experts.len(), scheduled_experts.weights.len());
-            debug_assert_eq!(scheduled_experts.is_empty(), active.is_empty());
+            debug_assert_eq!(scheduled_experts.is_empty(), active.routes.is_empty());
             for (expert, weight) in scheduled_experts
                 .experts
                 .iter()
@@ -11286,7 +11290,7 @@ impl FlashMoeEngine {
         layer: usize,
         normed: &[f32],
         active_experts: usize,
-    ) -> Result<Vec<(usize, f32)>> {
+    ) -> Result<ScheduledRoutingCommand> {
         let source = ScheduledRoutingCandidateSource::CpuRouterScores;
         let scheduled_routing = self.scheduled_graph.build_routing_topk(
             layer,
@@ -11312,9 +11316,7 @@ impl FlashMoeEngine {
             routing_output.state().source(),
             FlashMoeRoutingOutputSource::CpuRouterScores
         );
-        scheduled_routing
-            .select_command_from_output_scores(routing_output, &router_scores)
-            .map(|command| command.routes)
+        scheduled_routing.select_command_from_output_scores(routing_output, &router_scores)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -18181,11 +18183,15 @@ impl ExpertScheduler {
         Ok(pending)
     }
 
-    fn issue_routes(&mut self, layer: usize, routes: &[(usize, f32)]) -> Result<PendingExpertSet> {
-        let routes = ExpertRoute::from_scores(routes)?;
+    fn issue_routing_command(
+        &mut self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<PendingExpertSet> {
+        command.validate_for_active_expert_issue()?;
+        let routes = ExpertRoute::from_scores(&command.routes)?;
         let experts: Vec<usize> = routes.iter().map(|route| route.expert).collect();
-        let reads = self.issue(layer, &experts)?;
-        Ok(PendingExpertSet::new(layer, routes, reads))
+        let reads = self.issue(command.layer, &experts)?;
+        Ok(PendingExpertSet::new(command.layer, routes, reads))
     }
 
     fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
@@ -33446,6 +33452,30 @@ mod tests {
         assert_eq!(snapshot.read_failures, 0);
     }
 
+    fn test_routing_command(
+        layer: usize,
+        experts: usize,
+        routes: &[(usize, f32)],
+    ) -> ScheduledRoutingCommand {
+        ScheduledRoutingCommand {
+            routing: ScheduledRoutingTopK {
+                stage: FlashMoeStageCapability::new(
+                    FlashMoeGraphStage::RoutingSoftmaxTopK,
+                    FlashMoeStagePlacement::CpuDeclared,
+                    "test CPU routing",
+                ),
+                layer,
+                experts,
+                active_experts: routes.len(),
+                source: ScheduledRoutingCandidateSource::CpuRouterScores,
+            },
+            layer,
+            active_experts: routes.len(),
+            source: ScheduledRoutingCandidateSource::CpuRouterScores,
+            routes: routes.to_vec(),
+        }
+    }
+
     #[test]
     fn expert_scheduler_finishes_routed_set_with_normalized_weights() {
         let temp = tempfile::tempdir().unwrap();
@@ -33464,7 +33494,8 @@ mod tests {
         let mut scheduler =
             ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
         let routes = [(7usize, 2.0f32), (1, 1.0), (3, -1.0)];
-        let pending = scheduler.issue_routes(0, &routes).unwrap();
+        let command = test_routing_command(0, 8, &routes);
+        let pending = scheduler.issue_routing_command(&command).unwrap();
         assert_eq!(scheduler.worker_count(), 3);
         let scheduled = scheduler.finish_routes(pending).unwrap();
 
@@ -33507,7 +33538,8 @@ mod tests {
         let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
         let mut scheduler = ExpertScheduler::new_with_routed_expert_scale(store, 0.9);
         let routes = [(3usize, 2.0f32), (1, 1.0)];
-        let pending = scheduler.issue_routes(0, &routes).unwrap();
+        let command = test_routing_command(0, 4, &routes);
+        let pending = scheduler.issue_routing_command(&command).unwrap();
         let scheduled = scheduler.finish_routes(pending).unwrap();
         let mut expected_weights: Vec<f32> = routes.iter().map(|(_, score)| *score).collect();
         softmax_in_place(&mut expected_weights);
@@ -33526,13 +33558,12 @@ mod tests {
         let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
         let mut scheduler = ExpertScheduler::new(store);
 
-        let err = scheduler
-            .issue_routes(0, &[(3usize, f32::INFINITY)])
-            .unwrap_err();
+        let command = test_routing_command(0, 4, &[(3usize, f32::INFINITY)]);
+        let err = scheduler.issue_routing_command(&command).unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("expert route score for expert 3 is not finite"),
+                .contains("scheduled routing command score for expert 3 is not finite"),
             "{err:#}"
         );
         assert_eq!(scheduler.snapshot().issued_reads, 0);

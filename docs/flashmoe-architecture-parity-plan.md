@@ -192,10 +192,12 @@ The validator should reject silent fallbacks such as:
   made explicit.
 - Expert reads now follow the upstream positioned-read policy under `experts`, and the scheduler
   owns issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
-  CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. CMD1/CMD2/CMD3
-  submission now resolves scheduler-owned command objects before entering runtime helpers. The
-  remaining gap is to move the Metal command encoding and legacy CPU diagnostic helpers out of
-  `legacy.rs` behind the explicit CMD builder APIs.
+  CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. Active expert
+  reads are now issued from the validated `ScheduledRoutingCommand` produced by CPU router scores or
+  CMD2 preselected routes, so the read scheduler no longer receives a loose layer plus route vector.
+  CMD1/CMD2/CMD3 submission now resolves scheduler-owned command objects before entering runtime
+  helpers. The remaining gap is to move the Metal command encoding and legacy CPU diagnostic helpers
+  out of `legacy.rs` behind the explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   should become explicit command builders used by every supported variant.
 - GPU residency is partial. CMD1 CPU normed versus deferred GPU next-layer-normed inputs,
@@ -215,7 +217,8 @@ The validator should reject silent fallbacks such as:
   Metal post-attention prep must resolve as a scheduler-owned CMD2 output before its routes can feed
   topK validation. CPU router score production now consumes a scheduler-built projection command
   carrying declared routing state, hidden width, and the optional resident projection descriptor
-  before the dense store executes it. The remaining gap is score production ownership: router score
+  before the dense store executes it. Active expert issue now consumes the resulting
+  `ScheduledRoutingCommand` directly. The remaining gap is score production ownership: router score
   execution and any future readback variants are descriptor- and batch-backed by `weights`, but some
   execution still flows through legacy dense/runtime helpers instead of a typed CMD2 builder
   boundary.

@@ -1131,6 +1131,61 @@ pub struct ScheduledRoutingCommand {
     pub routes: Vec<(usize, f32)>,
 }
 
+impl ScheduledRoutingCommand {
+    pub(crate) fn validate_for_active_expert_issue(&self) -> Result<()> {
+        if self.layer != self.routing.layer {
+            bail!(
+                "FlashMoe scheduled routing command layer {} does not match routing descriptor layer {}",
+                self.layer,
+                self.routing.layer
+            );
+        }
+        if self.active_experts != self.routing.active_experts {
+            bail!(
+                "FlashMoe scheduled routing command active expert count {} does not match routing descriptor active expert count {}",
+                self.active_experts,
+                self.routing.active_experts
+            );
+        }
+        if self.source != self.routing.source {
+            bail!(
+                "FlashMoe scheduled routing command source {:?} does not match routing descriptor source {:?}",
+                self.source,
+                self.routing.source
+            );
+        }
+        self.routing.validate_bounds()?;
+        if self.routes.len() != self.active_experts {
+            bail!(
+                "FlashMoe scheduled routing command carries {} routes for active expert count {}",
+                self.routes.len(),
+                self.active_experts
+            );
+        }
+        let mut seen = BTreeSet::new();
+        for (expert, score) in self.routes.iter().copied() {
+            if expert >= self.routing.experts {
+                bail!(
+                    "FlashMoe scheduled routing command selected expert {} outside expert count {}",
+                    expert,
+                    self.routing.experts
+                );
+            }
+            if !seen.insert(expert) {
+                bail!("FlashMoe scheduled routing command selected expert {expert} more than once");
+            }
+            if !score.is_finite() {
+                bail!(
+                    "FlashMoe scheduled routing command score for expert {} is not finite: {}",
+                    expert,
+                    score
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledCmd3InputSource {
     MetalPostAttentionPrep,
@@ -3246,6 +3301,50 @@ mod tests {
         assert_eq!(command.routing.layer, 3);
         assert_eq!(command.routes.len(), 3);
         assert_eq!(command.routes[0].0, 3);
+    }
+
+    #[test]
+    fn scheduled_routing_command_validates_active_expert_issue_shape() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(3, 5, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
+            .unwrap();
+        let output = routing
+            .validate_output_state(FlashMoeRoutingOutputState::cpu_router_scores(3, 5, 3))
+            .unwrap();
+        let command = routing
+            .select_command_from_output_scores(
+                output,
+                &ScheduledRoutingScoreView::new(
+                    3,
+                    ScheduledRoutingCandidateSource::CpuRouterScores,
+                    &[0.1, 0.9, 0.2, 1.5, -0.2],
+                ),
+            )
+            .unwrap();
+
+        command.validate_for_active_expert_issue().unwrap();
+
+        let mut wrong_count = command.clone();
+        wrong_count.active_experts = 2;
+        let count_err = wrong_count.validate_for_active_expert_issue().unwrap_err();
+        assert!(
+            count_err
+                .to_string()
+                .contains("does not match routing descriptor active expert count"),
+            "{count_err:#}"
+        );
+
+        let mut repeated = command;
+        repeated.routes[1].0 = repeated.routes[0].0;
+        let repeated_err = repeated.validate_for_active_expert_issue().unwrap_err();
+        assert!(
+            repeated_err
+                .to_string()
+                .contains("selected expert 3 more than once"),
+            "{repeated_err:#}"
+        );
     }
 
     #[test]
