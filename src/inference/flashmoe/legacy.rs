@@ -71,7 +71,10 @@ use super::scheduler::{
     ScheduledExpertBatch, ScheduledExpertRoutes,
 };
 use super::types::*;
-use super::weights::{DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection};
+use super::weights::{
+    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
+    RuntimeTensorEntry, TensorQuantization,
+};
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
 type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
@@ -456,30 +459,6 @@ pub struct ExpertTensorRef {
     pub source_offsets: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q4_sources: Option<DenseQ4SourceRefs>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DenseTensorRef {
-    pub tensor: String,
-    pub shard: String,
-    pub dtype: String,
-    pub shape: Vec<usize>,
-    pub source_offsets: [u64; 2],
-    pub runtime_offset: u64,
-    pub byte_len: u64,
-    #[serde(default)]
-    pub quantization: TensorQuantization,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub q4_sources: Option<DenseQ4SourceRefs>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DenseQ4SourceRefs {
-    pub scales_shard: String,
-    pub scales_offsets: [u64; 2],
-    pub biases_shard: String,
-    pub biases_offsets: [u64; 2],
-    pub scale_bias_dtype: String,
 }
 
 #[derive(Debug, Clone)]
@@ -14713,27 +14692,6 @@ fn report_generation_progress(progress: &GenerationProgress<'_>, message: String
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TensorQuantization {
-    None,
-    Q4 {
-        group_size: usize,
-        format: String,
-        #[serde(default = "default_dense_q4_scale_bias_dtype")]
-        scale_bias_dtype: String,
-    },
-}
-
-impl Default for TensorQuantization {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-fn default_dense_q4_scale_bias_dtype() -> String {
-    EXPERT_SCALE_BIAS_DTYPE_F32.to_string()
-}
-
 #[derive(Debug, Clone, Copy)]
 struct DenseQ4Layout {
     rows: usize,
@@ -14798,17 +14756,6 @@ fn dense_q4_layout_with_scale_bias_dtype(
         scale_bias_bytes,
         total_bytes,
     })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeTensorEntry {
-    pub name: String,
-    pub dtype: String,
-    pub shape: Vec<usize>,
-    pub byte_offset: u64,
-    pub byte_len: u64,
-    pub alignment: u64,
-    pub quantization: TensorQuantization,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

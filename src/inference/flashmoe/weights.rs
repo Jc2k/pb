@@ -1,3 +1,61 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseTensorRef {
+    pub tensor: String,
+    pub shard: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub source_offsets: [u64; 2],
+    pub runtime_offset: u64,
+    pub byte_len: u64,
+    #[serde(default)]
+    pub quantization: TensorQuantization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q4_sources: Option<DenseQ4SourceRefs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseQ4SourceRefs {
+    pub scales_shard: String,
+    pub scales_offsets: [u64; 2],
+    pub biases_shard: String,
+    pub biases_offsets: [u64; 2],
+    pub scale_bias_dtype: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TensorQuantization {
+    None,
+    Q4 {
+        group_size: usize,
+        format: String,
+        #[serde(default = "default_dense_q4_scale_bias_dtype")]
+        scale_bias_dtype: String,
+    },
+}
+
+impl Default for TensorQuantization {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+fn default_dense_q4_scale_bias_dtype() -> String {
+    "F32".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeTensorEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+    pub alignment: u64,
+    pub quantization: TensorQuantization,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DenseMmapMatvecProjection {
     pub(crate) tensor_name: String,
@@ -32,6 +90,45 @@ pub(crate) struct DenseQ4MmapMatvecProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tensor_quantization_defaults_to_unquantized_dense() {
+        assert_eq!(TensorQuantization::default(), TensorQuantization::None);
+    }
+
+    #[test]
+    fn tensor_quantization_q4_defaults_scale_bias_dtype_for_legacy_manifests() {
+        let quantization: TensorQuantization =
+            serde_json::from_str(r#"{"Q4":{"group_size":16,"format":"dense-q4"}}"#).unwrap();
+
+        assert_eq!(
+            quantization,
+            TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "F32".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dense_tensor_ref_preserves_runtime_binding_offsets() {
+        let tensor = DenseTensorRef {
+            tensor: "model.embed_tokens.weight".to_string(),
+            shard: "model-00001.safetensors".to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![8, 4],
+            source_offsets: [128, 192],
+            runtime_offset: 4096,
+            byte_len: 64,
+            quantization: TensorQuantization::None,
+            q4_sources: None,
+        };
+
+        assert_eq!(tensor.runtime_offset, 4096);
+        assert_eq!(tensor.byte_len, 64);
+        assert_eq!(tensor.quantization, TensorQuantization::None);
+    }
 
     #[test]
     fn dense_mmap_projection_stride_uses_runtime_cols() {
