@@ -262,6 +262,12 @@ pub enum ScheduledNextNormSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledSharedExpertShape {
+    pub width: usize,
+    pub total_intermediate: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledCmd3ExpertPhase {
     pub stage: FlashMoeStageCapability,
     pub layer: usize,
@@ -273,6 +279,7 @@ pub struct ScheduledCmd3ExpertPhase {
 
 pub trait ScheduledCmd3Input {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource;
+    fn scheduled_cmd3_input_width(&self) -> usize;
 }
 
 pub trait ScheduledCmd3Expert {
@@ -383,6 +390,7 @@ where
 
 pub trait ScheduledSharedExpert {
     fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource;
+    fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -432,6 +440,85 @@ impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
             Self::Dense(_) => ScheduledSharedExpertSource::DenseCpuWeights,
             Self::Q4(_) => ScheduledSharedExpertSource::ResidentQ4Projections,
         }
+    }
+
+    fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>> {
+        let shape = match self {
+            Self::None => return Ok(None),
+            Self::Dense(shared) => {
+                let total = shared
+                    .shared_experts
+                    .checked_mul(shared.intermediate)
+                    .ok_or_else(|| anyhow::anyhow!("shared expert intermediate width overflow"))?;
+                let dense_len = total.checked_mul(shared.width).ok_or_else(|| {
+                    anyhow::anyhow!("shared expert dense projection width overflow")
+                })?;
+                let router_len =
+                    shared
+                        .shared_experts
+                        .checked_mul(shared.width)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("shared expert router projection width overflow")
+                        })?;
+                if shared.gate.len() != dense_len
+                    || shared.up.len() != dense_len
+                    || shared.down.len() != dense_len
+                    || shared.router.len() != router_len
+                {
+                    bail!(
+                        "FlashMoe scheduled shared dense expert shape is invalid: width={} shared_experts={} intermediate={} gate={} up={} down={} router={}",
+                        shared.width,
+                        shared.shared_experts,
+                        shared.intermediate,
+                        shared.gate.len(),
+                        shared.up.len(),
+                        shared.down.len(),
+                        shared.router.len()
+                    );
+                }
+                ScheduledSharedExpertShape {
+                    width: shared.width,
+                    total_intermediate: total,
+                }
+            }
+            Self::Q4(shared) => {
+                let total = shared
+                    .shared_experts
+                    .checked_mul(shared.intermediate)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("shared expert Q4 intermediate width overflow")
+                    })?;
+                if shared.gate.cols != shared.width
+                    || shared.up.cols != shared.width
+                    || shared.router.cols != shared.width
+                    || shared.down.cols != total
+                    || shared.gate.output_width != total
+                    || shared.up.output_width != total
+                    || shared.down.output_width != shared.width
+                    || shared.router.output_width != shared.shared_experts
+                {
+                    bail!(
+                        "FlashMoe scheduled shared Q4 expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
+                        shared.width,
+                        shared.shared_experts,
+                        shared.intermediate,
+                        shared.gate.output_width,
+                        shared.gate.cols,
+                        shared.up.output_width,
+                        shared.up.cols,
+                        shared.down.output_width,
+                        shared.down.cols,
+                        shared.router.output_width,
+                        shared.router.cols
+                    );
+                }
+                ScheduledSharedExpertShape {
+                    width: shared.width,
+                    total_intermediate: total,
+                }
+            }
+        };
+        Ok(Some(shape))
     }
 }
 
@@ -514,10 +601,35 @@ where
                 shared.scheduled_shared_expert_source()
             );
         }
+        let input_width = input.scheduled_cmd3_input_width();
+        if input_width == 0 {
+            bail!("FlashMoe scheduled CMD3 input width must be non-zero");
+        }
+        if let Some(shape) = shared.scheduled_shared_expert_shape()? {
+            if shape.width != input_width {
+                bail!(
+                    "FlashMoe scheduled CMD3 shared expert width {} does not match input width {}",
+                    shape.width,
+                    input_width
+                );
+            }
+            if shape.total_intermediate == 0 {
+                bail!("FlashMoe scheduled CMD3 shared expert intermediate width must be non-zero");
+            }
+        }
         if cmd3.next_norm == ScheduledNextNormSource::CpuVisibleWeights
             && next_norm_weight.is_none()
         {
             bail!("FlashMoe scheduled CMD3 requires next-norm weights but none were provided");
+        }
+        if let Some(weight) = next_norm_weight
+            && weight.len() < input_width
+        {
+            bail!(
+                "FlashMoe scheduled CMD3 next-norm weight length {} is smaller than input width {}",
+                weight.len(),
+                input_width
+            );
         }
         if cmd3.next_norm == ScheduledNextNormSource::None && next_norm_weight.is_some() {
             bail!("FlashMoe scheduled CMD3 received next-norm weights for a no-next-norm stage");
@@ -1108,21 +1220,67 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy)]
-    struct DummyCmd3Input(ScheduledCmd3InputSource);
+    struct DummyCmd3Input {
+        source: ScheduledCmd3InputSource,
+        width: usize,
+    }
 
     impl ScheduledCmd3Input for DummyCmd3Input {
         fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
-            self.0
+            self.source
+        }
+
+        fn scheduled_cmd3_input_width(&self) -> usize {
+            self.width
         }
     }
 
     #[derive(Debug, Clone, Copy)]
-    struct DummySharedExpert(ScheduledSharedExpertSource);
+    struct DummySharedExpert {
+        source: ScheduledSharedExpertSource,
+        shape: Option<ScheduledSharedExpertShape>,
+    }
 
     impl ScheduledSharedExpert for DummySharedExpert {
         fn scheduled_shared_expert_source(&self) -> ScheduledSharedExpertSource {
-            self.0
+            self.source
         }
+
+        fn scheduled_shared_expert_shape(&self) -> Result<Option<ScheduledSharedExpertShape>> {
+            Ok(self.shape)
+        }
+    }
+
+    fn dummy_cmd3_input(source: ScheduledCmd3InputSource) -> DummyCmd3Input {
+        DummyCmd3Input { source, width: 8 }
+    }
+
+    fn dummy_cmd3_input_with_width(
+        source: ScheduledCmd3InputSource,
+        width: usize,
+    ) -> DummyCmd3Input {
+        DummyCmd3Input { source, width }
+    }
+
+    fn dummy_shared_expert(source: ScheduledSharedExpertSource) -> DummySharedExpert {
+        let shape = match source {
+            ScheduledSharedExpertSource::None => None,
+            ScheduledSharedExpertSource::DenseCpuWeights
+            | ScheduledSharedExpertSource::ResidentQ4Projections => {
+                Some(ScheduledSharedExpertShape {
+                    width: 8,
+                    total_intermediate: 4,
+                })
+            }
+        };
+        DummySharedExpert { source, shape }
+    }
+
+    fn dummy_shared_expert_with_shape(
+        source: ScheduledSharedExpertSource,
+        shape: Option<ScheduledSharedExpertShape>,
+    ) -> DummySharedExpert {
+        DummySharedExpert { source, shape }
     }
 
     fn dummy_shared_dense_phase() -> SharedExpertPhaseWeights {
@@ -1130,24 +1288,28 @@ mod tests {
             gate: Arc::new(vec![1.0, 2.0]),
             up: Arc::new(vec![3.0, 4.0]),
             down: Arc::new(vec![5.0, 6.0]),
-            router: Arc::new(vec![7.0, 8.0]),
+            router: Arc::new(vec![7.0]),
             shared_experts: 1,
             intermediate: 2,
             width: 1,
         }
     }
 
-    fn dummy_q4_projection(name: &str) -> DenseQ4MmapMatvecProjection {
+    fn dummy_q4_projection(
+        name: &str,
+        output_width: usize,
+        cols: usize,
+    ) -> DenseQ4MmapMatvecProjection {
         DenseQ4MmapMatvecProjection {
             tensor_name: name.to_string(),
             packed_byte_offset: 128,
             scales_byte_offset: 256,
             biases_byte_offset: 512,
-            rows: 16,
-            cols: 32,
-            output_width: 16,
-            row_packed_bytes: 16,
-            groups_per_row: 2,
+            rows: output_width,
+            cols,
+            output_width,
+            row_packed_bytes: cols.div_ceil(2),
+            groups_per_row: cols.div_ceil(16),
             group_size: 16,
             scale_bias_dtype: "BF16".to_string(),
         }
@@ -1155,10 +1317,10 @@ mod tests {
 
     fn dummy_shared_q4_phase() -> SharedExpertPhaseQ4Projections {
         SharedExpertPhaseQ4Projections {
-            gate: dummy_q4_projection("shared.gate"),
-            up: dummy_q4_projection("shared.up"),
-            down: dummy_q4_projection("shared.down"),
-            router: dummy_q4_projection("shared.router"),
+            gate: dummy_q4_projection("shared.gate", 16, 32),
+            up: dummy_q4_projection("shared.up", 16, 32),
+            down: dummy_q4_projection("shared.down", 32, 16),
+            router: dummy_q4_projection("shared.router", 1, 32),
             shared_experts: 1,
             intermediate: 16,
             width: 32,
@@ -1187,6 +1349,13 @@ mod tests {
         assert!(dense_ref.is_some());
         assert!(dense_ref.dense().is_some());
         assert!(dense_ref.q4().is_none());
+        assert_eq!(
+            dense_ref.scheduled_shared_expert_shape().unwrap(),
+            Some(ScheduledSharedExpertShape {
+                width: 1,
+                total_intermediate: 2
+            })
+        );
 
         let q4_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), Some(&q4));
         assert_eq!(
@@ -1195,6 +1364,13 @@ mod tests {
         );
         assert!(q4_ref.dense().is_none());
         assert!(q4_ref.q4().is_some());
+        assert_eq!(
+            q4_ref.scheduled_shared_expert_shape().unwrap(),
+            Some(ScheduledSharedExpertShape {
+                width: 32,
+                total_intermediate: 16
+            })
+        );
     }
 
     #[derive(Debug, Clone)]
@@ -1510,8 +1686,8 @@ mod tests {
             19,
             cmd3,
             &scheduled,
-            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
             None,
         )
         .unwrap();
@@ -1570,8 +1746,8 @@ mod tests {
             19,
             cmd3,
             &scheduled,
-            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            DummySharedExpert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             Some(&[1.0]),
         )
         .unwrap_err();
@@ -1581,8 +1757,8 @@ mod tests {
             19,
             cmd3,
             &scheduled,
-            DummyCmd3Input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
-            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
             Some(&[1.0]),
         )
         .unwrap_err();
@@ -1596,8 +1772,8 @@ mod tests {
             19,
             cmd3,
             &scheduled,
-            DummyCmd3Input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
-            DummySharedExpert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             None,
         )
         .unwrap_err();
@@ -1605,6 +1781,42 @@ mod tests {
             next_norm_err
                 .to_string()
                 .contains("requires next-norm weights")
+        );
+
+        let shared_width_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
+            dummy_shared_expert_with_shape(
+                ScheduledSharedExpertSource::ResidentQ4Projections,
+                Some(ScheduledSharedExpertShape {
+                    width: 4,
+                    total_intermediate: 4,
+                }),
+            ),
+            Some(&[1.0; 8]),
+        )
+        .unwrap_err();
+        assert!(
+            shared_width_err
+                .to_string()
+                .contains("does not match input width")
+        );
+
+        let next_norm_width_err = ScheduledCmd3Submission::new(
+            19,
+            cmd3,
+            &scheduled,
+            dummy_cmd3_input_with_width(ScheduledCmd3InputSource::MetalPostAttentionPrep, 8),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            Some(&[1.0; 4]),
+        )
+        .unwrap_err();
+        assert!(
+            next_norm_width_err
+                .to_string()
+                .contains("smaller than input width")
         );
     }
 
@@ -1638,8 +1850,8 @@ mod tests {
             19,
             cmd3,
             &wrong_expert,
-            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
             None,
         )
         .unwrap_err();
@@ -1658,8 +1870,8 @@ mod tests {
             19,
             cmd3,
             &partial_expert,
-            DummyCmd3Input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            DummySharedExpert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
             None,
         )
         .unwrap_err();

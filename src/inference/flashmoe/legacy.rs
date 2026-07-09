@@ -1889,6 +1889,14 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
             Self::MetalPostAttention(_) => ScheduledCmd3InputSource::MetalPostAttentionPrep,
         }
     }
+
+    fn scheduled_cmd3_input_width(&self) -> usize {
+        match self {
+            Self::Cpu { residual, .. } => residual.len(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MetalPostAttention(prep) => prep.width,
+        }
+    }
 }
 
 type ScheduledExpertPhase<'a> =
