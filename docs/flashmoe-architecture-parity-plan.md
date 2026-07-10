@@ -159,6 +159,9 @@ Baseline reviewed on 2026-07-10:
   selectors and message sends, pipeline compilation, mmap buffer wrapping, buffer binding and
   readback, dispatch primitives, command submission, diagnostic waits, retain, and release. The
   duplicate FFI and command-wait implementation has been removed from `legacy.rs`.
+- Routing now has only the implementation selected by the resolved graph: Qwen3.5 uses declared
+  CPU softmax/top-k. The dormant `route_top4` bool probe, optional Metal pipeline, shader, encoder,
+  and CPU substitution branch have been deleted.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

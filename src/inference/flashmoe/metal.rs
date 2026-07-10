@@ -529,7 +529,6 @@ pub(crate) mod kernels {
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH: &str = "q4_mmap_fma_matvec_batch";
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS: &str =
         "q4_mmap_fma_matvec_batch_bf16_scale_bias";
-    pub(crate) const ROUTE_TOP4: &str = "route_top4";
     pub(crate) const DENSE_MATVEC: &str = "dense_matvec";
     pub(crate) const DENSE_MATVEC_BF16: &str = "dense_matvec_bf16";
     pub(crate) const DENSE_MMAP_MATVEC_F32: &str = "dense_mmap_matvec_f32";
@@ -605,7 +604,6 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-    kernels::ROUTE_TOP4,
     kernels::DENSE_MATVEC,
     kernels::DENSE_MATVEC_BF16,
     kernels::DENSE_MMAP_MATVEC_F32,
@@ -645,7 +643,6 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4_mmap_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap_batch: &'static str,
     pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
-    pub(crate) route_top4: Option<&'static str>,
     pub(crate) dense_matvec: &'static str,
     pub(crate) dense_matvec_bf16: &'static str,
     pub(crate) dense_mmap_matvec: &'static str,
@@ -676,7 +673,7 @@ pub(crate) struct MetalPipelineNameSet {
 }
 
 impl MetalPipelineNameSet {
-    pub(crate) fn new(route_top4_enabled: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             q4: kernels::Q4_FMA_MATVEC,
             q4_bf16_scale_bias: kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
@@ -686,7 +683,6 @@ impl MetalPipelineNameSet {
             q4_mmap_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
             q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
             q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-            route_top4: route_top4_enabled.then_some(kernels::ROUTE_TOP4),
             dense_matvec: kernels::DENSE_MATVEC,
             dense_matvec_bf16: kernels::DENSE_MATVEC_BF16,
             dense_mmap_matvec: kernels::DENSE_MMAP_MATVEC_F32,
@@ -718,7 +714,7 @@ impl MetalPipelineNameSet {
     }
 
     pub(crate) fn kernel_names(self) -> Vec<&'static str> {
-        let mut kernels = vec![
+        vec![
             self.q4,
             self.q4_bf16_scale_bias,
             self.q4_swiglu,
@@ -754,11 +750,7 @@ impl MetalPipelineNameSet {
             self.linear_decay_beta,
             self.linear_delta_step,
             self.linear_gated_rms_norm,
-        ];
-        if let Some(route_top4) = self.route_top4 {
-            kernels.push(route_top4);
-        }
-        kernels
+        ]
     }
 }
 
@@ -772,7 +764,6 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_mmap_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_batch_pipeline: T,
     pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
-    pub(crate) route_pipeline: Option<T>,
     pub(crate) dense_matvec_pipeline: T,
     pub(crate) dense_matvec_bf16_pipeline: T,
     pub(crate) dense_mmap_matvec_pipeline: T,
@@ -812,9 +803,6 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.q4_mmap_bf16_scale_bias_pipeline);
         release(self.q4_mmap_batch_pipeline);
         release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
-        if let Some(route_pipeline) = self.route_pipeline {
-            release(route_pipeline);
-        }
         release(self.dense_matvec_pipeline);
         release(self.dense_matvec_bf16_pipeline);
         release(self.dense_mmap_matvec_pipeline);
@@ -3329,25 +3317,6 @@ kernel void q4_mmap_fma_matvec_batch_bf16_scale_bias(
     }
 }
 
-kernel void route_top4(
-    device const float* scores [[buffer(0)]],
-    device uint4* indices [[buffer(1)]],
-    device float4* weights [[buffer(2)]],
-    constant uint& experts [[buffer(3)]],
-    uint token [[thread_position_in_grid]]) {
-    float4 best = float4(-INFINITY);
-    uint4 best_i = uint4(0);
-    for (uint i = 0; i < experts; ++i) {
-        float score = scores[token * experts + i];
-        if (score > best.x) { best.w = best.z; best_i.w = best_i.z; best.z = best.y; best_i.z = best_i.y; best.y = best.x; best_i.y = best_i.x; best.x = score; best_i.x = i; }
-        else if (score > best.y) { best.w = best.z; best_i.w = best_i.z; best.z = best.y; best_i.z = best_i.y; best.y = score; best_i.y = i; }
-        else if (score > best.z) { best.w = best.z; best_i.w = best_i.z; best.z = score; best_i.z = i; }
-        else if (score > best.w) { best.w = score; best_i.w = i; }
-    }
-    weights[token] = best;
-    indices[token] = best_i;
-}
-
 kernel void dense_matvec(
     device const float* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -4385,19 +4354,8 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_name_set_declares_optional_route_top4() {
-        let without_route = MetalPipelineNameSet::new(false);
-        assert_eq!(without_route.route_top4, None);
-        assert!(!without_route.kernel_names().contains(&kernels::ROUTE_TOP4));
-
-        let with_route = MetalPipelineNameSet::new(true);
-        assert_eq!(with_route.route_top4, Some(kernels::ROUTE_TOP4));
-        assert!(with_route.kernel_names().contains(&kernels::ROUTE_TOP4));
-    }
-
-    #[test]
     fn pipeline_name_set_matches_declared_forward_kernel_surface() {
-        let mut compiled = MetalPipelineNameSet::new(true).kernel_names();
+        let mut compiled = MetalPipelineNameSet::new().kernel_names();
         compiled.sort_unstable();
         compiled.dedup();
 
@@ -4409,23 +4367,14 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_set_release_order_includes_optional_route_pipeline() {
-        let without_route = test_pipeline_set(None);
+    fn pipeline_set_releases_every_resolved_pipeline() {
+        let pipelines = test_pipeline_set();
         let mut released = Vec::new();
-        without_route.release_with(|pipeline| released.push(pipeline));
-        assert_eq!(released.first(), Some(&1));
-        assert!(!released.contains(&9));
-        assert_eq!(released.last(), Some(&36));
-
-        let with_route = test_pipeline_set(Some(9));
-        let mut released = Vec::new();
-        with_route.release_with(|pipeline| released.push(pipeline));
-        assert_eq!(released.first(), Some(&1));
-        assert!(released.contains(&9));
-        assert_eq!(released.last(), Some(&36));
+        pipelines.release_with(|pipeline| released.push(pipeline));
+        assert_eq!(released, (1..=35).collect::<Vec<_>>());
     }
 
-    fn test_pipeline_set(route_pipeline: Option<i32>) -> MetalPipelineSet<i32> {
+    fn test_pipeline_set() -> MetalPipelineSet<i32> {
         MetalPipelineSet {
             q4_pipeline: 1,
             q4_bf16_scale_bias_pipeline: 2,
@@ -4435,34 +4384,33 @@ mod tests {
             q4_mmap_bf16_scale_bias_pipeline: 6,
             q4_mmap_batch_pipeline: 7,
             q4_mmap_batch_bf16_scale_bias_pipeline: 8,
-            route_pipeline,
-            dense_matvec_pipeline: 10,
-            dense_matvec_bf16_pipeline: 11,
-            dense_mmap_matvec_pipeline: 12,
-            dense_mmap_matvec_bf16_pipeline: 13,
-            dense_mmap_matvec_bf16_simd_pipeline: 14,
-            rms_norm_pipeline: 15,
-            rms_norm_reduced_pipeline: 16,
-            residual_rms_norm_pipeline: 17,
-            rope_pipeline: 18,
-            rope_split_half_pipeline: 19,
-            attention_pipeline: 20,
-            kv_write_pipeline: 21,
-            kv_read_attention_pipeline: 22,
-            expert_mlp_pipeline: 23,
-            silu_product_pipeline: 24,
-            shared_expert_activation_pipeline: 25,
-            combine_expert_phase_pipeline: 26,
-            fill_zero_pipeline: 27,
-            lm_head_pipeline: 28,
-            topk_vocab_pipeline: 29,
-            gqa_scores_pipeline: 30,
-            gqa_read_pipeline: 31,
-            linear_conv1d_pipeline: 32,
-            linear_rms_norm_qk_pipeline: 33,
-            linear_decay_beta_pipeline: 34,
-            linear_delta_step_pipeline: 35,
-            linear_gated_rms_norm_pipeline: 36,
+            dense_matvec_pipeline: 9,
+            dense_matvec_bf16_pipeline: 10,
+            dense_mmap_matvec_pipeline: 11,
+            dense_mmap_matvec_bf16_pipeline: 12,
+            dense_mmap_matvec_bf16_simd_pipeline: 13,
+            rms_norm_pipeline: 14,
+            rms_norm_reduced_pipeline: 15,
+            residual_rms_norm_pipeline: 16,
+            rope_pipeline: 17,
+            rope_split_half_pipeline: 18,
+            attention_pipeline: 19,
+            kv_write_pipeline: 20,
+            kv_read_attention_pipeline: 21,
+            expert_mlp_pipeline: 22,
+            silu_product_pipeline: 23,
+            shared_expert_activation_pipeline: 24,
+            combine_expert_phase_pipeline: 25,
+            fill_zero_pipeline: 26,
+            lm_head_pipeline: 27,
+            topk_vocab_pipeline: 28,
+            gqa_scores_pipeline: 29,
+            gqa_read_pipeline: 30,
+            linear_conv1d_pipeline: 31,
+            linear_rms_norm_qk_pipeline: 32,
+            linear_decay_beta_pipeline: 33,
+            linear_delta_step_pipeline: 34,
+            linear_gated_rms_norm_pipeline: 35,
         }
     }
 

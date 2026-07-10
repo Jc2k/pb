@@ -356,7 +356,7 @@ impl FlashMoeCapabilityPlan {
                 ResidentDenseLayout::Q4,
                 test_expert_storage(layout)?,
                 Some(MetalRuntimeCapabilities::from_pipeline_names(
-                    MetalPipelineNameSet::new(false),
+                    MetalPipelineNameSet::new(),
                 )),
             );
         }
@@ -365,7 +365,7 @@ impl FlashMoeCapabilityPlan {
             ResidentDenseLayout::Q4,
             test_expert_storage(layout)?,
             Some(MetalRuntimeCapabilities::from_pipeline_names(
-                MetalPipelineNameSet::new(false),
+                MetalPipelineNameSet::new(),
             )),
         )
     }
@@ -566,7 +566,7 @@ mod tests {
     }
 
     fn full_metal() -> MetalRuntimeCapabilities {
-        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new(false))
+        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
     }
 
     #[test]

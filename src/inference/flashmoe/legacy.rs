@@ -228,10 +228,6 @@ unsafe extern "C" {
     );
 }
 
-fn metal_route_top4_enabled() -> bool {
-    false
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlashMoeRoutingPolicy {
     pub active_experts_override: Option<usize>,
@@ -1754,7 +1750,6 @@ enum MropeAxis {
 struct MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     inner: Arc<MetalExecutorInner>,
-    route_top4_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -1885,16 +1880,8 @@ impl MetalExecutor {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            let route_top4_enabled = metal_route_top4_enabled();
             Ok(Self {
-                inner: Arc::new(MetalExecutorInner::new(
-                    plan,
-                    config,
-                    runtime,
-                    dense,
-                    route_top4_enabled,
-                )?),
-                route_top4_enabled,
+                inner: Arc::new(MetalExecutorInner::new(plan, config, runtime, dense)?),
             })
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1907,9 +1894,7 @@ impl MetalExecutor {
     }
 
     fn runtime_capabilities(&self) -> MetalRuntimeCapabilities {
-        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new(
-            self.route_top4_enabled,
-        ))
+        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
     }
 
     fn reset_linear_attention_state(&self) {
@@ -2096,27 +2081,6 @@ impl MetalExecutor {
             bail!(
                 "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
             );
-        }
-    }
-
-    fn route_topk(
-        &self,
-        position: usize,
-        layer: usize,
-        scores: &[f32],
-        k: usize,
-    ) -> Result<Vec<(usize, f32)>> {
-        if !self.route_top4_enabled || k != ACTIVE_EXPERTS_PER_TOKEN {
-            return Ok(top_k(scores, k));
-        }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner.route_top4(position, layer, scores)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (position, layer);
-            Ok(top_k(scores, k))
         }
     }
 
@@ -2934,7 +2898,6 @@ impl MetalExecutorInner {
         config: &QwenModelConfig,
         runtime: &DenseTransformerRuntime,
         dense: &DenseStore,
-        route_top4_enabled: bool,
     ) -> Result<Self> {
         unsafe {
             let device = metal_default_device();
@@ -2960,7 +2923,7 @@ impl MetalExecutorInner {
                 bail!("failed to compile Flash-MoE Metal shader library: {error}");
             }
 
-            let pipeline_names = MetalPipelineNameSet::new(route_top4_enabled);
+            let pipeline_names = MetalPipelineNameSet::new();
             let q4_pipeline = compile_pipeline(device, library, pipeline_names.q4)?;
             let q4_bf16_scale_bias_pipeline =
                 compile_pipeline(device, library, pipeline_names.q4_bf16_scale_bias)?;
@@ -2977,10 +2940,6 @@ impl MetalExecutorInner {
                 library,
                 pipeline_names.q4_mmap_batch_bf16_scale_bias,
             )?;
-            let route_pipeline = pipeline_names
-                .route_top4
-                .map(|kernel| compile_pipeline(device, library, kernel))
-                .transpose()?;
             let dense_matvec_pipeline =
                 compile_pipeline(device, library, pipeline_names.dense_matvec)?;
             let dense_matvec_bf16_pipeline =
@@ -3035,7 +2994,6 @@ impl MetalExecutorInner {
                 q4_mmap_bf16_scale_bias_pipeline,
                 q4_mmap_batch_pipeline,
                 q4_mmap_batch_bf16_scale_bias_pipeline,
-                route_pipeline,
                 dense_matvec_pipeline,
                 dense_matvec_bf16_pipeline,
                 dense_mmap_matvec_pipeline,
@@ -3091,7 +3049,6 @@ impl MetalExecutorInner {
                 max_context,
                 kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
                 experts = config.experts(),
-                route_top4 = route_top4_enabled,
                 dense_resident = dense_weights.is_some(),
                 "Flash-MoE Metal executor initialized"
             );
@@ -5447,79 +5404,6 @@ impl MetalExecutorInner {
             set_bytes(encoder, u32_as_bytes(&group_size), 11);
             dispatch_q4_mmap_threadgroups(encoder, total_rows as u64);
             Ok(true)
-        }
-    }
-
-    fn route_top4(
-        &self,
-        position: usize,
-        layer: usize,
-        scores: &[f32],
-    ) -> Result<Vec<(usize, f32)>> {
-        if scores.is_empty() {
-            return Ok(Vec::new());
-        }
-        let route_pipeline = self
-            .pipelines
-            .route_pipeline
-            .context("Metal route_top4 requested but routing pipeline is disabled")?;
-        unsafe {
-            let scores_buffer = self.buffer_with_bytes(f32_as_bytes(scores))?;
-            let indices_buffer = self.buffer_with_len(4 * std::mem::size_of::<u32>())?;
-            let weights_buffer = self.buffer_with_len(4 * std::mem::size_of::<f32>())?;
-            let experts = scores.len() as u32;
-            let experts_buffer = self.buffer_with_bytes(u32_as_bytes(&experts))?;
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                bail!("failed to create Flash-MoE routing command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                bail!("failed to create Flash-MoE routing compute encoder");
-            }
-
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), route_pipeline);
-            set_buffer(encoder, scores_buffer, 0);
-            set_buffer(encoder, indices_buffer, 1);
-            set_buffer(encoder, weights_buffer, 2);
-            set_buffer(encoder, experts_buffer, 3);
-            dispatch_threads(encoder, 1);
-            msg_send_void0(encoder, sel("endEncoding"));
-            let context = MetalCommandContext::new("route_top4")
-                .with("position", position)
-                .with("layer", layer)
-                .with("experts", scores.len());
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(
-                    &[
-                        scores_buffer,
-                        indices_buffer,
-                        weights_buffer,
-                        experts_buffer,
-                    ],
-                    error.should_release_buffers(),
-                );
-                return Err(error.into());
-            }
-
-            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
-            let weights_ptr = msg_send_ptr0(weights_buffer, sel("contents")).cast::<f32>();
-            let mut routed = Vec::with_capacity(ACTIVE_EXPERTS_PER_TOKEN);
-            for idx in 0..ACTIVE_EXPERTS_PER_TOKEN {
-                routed.push((*indices_ptr.add(idx) as usize, *weights_ptr.add(idx)));
-            }
-
-            release(encoder);
-            release(command_buffer);
-            self.recycle(scores_buffer);
-            self.recycle(indices_buffer);
-            self.recycle(weights_buffer);
-            self.recycle(experts_buffer);
-            Ok(routed)
         }
     }
 
@@ -21054,8 +20938,7 @@ mod tests {
             .unwrap();
             let runtime = DenseTransformerRuntime::new(&config);
             let dense = tiny_dense_store(temp.path());
-            let _executor =
-                MetalExecutorInner::new(&plan, &config, &runtime, &dense, false).unwrap();
+            let _executor = MetalExecutorInner::new(&plan, &config, &runtime, &dense).unwrap();
         }
 
         #[test]
@@ -21069,8 +20952,7 @@ mod tests {
             .unwrap();
             let runtime = DenseTransformerRuntime::new(&config);
             let dense = tiny_dense_store(temp.path());
-            let executor =
-                MetalExecutorInner::new(&plan, &config, &runtime, &dense, false).unwrap();
+            let executor = MetalExecutorInner::new(&plan, &config, &runtime, &dense).unwrap();
             let output = executor.rms_norm(&[3.0, 4.0], Some(&[1.0, 1.0])).unwrap();
 
             assert_eq!(output.len(), 2);
