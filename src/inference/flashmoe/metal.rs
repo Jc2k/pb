@@ -1337,6 +1337,17 @@ pub(crate) struct MetalCmd3ExecutionPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3BufferLayout {
+    pub(crate) width_u32: u32,
+    pub(crate) active_count_u32: u32,
+    pub(crate) expert_outputs_bytes: usize,
+    pub(crate) shared_output_bytes: usize,
+    pub(crate) hidden_output_bytes: usize,
+    pub(crate) next_normed_output_bytes: Option<usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3ExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1382,6 +1393,17 @@ impl MetalCmd3ExecutionPlan {
             shared,
             active_experts,
             combine,
+        })
+    }
+
+    pub(crate) fn buffer_layout(&self) -> anyhow::Result<MetalCmd3BufferLayout> {
+        Ok(MetalCmd3BufferLayout {
+            width_u32: self.phase.width_u32(),
+            active_count_u32: self.combine.active_count_u32(),
+            expert_outputs_bytes: self.phase.expert_outputs_bytes()?,
+            shared_output_bytes: self.phase.shared_output_bytes()?,
+            hidden_output_bytes: self.phase.hidden_output_bytes()?,
+            next_normed_output_bytes: self.phase.next_normed_output_bytes()?,
         })
     }
 }
@@ -3701,6 +3723,14 @@ mod tests {
         assert_eq!(plan.active_experts[1].output_offset, 4 * 4);
         assert_eq!(plan.combine.active_count, 2);
         assert_eq!(plan.next_norm.unwrap().width, 4);
+
+        let layout = plan.buffer_layout().unwrap();
+        assert_eq!(layout.width_u32, 4);
+        assert_eq!(layout.active_count_u32, 2);
+        assert_eq!(layout.expert_outputs_bytes, 2 * 4 * 4);
+        assert_eq!(layout.shared_output_bytes, 4 * 4);
+        assert_eq!(layout.hidden_output_bytes, 4 * 4);
+        assert_eq!(layout.next_normed_output_bytes, Some(4 * 4));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

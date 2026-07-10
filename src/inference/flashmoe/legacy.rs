@@ -4804,6 +4804,15 @@ impl MetalExecutorInner {
         let expert_count = plan.expert_count;
         let width = plan.width;
         let output_state = plan.output_state;
+        let buffer_layout = match command_plan.buffer_layout() {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Err(error.context(
+                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled buffer layout",
+                ));
+            }
+        };
         let shared_dense = shared.dense();
         let shared_q4 = shared.q4();
         let shared_metal = if let (Some(shared), MetalCmd3SharedPhaseSource::Dense) =
@@ -4825,13 +4834,13 @@ impl MetalExecutorInner {
             ];
             let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
             buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
-            let expert_outputs_buffer = self.buffer_with_len(plan.expert_outputs_bytes()?)?;
+            let expert_outputs_buffer = self.buffer_with_len(buffer_layout.expert_outputs_bytes)?;
             buffers.push(MetalPhaseBuffer::recyclable(expert_outputs_buffer));
-            let shared_output_buffer = self.buffer_with_len(plan.shared_output_bytes()?)?;
+            let shared_output_buffer = self.buffer_with_len(buffer_layout.shared_output_bytes)?;
             buffers.push(MetalPhaseBuffer::recyclable(shared_output_buffer));
-            let hidden_buffer = self.buffer_with_len(plan.hidden_output_bytes()?)?;
+            let hidden_buffer = self.buffer_with_len(buffer_layout.hidden_output_bytes)?;
             buffers.push(MetalPhaseBuffer::recyclable(hidden_buffer));
-            let next_normed_buffer = if let Some(bytes) = plan.next_normed_output_bytes()? {
+            let next_normed_buffer = if let Some(bytes) = buffer_layout.next_normed_output_bytes {
                 let buffer = self.buffer_with_len(bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(buffer));
                 Some(buffer)
@@ -4851,7 +4860,7 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE deferred expert compute encoder");
             }
 
-            let width_u32 = plan.width_u32();
+            let width_u32 = buffer_layout.width_u32;
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
             let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
@@ -5053,7 +5062,7 @@ impl MetalExecutorInner {
             }
 
             let combine_plan = command_plan.combine;
-            let active_u32 = combine_plan.active_count_u32();
+            let active_u32 = buffer_layout.active_count_u32;
             let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
             msg_send_void1_id(
