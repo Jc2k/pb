@@ -225,6 +225,67 @@ pub(crate) struct MetalKvLayer {
     pub(crate) width: usize,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalLinearAttentionStateCache {
+    pub(crate) layers: Vec<Option<MetalLinearAttentionLayerState>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLinearAttentionStateCache {
+    pub(crate) fn new(layers: Vec<Option<MetalLinearAttentionLayerState>>) -> Self {
+        Self { layers }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalLinearAttentionLayerState {
+    pub(crate) conv_state: MetalObjcId,
+    pub(crate) ssm_state: MetalObjcId,
+    pub(crate) conv_output: MetalObjcId,
+    pub(crate) delta_output: MetalObjcId,
+    pub(crate) g_decay: MetalObjcId,
+    pub(crate) beta_gate: MetalObjcId,
+    pub(crate) conv_state_len: usize,
+    pub(crate) ssm_state_len: usize,
+    pub(crate) conv_dim: usize,
+    pub(crate) total_value_width: usize,
+    pub(crate) num_value_heads: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLinearAttentionLayerState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        conv_state: MetalObjcId,
+        ssm_state: MetalObjcId,
+        conv_output: MetalObjcId,
+        delta_output: MetalObjcId,
+        g_decay: MetalObjcId,
+        beta_gate: MetalObjcId,
+        conv_state_len: usize,
+        ssm_state_len: usize,
+        conv_dim: usize,
+        total_value_width: usize,
+        num_value_heads: usize,
+    ) -> Self {
+        Self {
+            conv_state,
+            ssm_state,
+            conv_output,
+            delta_output,
+            g_decay,
+            beta_gate,
+            conv_state_len,
+            ssm_state_len,
+            conv_dim,
+            total_value_width,
+            num_value_heads,
+        }
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2725,6 +2786,29 @@ mod tests {
                 .to_string()
                 .contains("has no layer 3")
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_linear_attention_state_cache_preserves_gpu_buffer_roles() {
+        let base = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let state = MetalLinearAttentionLayerState::new(
+            base, base, base, base, base, base, 12, 20, 4, 8, 2,
+        );
+        let cache = MetalLinearAttentionStateCache::new(vec![None, Some(state)]);
+        let layer = cache.layers[1].as_ref().unwrap();
+
+        assert_eq!(layer.conv_state, base);
+        assert_eq!(layer.ssm_state, base);
+        assert_eq!(layer.conv_output, base);
+        assert_eq!(layer.delta_output, base);
+        assert_eq!(layer.g_decay, base);
+        assert_eq!(layer.beta_gate, base);
+        assert_eq!(layer.conv_state_len, 12);
+        assert_eq!(layer.ssm_state_len, 20);
+        assert_eq!(layer.conv_dim, 4);
+        assert_eq!(layer.total_value_width, 8);
+        assert_eq!(layer.num_value_heads, 2);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

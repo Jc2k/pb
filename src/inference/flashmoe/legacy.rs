@@ -105,6 +105,7 @@ use super::metal::{
     METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy, MetalAttentionValues,
     MetalBatchProjectionInput, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
     MetalCommandWaitPolicy, MetalCommandWaitResult, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
     MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache,
     metal_command_failure_requires_release, resolve_metal_command_wait,
@@ -2797,28 +2798,6 @@ struct MetalReusableBuffer {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalLinearAttentionStateCache {
-    layers: Vec<Option<MetalLinearAttentionLayerState>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalLinearAttentionLayerState {
-    conv_state: ObjcId,
-    ssm_state: ObjcId,
-    conv_output: ObjcId,
-    delta_output: ObjcId,
-    g_decay: ObjcId,
-    beta_gate: ObjcId,
-    conv_state_len: usize,
-    ssm_state_len: usize,
-    conv_dim: usize,
-    total_value_width: usize,
-    num_value_heads: usize,
-}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
@@ -12633,7 +12612,7 @@ fn allocate_metal_linear_attention_state(
                 });
             }
         };
-        layers.push(Some(MetalLinearAttentionLayerState {
+        layers.push(Some(MetalLinearAttentionLayerState::new(
             conv_state,
             ssm_state,
             conv_output,
@@ -12642,12 +12621,12 @@ fn allocate_metal_linear_attention_state(
             beta_gate,
             conv_state_len,
             ssm_state_len,
-            conv_dim: layout.conv_dim,
-            total_value_width: layout.total_value_width,
-            num_value_heads: layout.num_value_heads,
-        }));
+            layout.conv_dim,
+            layout.total_value_width,
+            layout.num_value_heads,
+        )));
     }
-    Ok(MetalLinearAttentionStateCache { layers })
+    Ok(MetalLinearAttentionStateCache::new(layers))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
