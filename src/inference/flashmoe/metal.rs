@@ -1423,6 +1423,41 @@ pub(crate) struct MetalCmd3BufferLayout {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3OutputBuffers {
+    pub(crate) expert_outputs: MetalObjcId,
+    pub(crate) shared_output: MetalObjcId,
+    pub(crate) hidden: MetalObjcId,
+    pub(crate) next_normed: Option<MetalObjcId>,
+    pub(crate) layout: MetalCmd3BufferLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3OutputBuffers {
+    pub(crate) fn new(
+        plan: &MetalCmd3ExecutionPlan,
+        expert_outputs: MetalObjcId,
+        shared_output: MetalObjcId,
+        hidden: MetalObjcId,
+        next_normed: Option<MetalObjcId>,
+    ) -> anyhow::Result<Self> {
+        let layout = plan.buffer_layout()?;
+        if next_normed.is_some() != layout.next_normed_output_bytes.is_some() {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 output buffers next-normed presence does not match declared output state"
+            );
+        }
+        Ok(Self {
+            expert_outputs,
+            shared_output,
+            hidden,
+            next_normed,
+            layout,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3ExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -3825,6 +3860,86 @@ mod tests {
         assert_eq!(
             context.label(),
             "Flash-MoE deferred_expert_phase_from_buffers position=9 layer=3 active_experts=2 experts=1,7 width=4 shared=true next_norm=true"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_output_buffers_match_declared_output_state() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, true);
+        let payloads = vec![ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(
+            5, 4,
+        ))];
+        let plan = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            1,
+            4,
+            1,
+            output_state,
+            ScheduledSharedExpertPhaseRef::None,
+            Some(4),
+            &payloads,
+        )
+        .unwrap();
+
+        let buffers = MetalCmd3OutputBuffers::new(
+            &plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            Some(0x4000usize as MetalObjcId),
+        )
+        .unwrap();
+
+        assert_eq!(buffers.layout.width_u32, 4);
+        assert_eq!(buffers.layout.active_count_u32, 1);
+        assert_eq!(buffers.layout.expert_outputs_bytes, 4 * 4);
+        assert_eq!(buffers.layout.shared_output_bytes, 4 * 4);
+        assert_eq!(buffers.layout.hidden_output_bytes, 4 * 4);
+        assert_eq!(buffers.layout.next_normed_output_bytes, Some(4 * 4));
+        assert_eq!(buffers.hidden, 0x3000usize as MetalObjcId);
+
+        let missing_next = MetalCmd3OutputBuffers::new(
+            &plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            missing_next
+                .to_string()
+                .contains("does not match declared output state"),
+            "{missing_next:#}"
+        );
+
+        let no_next_plan = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            1,
+            4,
+            1,
+            FlashMoeCmd3OutputState::gpu_resident(4, false),
+            ScheduledSharedExpertPhaseRef::None,
+            None,
+            &payloads,
+        )
+        .unwrap();
+        let unexpected_next = MetalCmd3OutputBuffers::new(
+            &no_next_plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            Some(0x4000usize as MetalObjcId),
+        )
+        .unwrap_err();
+        assert!(
+            unexpected_next
+                .to_string()
+                .contains("does not match declared output state"),
+            "{unexpected_next:#}"
         );
     }
 
