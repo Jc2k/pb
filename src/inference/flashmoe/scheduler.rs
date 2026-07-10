@@ -129,6 +129,23 @@ impl FlashMoeScheduledGraph {
         ScheduledCmd2Submission::new(cmd2, inputs)
     }
 
+    pub fn build_cmd2_command(
+        &self,
+        layer: usize,
+        active_experts: usize,
+        inputs: ScheduledCmd2PhaseInputs,
+    ) -> Result<ScheduledCmd2Command<ScheduledCmd2PhaseInputs>> {
+        let cmd2 = self.build_cmd2_post_attention(
+            layer,
+            active_experts,
+            inputs.scheduled_cmd2_attention_source(),
+            inputs.scheduled_cmd2_residual_source(),
+        )?;
+        Ok(self
+            .build_cmd2_submission(cmd2, inputs)?
+            .into_cmd2_command())
+    }
+
     pub fn build_attention_math(
         &self,
         layer: usize,
@@ -579,6 +596,64 @@ pub enum ScheduledCmd2ResidualSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd2AttentionInput {
+    CpuValues { len: usize },
+    MetalValues { len: usize },
+}
+
+impl ScheduledCmd2AttentionInput {
+    pub const fn cpu_values(len: usize) -> Self {
+        Self::CpuValues { len }
+    }
+
+    pub const fn metal_values(len: usize) -> Self {
+        Self::MetalValues { len }
+    }
+
+    const fn source(self) -> ScheduledCmd2AttentionSource {
+        match self {
+            Self::CpuValues { .. } => ScheduledCmd2AttentionSource::CpuAttentionValues,
+            Self::MetalValues { .. } => ScheduledCmd2AttentionSource::MetalAttentionValues,
+        }
+    }
+
+    const fn len(self) -> usize {
+        match self {
+            Self::CpuValues { len } | Self::MetalValues { len } => len,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCmd2ResidualInput {
+    CpuHidden { len: usize },
+    MetalBuffer { len: usize },
+}
+
+impl ScheduledCmd2ResidualInput {
+    pub const fn cpu_hidden(len: usize) -> Self {
+        Self::CpuHidden { len }
+    }
+
+    pub const fn metal_buffer(len: usize) -> Self {
+        Self::MetalBuffer { len }
+    }
+
+    const fn source(self) -> ScheduledCmd2ResidualSource {
+        match self {
+            Self::CpuHidden { .. } => ScheduledCmd2ResidualSource::CpuHidden,
+            Self::MetalBuffer { .. } => ScheduledCmd2ResidualSource::MetalBuffer,
+        }
+    }
+
+    const fn len(self) -> usize {
+        match self {
+            Self::CpuHidden { len } | Self::MetalBuffer { len } => len,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledCmd2PostAttention {
     pub stage: FlashMoeStageCapability,
     pub layer: usize,
@@ -614,6 +689,18 @@ impl ScheduledCmd2PhaseInputs {
             attention_len,
             residual_len,
         }
+    }
+
+    pub const fn from_inputs(
+        attention: ScheduledCmd2AttentionInput,
+        residual: ScheduledCmd2ResidualInput,
+    ) -> Self {
+        Self::new(
+            attention.source(),
+            residual.source(),
+            attention.len(),
+            residual.len(),
+        )
     }
 }
 
@@ -4192,6 +4279,65 @@ mod tests {
         );
         assert_eq!(input_state.residual().len(), 4096);
         assert!(input_state.is_declared_graph_state());
+    }
+
+    #[test]
+    fn scheduled_cmd2_input_descriptors_build_declared_command() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let command = graph
+            .build_cmd2_command(
+                11,
+                4,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(4096),
+                    ScheduledCmd2ResidualInput::cpu_hidden(4096),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            command.cmd2.attention,
+            ScheduledCmd2AttentionSource::MetalAttentionValues
+        );
+        assert_eq!(
+            command.cmd2.residual,
+            ScheduledCmd2ResidualSource::CpuHidden
+        );
+        assert_eq!(
+            command.input_state().attention().placement(),
+            FlashMoeStatePlacement::GpuResident
+        );
+        assert_eq!(
+            command.input_state().residual().placement(),
+            FlashMoeStatePlacement::CpuVisible
+        );
+        assert_eq!(command.input_state().attention().len(), 4096);
+        assert_eq!(command.input_state().residual().len(), 4096);
+    }
+
+    #[test]
+    fn scheduled_cmd2_input_descriptors_reject_empty_graph_state_without_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let err = graph
+            .build_cmd2_command(
+                11,
+                4,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::cpu_values(0),
+                    ScheduledCmd2ResidualInput::cpu_hidden(4096),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("scheduled CMD2 input is not declared graph state"),
+            "{err:#}"
+        );
     }
 
     #[test]

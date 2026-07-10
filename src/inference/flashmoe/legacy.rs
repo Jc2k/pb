@@ -108,8 +108,8 @@ use super::model_family::{QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
-    ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
-    ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
+    ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionInput,
+    ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualInput, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
     ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledCmd3Submission,
     ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
@@ -117,6 +117,8 @@ use super::scheduler::{
     ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
+#[cfg(test)]
+use super::scheduler::{ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource};
 #[cfg(test)]
 use super::scheduler::{
     ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledQ4ExpertPhaseMlpPayload,
@@ -10400,18 +10402,6 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
                 early_metal_post_attention_prep;
-            let cmd2_attention_source = if metal_post_attention_prep.is_some()
-                || metal_post_attention_values_for_prep.is_some()
-            {
-                ScheduledCmd2AttentionSource::MetalAttentionValues
-            } else {
-                ScheduledCmd2AttentionSource::CpuAttentionValues
-            };
-            let cmd2_residual_source = if deferred_residual_input.is_some() {
-                ScheduledCmd2ResidualSource::MetalBuffer
-            } else {
-                ScheduledCmd2ResidualSource::CpuHidden
-            };
             let cmd2_attention_len = metal_post_attention_prep
                 .as_ref()
                 .map(|prep| prep.width)
@@ -10429,24 +10419,23 @@ impl FlashMoeEngine {
             let cmd2_residual_len = deferred_residual_input
                 .map(|input| input.len())
                 .unwrap_or_else(|| token_state.hidden().len());
-            let scheduled_cmd2 = self.scheduled_graph.build_cmd2_post_attention(
+            let cmd2_attention_input = if metal_post_attention_prep.is_some()
+                || metal_post_attention_values_for_prep.is_some()
+            {
+                ScheduledCmd2AttentionInput::metal_values(cmd2_attention_len)
+            } else {
+                ScheduledCmd2AttentionInput::cpu_values(cmd2_attention_len)
+            };
+            let cmd2_residual_input = if deferred_residual_input.is_some() {
+                ScheduledCmd2ResidualInput::metal_buffer(cmd2_residual_len)
+            } else {
+                ScheduledCmd2ResidualInput::cpu_hidden(cmd2_residual_len)
+            };
+            let scheduled_cmd2 = self.scheduled_graph.build_cmd2_command(
                 layer,
                 self.routing_policy.active_experts,
-                cmd2_attention_source,
-                cmd2_residual_source,
+                ScheduledCmd2PhaseInputs::from_inputs(cmd2_attention_input, cmd2_residual_input),
             )?;
-            let scheduled_cmd2 = self
-                .scheduled_graph
-                .build_cmd2_submission(
-                    scheduled_cmd2,
-                    ScheduledCmd2PhaseInputs::new(
-                        cmd2_attention_source,
-                        cmd2_residual_source,
-                        cmd2_attention_len,
-                        cmd2_residual_len,
-                    ),
-                )?
-                .into_cmd2_command();
             debug_assert_eq!(scheduled_cmd2.input_state().layer(), layer);
             debug_assert_eq!(
                 scheduled_cmd2.input_state().attention().len(),

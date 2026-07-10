@@ -138,8 +138,9 @@ The validator should reject silent fallbacks such as:
   now. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
   whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
-  descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
-  post-attention prep output resolution tied to that input state, CMD3 input validation, retained
+  descriptors, typed CMD2 attention/residual input descriptors, CMD2 command construction from
+  declared CPU/GPU input placement, CMD2 typed input-state validation and resolved input-state
+  handoff, CMD2 post-attention prep output resolution tied to that input state, CMD3 input validation, retained
   input-state handoff, and scheduled deferred output resolution carried to the Metal helper
   boundary, routing topK placement validation with retained routing-output handoff into route
   selection, declared router-score batches for CPU routing output, scheduler-built preselected
@@ -266,9 +267,11 @@ The validator should reject silent fallbacks such as:
   topK validation. That resolved CMD2 output now builds the preselected routing command directly
   instead of delegating command construction to a legacy Metal prep helper. The live path now asks
   the scheduled graph to build CMD2 submissions, rejecting stale descriptors that do not match the
-  current graph capability before post-attention helpers execute. CPU router score production now
-  asks the scheduled graph to build the projection command carrying declared routing state, hidden
-  width, and the optional resident projection descriptor before the dense store executes it, and the
+  current graph capability before post-attention helpers execute, and the live loop now asks the
+  scheduled graph to build the CMD2 command directly from typed attention/residual input
+  descriptors. CPU router score production now asks the scheduled graph to build the projection
+  command carrying declared routing state, hidden width, and the optional resident projection
+  descriptor before the dense store executes it, and the
   scheduled command now finalizes raw scores into the declared `RouterScoreBatch`. Active expert
   issue now consumes the resulting
   `ScheduledRoutingCommand` directly and resolves it into scheduler-owned `ScheduledExpertRoutes`
