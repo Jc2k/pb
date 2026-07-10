@@ -8,8 +8,9 @@ use std::time::Duration;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
-    ScheduledCmd3MetalPostAttentionInput, ScheduledQ4ExpertPhaseMlpPayload,
-    ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledExpertPhaseMlpPayload,
+    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledSharedExpertPhaseRef,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
@@ -1322,6 +1323,66 @@ impl MetalCmd3ActiveExpertPlan {
             .ok_or_else(|| {
                 anyhow::anyhow!("FlashMoe Metal CMD3 active expert {label} byte size overflow")
             })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetalCmd3ExecutionPlan {
+    pub(crate) phase: MetalCmd3PhasePlan,
+    pub(crate) next_norm: Option<MetalCmd3NextNormPlan>,
+    pub(crate) shared: MetalCmd3SharedPhasePlan,
+    pub(crate) active_experts: Vec<MetalCmd3ActiveExpertPlan>,
+    pub(crate) combine: MetalCmd3CombinePlan,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3ExecutionPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        position: usize,
+        layer: usize,
+        expert_count: usize,
+        width: usize,
+        weights_len: usize,
+        output_state: FlashMoeCmd3OutputState,
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+        next_norm_weight_len: Option<usize>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> anyhow::Result<Self> {
+        let phase = MetalCmd3PhasePlan::new(
+            position,
+            layer,
+            expert_count,
+            width,
+            weights_len,
+            payloads.len(),
+            output_state,
+            next_norm_weight_len.is_some(),
+        )?;
+        let next_norm = MetalCmd3NextNormPlan::new(phase, next_norm_weight_len)?;
+        let shared = match shared {
+            ScheduledSharedExpertPhaseRef::None => MetalCmd3SharedPhasePlan::none(width),
+            ScheduledSharedExpertPhaseRef::Dense(shared) => {
+                MetalCmd3SharedPhasePlan::dense(width, shared)?
+            }
+            ScheduledSharedExpertPhaseRef::Q4(shared) => {
+                MetalCmd3SharedPhasePlan::resident_q4(width, shared)?
+            }
+        };
+        let active_experts = payloads
+            .iter()
+            .enumerate()
+            .map(|(idx, payload)| MetalCmd3ActiveExpertPlan::new(phase, idx, payload.q4()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let combine = MetalCmd3CombinePlan::new(phase);
+        Ok(Self {
+            phase,
+            next_norm,
+            shared,
+            active_experts,
+            combine,
+        })
     }
 }
 
@@ -3594,6 +3655,109 @@ mod tests {
         assert!(
             width_err.to_string().contains("does not fit Metal u32"),
             "{width_err:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_execution_plan_declares_full_command_topology() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, true);
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: test_q4_projection("gate", 6, 4),
+            up: test_q4_projection("up", 6, 4),
+            down: test_q4_projection("down", 4, 6),
+            router: test_q4_projection("router", 2, 4),
+            shared_experts: 2,
+            intermediate: 3,
+            width: 4,
+        };
+        let payloads = vec![
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(5, 4)),
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(7, 4)),
+        ];
+
+        let plan = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            2,
+            4,
+            2,
+            output_state,
+            ScheduledSharedExpertPhaseRef::Q4(&shared),
+            Some(4),
+            &payloads,
+        )
+        .unwrap();
+
+        assert_eq!(plan.phase.position, 9);
+        assert_eq!(plan.phase.layer, 3);
+        assert_eq!(plan.phase.output_state, output_state);
+        assert_eq!(plan.shared.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(plan.shared.total_intermediate, 6);
+        assert_eq!(plan.active_experts.len(), 2);
+        assert_eq!(plan.active_experts[0].intermediate, 5);
+        assert_eq!(plan.active_experts[0].output_offset, 0);
+        assert_eq!(plan.active_experts[1].intermediate, 7);
+        assert_eq!(plan.active_experts[1].output_offset, 4 * 4);
+        assert_eq!(plan.combine.active_count, 2);
+        assert_eq!(plan.next_norm.unwrap().width, 4);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_execution_plan_rejects_mismatched_subplans() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let payloads = vec![ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(
+            5, 6,
+        ))];
+
+        let payload_err = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            1,
+            4,
+            1,
+            output_state,
+            ScheduledSharedExpertPhaseRef::None,
+            None,
+            &payloads,
+        )
+        .unwrap_err();
+        assert!(
+            payload_err
+                .to_string()
+                .contains("does not match phase width 4"),
+            "{payload_err:#}"
+        );
+
+        let shared = SharedExpertPhaseWeights::new(
+            Arc::new(vec![1.0; 24]),
+            Arc::new(vec![2.0; 24]),
+            Arc::new(vec![3.0; 24]),
+            Arc::new(vec![4.0; 8]),
+            2,
+            3,
+            4,
+        )
+        .unwrap();
+        let payloads = vec![ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(
+            5, 8,
+        ))];
+        let shared_err = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            1,
+            8,
+            1,
+            FlashMoeCmd3OutputState::gpu_resident(8, false),
+            ScheduledSharedExpertPhaseRef::Dense(&shared),
+            None,
+            &payloads,
+        )
+        .unwrap_err();
+        assert!(
+            shared_err.to_string().contains("shared expert width 4"),
+            "{shared_err:#}"
         );
     }
 

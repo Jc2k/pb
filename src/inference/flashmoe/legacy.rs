@@ -103,9 +103,8 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3CombinePlan, MetalCmd3DeferredOutput, MetalCmd3NextNormPlan, MetalCmd3PhasePlan,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput,
+    MetalCmd3ExecutionPlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
     MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
     MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
     MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
@@ -4779,15 +4778,16 @@ impl MetalExecutorInner {
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         let expert_count = retained_experts.len();
-        let plan = match MetalCmd3PhasePlan::new(
+        let command_plan = match MetalCmd3ExecutionPlan::new(
             position,
             layer,
             expert_count,
             width,
             weights.len(),
-            payloads.len(),
             output_state,
-            next_norm_weight.is_some(),
+            shared,
+            next_norm_weight.map(|weight| weight.len()),
+            payloads,
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -4797,15 +4797,8 @@ impl MetalExecutorInner {
                 ));
             }
         };
-        let next_norm_plan =
-            match MetalCmd3NextNormPlan::new(plan, next_norm_weight.map(|weight| weight.len())) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Err(error
-                        .context("FlashMoe unsupported Metal CMD3 phase: invalid next-norm plan"));
-                }
-            };
+        let plan = command_plan.phase;
+        let next_norm_plan = command_plan.next_norm;
         let position = plan.position;
         let layer = plan.layer;
         let expert_count = plan.expert_count;
@@ -4813,35 +4806,14 @@ impl MetalExecutorInner {
         let output_state = plan.output_state;
         let shared_dense = shared.dense();
         let shared_q4 = shared.q4();
-        let shared_dense_plan = if let Some(shared) = shared_dense {
-            match MetalCmd3SharedPhasePlan::dense(width, shared) {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Err(error.context(
-                        "FlashMoe unsupported Metal CMD3 phase: invalid dense shared expert plan",
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        let shared_metal =
-            if let (Some(shared), Some(shared_plan)) = (shared_dense, shared_dense_plan) {
-                Some(self.shared_expert_buffers(layer, shared, shared_plan.total_intermediate)?)
-            } else {
-                None
-            };
-        let shared_q4_plan = if let Some(shared) = shared_q4 {
-            match MetalCmd3SharedPhasePlan::resident_q4(width, shared) {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Err(error.context(
-                        "FlashMoe unsupported Metal CMD3 phase: invalid resident-Q4 shared expert plan",
-                    ));
-                }
-            }
+        let shared_metal = if let (Some(shared), MetalCmd3SharedPhaseSource::Dense) =
+            (shared_dense, command_plan.shared.source)
+        {
+            Some(self.shared_expert_buffers(
+                layer,
+                shared,
+                command_plan.shared.projection_rows(),
+            )?)
         } else {
             None
         };
@@ -4884,7 +4856,10 @@ impl MetalExecutorInner {
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
             let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
 
-            if let (Some(shared), Some(shared_plan)) = (shared_q4, shared_q4_plan) {
+            if let (Some(shared), MetalCmd3SharedPhaseSource::ResidentQ4) =
+                (shared_q4, command_plan.shared.source)
+            {
+                let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
                 let total_u32 = shared_plan.total_intermediate_u32()?;
                 let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
@@ -4935,7 +4910,10 @@ impl MetalExecutorInner {
                     shared_activated,
                     shared_output_buffer,
                 )?;
-            } else if let (Some(_shared), Some(shared_plan)) = (shared_dense, shared_dense_plan) {
+            } else if let (Some(_shared), MetalCmd3SharedPhaseSource::Dense) =
+                (shared_dense, command_plan.shared.source)
+            {
+                let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let total_u32 = shared_plan.total_intermediate_u32()?;
@@ -5001,7 +4979,7 @@ impl MetalExecutorInner {
                     width,
                 );
             } else {
-                let shared_plan = MetalCmd3SharedPhasePlan::none(width);
+                let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::None);
                 self.encode_fill_zero(
                     encoder,
@@ -5011,9 +4989,8 @@ impl MetalExecutorInner {
                 );
             }
 
-            for (idx, payload) in payloads.iter().enumerate() {
+            for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
                 let payload = payload.q4();
-                let active_plan = MetalCmd3ActiveExpertPlan::new(plan, idx, payload)?;
                 let activated = self.buffer_with_len(active_plan.activation_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
 
@@ -5075,7 +5052,7 @@ impl MetalExecutorInner {
                 )?;
             }
 
-            let combine_plan = MetalCmd3CombinePlan::new(plan);
+            let combine_plan = command_plan.combine;
             let active_u32 = combine_plan.active_count_u32();
             let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
