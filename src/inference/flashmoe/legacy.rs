@@ -52,7 +52,9 @@ use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Seek, Write};
+#[cfg(not(unix))]
+use std::io::Seek;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use tokenizers::Tokenizer;
@@ -66,6 +68,8 @@ use super::experts::ExpertReadPath;
 #[cfg(test)]
 use super::experts::FLASHMOE_EXPERT_IO_POLICY;
 #[cfg(test)]
+use super::experts::FixedQ4ExpertSlotView;
+#[cfg(test)]
 use super::experts::ReusableExpertBuffer;
 #[cfg(test)]
 use super::experts::parse_pbq4_expert_pack_generic;
@@ -76,16 +80,19 @@ use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertPackWireRecord,
-    ExpertRawPayload, ExpertRawRead, ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView,
+    ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore,
     FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
-    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, PackedExpertTensor,
-    Q4MatvecPayload, Q4MatvecSource, expert_layer_metadata_path, expert_layer_path,
+    FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PBQ4_EXPERT_MAGIC, PackedExpertTensor,
+    Q4MatvecPayload, Q4MatvecSource, build_expert_pack, build_fixed_native_q4_expert_pack,
+    build_native_q4_expert_pack, expert_layer_metadata_path, expert_layer_path,
     expert_scale_bias_dtype_size, expert_slot_end, expert_slot_offset,
     fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
     pbq4_expert_pack_wire_size, read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
-use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+#[cfg(test)]
+use super::model_family::QwenMoeExpertComponentKind;
+use super::model_family::{QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
@@ -23027,293 +23034,6 @@ fn expert_tensor_byte_range(
         );
     }
     Ok([byte_start, byte_end])
-}
-
-struct ExpertRecordInput {
-    tensor: String,
-    dtype: String,
-    shape: Vec<usize>,
-    source_offsets: [u64; 2],
-    source_hash: Option<String>,
-    values: Vec<f32>,
-}
-
-struct NativeQ4ExpertRecordInput {
-    tensor: String,
-    dtype: String,
-    shape: Vec<usize>,
-    source_offsets: [u64; 2],
-    source_hash: Option<String>,
-    packed: Vec<u8>,
-    scale_bytes: Vec<u8>,
-    bias_bytes: Vec<u8>,
-    groups: usize,
-    scale_bias_dtype: String,
-}
-
-fn build_expert_pack(
-    layer: usize,
-    expert: usize,
-    inputs: Vec<ExpertRecordInput>,
-) -> Result<(Vec<u8>, ExpertPackMetadata)> {
-    let mut out = std::io::Cursor::new(Vec::new());
-    let mut records = Vec::with_capacity(inputs.len());
-    out.write_all(PBQ4_EXPERT_MAGIC)
-        .context("failed to write packed expert header")?;
-    for input in inputs {
-        write_quantized_expert_record(&mut out, &mut records, input)?;
-    }
-    let packed = out.into_inner();
-    let metadata = ExpertPackMetadata {
-        layer,
-        expert,
-        packed_bytes: packed.len() as u64,
-        records,
-    };
-    Ok((packed, metadata))
-}
-
-fn build_native_q4_expert_pack(
-    layer: usize,
-    expert: usize,
-    inputs: Vec<NativeQ4ExpertRecordInput>,
-) -> Result<(Vec<u8>, ExpertPackMetadata)> {
-    let mut out = std::io::Cursor::new(Vec::new());
-    let mut records = Vec::with_capacity(inputs.len());
-    out.write_all(PBQ4_EXPERT_MAGIC)
-        .context("failed to write packed expert header")?;
-    for input in inputs {
-        write_native_q4_expert_record(&mut out, &mut records, input)?;
-    }
-    let packed = out.into_inner();
-    let metadata = ExpertPackMetadata {
-        layer,
-        expert,
-        packed_bytes: packed.len() as u64,
-        records,
-    };
-    Ok((packed, metadata))
-}
-
-fn build_fixed_native_q4_expert_pack(
-    layer: usize,
-    expert: usize,
-    fixed: QwenMoeQ4ExpertLayout,
-    inputs: Vec<NativeQ4ExpertRecordInput>,
-) -> Result<(Vec<u8>, ExpertPackMetadata)> {
-    if inputs.len() != 3 {
-        bail!("fixed native q4 expert pack requires gate, up, and down inputs");
-    }
-    let [gate, up, down]: [NativeQ4ExpertRecordInput; 3] =
-        inputs
-            .try_into()
-            .map_err(|inputs: Vec<NativeQ4ExpertRecordInput>| {
-                anyhow::anyhow!(
-                    "fixed native q4 expert pack requires 3 inputs, got {}",
-                    inputs.len()
-                )
-            })?;
-    let mut out = vec![0u8; fixed.expert_bytes];
-    let mut records = Vec::with_capacity(3);
-    write_fixed_native_q4_component(
-        &mut out,
-        &mut records,
-        fixed,
-        gate,
-        QwenMoeExpertComponentKind::GateWeight,
-        QwenMoeExpertComponentKind::GateScale,
-        QwenMoeExpertComponentKind::GateBias,
-    )?;
-    write_fixed_native_q4_component(
-        &mut out,
-        &mut records,
-        fixed,
-        up,
-        QwenMoeExpertComponentKind::UpWeight,
-        QwenMoeExpertComponentKind::UpScale,
-        QwenMoeExpertComponentKind::UpBias,
-    )?;
-    write_fixed_native_q4_component(
-        &mut out,
-        &mut records,
-        fixed,
-        down,
-        QwenMoeExpertComponentKind::DownWeight,
-        QwenMoeExpertComponentKind::DownScale,
-        QwenMoeExpertComponentKind::DownBias,
-    )?;
-    let slot = ExpertSlotView::new(layer, expert, 0, fixed.expert_bytes, &out)?;
-    FixedQ4ExpertSlotView::new(slot, fixed)?;
-    let metadata = ExpertPackMetadata {
-        layer,
-        expert,
-        packed_bytes: out.len() as u64,
-        records,
-    };
-    Ok((out, metadata))
-}
-
-fn write_fixed_native_q4_component(
-    out: &mut [u8],
-    records: &mut Vec<ExpertPackRecord>,
-    layout: QwenMoeQ4ExpertLayout,
-    input: NativeQ4ExpertRecordInput,
-    weight_kind: QwenMoeExpertComponentKind,
-    scale_kind: QwenMoeExpertComponentKind,
-    bias_kind: QwenMoeExpertComponentKind,
-) -> Result<()> {
-    let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
-    let scale_bias_len = input
-        .groups
-        .checked_mul(scale_bias_bytes)
-        .context("fixed native q4 expert scale/bias byte length overflow")?;
-    if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len {
-        bail!(
-            "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
-            input.tensor,
-            input.scale_bytes.len(),
-            input.bias_bytes.len(),
-            input.groups,
-            scale_bias_bytes
-        );
-    }
-    let weight = layout.component(weight_kind);
-    let scale = layout.component(scale_kind);
-    let bias = layout.component(bias_kind);
-    if input.packed.len() != weight.bytes
-        || input.scale_bytes.len() != scale.bytes
-        || input.bias_bytes.len() != bias.bytes
-    {
-        bail!(
-            "native q4 expert tensor {} byte lengths packed/scales/biases {}/{}/{} do not match fixed layout {}/{}/{}",
-            input.tensor,
-            input.packed.len(),
-            input.scale_bytes.len(),
-            input.bias_bytes.len(),
-            weight.bytes,
-            scale.bytes,
-            bias.bytes
-        );
-    }
-    out[weight.offset..weight.offset + weight.bytes].copy_from_slice(&input.packed);
-    out[scale.offset..scale.offset + scale.bytes].copy_from_slice(&input.scale_bytes);
-    out[bias.offset..bias.offset + bias.bytes].copy_from_slice(&input.bias_bytes);
-    records.push(ExpertPackRecord {
-        tensor: input.tensor,
-        dtype: input.dtype,
-        shape: input.shape,
-        source_offsets: input.source_offsets,
-        source_hash: input.source_hash,
-        record_offset: weight.offset as u64,
-        packed_bytes: input.packed.len() as u64,
-        groups: input.groups,
-        group_size: layout.group_size,
-        scale_bias_dtype: input.scale_bias_dtype,
-    });
-    Ok(())
-}
-
-fn write_quantized_expert_record<W: Write + Seek>(
-    out: &mut W,
-    records: &mut Vec<ExpertPackRecord>,
-    input: ExpertRecordInput,
-) -> Result<()> {
-    let packed = quantize_q4(&input.values, &input.shape, GROUP_SIZE).with_context(|| {
-        format!(
-            "failed to quantize decoded expert tensor {} into q4 groups",
-            input.tensor
-        )
-    })?;
-    let record_offset = out
-        .stream_position()
-        .context("failed to get expert record offset")?;
-    out.write_all(&(input.tensor.len() as u32).to_le_bytes())?;
-    out.write_all(input.tensor.as_bytes())?;
-    out.write_all(&(packed.values.len() as u64).to_le_bytes())?;
-    out.write_all(&(packed.scales.len() as u64).to_le_bytes())?;
-    write_expert_scale_bias_vec_le(out, &packed.scales, EXPERT_PACK_SCALE_BIAS_DTYPE)?;
-    write_expert_scale_bias_vec_le(out, &packed.biases, EXPERT_PACK_SCALE_BIAS_DTYPE)?;
-    out.write_all(&packed.values)?;
-    records.push(ExpertPackRecord {
-        tensor: input.tensor,
-        dtype: input.dtype,
-        shape: input.shape,
-        source_offsets: input.source_offsets,
-        source_hash: input.source_hash,
-        record_offset,
-        packed_bytes: packed.values.len() as u64,
-        groups: packed.scales.len(),
-        group_size: GROUP_SIZE,
-        scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
-    });
-    Ok(())
-}
-
-fn write_native_q4_expert_record<W: Write + Seek>(
-    out: &mut W,
-    records: &mut Vec<ExpertPackRecord>,
-    input: NativeQ4ExpertRecordInput,
-) -> Result<()> {
-    let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
-    let scale_bias_len = input
-        .groups
-        .checked_mul(scale_bias_bytes)
-        .context("native q4 expert scale/bias byte length overflow")?;
-    if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len {
-        bail!(
-            "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
-            input.tensor,
-            input.scale_bytes.len(),
-            input.bias_bytes.len(),
-            input.groups,
-            scale_bias_bytes
-        );
-    }
-
-    let record_offset = out
-        .stream_position()
-        .context("failed to get expert record offset")?;
-    out.write_all(&(input.tensor.len() as u32).to_le_bytes())?;
-    out.write_all(input.tensor.as_bytes())?;
-    out.write_all(&(input.packed.len() as u64).to_le_bytes())?;
-    out.write_all(&(input.groups as u64).to_le_bytes())?;
-    out.write_all(&input.scale_bytes)?;
-    out.write_all(&input.bias_bytes)?;
-    out.write_all(&input.packed)?;
-    records.push(ExpertPackRecord {
-        tensor: input.tensor,
-        dtype: input.dtype,
-        shape: input.shape,
-        source_offsets: input.source_offsets,
-        source_hash: input.source_hash,
-        record_offset,
-        packed_bytes: input.packed.len() as u64,
-        groups: input.groups,
-        group_size: GROUP_SIZE,
-        scale_bias_dtype: input.scale_bias_dtype,
-    });
-    Ok(())
-}
-
-fn write_expert_scale_bias_vec_le<W: Write>(
-    out: &mut W,
-    values: &[f32],
-    dtype: &str,
-) -> Result<()> {
-    match dtype.to_ascii_uppercase().as_str() {
-        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => {
-            for value in values {
-                out.write_all(&value.to_le_bytes())?;
-            }
-        }
-        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => {
-            for value in values {
-                out.write_all(&f32_to_bf16_bits(*value).to_le_bytes())?;
-            }
-        }
-        other => bail!("unsupported q4 scale/bias dtype {other}"),
-    }
-    Ok(())
 }
 
 fn validate_expert_tensor_group(
