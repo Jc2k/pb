@@ -209,6 +209,89 @@ impl MetalPipelineNameSet {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct MetalPipelineSet<T> {
+    pub(crate) q4_pipeline: T,
+    pub(crate) q4_bf16_scale_bias_pipeline: T,
+    pub(crate) q4_swiglu_pipeline: T,
+    pub(crate) q4_swiglu_bf16_scale_bias_pipeline: T,
+    pub(crate) q4_mmap_pipeline: T,
+    pub(crate) q4_mmap_bf16_scale_bias_pipeline: T,
+    pub(crate) q4_mmap_batch_pipeline: T,
+    pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
+    pub(crate) route_pipeline: Option<T>,
+    pub(crate) dense_matvec_pipeline: T,
+    pub(crate) dense_matvec_bf16_pipeline: T,
+    pub(crate) dense_mmap_matvec_pipeline: T,
+    pub(crate) dense_mmap_matvec_bf16_pipeline: T,
+    pub(crate) dense_mmap_matvec_bf16_simd_pipeline: T,
+    pub(crate) rms_norm_pipeline: T,
+    pub(crate) rms_norm_reduced_pipeline: T,
+    pub(crate) residual_rms_norm_pipeline: T,
+    pub(crate) rope_pipeline: T,
+    pub(crate) rope_split_half_pipeline: T,
+    pub(crate) attention_pipeline: T,
+    pub(crate) kv_write_pipeline: T,
+    pub(crate) kv_read_attention_pipeline: T,
+    pub(crate) expert_mlp_pipeline: T,
+    pub(crate) silu_product_pipeline: T,
+    pub(crate) shared_expert_activation_pipeline: T,
+    pub(crate) combine_expert_phase_pipeline: T,
+    pub(crate) fill_zero_pipeline: T,
+    pub(crate) lm_head_pipeline: T,
+    pub(crate) topk_vocab_pipeline: T,
+    pub(crate) gqa_scores_pipeline: T,
+    pub(crate) gqa_read_pipeline: T,
+    pub(crate) linear_conv1d_pipeline: T,
+    pub(crate) linear_rms_norm_qk_pipeline: T,
+    pub(crate) linear_decay_beta_pipeline: T,
+    pub(crate) linear_delta_step_pipeline: T,
+    pub(crate) linear_gated_rms_norm_pipeline: T,
+}
+
+impl<T: Copy> MetalPipelineSet<T> {
+    pub(crate) fn release_with(&self, mut release: impl FnMut(T)) {
+        release(self.q4_pipeline);
+        release(self.q4_bf16_scale_bias_pipeline);
+        release(self.q4_swiglu_pipeline);
+        release(self.q4_swiglu_bf16_scale_bias_pipeline);
+        release(self.q4_mmap_pipeline);
+        release(self.q4_mmap_bf16_scale_bias_pipeline);
+        release(self.q4_mmap_batch_pipeline);
+        release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
+        if let Some(route_pipeline) = self.route_pipeline {
+            release(route_pipeline);
+        }
+        release(self.dense_matvec_pipeline);
+        release(self.dense_matvec_bf16_pipeline);
+        release(self.dense_mmap_matvec_pipeline);
+        release(self.dense_mmap_matvec_bf16_pipeline);
+        release(self.dense_mmap_matvec_bf16_simd_pipeline);
+        release(self.rms_norm_pipeline);
+        release(self.rms_norm_reduced_pipeline);
+        release(self.residual_rms_norm_pipeline);
+        release(self.rope_pipeline);
+        release(self.rope_split_half_pipeline);
+        release(self.attention_pipeline);
+        release(self.kv_write_pipeline);
+        release(self.kv_read_attention_pipeline);
+        release(self.expert_mlp_pipeline);
+        release(self.silu_product_pipeline);
+        release(self.shared_expert_activation_pipeline);
+        release(self.combine_expert_phase_pipeline);
+        release(self.fill_zero_pipeline);
+        release(self.lm_head_pipeline);
+        release(self.topk_vocab_pipeline);
+        release(self.gqa_scores_pipeline);
+        release(self.gqa_read_pipeline);
+        release(self.linear_conv1d_pipeline);
+        release(self.linear_rms_norm_qk_pipeline);
+        release(self.linear_decay_beta_pipeline);
+        release(self.linear_delta_step_pipeline);
+        release(self.linear_gated_rms_norm_pipeline);
+    }
+}
+
 pub const METAL_SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2040,5 +2123,63 @@ mod tests {
         required.dedup();
 
         assert_eq!(compiled, required);
+    }
+
+    #[test]
+    fn pipeline_set_release_order_includes_optional_route_pipeline() {
+        let without_route = test_pipeline_set(None);
+        let mut released = Vec::new();
+        without_route.release_with(|pipeline| released.push(pipeline));
+        assert_eq!(released.first(), Some(&1));
+        assert!(!released.contains(&9));
+        assert_eq!(released.last(), Some(&36));
+
+        let with_route = test_pipeline_set(Some(9));
+        let mut released = Vec::new();
+        with_route.release_with(|pipeline| released.push(pipeline));
+        assert_eq!(released.first(), Some(&1));
+        assert!(released.contains(&9));
+        assert_eq!(released.last(), Some(&36));
+    }
+
+    fn test_pipeline_set(route_pipeline: Option<i32>) -> MetalPipelineSet<i32> {
+        MetalPipelineSet {
+            q4_pipeline: 1,
+            q4_bf16_scale_bias_pipeline: 2,
+            q4_swiglu_pipeline: 3,
+            q4_swiglu_bf16_scale_bias_pipeline: 4,
+            q4_mmap_pipeline: 5,
+            q4_mmap_bf16_scale_bias_pipeline: 6,
+            q4_mmap_batch_pipeline: 7,
+            q4_mmap_batch_bf16_scale_bias_pipeline: 8,
+            route_pipeline,
+            dense_matvec_pipeline: 10,
+            dense_matvec_bf16_pipeline: 11,
+            dense_mmap_matvec_pipeline: 12,
+            dense_mmap_matvec_bf16_pipeline: 13,
+            dense_mmap_matvec_bf16_simd_pipeline: 14,
+            rms_norm_pipeline: 15,
+            rms_norm_reduced_pipeline: 16,
+            residual_rms_norm_pipeline: 17,
+            rope_pipeline: 18,
+            rope_split_half_pipeline: 19,
+            attention_pipeline: 20,
+            kv_write_pipeline: 21,
+            kv_read_attention_pipeline: 22,
+            expert_mlp_pipeline: 23,
+            silu_product_pipeline: 24,
+            shared_expert_activation_pipeline: 25,
+            combine_expert_phase_pipeline: 26,
+            fill_zero_pipeline: 27,
+            lm_head_pipeline: 28,
+            topk_vocab_pipeline: 29,
+            gqa_scores_pipeline: 30,
+            gqa_read_pipeline: 31,
+            linear_conv1d_pipeline: 32,
+            linear_rms_norm_qk_pipeline: 33,
+            linear_decay_beta_pipeline: 34,
+            linear_delta_step_pipeline: 35,
+            linear_gated_rms_norm_pipeline: 36,
+        }
     }
 }

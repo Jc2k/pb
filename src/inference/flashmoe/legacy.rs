@@ -103,7 +103,7 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalPipelineNameSet, metal_command_failure_requires_release,
+    MetalPipelineNameSet, MetalPipelineSet, metal_command_failure_requires_release,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2775,42 +2775,7 @@ impl MetalAttentionPolicy {
 struct MetalExecutorInner {
     device: ObjcId,
     command_queue: ObjcId,
-    q4_pipeline: ObjcId,
-    q4_bf16_scale_bias_pipeline: ObjcId,
-    q4_swiglu_pipeline: ObjcId,
-    q4_swiglu_bf16_scale_bias_pipeline: ObjcId,
-    q4_mmap_pipeline: ObjcId,
-    q4_mmap_bf16_scale_bias_pipeline: ObjcId,
-    q4_mmap_batch_pipeline: ObjcId,
-    q4_mmap_batch_bf16_scale_bias_pipeline: ObjcId,
-    route_pipeline: Option<ObjcId>,
-    dense_matvec_pipeline: ObjcId,
-    dense_matvec_bf16_pipeline: ObjcId,
-    dense_mmap_matvec_pipeline: ObjcId,
-    dense_mmap_matvec_bf16_pipeline: ObjcId,
-    dense_mmap_matvec_bf16_simd_pipeline: ObjcId,
-    rms_norm_pipeline: ObjcId,
-    rms_norm_reduced_pipeline: ObjcId,
-    residual_rms_norm_pipeline: ObjcId,
-    rope_pipeline: ObjcId,
-    rope_split_half_pipeline: ObjcId,
-    attention_pipeline: ObjcId,
-    kv_write_pipeline: ObjcId,
-    kv_read_attention_pipeline: ObjcId,
-    expert_mlp_pipeline: ObjcId,
-    silu_product_pipeline: ObjcId,
-    shared_expert_activation_pipeline: ObjcId,
-    combine_expert_phase_pipeline: ObjcId,
-    fill_zero_pipeline: ObjcId,
-    lm_head_pipeline: ObjcId,
-    topk_vocab_pipeline: ObjcId,
-    gqa_scores_pipeline: ObjcId,
-    gqa_read_pipeline: ObjcId,
-    linear_conv1d_pipeline: ObjcId,
-    linear_rms_norm_qk_pipeline: ObjcId,
-    linear_decay_beta_pipeline: ObjcId,
-    linear_delta_step_pipeline: ObjcId,
-    linear_gated_rms_norm_pipeline: ObjcId,
+    pipelines: MetalPipelineSet<ObjcId>,
     shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
     dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
@@ -3148,44 +3113,7 @@ unsafe impl Sync for MetalExecutorInner {}
 impl Drop for MetalExecutorInner {
     fn drop(&mut self) {
         unsafe {
-            release(self.q4_pipeline);
-            release(self.q4_bf16_scale_bias_pipeline);
-            release(self.q4_swiglu_pipeline);
-            release(self.q4_swiglu_bf16_scale_bias_pipeline);
-            release(self.q4_mmap_pipeline);
-            release(self.q4_mmap_bf16_scale_bias_pipeline);
-            release(self.q4_mmap_batch_pipeline);
-            release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
-            if let Some(route_pipeline) = self.route_pipeline {
-                release(route_pipeline);
-            }
-            release(self.dense_matvec_pipeline);
-            release(self.dense_matvec_bf16_pipeline);
-            release(self.dense_mmap_matvec_pipeline);
-            release(self.dense_mmap_matvec_bf16_pipeline);
-            release(self.dense_mmap_matvec_bf16_simd_pipeline);
-            release(self.rms_norm_pipeline);
-            release(self.rms_norm_reduced_pipeline);
-            release(self.residual_rms_norm_pipeline);
-            release(self.rope_pipeline);
-            release(self.rope_split_half_pipeline);
-            release(self.attention_pipeline);
-            release(self.kv_write_pipeline);
-            release(self.kv_read_attention_pipeline);
-            release(self.expert_mlp_pipeline);
-            release(self.silu_product_pipeline);
-            release(self.shared_expert_activation_pipeline);
-            release(self.combine_expert_phase_pipeline);
-            release(self.fill_zero_pipeline);
-            release(self.lm_head_pipeline);
-            release(self.topk_vocab_pipeline);
-            release(self.gqa_scores_pipeline);
-            release(self.gqa_read_pipeline);
-            release(self.linear_conv1d_pipeline);
-            release(self.linear_rms_norm_qk_pipeline);
-            release(self.linear_decay_beta_pipeline);
-            release(self.linear_delta_step_pipeline);
-            release(self.linear_gated_rms_norm_pipeline);
+            self.pipelines.release_with(|pipeline| release(pipeline));
             if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
                 for buffers in shared_buffers.values() {
                     release(buffers.gate);
@@ -3331,78 +3259,7 @@ impl MetalExecutorInner {
             let linear_gated_rms_norm_pipeline =
                 compile_pipeline(device, library, pipeline_names.linear_gated_rms_norm)?;
             release(library);
-
-            let command_queue = msg_send_id0(device, sel("newCommandQueue"));
-            if command_queue.is_null() {
-                release(q4_pipeline);
-                release(q4_bf16_scale_bias_pipeline);
-                release(q4_swiglu_pipeline);
-                release(q4_swiglu_bf16_scale_bias_pipeline);
-                release(q4_mmap_pipeline);
-                release(q4_mmap_bf16_scale_bias_pipeline);
-                release(q4_mmap_batch_pipeline);
-                release(q4_mmap_batch_bf16_scale_bias_pipeline);
-                if let Some(route_pipeline) = route_pipeline {
-                    release(route_pipeline);
-                }
-                release(dense_matvec_pipeline);
-                release(dense_matvec_bf16_pipeline);
-                release(dense_mmap_matvec_pipeline);
-                release(dense_mmap_matvec_bf16_pipeline);
-                release(dense_mmap_matvec_bf16_simd_pipeline);
-                release(rms_norm_pipeline);
-                release(rms_norm_reduced_pipeline);
-                release(residual_rms_norm_pipeline);
-                release(rope_pipeline);
-                release(rope_split_half_pipeline);
-                release(attention_pipeline);
-                release(kv_write_pipeline);
-                release(kv_read_attention_pipeline);
-                release(expert_mlp_pipeline);
-                release(silu_product_pipeline);
-                release(shared_expert_activation_pipeline);
-                release(combine_expert_phase_pipeline);
-                release(fill_zero_pipeline);
-                release(lm_head_pipeline);
-                release(topk_vocab_pipeline);
-                release(gqa_scores_pipeline);
-                release(gqa_read_pipeline);
-                release(linear_conv1d_pipeline);
-                release(linear_rms_norm_qk_pipeline);
-                release(linear_decay_beta_pipeline);
-                release(linear_delta_step_pipeline);
-                release(linear_gated_rms_norm_pipeline);
-                release(device);
-                bail!("failed to create Flash-MoE Metal command queue");
-            }
-
-            let dense_weights =
-                wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
-
-            let max_context = metal_kv_max_context_for_layouts(
-                config,
-                &runtime.full_attention,
-                system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
-            );
-            let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
-            let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
-            let linear_attention_state =
-                allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
-
-            tracing::info!(
-                model = %plan.model,
-                layers = config.num_hidden_layers,
-                max_context,
-                kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
-                experts = config.experts(),
-                route_top4 = route_top4_enabled,
-                dense_resident = dense_weights.is_some(),
-                "Flash-MoE Metal executor initialized"
-            );
-
-            Ok(Self {
-                device,
-                command_queue,
+            let pipelines = MetalPipelineSet {
                 q4_pipeline,
                 q4_bf16_scale_bias_pipeline,
                 q4_swiglu_pipeline,
@@ -3439,6 +3296,43 @@ impl MetalExecutorInner {
                 linear_decay_beta_pipeline,
                 linear_delta_step_pipeline,
                 linear_gated_rms_norm_pipeline,
+            };
+
+            let command_queue = msg_send_id0(device, sel("newCommandQueue"));
+            if command_queue.is_null() {
+                pipelines.release_with(|pipeline| release(pipeline));
+                release(device);
+                bail!("failed to create Flash-MoE Metal command queue");
+            }
+
+            let dense_weights =
+                wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
+
+            let max_context = metal_kv_max_context_for_layouts(
+                config,
+                &runtime.full_attention,
+                system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
+            );
+            let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
+            let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
+            let linear_attention_state =
+                allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
+
+            tracing::info!(
+                model = %plan.model,
+                layers = config.num_hidden_layers,
+                max_context,
+                kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
+                experts = config.experts(),
+                route_top4 = route_top4_enabled,
+                dense_resident = dense_weights.is_some(),
+                "Flash-MoE Metal executor initialized"
+            );
+
+            Ok(Self {
+                device,
+                command_queue,
+                pipelines,
                 shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
                 dense_weights,
                 lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
@@ -3600,7 +3494,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_conv1d_pipeline,
+                self.pipelines.linear_conv1d_pipeline,
             );
             set_buffer(encoder, state.conv_state, 0);
             set_buffer_with_offset(encoder, batch.output_buffer, qkv_offset, 1);
@@ -3618,7 +3512,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_rms_norm_qk_pipeline,
+                self.pipelines.linear_rms_norm_qk_pipeline,
             );
             set_buffer(encoder, state.conv_output, 0);
             set_buffer_with_offset(
@@ -3647,7 +3541,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_decay_beta_pipeline,
+                self.pipelines.linear_decay_beta_pipeline,
             );
             set_buffer_with_offset(encoder, batch.output_buffer, alpha_offset, 0);
             set_buffer_with_offset(encoder, batch.output_buffer, beta_offset, 1);
@@ -3671,7 +3565,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_delta_step_pipeline,
+                self.pipelines.linear_delta_step_pipeline,
             );
             set_buffer(encoder, state.ssm_state, 0);
             set_buffer(encoder, state.conv_output, 1);
@@ -3711,7 +3605,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_gated_rms_norm_pipeline,
+                self.pipelines.linear_gated_rms_norm_pipeline,
             );
             set_buffer(encoder, state.delta_output, 0);
             set_buffer_with_offset(encoder, batch.output_buffer, z_offset, 1);
@@ -3921,9 +3815,9 @@ impl MetalExecutorInner {
                         .scale_bias_dtype
                         .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                     {
-                        self.q4_mmap_bf16_scale_bias_pipeline
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                     } else {
-                        self.q4_mmap_pipeline
+                        self.pipelines.q4_mmap_pipeline
                     },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
@@ -3952,7 +3846,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_conv1d_pipeline,
+                self.pipelines.linear_conv1d_pipeline,
             );
             set_buffer(encoder, state.conv_state, 0);
             set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
@@ -3971,7 +3865,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_rms_norm_qk_pipeline,
+                self.pipelines.linear_rms_norm_qk_pipeline,
             );
             set_buffer(encoder, state.conv_output, 0);
             set_buffer_with_offset(
@@ -4001,7 +3895,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_decay_beta_pipeline,
+                self.pipelines.linear_decay_beta_pipeline,
             );
             set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
             set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
@@ -4026,7 +3920,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_delta_step_pipeline,
+                self.pipelines.linear_delta_step_pipeline,
             );
             set_buffer(encoder, state.ssm_state, 0);
             set_buffer(encoder, state.conv_output, 1);
@@ -4067,7 +3961,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_gated_rms_norm_pipeline,
+                self.pipelines.linear_gated_rms_norm_pipeline,
             );
             set_buffer(encoder, state.delta_output, 0);
             set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
@@ -4327,9 +4221,9 @@ impl MetalExecutorInner {
                         .scale_bias_dtype
                         .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                     {
-                        self.q4_mmap_bf16_scale_bias_pipeline
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                     } else {
-                        self.q4_mmap_pipeline
+                        self.pipelines.q4_mmap_pipeline
                     },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
@@ -4357,7 +4251,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_conv1d_pipeline,
+                self.pipelines.linear_conv1d_pipeline,
             );
             set_buffer(encoder, state.conv_state, 0);
             set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
@@ -4375,7 +4269,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_rms_norm_qk_pipeline,
+                self.pipelines.linear_rms_norm_qk_pipeline,
             );
             set_buffer(encoder, state.conv_output, 0);
             set_buffer_with_offset(
@@ -4404,7 +4298,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_decay_beta_pipeline,
+                self.pipelines.linear_decay_beta_pipeline,
             );
             set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
             set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
@@ -4428,7 +4322,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_delta_step_pipeline,
+                self.pipelines.linear_delta_step_pipeline,
             );
             set_buffer(encoder, state.ssm_state, 0);
             set_buffer(encoder, state.conv_output, 1);
@@ -4468,7 +4362,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.linear_gated_rms_norm_pipeline,
+                self.pipelines.linear_gated_rms_norm_pipeline,
             );
             set_buffer(encoder, state.delta_output, 0);
             set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
@@ -4510,9 +4404,9 @@ impl MetalExecutorInner {
                         .scale_bias_dtype
                         .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                     {
-                        self.q4_mmap_bf16_scale_bias_pipeline
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                     } else {
-                        self.q4_mmap_pipeline
+                        self.pipelines.q4_mmap_pipeline
                     },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
@@ -4532,7 +4426,7 @@ impl MetalExecutorInner {
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
-                        self.residual_rms_norm_pipeline,
+                        self.pipelines.residual_rms_norm_pipeline,
                     );
                     set_buffer(encoder, projected_buffer, 0);
                     set_buffer(encoder, residual_input_buffer, 1);
@@ -4645,7 +4539,11 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE Metal compute encoder");
             }
 
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.q4_pipeline);
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.q4_pipeline,
+            );
             set_buffer(encoder, packed_buffer, 0);
             set_buffer(encoder, input_buffer, 1);
             set_buffer(encoder, scale_buffer, 2);
@@ -4777,9 +4675,9 @@ impl MetalExecutorInner {
                 encoder,
                 sel("setComputePipelineState:"),
                 if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
-                    self.q4_mmap_bf16_scale_bias_pipeline
+                    self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                 } else {
-                    self.q4_mmap_pipeline
+                    self.pipelines.q4_mmap_pipeline
                 },
             );
             set_buffer(encoder, dense_weights.buffer, 0);
@@ -4871,7 +4769,7 @@ impl MetalExecutorInner {
             let use_mrope_buffer = self.buffer_with_bytes(u32_as_bytes(&use_mrope))?;
             let section_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&section_u32))?;
             self.dispatch_unary(
-                self.rope_split_half_pipeline,
+                self.pipelines.rope_split_half_pipeline,
                 &[
                     values_buffer,
                     temporal_buffer,
@@ -5308,7 +5206,7 @@ impl MetalExecutorInner {
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    self.shared_expert_activation_pipeline,
+                    self.pipelines.shared_expert_activation_pipeline,
                 );
                 set_buffer(encoder, shared_gate_out, 0);
                 set_buffer(encoder, shared_up_out, 1);
@@ -5372,7 +5270,7 @@ impl MetalExecutorInner {
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    self.shared_expert_activation_pipeline,
+                    self.pipelines.shared_expert_activation_pipeline,
                 );
                 set_buffer(encoder, shared_gate_out, 0);
                 set_buffer(encoder, shared_up_out, 1);
@@ -5440,7 +5338,7 @@ impl MetalExecutorInner {
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
-                        self.silu_product_pipeline,
+                        self.pipelines.silu_product_pipeline,
                     );
                     set_buffer(encoder, gate_out, 0);
                     set_buffer(encoder, up_out, 1);
@@ -5470,7 +5368,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.combine_expert_phase_pipeline,
+                self.pipelines.combine_expert_phase_pipeline,
             );
             set_buffer(encoder, residual_buffer, 0);
             set_buffer(encoder, shared_output_buffer, 1);
@@ -5488,7 +5386,7 @@ impl MetalExecutorInner {
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    self.rms_norm_reduced_pipeline,
+                    self.pipelines.rms_norm_reduced_pipeline,
                 );
                 set_buffer(encoder, hidden_buffer, 0);
                 set_buffer(encoder, norm_weight_buffer, 1);
@@ -5559,7 +5457,7 @@ impl MetalExecutorInner {
             ) = if let Some(source) = fixed_source {
                 let buffer = self.q4_source_phase_buffer(source, buffers, source_buffers)?;
                 (
-                    self.q4_bf16_scale_bias_pipeline,
+                    self.pipelines.q4_bf16_scale_bias_pipeline,
                     buffer,
                     source.packed_offset as u64,
                     buffer,
@@ -5574,13 +5472,13 @@ impl MetalExecutorInner {
                 buffers.push(packed_phase_buffer);
                 let (pipeline, scale_bytes, bias_bytes) = if use_bf16_scale_bias {
                     (
-                        self.q4_bf16_scale_bias_pipeline,
+                        self.pipelines.q4_bf16_scale_bias_pipeline,
                         payload.scale_bytes,
                         payload.bias_bytes,
                     )
                 } else {
                     (
-                        self.q4_pipeline,
+                        self.pipelines.q4_pipeline,
                         f32_as_bytes(payload.scales),
                         f32_as_bytes(payload.biases),
                     )
@@ -5676,7 +5574,7 @@ impl MetalExecutorInner {
             ) = if let Some((gate_source, up_source)) = fixed_sources {
                 let buffer = self.q4_source_phase_buffer(gate_source, buffers, source_buffers)?;
                 (
-                    self.q4_swiglu_bf16_scale_bias_pipeline,
+                    self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
                     buffer,
                     gate_source.packed_offset as u64,
                     buffer,
@@ -5703,7 +5601,7 @@ impl MetalExecutorInner {
                 let (pipeline, gate_scale_bytes, gate_bias_bytes, up_scale_bytes, up_bias_bytes) =
                     if use_bf16_scale_bias {
                         (
-                            self.q4_swiglu_bf16_scale_bias_pipeline,
+                            self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
                             gate.scale_bytes,
                             gate.bias_bytes,
                             up.scale_bytes,
@@ -5711,7 +5609,7 @@ impl MetalExecutorInner {
                         )
                     } else {
                         (
-                            self.q4_swiglu_pipeline,
+                            self.pipelines.q4_swiglu_pipeline,
                             f32_as_bytes(gate.scales),
                             f32_as_bytes(gate.biases),
                             f32_as_bytes(up.scales),
@@ -5796,7 +5694,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.dense_matvec_pipeline,
+                self.pipelines.dense_matvec_pipeline,
             );
             set_buffer(encoder, weights_buffer, 0);
             set_buffer(encoder, input_buffer, 1);
@@ -5856,9 +5754,9 @@ impl MetalExecutorInner {
                     .scale_bias_dtype
                     .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                 {
-                    self.q4_mmap_bf16_scale_bias_pipeline
+                    self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                 } else {
-                    self.q4_mmap_pipeline
+                    self.pipelines.q4_mmap_pipeline
                 },
             );
             set_buffer(encoder, dense_weights.buffer, 0);
@@ -5887,7 +5785,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.fill_zero_pipeline,
+                self.pipelines.fill_zero_pipeline,
             );
             set_buffer(encoder, output_buffer, 0);
             set_buffer(encoder, width_buffer, 1);
@@ -5986,9 +5884,9 @@ impl MetalExecutorInner {
                 encoder,
                 sel("setComputePipelineState:"),
                 if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
-                    self.q4_mmap_batch_bf16_scale_bias_pipeline
+                    self.pipelines.q4_mmap_batch_bf16_scale_bias_pipeline
                 } else {
-                    self.q4_mmap_batch_pipeline
+                    self.pipelines.q4_mmap_batch_pipeline
                 },
             );
             set_buffer(encoder, dense_weights.buffer, 0);
@@ -6018,6 +5916,7 @@ impl MetalExecutorInner {
             return Ok(Vec::new());
         }
         let route_pipeline = self
+            .pipelines
             .route_pipeline
             .context("Metal route_top4 requested but routing pipeline is disabled")?;
         unsafe {
@@ -6098,7 +5997,7 @@ impl MetalExecutorInner {
             let width = input.len() as u32;
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
             self.dispatch_unary(
-                self.rms_norm_pipeline,
+                self.pipelines.rms_norm_pipeline,
                 &[input_buffer, weight_buffer, output_buffer, width_buffer],
                 input.len() as u64,
                 &MetalCommandContext::new("rms_norm").with("width", input.len()),
@@ -6137,7 +6036,7 @@ impl MetalExecutorInner {
             let cols_u32 = cols as u32;
             let cols_buffer = self.buffer_with_bytes(u32_as_bytes(&cols_u32))?;
             self.dispatch_unary(
-                self.dense_matvec_pipeline,
+                self.pipelines.dense_matvec_pipeline,
                 &[weights_buffer, input_buffer, output_buffer, cols_buffer],
                 rows as u64,
                 &MetalCommandContext::new("dense_matvec")
@@ -6183,7 +6082,7 @@ impl MetalExecutorInner {
 
             let dispatch_started = Instant::now();
             self.dispatch_unary(
-                self.dense_matvec_bf16_pipeline,
+                self.pipelines.dense_matvec_bf16_pipeline,
                 &[weights_buffer, input_buffer, output_buffer, cols_buffer],
                 rows as u64,
                 &MetalCommandContext::new("dense_matvec_bf16")
@@ -6235,12 +6134,12 @@ impl MetalExecutorInner {
         let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
             "F32" | "FLOAT32" | "FP32" => (
                 std::mem::size_of::<f32>(),
-                self.dense_mmap_matvec_pipeline,
+                self.pipelines.dense_mmap_matvec_pipeline,
                 false,
             ),
             "BF16" | "BFLOAT16" => (
                 std::mem::size_of::<u16>(),
-                self.dense_mmap_matvec_bf16_simd_pipeline,
+                self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
                 true,
             ),
             _ => return Ok(None),
@@ -6370,12 +6269,12 @@ impl MetalExecutorInner {
             let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
                 "F32" | "FLOAT32" | "FP32" => (
                     std::mem::size_of::<f32>(),
-                    self.dense_mmap_matvec_pipeline,
+                    self.pipelines.dense_mmap_matvec_pipeline,
                     false,
                 ),
                 "BF16" | "BFLOAT16" => (
                     std::mem::size_of::<u16>(),
-                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
                     true,
                 ),
                 _ => return Ok(None),
@@ -6655,9 +6554,9 @@ impl MetalExecutorInner {
                             .scale_bias_dtype
                             .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                         {
-                            self.q4_mmap_bf16_scale_bias_pipeline
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                         } else {
-                            self.q4_mmap_pipeline
+                            self.pipelines.q4_mmap_pipeline
                         },
                     );
                     set_buffer(encoder, dense_weights.buffer, 0);
@@ -6773,12 +6672,12 @@ impl MetalExecutorInner {
             let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
                 "F32" | "FLOAT32" | "FP32" => (
                     std::mem::size_of::<f32>(),
-                    self.dense_mmap_matvec_pipeline,
+                    self.pipelines.dense_mmap_matvec_pipeline,
                     false,
                 ),
                 "BF16" | "BFLOAT16" => (
                     std::mem::size_of::<u16>(),
-                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
                     true,
                 ),
                 _ => return Ok(None),
@@ -6956,12 +6855,12 @@ impl MetalExecutorInner {
             let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
                 "F32" | "FLOAT32" | "FP32" => (
                     std::mem::size_of::<f32>(),
-                    self.dense_mmap_matvec_pipeline,
+                    self.pipelines.dense_mmap_matvec_pipeline,
                     false,
                 ),
                 "BF16" | "BFLOAT16" => (
                     std::mem::size_of::<u16>(),
-                    self.dense_mmap_matvec_bf16_simd_pipeline,
+                    self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
                     true,
                 ),
                 _ => return Ok(None),
@@ -7104,12 +7003,12 @@ impl MetalExecutorInner {
         let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
             "F32" | "FLOAT32" | "FP32" => (
                 std::mem::size_of::<f32>(),
-                self.dense_mmap_matvec_pipeline,
+                self.pipelines.dense_mmap_matvec_pipeline,
                 false,
             ),
             "BF16" | "BFLOAT16" => (
                 std::mem::size_of::<u16>(),
-                self.dense_mmap_matvec_bf16_simd_pipeline,
+                self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
                 true,
             ),
             _ => return Ok(None),
@@ -7185,7 +7084,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.topk_vocab_pipeline,
+                self.pipelines.topk_vocab_pipeline,
             );
             set_buffer(encoder, logits_buffer, 0);
             set_buffer(encoder, indices_buffer, 1);
@@ -7313,9 +7212,9 @@ impl MetalExecutorInner {
                 encoder,
                 sel("setComputePipelineState:"),
                 if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
-                    self.q4_mmap_bf16_scale_bias_pipeline
+                    self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                 } else {
-                    self.q4_mmap_pipeline
+                    self.pipelines.q4_mmap_pipeline
                 },
             );
             set_buffer(encoder, dense_weights.buffer, 0);
@@ -7333,7 +7232,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.topk_vocab_pipeline,
+                self.pipelines.topk_vocab_pipeline,
             );
             set_buffer(encoder, logits_buffer, 0);
             set_buffer(encoder, indices_buffer, 1);
@@ -7486,9 +7385,9 @@ impl MetalExecutorInner {
                         .scale_bias_dtype
                         .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                     {
-                        self.q4_mmap_bf16_scale_bias_pipeline
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                     } else {
-                        self.q4_mmap_pipeline
+                        self.pipelines.q4_mmap_pipeline
                     },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
@@ -7508,7 +7407,7 @@ impl MetalExecutorInner {
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
-                        self.residual_rms_norm_pipeline,
+                        self.pipelines.residual_rms_norm_pipeline,
                     );
                     set_buffer(encoder, projected_buffer, 0);
                     set_buffer(encoder, residual_input_buffer, 1);
@@ -7684,9 +7583,9 @@ impl MetalExecutorInner {
                         .scale_bias_dtype
                         .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                     {
-                        self.q4_mmap_bf16_scale_bias_pipeline
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                     } else {
-                        self.q4_mmap_pipeline
+                        self.pipelines.q4_mmap_pipeline
                     },
                 );
                 set_buffer(encoder, dense_weights.buffer, 0);
@@ -7706,7 +7605,7 @@ impl MetalExecutorInner {
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
-                        self.residual_rms_norm_pipeline,
+                        self.pipelines.residual_rms_norm_pipeline,
                     );
                     set_buffer(encoder, projected_buffer, 0);
                     set_buffer(encoder, residual_input_buffer, 1);
@@ -7893,9 +7792,9 @@ impl MetalExecutorInner {
                             .scale_bias_dtype
                             .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                         {
-                            self.q4_mmap_bf16_scale_bias_pipeline
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                         } else {
-                            self.q4_mmap_pipeline
+                            self.pipelines.q4_mmap_pipeline
                         },
                     );
                     set_buffer(encoder, dense_weights.buffer, 0);
@@ -8085,9 +7984,9 @@ impl MetalExecutorInner {
                             .scale_bias_dtype
                             .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
                         {
-                            self.q4_mmap_bf16_scale_bias_pipeline
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
                         } else {
-                            self.q4_mmap_pipeline
+                            self.pipelines.q4_mmap_pipeline
                         },
                     );
                     set_buffer(encoder, dense_weights.buffer, 0);
@@ -8287,7 +8186,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.lm_head_pipeline,
+                self.pipelines.lm_head_pipeline,
             );
             set_buffer(encoder, lm_head.weights, 0);
             set_buffer(encoder, hidden_buffer, 1);
@@ -8344,7 +8243,7 @@ impl MetalExecutorInner {
             let head_dim_buffer = self.buffer_with_bytes(u32_as_bytes(&head_dim))?;
             let theta_buffer = self.buffer_with_bytes(f32_as_bytes(&[theta]))?;
             self.dispatch_unary(
-                self.rope_pipeline,
+                self.pipelines.rope_pipeline,
                 &[
                     values_buffer,
                     position_buffer,
@@ -8445,7 +8344,7 @@ impl MetalExecutorInner {
             let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&offset))?;
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
             self.dispatch_unary(
-                self.kv_write_pipeline,
+                self.pipelines.kv_write_pipeline,
                 &[
                     key_buffer,
                     value_buffer,
@@ -8540,7 +8439,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.gqa_scores_pipeline,
+                self.pipelines.gqa_scores_pipeline,
             );
             set_buffer(encoder, query_buffer, 0);
             set_buffer_with_offset(encoder, kv_cache.keys, layer_offset_bytes, 1);
@@ -8600,7 +8499,7 @@ impl MetalExecutorInner {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.gqa_read_pipeline,
+                self.pipelines.gqa_read_pipeline,
             );
             set_buffer(encoder, scores_buffer_2, 0);
             set_buffer_with_offset(encoder, kv_cache.values, layer_offset_bytes, 1);

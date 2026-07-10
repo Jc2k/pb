@@ -177,9 +177,10 @@ The validator should reject silent fallbacks such as:
   caller path.
 - `metal.rs` now owns Metal command labels, status decoding, timeout/failure formatting, and
   release-policy detection for command-buffer failures. It also owns the Metal shader source,
-  declared kernel-name surface, pipeline-name plan, and kernel-surface coverage. Legacy still owns
-  the concrete encoders and Obj-C buffer lifecycle, but command submission diagnostics and kernel
-  definitions now have a module boundary for the CMD1/CMD2/CMD3 builders to move behind.
+  declared kernel-name surface, pipeline-name plan, typed pipeline handle set, release ordering, and
+  kernel-surface coverage. Legacy still owns the concrete encoders and Obj-C buffer lifecycle, but
+  command submission diagnostics and kernel definitions now have a module boundary for the
+  CMD1/CMD2/CMD3 builders to move behind.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -331,8 +332,8 @@ The refactor should break the current monolith by ownership boundary, not by "fa
   capability-selected stage implementations, and CMD sequencing.
 - `metal`: command-buffer builders and kernels for CMD1, CMD2, CMD3, LM-head/topK, KV cache, and
   recurrent-state operations. Command-context/status/failure handling, shader-source ownership, and
-  the declared kernel-name/pipeline-plan surface are now extracted here; the next step is to move
-  the concrete encoder builders behind the same module boundary.
+  the declared kernel-name/pipeline-plan and pipeline-handle release surfaces are now extracted
+  here; the next step is to move the concrete encoder builders behind the same module boundary.
 - `state`: KV cache, linear-attention recurrent state, hidden/residual/normed buffer ownership,
   token position state, and multimodal position plans.
 - `runtime`: model-family-agnostic generation loop that composes scheduler, weights, experts, metal,
