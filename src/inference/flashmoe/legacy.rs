@@ -9875,40 +9875,14 @@ impl FlashMoeEngine {
                     used_buffer = true;
                 }
                 if !used_buffer {
-                    if deferred_attention_input.is_some()
-                        && let Some(pending) = pending_for_layer.take()
-                    {
-                        let wait_started = Instant::now();
-                        let output = pending.wait()?;
-                        let wait_elapsed = wait_started.elapsed();
-                        info!(
-                            token_position = position,
-                            completed_layer = layer.saturating_sub(1),
-                            wait_ms = wait_elapsed.as_millis(),
-                            "flashmoe deferred expert wait complete before attention fallback"
-                        );
-                        if let Some(timing) = timing.as_deref_mut() {
-                            timing.buckets.deferred_wait += wait_elapsed;
-                            if let Some(previous_layer) = timing.layers.last_mut() {
-                                previous_layer.buckets.deferred_wait += wait_elapsed;
-                                previous_layer.buckets.total_wall += wait_elapsed;
-                            }
-                        }
-                        token_state.apply_declared_expert_phase(
-                            output,
-                            FlashMoeExpertPhaseApplication::HiddenOnly,
-                        )?;
-                    }
                     if let Some(metal) = &self.metal {
-                        let attention_values = metal.read_and_recycle_attention_values(
-                            attention_values
-                                .take()
-                                .context("missing Metal attention values for fallback")?,
-                        );
-                        post_attention_values_for_prep = Some((out_proj_name, attention_values));
-                    } else {
-                        bail!("missing Metal executor for Metal attention values");
+                        if let Some(attention_values) = attention_values.take() {
+                            metal.recycle_attention_values(attention_values);
+                        }
                     }
+                    scheduled_cmd2.reject_missing_post_attention_prep(
+                        "Metal attention values cannot fall back to CPU post-attention prep",
+                    )?;
                 }
             }
             let active = if let Some(routing_command) = precomputed_active {

@@ -907,6 +907,16 @@ impl<TInputs> ScheduledCmd2Command<TInputs> {
         self.resolve_post_attention_prep(state)?
             .command_from_preselected_routes(graph, routes)
     }
+
+    pub(crate) fn reject_missing_post_attention_prep(&self, reason: &str) -> Result<()> {
+        bail!(
+            "FlashMoe unsupported scheduled CMD2 path: layer {} declares {} implementation '{}' but no Metal post-attention prep was submitted: {}",
+            self.layer,
+            self.cmd2.stage.stage,
+            self.cmd2.stage.implementation,
+            reason
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4537,6 +4547,34 @@ mod tests {
                 .contains("received 1 preselected experts; expected 2"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn scheduled_cmd2_rejects_missing_post_attention_prep_without_cpu_fallback() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let command = graph
+            .build_cmd2_command(
+                11,
+                4,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(4096),
+                    ScheduledCmd2ResidualInput::metal_buffer(4096),
+                ),
+            )
+            .unwrap();
+
+        let err = command
+            .reject_missing_post_attention_prep("test missing prep")
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "FlashMoe unsupported scheduled CMD2 path: layer 11 declares CMD2 post-attention and routing projection implementation"
+            ),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("test missing prep"), "{err:#}");
     }
 
     #[test]

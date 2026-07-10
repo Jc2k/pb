@@ -315,7 +315,9 @@ The validator should reject silent fallbacks such as:
   of resolving those bindings inside the legacy helper; the live scheduled prep path now requires
   those resident bindings, while optional lookup is kept only for descriptor discovery. Its resident
   execution plan now rejects mismatched attention/residual/norm shapes as unsupported
-  scheduled-CMD2 inputs instead of returning a silent no-prep result. The scheduled router score command now owns raw score
+  scheduled-CMD2 inputs instead of returning a silent no-prep result. Metal attention values that
+  cannot produce scheduled CMD2 prep now fail through the scheduled command instead of being read
+  back into CPU post-attention fallback. The scheduled router score command now owns raw score
   finalization into a declared batch, routing-output validation, and score-based topK selection
   before the runtime receives a `ScheduledRoutingCommand`. Router projection execution,
   Accelerate score production, and Metal router topK now require a weight-built declared resident
