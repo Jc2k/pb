@@ -44,8 +44,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::ptr;
-
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
@@ -105,14 +103,10 @@ use super::experts::{
 use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalBatchProjectionInput, MetalBufferPool, MetalDenseWeights,
-    MetalFusedLinearAttentionBuilder, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalMatvecTiming,
-    MetalObjcId as ObjcId, MetalPipelineNameSet, MetalPostAttentionPrep,
-    MetalQ4PostAttentionPrepBuilder, MetalQ4ProjectionBatchBuilder, MetalResidentQ4TopKBuilder,
-    MetalRuntime, MetalRuntimeCapabilities, MetalScheduledCmd3Builder,
-    MetalScheduledCmd3Submission, msg_send_id2_usize_u64, msg_send_ptr0, release, sel,
-    wrap_dense_mmap_as_metal_buffer,
+    METAL_SHADERS, MetalBatchProjectionInput, MetalExecutionContext,
+    MetalLinearAttentionStaticOffsets, MetalMatvecTiming, MetalObjcId as ObjcId,
+    MetalPipelineNameSet, MetalPostAttentionPrep, MetalRuntimeCapabilities,
+    MetalScheduledCmd3Builder, MetalScheduledCmd3Submission,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -140,9 +134,9 @@ use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCpuBuffer,
     FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoeLinearAttentionCacheState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
-    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, LinearAttentionLayout,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState, FlashMoeSessionState,
+    FlashMoeStatePlacement, FlashMoeTokenState, LinearAttentionLayout, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 #[cfg(test)]
@@ -1255,7 +1249,7 @@ where
     let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
     progress("vision_encoder", phase_started.elapsed());
     phase_started = Instant::now();
-    let metal = MetalExecutor::new(plan, &config, &runtime, &dense)?;
+    let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
     let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
@@ -1304,7 +1298,7 @@ pub struct FlashMoeEngine {
     scheduler: ExpertScheduler,
     dense: DenseStore,
     tokenizer: QwenTokenizer,
-    metal: MetalExecutor,
+    metal: MetalExecutionFacade,
     config: QwenModelConfig,
     model_layout: QwenMoeModelLayout,
     capability_plan: FlashMoeCapabilityPlan,
@@ -1733,9 +1727,9 @@ enum MropeAxis {
 }
 
 #[derive(Debug, Clone)]
-struct MetalExecutor {
+struct MetalExecutionFacade {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    inner: Arc<MetalExecutorInner>,
+    inner: Arc<MetalExecutionContext>,
 }
 
 #[derive(Debug)]
@@ -1848,7 +1842,7 @@ impl DeferredMetalInput {
     }
 }
 
-impl MetalExecutor {
+impl MetalExecutionFacade {
     fn new(
         plan: &FlashMoePlan,
         config: &QwenModelConfig,
@@ -1862,8 +1856,20 @@ impl MetalExecutor {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
+            let inner = MetalExecutionContext::compile(
+                dense.mmap.clone(),
+                dense.len,
+                &runtime.linear_attention,
+            )?;
+            tracing::info!(
+                model = %plan.model,
+                layers = config.num_hidden_layers,
+                experts = config.experts(),
+                dense_resident = inner.has_resident_dense_weights(),
+                "Flash-MoE Metal executor initialized"
+            );
             Ok(Self {
-                inner: Arc::new(MetalExecutorInner::new(plan, config, runtime, dense)?),
+                inner: Arc::new(inner),
             })
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1895,7 +1901,7 @@ impl MetalExecutor {
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.project_q4_expert(expert, hidden, width)
+            expert.project(hidden, width)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1916,13 +1922,13 @@ impl MetalExecutor {
         next_norm_weight: Option<&[f32]>,
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<MetalScheduledCmd3Submission> {
-        let dense_weights = self.inner.dense_weights.as_ref().context(
+        let dense_weights = self.inner.dense_weights().context(
             "FlashMoe unsupported scheduled CMD3 implementation: resident dense Metal weights are unavailable",
         )?;
         MetalScheduledCmd3Builder::new(
-            &self.inner.metal_runtime,
+            self.inner.runtime(),
             dense_weights,
-            Arc::clone(&self.inner.buffers),
+            Arc::clone(self.inner.buffers()),
         )
         .submit(
             position,
@@ -2091,7 +2097,7 @@ impl MetalExecutor {
     ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.q4_mmap_matvec_batch(projections, input)
+            self.inner.q4_projection_batch(projections, input)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -2108,225 +2114,7 @@ impl MetalExecutor {
         input_len: usize,
     ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
         self.inner
-            .q4_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalExecutorInner {
-    metal_runtime: MetalRuntime,
-    dense_weights: Option<MetalDenseWeights>,
-    linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
-    buffers: Arc<MetalBufferPool>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe impl Send for MetalExecutorInner {}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe impl Sync for MetalExecutorInner {}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl std::ops::Deref for MetalExecutorInner {
-    type Target = MetalRuntime;
-
-    fn deref(&self) -> &Self::Target {
-        &self.metal_runtime
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for MetalExecutorInner {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(dense_weights) = self.dense_weights.take() {
-                release(dense_weights.buffer);
-            }
-            if let Ok(linear_state) = self.linear_attention_state.get_mut() {
-                for layer in linear_state.layers.iter_mut().filter_map(Option::take) {
-                    release(layer.conv_state);
-                    release(layer.ssm_state);
-                    release(layer.conv_output);
-                    release(layer.delta_output);
-                    release(layer.g_decay);
-                    release(layer.beta_gate);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalExecutorInner {
-    fn new(
-        plan: &FlashMoePlan,
-        config: &QwenModelConfig,
-        runtime: &DenseTransformerRuntime,
-        dense: &DenseStore,
-    ) -> Result<Self> {
-        let metal_runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
-        let device = metal_runtime.device;
-        let dense_weights = wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
-
-        let linear_attention_state =
-            allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
-
-        tracing::info!(
-            model = %plan.model,
-            layers = config.num_hidden_layers,
-            experts = config.experts(),
-            dense_resident = dense_weights.is_some(),
-            "Flash-MoE Metal executor initialized"
-        );
-
-        Ok(Self {
-            metal_runtime,
-            dense_weights,
-            linear_attention_state: std::sync::Mutex::new(linear_attention_state),
-            buffers: Arc::new(MetalBufferPool::default()),
-        })
-    }
-
-    fn project_q4_expert(
-        &self,
-        expert: &ExpertWeights,
-        hidden: &[f32],
-        width: usize,
-    ) -> Result<Vec<f32>> {
-        if hidden.is_empty() || width == 0 {
-            return Ok(vec![0.0; width]);
-        }
-        expert.project(hidden, width)
-    }
-
-    fn reset_linear_attention_state(&self) {
-        let Ok(state) = self.linear_attention_state.lock() else {
-            return;
-        };
-        unsafe {
-            for layer in state.layers.iter().flatten() {
-                zero_metal_buffer(layer.conv_state, layer.conv_state_len);
-                zero_metal_buffer(layer.ssm_state, layer.ssm_state_len);
-                zero_metal_buffer(layer.conv_output, layer.conv_dim);
-                zero_metal_buffer(layer.delta_output, layer.total_value_width);
-                zero_metal_buffer(layer.g_decay, layer.num_value_heads);
-                zero_metal_buffer(layer.beta_gate, layer.num_value_heads);
-            }
-        }
-    }
-
-    fn has_resident_dense_weights(&self) -> bool {
-        self.dense_weights.is_some()
-    }
-
-    fn resident_q4_top_candidates(
-        &self,
-        projection: &DenseQ4MmapMatvecProjection,
-        input: &[f32],
-        top_k: usize,
-    ) -> Result<Vec<(usize, f32)>> {
-        let dense_weights = self.dense_weights.as_ref().context(
-            "FlashMoe unsupported resident Q4 topK path: resident dense Metal weights are unavailable",
-        )?;
-        MetalResidentQ4TopKBuilder::new(
-            self.device,
-            self.command_queue,
-            &self.pipelines,
-            dense_weights,
-            &self.buffers,
-        )
-        .execute(projection, input, top_k)
-    }
-
-    fn q4_post_attention_prep_topk(
-        &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
-        attention_output: &[f32],
-        residual: MetalBatchProjectionInput<'_>,
-        post_norm_weight: &[f32],
-    ) -> Result<MetalPostAttentionPrep> {
-        let dense_weights = self.dense_weights.as_ref().context(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
-        )?;
-        MetalQ4PostAttentionPrepBuilder::new(
-            self.device,
-            self.command_queue,
-            &self.pipelines,
-            dense_weights,
-            &self.buffers,
-        )
-        .execute(projections, attention_output, residual, post_norm_weight)
-    }
-
-    fn linear_attention_q4_post_attention_prep(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
-        residual: MetalBatchProjectionInput<'_>,
-        post_norm_weight: &[f32],
-        top_k: usize,
-    ) -> Result<MetalPostAttentionPrep> {
-        MetalFusedLinearAttentionBuilder::new(
-            &self.metal_runtime,
-            self.dense_weights.as_ref(),
-            &self.linear_attention_state,
-            &self.buffers,
-        )
-        .execute(
-            layer,
-            layout,
-            projections,
-            input,
-            static_offsets,
-            out_proj,
-            router,
-            residual,
-            post_norm_weight,
-            top_k,
-        )
-    }
-
-    fn q4_mmap_matvec_batch(
-        &self,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: &[f32],
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
-        MetalQ4ProjectionBatchBuilder::new(
-            &self.metal_runtime,
-            self.dense_weights.as_ref(),
-            &self.buffers,
-        )
-        .execute(projections, input)
-    }
-    fn q4_mmap_matvec_batch_with_input_buffer(
-        &self,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input_buffer: ObjcId,
-        input_len: usize,
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
-        MetalQ4ProjectionBatchBuilder::new(
-            &self.metal_runtime,
-            self.dense_weights.as_ref(),
-            &self.buffers,
-        )
-        .execute_with_input_buffer(projections, input_buffer, input_len)
-    }
-    unsafe fn buffer_with_len(&self, len: usize) -> Result<ObjcId> {
-        unsafe { self.buffers.buffer_with_len(self.device, len) }
-    }
-
-    unsafe fn recycle(&self, buffer: ObjcId) {
-        unsafe { self.buffers.recycle(buffer) }
-    }
-
-    fn recycle_or_release_buffers(&self, buffers: &[ObjcId], release_only: bool) {
-        self.buffers.recycle_or_release(buffers, release_only);
+            .q4_projection_batch_with_input_buffer(projections, input_buffer, input_len)
     }
 }
 
@@ -5256,181 +5044,6 @@ fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn allocate_zeroed_metal_buffer(device: ObjcId, len: usize, label: &str) -> Result<ObjcId> {
-    let len = len.max(std::mem::size_of::<f32>());
-    unsafe {
-        let buffer = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
-        if buffer.is_null() {
-            bail!("failed to allocate Flash-MoE Metal {label} buffer ({len} bytes)");
-        }
-        let contents = msg_send_ptr0(buffer, sel("contents"));
-        ptr::write_bytes(contents.cast::<u8>(), 0, len);
-        Ok(buffer)
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn zero_metal_buffer(buffer: ObjcId, f32_len: usize) {
-    unsafe {
-        let contents = msg_send_ptr0(buffer, sel("contents"));
-        ptr::write_bytes(
-            contents.cast::<u8>(),
-            0,
-            f32_len.saturating_mul(std::mem::size_of::<f32>()),
-        );
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn allocate_metal_linear_attention_state(
-    device: ObjcId,
-    layouts: &[Option<LinearAttentionLayout>],
-) -> Result<MetalLinearAttentionStateCache> {
-    let mut layers = Vec::with_capacity(layouts.len());
-    for (layer, layout) in layouts.iter().copied().enumerate() {
-        let Some(layout) = layout else {
-            layers.push(None);
-            continue;
-        };
-        let conv_state_len = layout.conv_state_len();
-        let ssm_state_len = layout.ssm_state_len();
-        let state = FlashMoeLinearAttentionCacheState::gpu_resident(
-            layer,
-            conv_state_len,
-            ssm_state_len,
-            layout.conv_dim,
-            layout.total_value_width,
-        );
-        if state.layer() != layer {
-            bail!(
-                "FlashMoe Metal linear-attention cache state layer {} does not match allocation layer {layer}",
-                state.layer()
-            );
-        }
-        if !state.is_declared_graph_state() {
-            bail!("FlashMoe Metal linear-attention cache state is not declared graph state");
-        }
-        let conv_state = allocate_zeroed_metal_buffer(
-            device,
-            state
-                .conv_state_len()
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear conv state",
-        )
-        .with_context(|| {
-            format!("failed to allocate linear-attention conv state for layer {layer}")
-        })?;
-        let ssm_state = match allocate_zeroed_metal_buffer(
-            device,
-            state
-                .ssm_state_len()
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear SSM state",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                unsafe { release(conv_state) };
-                return Err(error).with_context(|| {
-                    format!("failed to allocate linear-attention SSM state for layer {layer}")
-                });
-            }
-        };
-        let conv_output = match allocate_zeroed_metal_buffer(
-            device,
-            state
-                .conv_output_len()
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear conv output",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                unsafe {
-                    release(conv_state);
-                    release(ssm_state);
-                }
-                return Err(error).with_context(|| {
-                    format!("failed to allocate linear-attention conv output for layer {layer}")
-                });
-            }
-        };
-        let delta_output = match allocate_zeroed_metal_buffer(
-            device,
-            state
-                .output_len()
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear delta output",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                unsafe {
-                    release(conv_state);
-                    release(ssm_state);
-                    release(conv_output);
-                }
-                return Err(error).with_context(|| {
-                    format!("failed to allocate linear-attention delta output for layer {layer}")
-                });
-            }
-        };
-        let g_decay = match allocate_zeroed_metal_buffer(
-            device,
-            layout
-                .num_value_heads
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear decay",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                unsafe {
-                    release(conv_state);
-                    release(ssm_state);
-                    release(conv_output);
-                    release(delta_output);
-                }
-                return Err(error).with_context(|| {
-                    format!("failed to allocate linear-attention decay state for layer {layer}")
-                });
-            }
-        };
-        let beta_gate = match allocate_zeroed_metal_buffer(
-            device,
-            layout
-                .num_value_heads
-                .saturating_mul(std::mem::size_of::<f32>()),
-            "linear beta gate",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                unsafe {
-                    release(conv_state);
-                    release(ssm_state);
-                    release(conv_output);
-                    release(delta_output);
-                    release(g_decay);
-                }
-                return Err(error).with_context(|| {
-                    format!("failed to allocate linear-attention beta gate for layer {layer}")
-                });
-            }
-        };
-        layers.push(Some(MetalLinearAttentionLayerState::new(
-            conv_state,
-            ssm_state,
-            conv_output,
-            delta_output,
-            g_decay,
-            beta_gate,
-            conv_state_len,
-            ssm_state_len,
-            layout.conv_dim,
-            layout.total_value_width,
-            layout.num_value_heads,
-        )));
-    }
-    Ok(MetalLinearAttentionStateCache::new(layers))
-}
-
 fn causal_attention(
     q: &[f32],
     keys_values: &[(&[f32], &[f32])],
@@ -7942,7 +7555,7 @@ impl DenseStore {
 
     fn project_with_metal(
         &self,
-        metal: Option<&MetalExecutor>,
+        metal: Option<&MetalExecutionFacade>,
         layer: usize,
         name: &str,
         input: &[f32],
@@ -7963,7 +7576,7 @@ impl DenseStore {
     }
     fn project_q4_tensors_from_cpu_input(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         specs: &[DenseProjectionRequest<'_>],
         input: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
@@ -8067,7 +7680,7 @@ impl DenseStore {
     #[allow(clippy::too_many_arguments)]
     fn linear_attention_q4_post_attention_prep_with_metal(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         layer: usize,
         layout: LinearAttentionLayout,
         input_specs: &[DenseProjectionRequest<'_>],
@@ -8137,7 +7750,7 @@ impl DenseStore {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn project_q4_tensors_from_metal_input(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         specs: &[DenseProjectionRequest<'_>],
         input_buffer: ObjcId,
         input_len: usize,
@@ -8176,7 +7789,7 @@ impl DenseStore {
     /// the feature is disabled for this model variant).
     fn project_dense_tensor_with_metal(
         &self,
-        metal: Option<&MetalExecutor>,
+        metal: Option<&MetalExecutionFacade>,
         tensor_name: &str,
         input: &[f32],
         output_width: usize,
@@ -8258,7 +7871,7 @@ impl DenseStore {
 
     fn router_command_with_metal(
         &self,
-        metal: Option<&MetalExecutor>,
+        metal: Option<&MetalExecutionFacade>,
         command: ScheduledRouterScoreProjectionCommand,
         hidden: &[f32],
     ) -> Result<ScheduledRoutingCommand> {
@@ -8355,7 +7968,7 @@ impl DenseStore {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn post_attention_q4_prep_with_metal(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         layer: usize,
         experts: usize,
         out_proj_name: &str,
@@ -8391,7 +8004,7 @@ impl DenseStore {
 
     fn router_topk_with_metal(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         layer: usize,
         experts: usize,
         hidden: &[f32],
@@ -8437,7 +8050,7 @@ impl DenseStore {
 
     fn lm_head_logits_with_metal(
         &self,
-        metal: Option<&MetalExecutor>,
+        metal: Option<&MetalExecutionFacade>,
         _state: u64,
         hidden: &[f32],
         tokenizer: &QwenTokenizer,
@@ -8470,7 +8083,7 @@ impl DenseStore {
 
     fn lm_head_top_candidates_with_metal(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         hidden: &[f32],
         tokenizer: &QwenTokenizer,
         sampler: &TokenSampler,
@@ -8638,7 +8251,7 @@ impl DenseStore {
 
     fn metal_matvec_tiled(
         &self,
-        metal: &MetalExecutor,
+        metal: &MetalExecutionFacade,
         canonical_name: &str,
         input: &[f32],
         rows: usize,
@@ -13788,14 +13401,18 @@ mod tests {
         #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
         fn arm_macos_compiles_flashmoe_metal_kernels() {
             let temp = tempfile::tempdir().unwrap();
-            let plan = plan_unchecked(QWEN35_MODEL, temp.path());
             let config: QwenModelConfig = serde_json::from_slice(
                 br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
             )
             .unwrap();
             let runtime = DenseTransformerRuntime::new(&config);
             let dense = tiny_dense_store(temp.path());
-            let _executor = MetalExecutorInner::new(&plan, &config, &runtime, &dense).unwrap();
+            let _executor = MetalExecutionContext::compile(
+                dense.mmap.clone(),
+                dense.len,
+                &runtime.linear_attention,
+            )
+            .unwrap();
         }
 
         #[test]
@@ -18255,7 +17872,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
+        let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
         let input: Vec<f32> = (0..cols)
             .map(|idx| ((idx as f32) * 0.11).cos() - 0.1875)
             .collect();
@@ -18419,7 +18036,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
+        let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
 
         let attention_output: Vec<f32> = (0..attention_width)
             .map(|idx| ((idx as f32) * 0.11).sin() - 0.375)
@@ -18521,27 +18138,23 @@ mod tests {
         assert_eq!(attached, routing_command);
         assert_eq!(prep.routing_command(), Some(&routing_command));
 
-        unsafe {
-            let residual_ptr = msg_send_ptr0(prep.residual_buffer, sel("contents")).cast::<f32>();
-            let normed_ptr = msg_send_ptr0(prep.normed_buffer, sel("contents")).cast::<f32>();
-            let actual_residual = std::slice::from_raw_parts(residual_ptr, width);
-            let actual_normed = std::slice::from_raw_parts(normed_ptr, width);
-            for idx in 0..width {
-                assert!(
-                    (actual_residual[idx] - expected_residual[idx]).abs() <= 1e-4,
-                    "residual[{idx}] diverged: actual={} expected={}",
-                    actual_residual[idx],
-                    expected_residual[idx]
-                );
-                assert!(
-                    (actual_normed[idx] - expected_normed[idx]).abs() <= 1e-4,
-                    "normed[{idx}] diverged: actual={} expected={}",
-                    actual_normed[idx],
-                    expected_normed[idx]
-                );
-            }
-            metal.inner.recycle(prep.residual_buffer);
-            metal.inner.recycle(prep.normed_buffer);
+        let actual_residual = metal
+            .inner
+            .read_and_recycle_f32(prep.residual_buffer, width);
+        let actual_normed = metal.inner.read_and_recycle_f32(prep.normed_buffer, width);
+        for idx in 0..width {
+            assert!(
+                (actual_residual[idx] - expected_residual[idx]).abs() <= 1e-4,
+                "residual[{idx}] diverged: actual={} expected={}",
+                actual_residual[idx],
+                expected_residual[idx]
+            );
+            assert!(
+                (actual_normed[idx] - expected_normed[idx]).abs() <= 1e-4,
+                "normed[{idx}] diverged: actual={} expected={}",
+                actual_normed[idx],
+                expected_normed[idx]
+            );
         }
     }
 

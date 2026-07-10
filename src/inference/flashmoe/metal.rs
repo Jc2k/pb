@@ -28,8 +28,8 @@ use super::scheduler::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
-    FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoePostAttentionPrepState,
-    LinearAttentionLayout,
+    FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeLinearAttentionCacheState,
+    FlashMoePostAttentionPrepState, LinearAttentionLayout,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
@@ -802,6 +802,196 @@ impl Drop for MetalRuntime {
             self.pipelines.release_with(|pipeline| release(pipeline));
             release(self.command_queue);
             release(self.device);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalExecutionContext {
+    runtime: MetalRuntime,
+    dense_weights: Option<MetalDenseWeights>,
+    linear_attention_state: Mutex<MetalLinearAttentionStateCache>,
+    buffers: Arc<MetalBufferPool>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for MetalExecutionContext {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for MetalExecutionContext {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalExecutionContext {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(dense_weights) = self.dense_weights.take() {
+                release(dense_weights.buffer);
+            }
+            if let Ok(linear_state) = self.linear_attention_state.get_mut() {
+                release_linear_attention_state(linear_state);
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalExecutionContext {
+    pub(crate) fn compile(
+        dense_mmap: Arc<memmap2::Mmap>,
+        dense_len: u64,
+        linear_layouts: &[Option<LinearAttentionLayout>],
+    ) -> anyhow::Result<Self> {
+        let runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
+        let dense_weights = wrap_dense_mmap_as_metal_buffer(runtime.device, dense_mmap, dense_len)?;
+        let linear_attention_state =
+            allocate_linear_attention_state(runtime.device, linear_layouts)?;
+        Ok(Self {
+            runtime,
+            dense_weights,
+            linear_attention_state: Mutex::new(linear_attention_state),
+            buffers: Arc::new(MetalBufferPool::default()),
+        })
+    }
+
+    pub(crate) fn runtime(&self) -> &MetalRuntime {
+        &self.runtime
+    }
+
+    pub(crate) fn dense_weights(&self) -> Option<&MetalDenseWeights> {
+        self.dense_weights.as_ref()
+    }
+
+    pub(crate) fn buffers(&self) -> &Arc<MetalBufferPool> {
+        &self.buffers
+    }
+
+    pub(crate) fn has_resident_dense_weights(&self) -> bool {
+        self.dense_weights.is_some()
+    }
+
+    pub(crate) fn reset_linear_attention_state(&self) {
+        let Ok(state) = self.linear_attention_state.lock() else {
+            return;
+        };
+        unsafe {
+            for layer in state.layers.iter().flatten() {
+                zero_buffer(layer.conv_state, layer.conv_state_len);
+                zero_buffer(layer.ssm_state, layer.ssm_state_len);
+                zero_buffer(layer.conv_output, layer.conv_dim);
+                zero_buffer(layer.delta_output, layer.total_value_width);
+                zero_buffer(layer.g_decay, layer.num_value_heads);
+                zero_buffer(layer.beta_gate, layer.num_value_heads);
+            }
+        }
+    }
+
+    pub(crate) fn resident_q4_top_candidates(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        input: &[f32],
+        top_k: usize,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported resident Q4 topK path: resident dense Metal weights are unavailable",
+        )?;
+        MetalResidentQ4TopKBuilder::new(
+            self.runtime.device,
+            self.runtime.command_queue,
+            &self.runtime.pipelines,
+            dense_weights,
+            &self.buffers,
+        )
+        .execute(projection, input, top_k)
+    }
+
+    pub(crate) fn q4_post_attention_prep_topk(
+        &self,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
+        attention_output: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+    ) -> anyhow::Result<MetalPostAttentionPrep> {
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
+        )?;
+        MetalQ4PostAttentionPrepBuilder::new(
+            self.runtime.device,
+            self.runtime.command_queue,
+            &self.runtime.pipelines,
+            dense_weights,
+            &self.buffers,
+        )
+        .execute(projections, attention_output, residual, post_norm_weight)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_attention_q4_post_attention_prep(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> anyhow::Result<MetalPostAttentionPrep> {
+        MetalFusedLinearAttentionBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.linear_attention_state,
+            &self.buffers,
+        )
+        .execute(
+            layer,
+            layout,
+            projections,
+            input,
+            static_offsets,
+            out_proj,
+            router,
+            residual,
+            post_norm_weight,
+            top_k,
+        )
+    }
+
+    pub(crate) fn q4_projection_batch(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: &[f32],
+    ) -> anyhow::Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        MetalQ4ProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute(projections, input)
+    }
+
+    pub(crate) fn q4_projection_batch_with_input_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input_buffer: MetalObjcId,
+        input_len: usize,
+    ) -> anyhow::Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        MetalQ4ProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_with_input_buffer(projections, input_buffer, input_len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_and_recycle_f32(&self, buffer: MetalObjcId, len: usize) -> Vec<f32> {
+        unsafe {
+            let values = read_f32_buffer(buffer, len);
+            self.buffers.recycle(buffer);
+            values
         }
     }
 }
@@ -4319,6 +4509,137 @@ pub(crate) fn wrap_dense_mmap_as_metal_buffer(
         }
         Ok(Some(MetalDenseWeights::new(buffer, mmap, len)))
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn allocate_zeroed_buffer(
+    device: MetalObjcId,
+    len: usize,
+    label: &str,
+) -> anyhow::Result<MetalObjcId> {
+    let len = len.max(std::mem::size_of::<f32>());
+    unsafe {
+        let buffer = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
+        if buffer.is_null() {
+            anyhow::bail!("failed to allocate Flash-MoE Metal {label} buffer ({len} bytes)");
+        }
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        ptr::write_bytes(contents.cast::<u8>(), 0, len);
+        Ok(buffer)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn zero_buffer(buffer: MetalObjcId, f32_len: usize) {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        ptr::write_bytes(
+            contents.cast::<u8>(),
+            0,
+            f32_len.saturating_mul(std::mem::size_of::<f32>()),
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn release_linear_attention_layer(layer: &MetalLinearAttentionLayerState) {
+    unsafe {
+        release(layer.conv_state);
+        release(layer.ssm_state);
+        release(layer.conv_output);
+        release(layer.delta_output);
+        release(layer.g_decay);
+        release(layer.beta_gate);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn release_linear_attention_state(state: &mut MetalLinearAttentionStateCache) {
+    unsafe {
+        for layer in state.layers.iter_mut().filter_map(Option::take) {
+            release_linear_attention_layer(&layer);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn allocate_linear_attention_state(
+    device: MetalObjcId,
+    layouts: &[Option<LinearAttentionLayout>],
+) -> anyhow::Result<MetalLinearAttentionStateCache> {
+    let mut cache = MetalLinearAttentionStateCache::new(Vec::with_capacity(layouts.len()));
+    for (layer, layout) in layouts.iter().copied().enumerate() {
+        let Some(layout) = layout else {
+            cache.layers.push(None);
+            continue;
+        };
+        let state = FlashMoeLinearAttentionCacheState::gpu_resident(
+            layer,
+            layout.conv_state_len(),
+            layout.ssm_state_len(),
+            layout.conv_dim,
+            layout.total_value_width,
+        );
+        if state.layer() != layer || !state.is_declared_graph_state() {
+            unsafe { release_linear_attention_state(&mut cache) };
+            anyhow::bail!(
+                "FlashMoe Metal linear-attention cache state for layer {layer} is not declared graph state"
+            );
+        }
+
+        let allocation = (|| -> anyhow::Result<MetalLinearAttentionLayerState> {
+            let mut owned = Vec::with_capacity(6);
+            let mut allocate = |len: usize, label: &str| -> anyhow::Result<MetalObjcId> {
+                match allocate_zeroed_buffer(
+                    device,
+                    len.saturating_mul(std::mem::size_of::<f32>()),
+                    label,
+                ) {
+                    Ok(buffer) => {
+                        owned.push(buffer);
+                        Ok(buffer)
+                    }
+                    Err(error) => {
+                        unsafe {
+                            for buffer in owned.drain(..) {
+                                release(buffer);
+                            }
+                        }
+                        Err(error)
+                    }
+                }
+            };
+            let conv_state = allocate(state.conv_state_len(), "linear conv state")?;
+            let ssm_state = allocate(state.ssm_state_len(), "linear SSM state")?;
+            let conv_output = allocate(state.conv_output_len(), "linear conv output")?;
+            let delta_output = allocate(state.output_len(), "linear delta output")?;
+            let g_decay = allocate(layout.num_value_heads, "linear decay")?;
+            let beta_gate = allocate(layout.num_value_heads, "linear beta gate")?;
+            Ok(MetalLinearAttentionLayerState::new(
+                conv_state,
+                ssm_state,
+                conv_output,
+                delta_output,
+                g_decay,
+                beta_gate,
+                state.conv_state_len(),
+                state.ssm_state_len(),
+                layout.conv_dim,
+                layout.total_value_width,
+                layout.num_value_heads,
+            ))
+        })();
+        match allocation {
+            Ok(state) => cache.layers.push(Some(state)),
+            Err(error) => {
+                unsafe { release_linear_attention_state(&mut cache) };
+                return Err(error).with_context(|| {
+                    format!("failed to allocate linear-attention state for layer {layer}")
+                });
+            }
+        }
+    }
+    Ok(cache)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -170,10 +170,10 @@ Baseline reviewed on 2026-07-10:
   projection/state widths, encodes output projection, residual-add/RMS norm, and router projection
   in one command, performs declared CPU top-k readback, and returns GPU-resident residual/normed
   state. `legacy.rs` now only invokes this concrete builder for that stage.
-- `MetalRuntime` now owns device discovery, shader-library compilation, the command queue, every
-  required pipeline, partial-construction cleanup, and final release. `MetalExecutorInner` borrows
-  that runtime through dereference; `legacy.rs` no longer compiles or releases Metal pipelines,
-  queues, or devices.
+- `MetalRuntime` owns device discovery, shader-library compilation, the command queue, every
+  required pipeline, partial-construction cleanup, and final release. `MetalExecutionContext`
+  owns that runtime together with resident dense and recurrent state; `legacy.rs` no longer
+  compiles or releases Metal pipelines, queues, devices, or buffers.
 - Production scheduled CMD3 now consumes typed GPU-resident post-attention state, scheduler-owned
   whole-expert slots, resident-Q4 shared projections, routing weights, and typed output state in a
   single `MetalScheduledCmd3Builder`. Its submitted result owns the command buffer, slot leases,
@@ -198,8 +198,11 @@ Baseline reviewed on 2026-07-10:
   batches. The packed/component upload retry, direct single-mmap encoder, and their tests have been
   removed. The unused application-owned F32 LM-head buffer cache and command were also deleted;
   sampling has only the resolved resident-Q4 topK builder. As a result, `legacy.rs` no longer
-  creates command buffers or encoders, dispatches pipelines, or waits for Metal commands. Gate 2
-  still needs to move `MetalExecutorInner` and recurrent buffer allocation/lifetime ownership.
+  creates command buffers or encoders, dispatches pipelines, or waits for Metal commands.
+- `MetalExecutionContext` now owns runtime compilation, device/queue/pipelines, resident mmap
+  binding, recurrent-state allocation/reset/release, and the reusable buffer pool. The former
+  `MetalExecutorInner` and all recurrent Obj-C lifecycle helpers have left `legacy.rs`; its
+  `MetalExecutionFacade` only validates construction policy and calls typed Metal APIs.
 - `MetalQ4ProjectionBatchBuilder` now owns the resident-Q4 projection batch used by full-attention
   CMD1 and deferred state: CPU or GPU input binding, fused compatible-projection dispatch,
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
@@ -219,9 +222,10 @@ Baseline reviewed on 2026-07-10:
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
   scheduled graph only after those concrete facts resolve.
-- A production `FlashMoeEngine` now owns a required `MetalExecutor`. Metal-disabled and non-Apple
-  construction fail explicitly, so a graph that selects required Metal stages cannot be represented
-  by an engine with an absent executor.
+- A production `FlashMoeEngine` now owns a required `MetalExecutionFacade` backed by a
+  Metal-owned `MetalExecutionContext`. Metal-disabled and non-Apple construction fail explicitly,
+  so a graph that selects required Metal stages cannot be represented by an engine with an absent
+  executor.
 - Scheduler-owned Q4 CMD3 payloads now validate BF16 scale/bias layout and aligned gate/up/down
   views into one whole-expert slot before encoding. The active-expert encoder has one fused
   whole-slot implementation; its component-upload and unfused SwiGLU substitution have been
@@ -244,22 +248,21 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- `legacy.rs` remains the production center of gravity and is larger than when this plan began.
+- `legacy.rs` remains the production center of gravity for generation and the layer loop.
 - `FlashMoeScheduledGraph` validates stage descriptors but does not own the complete per-layer
   execution lifecycle.
-- `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
-  `VisionEncoder` remain in `legacy.rs`.
-- Concrete encoders in `legacy.rs` still call the low-level Metal substrate directly. Gate 2 must
-  move those callers and executor ownership behind typed builders before the substrate can become
-  private to `metal.rs`.
+- `forward_hidden`, `DenseStore`, CPU KV/session caches, and `VisionEncoder` remain in `legacy.rs`.
+- The legacy Metal facade still appears at production call sites; Gate 3 must move layer sequencing
+  into a scheduler-owned runtime that consumes only typed stage APIs.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this checkpoint, Gate 1 concrete graph resolution is complete. Execution ownership remains in
-`legacy.rs`, so approximately 45-55% of the architectural work remains.
+At this checkpoint, Gates 1 and 2 are complete. Layer lifecycle, weights/state ownership, parity
+closure, additional variants, and final legacy removal remain, so approximately 35-45% of the
+architectural work remains.
 
 ## Completion Gates
 
@@ -269,8 +272,8 @@ exit criteria hold in production code and tests.
 | Gate | Status | Architectural result |
 | --- | --- | --- |
 | 1. Concrete Graph Resolution | Complete | Support is resolved from the real model and device. |
-| 2. Concrete Metal Builders | Active | Metal command execution is owned by `metal`. |
-| 3. Scheduler-Owned Runtime | Pending | The scheduler executes the layer lifecycle. |
+| 2. Concrete Metal Builders | Complete | Metal command execution is owned by `metal`. |
+| 3. Scheduler-Owned Runtime | Active | The scheduler executes the layer lifecycle. |
 | 4. Weights And State Ownership | Pending | Runtime storage and state have single owners. |
 | 5. Qwen3.5 Q4 Correctness Closure | Pending | The first production graph has parity evidence. |
 | 6. Unified Variant Implementations | Pending | Other variants use the same graph/runtime. |
@@ -332,6 +335,18 @@ Exit criteria:
 - Runtime code cannot call low-level `encode_*` helpers.
 - CMD1/CMD2/CMD3 builder tests cover bindings, state transitions, command topology, and missing
   implementation errors.
+
+Completion evidence:
+
+- `MetalExecutionContext` is the sole production owner of the Metal runtime, resident dense
+  binding, reusable buffers, and GPU recurrent-state lifecycle.
+- Concrete resident-Q4 projection/topK, fused CMD1/recurrent/CMD2, Q4 post-attention CMD2, and
+  whole-slot CMD3 builders own command creation, encoding, submission, waits, and cleanup.
+- Undeclared Metal KV, RoPE/RMS, dense F32/BF16, component/upload Q4, split recurrence, and F32
+  LM-head cache paths have been deleted rather than retained as fallbacks.
+- Source audits show no command encoder, pipeline dispatch, Obj-C lifecycle, command wait, or
+  low-level Metal encode call in production `legacy.rs`; focused builder tests, all-target tests,
+  release build, and the required smoke provide checkpoint verification.
 
 ### Gate 3: Scheduler-Owned Runtime
 
@@ -515,7 +530,7 @@ Use this prompt for implementation work:
 ```text
 Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
 
-Active gate: Gate 2, Concrete Metal Builders.
+Active gate: Gate 3, Scheduler-Owned Runtime.
 
 Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
 the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
@@ -532,20 +547,19 @@ North star:
 - No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
   the benchmark lock opens.
 
-For Gate 2:
-1. Move `MetalExecutor`, `MetalExecutorInner`, device/queue/pipeline ownership, Obj-C buffer
-   lifetime, reusable buffers, command commit/wait, and failure cleanup from `legacy.rs` to
-   `metal.rs` in coherent command-builder slices.
-2. Move complete CMD1 projection/attention-state encoders, fused CMD2 post-attention/routing
-   encoders, fused whole-slot CMD3 encoders, and resident Q4 LM-head builders behind concrete typed
-   `metal` APIs selected by the resolved graph.
-3. Make builders consume typed state plus resident weight/expert handles and return submitted or
-   deferred typed state. The runtime and scheduler must not call low-level `encode_*`, Obj-C, or
-   pipeline helpers.
-4. Delete obsolete CPU-upload, component-upload, fused/unfused, alternate wait, and optional Metal
-   builder paths as their concrete replacements take production ownership.
-5. Keep `legacy.rs` as a shrinking call-through facade during extraction; do not move descriptors
-   without the command execution and live caller that use them.
+For Gate 3:
+1. Create `runtime.rs` and move `forward_hidden` plus the model-family-agnostic token/layer
+   lifecycle out of `legacy.rs` in coherent slices.
+2. Give one scheduler-owned per-layer API responsibility for previous deferred CMD3 handoff, CMD1
+   input/state resolution, declared attention placement, CMD2, routing, expert issue/finish, CMD3
+   submission, and deferred output handoff.
+3. Move production sequencing call sites with their state transitions; do not create another helper
+   layer that leaves `forward_hidden` as the real owner.
+4. Remove runtime branches on family, dtype, optional Metal, or implementation availability. The
+   resolved graph and typed stage inputs select implementations; missing support is an explicit
+   capability error.
+5. Keep tokenizer, prompt rendering, sampling, and model-specific input adaptation outside the hot
+   layer runtime. Qwen-VL remains an unresolved pre-MoE adapter, not a branch in the layer loop.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -558,7 +572,7 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 2 is a checkpoint, not the end of the goal. When every Gate 2 exit criterion is proven, update
-the gate status and this prompt to Gate 3 in the same semantic commit, then continue implementing
+Gate 3 is a checkpoint, not the end of the goal. When every Gate 3 exit criterion is proven, update
+the gate status and this prompt to Gate 4 in the same semantic commit, then continue implementing
 the plan. Do not mark the overall goal complete until Gate 7 is complete.
 ```
