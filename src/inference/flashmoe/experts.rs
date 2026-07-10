@@ -1026,6 +1026,83 @@ pub(crate) fn validate_direct_expert_tensor_group<T: AggregateExpertTensor>(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeQ4SliceByteRanges {
+    pub(crate) packed_offset: usize,
+    pub(crate) packed_bytes: usize,
+    pub(crate) scale_bias_offset: usize,
+    pub(crate) scale_bias_bytes: usize,
+    pub(crate) groups: usize,
+}
+
+pub(crate) fn native_q4_slice_byte_ranges<T: AggregateExpertTensor>(
+    source: &T,
+    shape: &[usize],
+    scale_bias_dtype: &str,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<NativeQ4SliceByteRanges> {
+    let source_shape = source.aggregate_tensor_shape();
+    if source_shape.len() < 2 {
+        bail!(
+            "native q4 expert tensor {} has invalid logical shape {:?}",
+            source.aggregate_tensor_name(),
+            source_shape
+        );
+    }
+    let cols = source_shape.last().copied().unwrap_or(0);
+    if cols == 0 || element_offset % cols != 0 || element_count % cols != 0 {
+        bail!(
+            "native q4 expert tensor {} slice {element_offset}..{} is not aligned to {cols} columns",
+            source.aggregate_tensor_name(),
+            element_offset.saturating_add(element_count)
+        );
+    }
+    let slice_rows = element_count / cols;
+    let expected_rows =
+        shape[..shape.len().saturating_sub(1)]
+            .iter()
+            .try_fold(1usize, |acc, dim| {
+                acc.checked_mul(*dim)
+                    .context("native q4 expert slice row count overflow")
+            })?;
+    if shape.last().copied() != Some(cols) || expected_rows != slice_rows {
+        bail!(
+            "native q4 expert tensor {} slice shape {:?} does not match {slice_rows} rows x {cols} cols",
+            source.aggregate_tensor_name(),
+            shape
+        );
+    }
+
+    let scale_bias_width = expert_scale_bias_dtype_size(scale_bias_dtype)?;
+    let row_packed_bytes = cols.div_ceil(2);
+    let groups_per_row = cols.div_ceil(GROUP_SIZE);
+    let row_start = element_offset / cols;
+    let packed_offset = row_start
+        .checked_mul(row_packed_bytes)
+        .context("native q4 expert packed byte offset overflow")?;
+    let scale_bias_offset = row_start
+        .checked_mul(groups_per_row)
+        .and_then(|groups| groups.checked_mul(scale_bias_width))
+        .context("native q4 expert scale/bias byte offset overflow")?;
+    let packed_bytes = slice_rows
+        .checked_mul(row_packed_bytes)
+        .context("native q4 expert packed byte count overflow")?;
+    let groups = slice_rows
+        .checked_mul(groups_per_row)
+        .context("native q4 expert group count overflow")?;
+    let scale_bias_bytes = groups
+        .checked_mul(scale_bias_width)
+        .context("native q4 expert scale/bias byte count overflow")?;
+    Ok(NativeQ4SliceByteRanges {
+        packed_offset,
+        packed_bytes,
+        scale_bias_offset,
+        scale_bias_bytes,
+        groups,
+    })
+}
+
 fn validate_direct_expert_matrix_shape<T: AggregateExpertTensor>(
     tensor: &T,
     expected: &[usize; 2],
@@ -3298,6 +3375,50 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("expected [2, 3] for up_proj.weight")
+        );
+    }
+
+    #[test]
+    fn native_q4_slice_byte_ranges_plan_row_aligned_slices() {
+        let source = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.gate_up_proj.weight",
+            shape: vec![4, 8],
+            native_q4: true,
+        };
+        let ranges = native_q4_slice_byte_ranges(&source, &[2, 8], "BF16", 8, 16).unwrap();
+
+        assert_eq!(
+            ranges,
+            NativeQ4SliceByteRanges {
+                packed_offset: 4,
+                packed_bytes: 8,
+                scale_bias_offset: 2,
+                scale_bias_bytes: 4,
+                groups: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn native_q4_slice_byte_ranges_reject_unaligned_or_mismatched_slices() {
+        let source = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.gate_up_proj.weight",
+            shape: vec![4, 8],
+            native_q4: true,
+        };
+
+        let unaligned = native_q4_slice_byte_ranges(&source, &[1, 8], "BF16", 1, 8).unwrap_err();
+        assert!(
+            unaligned
+                .to_string()
+                .contains("is not aligned to 8 columns")
+        );
+
+        let mismatch = native_q4_slice_byte_ranges(&source, &[3, 8], "BF16", 8, 16).unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("slice shape [3, 8] does not match 2 rows x 8 cols")
         );
     }
 

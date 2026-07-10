@@ -84,10 +84,10 @@ use super::experts::{
     build_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
     cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
     first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
-    fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
-    q4_record_layout_for_shape, rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4,
-    single_aggregate_expert_tensor, validate_aggregate_expert_tensor_shape,
-    validate_direct_expert_tensor_group,
+    fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
+    pbq4_expert_pack_wire_size, q4_record_layout_for_shape, rewrite_expert_layer_pack,
+    rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
+    validate_aggregate_expert_tensor_shape, validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
 use super::experts::{
@@ -22253,73 +22253,6 @@ fn native_q4_expert_record_input(
         bias_bytes,
         groups: slice.groups,
         scale_bias_dtype: q4_sources.scale_bias_dtype.clone(),
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NativeQ4SliceByteRanges {
-    packed_offset: usize,
-    packed_bytes: usize,
-    scale_bias_offset: usize,
-    scale_bias_bytes: usize,
-    groups: usize,
-}
-
-fn native_q4_slice_byte_ranges(
-    source: &ExpertTensorRef,
-    shape: &[usize],
-    scale_bias_dtype: &str,
-    element_offset: usize,
-    element_count: usize,
-) -> Result<NativeQ4SliceByteRanges> {
-    if source.shape.len() < 2 {
-        bail!(
-            "native q4 expert tensor {} has invalid logical shape {:?}",
-            source.tensor,
-            source.shape
-        );
-    }
-    let cols = source.shape.last().copied().unwrap_or(0);
-    if cols == 0 || element_offset % cols != 0 || element_count % cols != 0 {
-        bail!(
-            "native q4 expert tensor {} slice {element_offset}..{} is not aligned to {cols} columns",
-            source.tensor,
-            element_offset.saturating_add(element_count)
-        );
-    }
-    let slice_rows = element_count / cols;
-    let expected_rows =
-        shape[..shape.len().saturating_sub(1)]
-            .iter()
-            .try_fold(1usize, |acc, dim| {
-                acc.checked_mul(*dim)
-                    .context("native q4 expert slice row count overflow")
-            })?;
-    if shape.last().copied() != Some(cols) || expected_rows != slice_rows {
-        bail!(
-            "native q4 expert tensor {} slice shape {:?} does not match {slice_rows} rows x {cols} cols",
-            source.tensor,
-            shape
-        );
-    }
-
-    let source_layout =
-        dense_q4_layout_with_scale_bias_dtype(&source.shape, GROUP_SIZE, scale_bias_dtype)?;
-    let slice_layout = dense_q4_layout_with_scale_bias_dtype(shape, GROUP_SIZE, scale_bias_dtype)?;
-    let row_start = element_offset / cols;
-    let packed_offset = row_start
-        .checked_mul(source_layout.row_packed_bytes)
-        .context("native q4 expert packed byte offset overflow")?;
-    let scale_bias_offset = row_start
-        .checked_mul(source_layout.groups_per_row)
-        .and_then(|groups| groups.checked_mul(source_layout.scale_bias_bytes))
-        .context("native q4 expert scale/bias byte offset overflow")?;
-    Ok(NativeQ4SliceByteRanges {
-        packed_offset,
-        packed_bytes: slice_layout.packed_bytes,
-        scale_bias_offset,
-        scale_bias_bytes: slice_layout.scales_bytes,
-        groups: slice_layout.rows * slice_layout.groups_per_row,
     })
 }
 
