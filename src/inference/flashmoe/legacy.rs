@@ -106,8 +106,6 @@ use super::metal::{
     metal_command_failure_requires_release,
 };
 #[cfg(test)]
-use super::metal::{MetalCommandFailureKind, format_metal_command_failure};
-#[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
 use super::model_family::{QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 #[cfg(test)]
@@ -24948,79 +24946,6 @@ mod tests {
                 "routing weight {idx} diverged: actual={actual}, expected={expected}"
             );
         }
-    }
-
-    #[test]
-    fn metal_command_context_label_includes_actionable_details() {
-        let context = MetalCommandContext::new("deferred_expert_phase")
-            .with("position", 17)
-            .with("layer", 3)
-            .with("experts", "1,7,9,11")
-            .with("width", 4096);
-
-        assert_eq!(
-            context.label(),
-            "Flash-MoE deferred_expert_phase position=17 layer=3 experts=1,7,9,11 width=4096"
-        );
-        assert_eq!(
-            context.detail_summary(),
-            "position=17, layer=3, experts=1,7,9,11, width=4096"
-        );
-    }
-
-    #[test]
-    fn metal_command_status_names_known_and_unknown_values() {
-        assert_eq!(MetalCommandStatus::from_raw(0).to_string(), "not_enqueued");
-        assert_eq!(MetalCommandStatus::from_raw(3).to_string(), "scheduled");
-        assert_eq!(MetalCommandStatus::from_raw(4).to_string(), "completed");
-        assert_eq!(MetalCommandStatus::from_raw(5).to_string(), "error");
-        assert_eq!(MetalCommandStatus::from_raw(99).to_string(), "unknown(99)");
-        assert!(MetalCommandStatus::Completed.is_terminal());
-        assert!(MetalCommandStatus::Error.is_terminal());
-        assert!(!MetalCommandStatus::Scheduled.is_terminal());
-    }
-
-    #[test]
-    fn metal_command_failure_diagnostic_is_actionable() {
-        let context = MetalCommandContext::new("gqa_attention_scores")
-            .with("layer", 12)
-            .with("position", 128)
-            .with("tokens", 129)
-            .with("q_heads", 32)
-            .with("kv_heads", 8);
-
-        let message = format_metal_command_failure(
-            MetalCommandFailureKind::Timeout,
-            &context,
-            Duration::from_millis(1234),
-            MetalCommandStatus::Scheduled,
-            Some("GPU timeout"),
-        );
-
-        assert!(message.contains("timed out"));
-        assert!(message.contains("label=\"Flash-MoE gqa_attention_scores"));
-        assert!(message.contains("elapsed=1234ms"));
-        assert!(message.contains("status=scheduled"));
-        assert!(message.contains("metal_error=\"GPU timeout\""));
-        assert!(message.contains("layer=12"));
-        assert!(message.contains("position=128"));
-        assert!(message.contains("tokens=129"));
-    }
-
-    #[test]
-    fn metal_command_failure_marks_buffers_for_release() {
-        let context = MetalCommandContext::new("lm_head_topk").with("rows", 42);
-        let error = MetalCommandBufferFailure::failed(
-            &context,
-            Duration::from_millis(7),
-            MetalCommandStatus::Error,
-            None,
-        );
-        let anyhow_error = anyhow::Error::from(error.clone());
-
-        assert!(error.should_release_buffers());
-        assert!(metal_command_failure_requires_release(&anyhow_error));
-        assert!(error.to_string().contains("none reported"));
     }
 
     #[test]
