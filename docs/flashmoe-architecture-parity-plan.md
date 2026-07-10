@@ -273,9 +273,10 @@ The validator should reject silent fallbacks such as:
   receives weight-owned CMD2 projection bindings for output projection and router projection instead
   of resolving those bindings inside the legacy helper. The scheduled router score command now owns
   raw score finalization into a declared batch, routing-output validation, and score-based topK
-  selection before the runtime receives a `ScheduledRoutingCommand`. Router projection execution and
-  Metal router topK now require a weight-built declared resident dense/Q4 descriptor before the
-  legacy bridge can run them, so missing router storage is an unsupported implementation error rather than a synthetic fallback. The
+  selection before the runtime receives a `ScheduledRoutingCommand`. Router projection execution,
+  Accelerate score production, and Metal router topK now require a weight-built declared resident
+  dense/Q4 descriptor before the legacy bridge can run them, so missing router storage is an
+  unsupported implementation error rather than a synthetic fallback. The
   remaining gap is score production ownership: projection execution still flows through legacy
   dense/runtime helpers instead of a typed CMD2 builder boundary, even though the inputs and
   capability checks are now descriptor-backed.

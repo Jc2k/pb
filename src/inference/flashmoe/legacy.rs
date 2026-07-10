@@ -137,12 +137,13 @@ use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
-    RouterScoreProjectionDescriptor, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, apply_qwen3next_norm_offset_if_needed,
-    build_cmd2_q4_post_attention_prep_projections, build_router_score_projection_descriptor,
-    build_shared_expert_phase_weights, build_shared_expert_q4_phase_projections,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
+    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
+    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    apply_qwen3next_norm_offset_if_needed, build_cmd2_q4_post_attention_prep_projections,
+    build_router_score_projection_descriptor, build_shared_expert_phase_weights,
+    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -16527,14 +16528,13 @@ impl DenseStore {
         }
         let execution = command.projection_execution()?;
         let experts = execution.experts;
-        let tensor_name = execution.tensor_name.to_string();
         let _ = metal;
         if execution.kind == RouterScoreProjectionExecutionKind::ResidentDense
-            && let Some(scores) =
-                self.router_scores_with_accelerate(&tensor_name, experts, hidden)?
+            && let Some(scores) = self.router_scores_with_accelerate(execution, hidden)?
         {
             return command.into_routing_command(scores);
         }
+        let tensor_name = execution.tensor_name.to_string();
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.declared_router_projection(&tensor_name, expert, hidden)?;
@@ -16754,22 +16754,23 @@ impl DenseStore {
 
     fn router_scores_with_accelerate(
         &self,
-        tensor_name: &str,
-        experts: usize,
+        execution: RouterScoreProjectionExecution<'_>,
         hidden: &[f32],
     ) -> Result<Option<Vec<f32>>> {
-        let Some(entry) = self.registry.tensor(tensor_name) else {
-            return Ok(None);
-        };
-        if entry.quantization != TensorQuantization::None {
+        if execution.kind != RouterScoreProjectionExecutionKind::ResidentDense {
             return Ok(None);
         }
-        let (rows, cols) = validate_dense_matvec_shape(entry, tensor_name, experts, hidden.len())?;
-        if rows != experts || cols != hidden.len() {
+        if execution.hidden_width != hidden.len() {
             return Ok(None);
         }
-        let weights = self.read_tensor_rows_f32_cached(tensor_name, 0, experts)?;
-        dense_f32_matvec_rows(weights.as_slice(), hidden, rows, cols)
+        let weights =
+            self.read_tensor_rows_f32_cached(execution.tensor_name, 0, execution.experts)?;
+        dense_f32_matvec_rows(
+            weights.as_slice(),
+            hidden,
+            execution.experts,
+            execution.hidden_width,
+        )
     }
 
     fn lm_head_logits_with_metal(
