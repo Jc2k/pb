@@ -1190,6 +1190,22 @@ impl MetalCmd3SharedPhasePlan {
         Self::f32_bytes("router output", self.shared_experts)
     }
 
+    pub(crate) fn projection_rows(self) -> usize {
+        self.total_intermediate
+    }
+
+    pub(crate) fn router_rows(self) -> usize {
+        self.shared_experts
+    }
+
+    pub(crate) fn activation_dispatch_threads(self) -> u64 {
+        self.total_intermediate as u64
+    }
+
+    pub(crate) fn fill_zero_width(self) -> usize {
+        self.width
+    }
+
     fn from_shape(
         source: MetalCmd3SharedPhaseSource,
         width: usize,
@@ -3699,6 +3715,9 @@ mod tests {
         assert_eq!(plan.intermediate_u32().unwrap(), 3);
         assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
         assert_eq!(plan.router_output_bytes().unwrap(), 2 * 4);
+        assert_eq!(plan.projection_rows(), 6);
+        assert_eq!(plan.router_rows(), 2);
+        assert_eq!(plan.activation_dispatch_threads(), 6);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3725,6 +3744,9 @@ mod tests {
         assert_eq!(plan.intermediate_u32().unwrap(), 3);
         assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
         assert_eq!(plan.router_output_bytes().unwrap(), 2 * 4);
+        assert_eq!(plan.projection_rows(), 6);
+        assert_eq!(plan.router_rows(), 2);
+        assert_eq!(plan.activation_dispatch_threads(), 6);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3753,6 +3775,10 @@ mod tests {
             huge_err.to_string().contains("does not fit Metal u32"),
             "{huge_err:#}"
         );
+
+        let none = MetalCmd3SharedPhasePlan::none(4);
+        assert_eq!(none.fill_zero_width(), 4);
+        assert_eq!(none.activation_dispatch_threads(), 0);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

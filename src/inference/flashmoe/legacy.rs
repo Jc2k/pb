@@ -4886,7 +4886,6 @@ impl MetalExecutorInner {
 
             if let (Some(shared), Some(shared_plan)) = (shared_q4, shared_q4_plan) {
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
-                let shared_total_intermediate = shared_plan.total_intermediate;
                 let total_u32 = shared_plan.total_intermediate_u32()?;
                 let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
                 let shared_gate_out =
@@ -4929,7 +4928,7 @@ impl MetalExecutorInner {
                 set_buffer(encoder, shared_activated, 3);
                 set_buffer(encoder, shared_intermediate_buffer, 4);
                 set_buffer(encoder, total_buffer, 5);
-                dispatch_threads(encoder, shared_total_intermediate as u64);
+                dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.down,
@@ -4939,7 +4938,6 @@ impl MetalExecutorInner {
             } else if let (Some(_shared), Some(shared_plan)) = (shared_dense, shared_dense_plan) {
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
-                let shared_total_intermediate = shared_plan.total_intermediate;
                 let total_u32 = shared_plan.total_intermediate_u32()?;
                 let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
                 let shared_gate_out =
@@ -4964,7 +4962,7 @@ impl MetalExecutorInner {
                     normed_buffer,
                     shared_gate_out,
                     width_buffer,
-                    shared_total_intermediate,
+                    shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
                     encoder,
@@ -4972,7 +4970,7 @@ impl MetalExecutorInner {
                     normed_buffer,
                     shared_up_out,
                     width_buffer,
-                    shared_total_intermediate,
+                    shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
                     encoder,
@@ -4980,7 +4978,7 @@ impl MetalExecutorInner {
                     normed_buffer,
                     shared_router_out,
                     width_buffer,
-                    shared_plan.shared_experts,
+                    shared_plan.router_rows(),
                 );
                 msg_send_void1_id(
                     encoder,
@@ -4993,7 +4991,7 @@ impl MetalExecutorInner {
                 set_buffer(encoder, shared_activated, 3);
                 set_buffer(encoder, shared_intermediate_buffer, 4);
                 set_buffer(encoder, total_buffer, 5);
-                dispatch_threads(encoder, shared_total_intermediate as u64);
+                dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.down,
@@ -5009,7 +5007,7 @@ impl MetalExecutorInner {
                     encoder,
                     shared_output_buffer,
                     width_buffer,
-                    shared_plan.width,
+                    shared_plan.fill_zero_width(),
                 );
             }
 
