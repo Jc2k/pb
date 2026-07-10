@@ -130,8 +130,9 @@ The validator should reject silent fallbacks such as:
   metadata commits are also owned by `experts`; legacy conversion code now supplies build callbacks
   while the storage module decides reuse and layout. PBQ4-to-fixed-Q4 layer upgrades, stale temp
   cleanup, per-expert completeness checks, and missing-pack detection now also live under expert
-  storage. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
-  whole-expert slots.
+  storage. Aggregate expert tensor classification and split-layout sizing have started moving into
+  `experts` as the build planner boundary for Qwen/Qwen3-style aggregate tensors. PBQ4 remains
+  import/build compatibility; execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained

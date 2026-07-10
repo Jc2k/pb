@@ -718,6 +718,71 @@ pub(crate) struct ExpectedExpertPack {
     pub(crate) records: Vec<ExpectedExpertPackRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateExpertTensorKind {
+    GateUp,
+    Gate,
+    Up,
+    Down,
+}
+
+pub(crate) fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind> {
+    if name.ends_with(".mlp.experts.gate_up_proj")
+        || name.ends_with(".mlp.experts.gate_up_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::GateUp)
+    } else if name.ends_with(".mlp.switch_mlp.gate_proj")
+        || name.ends_with(".mlp.switch_mlp.gate_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Gate)
+    } else if name.ends_with(".mlp.switch_mlp.up_proj")
+        || name.ends_with(".mlp.switch_mlp.up_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Up)
+    } else if name.ends_with(".mlp.experts.down_proj")
+        || name.ends_with(".mlp.experts.down_proj.weight")
+        || name.ends_with(".mlp.switch_mlp.down_proj")
+        || name.ends_with(".mlp.switch_mlp.down_proj.weight")
+    {
+        Some(AggregateExpertTensorKind::Down)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateExpertLayout {
+    pub(crate) experts: usize,
+    pub(crate) hidden: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) gate_up_expert_values: usize,
+    pub(crate) single_projection_values: usize,
+    pub(crate) down_expert_values: usize,
+}
+
+impl AggregateExpertLayout {
+    pub(crate) fn new(experts: usize, hidden: usize, intermediate: usize) -> Result<Self> {
+        let gate_up_expert_values = intermediate
+            .checked_mul(2)
+            .and_then(|rows| rows.checked_mul(hidden))
+            .context("aggregate gate_up expert element count overflow")?;
+        let single_projection_values = intermediate
+            .checked_mul(hidden)
+            .context("aggregate gate/up projection element count overflow")?;
+        let down_expert_values = hidden
+            .checked_mul(intermediate)
+            .context("aggregate down projection element count overflow")?;
+        Ok(Self {
+            experts,
+            hidden,
+            intermediate,
+            gate_up_expert_values,
+            single_projection_values,
+            down_expert_values,
+        })
+    }
+}
+
 pub(crate) fn pbq4_expert_pack_wire_size<R: ExpertPackWireRecord>(records: &[R]) -> Result<u64> {
     let mut size = PBQ4_EXPERT_MAGIC.len() as u64;
     for record in records {
@@ -2706,6 +2771,42 @@ impl ReusableExpertBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_expert_tensor_kind_classifies_qwen_and_mlx_names() {
+        assert_eq!(
+            aggregate_expert_tensor_kind("model.layers.0.mlp.experts.gate_up_proj"),
+            Some(AggregateExpertTensorKind::GateUp)
+        );
+        assert_eq!(
+            aggregate_expert_tensor_kind("model.layers.0.mlp.switch_mlp.gate_proj.weight"),
+            Some(AggregateExpertTensorKind::Gate)
+        );
+        assert_eq!(
+            aggregate_expert_tensor_kind("model.layers.0.mlp.switch_mlp.up_proj.weight"),
+            Some(AggregateExpertTensorKind::Up)
+        );
+        assert_eq!(
+            aggregate_expert_tensor_kind("model.layers.0.mlp.experts.down_proj.weight"),
+            Some(AggregateExpertTensorKind::Down)
+        );
+        assert_eq!(
+            aggregate_expert_tensor_kind("model.layers.0.self_attn.q_proj"),
+            None
+        );
+    }
+
+    #[test]
+    fn aggregate_expert_layout_computes_split_ranges_from_model_shape() {
+        let layout = AggregateExpertLayout::new(64, 3584, 1024).unwrap();
+
+        assert_eq!(layout.experts, 64);
+        assert_eq!(layout.hidden, 3584);
+        assert_eq!(layout.intermediate, 1024);
+        assert_eq!(layout.single_projection_values, 1024 * 3584);
+        assert_eq!(layout.gate_up_expert_values, 2 * 1024 * 3584);
+        assert_eq!(layout.down_expert_values, 3584 * 1024);
+    }
 
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
         use QwenMoeExpertComponentKind::*;

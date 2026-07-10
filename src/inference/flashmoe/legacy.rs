@@ -74,12 +74,14 @@ use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
-    EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
-    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
+    AggregateExpertLayout, AggregateExpertTensorKind, EXPERT_PACK_SCALE_BIAS_DTYPE,
+    EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, ExpectedExpertPack,
+    ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload, ExpertRawRead,
+    ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
     FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
-    Q4MatvecPayload, Q4MatvecSource, build_expert_pack, build_fixed_native_q4_expert_pack,
-    build_native_q4_expert_pack, cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
+    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, build_expert_pack,
+    build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
+    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
     first_missing_expert_pack_for_shape, fixed_q4_payload_from_pbq4_records,
     parse_pbq4_expert_pack, pbq4_expert_pack_wire_size, rewrite_expert_layer_pack,
     rewrite_pbq4_layer_to_fixed_q4,
@@ -21715,38 +21717,6 @@ fn build_direct_expert_pack(
     build_expert_pack(layer, expert, inputs)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AggregateExpertTensorKind {
-    GateUp,
-    Gate,
-    Up,
-    Down,
-}
-
-fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind> {
-    if name.ends_with(".mlp.experts.gate_up_proj")
-        || name.ends_with(".mlp.experts.gate_up_proj.weight")
-    {
-        Some(AggregateExpertTensorKind::GateUp)
-    } else if name.ends_with(".mlp.switch_mlp.gate_proj")
-        || name.ends_with(".mlp.switch_mlp.gate_proj.weight")
-    {
-        Some(AggregateExpertTensorKind::Gate)
-    } else if name.ends_with(".mlp.switch_mlp.up_proj")
-        || name.ends_with(".mlp.switch_mlp.up_proj.weight")
-    {
-        Some(AggregateExpertTensorKind::Up)
-    } else if name.ends_with(".mlp.experts.down_proj")
-        || name.ends_with(".mlp.experts.down_proj.weight")
-        || name.ends_with(".mlp.switch_mlp.down_proj")
-        || name.ends_with(".mlp.switch_mlp.down_proj.weight")
-    {
-        Some(AggregateExpertTensorKind::Down)
-    } else {
-        None
-    }
-}
-
 fn pack_aggregate_expert_layer(
     snapshot_dir: &Path,
     plan: &FlashMoePlan,
@@ -21757,7 +21727,11 @@ fn pack_aggregate_expert_layer(
     config: Option<&QwenModelConfig>,
 ) -> Result<()> {
     let config = config.context("Qwen config is required to split aggregate expert tensors")?;
-    let layout = AggregateExpertLayout::new(config)?;
+    let intermediate = config
+        .moe_intermediate_size
+        .or(config.intermediate_size)
+        .context("Qwen config is missing moe_intermediate_size/intermediate_size for aggregate expert packing")?;
+    let layout = AggregateExpertLayout::new(config.experts(), config.hidden_size, intermediate)?;
 
     let aggregate_tensors = aggregate_expert_tensors(tensors, layer, layout)?;
     let down = single_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Down, layer)?;
@@ -21820,16 +21794,6 @@ fn pack_aggregate_expert_layer(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AggregateExpertLayout {
-    experts: usize,
-    hidden: usize,
-    intermediate: usize,
-    gate_up_expert_values: usize,
-    single_projection_values: usize,
-    down_expert_values: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct AggregateExpertTensors<'a> {
     gate: AggregateExpertSlice<'a>,
     up: AggregateExpertSlice<'a>,
@@ -21848,36 +21812,6 @@ impl AggregateExpertSlice<'_> {
             .checked_mul(self.expert_stride_values)
             .and_then(|base| base.checked_add(self.expert_offset_values))
             .context("aggregate expert slice offset overflow")
-    }
-}
-
-impl AggregateExpertLayout {
-    fn new(config: &QwenModelConfig) -> Result<Self> {
-        let experts = config.experts();
-        let hidden = config.hidden_size;
-        let intermediate = config
-            .moe_intermediate_size
-            .or(config.intermediate_size)
-            .context("Qwen config is missing moe_intermediate_size/intermediate_size for aggregate expert packing")?;
-
-        let gate_up_expert_values = intermediate
-            .checked_mul(2)
-            .and_then(|rows| rows.checked_mul(hidden))
-            .context("aggregate gate_up expert element count overflow")?;
-        let single_projection_values = intermediate
-            .checked_mul(hidden)
-            .context("aggregate gate/up projection element count overflow")?;
-        let down_expert_values = hidden
-            .checked_mul(intermediate)
-            .context("aggregate down projection element count overflow")?;
-        Ok(Self {
-            experts,
-            hidden,
-            intermediate,
-            gate_up_expert_values,
-            single_projection_values,
-            down_expert_values,
-        })
     }
 }
 
@@ -29230,7 +29164,12 @@ mod tests {
             br#"{"model_type":"qwen3_5_moe_text","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"head_dim":256,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":1024,"shared_expert_intermediate_size":1024}"#,
         )
         .unwrap();
-        let layout = AggregateExpertLayout::new(&config).unwrap();
+        let layout = AggregateExpertLayout::new(
+            config.experts(),
+            config.hidden_size,
+            config.moe_intermediate_size.unwrap(),
+        )
+        .unwrap();
         let (packed, metadata) = build_fixed_native_q4_expert_pack(
             0,
             7,
