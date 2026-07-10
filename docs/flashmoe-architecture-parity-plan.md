@@ -134,6 +134,10 @@ The validator should reject silent fallbacks such as:
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.
+  `scheduler.rs` also now owns the scheduled expert read coordinator that combines `ExpertSlotStore`,
+  positioned-read worker submission, active read IDs, warm-read metrics, route normalization, and
+  completion into scheduler-owned whole-expert slots. The historical runtime keeps a coordinator
+  handle only as a bridge while command encoding is extracted.
   Shared expert source and shape are now carried by the runtime-built CMD3 scheduler descriptor, so
   a Q4 or dense shared expert implementation cannot be accepted without its declared graph shape.
   Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3
@@ -192,14 +196,15 @@ The validator should reject silent fallbacks such as:
 - Fallbacks are not yet consistently modeled as errors. Any branch that silently changes dtype,
   buffer ownership, scheduler, or CPU/GPU placement hides missing implementation work and must be
   made explicit.
-- Expert reads now follow the upstream positioned-read policy under `experts`, and the runtime and
-  scheduler hold `ExpertSlotStore` directly instead of a legacy store wrapper. The scheduler owns
-  issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
-  CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. Active expert
-  reads are now issued from the validated `ScheduledRoutingCommand` produced by CPU router scores or
-  CMD2 preselected routes. The scheduler turns that routing command into a typed
+- Expert reads now follow the upstream positioned-read policy under `experts`, and the runtime holds
+  a scheduler-owned read coordinator instead of a legacy store/pool wrapper. The scheduler owns
+  issue/finish metrics, worker submission, route normalization, and scheduled slot completion.
+  Scheduler-owned slots now expose fixed-Q4 CMD3 payloads with typed offsets and reject
+  PBQ4/component payloads for execution. Active expert reads are now issued from the validated
+  `ScheduledRoutingCommand` produced by CPU router scores or CMD2 preselected routes. The scheduler
+  turns that routing command into a typed
   `ScheduledExpertReadSet` containing normalized `ScheduledExpertRoutes` plus issued read IDs/warm
-  flags before the legacy worker bridge submits file reads, and the pending read set carries those
+  flags before positioned file reads are submitted, and the pending read set carries those
   scheduler-normalized routes instead of a loose layer plus route vector. CMD1/CMD2/CMD3 submission
   is now built through the scheduled graph and resolves scheduler-owned command objects before
   entering runtime helpers. The remaining gap is to move the Metal command encoding and legacy CPU

@@ -3,8 +3,9 @@ use super::capabilities::{
     FlashMoeUnsupportedCapability,
 };
 use super::experts::{
-    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertSlotDescriptor,
-    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection, Q4MatvecPayload,
+    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertReadWorkerPool,
+    ExpertSlotDescriptor, ExpertSlotStore, FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection,
+    Q4MatvecPayload,
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
@@ -19,7 +20,7 @@ use super::weights::{
     ScheduledNextNormWeights, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
     SharedExpertPhaseWeights,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, mpsc};
@@ -2526,6 +2527,131 @@ impl ActiveExpertReadScheduler {
 
     pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
         self.metrics.snapshot()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledExpertReadCoordinator {
+    store: ExpertSlotStore,
+    pool: ExpertReadWorkerPool,
+    core: ActiveExpertReadScheduler,
+}
+
+impl ScheduledExpertReadCoordinator {
+    #[cfg(test)]
+    pub(crate) fn new(store: ExpertSlotStore) -> Self {
+        Self::new_with_routed_expert_scale(store, 1.0)
+    }
+
+    pub(crate) fn new_with_routed_expert_scale(
+        store: ExpertSlotStore,
+        routed_expert_scale: f32,
+    ) -> Self {
+        Self {
+            store,
+            pool: ExpertReadWorkerPool::default(),
+            core: ActiveExpertReadScheduler::new(routed_expert_scale),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<PendingScheduledRead<ExpertRawReadResponse>>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pool.ensure_workers(experts.len().max(1));
+        let reader = self.store.layer_reader(layer)?;
+        let mut pending = Vec::with_capacity(experts.len());
+        for expert in experts {
+            let plan = reader.prepare_read(*expert)?;
+            let issue = self.core.issue_read(layer, *expert);
+            let rx = self.pool.submit_read(
+                issue.id,
+                issue.key.expert,
+                Arc::clone(&reader),
+                plan,
+                issue.warm,
+                issue.issued_at,
+            )?;
+            pending.push(PendingScheduledRead::new(issue.id, rx));
+        }
+        Ok(pending)
+    }
+
+    pub(crate) fn issue_routing_command(
+        &mut self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<PendingScheduledExpertSet<ExpertRawReadResponse>> {
+        let issued = self.core.issue_routed_reads(command)?;
+        let reads = self.submit_issued_reads(&issued)?;
+        let routes = issued.into_routes();
+        Ok(PendingScheduledExpertSet::new(routes, reads))
+    }
+
+    fn submit_issued_reads(
+        &mut self,
+        issued: &ScheduledExpertReadSet,
+    ) -> Result<Vec<PendingScheduledRead<ExpertRawReadResponse>>> {
+        if issued.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pool.ensure_workers(issued.len().max(1));
+        let reader = self.store.layer_reader(issued.layer())?;
+        let mut pending = Vec::with_capacity(issued.len());
+        // Submit positioned reads directly into reusable whole-expert slots; the OS page cache
+        // remains the cache policy for this stage.
+        for issue in issued.issues() {
+            let plan = reader.prepare_read(issue.key.expert)?;
+            let rx = self.pool.submit_read(
+                issue.id,
+                issue.key.expert,
+                Arc::clone(&reader),
+                plan,
+                issue.warm,
+                issue.issued_at,
+            )?;
+            pending.push(PendingScheduledRead::new(issue.id, rx));
+        }
+        Ok(pending)
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        pending: Vec<PendingScheduledRead<ExpertRawReadResponse>>,
+    ) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
+        let mut out = Vec::with_capacity(pending.len());
+        for pending in pending {
+            let pending_id = pending.id();
+            let response = pending
+                .recv()
+                .context("expert I/O worker dropped response channel")?;
+            let slot = self.core.finish_slot_read(pending_id, response)?;
+            out.push(Arc::new(slot));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn finish_routes(
+        &mut self,
+        pending: PendingScheduledExpertSet<ExpertRawReadResponse>,
+    ) -> Result<ScheduledExpertSet<Arc<ScheduledExpertSlot>>> {
+        let (routes, reads) = pending.into_parts();
+        let experts = self.finish(reads)?;
+        self.core
+            .finish_routes(routes, experts, |expert| (expert.layer(), expert.expert()))
+    }
+
+    pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        self.core.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.pool.worker_count()
     }
 }
 

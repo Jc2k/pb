@@ -74,25 +74,24 @@ use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertRawPayload, ExpertRawRead,
-    ExpertRawReadResponse, ExpertReadWorkerPool, ExpertSlotDescriptor, ExpertSlotStore,
-    ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
-    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, Q4MatvecPayload,
-    Q4MatvecSource, ReusableExpertBytePool, expert_layer_metadata_path, expert_layer_path,
-    expert_slot_end, expert_slot_offset, read_exact_at_positioned, read_expert_layer_pack_metadata,
+    ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+    FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
+    PBQ4_EXPERT_MAGIC, Q4MatvecPayload, Q4MatvecSource, ReusableExpertBytePool,
+    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
+    read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
-    ActiveExpertReadScheduler, ExpertSchedulerSnapshot, FlashMoeScheduledGraph,
-    PendingScheduledExpertSet, PendingScheduledRead, ScheduledAttentionMathImplementation,
+    ExpertSchedulerSnapshot, FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
     ScheduledCmd3InputSource, ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload, ScheduledExpertReadSet,
-    ScheduledExpertSet as SchedulerScheduledExpertSet, ScheduledExpertSlot,
+    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertReadCoordinator as ExpertScheduler, ScheduledExpertSlot,
     ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
     ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
@@ -18063,124 +18062,6 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
     };
     f32::from_bits(value)
-}
-
-type PendingExpertRead = PendingScheduledRead<ExpertRawReadResponse>;
-type PendingExpertSet = PendingScheduledExpertSet<ExpertRawReadResponse>;
-type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ScheduledExpertSlot>>;
-
-#[derive(Debug)]
-struct ExpertScheduler {
-    store: ExpertSlotStore,
-    pool: ExpertReadWorkerPool,
-    core: ActiveExpertReadScheduler,
-}
-
-impl ExpertScheduler {
-    fn new(store: ExpertSlotStore) -> Self {
-        Self::new_with_routed_expert_scale(store, 1.0)
-    }
-
-    fn new_with_routed_expert_scale(store: ExpertSlotStore, routed_expert_scale: f32) -> Self {
-        Self {
-            store,
-            pool: ExpertReadWorkerPool::default(),
-            core: ActiveExpertReadScheduler::new(routed_expert_scale),
-        }
-    }
-
-    fn issue(&mut self, layer: usize, experts: &[usize]) -> Result<Vec<PendingExpertRead>> {
-        if experts.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.pool.ensure_workers(experts.len().max(1));
-        let reader = self.store.layer_reader(layer)?;
-        let mut pending = Vec::with_capacity(experts.len());
-        for expert in experts {
-            let plan = reader.prepare_read(*expert)?;
-            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
-            // maintaining a second in-process cache of hot expert packs. Cold expert reads still
-            // pay the SSD cost, but repeated accesses are naturally cached until memory pressure
-            // evicts them, which matches the behavior described in the upstream notes.
-            let issue = self.core.issue_read(layer, *expert);
-            let rx = self.pool.submit_read(
-                issue.id,
-                issue.key.expert,
-                Arc::clone(&reader),
-                plan,
-                issue.warm,
-                issue.issued_at,
-            )?;
-            pending.push(PendingExpertRead::new(issue.id, rx));
-        }
-        Ok(pending)
-    }
-
-    fn issue_routing_command(
-        &mut self,
-        command: &ScheduledRoutingCommand,
-    ) -> Result<PendingExpertSet> {
-        let issued = self.core.issue_routed_reads(command)?;
-        let reads = self.submit_issued_reads(&issued)?;
-        let routes = issued.into_routes();
-        Ok(PendingExpertSet::new(routes, reads))
-    }
-
-    fn submit_issued_reads(
-        &mut self,
-        issued: &ScheduledExpertReadSet,
-    ) -> Result<Vec<PendingExpertRead>> {
-        if issued.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.pool.ensure_workers(issued.len().max(1));
-        let reader = self.store.layer_reader(issued.layer())?;
-        let mut pending = Vec::with_capacity(issued.len());
-        for issue in issued.issues() {
-            let plan = reader.prepare_read(issue.key.expert)?;
-            // Upstream Flash-MoE relies on the OS page cache for expert reuse rather than
-            // maintaining a second in-process cache of hot expert packs.
-            let rx = self.pool.submit_read(
-                issue.id,
-                issue.key.expert,
-                Arc::clone(&reader),
-                plan,
-                issue.warm,
-                issue.issued_at,
-            )?;
-            pending.push(PendingExpertRead::new(issue.id, rx));
-        }
-        Ok(pending)
-    }
-
-    fn finish(&mut self, pending: Vec<PendingExpertRead>) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
-        let mut out = Vec::with_capacity(pending.len());
-        for pending in pending {
-            let pending_id = pending.id();
-            let response = pending
-                .recv()
-                .context("expert I/O worker dropped response channel")?;
-            let slot = self.core.finish_slot_read(pending_id, response)?;
-            out.push(Arc::new(slot));
-        }
-        Ok(out)
-    }
-
-    fn finish_routes(&mut self, pending: PendingExpertSet) -> Result<ScheduledExpertSet> {
-        let (routes, reads) = pending.into_parts();
-        let experts = self.finish(reads)?;
-        self.core
-            .finish_routes(routes, experts, |expert| (expert.layer(), expert.expert()))
-    }
-
-    fn snapshot(&self) -> ExpertSchedulerSnapshot {
-        self.core.snapshot()
-    }
-
-    #[cfg(test)]
-    fn worker_count(&self) -> usize {
-        self.pool.worker_count()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
