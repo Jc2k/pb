@@ -1302,6 +1302,63 @@ pub(crate) struct MetalCmd3SharedWorkBuffers {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3SharedStageBuffers {
+    pub(crate) source: MetalCmd3SharedPhaseSource,
+    pub(crate) normed: MetalObjcId,
+    pub(crate) width: MetalObjcId,
+    pub(crate) shared_output: MetalObjcId,
+    pub(crate) work: Option<MetalCmd3SharedWorkBuffers>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3SharedStageBuffers {
+    pub(crate) fn projected(
+        plan: MetalCmd3SharedPhasePlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        combine: MetalCmd3CombineBuffers,
+        work: MetalCmd3SharedWorkBuffers,
+    ) -> anyhow::Result<Self> {
+        if plan.source == MetalCmd3SharedPhaseSource::None {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 projected shared stage requires a declared shared expert source"
+            );
+        }
+        if work.layout != plan.buffer_layout()? {
+            anyhow::bail!("FlashMoe Metal CMD3 shared stage work layout does not match plan");
+        }
+        Ok(Self {
+            source: plan.source,
+            normed: inputs.normed,
+            width: combine.width,
+            shared_output: outputs.shared_output,
+            work: Some(work),
+        })
+    }
+
+    pub(crate) fn fill_zero(
+        plan: MetalCmd3SharedPhasePlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        combine: MetalCmd3CombineBuffers,
+    ) -> anyhow::Result<Self> {
+        if plan.source != MetalCmd3SharedPhaseSource::None {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 fill-zero shared stage requires no shared expert source"
+            );
+        }
+        Ok(Self {
+            source: plan.source,
+            normed: inputs.normed,
+            width: combine.width,
+            shared_output: outputs.shared_output,
+            work: None,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3SharedWorkBuffers {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -4054,6 +4111,105 @@ mod tests {
         assert_eq!(buffers.width, 0x4000usize as MetalObjcId);
         assert_eq!(buffers.layout.width_u32, 4);
         assert_eq!(buffers.layout.weight_bytes, 4 * 4);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_shared_stage_buffers_require_declared_source() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: test_q4_projection("gate", 6, 4),
+            up: test_q4_projection("up", 6, 4),
+            down: test_q4_projection("down", 4, 6),
+            router: test_q4_projection("router", 2, 4),
+            shared_experts: 2,
+            intermediate: 3,
+            width: 4,
+        };
+        let payloads = vec![
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(5, 4)),
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(7, 4)),
+        ];
+        let plan = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            2,
+            4,
+            2,
+            output_state,
+            ScheduledSharedExpertPhaseRef::Q4(&shared),
+            None,
+            &payloads,
+        )
+        .unwrap();
+        let inputs = MetalCmd3InputBuffers::new(
+            plan.phase,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+        )
+        .unwrap();
+        let outputs = MetalCmd3OutputBuffers::new(
+            &plan,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+            0x5000usize as MetalObjcId,
+            None,
+        )
+        .unwrap();
+        let combine = MetalCmd3CombineBuffers::new(
+            plan.combine,
+            0x6000usize as MetalObjcId,
+            0x7000usize as MetalObjcId,
+            0x8000usize as MetalObjcId,
+        )
+        .unwrap();
+        let work = MetalCmd3SharedWorkBuffers::new(
+            plan.shared,
+            0x9000usize as MetalObjcId,
+            0xa000usize as MetalObjcId,
+            0xb000usize as MetalObjcId,
+            0xc000usize as MetalObjcId,
+            0xd000usize as MetalObjcId,
+            0xe000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        let projected =
+            MetalCmd3SharedStageBuffers::projected(plan.shared, inputs, &outputs, combine, work)
+                .unwrap();
+
+        assert_eq!(projected.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(projected.normed, inputs.normed);
+        assert_eq!(projected.width, combine.width);
+        assert_eq!(projected.shared_output, outputs.shared_output);
+        assert_eq!(projected.work, Some(work));
+
+        let no_shared = MetalCmd3SharedPhasePlan::none(4);
+        let fill_zero =
+            MetalCmd3SharedStageBuffers::fill_zero(no_shared, inputs, &outputs, combine).unwrap();
+        assert_eq!(fill_zero.source, MetalCmd3SharedPhaseSource::None);
+        assert_eq!(fill_zero.work, None);
+        assert_eq!(fill_zero.shared_output, outputs.shared_output);
+
+        let projected_none =
+            MetalCmd3SharedStageBuffers::projected(no_shared, inputs, &outputs, combine, work)
+                .unwrap_err();
+        assert!(
+            projected_none
+                .to_string()
+                .contains("declared shared expert source"),
+            "{projected_none:#}"
+        );
+
+        let fill_projected =
+            MetalCmd3SharedStageBuffers::fill_zero(plan.shared, inputs, &outputs, combine)
+                .unwrap_err();
+        assert!(
+            fill_projected
+                .to_string()
+                .contains("no shared expert source"),
+            "{fill_projected:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

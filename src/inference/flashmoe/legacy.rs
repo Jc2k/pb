@@ -107,10 +107,10 @@ use super::metal::{
     MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
     MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3InputBuffers,
     MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers,
-    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
-    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
-    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedStageBuffers,
+    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
+    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
     MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
     MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
     MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
@@ -4898,23 +4898,33 @@ impl MetalExecutorInner {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
                 let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
+                let shared_stage = MetalCmd3SharedStageBuffers::projected(
+                    shared_plan,
+                    input_buffers,
+                    &output_buffers,
+                    combine_buffers,
+                    shared_work,
+                )?;
+                let shared_work = shared_stage
+                    .work
+                    .context("FlashMoe Metal CMD3 projected shared stage missing work buffers")?;
 
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.gate,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.gate_out,
                 )?;
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.up,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.up_out,
                 )?;
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.router,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.router_out,
                 )?;
                 msg_send_void1_id(
@@ -4933,7 +4943,7 @@ impl MetalExecutorInner {
                     encoder,
                     &shared.down,
                     shared_work.activated,
-                    output_buffers.shared_output,
+                    shared_stage.shared_output,
                 )?;
             } else if let (Some(_shared), MetalCmd3SharedPhaseSource::Dense) =
                 (shared_dense, command_plan.shared.source)
@@ -4942,29 +4952,39 @@ impl MetalExecutorInner {
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
+                let shared_stage = MetalCmd3SharedStageBuffers::projected(
+                    shared_plan,
+                    input_buffers,
+                    &output_buffers,
+                    combine_buffers,
+                    shared_work,
+                )?;
+                let shared_work = shared_stage
+                    .work
+                    .context("FlashMoe Metal CMD3 projected shared stage missing work buffers")?;
 
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.gate,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.gate_out,
-                    combine_buffers.width,
+                    shared_stage.width,
                     shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.up,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.up_out,
-                    combine_buffers.width,
+                    shared_stage.width,
                     shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.router,
-                    input_buffers.normed,
+                    shared_stage.normed,
                     shared_work.router_out,
-                    combine_buffers.width,
+                    shared_stage.width,
                     shared_plan.router_rows(),
                 );
                 msg_send_void1_id(
@@ -4983,17 +5003,23 @@ impl MetalExecutorInner {
                     encoder,
                     shared_metal.down,
                     shared_work.activated,
-                    output_buffers.shared_output,
+                    shared_stage.shared_output,
                     shared_work.total_intermediate,
                     width,
                 );
             } else {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::None);
+                let shared_stage = MetalCmd3SharedStageBuffers::fill_zero(
+                    shared_plan,
+                    input_buffers,
+                    &output_buffers,
+                    combine_buffers,
+                )?;
                 self.encode_fill_zero(
                     encoder,
-                    output_buffers.shared_output,
-                    combine_buffers.width,
+                    shared_stage.shared_output,
+                    shared_stage.width,
                     shared_plan.fill_zero_width(),
                 );
             }
