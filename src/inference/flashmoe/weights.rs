@@ -341,6 +341,49 @@ pub(crate) struct RouterScoreProjectionExecution<'a> {
     pub(crate) kind: RouterScoreProjectionExecutionKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouterScoreProjectionScoreSource {
+    ResidentDenseFullTensor,
+    DeclaredRows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouterScoreProjectionScorePlan<'a> {
+    pub(crate) tensor_name: &'a str,
+    pub(crate) experts: usize,
+    pub(crate) hidden_width: usize,
+    pub(crate) source: RouterScoreProjectionScoreSource,
+}
+
+impl<'a> RouterScoreProjectionExecution<'a> {
+    pub(crate) fn score_plan(
+        self,
+        hidden_len: usize,
+    ) -> Result<RouterScoreProjectionScorePlan<'a>> {
+        if self.hidden_width != hidden_len {
+            bail!(
+                "Flash-MoE router score projection hidden length {} does not match declared width {}",
+                hidden_len,
+                self.hidden_width
+            );
+        }
+        let source = match self.kind {
+            RouterScoreProjectionExecutionKind::ResidentDense => {
+                RouterScoreProjectionScoreSource::ResidentDenseFullTensor
+            }
+            RouterScoreProjectionExecutionKind::ResidentQ4 => {
+                RouterScoreProjectionScoreSource::DeclaredRows
+            }
+        };
+        Ok(RouterScoreProjectionScorePlan {
+            tensor_name: self.tensor_name,
+            experts: self.experts,
+            hidden_width: self.hidden_width,
+            source,
+        })
+    }
+}
+
 impl RouterScoreProjectionDescriptor {
     pub(crate) fn from_entry(
         layer: usize,
@@ -1851,12 +1894,58 @@ mod tests {
             execution.kind,
             RouterScoreProjectionExecutionKind::ResidentDense
         );
+        let score_plan = execution.score_plan(4).unwrap();
+        assert_eq!(score_plan.tensor_name, entry.name);
+        assert_eq!(score_plan.experts, 2);
+        assert_eq!(score_plan.hidden_width, 4);
+        assert_eq!(
+            score_plan.source,
+            RouterScoreProjectionScoreSource::ResidentDenseFullTensor
+        );
+
+        let hidden_err = execution.score_plan(3).unwrap_err();
+        assert!(
+            hidden_err
+                .to_string()
+                .contains("hidden length 3 does not match declared width 4"),
+            "{hidden_err:#}"
+        );
 
         let err = descriptor.execution(3, 3, 4).unwrap_err();
         assert!(
             err.to_string()
                 .contains("experts 2 does not match scheduled experts 3"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn router_score_projection_score_plan_declares_q4_row_execution() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 32],
+            byte_offset: 64,
+            byte_len: 48,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 512, 2, 32)
+                .unwrap();
+
+        let execution = descriptor.execution(3, 2, 32).unwrap();
+        assert_eq!(
+            execution.kind,
+            RouterScoreProjectionExecutionKind::ResidentQ4
+        );
+        assert_eq!(
+            execution.score_plan(32).unwrap().source,
+            RouterScoreProjectionScoreSource::DeclaredRows
         );
     }
 

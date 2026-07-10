@@ -151,8 +151,8 @@ use super::weights::{
     Cmd2Q4PostAttentionPrepProjections, DenseMmapMatvecProjection, DenseProjectionRequest,
     DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
-    RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
-    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseCache,
+    RouterScoreProjectionDescriptor, RouterScoreProjectionScorePlan,
+    RouterScoreProjectionScoreSource, RuntimeTensorEntry, SharedExpertPhaseCache,
     SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
     TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
     build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
@@ -15545,22 +15545,16 @@ impl DenseStore {
         command: ScheduledRouterScoreProjectionCommand,
         hidden: &[f32],
     ) -> Result<ScheduledRoutingCommand> {
-        if hidden.len() != command.hidden_width {
-            bail!(
-                "FlashMoe scheduled router score projection hidden length {} does not match declared width {}",
-                hidden.len(),
-                command.hidden_width
-            );
-        }
         let execution = command.projection_execution()?;
-        let experts = execution.experts;
+        let score_plan = execution.score_plan(hidden.len())?;
+        let experts = score_plan.experts;
         let _ = metal;
-        if execution.kind == RouterScoreProjectionExecutionKind::ResidentDense
-            && let Some(scores) = self.router_scores_with_accelerate(execution, hidden)?
+        if score_plan.source == RouterScoreProjectionScoreSource::ResidentDenseFullTensor
+            && let Some(scores) = self.router_scores_with_accelerate(score_plan, hidden)?
         {
             return command.into_routing_command(scores);
         }
-        let tensor_name = execution.tensor_name.to_string();
+        let tensor_name = score_plan.tensor_name.to_string();
         let mut router_scores = vec![0.0f32; experts];
         for (expert, score) in router_scores.iter_mut().enumerate() {
             *score = self.declared_router_projection(&tensor_name, expert, hidden)?;
@@ -15767,22 +15761,22 @@ impl DenseStore {
 
     fn router_scores_with_accelerate(
         &self,
-        execution: RouterScoreProjectionExecution<'_>,
+        score_plan: RouterScoreProjectionScorePlan<'_>,
         hidden: &[f32],
     ) -> Result<Option<Vec<f32>>> {
-        if execution.kind != RouterScoreProjectionExecutionKind::ResidentDense {
+        if score_plan.source != RouterScoreProjectionScoreSource::ResidentDenseFullTensor {
             return Ok(None);
         }
-        if execution.hidden_width != hidden.len() {
+        if score_plan.hidden_width != hidden.len() {
             return Ok(None);
         }
         let weights =
-            self.read_tensor_rows_f32_cached(execution.tensor_name, 0, execution.experts)?;
+            self.read_tensor_rows_f32_cached(score_plan.tensor_name, 0, score_plan.experts)?;
         dense_f32_matvec_rows(
             weights.as_slice(),
             hidden,
-            execution.experts,
-            execution.hidden_width,
+            score_plan.experts,
+            score_plan.hidden_width,
         )
     }
 

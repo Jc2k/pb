@@ -318,9 +318,10 @@ The validator should reject silent fallbacks such as:
   Accelerate score production, and Metal router topK now require a weight-built declared resident
   dense/Q4 descriptor before the legacy bridge can run them, so missing router storage is an
   unsupported implementation error rather than a synthetic fallback. The
-  remaining gap is score production ownership: projection execution still flows through legacy
-  dense/runtime helpers instead of a typed CMD2 builder boundary, even though the inputs and
-  capability checks are now descriptor-backed.
+  remaining gap is score production ownership: projection execution now resolves through a
+  weight-owned score plan that validates hidden width and declares resident-dense full-tensor
+  matvec versus declared-row score production, but the actual row/full-tensor reads still flow
+  through legacy dense/runtime helpers instead of a typed CMD2 builder boundary.
 - Shared experts now enter CMD3 through a scheduler descriptor that carries source and graph shape,
   and the live CMD3 builder derives next-norm source from typed `ScheduledNextNormWeights` instead
   of a separate legacy-owned branch. The live path now asks the scheduled graph to build resolved
