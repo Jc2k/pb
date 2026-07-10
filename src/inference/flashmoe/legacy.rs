@@ -9982,11 +9982,8 @@ impl FlashMoeEngine {
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let shared_q4_phase = if has_metal_post_attention_prep {
-                self.required_shared_expert_q4_phase_projections(layer, runtime.width)?
-            } else {
-                None
-            };
+            let shared_q4_phase =
+                self.required_shared_expert_q4_phase_projections(layer, runtime.width)?;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let shared_q4_phase: Option<SharedExpertPhaseQ4Projections> = None;
             let shared_dense_phase = if shared_q4_phase.is_some() {
@@ -28035,11 +28032,11 @@ mod tests {
         };
 
         let first = engine
-            .shared_expert_q4_phase_projections(0, 4)
+            .required_shared_expert_q4_phase_projections(0, 4)
             .unwrap()
             .unwrap();
         let second = engine
-            .shared_expert_q4_phase_projections(0, 4)
+            .required_shared_expert_q4_phase_projections(0, 4)
             .unwrap()
             .unwrap();
 
