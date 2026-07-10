@@ -125,8 +125,11 @@ The validator should reject silent fallbacks such as:
   through the model layout; default Qwen3.5 raw multi-read helpers are kept test-only. Packed expert
   tensor records, PBQ4 pack parsing, PBQ4 pack builder input records and writers, PBQ4 wire-size
   accounting, scale/bias payload decoding, shared scale/bias dtype sizing, and PBQ4-to-fixed-Q4
-  compatibility conversion now live with expert storage instead of the legacy runtime. PBQ4 remains
-  import/build compatibility; execution reads are moving toward fixed whole-expert slots.
+  compatibility conversion now live with expert storage instead of the legacy runtime. Expert layer
+  rewrite/reuse policy, positioned slot writes, fixed-slot reuse validation, and atomic expert
+  metadata commits are also owned by `experts`; legacy conversion code now supplies build callbacks
+  while the storage module decides reuse and layout. PBQ4 remains import/build compatibility;
+  execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -313,8 +316,8 @@ The refactor should break the current monolith by ownership boundary, not by "fa
 3. Extract expert storage and readers from `legacy.rs`.
    Move fixed-slot layout validation, layer reader opening, positioned read helpers, reusable
    buffers, read metrics, fixed-slot packed-record fixture coverage, PBQ4 parsing/writing/wire-size
-   accounting, scale/bias decoding, and PBQ4 import/build compatibility into `experts`. Runtime reads
-   should return typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split
+   accounting, scale/bias decoding, layer rewrite/reuse policy, and PBQ4 import/build compatibility
+   into `experts`. Runtime reads should return typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split
    gate/up/down owners.
 
 4. Introduce the scheduler API before optimizing it.
@@ -376,8 +379,8 @@ The refactor should break the current monolith by ownership boundary, not by "fa
    extraction.
 2. Add the graph capability validator and start converting silent fallbacks into explicit
    unsupported errors.
-3. Move the expert reader/read-policy and remaining PBQ4 import/build call sites from `legacy.rs` into `experts`,
-   keeping tests with the moved code.
+3. Move the remaining expert conversion/build call sites from `legacy.rs` into `experts`, keeping
+   tests with the moved code.
 4. Add a scheduler module with a narrow API for "issue active expert reads" and "finish active
    expert slots", then route current runtime expert reads through it.
 5. Convert active expert execution to consume scheduler-owned whole-expert slots only. Keep PBQ4 as

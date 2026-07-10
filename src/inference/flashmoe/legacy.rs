@@ -52,11 +52,7 @@ use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(not(unix))]
-use std::io::Seek;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -79,16 +75,20 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertPackWireRecord,
+    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertLayerPackMetadata, ExpertPackMetadata,
     ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore,
     FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
     FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PBQ4_EXPERT_MAGIC, PackedExpertTensor,
     Q4MatvecPayload, Q4MatvecSource, build_expert_pack, build_fixed_native_q4_expert_pack,
     build_native_q4_expert_pack, expert_layer_metadata_path, expert_layer_path,
-    expert_scale_bias_dtype_size, expert_slot_end, expert_slot_offset,
+    expert_scale_bias_dtype_size, expert_slot_offset, finish_expert_pack_atomically,
     fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
     pbq4_expert_pack_wire_size, read_exact_at_positioned, read_expert_layer_pack_metadata,
+    read_layer_slot_bytes, rewrite_expert_layer_pack, temp_pack_path, write_all_at_positioned,
+    write_expert_metadata_atomically,
 };
+#[cfg(test)]
+use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::math::*;
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -18791,33 +18791,6 @@ fn pbq4_layer_looks_fixed_q4_compatible(
     Ok(fixed_q4_pack_from_pbq4_records(metadata.layer, first.expert, spec, &records).is_ok())
 }
 
-fn write_all_at_positioned(file: &fs::File, buf: &[u8], offset: u64) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut written = 0usize;
-        while written < buf.len() {
-            let n = file.write_at(
-                &buf[written..],
-                offset
-                    .checked_add(written as u64)
-                    .context("positioned write offset overflow")?,
-            )?;
-            if n == 0 {
-                bail!("short positioned write");
-            }
-            written += n;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = file.try_clone().context("failed to clone file for write")?;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(buf)?;
-        Ok(())
-    }
-}
-
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -21779,12 +21752,18 @@ fn pack_direct_expert_layer(
         )?);
     }
     let expert_count = layer_expert_count(config, &experts);
-    rewrite_expert_layer_pack(plan, layer, expert_count, &expected, |expert| {
-        let tensors = experts
-            .get(&expert)
-            .with_context(|| format!("missing expert {expert} tensors for layer {layer}"))?;
-        build_direct_expert_pack(snapshot_dir, shard_cache, layer, expert, tensors)
-    })?;
+    rewrite_expert_layer_pack(
+        &plan.experts_dir,
+        layer,
+        expert_count,
+        &expected,
+        |expert| {
+            let tensors = experts
+                .get(&expert)
+                .with_context(|| format!("missing expert {expert} tensors for layer {layer}"))?;
+            build_direct_expert_pack(snapshot_dir, shard_cache, layer, expert, tensors)
+        },
+    )?;
     Ok(())
 }
 
@@ -21934,17 +21913,23 @@ fn pack_aggregate_expert_layer(
             records,
         });
     }
-    let skipped = rewrite_expert_layer_pack(plan, layer, layout.experts, &expected, |expert| {
-        build_aggregate_expert_pack(
-            snapshot_dir,
-            &mut shard_cache,
-            layer,
-            expert,
-            aggregate_tensors,
-            down,
-            layout,
-        )
-    })?;
+    let skipped = rewrite_expert_layer_pack(
+        &plan.experts_dir,
+        layer,
+        layout.experts,
+        &expected,
+        |expert| {
+            build_aggregate_expert_pack(
+                snapshot_dir,
+                &mut shard_cache,
+                layer,
+                expert,
+                aggregate_tensors,
+                down,
+                layout,
+            )
+        },
+    )?;
     eprintln!(
         "prepared aggregate experts for layer {layer} ({layer_index}/{layer_total}): {}/{} ({skipped} reused)",
         layout.experts, layout.experts,
@@ -22431,176 +22416,6 @@ fn expected_expert_pack(
     })
 }
 
-fn expert_pack_records_match_expected(
-    actual: &[ExpertPackRecord],
-    expected: &[ExpectedExpertPackRecord],
-) -> bool {
-    actual.len() == expected.len()
-        && actual.iter().zip(expected).all(|(actual, expected)| {
-            actual.tensor == expected.tensor
-                && actual.dtype == expected.dtype
-                && actual.shape == expected.shape
-                && actual.source_offsets == expected.source_offsets
-                && actual.source_hash.as_deref() == Some(expected.source_hash.as_str())
-                && actual.packed_bytes == expected.packed_bytes
-                && actual.groups == expected.groups
-                && actual.group_size == expected.group_size
-                && actual.scale_bias_dtype == expected.scale_bias_dtype
-        })
-}
-
-fn rewrite_expert_layer_pack(
-    plan: &FlashMoePlan,
-    layer: usize,
-    experts: usize,
-    expected: &[ExpectedExpertPack],
-    mut build: impl FnMut(usize) -> Result<(Vec<u8>, ExpertPackMetadata)>,
-) -> Result<usize> {
-    if expected.is_empty() {
-        return Ok(0);
-    }
-    let slot_size = expected
-        .iter()
-        .map(|pack| pack.packed_bytes)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    let old_metadata = read_expert_layer_pack_metadata(&plan.experts_dir, layer)?;
-    let layer_path = expert_layer_path(&plan.experts_dir, layer);
-    let all_reusable = old_metadata.as_ref().is_some_and(|metadata| {
-        expected
-            .iter()
-            .all(|pack| expert_layer_slot_is_reusable(&layer_path, metadata, pack).unwrap_or(false))
-    });
-    if all_reusable {
-        return Ok(expected.len());
-    }
-
-    let temp_path = temp_pack_path(&layer_path);
-    let out = fs::File::create(&temp_path).with_context(|| {
-        format!(
-            "failed to create temporary packed expert layer {}",
-            temp_path.display()
-        )
-    })?;
-    let layer_size = (experts as u64)
-        .checked_mul(slot_size)
-        .context("expert layer file size overflow")?;
-    out.set_len(layer_size)
-        .with_context(|| format!("failed to preallocate {}", temp_path.display()))?;
-
-    let mut packs = Vec::with_capacity(expected.len());
-    let mut reused = 0usize;
-    for pack in expected {
-        let offset = expert_slot_offset(pack.expert, slot_size)?;
-        let (packed, metadata) = if let Some(old_metadata) = old_metadata.as_ref()
-            && expert_layer_slot_is_reusable(&layer_path, old_metadata, pack)?
-        {
-            reused += 1;
-            let metadata = old_metadata
-                .pack_for(pack.expert)
-                .cloned()
-                .context("reusable expert metadata disappeared")?;
-            let bytes = read_layer_slot_bytes(&layer_path, old_metadata, pack.expert, &metadata)?;
-            (bytes, metadata)
-        } else {
-            build(pack.expert)?
-        };
-        if packed.len() as u64 > slot_size {
-            bail!(
-                "packed expert layer {layer} expert {} is {} bytes, exceeds slot size {slot_size}",
-                pack.expert,
-                packed.len()
-            );
-        }
-        write_all_at_positioned(&out, &packed, offset).with_context(|| {
-            format!(
-                "failed to write layer {layer} expert {} into {}",
-                pack.expert,
-                temp_path.display()
-            )
-        })?;
-        packs.push(ExpertPackMetadata {
-            packed_bytes: packed.len() as u64,
-            ..metadata
-        });
-    }
-
-    finish_expert_pack_atomically(out, &temp_path, &layer_path)?;
-    let metadata = ExpertLayerPackMetadata::new(layer, slot_size, experts, packs);
-    write_expert_metadata_atomically(&plan.experts_dir, layer, &metadata)?;
-    Ok(reused)
-}
-
-fn expert_layer_slot_is_reusable(
-    layer_path: &Path,
-    layer_metadata: &ExpertLayerPackMetadata,
-    expected: &ExpectedExpertPack,
-) -> Result<bool> {
-    let Some(metadata) = layer_metadata.pack_for(expected.expert) else {
-        return Ok(false);
-    };
-    if metadata.packed_bytes != expected.packed_bytes
-        || !expert_pack_records_match_expected(&metadata.records, &expected.records)
-    {
-        return Ok(false);
-    }
-    if metadata
-        .records
-        .iter()
-        .any(|record| record.source_hash.is_none())
-    {
-        return Ok(false);
-    }
-    if metadata.packed_bytes > layer_metadata.expert_size {
-        return Ok(false);
-    }
-    let file = match fs::File::open(layer_path) {
-        Ok(file) => file,
-        Err(_) => return Ok(false),
-    };
-    let file_len = file.metadata()?.len();
-    let end = expert_slot_end(
-        expected.expert,
-        layer_metadata.expert_size,
-        metadata.packed_bytes,
-    )?;
-    if file_len < end {
-        return Ok(false);
-    }
-    let offset = expert_slot_offset(expected.expert, layer_metadata.expert_size)?;
-    let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
-    if read_exact_at_positioned(&file, &mut magic, offset).is_err() {
-        return Ok(false);
-    }
-    Ok(magic == PBQ4_EXPERT_MAGIC)
-}
-
-fn read_layer_slot_bytes(
-    layer_path: &Path,
-    layer_metadata: &ExpertLayerPackMetadata,
-    expert: usize,
-    metadata: &ExpertPackMetadata,
-) -> Result<Vec<u8>> {
-    let file = fs::File::open(layer_path)
-        .with_context(|| format!("failed to open expert layer {}", layer_path.display()))?;
-    let offset = expert_slot_offset(expert, layer_metadata.expert_size)?;
-    let len =
-        usize::try_from(metadata.packed_bytes).context("expert pack length does not fit usize")?;
-    let mut bytes = vec![0u8; len];
-    read_exact_at_positioned(&file, &mut bytes, offset)?;
-    Ok(bytes)
-}
-
-fn temp_pack_path(path: &Path) -> PathBuf {
-    let suffix = format!("tmp-{}-{:?}", std::process::id(), thread::current().id());
-    let extension = match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => format!("{ext}.{suffix}"),
-        None => suffix,
-    };
-    path.with_extension(extension)
-}
-
 fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
     let path = expert_layer_path(root, layer);
     let Ok(file) = fs::File::open(&path) else {
@@ -22617,58 +22432,6 @@ fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
     };
     let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
     read_exact_at_positioned(&file, &mut magic, offset).is_ok() && magic == PBQ4_EXPERT_MAGIC
-}
-
-fn finish_expert_pack_atomically(
-    mut out: fs::File,
-    temp_path: &Path,
-    final_path: &Path,
-) -> Result<()> {
-    out.flush()
-        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-    out.sync_all()
-        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
-    drop(out);
-    fs::rename(temp_path, final_path).with_context(|| {
-        format!(
-            "failed to atomically move {} to {}",
-            temp_path.display(),
-            final_path.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn write_expert_metadata_atomically(
-    root: &Path,
-    layer: usize,
-    metadata: &ExpertLayerPackMetadata,
-) -> Result<()> {
-    let path = expert_layer_metadata_path(root, layer);
-    let temp_path = temp_pack_path(&path);
-    let bytes = serde_json::to_vec_pretty(metadata).context("failed to encode expert metadata")?;
-    {
-        let mut out = fs::File::create(&temp_path).with_context(|| {
-            format!(
-                "failed to create temporary expert metadata {}",
-                temp_path.display()
-            )
-        })?;
-        out.write_all(&bytes)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        out.flush()
-            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-        out.sync_all()
-            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
-    }
-    fs::rename(&temp_path, &path).with_context(|| {
-        format!(
-            "failed to atomically move {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn single_aggregate_expert_tensor<'a>(
@@ -23106,44 +22869,6 @@ fn validate_expert_matrix_shape(
         );
     }
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct ExpectedExpertPackRecord {
-    tensor: String,
-    dtype: String,
-    shape: Vec<usize>,
-    source_offsets: [u64; 2],
-    source_hash: String,
-    packed_bytes: u64,
-    groups: usize,
-    group_size: usize,
-    scale_bias_dtype: String,
-}
-
-impl ExpertPackWireRecord for ExpectedExpertPackRecord {
-    fn tensor_name(&self) -> &str {
-        &self.tensor
-    }
-
-    fn packed_bytes(&self) -> u64 {
-        self.packed_bytes
-    }
-
-    fn scale_bias_groups(&self) -> usize {
-        self.groups
-    }
-
-    fn scale_bias_dtype(&self) -> &str {
-        &self.scale_bias_dtype
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ExpectedExpertPack {
-    expert: usize,
-    packed_bytes: u64,
-    records: Vec<ExpectedExpertPackRecord>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
