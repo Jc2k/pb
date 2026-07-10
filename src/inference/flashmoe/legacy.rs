@@ -6999,15 +6999,12 @@ impl MetalExecutorInner {
         let Some(dense_weights) = &self.dense_weights else {
             return Ok(None);
         };
-        let Some(plan) = projections.resident_plan(
+        let plan = projections.resident_plan(
             dense_weights.len,
             attention_output.len(),
             residual.len(),
             post_norm_weight.len(),
-        )?
-        else {
-            return Ok(None);
-        };
+        )?;
         let out_proj = &projections.out_proj;
         let router = &projections.router;
         let width = plan.width;
@@ -7159,15 +7156,12 @@ impl MetalExecutorInner {
         let Some(dense_weights) = &self.dense_weights else {
             return Ok(None);
         };
-        let Some(plan) = projections.resident_plan(
+        let plan = projections.resident_plan(
             dense_weights.len,
             attention_output.len,
             residual.len(),
             post_norm_weight.len(),
-        )?
-        else {
-            return Ok(None);
-        };
+        )?;
         let out_proj = &projections.out_proj;
         let router = &projections.router;
         let width = plan.width;
