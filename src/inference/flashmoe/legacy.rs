@@ -130,15 +130,14 @@ use super::scheduler::{
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualInput, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
     ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
-    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
-    ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
+    ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource};
 #[cfg(test)]
-use super::scheduler::{
-    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledQ4ExpertPhaseMlpPayload,
-};
+use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
@@ -5047,77 +5046,27 @@ impl MetalExecutorInner {
 
             for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
                 let payload = payload.q4();
-                let mut active_work =
+                let active_work =
                     self.cmd3_active_expert_work_buffers(*active_plan, &mut buffers)?;
-                let mut active_stage = MetalCmd3ActiveExpertStageBuffers::new(
+                let active_stage = MetalCmd3ActiveExpertStageBuffers::new(
                     *active_plan,
                     input_buffers,
                     &output_buffers,
                     active_work,
                 )?;
 
-                let fused = self.encode_q4_swiglu(
+                self.encode_q4_swiglu(
                     encoder,
-                    &payload.gate,
-                    &payload.up,
+                    payload,
                     active_stage.normed,
                     active_stage.activated,
                     &mut buffers,
                     &mut q4_source_buffers,
                 )?;
-                if !fused {
-                    active_work = self.cmd3_active_expert_unfused_work_buffers(
-                        *active_plan,
-                        active_work.activated,
-                        &mut buffers,
-                    )?;
-                    active_stage = MetalCmd3ActiveExpertStageBuffers::new(
-                        *active_plan,
-                        input_buffers,
-                        &output_buffers,
-                        active_work,
-                    )?;
-                    let gate_out = active_work.gate_out.context(
-                        "FlashMoe Metal CMD3 active expert unfused work missing gate output",
-                    )?;
-                    let up_out = active_work.up_out.context(
-                        "FlashMoe Metal CMD3 active expert unfused work missing up output",
-                    )?;
-                    self.encode_q4_matvec(
-                        encoder,
-                        &payload.gate,
-                        active_stage.normed,
-                        gate_out,
-                        0,
-                        &mut buffers,
-                        &mut q4_source_buffers,
-                    )?;
-                    self.encode_q4_matvec(
-                        encoder,
-                        &payload.up,
-                        active_stage.normed,
-                        up_out,
-                        0,
-                        &mut buffers,
-                        &mut q4_source_buffers,
-                    )?;
-                    let intermediate_buffer = active_work.intermediate.context(
-                        "FlashMoe Metal CMD3 active expert unfused work missing intermediate constant",
-                    )?;
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        self.pipelines.silu_product_pipeline,
-                    );
-                    set_buffer(encoder, gate_out, 0);
-                    set_buffer(encoder, up_out, 1);
-                    set_buffer(encoder, active_stage.activated, 2);
-                    set_buffer(encoder, intermediate_buffer, 3);
-                    dispatch_threads(encoder, active_stage.plan.dispatch_threads());
-                }
                 self.encode_q4_matvec(
                     encoder,
                     &payload.down,
+                    payload.down_source(),
                     active_stage.activated,
                     active_stage.expert_outputs,
                     active_stage.output_offset,
@@ -5197,6 +5146,7 @@ impl MetalExecutorInner {
         &self,
         encoder: ObjcId,
         payload: &Q4MatvecPayload<'_>,
+        source: Q4MatvecSource<'_>,
         input_buffer: ObjcId,
         output_buffer: ObjcId,
         output_offset: u64,
@@ -5204,75 +5154,20 @@ impl MetalExecutorInner {
         source_buffers: &mut MetalQ4SourceBufferCache,
     ) -> Result<()> {
         unsafe {
-            let expected_bf16_bytes = payload
-                .scale_bias_groups
-                .checked_mul(2)
-                .unwrap_or(usize::MAX);
-            let use_bf16_scale_bias = payload
-                .scale_bias_dtype
-                .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                && payload.scale_bytes.len() == expected_bf16_bytes
-                && payload.bias_bytes.len() == expected_bf16_bytes;
-            let fixed_source = payload.source.filter(|source| {
-                use_bf16_scale_bias && source.covers(payload) && source.offsets_are_metal_aligned()
-            });
-            let (
-                pipeline,
-                packed_buffer,
-                packed_offset,
-                scale_buffer,
-                scale_offset,
-                bias_buffer,
-                bias_offset,
-            ) = if let Some(source) = fixed_source {
-                let buffer = self.q4_source_phase_buffer(source, buffers, source_buffers)?;
-                (
-                    self.pipelines.q4_bf16_scale_bias_pipeline,
-                    buffer,
-                    source.packed_offset as u64,
-                    buffer,
-                    source.scale_offset as u64,
-                    buffer,
-                    source.bias_offset as u64,
-                )
-            } else {
-                let packed_phase_buffer =
-                    self.phase_buffer_with_borrowed_bytes_aligned(payload.packed, 16)?;
-                let packed_buffer = packed_phase_buffer.id;
-                buffers.push(packed_phase_buffer);
-                let (pipeline, scale_bytes, bias_bytes) = if use_bf16_scale_bias {
-                    (
-                        self.pipelines.q4_bf16_scale_bias_pipeline,
-                        payload.scale_bytes,
-                        payload.bias_bytes,
-                    )
-                } else {
-                    (
-                        self.pipelines.q4_pipeline,
-                        f32_as_bytes(payload.scales),
-                        f32_as_bytes(payload.biases),
-                    )
-                };
-                let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
-                let scale_phase_buffer = self
-                    .phase_buffer_with_borrowed_bytes_aligned(scale_bytes, scale_bias_alignment)?;
-                let scale_buffer = scale_phase_buffer.id;
-                buffers.push(scale_phase_buffer);
-                let bias_phase_buffer = self
-                    .phase_buffer_with_borrowed_bytes_aligned(bias_bytes, scale_bias_alignment)?;
-                let bias_buffer = bias_phase_buffer.id;
-                buffers.push(bias_phase_buffer);
-                (pipeline, packed_buffer, 0, scale_buffer, 0, bias_buffer, 0)
-            };
+            let buffer = self.q4_source_phase_buffer(source, buffers, source_buffers)?;
             let rows_u32 = payload.rows as u32;
             let cols_u32 = payload.cols as u32;
             let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
             let group_size_u32 = payload.group_size as u32;
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer_with_offset(encoder, packed_buffer, packed_offset, 0);
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.q4_bf16_scale_bias_pipeline,
+            );
+            set_buffer_with_offset(encoder, buffer, source.packed_offset as u64, 0);
             set_buffer(encoder, input_buffer, 1);
-            set_buffer_with_offset(encoder, scale_buffer, scale_offset, 2);
-            set_buffer_with_offset(encoder, bias_buffer, bias_offset, 3);
+            set_buffer_with_offset(encoder, buffer, source.scale_offset as u64, 2);
+            set_buffer_with_offset(encoder, buffer, source.bias_offset as u64, 3);
             set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
             set_bytes(encoder, u32_as_bytes(&rows_u32), 5);
             set_bytes(encoder, u32_as_bytes(&cols_u32), 6);
@@ -5286,168 +5181,41 @@ impl MetalExecutorInner {
     unsafe fn encode_q4_swiglu(
         &self,
         encoder: ObjcId,
-        gate: &Q4MatvecPayload<'_>,
-        up: &Q4MatvecPayload<'_>,
+        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
         input_buffer: ObjcId,
         output_buffer: ObjcId,
         buffers: &mut Vec<MetalPhaseBuffer>,
         source_buffers: &mut MetalQ4SourceBufferCache,
-    ) -> Result<bool> {
-        if gate.rows != up.rows
-            || gate.cols != up.cols
-            || gate.group_size != up.group_size
-            || gate.scale_bias_dtype != up.scale_bias_dtype
-        {
-            return Ok(false);
-        }
-        let expected_bf16_bytes = gate.scale_bias_groups.checked_mul(2).unwrap_or(usize::MAX);
-        let use_bf16_scale_bias = gate
-            .scale_bias_dtype
-            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-            && gate.scale_bytes.len() == expected_bf16_bytes
-            && gate.bias_bytes.len() == expected_bf16_bytes
-            && up.scale_bytes.len() == expected_bf16_bytes
-            && up.bias_bytes.len() == expected_bf16_bytes;
-        let use_f32_scale_bias = !gate
-            .scale_bias_dtype
-            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16);
-        if !use_bf16_scale_bias && !use_f32_scale_bias {
-            return Ok(false);
-        }
-
+    ) -> Result<()> {
         unsafe {
-            let fixed_sources = gate
-                .source
-                .zip(up.source)
-                .filter(|(gate_source, up_source)| {
-                    use_bf16_scale_bias
-                        && gate_source.same_buffer(*up_source)
-                        && gate_source.covers(gate)
-                        && up_source.covers(up)
-                        && gate_source.offsets_are_metal_aligned()
-                        && up_source.offsets_are_metal_aligned()
-                });
-            let (
-                pipeline,
-                gate_packed_buffer,
-                gate_packed_offset,
-                up_packed_buffer,
-                up_packed_offset,
-                gate_scale_buffer,
-                gate_scale_offset,
-                gate_bias_buffer,
-                gate_bias_offset,
-                up_scale_buffer,
-                up_scale_offset,
-                up_bias_buffer,
-                up_bias_offset,
-            ) = if let Some((gate_source, up_source)) = fixed_sources {
-                let buffer = self.q4_source_phase_buffer(gate_source, buffers, source_buffers)?;
-                (
-                    self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
-                    buffer,
-                    gate_source.packed_offset as u64,
-                    buffer,
-                    up_source.packed_offset as u64,
-                    buffer,
-                    gate_source.scale_offset as u64,
-                    buffer,
-                    gate_source.bias_offset as u64,
-                    buffer,
-                    up_source.scale_offset as u64,
-                    buffer,
-                    up_source.bias_offset as u64,
-                )
-            } else {
-                let gate_packed_phase =
-                    self.phase_buffer_with_borrowed_bytes_aligned(gate.packed, 16)?;
-                let gate_packed_buffer = gate_packed_phase.id;
-                buffers.push(gate_packed_phase);
-                let up_packed_phase =
-                    self.phase_buffer_with_borrowed_bytes_aligned(up.packed, 16)?;
-                let up_packed_buffer = up_packed_phase.id;
-                buffers.push(up_packed_phase);
-
-                let (pipeline, gate_scale_bytes, gate_bias_bytes, up_scale_bytes, up_bias_bytes) =
-                    if use_bf16_scale_bias {
-                        (
-                            self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
-                            gate.scale_bytes,
-                            gate.bias_bytes,
-                            up.scale_bytes,
-                            up.bias_bytes,
-                        )
-                    } else {
-                        (
-                            self.pipelines.q4_swiglu_pipeline,
-                            f32_as_bytes(gate.scales),
-                            f32_as_bytes(gate.biases),
-                            f32_as_bytes(up.scales),
-                            f32_as_bytes(up.biases),
-                        )
-                    };
-                let scale_bias_alignment = if use_bf16_scale_bias { 2 } else { 4 };
-                let gate_scale_phase = self.phase_buffer_with_borrowed_bytes_aligned(
-                    gate_scale_bytes,
-                    scale_bias_alignment,
-                )?;
-                let gate_scale_buffer = gate_scale_phase.id;
-                buffers.push(gate_scale_phase);
-                let gate_bias_phase = self.phase_buffer_with_borrowed_bytes_aligned(
-                    gate_bias_bytes,
-                    scale_bias_alignment,
-                )?;
-                let gate_bias_buffer = gate_bias_phase.id;
-                buffers.push(gate_bias_phase);
-                let up_scale_phase = self.phase_buffer_with_borrowed_bytes_aligned(
-                    up_scale_bytes,
-                    scale_bias_alignment,
-                )?;
-                let up_scale_buffer = up_scale_phase.id;
-                buffers.push(up_scale_phase);
-                let up_bias_phase = self.phase_buffer_with_borrowed_bytes_aligned(
-                    up_bias_bytes,
-                    scale_bias_alignment,
-                )?;
-                let up_bias_buffer = up_bias_phase.id;
-                buffers.push(up_bias_phase);
-                (
-                    pipeline,
-                    gate_packed_buffer,
-                    0,
-                    up_packed_buffer,
-                    0,
-                    gate_scale_buffer,
-                    0,
-                    gate_bias_buffer,
-                    0,
-                    up_scale_buffer,
-                    0,
-                    up_bias_buffer,
-                    0,
-                )
-            };
-
+            let gate = &payload.gate;
+            let gate_source = payload.gate_source();
+            let up_source = payload.up_source();
+            let buffer = self.q4_source_phase_buffer(gate_source, buffers, source_buffers)?;
             let rows_u32 = gate.rows as u32;
             let cols_u32 = gate.cols as u32;
             let groups_u32 = gate.cols.div_ceil(gate.group_size).max(1) as u32;
             let group_size_u32 = gate.group_size as u32;
 
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer_with_offset(encoder, gate_packed_buffer, gate_packed_offset, 0);
-            set_buffer_with_offset(encoder, up_packed_buffer, up_packed_offset, 1);
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
+            );
+            set_buffer_with_offset(encoder, buffer, gate_source.packed_offset as u64, 0);
+            set_buffer_with_offset(encoder, buffer, up_source.packed_offset as u64, 1);
             set_buffer(encoder, input_buffer, 2);
-            set_buffer_with_offset(encoder, gate_scale_buffer, gate_scale_offset, 3);
-            set_buffer_with_offset(encoder, gate_bias_buffer, gate_bias_offset, 4);
-            set_buffer_with_offset(encoder, up_scale_buffer, up_scale_offset, 5);
-            set_buffer_with_offset(encoder, up_bias_buffer, up_bias_offset, 6);
+            set_buffer_with_offset(encoder, buffer, gate_source.scale_offset as u64, 3);
+            set_buffer_with_offset(encoder, buffer, gate_source.bias_offset as u64, 4);
+            set_buffer_with_offset(encoder, buffer, up_source.scale_offset as u64, 5);
+            set_buffer_with_offset(encoder, buffer, up_source.bias_offset as u64, 6);
             set_buffer(encoder, output_buffer, 7);
             set_bytes(encoder, u32_as_bytes(&rows_u32), 8);
             set_bytes(encoder, u32_as_bytes(&cols_u32), 9);
             set_bytes(encoder, u32_as_bytes(&groups_u32), 10);
             set_bytes(encoder, u32_as_bytes(&group_size_u32), 11);
             dispatch_q4_threadgroups(encoder, gate.rows as u64);
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -8444,31 +8212,7 @@ impl MetalExecutorInner {
             let layout = plan.buffer_layout()?;
             let activated = self.buffer_with_len(layout.activation_bytes)?;
             buffers.push(MetalPhaseBuffer::recyclable(activated));
-            MetalCmd3ActiveExpertWorkBuffers::fused(plan, activated)
-        }
-    }
-
-    unsafe fn cmd3_active_expert_unfused_work_buffers(
-        &self,
-        plan: MetalCmd3ActiveExpertPlan,
-        activated: ObjcId,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3ActiveExpertWorkBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let gate_out = self.buffer_with_len(layout.projection_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-            let up_out = self.buffer_with_len(layout.projection_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(up_out));
-            let intermediate = self.buffer_with_bytes(u32_as_bytes(&layout.intermediate_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(intermediate));
-            MetalCmd3ActiveExpertWorkBuffers::unfused(
-                plan,
-                activated,
-                gate_out,
-                up_out,
-                intermediate,
-            )
+            MetalCmd3ActiveExpertWorkBuffers::new(plan, activated)
         }
     }
 
@@ -21230,10 +20974,14 @@ mod tests {
         let out = fixed_expert.mlp(&hidden, 2).unwrap();
         assert_close(out[0], 15.0 * intermediate[0]);
         assert_close(out[1], 15.0 * intermediate[1]);
-        assert!(matches!(
-            fixed_expert.scheduled_cmd3_expert_phase_payload(2).unwrap(),
-            ScheduledExpertPhaseMlpPayload::Q4(_)
-        ));
+        let err = fixed_expert
+            .scheduled_cmd3_expert_phase_payload(2)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("offsets are outside or misaligned"),
+            "{err:#}"
+        );
     }
 
     #[test]

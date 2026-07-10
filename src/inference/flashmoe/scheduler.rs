@@ -5,9 +5,9 @@ use super::capabilities::{
     FlashMoeUnsupportedCapability,
 };
 use super::experts::{
-    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertReadWorkerPool,
-    ExpertSlotDescriptor, ExpertSlotStore, FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection,
-    Q4MatvecPayload,
+    EXPERT_SCALE_BIAS_DTYPE_BF16, ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse,
+    ExpertReadPath, ExpertReadWorkerPool, ExpertSlotDescriptor, ExpertSlotStore,
+    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection, Q4MatvecPayload, Q4MatvecSource,
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::QwenMoeFamily;
@@ -1713,6 +1713,9 @@ pub struct ScheduledQ4ExpertPhaseMlpPayload<'a> {
     pub(crate) gate: Q4MatvecPayload<'a>,
     pub(crate) up: Q4MatvecPayload<'a>,
     pub(crate) down: Q4MatvecPayload<'a>,
+    gate_source: Q4MatvecSource<'a>,
+    up_source: Q4MatvecSource<'a>,
+    down_source: Q4MatvecSource<'a>,
 }
 
 impl<'a> ScheduledQ4ExpertPhaseMlpPayload<'a> {
@@ -1755,7 +1758,83 @@ impl<'a> ScheduledQ4ExpertPhaseMlpPayload<'a> {
                 down.cols
             );
         }
-        Ok(Self { gate, up, down })
+        if gate.group_size != up.group_size || gate.group_size != down.group_size {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} has mismatched group sizes gate={} up={} down={}",
+                gate.group_size,
+                up.group_size,
+                down.group_size
+            );
+        }
+        let gate_source = Self::required_fixed_source(layer, expert, "gate", &gate)?;
+        let up_source = Self::required_fixed_source(layer, expert, "up", &up)?;
+        let down_source = Self::required_fixed_source(layer, expert, "down", &down)?;
+        if !gate_source.same_buffer(up_source) || !gate_source.same_buffer(down_source) {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} projections do not share one scheduler-owned whole-expert slot"
+            );
+        }
+        Ok(Self {
+            gate,
+            up,
+            down,
+            gate_source,
+            up_source,
+            down_source,
+        })
+    }
+
+    fn required_fixed_source(
+        layer: usize,
+        expert: usize,
+        projection: &str,
+        payload: &Q4MatvecPayload<'a>,
+    ) -> Result<Q4MatvecSource<'a>> {
+        if !payload
+            .scale_bias_dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection uses {} scale/bias values; the resolved implementation requires BF16",
+                payload.scale_bias_dtype
+            );
+        }
+        let expected_scale_bias_bytes = payload
+            .scale_bias_groups
+            .checked_mul(std::mem::size_of::<u16>())
+            .context("fixed Q4 expert scale/bias byte size overflow")?;
+        if payload.scale_bytes.len() != expected_scale_bias_bytes
+            || payload.bias_bytes.len() != expected_scale_bias_bytes
+        {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection has scale/bias byte lengths {}/{}; expected {expected_scale_bias_bytes}",
+                payload.scale_bytes.len(),
+                payload.bias_bytes.len()
+            );
+        }
+        let source = payload.source.with_context(|| {
+            format!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection is not backed by a scheduler-owned whole-expert slot"
+            )
+        })?;
+        if !source.covers(payload) || !source.offsets_are_metal_aligned() {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection offsets are outside or misaligned for its scheduler-owned whole-expert slot"
+            );
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn gate_source(&self) -> Q4MatvecSource<'a> {
+        self.gate_source
+    }
+
+    pub(crate) fn up_source(&self) -> Q4MatvecSource<'a> {
+        self.up_source
+    }
+
+    pub(crate) fn down_source(&self) -> Q4MatvecSource<'a> {
+        self.down_source
     }
 }
 
@@ -2936,52 +3015,52 @@ mod tests {
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
         use QwenMoeExpertComponentKind::*;
         QwenMoeQ4ExpertLayout {
-            expert_bytes: 30,
+            expert_bytes: 48,
             group_size: 2,
             components: [
                 QwenMoeExpertComponentLayout {
                     kind: GateWeight,
                     offset: 0,
-                    bytes: 2,
+                    bytes: 8,
                 },
                 QwenMoeExpertComponentLayout {
                     kind: GateScale,
-                    offset: 2,
+                    offset: 8,
                     bytes: 4,
                 },
                 QwenMoeExpertComponentLayout {
                     kind: GateBias,
-                    offset: 6,
-                    bytes: 4,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpWeight,
-                    offset: 10,
-                    bytes: 2,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpScale,
                     offset: 12,
                     bytes: 4,
                 },
                 QwenMoeExpertComponentLayout {
-                    kind: UpBias,
+                    kind: UpWeight,
                     offset: 16,
+                    bytes: 8,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpScale,
+                    offset: 24,
+                    bytes: 4,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: UpBias,
+                    offset: 28,
                     bytes: 4,
                 },
                 QwenMoeExpertComponentLayout {
                     kind: DownWeight,
-                    offset: 20,
-                    bytes: 2,
+                    offset: 32,
+                    bytes: 8,
                 },
                 QwenMoeExpertComponentLayout {
                     kind: DownScale,
-                    offset: 22,
+                    offset: 40,
                     bytes: 4,
                 },
                 QwenMoeExpertComponentLayout {
                     kind: DownBias,
-                    offset: 26,
+                    offset: 44,
                     bytes: 4,
                 },
             ],
@@ -3281,25 +3360,28 @@ mod tests {
         }
     }
 
-    static DUMMY_Q4_PACKED: [u8; 64] = [0; 64];
-    static DUMMY_Q4_SCALES: [f32; 64] = [1.0; 64];
-    static DUMMY_Q4_BIASES: [f32; 64] = [0.0; 64];
-    static DUMMY_Q4_SCALE_BYTES: [u8; 128] = [0; 128];
-    static DUMMY_Q4_BIAS_BYTES: [u8; 128] = [0; 128];
+    static DUMMY_Q4_SLOT: [u8; 512] = [0; 512];
 
     fn dummy_q4_payload(rows: usize, cols: usize) -> Q4MatvecPayload<'static> {
+        let packed_bytes = rows * cols.div_ceil(2);
+        let scale_bias_bytes = rows * cols.div_ceil(8) * 2;
         Q4MatvecPayload {
             rows,
             cols,
             group_size: 8,
-            packed: &DUMMY_Q4_PACKED[..rows * cols.div_ceil(2)],
-            scales: &DUMMY_Q4_SCALES[..rows * cols.div_ceil(8)],
-            biases: &DUMMY_Q4_BIASES[..rows * cols.div_ceil(8)],
+            packed: &DUMMY_Q4_SLOT[..packed_bytes],
+            scales: &[],
+            biases: &[],
             scale_bias_groups: rows * cols.div_ceil(8),
             scale_bias_dtype: "BF16",
-            scale_bytes: &DUMMY_Q4_SCALE_BYTES[..rows * cols.div_ceil(8) * 2],
-            bias_bytes: &DUMMY_Q4_BIAS_BYTES[..rows * cols.div_ceil(8) * 2],
-            source: None,
+            scale_bytes: &DUMMY_Q4_SLOT[128..128 + scale_bias_bytes],
+            bias_bytes: &DUMMY_Q4_SLOT[256..256 + scale_bias_bytes],
+            source: Some(Q4MatvecSource {
+                bytes: &DUMMY_Q4_SLOT,
+                packed_offset: 0,
+                scale_offset: 128,
+                bias_offset: 256,
+            }),
         }
     }
 
@@ -5130,6 +5212,48 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_q4_cmd3_payload_requires_fixed_whole_slot_source() {
+        let mut gate = dummy_q4_payload(4, 8);
+        gate.source = None;
+        let err = ScheduledQ4ExpertPhaseMlpPayload::new(
+            7,
+            3,
+            8,
+            gate,
+            dummy_q4_payload(4, 8),
+            dummy_q4_payload(8, 4),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("not backed by a scheduler-owned whole-expert slot"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn scheduled_q4_cmd3_payload_rejects_unresolved_scale_layout() {
+        let mut gate = dummy_q4_payload(4, 8);
+        gate.scale_bias_dtype = "F32";
+        let err = ScheduledQ4ExpertPhaseMlpPayload::new(
+            7,
+            3,
+            8,
+            gate,
+            dummy_q4_payload(4, 8),
+            dummy_q4_payload(8, 4),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("resolved implementation requires BF16"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn scheduled_cmd3_submission_rejects_mismatched_sources_without_fallback() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
@@ -5738,8 +5862,8 @@ mod tests {
             .source
             .expect("fixed slot should expose source offsets");
         assert_eq!(source.packed_offset, 0);
-        assert_eq!(source.scale_offset, 2);
-        assert_eq!(source.bias_offset, 6);
+        assert_eq!(source.scale_offset, 8);
+        assert_eq!(source.bias_offset, 12);
     }
 
     #[test]

@@ -162,6 +162,10 @@ Baseline reviewed on 2026-07-10:
 - A production `FlashMoeEngine` now owns a required `MetalExecutor`. Metal-disabled and non-Apple
   construction fail explicitly, so a graph that selects required Metal stages cannot be represented
   by an engine with an absent executor.
+- Scheduler-owned Q4 CMD3 payloads now validate BF16 scale/bias layout and aligned gate/up/down
+  views into one whole-expert slot before encoding. The active-expert encoder has one fused
+  whole-slot implementation; its component-upload and unfused SwiGLU substitution have been
+  removed.
 - Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
   no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
@@ -174,11 +178,9 @@ The architecture is not yet at the target:
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
   `VisionEncoder` remain in `legacy.rs`.
-- Live dense/attention/expert helpers still use `Option`, boolean success, and `Ok(None)` to discover
+- Live dense/attention/CMD2 helpers still use `Option`, boolean success, and `Ok(None)` to discover
   particular implementations and continue through another path. These are now the remaining Gate 1
-  resolution boundary, rather than an optional engine/device boundary.
-- Active Q4 execution can still switch from fused whole-slot handling to unfused/component-shaped
-  work after graph resolution.
+  resolution boundary, rather than the engine/device or active-expert CMD3 boundaries.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.

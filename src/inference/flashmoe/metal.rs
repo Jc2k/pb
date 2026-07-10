@@ -1592,9 +1592,6 @@ pub(crate) struct MetalCmd3ActiveExpertBufferLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalCmd3ActiveExpertWorkBuffers {
     pub(crate) activated: MetalObjcId,
-    pub(crate) gate_out: Option<MetalObjcId>,
-    pub(crate) up_out: Option<MetalObjcId>,
-    pub(crate) intermediate: Option<MetalObjcId>,
     pub(crate) layout: MetalCmd3ActiveExpertBufferLayout,
 }
 
@@ -1633,31 +1630,12 @@ impl MetalCmd3ActiveExpertStageBuffers {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3ActiveExpertWorkBuffers {
-    pub(crate) fn fused(
+    pub(crate) fn new(
         plan: MetalCmd3ActiveExpertPlan,
         activated: MetalObjcId,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             activated,
-            gate_out: None,
-            up_out: None,
-            intermediate: None,
-            layout: plan.buffer_layout()?,
-        })
-    }
-
-    pub(crate) fn unfused(
-        plan: MetalCmd3ActiveExpertPlan,
-        activated: MetalObjcId,
-        gate_out: MetalObjcId,
-        up_out: MetalObjcId,
-        intermediate: MetalObjcId,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            activated,
-            gate_out: Some(gate_out),
-            up_out: Some(up_out),
-            intermediate: Some(intermediate),
             layout: plan.buffer_layout()?,
         })
     }
@@ -1711,10 +1689,6 @@ impl MetalCmd3ActiveExpertPlan {
 
     pub(crate) fn projection_output_bytes(self) -> anyhow::Result<usize> {
         Self::f32_bytes("projection output", self.intermediate)
-    }
-
-    pub(crate) fn dispatch_threads(self) -> u64 {
-        self.intermediate as u64
     }
 
     pub(crate) fn buffer_layout(self) -> anyhow::Result<MetalCmd3ActiveExpertBufferLayout> {
@@ -4529,37 +4503,19 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn cmd3_active_expert_work_buffers_carry_declared_layout() {
+    fn cmd3_active_expert_work_buffers_carry_fused_layout() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
         let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
         let payload = test_q4_expert_payload(6, 4);
         let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
 
         let fused =
-            MetalCmd3ActiveExpertWorkBuffers::fused(plan, 0x1000usize as MetalObjcId).unwrap();
+            MetalCmd3ActiveExpertWorkBuffers::new(plan, 0x1000usize as MetalObjcId).unwrap();
 
         assert_eq!(fused.activated, 0x1000usize as MetalObjcId);
-        assert_eq!(fused.gate_out, None);
-        assert_eq!(fused.up_out, None);
-        assert_eq!(fused.intermediate, None);
         assert_eq!(fused.layout.intermediate_u32, 6);
         assert_eq!(fused.layout.activation_bytes, 6 * 4);
         assert_eq!(fused.layout.projection_output_bytes, 6 * 4);
-
-        let unfused = MetalCmd3ActiveExpertWorkBuffers::unfused(
-            plan,
-            0x1000usize as MetalObjcId,
-            0x2000usize as MetalObjcId,
-            0x3000usize as MetalObjcId,
-            0x4000usize as MetalObjcId,
-        )
-        .unwrap();
-
-        assert_eq!(unfused.activated, 0x1000usize as MetalObjcId);
-        assert_eq!(unfused.gate_out, Some(0x2000usize as MetalObjcId));
-        assert_eq!(unfused.up_out, Some(0x3000usize as MetalObjcId));
-        assert_eq!(unfused.intermediate, Some(0x4000usize as MetalObjcId));
-        assert_eq!(unfused.layout, fused.layout);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4597,8 +4553,8 @@ mod tests {
         )
         .unwrap();
         let active_plan = execution.active_experts[1];
-        let work = MetalCmd3ActiveExpertWorkBuffers::fused(active_plan, 0x6000usize as MetalObjcId)
-            .unwrap();
+        let work =
+            MetalCmd3ActiveExpertWorkBuffers::new(active_plan, 0x6000usize as MetalObjcId).unwrap();
 
         let stage =
             MetalCmd3ActiveExpertStageBuffers::new(active_plan, inputs, &outputs, work).unwrap();
@@ -4757,7 +4713,6 @@ mod tests {
         assert_eq!(plan.activation_bytes().unwrap(), 6 * 4);
         assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
         assert_eq!(plan.output_offset, 4 * 4);
-        assert_eq!(plan.dispatch_threads(), 6);
         assert_eq!(
             plan.buffer_layout().unwrap(),
             MetalCmd3ActiveExpertBufferLayout {
@@ -4951,19 +4906,30 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static TEST_Q4_EXPERT_SLOT: [u8; 4096] = [0; 4096];
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn test_q4_matvec_payload(rows: usize, cols: usize) -> Q4MatvecPayload<'static> {
+        let packed_bytes = rows * cols.div_ceil(2);
+        let scale_bias_groups = rows * cols.div_ceil(16);
+        let scale_bias_bytes = scale_bias_groups * 2;
         Q4MatvecPayload {
             rows,
             cols,
             group_size: 16,
-            packed: &[],
+            packed: &TEST_Q4_EXPERT_SLOT[..packed_bytes],
             scales: &[],
             biases: &[],
-            scale_bias_groups: 0,
-            scale_bias_dtype: "F32",
-            scale_bytes: &[],
-            bias_bytes: &[],
-            source: None,
+            scale_bias_groups,
+            scale_bias_dtype: "BF16",
+            scale_bytes: &TEST_Q4_EXPERT_SLOT[1024..1024 + scale_bias_bytes],
+            bias_bytes: &TEST_Q4_EXPERT_SLOT[2048..2048 + scale_bias_bytes],
+            source: Some(super::super::experts::Q4MatvecSource {
+                bytes: &TEST_Q4_EXPERT_SLOT,
+                packed_offset: 0,
+                scale_offset: 1024,
+                bias_offset: 2048,
+            }),
         }
     }
 
