@@ -111,9 +111,9 @@ use super::scheduler::{
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionInput,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualInput, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
-    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledCmd3Submission,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
-    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertReadCoordinator as ExpertScheduler, ScheduledExpertSlot,
+    ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
     ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -1934,12 +1934,6 @@ impl ScheduledCmd3Input for ExpertPhaseInput<'_> {
     }
 }
 
-type ScheduledExpertPhase<'a> = ScheduledCmd3Submission<
-    'a,
-    Arc<ScheduledExpertSlot>,
-    ExpertPhaseInput<'a>,
-    SharedExpertPhaseRef<'a>,
->;
 type ScheduledExpertCommand<'a> = ScheduledCmd3Command<
     'a,
     Arc<ScheduledExpertSlot>,
@@ -2181,14 +2175,6 @@ impl MetalExecutor {
                 "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
             );
         }
-    }
-
-    fn submit_scheduled_expert_phase(
-        &self,
-        phase: ScheduledExpertPhase<'_>,
-    ) -> Result<DeferredExpertPhase> {
-        let command = phase.into_cmd3_command()?;
-        self.submit_scheduled_expert_command(command)
     }
 
     fn submit_scheduled_expert_command(

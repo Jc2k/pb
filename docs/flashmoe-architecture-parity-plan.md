@@ -171,9 +171,10 @@ The validator should reject silent fallbacks such as:
   post-attention prep now resolves through the scheduler-owned CMD2 output before recording the
   approved preselected routing command for the runtime, so CMD2-to-routing handoff is not just a
   loose active-expert vector.
-  Scheduled CMD3 Metal submission now consumes a scheduler-resolved CMD3 command, returns a concrete
-  deferred phase from both the wrapper and inner scheduled helpers, and treats "no submitted phase"
-  as an unsupported implementation gap instead of returning to a fallback-shaped caller path.
+  Scheduled CMD3 Metal submission now consumes only a scheduler-resolved CMD3 command, returns a
+  concrete deferred phase from both the wrapper and inner scheduled helpers, and treats "no
+  submitted phase" as an unsupported implementation gap instead of returning to a fallback-shaped
+  caller path.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
