@@ -620,6 +620,18 @@ pub(crate) fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
     format!("model.layers.{layer}.{name}.weight")
 }
 
+pub(crate) fn router_tensor_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.gate.weight")
+}
+
+pub(crate) fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert.{projection}.weight")
+}
+
+pub(crate) fn shared_expert_gate_tensor_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
+}
+
 pub(crate) fn prepare_scheduled_next_norm_weights<F>(
     layer: usize,
     total_layers: usize,
@@ -1533,6 +1545,23 @@ mod tests {
         assert!(err.to_string().contains(
             "missing next-layer norm weight model.layers.3.input_layernorm.weight for layer 2"
         ));
+    }
+
+    #[test]
+    fn qwen_moe_weight_tensor_names_are_canonical_hf_paths() {
+        assert_eq!(
+            layer_norm_tensor_name(7, "post_attention_layernorm"),
+            "model.layers.7.post_attention_layernorm.weight"
+        );
+        assert_eq!(router_tensor_name(7), "model.layers.7.mlp.gate.weight");
+        assert_eq!(
+            shared_expert_tensor_name(7, "gate_proj"),
+            "model.layers.7.mlp.shared_expert.gate_proj.weight"
+        );
+        assert_eq!(
+            shared_expert_gate_tensor_name(7),
+            "model.layers.7.mlp.shared_expert_gate.weight"
+        );
     }
 
     #[test]

@@ -141,7 +141,8 @@ use super::weights::{
     SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, canonical_hf_tensor_name,
     dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
-    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, validate_dense_matvec_shape,
+    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
+    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -15423,18 +15424,6 @@ fn is_full_attention_layer(layer: usize) -> bool {
     // Flash-MoE schedules full attention every 4th layer when counted from 1.
     // In 0-indexed coordinates that is layers 3, 7, 11, ...
     (layer + 1).is_multiple_of(FULL_ATTN_INTERVAL)
-}
-
-fn router_tensor_name(layer: usize) -> String {
-    format!("model.layers.{layer}.mlp.gate.weight")
-}
-
-fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
-    format!("model.layers.{layer}.mlp.shared_expert.{projection}.weight")
-}
-
-fn shared_expert_gate_tensor_name(layer: usize) -> String {
-    format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
 }
 
 fn dense_projection_tile_rows(cols: usize, rows: usize) -> usize {

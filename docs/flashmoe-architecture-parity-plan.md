@@ -181,10 +181,11 @@ The validator should reject silent fallbacks such as:
 - Dense weights are closer to the upstream resident-blob model than experts are. `weights` now owns
   typed resident projection descriptors for dense, Q4, shared expert, and router score bindings plus
   the router score batch data model. Shared expert dense/Q4 descriptor groups now validate and
-  expose their graph shape before the scheduler accepts them. CMD3 next-layer norm tensor naming,
-  Qwen3Next norm-offset policy, and prepared scheduled next-norm descriptors also live in `weights`,
-  so the generation loop supplies a lookup closure instead of owning that weight-policy branch.
-  Command construction and much of runtime score execution still flows through `legacy.rs` shims.
+  expose their graph shape before the scheduler accepts them. Canonical router, shared expert, and
+  CMD3 next-layer norm tensor naming, Qwen3Next norm-offset policy, and prepared scheduled next-norm
+  descriptors also live in `weights`, so the generation loop supplies a lookup closure instead of
+  owning that weight-policy branch. Command construction and much of runtime score execution still
+  flows through `legacy.rs` shims.
 - `state.rs` owns CPU-visible hidden/residual/normed/next-normed buffers and now also describes
   GPU-resident hidden, residual, normed, and next-layer normed buffers with typed roles and lengths.
   CMD1 now declares its actual input as either CPU-visible normed state or GPU-resident
