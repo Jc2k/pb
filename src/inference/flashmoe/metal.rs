@@ -118,6 +118,51 @@ impl MetalAttentionValues {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalQ4SourceBufferKey {
+    ptr: usize,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalQ4SourceBufferEntry {
+    key: MetalQ4SourceBufferKey,
+    buffer: MetalObjcId,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+pub(crate) struct MetalQ4SourceBufferCache {
+    entries: Vec<MetalQ4SourceBufferEntry>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalQ4SourceBufferCache {
+    fn key_for(bytes: &[u8]) -> MetalQ4SourceBufferKey {
+        MetalQ4SourceBufferKey {
+            ptr: bytes.as_ptr() as usize,
+            len: bytes.len(),
+        }
+    }
+
+    pub(crate) fn get(&self, bytes: &[u8]) -> Option<MetalObjcId> {
+        let key = Self::key_for(bytes);
+        self.entries
+            .iter()
+            .find_map(|entry| (entry.key == key).then_some(entry.buffer))
+    }
+
+    pub(crate) fn insert(&mut self, bytes: &[u8], buffer: MetalObjcId) {
+        let key = Self::key_for(bytes);
+        if self.entries.iter().any(|entry| entry.key == key) {
+            return;
+        }
+        self.entries.push(MetalQ4SourceBufferEntry { key, buffer });
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2583,6 +2628,20 @@ mod tests {
             err.to_string()
                 .contains("Metal post-attention input for layer 3")
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_q4_source_buffer_cache_reuses_same_fixed_payload_key() {
+        let first = [1u8; 16];
+        let second = [2u8; 16];
+        let buffer = 0x1000usize as MetalObjcId;
+        let mut cache = MetalQ4SourceBufferCache::default();
+
+        cache.insert(&first, buffer);
+
+        assert_eq!(cache.get(&first), Some(buffer));
+        assert_eq!(cache.get(&second), None);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

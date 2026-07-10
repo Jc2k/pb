@@ -106,7 +106,8 @@ use super::metal::{
     MetalBatchProjectionInput, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
     MetalCommandWaitPolicy, MetalCommandWaitResult, MetalLinearAttentionStaticOffsets,
     MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep,
-    MetalProjectionBatch, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalProjectionBatch, MetalQ4SourceBufferCache, metal_command_failure_requires_release,
+    resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2834,51 +2835,6 @@ struct MetalLinearAttentionLayerState {
     conv_dim: usize,
     total_value_width: usize,
     num_value_heads: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MetalQ4SourceBufferKey {
-    ptr: usize,
-    len: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-struct MetalQ4SourceBufferEntry {
-    key: MetalQ4SourceBufferKey,
-    buffer: ObjcId,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
-struct MetalQ4SourceBufferCache {
-    entries: Vec<MetalQ4SourceBufferEntry>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalQ4SourceBufferCache {
-    fn key_for(bytes: &[u8]) -> MetalQ4SourceBufferKey {
-        MetalQ4SourceBufferKey {
-            ptr: bytes.as_ptr() as usize,
-            len: bytes.len(),
-        }
-    }
-
-    fn get(&self, bytes: &[u8]) -> Option<ObjcId> {
-        let key = Self::key_for(bytes);
-        self.entries
-            .iter()
-            .find_map(|entry| (entry.key == key).then_some(entry.buffer))
-    }
-
-    fn insert(&mut self, bytes: &[u8], buffer: ObjcId) {
-        let key = Self::key_for(bytes);
-        if self.entries.iter().any(|entry| entry.key == key) {
-            return;
-        }
-        self.entries.push(MetalQ4SourceBufferEntry { key, buffer });
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -21969,20 +21925,6 @@ mod tests {
         for (actual, expected) in lazy_out.iter().zip(eager_out.iter()) {
             assert_close(*actual, *expected);
         }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn metal_q4_source_buffer_cache_reuses_same_fixed_payload_key() {
-        let first = [1u8; 16];
-        let second = [2u8; 16];
-        let buffer = 0x1000usize as ObjcId;
-        let mut cache = MetalQ4SourceBufferCache::default();
-
-        cache.insert(&first, buffer);
-
-        assert_eq!(cache.get(&first), Some(buffer));
-        assert_eq!(cache.get(&second), None);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
