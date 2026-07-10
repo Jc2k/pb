@@ -4854,23 +4854,14 @@ impl MetalExecutorInner {
             ];
             let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
             buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
-            let expert_outputs_buffer = self.buffer_with_len(
-                expert_count
-                    .max(1)
-                    .checked_mul(width)
-                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
-                    .context("expert output buffer size overflow")?,
-            )?;
+            let expert_outputs_buffer = self.buffer_with_len(plan.expert_outputs_bytes()?)?;
             buffers.push(MetalPhaseBuffer::recyclable(expert_outputs_buffer));
-            let shared_output_buffer =
-                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            let shared_output_buffer = self.buffer_with_len(plan.shared_output_bytes()?)?;
             buffers.push(MetalPhaseBuffer::recyclable(shared_output_buffer));
-            let hidden_buffer =
-                self.buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            let hidden_buffer = self.buffer_with_len(plan.hidden_output_bytes()?)?;
             buffers.push(MetalPhaseBuffer::recyclable(hidden_buffer));
-            let next_normed_buffer = if next_norm_weight.is_some() {
-                let buffer = self
-                    .buffer_with_len(width.checked_mul(std::mem::size_of::<f32>()).unwrap_or(0))?;
+            let next_normed_buffer = if let Some(bytes) = plan.next_normed_output_bytes()? {
+                let buffer = self.buffer_with_len(bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(buffer));
                 Some(buffer)
             } else {
@@ -4889,7 +4880,7 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE deferred expert compute encoder");
             }
 
-            let width_u32 = width as u32;
+            let width_u32 = plan.width_u32();
             let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
             let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
@@ -5082,11 +5073,7 @@ impl MetalExecutorInner {
                     set_buffer(encoder, intermediate_buffer, 3);
                     dispatch_threads(encoder, payload.gate.rows as u64);
                 }
-                let expert_offset = idx
-                    .checked_mul(width)
-                    .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
-                    .context("expert output buffer offset overflow")?
-                    as u64;
+                let expert_offset = plan.expert_output_offset(idx)?;
                 self.encode_q4_matvec(
                     encoder,
                     &payload.down,
@@ -5098,7 +5085,7 @@ impl MetalExecutorInner {
                 )?;
             }
 
-            let active_u32 = expert_count as u32;
+            let active_u32 = plan.active_count_u32();
             let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
             msg_send_void1_id(

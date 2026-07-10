@@ -972,6 +972,18 @@ impl MetalCmd3PhasePlan {
         if expert_count == 0 {
             anyhow::bail!("FlashMoe Metal CMD3 phase requires at least one active expert");
         }
+        if width > u32::MAX as usize {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 phase width {} does not fit Metal u32 constants",
+                width
+            );
+        }
+        if expert_count > u32::MAX as usize {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 phase expert count {} does not fit Metal u32 constants",
+                expert_count
+            );
+        }
         if weights_len != expert_count || payloads_len != expert_count {
             anyhow::bail!(
                 "FlashMoe Metal CMD3 phase expert count {} does not match weights={} payloads={}",
@@ -1003,6 +1015,58 @@ impl MetalCmd3PhasePlan {
             output_state,
             has_next_norm,
         })
+    }
+
+    pub(crate) fn width_u32(self) -> u32 {
+        self.width as u32
+    }
+
+    pub(crate) fn active_count_u32(self) -> u32 {
+        self.expert_count as u32
+    }
+
+    pub(crate) fn expert_outputs_bytes(self) -> anyhow::Result<usize> {
+        let items = self.expert_count.checked_mul(self.width).ok_or_else(|| {
+            anyhow::anyhow!("FlashMoe Metal CMD3 expert output item count overflow")
+        })?;
+        Self::f32_bytes("expert output", items)
+    }
+
+    pub(crate) fn shared_output_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("shared expert output", self.width)
+    }
+
+    pub(crate) fn hidden_output_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("hidden output", self.width)
+    }
+
+    pub(crate) fn next_normed_output_bytes(self) -> anyhow::Result<Option<usize>> {
+        if self.has_next_norm {
+            Self::f32_bytes("next-normed output", self.width).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn expert_output_offset(self, index: usize) -> anyhow::Result<u64> {
+        if index >= self.expert_count {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 expert output index {} exceeds active expert count {}",
+                index,
+                self.expert_count
+            );
+        }
+        let items = index.checked_mul(self.width).ok_or_else(|| {
+            anyhow::anyhow!("FlashMoe Metal CMD3 expert output offset item count overflow")
+        })?;
+        let bytes = Self::f32_bytes("expert output offset", items)?;
+        Ok(bytes as u64)
+    }
+
+    fn f32_bytes(label: &str, items: usize) -> anyhow::Result<usize> {
+        items
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("FlashMoe Metal CMD3 {label} byte size overflow"))
     }
 }
 
@@ -3294,6 +3358,14 @@ mod tests {
         assert_eq!(plan.width, 16);
         assert_eq!(plan.output_state, output_state);
         assert!(plan.has_next_norm);
+        assert_eq!(plan.width_u32(), 16);
+        assert_eq!(plan.active_count_u32(), 4);
+        assert_eq!(plan.expert_outputs_bytes().unwrap(), 4 * 16 * 4);
+        assert_eq!(plan.shared_output_bytes().unwrap(), 16 * 4);
+        assert_eq!(plan.hidden_output_bytes().unwrap(), 16 * 4);
+        assert_eq!(plan.next_normed_output_bytes().unwrap(), Some(16 * 4));
+        assert_eq!(plan.expert_output_offset(0).unwrap(), 0);
+        assert_eq!(plan.expert_output_offset(3).unwrap(), 3 * 16 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3314,6 +3386,15 @@ mod tests {
                 .to_string()
                 .contains("next-norm output declaration"),
             "{output_err:#}"
+        );
+
+        let wide_state = FlashMoeCmd3OutputState::gpu_resident(u32::MAX as usize + 1, false);
+        let width_err =
+            MetalCmd3PhasePlan::new(9, 3, 4, u32::MAX as usize + 1, 4, 4, wide_state, false)
+                .unwrap_err();
+        assert!(
+            width_err.to_string().contains("does not fit Metal u32"),
+            "{width_err:#}"
         );
     }
 
