@@ -4,7 +4,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::experts::{EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size};
+use super::experts::{
+    AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
+};
 use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
 use super::types::{ExpertQuantization, GROUP_SIZE};
 use anyhow::{Context, Result, bail};
@@ -31,6 +33,20 @@ pub struct ExpertTensorRef {
     pub source_offsets: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q4_sources: Option<DenseQ4SourceRefs>,
+}
+
+impl AggregateExpertTensor for ExpertTensorRef {
+    fn aggregate_tensor_name(&self) -> &str {
+        &self.tensor
+    }
+
+    fn aggregate_tensor_shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn aggregate_tensor_has_native_q4(&self) -> bool {
+        self.q4_sources.is_some()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

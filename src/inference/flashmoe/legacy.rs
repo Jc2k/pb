@@ -74,17 +74,18 @@ use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
-    AggregateExpertLayout, AggregateExpertTensorKind, EXPERT_PACK_SCALE_BIAS_DTYPE,
-    EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, ExpectedExpertPack,
-    ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload, ExpertRawRead,
-    ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
+    AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors,
+    EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
+    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
+    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
     FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
-    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, build_expert_pack,
-    build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
-    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
-    first_missing_expert_pack_for_shape, fixed_q4_payload_from_pbq4_records,
-    parse_pbq4_expert_pack, pbq4_expert_pack_wire_size, rewrite_expert_layer_pack,
-    rewrite_pbq4_layer_to_fixed_q4,
+    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, aggregate_expert_tensors,
+    aggregate_native_q4_enabled, build_expert_pack, build_fixed_native_q4_expert_pack,
+    build_native_q4_expert_pack, cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
+    first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
+    fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
+    rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
+    validate_aggregate_expert_tensor_shape,
 };
 #[cfg(test)]
 use super::experts::{
@@ -21753,12 +21754,12 @@ fn pack_aggregate_expert_layer(
             &mut shard_cache,
             layer,
             expert,
-            aggregate_tensors,
+            &aggregate_tensors,
             down,
             layout,
         )?;
         let packed_bytes =
-            if fixed_native_q4_aggregate_layout(aggregate_tensors, down, layout)?.is_some() {
+            if fixed_native_q4_aggregate_layout(&aggregate_tensors, down, layout)?.is_some() {
                 QwenMoeQ4ExpertLayout::qwen35_a17b().expert_bytes as u64
             } else {
                 pbq4_expert_pack_wire_size(&records)?
@@ -21780,7 +21781,7 @@ fn pack_aggregate_expert_layer(
                 &mut shard_cache,
                 layer,
                 expert,
-                aggregate_tensors,
+                &aggregate_tensors,
                 down,
                 layout,
             )
@@ -21793,92 +21794,12 @@ fn pack_aggregate_expert_layer(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AggregateExpertTensors<'a> {
-    gate: AggregateExpertSlice<'a>,
-    up: AggregateExpertSlice<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AggregateExpertSlice<'a> {
-    tensor: &'a ExpertTensorRef,
-    expert_stride_values: usize,
-    expert_offset_values: usize,
-}
-
-impl AggregateExpertSlice<'_> {
-    fn start(self, expert: usize) -> Result<usize> {
-        expert
-            .checked_mul(self.expert_stride_values)
-            .and_then(|base| base.checked_add(self.expert_offset_values))
-            .context("aggregate expert slice offset overflow")
-    }
-}
-
-fn aggregate_expert_tensors<'a>(
-    tensors: &[&'a ExpertTensorRef],
-    layer: usize,
-    layout: AggregateExpertLayout,
-) -> Result<AggregateExpertTensors<'a>> {
-    let gate_up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp);
-    let gate = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Gate);
-    let up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Up);
-    match (gate_up, gate, up) {
-        (Some(gate_up), None, None) => {
-            validate_aggregate_expert_tensor_shape(
-                gate_up,
-                &[layout.experts, layout.intermediate * 2, layout.hidden],
-                "gate_up_proj",
-            )?;
-            Ok(AggregateExpertTensors {
-                gate: AggregateExpertSlice {
-                    tensor: gate_up,
-                    expert_stride_values: layout.gate_up_expert_values,
-                    expert_offset_values: 0,
-                },
-                up: AggregateExpertSlice {
-                    tensor: gate_up,
-                    expert_stride_values: layout.gate_up_expert_values,
-                    expert_offset_values: layout.single_projection_values,
-                },
-            })
-        }
-        (None, Some(gate), Some(up)) => {
-            validate_aggregate_expert_tensor_shape(
-                gate,
-                &[layout.experts, layout.intermediate, layout.hidden],
-                "switch_mlp.gate_proj",
-            )?;
-            validate_aggregate_expert_tensor_shape(
-                up,
-                &[layout.experts, layout.intermediate, layout.hidden],
-                "switch_mlp.up_proj",
-            )?;
-            Ok(AggregateExpertTensors {
-                gate: AggregateExpertSlice {
-                    tensor: gate,
-                    expert_stride_values: layout.single_projection_values,
-                    expert_offset_values: 0,
-                },
-                up: AggregateExpertSlice {
-                    tensor: up,
-                    expert_stride_values: layout.single_projection_values,
-                    expert_offset_values: 0,
-                },
-            })
-        }
-        _ => bail!(
-            "aggregate expert layer {layer} must contain either combined gate_up_proj or separate switch_mlp gate_proj/up_proj tensors"
-        ),
-    }
-}
-
 fn build_aggregate_expert_pack(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    aggregate_tensors: AggregateExpertTensors<'_>,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
@@ -21963,7 +21884,7 @@ fn expected_aggregate_expert_records(
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    aggregate_tensors: AggregateExpertTensors<'_>,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
@@ -22012,50 +21933,12 @@ fn expected_aggregate_expert_records(
     Ok(vec![gate, up, down])
 }
 
-fn aggregate_native_q4_enabled(
-    aggregate_tensors: AggregateExpertTensors<'_>,
-    down: &ExpertTensorRef,
-) -> Result<bool> {
-    let sources = [
-        aggregate_tensors.gate.tensor,
-        aggregate_tensors.up.tensor,
-        down,
-    ];
-    let native_count = sources
-        .iter()
-        .filter(|tensor| tensor.q4_sources.is_some())
-        .count();
-    match native_count {
-        0 => Ok(false),
-        3 => Ok(true),
-        _ => bail!("aggregate expert tensors must be all native MLX Q4 or all decoded tensors"),
-    }
-}
-
-fn fixed_native_q4_aggregate_layout(
-    aggregate_tensors: AggregateExpertTensors<'_>,
-    down: &ExpertTensorRef,
-    layout: AggregateExpertLayout,
-) -> Result<Option<QwenMoeQ4ExpertLayout>> {
-    if !aggregate_native_q4_enabled(aggregate_tensors, down)? {
-        return Ok(None);
-    }
-    let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
-    fixed.validate()?;
-    if layout.hidden == HIDDEN_DIM && layout.intermediate == 1024 && fixed.group_size == GROUP_SIZE
-    {
-        Ok(Some(fixed))
-    } else {
-        Ok(None)
-    }
-}
-
 fn build_native_q4_aggregate_expert_pack(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    aggregate_tensors: AggregateExpertTensors<'_>,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
@@ -22101,7 +21984,7 @@ fn expected_native_q4_aggregate_expert_records(
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
     layer: usize,
     expert: usize,
-    aggregate_tensors: AggregateExpertTensors<'_>,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
@@ -22230,57 +22113,6 @@ fn expected_expert_pack(
         packed_bytes,
         records,
     })
-}
-
-fn single_aggregate_expert_tensor<'a>(
-    tensors: &[&'a ExpertTensorRef],
-    kind: AggregateExpertTensorKind,
-    layer: usize,
-) -> Result<&'a ExpertTensorRef> {
-    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
-    match matches.as_slice() {
-        [tensor] => Ok(*tensor),
-        [] => bail!("aggregate expert layer {layer} is missing {kind:?} tensor"),
-        _ => bail!("aggregate expert layer {layer} has duplicate {kind:?} tensors"),
-    }
-}
-
-fn optional_aggregate_expert_tensor<'a>(
-    tensors: &[&'a ExpertTensorRef],
-    kind: AggregateExpertTensorKind,
-) -> Option<&'a ExpertTensorRef> {
-    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
-    match matches.as_slice() {
-        [tensor] => Some(*tensor),
-        _ => None,
-    }
-}
-
-fn tensors_matching_aggregate_expert_kind<'a>(
-    tensors: &[&'a ExpertTensorRef],
-    kind: AggregateExpertTensorKind,
-) -> Vec<&'a ExpertTensorRef> {
-    tensors
-        .iter()
-        .copied()
-        .filter(|tensor| aggregate_expert_tensor_kind(&tensor.tensor) == Some(kind))
-        .collect()
-}
-
-fn validate_aggregate_expert_tensor_shape(
-    tensor: &ExpertTensorRef,
-    expected: &[usize; 3],
-    label: &str,
-) -> Result<()> {
-    if tensor.shape.as_slice() != expected {
-        bail!(
-            "aggregate expert tensor {} has shape {:?}; expected {:?} for {label}",
-            tensor.tensor,
-            tensor.shape,
-            expected
-        );
-    }
-    Ok(())
 }
 
 fn q4_layout_for_shape(shape: &[usize]) -> Result<(u64, usize)> {

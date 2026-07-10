@@ -17,9 +17,7 @@ use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
     QwenMoeQ4ExpertLayout,
 };
-#[cfg(test)]
-use super::types::HIDDEN_DIM;
-use super::types::{ACTIVE_EXPERTS_PER_TOKEN, GROUP_SIZE};
+use super::types::{ACTIVE_EXPERTS_PER_TOKEN, GROUP_SIZE, HIDDEN_DIM};
 
 pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
 
@@ -781,6 +779,183 @@ impl AggregateExpertLayout {
             down_expert_values,
         })
     }
+}
+
+pub(crate) trait AggregateExpertTensor {
+    fn aggregate_tensor_name(&self) -> &str;
+    fn aggregate_tensor_shape(&self) -> &[usize];
+    fn aggregate_tensor_has_native_q4(&self) -> bool;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AggregateExpertTensors<'a, T> {
+    pub(crate) gate: AggregateExpertSlice<'a, T>,
+    pub(crate) up: AggregateExpertSlice<'a, T>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AggregateExpertSlice<'a, T> {
+    pub(crate) tensor: &'a T,
+    pub(crate) expert_stride_values: usize,
+    pub(crate) expert_offset_values: usize,
+}
+
+impl<T> AggregateExpertSlice<'_, T> {
+    pub(crate) fn start(&self, expert: usize) -> Result<usize> {
+        expert
+            .checked_mul(self.expert_stride_values)
+            .and_then(|base| base.checked_add(self.expert_offset_values))
+            .context("aggregate expert slice offset overflow")
+    }
+}
+
+pub(crate) fn aggregate_expert_tensors<'a, T: AggregateExpertTensor>(
+    tensors: &[&'a T],
+    layer: usize,
+    layout: AggregateExpertLayout,
+) -> Result<AggregateExpertTensors<'a, T>> {
+    let gate_up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::GateUp);
+    let gate = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Gate);
+    let up = optional_aggregate_expert_tensor(tensors, AggregateExpertTensorKind::Up);
+    match (gate_up, gate, up) {
+        (Some(gate_up), None, None) => {
+            validate_aggregate_expert_tensor_shape(
+                gate_up,
+                &[layout.experts, layout.intermediate * 2, layout.hidden],
+                "gate_up_proj",
+            )?;
+            Ok(AggregateExpertTensors {
+                gate: AggregateExpertSlice {
+                    tensor: gate_up,
+                    expert_stride_values: layout.gate_up_expert_values,
+                    expert_offset_values: 0,
+                },
+                up: AggregateExpertSlice {
+                    tensor: gate_up,
+                    expert_stride_values: layout.gate_up_expert_values,
+                    expert_offset_values: layout.single_projection_values,
+                },
+            })
+        }
+        (None, Some(gate), Some(up)) => {
+            validate_aggregate_expert_tensor_shape(
+                gate,
+                &[layout.experts, layout.intermediate, layout.hidden],
+                "switch_mlp.gate_proj",
+            )?;
+            validate_aggregate_expert_tensor_shape(
+                up,
+                &[layout.experts, layout.intermediate, layout.hidden],
+                "switch_mlp.up_proj",
+            )?;
+            Ok(AggregateExpertTensors {
+                gate: AggregateExpertSlice {
+                    tensor: gate,
+                    expert_stride_values: layout.single_projection_values,
+                    expert_offset_values: 0,
+                },
+                up: AggregateExpertSlice {
+                    tensor: up,
+                    expert_stride_values: layout.single_projection_values,
+                    expert_offset_values: 0,
+                },
+            })
+        }
+        _ => bail!(
+            "aggregate expert layer {layer} must contain either combined gate_up_proj or separate switch_mlp gate_proj/up_proj tensors"
+        ),
+    }
+}
+
+pub(crate) fn single_aggregate_expert_tensor<'a, T: AggregateExpertTensor>(
+    tensors: &[&'a T],
+    kind: AggregateExpertTensorKind,
+    layer: usize,
+) -> Result<&'a T> {
+    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
+    match matches.as_slice() {
+        [tensor] => Ok(*tensor),
+        [] => bail!("aggregate expert layer {layer} is missing {kind:?} tensor"),
+        _ => bail!("aggregate expert layer {layer} has duplicate {kind:?} tensors"),
+    }
+}
+
+pub(crate) fn aggregate_native_q4_enabled<T: AggregateExpertTensor>(
+    aggregate_tensors: &AggregateExpertTensors<'_, T>,
+    down: &T,
+) -> Result<bool> {
+    let native_count = [
+        aggregate_tensors
+            .gate
+            .tensor
+            .aggregate_tensor_has_native_q4(),
+        aggregate_tensors.up.tensor.aggregate_tensor_has_native_q4(),
+        down.aggregate_tensor_has_native_q4(),
+    ]
+    .into_iter()
+    .filter(|native| *native)
+    .count();
+    match native_count {
+        0 => Ok(false),
+        3 => Ok(true),
+        _ => bail!("aggregate expert tensors must be all native MLX Q4 or all decoded tensors"),
+    }
+}
+
+pub(crate) fn fixed_native_q4_aggregate_layout<T: AggregateExpertTensor>(
+    aggregate_tensors: &AggregateExpertTensors<'_, T>,
+    down: &T,
+    layout: AggregateExpertLayout,
+) -> Result<Option<QwenMoeQ4ExpertLayout>> {
+    if !aggregate_native_q4_enabled(aggregate_tensors, down)? {
+        return Ok(None);
+    }
+    let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
+    fixed.validate()?;
+    if layout.hidden == HIDDEN_DIM && layout.intermediate == 1024 && fixed.group_size == GROUP_SIZE
+    {
+        Ok(Some(fixed))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn validate_aggregate_expert_tensor_shape<T: AggregateExpertTensor>(
+    tensor: &T,
+    expected: &[usize; 3],
+    label: &str,
+) -> Result<()> {
+    if tensor.aggregate_tensor_shape() != expected {
+        bail!(
+            "aggregate expert tensor {} has shape {:?}; expected {:?} for {label}",
+            tensor.aggregate_tensor_name(),
+            tensor.aggregate_tensor_shape(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn optional_aggregate_expert_tensor<'a, T: AggregateExpertTensor>(
+    tensors: &[&'a T],
+    kind: AggregateExpertTensorKind,
+) -> Option<&'a T> {
+    let matches = tensors_matching_aggregate_expert_kind(tensors, kind);
+    match matches.as_slice() {
+        [tensor] => Some(*tensor),
+        _ => None,
+    }
+}
+
+fn tensors_matching_aggregate_expert_kind<'a, T: AggregateExpertTensor>(
+    tensors: &[&'a T],
+    kind: AggregateExpertTensorKind,
+) -> Vec<&'a T> {
+    tensors
+        .iter()
+        .copied()
+        .filter(|tensor| aggregate_expert_tensor_kind(tensor.aggregate_tensor_name()) == Some(kind))
+        .collect()
 }
 
 pub(crate) fn pbq4_expert_pack_wire_size<R: ExpertPackWireRecord>(records: &[R]) -> Result<u64> {
@@ -2772,6 +2947,27 @@ impl ReusableExpertBuffer {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct TestAggregateTensor {
+        name: &'static str,
+        shape: Vec<usize>,
+        native_q4: bool,
+    }
+
+    impl AggregateExpertTensor for TestAggregateTensor {
+        fn aggregate_tensor_name(&self) -> &str {
+            self.name
+        }
+
+        fn aggregate_tensor_shape(&self) -> &[usize] {
+            &self.shape
+        }
+
+        fn aggregate_tensor_has_native_q4(&self) -> bool {
+            self.native_q4
+        }
+    }
+
     #[test]
     fn aggregate_expert_tensor_kind_classifies_qwen_and_mlx_names() {
         assert_eq!(
@@ -2806,6 +3002,84 @@ mod tests {
         assert_eq!(layout.single_projection_values, 1024 * 3584);
         assert_eq!(layout.gate_up_expert_values, 2 * 1024 * 3584);
         assert_eq!(layout.down_expert_values, 3584 * 1024);
+    }
+
+    #[test]
+    fn aggregate_expert_tensors_plan_combined_gate_up_slices() {
+        let gate_up = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.gate_up_proj.weight",
+            shape: vec![2, 4, 3],
+            native_q4: false,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.down_proj.weight",
+            shape: vec![2, 3, 2],
+            native_q4: false,
+        };
+        let layout = AggregateExpertLayout::new(2, 3, 2).unwrap();
+        let tensors = aggregate_expert_tensors(&[&gate_up, &down], 0, layout).unwrap();
+
+        assert_eq!(tensors.gate.start(1).unwrap(), 12);
+        assert_eq!(tensors.up.start(1).unwrap(), 18);
+        assert_eq!(
+            single_aggregate_expert_tensor(&[&gate_up, &down], AggregateExpertTensorKind::Down, 0)
+                .unwrap()
+                .name,
+            down.name
+        );
+    }
+
+    #[test]
+    fn aggregate_expert_tensors_plan_split_switch_mlp_slices() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: true,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.up_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: true,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.down_proj.weight",
+            shape: vec![2, 3, 2],
+            native_q4: true,
+        };
+        let layout = AggregateExpertLayout::new(2, 3, 2).unwrap();
+        let tensors = aggregate_expert_tensors(&[&gate, &up, &down], 1, layout).unwrap();
+
+        assert_eq!(tensors.gate.start(1).unwrap(), 6);
+        assert_eq!(tensors.up.start(1).unwrap(), 6);
+        assert!(aggregate_native_q4_enabled(&tensors, &down).unwrap());
+    }
+
+    #[test]
+    fn aggregate_native_q4_requires_consistent_sources() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: true,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.up_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: false,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.down_proj.weight",
+            shape: vec![2, 3, 2],
+            native_q4: true,
+        };
+        let layout = AggregateExpertLayout::new(2, 3, 2).unwrap();
+        let tensors = aggregate_expert_tensors(&[&gate, &up, &down], 1, layout).unwrap();
+        let err = aggregate_native_q4_enabled(&tensors, &down).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "aggregate expert tensors must be all native MLX Q4 or all decoded tensors"
+            )
+        );
     }
 
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
