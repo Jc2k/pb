@@ -1022,10 +1022,6 @@ impl MetalCmd3PhasePlan {
         self.width as u32
     }
 
-    pub(crate) fn active_count_u32(self) -> u32 {
-        self.expert_count as u32
-    }
-
     pub(crate) fn expert_outputs_bytes(self) -> anyhow::Result<usize> {
         let items = self.expert_count.checked_mul(self.width).ok_or_else(|| {
             anyhow::anyhow!("FlashMoe Metal CMD3 expert output item count overflow")
@@ -1068,6 +1064,29 @@ impl MetalCmd3PhasePlan {
         items
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| anyhow::anyhow!("FlashMoe Metal CMD3 {label} byte size overflow"))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3CombinePlan {
+    pub(crate) width: usize,
+    pub(crate) active_count: usize,
+    pub(crate) dispatch_threads: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3CombinePlan {
+    pub(crate) fn new(phase: MetalCmd3PhasePlan) -> Self {
+        Self {
+            width: phase.width,
+            active_count: phase.expert_count,
+            dispatch_threads: phase.width as u64,
+        }
+    }
+
+    pub(crate) fn active_count_u32(self) -> u32 {
+        self.active_count as u32
     }
 }
 
@@ -3518,13 +3537,18 @@ mod tests {
         assert_eq!(plan.output_state, output_state);
         assert!(plan.has_next_norm);
         assert_eq!(plan.width_u32(), 16);
-        assert_eq!(plan.active_count_u32(), 4);
         assert_eq!(plan.expert_outputs_bytes().unwrap(), 4 * 16 * 4);
         assert_eq!(plan.shared_output_bytes().unwrap(), 16 * 4);
         assert_eq!(plan.hidden_output_bytes().unwrap(), 16 * 4);
         assert_eq!(plan.next_normed_output_bytes().unwrap(), Some(16 * 4));
         assert_eq!(plan.expert_output_offset(0).unwrap(), 0);
         assert_eq!(plan.expert_output_offset(3).unwrap(), 3 * 16 * 4);
+
+        let combine = MetalCmd3CombinePlan::new(plan);
+        assert_eq!(combine.width, 16);
+        assert_eq!(combine.active_count, 4);
+        assert_eq!(combine.active_count_u32(), 4);
+        assert_eq!(combine.dispatch_threads, 16);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

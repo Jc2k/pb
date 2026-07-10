@@ -104,14 +104,15 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3DeferredOutput, MetalCmd3NextNormPlan, MetalCmd3PhasePlan, MetalCmd3SharedPhasePlan,
-    MetalCmd3SharedPhaseSource, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
-    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
-    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3CombinePlan, MetalCmd3DeferredOutput, MetalCmd3NextNormPlan, MetalCmd3PhasePlan,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -5076,7 +5077,8 @@ impl MetalExecutorInner {
                 )?;
             }
 
-            let active_u32 = plan.active_count_u32();
+            let combine_plan = MetalCmd3CombinePlan::new(plan);
+            let active_u32 = combine_plan.active_count_u32();
             let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
             msg_send_void1_id(
@@ -5091,7 +5093,7 @@ impl MetalExecutorInner {
             set_buffer(encoder, hidden_buffer, 4);
             set_buffer(encoder, width_buffer, 5);
             set_buffer(encoder, active_buffer, 6);
-            dispatch_threads(encoder, width as u64);
+            dispatch_threads(encoder, combine_plan.dispatch_threads);
 
             if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
                 (next_norm_weight, next_normed_buffer, next_norm_plan)
