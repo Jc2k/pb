@@ -1,8 +1,6 @@
-#[cfg(test)]
-use super::capabilities::FlashMoeStageImplementation;
 use super::capabilities::{
-    FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
-    FlashMoeUnsupportedCapability,
+    FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability,
+    FlashMoeStageImplementation, FlashMoeStagePlacement, FlashMoeUnsupportedCapability,
 };
 use super::experts::{
     EXPERT_SCALE_BIAS_DTYPE_BF16, ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse,
@@ -152,17 +150,9 @@ impl FlashMoeScheduledGraph {
         &self,
         layer: usize,
         position: usize,
-        implementation: ScheduledAttentionMathImplementation,
     ) -> Result<ScheduledAttentionMath, FlashMoeUnsupportedCapability> {
         let stage = *self.stage(FlashMoeGraphStage::AttentionMath);
-        let expected_placement = implementation.stage_placement();
-        if stage.placement != expected_placement {
-            return Err(FlashMoeUnsupportedCapability::new(
-                self.family,
-                stage.stage,
-                implementation.unsupported_reason(),
-            ));
-        }
+        let implementation = ScheduledAttentionMathImplementation::resolve(self.family, stage)?;
         Ok(ScheduledAttentionMath {
             stage,
             layer,
@@ -503,32 +493,32 @@ pub(crate) struct ScheduledCmd1ResolvedCommand<TInput> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledAttentionMathImplementation {
     CpuKvCache,
-    MetalKvCache,
 }
 
 impl ScheduledAttentionMathImplementation {
-    fn stage_placement(self) -> FlashMoeStagePlacement {
-        match self {
-            Self::CpuKvCache => FlashMoeStagePlacement::CpuDeclared,
-            Self::MetalKvCache => FlashMoeStagePlacement::Metal,
+    fn resolve(
+        family: QwenMoeFamily,
+        stage: FlashMoeStageCapability,
+    ) -> Result<Self, FlashMoeUnsupportedCapability> {
+        match (stage.placement, stage.implementation) {
+            (
+                FlashMoeStagePlacement::CpuDeclared,
+                FlashMoeStageImplementation::Qwen35CpuAttention,
+            ) => Ok(Self::CpuKvCache),
+            _ => Err(FlashMoeUnsupportedCapability::new(
+                family,
+                stage.stage,
+                format!(
+                    "attention implementation {} at {:?} has no scheduled executor",
+                    stage.implementation, stage.placement
+                ),
+            )),
         }
     }
 
     fn kv_placement(self) -> FlashMoeStatePlacement {
         match self {
             Self::CpuKvCache => FlashMoeStatePlacement::CpuVisible,
-            Self::MetalKvCache => FlashMoeStatePlacement::GpuResident,
-        }
-    }
-
-    fn unsupported_reason(self) -> &'static str {
-        match self {
-            Self::CpuKvCache => {
-                "CPU full-attention math is not declared for this graph-stage capability"
-            }
-            Self::MetalKvCache => {
-                "Metal full-attention KV/cache math is not declared for this graph-stage capability"
-            }
         }
     }
 }
@@ -3551,9 +3541,7 @@ mod tests {
     fn scheduled_attention_math_resolves_declared_cpu_kv_state() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        let attention = graph
-            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::CpuKvCache)
-            .unwrap();
+        let attention = graph.build_attention_math(14, 9).unwrap();
 
         let output = attention
             .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 14, 128, 128))
@@ -3569,18 +3557,22 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_attention_math_rejects_undeclared_metal_kv_without_fallback() {
+    fn scheduled_attention_math_rejects_stage_without_executor() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
-        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let mut graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let attention = graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::AttentionMath)
+            .unwrap();
+        attention.placement = FlashMoeStagePlacement::Metal;
+        attention.implementation = FlashMoeStageImplementation::MetalResidentQ4AttentionProjections;
 
-        let err = graph
-            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::MetalKvCache)
-            .unwrap_err();
+        let err = graph.build_attention_math(14, 9).unwrap_err();
 
         assert_eq!(err.stage, FlashMoeGraphStage::AttentionMath);
         assert!(
-            err.to_string()
-                .contains("Metal full-attention KV/cache math is not declared"),
+            err.to_string().contains("has no scheduled executor"),
             "{err}"
         );
     }
@@ -3589,9 +3581,7 @@ mod tests {
     fn scheduled_attention_math_rejects_mismatched_kv_state_without_fallback() {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        let attention = graph
-            .build_attention_math(14, 9, ScheduledAttentionMathImplementation::CpuKvCache)
-            .unwrap();
+        let attention = graph.build_attention_math(14, 9).unwrap();
 
         let placement_err = attention
             .resolve_kv_state(FlashMoeFullAttentionKvState::gpu_resident(9, 14, 128, 128))

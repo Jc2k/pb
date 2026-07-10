@@ -193,6 +193,11 @@ Baseline reviewed on 2026-07-10:
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
   cleanup are one implementation. The three duplicate encoders and fused-batch helper have been
   removed from `legacy.rs`.
+- Full-attention placement is now resolved by the scheduled graph rather than supplied by the
+  runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
+  attention stage without a matching scheduled executor is a named unsupported capability. The
+  dormant Metal KV cache allocation, runtime branches, four pipelines, shaders, and legacy
+  encoders have been deleted, so CPU placement cannot silently switch to an undeclared GPU path.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

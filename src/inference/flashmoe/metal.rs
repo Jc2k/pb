@@ -192,68 +192,6 @@ impl MetalQ4SourceBufferCache {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-pub(crate) struct MetalKvCacheInner {
-    pub(crate) keys: MetalObjcId,
-    pub(crate) values: MetalObjcId,
-    layers: Vec<MetalKvLayer>,
-    pub(crate) max_context: usize,
-    total_items: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalKvCacheInner {
-    pub(crate) fn new(
-        keys: MetalObjcId,
-        values: MetalObjcId,
-        widths: &[usize],
-        max_context: usize,
-    ) -> anyhow::Result<Self> {
-        let mut offset = 0usize;
-        let mut layers = Vec::with_capacity(widths.len());
-        for width in widths.iter().copied() {
-            layers.push(MetalKvLayer { offset, width });
-            offset = offset
-                .checked_add(width.saturating_mul(max_context))
-                .ok_or_else(|| anyhow::anyhow!("Metal KV layer offset overflow"))?;
-        }
-        Ok(Self {
-            keys,
-            values,
-            layers,
-            max_context,
-            total_items: offset,
-        })
-    }
-
-    pub(crate) fn layer(&self, layer: usize) -> anyhow::Result<MetalKvLayer> {
-        let layer = self
-            .layers
-            .get(layer)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Metal KV cache has no layer {layer}"))?;
-        if layer.width == 0 {
-            anyhow::bail!("Metal KV cache layer is not a full-attention layer");
-        }
-        if layer
-            .offset
-            .saturating_add(layer.width.saturating_mul(self.max_context))
-            > self.total_items
-        {
-            anyhow::bail!("Metal KV cache layer range exceeds allocation");
-        }
-        Ok(layer)
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MetalKvLayer {
-    pub(crate) offset: usize,
-    pub(crate) width: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
 pub(crate) struct MetalLinearAttentionStateCache {
     pub(crate) layers: Vec<Option<MetalLinearAttentionLayerState>>,
 }
@@ -662,8 +600,6 @@ pub(crate) mod kernels {
     pub(crate) const ROPE_APPLY: &str = "rope_apply";
     pub(crate) const ROPE_SPLIT_HALF_APPLY: &str = "rope_split_half_apply";
     pub(crate) const ATTENTION_SCORES: &str = "attention_scores";
-    pub(crate) const KV_CACHE_WRITE: &str = "kv_cache_write";
-    pub(crate) const KV_CACHE_READ_ATTENTION: &str = "kv_cache_read_attention";
     pub(crate) const EXPERT_MLP_FUSED: &str = "expert_mlp_fused";
     pub(crate) const SILU_PRODUCT: &str = "silu_product";
     pub(crate) const SHARED_EXPERT_ACTIVATION: &str = "shared_expert_activation";
@@ -671,8 +607,6 @@ pub(crate) mod kernels {
     pub(crate) const FILL_ZERO: &str = "fill_zero";
     pub(crate) const LM_HEAD_LOGITS: &str = "lm_head_logits";
     pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
-    pub(crate) const GQA_ATTENTION_SCORES: &str = "gqa_attention_scores";
-    pub(crate) const GQA_KV_READ_ATTENTION: &str = "gqa_kv_read_attention";
     pub(crate) const LINEAR_CONV1D_STEP: &str = "linear_conv1d_step";
     pub(crate) const LINEAR_RMS_NORM_QK: &str = "linear_rms_norm_qk";
     pub(crate) const LINEAR_COMPUTE_DECAY_BETA: &str = "linear_compute_decay_beta";
@@ -737,8 +671,6 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::ROPE_APPLY,
     kernels::ROPE_SPLIT_HALF_APPLY,
     kernels::ATTENTION_SCORES,
-    kernels::KV_CACHE_WRITE,
-    kernels::KV_CACHE_READ_ATTENTION,
     kernels::EXPERT_MLP_FUSED,
     kernels::SILU_PRODUCT,
     kernels::SHARED_EXPERT_ACTIVATION,
@@ -746,8 +678,6 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::FILL_ZERO,
     kernels::LM_HEAD_LOGITS,
     kernels::TOPK_VOCAB,
-    kernels::GQA_ATTENTION_SCORES,
-    kernels::GQA_KV_READ_ATTENTION,
     kernels::LINEAR_CONV1D_STEP,
     kernels::LINEAR_RMS_NORM_QK,
     kernels::LINEAR_COMPUTE_DECAY_BETA,
@@ -776,8 +706,6 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) rope: &'static str,
     pub(crate) rope_split_half: &'static str,
     pub(crate) attention: &'static str,
-    pub(crate) kv_write: &'static str,
-    pub(crate) kv_read_attention: &'static str,
     pub(crate) expert_mlp: &'static str,
     pub(crate) silu_product: &'static str,
     pub(crate) shared_expert_activation: &'static str,
@@ -785,8 +713,6 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) fill_zero: &'static str,
     pub(crate) lm_head: &'static str,
     pub(crate) topk_vocab: &'static str,
-    pub(crate) gqa_scores: &'static str,
-    pub(crate) gqa_read: &'static str,
     pub(crate) linear_conv1d: &'static str,
     pub(crate) linear_rms_norm_qk: &'static str,
     pub(crate) linear_decay_beta: &'static str,
@@ -816,8 +742,6 @@ impl MetalPipelineNameSet {
             rope: kernels::ROPE_APPLY,
             rope_split_half: kernels::ROPE_SPLIT_HALF_APPLY,
             attention: kernels::ATTENTION_SCORES,
-            kv_write: kernels::KV_CACHE_WRITE,
-            kv_read_attention: kernels::KV_CACHE_READ_ATTENTION,
             expert_mlp: kernels::EXPERT_MLP_FUSED,
             silu_product: kernels::SILU_PRODUCT,
             shared_expert_activation: kernels::SHARED_EXPERT_ACTIVATION,
@@ -825,8 +749,6 @@ impl MetalPipelineNameSet {
             fill_zero: kernels::FILL_ZERO,
             lm_head: kernels::LM_HEAD_LOGITS,
             topk_vocab: kernels::TOPK_VOCAB,
-            gqa_scores: kernels::GQA_ATTENTION_SCORES,
-            gqa_read: kernels::GQA_KV_READ_ATTENTION,
             linear_conv1d: kernels::LINEAR_CONV1D_STEP,
             linear_rms_norm_qk: kernels::LINEAR_RMS_NORM_QK,
             linear_decay_beta: kernels::LINEAR_COMPUTE_DECAY_BETA,
@@ -856,8 +778,6 @@ impl MetalPipelineNameSet {
             self.rope,
             self.rope_split_half,
             self.attention,
-            self.kv_write,
-            self.kv_read_attention,
             self.expert_mlp,
             self.silu_product,
             self.shared_expert_activation,
@@ -865,8 +785,6 @@ impl MetalPipelineNameSet {
             self.fill_zero,
             self.lm_head,
             self.topk_vocab,
-            self.gqa_scores,
-            self.gqa_read,
             self.linear_conv1d,
             self.linear_rms_norm_qk,
             self.linear_decay_beta,
@@ -897,8 +815,6 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) rope_pipeline: T,
     pub(crate) rope_split_half_pipeline: T,
     pub(crate) attention_pipeline: T,
-    pub(crate) kv_write_pipeline: T,
-    pub(crate) kv_read_attention_pipeline: T,
     pub(crate) expert_mlp_pipeline: T,
     pub(crate) silu_product_pipeline: T,
     pub(crate) shared_expert_activation_pipeline: T,
@@ -906,8 +822,6 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) fill_zero_pipeline: T,
     pub(crate) lm_head_pipeline: T,
     pub(crate) topk_vocab_pipeline: T,
-    pub(crate) gqa_scores_pipeline: T,
-    pub(crate) gqa_read_pipeline: T,
     pub(crate) linear_conv1d_pipeline: T,
     pub(crate) linear_rms_norm_qk_pipeline: T,
     pub(crate) linear_decay_beta_pipeline: T,
@@ -936,8 +850,6 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.rope_pipeline);
         release(self.rope_split_half_pipeline);
         release(self.attention_pipeline);
-        release(self.kv_write_pipeline);
-        release(self.kv_read_attention_pipeline);
         release(self.expert_mlp_pipeline);
         release(self.silu_product_pipeline);
         release(self.shared_expert_activation_pipeline);
@@ -945,8 +857,6 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.fill_zero_pipeline);
         release(self.lm_head_pipeline);
         release(self.topk_vocab_pipeline);
-        release(self.gqa_scores_pipeline);
-        release(self.gqa_read_pipeline);
         release(self.linear_conv1d_pipeline);
         release(self.linear_rms_norm_qk_pipeline);
         release(self.linear_decay_beta_pipeline);
@@ -1062,8 +972,6 @@ impl MetalRuntime {
                 rope_pipeline: take_pipeline(names.rope),
                 rope_split_half_pipeline: take_pipeline(names.rope_split_half),
                 attention_pipeline: take_pipeline(names.attention),
-                kv_write_pipeline: take_pipeline(names.kv_write),
-                kv_read_attention_pipeline: take_pipeline(names.kv_read_attention),
                 expert_mlp_pipeline: take_pipeline(names.expert_mlp),
                 silu_product_pipeline: take_pipeline(names.silu_product),
                 shared_expert_activation_pipeline: take_pipeline(names.shared_expert_activation),
@@ -1071,8 +979,6 @@ impl MetalRuntime {
                 fill_zero_pipeline: take_pipeline(names.fill_zero),
                 lm_head_pipeline: take_pipeline(names.lm_head),
                 topk_vocab_pipeline: take_pipeline(names.topk_vocab),
-                gqa_scores_pipeline: take_pipeline(names.gqa_scores),
-                gqa_read_pipeline: take_pipeline(names.gqa_read),
                 linear_conv1d_pipeline: take_pipeline(names.linear_conv1d),
                 linear_rms_norm_qk_pipeline: take_pipeline(names.linear_rms_norm_qk),
                 linear_decay_beta_pipeline: take_pipeline(names.linear_decay_beta),
@@ -6401,34 +6307,6 @@ kernel void attention_scores(
     scores[token] = acc * rsqrt(float(max(head_dim, 1u)));
 }
 
-kernel void kv_cache_write(
-    device const float* key [[buffer(0)]],
-    device const float* value [[buffer(1)]],
-    device float* keys [[buffer(2)]],
-    device float* values [[buffer(3)]],
-    constant ulong& offset [[buffer(4)]],
-    constant uint& width [[buffer(5)]],
-    uint idx [[thread_position_in_grid]]) {
-    if (idx >= width) { return; }
-    keys[offset + idx] = key[idx];
-    values[offset + idx] = value[idx];
-}
-
-kernel void kv_cache_read_attention(
-    device const float* weights [[buffer(0)]],
-    device const float* values [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& width [[buffer(3)]],
-    constant uint& tokens [[buffer(4)]],
-    uint idx [[thread_position_in_grid]]) {
-    if (idx >= width) { return; }
-    float acc = 0.0f;
-    for (uint token = 0; token < tokens; ++token) {
-        acc = fma(weights[token], values[token * width + idx], acc);
-    }
-    output[idx] = acc;
-}
-
 kernel void expert_mlp_fused(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
@@ -6561,58 +6439,6 @@ kernel void topk_vocab(
         indices[out] = best_i;
         values[out] = best;
     }
-}
-
-// Multi-head GQA attention scores.
-// One thread per (q_head, token) pair: tid = q_head * tokens + token.
-// query   : [num_q_heads * head_dim]
-// keys    : [tokens * kv_width]   (layer-offset slice supplied by the caller)
-// scores  : [num_q_heads * tokens]  (output)
-kernel void gqa_attention_scores(
-    device const float* query       [[buffer(0)]],
-    device const float* keys        [[buffer(1)]],
-    device float*       scores      [[buffer(2)]],
-    constant uint& head_dim         [[buffer(3)]],
-    constant uint& groups_per_kv    [[buffer(4)]],
-    constant uint& tokens           [[buffer(5)]],
-    constant uint& kv_width         [[buffer(6)]],
-    uint tid [[thread_position_in_grid]]) {
-    uint q_head  = tid / max(tokens, 1u);
-    uint token   = tid % max(tokens, 1u);
-    uint kv_head = q_head / max(groups_per_kv, 1u);
-    float acc = 0.0f;
-    uint q_base = q_head  * head_dim;
-    uint k_base = token   * kv_width + kv_head * head_dim;
-    for (uint d = 0; d < head_dim; ++d) {
-        acc = fma(query[q_base + d], keys[k_base + d], acc);
-    }
-    scores[q_head * max(tokens, 1u) + token] = acc * rsqrt(float(max(head_dim, 1u)));
-}
-
-// Multi-head GQA weighted value aggregation.
-// One thread per output element idx = q_head * head_dim + d.
-// scores  : [num_q_heads * tokens]  (softmax-normalised per Q-head, supplied by caller)
-// values  : [tokens * kv_width]     (layer-offset slice supplied by the caller)
-// output  : [num_q_heads * head_dim]
-kernel void gqa_kv_read_attention(
-    device const float* scores      [[buffer(0)]],
-    device const float* values      [[buffer(1)]],
-    device float*       output      [[buffer(2)]],
-    constant uint& head_dim         [[buffer(3)]],
-    constant uint& groups_per_kv    [[buffer(4)]],
-    constant uint& tokens           [[buffer(5)]],
-    constant uint& kv_width         [[buffer(6)]],
-    uint idx [[thread_position_in_grid]]) {
-    uint q_head  = idx / max(head_dim, 1u);
-    uint d       = idx % max(head_dim, 1u);
-    uint kv_head = q_head / max(groups_per_kv, 1u);
-    float acc = 0.0f;
-    for (uint token = 0; token < tokens; ++token) {
-        float w = scores[q_head * max(tokens, 1u) + token];
-        float v = values[token * kv_width + kv_head * head_dim + d];
-        acc = fma(w, v, acc);
-    }
-    output[idx] = acc;
 }
 
 kernel void linear_conv1d_step(
@@ -7197,7 +7023,7 @@ mod tests {
         let pipelines = test_pipeline_set();
         let mut released = Vec::new();
         pipelines.release_with(|pipeline| released.push(pipeline));
-        assert_eq!(released, (1..=35).collect::<Vec<_>>());
+        assert_eq!(released, (1..=31).collect::<Vec<_>>());
     }
 
     fn test_pipeline_set() -> MetalPipelineSet<i32> {
@@ -7221,22 +7047,18 @@ mod tests {
             rope_pipeline: 17,
             rope_split_half_pipeline: 18,
             attention_pipeline: 19,
-            kv_write_pipeline: 20,
-            kv_read_attention_pipeline: 21,
-            expert_mlp_pipeline: 22,
-            silu_product_pipeline: 23,
-            shared_expert_activation_pipeline: 24,
-            combine_expert_phase_pipeline: 25,
-            fill_zero_pipeline: 26,
-            lm_head_pipeline: 27,
-            topk_vocab_pipeline: 28,
-            gqa_scores_pipeline: 29,
-            gqa_read_pipeline: 30,
-            linear_conv1d_pipeline: 31,
-            linear_rms_norm_qk_pipeline: 32,
-            linear_decay_beta_pipeline: 33,
-            linear_delta_step_pipeline: 34,
-            linear_gated_rms_norm_pipeline: 35,
+            expert_mlp_pipeline: 20,
+            silu_product_pipeline: 21,
+            shared_expert_activation_pipeline: 22,
+            combine_expert_phase_pipeline: 23,
+            fill_zero_pipeline: 24,
+            lm_head_pipeline: 25,
+            topk_vocab_pipeline: 26,
+            linear_conv1d_pipeline: 27,
+            linear_rms_norm_qk_pipeline: 28,
+            linear_decay_beta_pipeline: 29,
+            linear_delta_step_pipeline: 30,
+            linear_gated_rms_norm_pipeline: 31,
         }
     }
 
@@ -8350,41 +8172,6 @@ mod tests {
             source: ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
             routes: routes.to_vec(),
         }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn metal_kv_cache_declares_layer_offsets_and_rejects_missing_layers() {
-        let keys = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-        let values = keys;
-        let cache = MetalKvCacheInner::new(keys, values, &[4, 0, 8], 3).unwrap();
-
-        assert_eq!(cache.keys, keys);
-        assert_eq!(cache.values, values);
-        assert_eq!(cache.max_context, 3);
-
-        let first = cache.layer(0).unwrap();
-        assert_eq!(first.offset, 0);
-        assert_eq!(first.width, 4);
-
-        let third = cache.layer(2).unwrap();
-        assert_eq!(third.offset, 12);
-        assert_eq!(third.width, 8);
-
-        assert!(
-            cache
-                .layer(1)
-                .unwrap_err()
-                .to_string()
-                .contains("not a full-attention layer")
-        );
-        assert!(
-            cache
-                .layer(3)
-                .unwrap_err()
-                .to_string()
-                .contains("has no layer 3")
-        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

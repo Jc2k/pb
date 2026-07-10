@@ -105,7 +105,7 @@ use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalBufferPool,
     MetalCommandContext, MetalDenseWeights, MetalDispatchSize, MetalFusedLinearAttentionBuilder,
-    MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache,
     MetalMatvecTiming, MetalObjcId as ObjcId, MetalPipelineNameSet, MetalPostAttentionPrep,
     MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder, MetalQ4ProjectionBatchBuilder,
@@ -2504,70 +2504,6 @@ impl MetalExecutor {
             Ok(None)
         }
     }
-
-    #[allow(dead_code)]
-    fn causal_attention(
-        &self,
-        query: &[f32],
-        keys_values: &[(&[f32], &[f32])],
-        num_q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Vec<f32>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner
-                .causal_attention(query, keys_values, num_q_heads, kv_heads, head_dim)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            Ok(causal_attention(
-                query,
-                keys_values,
-                num_q_heads,
-                kv_heads,
-                head_dim,
-            ))
-        }
-    }
-
-    fn record_kv(
-        &self,
-        position: usize,
-        layer: usize,
-        layout: FullAttentionLayout,
-        key: &[f32],
-        value: &[f32],
-    ) -> Result<()> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner.record_kv(position, layer, layout, key, value)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (position, layer, layout, key, value);
-            Ok(())
-        }
-    }
-
-    fn causal_attention_cached(
-        &self,
-        position: usize,
-        layer: usize,
-        query: &[f32],
-        layout: FullAttentionLayout,
-    ) -> Result<Vec<f32>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner
-                .causal_attention_cached(position, layer, query, layout)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (position, layer, layout);
-            Ok(vec![0.0; query.len()])
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2576,7 +2512,6 @@ struct MetalExecutorInner {
     metal_runtime: MetalRuntime,
     dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
-    kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
     buffers: Arc<MetalBufferPool>,
 }
@@ -2606,12 +2541,6 @@ impl Drop for MetalExecutorInner {
             if let Ok(lm_head_buffers) = self.lm_head_buffers.get_mut() {
                 lm_head_buffers.release_all(|buffer| release(buffer.weights));
             }
-            if let Ok(kv_cache) = self.kv_cache.get_mut()
-                && let Some(kv_cache) = kv_cache.take()
-            {
-                release(kv_cache.keys);
-                release(kv_cache.values);
-            }
             if let Ok(linear_state) = self.linear_attention_state.get_mut() {
                 for layer in linear_state.layers.iter_mut().filter_map(Option::take) {
                     release(layer.conv_state);
@@ -2638,21 +2567,12 @@ impl MetalExecutorInner {
         let device = metal_runtime.device;
         let dense_weights = wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
 
-        let max_context = metal_kv_max_context_for_layouts(
-            config,
-            &runtime.full_attention,
-            system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
-        );
-        let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
-        let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
         let linear_attention_state =
             allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
 
         tracing::info!(
             model = %plan.model,
             layers = config.num_hidden_layers,
-            max_context,
-            kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
             experts = config.experts(),
             dense_resident = dense_weights.is_some(),
             "Flash-MoE Metal executor initialized"
@@ -2664,7 +2584,6 @@ impl MetalExecutorInner {
             lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
                 metal_lm_head_buffer_budget_bytes(),
             )),
-            kv_cache: std::sync::Mutex::new(Some(kv_cache)),
             linear_attention_state: std::sync::Mutex::new(linear_attention_state),
             buffers: Arc::new(MetalBufferPool::default()),
         })
@@ -5006,281 +4925,6 @@ impl MetalExecutorInner {
         }
     }
 
-    fn causal_attention(
-        &self,
-        query: &[f32],
-        keys_values: &[(&[f32], &[f32])],
-        num_q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Vec<f32>> {
-        if query.is_empty() || keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
-            return Ok(vec![0.0; query.len()]);
-        }
-        // Fall back to CPU GQA for the non-cached path
-        Ok(causal_attention(
-            query,
-            keys_values,
-            num_q_heads,
-            kv_heads,
-            head_dim,
-        ))
-    }
-
-    fn record_kv(
-        &self,
-        position: usize,
-        layer: usize,
-        layout: FullAttentionLayout,
-        key: &[f32],
-        value: &[f32],
-    ) -> Result<()> {
-        let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
-        let kv_cache = kv_cache
-            .as_ref()
-            .context("Flash-MoE Metal KV cache is not allocated")?;
-        let layer_info = kv_cache.layer(layer)?;
-        if layer_info.width != layout.kv_width {
-            bail!(
-                "Metal KV write layer {layer} layout width {} does not match cache width {}",
-                layout.kv_width,
-                layer_info.width
-            );
-        }
-        if position >= kv_cache.max_context {
-            bail!(
-                "Metal KV write layer {layer} position {position} exceeds cache {} tokens",
-                kv_cache.max_context
-            );
-        }
-        if key.len() < layer_info.width || value.len() < layer_info.width {
-            bail!(
-                "Metal KV write width mismatch: key {}, value {}, cache width {}",
-                key.len(),
-                value.len(),
-                layer_info.width
-            );
-        }
-        unsafe {
-            let key_buffer = self.buffer_with_bytes(f32_as_bytes(&key[..layer_info.width]))?;
-            let value_buffer = self.buffer_with_bytes(f32_as_bytes(&value[..layer_info.width]))?;
-            let offset = layer_info
-                .offset
-                .checked_add(position.saturating_mul(layer_info.width))
-                .context("Metal KV cache offset overflow")? as u64;
-            let width = layer_info.width as u32;
-            let offset_buffer = self.buffer_with_bytes(u64_as_bytes(&offset))?;
-            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width))?;
-            self.dispatch_unary(
-                self.pipelines.kv_write_pipeline,
-                &[
-                    key_buffer,
-                    value_buffer,
-                    kv_cache.keys,
-                    kv_cache.values,
-                    offset_buffer,
-                    width_buffer,
-                ],
-                layer_info.width as u64,
-                &MetalCommandContext::new("kv_write")
-                    .with("layer", layer)
-                    .with("position", position)
-                    .with("width", layer_info.width)
-                    .with("offset_items", offset),
-            )
-            .map_err(|error| {
-                let release_only = metal_command_failure_requires_release(&error);
-                self.recycle_or_release_buffers(
-                    &[key_buffer, value_buffer, offset_buffer, width_buffer],
-                    release_only,
-                );
-                error
-            })?;
-            self.recycle(key_buffer);
-            self.recycle(value_buffer);
-            self.recycle(offset_buffer);
-            self.recycle(width_buffer);
-        }
-        Ok(())
-    }
-
-    fn causal_attention_cached(
-        &self,
-        position: usize,
-        layer: usize,
-        query: &[f32],
-        layout: FullAttentionLayout,
-    ) -> Result<Vec<f32>> {
-        let kv_cache = self.kv_cache.lock().expect("metal kv cache poisoned");
-        let kv_cache = kv_cache
-            .as_ref()
-            .context("Flash-MoE Metal KV cache is not allocated")?;
-        let layer_info = kv_cache.layer(layer)?;
-        if layer_info.width != layout.kv_width {
-            bail!(
-                "Metal KV read layer {layer} layout width {} does not match cache width {}",
-                layout.kv_width,
-                layer_info.width
-            );
-        }
-        if position >= kv_cache.max_context {
-            bail!(
-                "Metal KV read layer {layer} position {position} exceeds cache {} tokens",
-                kv_cache.max_context
-            );
-        }
-        let q_width = layout.q_width;
-        if query.len() < q_width {
-            bail!(
-                "Metal GQA attention query len {} is smaller than q_width {}",
-                query.len(),
-                q_width
-            );
-        }
-        let tokens = position + 1;
-        let groups_per_kv = layout.num_q_heads / layout.kv_heads.max(1);
-        let layer_offset_items = layer_info.offset;
-        let layer_offset_bytes = (layer_offset_items * std::mem::size_of::<f32>()) as u64;
-        unsafe {
-            let query_buffer = self.buffer_with_bytes(f32_as_bytes(&query[..q_width]))?;
-            let scores_buffer =
-                self.buffer_with_len(layout.num_q_heads * tokens * std::mem::size_of::<f32>())?;
-            let head_dim_u32 = layout.head_dim as u32;
-            let groups_per_kv_u32 = groups_per_kv as u32;
-            let tokens_u32 = tokens as u32;
-            let kv_width_u32 = layer_info.width as u32;
-            let head_dim_buf = self.buffer_with_bytes(u32_as_bytes(&head_dim_u32))?;
-            let gpk_buf = self.buffer_with_bytes(u32_as_bytes(&groups_per_kv_u32))?;
-            let tokens_buf = self.buffer_with_bytes(u32_as_bytes(&tokens_u32))?;
-            let kv_width_buf = self.buffer_with_bytes(u32_as_bytes(&kv_width_u32))?;
-
-            // Step 1: compute raw dot-product scores for all (q_head, token) pairs
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                bail!("failed to create Flash-MoE Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                bail!("failed to create Flash-MoE Metal compute encoder");
-            }
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.gqa_scores_pipeline,
-            );
-            set_buffer(encoder, query_buffer, 0);
-            set_buffer_with_offset(encoder, kv_cache.keys, layer_offset_bytes, 1);
-            set_buffer(encoder, scores_buffer, 2);
-            set_buffer(encoder, head_dim_buf, 3);
-            set_buffer(encoder, gpk_buf, 4);
-            set_buffer(encoder, tokens_buf, 5);
-            set_buffer(encoder, kv_width_buf, 6);
-            dispatch_threads(encoder, (layout.num_q_heads * tokens) as u64);
-            msg_send_void0(encoder, sel("endEncoding"));
-            let score_context = MetalCommandContext::new("gqa_attention_scores")
-                .with("layer", layer)
-                .with("position", position)
-                .with("tokens", tokens)
-                .with("q_heads", layout.num_q_heads)
-                .with("kv_heads", layout.kv_heads)
-                .with("head_dim", layout.head_dim)
-                .with("kv_width", layer_info.width);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &score_context)
-            {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(
-                    &[
-                        query_buffer,
-                        scores_buffer,
-                        head_dim_buf,
-                        gpk_buf,
-                        tokens_buf,
-                        kv_width_buf,
-                    ],
-                    error.should_release_buffers(),
-                );
-                return Err(error.into());
-            }
-            release(encoder);
-            release(command_buffer);
-
-            // Step 2: softmax per Q-head independently (CPU)
-            let mut scores = read_f32_buffer(scores_buffer, layout.num_q_heads * tokens);
-            for qh in 0..layout.num_q_heads {
-                softmax_in_place(&mut scores[qh * tokens..(qh + 1) * tokens]);
-            }
-
-            // Step 3: weighted sum of values
-            let scores_buffer_2 = self.buffer_with_bytes(f32_as_bytes(&scores))?;
-            let output_buffer = self.buffer_with_len(q_width * std::mem::size_of::<f32>())?;
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                bail!("failed to create Flash-MoE Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                bail!("failed to create Flash-MoE Metal compute encoder");
-            }
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.gqa_read_pipeline,
-            );
-            set_buffer(encoder, scores_buffer_2, 0);
-            set_buffer_with_offset(encoder, kv_cache.values, layer_offset_bytes, 1);
-            set_buffer(encoder, output_buffer, 2);
-            set_buffer(encoder, head_dim_buf, 3);
-            set_buffer(encoder, gpk_buf, 4);
-            set_buffer(encoder, tokens_buf, 5);
-            set_buffer(encoder, kv_width_buf, 6);
-            dispatch_threads(encoder, q_width as u64);
-            msg_send_void0(encoder, sel("endEncoding"));
-            let read_context = MetalCommandContext::new("gqa_kv_read_attention")
-                .with("layer", layer)
-                .with("position", position)
-                .with("tokens", tokens)
-                .with("q_width", q_width)
-                .with("q_heads", layout.num_q_heads)
-                .with("kv_heads", layout.kv_heads)
-                .with("head_dim", layout.head_dim)
-                .with("kv_width", layer_info.width);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &read_context)
-            {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(
-                    &[
-                        query_buffer,
-                        scores_buffer,
-                        head_dim_buf,
-                        gpk_buf,
-                        tokens_buf,
-                        kv_width_buf,
-                        scores_buffer_2,
-                        output_buffer,
-                    ],
-                    error.should_release_buffers(),
-                );
-                return Err(error.into());
-            }
-            let output = read_f32_buffer(output_buffer, q_width);
-            release(encoder);
-            release(command_buffer);
-            self.recycle(query_buffer);
-            self.recycle(scores_buffer);
-            self.recycle(head_dim_buf);
-            self.recycle(gpk_buf);
-            self.recycle(tokens_buf);
-            self.recycle(kv_width_buf);
-            self.recycle(scores_buffer_2);
-            self.recycle(output_buffer);
-            Ok(output)
-        }
-    }
-
     unsafe fn dispatch_unary(
         &self,
         pipeline: ObjcId,
@@ -7072,11 +6716,7 @@ impl FlashMoeEngine {
         _layout: FullAttentionLayout,
         kv_record: &FlashMoeFullAttentionKvRecord,
     ) -> Result<ScheduledAttentionMathOutput> {
-        let scheduled_attention = self.scheduled_graph.build_attention_math(
-            layer,
-            position,
-            ScheduledAttentionMathImplementation::CpuKvCache,
-        )?;
+        let scheduled_attention = self.scheduled_graph.build_attention_math(layer, position)?;
         scheduled_attention.resolve_kv_state(kv_record.state(FlashMoeStatePlacement::CpuVisible))
     }
 
@@ -7124,29 +6764,18 @@ impl FlashMoeEngine {
         layout: FullAttentionLayout,
         attention_output: ScheduledAttentionMathOutput,
     ) -> Result<Vec<f32>> {
-        let cpu_attention = |kv_cache: &KvCache| {
-            kv_cache.causal_attention(
+        let attention_output =
+            attention_output.validate_execution_state(layer, position, layout.kv_width)?;
+
+        match attention_output.implementation() {
+            ScheduledAttentionMathImplementation::CpuKvCache => kv_cache.causal_attention(
                 position,
                 layer,
                 q,
                 layout.num_q_heads,
                 layout.kv_heads,
                 layout.head_dim,
-            )
-        };
-        let attention_output =
-            attention_output.validate_execution_state(layer, position, layout.kv_width)?;
-
-        match attention_output.implementation() {
-            ScheduledAttentionMathImplementation::CpuKvCache => cpu_attention(kv_cache),
-            ScheduledAttentionMathImplementation::MetalKvCache => self
-                .metal
-                .causal_attention_cached(position, layer, q, layout)
-                .with_context(|| {
-                    format!(
-                        "Metal full-attention execution failed for declared attention stage at layer {layer} position {position}"
-                    )
-                }),
+            ),
         }
     }
 
@@ -8659,100 +8288,6 @@ fn mrope_axis_for_frequency(index: usize, section: [usize; 3]) -> MropeAxis {
 
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
-}
-
-#[allow(dead_code)]
-fn metal_kv_cache_bytes(layers: usize, max_context: usize, width: usize) -> usize {
-    layers
-        .saturating_mul(max_context)
-        .saturating_mul(width)
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<f32>())
-}
-
-fn metal_kv_layer_widths(layouts: &[Option<FullAttentionLayout>]) -> Vec<usize> {
-    layouts
-        .iter()
-        .map(|layout| layout.map(|layout| layout.kv_width).unwrap_or(0))
-        .collect()
-}
-
-fn metal_kv_cache_bytes_for_widths(widths: &[usize], max_context: usize) -> usize {
-    widths
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(max_context)
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<f32>())
-}
-
-#[allow(dead_code)]
-fn metal_kv_max_context(config: &QwenModelConfig, width: usize, total_ram_bytes: usize) -> usize {
-    let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
-    let bytes_per_token = config
-        .num_hidden_layers
-        .saturating_mul(width)
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<f32>())
-        .max(1);
-    let budget = (total_ram_bytes / 4).max(256 * 1024 * 1024);
-    requested.min((budget / bytes_per_token).max(1))
-}
-
-fn metal_kv_max_context_for_layouts(
-    config: &QwenModelConfig,
-    layouts: &[Option<FullAttentionLayout>],
-    total_ram_bytes: usize,
-) -> usize {
-    let requested = config.max_position_embeddings.unwrap_or(32_768).max(1);
-    let bytes_per_token = metal_kv_layer_widths(layouts)
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<f32>())
-        .max(1);
-    let budget = (total_ram_bytes / 4).max(256 * 1024 * 1024);
-    requested.min((budget / bytes_per_token).max(1))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn allocate_metal_kv_cache(
-    device: ObjcId,
-    max_context: usize,
-    widths: &[usize],
-) -> Result<MetalKvCacheInner> {
-    let bytes = metal_kv_cache_bytes_for_widths(widths, max_context);
-    unsafe {
-        let keys = msg_send_id2_usize_u64(
-            device,
-            sel("newBufferWithLength:options:"),
-            bytes.max(std::mem::size_of::<f32>()),
-            0,
-        );
-        if keys.is_null() {
-            bail!("failed to allocate Flash-MoE Metal KV key buffer ({bytes} bytes)");
-        }
-        let values = msg_send_id2_usize_u64(
-            device,
-            sel("newBufferWithLength:options:"),
-            bytes.max(std::mem::size_of::<f32>()),
-            0,
-        );
-        if values.is_null() {
-            release(keys);
-            bail!("failed to allocate Flash-MoE Metal KV value buffer ({bytes} bytes)");
-        }
-        match MetalKvCacheInner::new(keys, values, widths, max_context) {
-            Ok(cache) => Ok(cache),
-            Err(error) => {
-                release(keys);
-                release(values);
-                Err(error)
-            }
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -18679,39 +18214,6 @@ mod tests {
     }
 
     #[test]
-    fn metal_kv_cache_uses_full_attention_layout_widths() {
-        let standard = FullAttentionLayout {
-            q_layout: FullAttentionQLayout::Standard,
-            q_projection_width: 8,
-            q_width: 8,
-            kv_width: 4,
-            head_dim: 4,
-            rotary_dim: 4,
-            num_q_heads: 2,
-            kv_heads: 1,
-            rotary_pairing: RotaryPairing::SplitHalf,
-        };
-        let gated = FullAttentionLayout {
-            q_layout: FullAttentionQLayout::Gated,
-            q_projection_width: 16,
-            q_width: 8,
-            kv_width: 6,
-            head_dim: 3,
-            rotary_dim: 2,
-            num_q_heads: 2,
-            kv_heads: 2,
-            rotary_pairing: RotaryPairing::SplitHalf,
-        };
-        let layouts = vec![Some(standard), None, Some(gated)];
-        let widths = metal_kv_layer_widths(&layouts);
-        assert_eq!(widths, vec![4, 0, 6]);
-        assert_eq!(
-            metal_kv_cache_bytes_for_widths(&widths, 5),
-            (4 + 6) * 5 * 2 * std::mem::size_of::<f32>()
-        );
-    }
-
-    #[test]
     fn attention_output_closeness_allows_small_metal_roundoff_only() {
         assert!(attention_close(&[1.0, -2.0], &[1.0005, -2.0005]));
         assert!(!attention_close(&[1.0, -2.0], &[1.1, -2.0]));
@@ -23708,23 +23210,6 @@ mod tests {
         let runtime = DenseTransformerRuntime::new(&config);
         assert_eq!(runtime.width, 4096);
         assert_eq!(runtime.head_dim, 128);
-    }
-
-    #[test]
-    fn metal_kv_context_is_capped_by_memory_budget() {
-        let config: QwenModelConfig = serde_json::from_slice(
-            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4,"max_position_embeddings":131072}"#,
-        )
-        .unwrap();
-        let runtime = DenseTransformerRuntime::new(&config);
-        // kv_width = kv_heads * head_dim = 8 * 128 = 1024
-        assert_eq!(runtime.kv_width, 1024);
-        let context = metal_kv_max_context(&config, runtime.kv_width, 64 * 1024 * 1024 * 1024);
-        assert!(context < 131_072);
-        assert!(
-            metal_kv_cache_bytes(config.num_hidden_layers, context, runtime.kv_width)
-                <= 16 * 1024 * 1024 * 1024
-        );
     }
 
     #[test]
