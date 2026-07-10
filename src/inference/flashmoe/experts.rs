@@ -787,6 +787,10 @@ pub(crate) trait AggregateExpertTensor {
     fn aggregate_tensor_has_native_q4(&self) -> bool;
 }
 
+pub(crate) trait ExpertSourceTensor: AggregateExpertTensor {
+    fn expert_source_offsets(&self) -> Option<[u64; 2]>;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AggregateExpertTensors<'a, T> {
     pub(crate) gate: AggregateExpertSlice<'a, T>,
@@ -1101,6 +1105,58 @@ pub(crate) fn native_q4_slice_byte_ranges<T: AggregateExpertTensor>(
         scale_bias_bytes,
         groups,
     })
+}
+
+pub(crate) fn expert_tensor_byte_range<T: ExpertSourceTensor>(
+    tensor: &T,
+    dtype: &str,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<[u64; 2]> {
+    let [tensor_start, tensor_end] = tensor.expert_source_offsets().with_context(|| {
+        format!(
+            "expert tensor {} is missing source offsets",
+            tensor.aggregate_tensor_name()
+        )
+    })?;
+    let element_size = expert_tensor_dtype_size(dtype).with_context(|| {
+        format!(
+            "expert tensor {} has unsupported dtype {dtype}",
+            tensor.aggregate_tensor_name()
+        )
+    })?;
+    let byte_start = tensor_start
+        .checked_add(
+            (element_offset
+                .checked_mul(element_size)
+                .context("expert tensor byte offset overflow")?) as u64,
+        )
+        .context("expert tensor source offset overflow")?;
+    let byte_len = element_count
+        .checked_mul(element_size)
+        .context("expert tensor byte length overflow")?;
+    let byte_end = byte_start
+        .checked_add(byte_len as u64)
+        .context("expert tensor byte range overflow")?;
+    if byte_end > tensor_end {
+        bail!(
+            "expert tensor {} range {}..{} exceeds source offsets {:?}",
+            tensor.aggregate_tensor_name(),
+            byte_start,
+            byte_end,
+            [tensor_start, tensor_end]
+        );
+    }
+    Ok([byte_start, byte_end])
+}
+
+fn expert_tensor_dtype_size(dtype: &str) -> Option<usize> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "F32" | "FLOAT32" | "FP32" => Some(4),
+        "BF16" | "BFLOAT16" | "F16" | "FLOAT16" | "FP16" => Some(2),
+        "U8" | "I8" => Some(1),
+        _ => None,
+    }
 }
 
 fn validate_direct_expert_matrix_shape<T: AggregateExpertTensor>(
@@ -3151,6 +3207,12 @@ mod tests {
         }
     }
 
+    impl ExpertSourceTensor for TestAggregateTensor {
+        fn expert_source_offsets(&self) -> Option<[u64; 2]> {
+            Some([100, 200])
+        }
+    }
+
     #[test]
     fn aggregate_expert_tensor_kind_classifies_qwen_and_mlx_names() {
         assert_eq!(
@@ -3420,6 +3482,39 @@ mod tests {
                 .to_string()
                 .contains("slice shape [3, 8] does not match 2 rows x 8 cols")
         );
+    }
+
+    #[test]
+    fn expert_tensor_byte_range_uses_source_offsets_and_dtype_width() {
+        let tensor = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+
+        assert_eq!(
+            expert_tensor_byte_range(&tensor, "BF16", 3, 4).unwrap(),
+            [106, 114]
+        );
+        assert_eq!(
+            expert_tensor_byte_range(&tensor, "U8", 3, 4).unwrap(),
+            [103, 107]
+        );
+    }
+
+    #[test]
+    fn expert_tensor_byte_range_rejects_unsupported_or_out_of_bounds_ranges() {
+        let tensor = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+
+        let dtype = expert_tensor_byte_range(&tensor, "U32", 0, 1).unwrap_err();
+        assert!(dtype.to_string().contains("has unsupported dtype U32"));
+
+        let bounds = expert_tensor_byte_range(&tensor, "F32", 20, 10).unwrap_err();
+        assert!(bounds.to_string().contains("exceeds source offsets"));
     }
 
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {

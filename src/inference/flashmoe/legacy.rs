@@ -82,7 +82,7 @@ use super::experts::{
     NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
     aggregate_expert_tensor_kind, aggregate_expert_tensors, aggregate_native_q4_enabled,
     build_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
-    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
+    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size, expert_tensor_byte_range,
     first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
     fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
     pbq4_expert_pack_wire_size, q4_record_layout_for_shape, rewrite_expert_layer_pack,
@@ -22303,46 +22303,6 @@ fn read_safetensor_source_byte_range(
         bytes[abs_start as usize..abs_end as usize].to_vec(),
         [byte_start, byte_end],
     ))
-}
-
-fn expert_tensor_byte_range(
-    tensor: &ExpertTensorRef,
-    dtype: &str,
-    element_offset: usize,
-    element_count: usize,
-) -> Result<[u64; 2]> {
-    let [tensor_start, tensor_end] = tensor
-        .source_offsets
-        .with_context(|| format!("expert tensor {} is missing source offsets", tensor.tensor))?;
-    let element_size = dtype_size(dtype).with_context(|| {
-        format!(
-            "expert tensor {} has unsupported dtype {dtype}",
-            tensor.tensor
-        )
-    })?;
-    let byte_start = tensor_start
-        .checked_add(
-            (element_offset
-                .checked_mul(element_size)
-                .context("expert tensor byte offset overflow")?) as u64,
-        )
-        .context("expert tensor source offset overflow")?;
-    let byte_len = element_count
-        .checked_mul(element_size)
-        .context("expert tensor byte length overflow")?;
-    let byte_end = byte_start
-        .checked_add(byte_len as u64)
-        .context("expert tensor byte range overflow")?;
-    if byte_end > tensor_end {
-        bail!(
-            "expert tensor {} range {}..{} exceeds source offsets {:?}",
-            tensor.tensor,
-            byte_start,
-            byte_end,
-            [tensor_start, tensor_end]
-        );
-    }
-    Ok([byte_start, byte_end])
 }
 
 fn validate_expert_tensor_group(

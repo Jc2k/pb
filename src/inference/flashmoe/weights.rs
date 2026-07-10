@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::experts::{
-    AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
+    AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertSourceTensor,
+    expert_scale_bias_dtype_size,
 };
 use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
 use super::types::{ExpertQuantization, GROUP_SIZE};
@@ -46,6 +47,12 @@ impl AggregateExpertTensor for ExpertTensorRef {
 
     fn aggregate_tensor_has_native_q4(&self) -> bool {
         self.q4_sources.is_some()
+    }
+}
+
+impl ExpertSourceTensor for ExpertTensorRef {
+    fn expert_source_offsets(&self) -> Option<[u64; 2]> {
+        self.source_offsets
     }
 }
 
