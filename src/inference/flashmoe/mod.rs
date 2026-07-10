@@ -8,6 +8,7 @@ mod capabilities;
 mod experts;
 mod legacy;
 mod math;
+mod metal;
 mod model_family;
 mod scheduler;
 mod state;
