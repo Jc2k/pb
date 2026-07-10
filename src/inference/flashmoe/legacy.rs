@@ -103,14 +103,14 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput,
+    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
+    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
+    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2741,19 +2741,17 @@ struct MetalDeferredExpertPhase {
     command_buffer: ObjcId,
     buffers: Vec<MetalPhaseBuffer>,
     retained_experts: MetalExpertRetention,
-    hidden_buffer: ObjcId,
-    next_normed_buffer: Option<ObjcId>,
+    output: MetalCmd3DeferredOutput,
     context: MetalCommandContext,
-    output_state: FlashMoeCmd3OutputState,
     scheduled_output: Option<ScheduledCmd3OutputState>,
-    width: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalDeferredExpertPhase {
     fn next_normed_input(&self) -> Option<DeferredMetalInput> {
-        self.next_normed_buffer
-            .zip(self.output_state.next_normed())
+        self.output
+            .next_normed_buffer
+            .zip(self.output.output_state.next_normed())
             .map(|(buffer, next_normed)| {
                 let input = DeferredMetalInput::next_layer_normed(buffer, next_normed.len());
                 debug_assert_eq!(input.state(), next_normed);
@@ -2763,8 +2761,8 @@ impl MetalDeferredExpertPhase {
     }
 
     fn hidden_input(&self) -> DeferredMetalInput {
-        let hidden = self.output_state.hidden();
-        let input = DeferredMetalInput::hidden(self.hidden_buffer, hidden.len());
+        let hidden = self.output.output_state.hidden();
+        let input = DeferredMetalInput::hidden(self.output.hidden_buffer, hidden.len());
         debug_assert_eq!(input.state(), hidden);
         debug_assert!(input.state().is_declared_graph_state());
         input
@@ -2801,10 +2799,14 @@ impl MetalDeferredExpertPhase {
                 }
                 return Err(error.into());
             }
-            let hidden = read_f32_buffer(self.hidden_buffer, self.output_state.hidden().len());
+            let hidden = read_f32_buffer(
+                self.output.hidden_buffer,
+                self.output.output_state.hidden().len(),
+            );
             let next_normed = self
+                .output
                 .next_normed_buffer
-                .zip(self.output_state.next_normed())
+                .zip(self.output.output_state.next_normed())
                 .map(|(buffer, next_normed)| read_f32_buffer(buffer, next_normed.len()));
             release(self.command_buffer);
             for buffer in self.buffers {
@@ -5128,17 +5130,16 @@ impl MetalExecutorInner {
             commit_metal_command_buffer(command_buffer, &context);
             release(encoder);
 
+            let output =
+                MetalCmd3DeferredOutput::new(hidden_buffer, next_normed_buffer, output_state)?;
             Ok(Some(MetalDeferredExpertPhase {
                 inner: self.clone(),
                 command_buffer,
                 buffers,
                 retained_experts,
-                hidden_buffer,
-                next_normed_buffer,
+                output,
                 context,
-                output_state,
                 scheduled_output: None,
-                width,
             }))
         }
     }

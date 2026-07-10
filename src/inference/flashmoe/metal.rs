@@ -11,7 +11,7 @@ use super::scheduler::{
     ScheduledCmd3MetalPostAttentionInput, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::state::FlashMoePostAttentionPrepState;
+use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
@@ -904,6 +904,40 @@ impl MetalPostAttentionPrep {
         }
         self.routing_command = Some(command.clone());
         Ok(command)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalCmd3DeferredOutput {
+    pub(crate) hidden_buffer: MetalObjcId,
+    pub(crate) next_normed_buffer: Option<MetalObjcId>,
+    pub(crate) output_state: FlashMoeCmd3OutputState,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3DeferredOutput {
+    pub(crate) fn new(
+        hidden_buffer: MetalObjcId,
+        next_normed_buffer: Option<MetalObjcId>,
+        output_state: FlashMoeCmd3OutputState,
+    ) -> anyhow::Result<Self> {
+        if hidden_buffer.is_null() {
+            anyhow::bail!("FlashMoe CMD3 deferred output requires a non-null hidden buffer");
+        }
+        if !output_state.is_declared_graph_state() {
+            anyhow::bail!("FlashMoe CMD3 deferred output state is not declared graph state");
+        }
+        if next_normed_buffer.is_some() != output_state.has_next_normed() {
+            anyhow::bail!(
+                "FlashMoe CMD3 deferred output next-norm buffer presence does not match declared output state"
+            );
+        }
+        Ok(Self {
+            hidden_buffer,
+            next_normed_buffer,
+            output_state,
+        })
     }
 }
 
@@ -3065,6 +3099,53 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Metal post-attention input for layer 3")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_deferred_output_declares_gpu_resident_buffers() {
+        let hidden = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let next_normed = hidden;
+        let output = MetalCmd3DeferredOutput::new(
+            hidden,
+            Some(next_normed),
+            FlashMoeCmd3OutputState::gpu_resident(16, true),
+        )
+        .unwrap();
+
+        assert_eq!(output.hidden_buffer, hidden);
+        assert_eq!(output.next_normed_buffer, Some(next_normed));
+        assert_eq!(output.output_state.width(), 16);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_deferred_output_rejects_undeclared_buffer_state() {
+        let hidden = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+
+        let missing_next = MetalCmd3DeferredOutput::new(
+            hidden,
+            None,
+            FlashMoeCmd3OutputState::gpu_resident(16, true),
+        )
+        .unwrap_err();
+        assert!(
+            missing_next
+                .to_string()
+                .contains("next-norm buffer presence"),
+            "{missing_next:#}"
+        );
+
+        let null_hidden = MetalCmd3DeferredOutput::new(
+            std::ptr::null_mut(),
+            None,
+            FlashMoeCmd3OutputState::gpu_resident(16, false),
+        )
+        .unwrap_err();
+        assert!(
+            null_hidden.to_string().contains("non-null hidden buffer"),
+            "{null_hidden:#}"
         );
     }
 

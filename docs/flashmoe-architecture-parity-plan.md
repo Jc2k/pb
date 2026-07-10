@@ -187,8 +187,10 @@ The validator should reject silent fallbacks such as:
   attention-value outputs, and linear-attention static offsets now use Metal-owned descriptors for
   CMD1/CMD2 handoff. Metal KV cache layer layout/range validation and linear-attention GPU state
   cache descriptors now live with the Metal module, while allocation is still bridged through
-  legacy Obj-C helpers. CMD3 expert-phase temporary buffers and command-local fixed-Q4 source-buffer
-  reuse now carry Metal-owned lifecycle/cache markers, and reusable transient Metal buffer entries
+  legacy Obj-C helpers. CMD3 deferred hidden/next-normed output buffers now carry a Metal-owned
+  descriptor that validates GPU-resident output state before the legacy wait/readback bridge can
+  consume them. CMD3 expert-phase temporary buffers and command-local fixed-Q4 source-buffer reuse
+  now carry Metal-owned lifecycle/cache markers, and reusable transient Metal buffer entries
   are typed in the Metal module. Resident dense and shared-expert Metal buffers now have
   Metal-owned descriptors, including mmap retention for resident dense weights; LM-head Metal
   buffer cache budget, shape matching, eviction, and release-all policy also live in `metal.rs`.
