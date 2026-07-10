@@ -1160,6 +1160,47 @@ pub(crate) struct MetalCmd3SharedBufferLayout {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3SharedWorkBuffers {
+    pub(crate) gate_out: MetalObjcId,
+    pub(crate) up_out: MetalObjcId,
+    pub(crate) router_out: MetalObjcId,
+    pub(crate) activated: MetalObjcId,
+    pub(crate) total_intermediate: MetalObjcId,
+    pub(crate) intermediate: MetalObjcId,
+    pub(crate) layout: MetalCmd3SharedBufferLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3SharedWorkBuffers {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        plan: MetalCmd3SharedPhasePlan,
+        gate_out: MetalObjcId,
+        up_out: MetalObjcId,
+        router_out: MetalObjcId,
+        activated: MetalObjcId,
+        total_intermediate: MetalObjcId,
+        intermediate: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        if plan.source == MetalCmd3SharedPhaseSource::None {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 shared work buffers require a declared shared expert source"
+            );
+        }
+        Ok(Self {
+            gate_out,
+            up_out,
+            router_out,
+            activated,
+            total_intermediate,
+            intermediate,
+            layout: plan.buffer_layout()?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3SharedPhasePlan {
     pub(crate) const fn none(width: usize) -> Self {
         Self {
@@ -4020,6 +4061,53 @@ mod tests {
                 projection_output_bytes: 6 * 4,
                 router_output_bytes: 2 * 4,
             }
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_shared_work_buffers_carry_declared_layout() {
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: test_q4_projection("gate", 6, 4),
+            up: test_q4_projection("up", 6, 4),
+            down: test_q4_projection("down", 4, 6),
+            router: test_q4_projection("router", 2, 4),
+            shared_experts: 2,
+            intermediate: 3,
+            width: 4,
+        };
+        let plan = MetalCmd3SharedPhasePlan::resident_q4(4, &shared).unwrap();
+
+        let buffers = MetalCmd3SharedWorkBuffers::new(
+            plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+            0x5000usize as MetalObjcId,
+            0x6000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        assert_eq!(buffers.layout.total_intermediate_u32, 6);
+        assert_eq!(buffers.layout.intermediate_u32, 3);
+        assert_eq!(buffers.layout.projection_output_bytes, 6 * 4);
+        assert_eq!(buffers.layout.router_output_bytes, 2 * 4);
+        assert_eq!(buffers.gate_out, 0x1000usize as MetalObjcId);
+
+        let err = MetalCmd3SharedWorkBuffers::new(
+            MetalCmd3SharedPhasePlan::none(4),
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+            0x5000usize as MetalObjcId,
+            0x6000usize as MetalObjcId,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("declared shared expert source"),
+            "{err:#}"
         );
     }
 

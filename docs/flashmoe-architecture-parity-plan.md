@@ -346,11 +346,12 @@ The validator should reject silent fallbacks such as:
   weights, whether CMD3 consumes Metal post-attention prep buffers or CPU-uploaded inputs.
   The Qwen3.5 Q4 scheduled graph also rejects dense CPU shared weights as a CMD3 implementation, so
   this is a capability rule rather than only a live-loop convention.
-  Shared-expert temporary buffers, active-expert
-  activation/projection buffers, and submitted command context now resolve through Metal-owned plan
-  helpers instead of legacy size/metadata recomputation. The actual shared gate/up/down, next-norm
-  application, and shared down execution still live in the older Metal/CPU phase helpers. That
-  execution should become part of the same CMD2/CMD3 builder model as routed experts.
+  Shared-expert temporary buffers now materialize as a Metal-owned work-buffer record derived from
+  the shared plan; active-expert activation/projection buffers and submitted command context also
+  resolve through Metal-owned plan helpers instead of legacy size/metadata recomputation. The actual
+  shared gate/up/down, next-norm application, and shared down execution still live in the older
+  Metal/CPU phase helpers. That execution should become part of the same CMD2/CMD3 builder model as
+  routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
   plans should feed the same text/MoE runtime rather than spreading multimodal branches through the
   execution loop.

@@ -104,14 +104,14 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput,
-    MetalCmd3ExecutionPlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3ExecutionPlan, MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource,
+    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
+    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -4909,54 +4909,42 @@ impl MetalExecutorInner {
             {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
-                let shared_layout = shared_plan.buffer_layout()?;
-                let total_u32 = shared_layout.total_intermediate_u32;
-                let shared_intermediate_u32 = shared_layout.intermediate_u32;
-                let shared_gate_out =
-                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out = self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out = self.buffer_with_len(shared_layout.router_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
-                let shared_activated =
-                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
-                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
-                let shared_intermediate_buffer =
-                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
+                let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
 
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.gate,
                     normed_buffer,
-                    shared_gate_out,
+                    shared_work.gate_out,
                 )?;
-                self.encode_q4_mmap_projection(encoder, &shared.up, normed_buffer, shared_up_out)?;
+                self.encode_q4_mmap_projection(
+                    encoder,
+                    &shared.up,
+                    normed_buffer,
+                    shared_work.up_out,
+                )?;
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.router,
                     normed_buffer,
-                    shared_router_out,
+                    shared_work.router_out,
                 )?;
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
                     self.pipelines.shared_expert_activation_pipeline,
                 );
-                set_buffer(encoder, shared_gate_out, 0);
-                set_buffer(encoder, shared_up_out, 1);
-                set_buffer(encoder, shared_router_out, 2);
-                set_buffer(encoder, shared_activated, 3);
-                set_buffer(encoder, shared_intermediate_buffer, 4);
-                set_buffer(encoder, total_buffer, 5);
+                set_buffer(encoder, shared_work.gate_out, 0);
+                set_buffer(encoder, shared_work.up_out, 1);
+                set_buffer(encoder, shared_work.router_out, 2);
+                set_buffer(encoder, shared_work.activated, 3);
+                set_buffer(encoder, shared_work.intermediate, 4);
+                set_buffer(encoder, shared_work.total_intermediate, 5);
                 dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.down,
-                    shared_activated,
+                    shared_work.activated,
                     shared_output_buffer,
                 )?;
             } else if let (Some(_shared), MetalCmd3SharedPhaseSource::Dense) =
@@ -4965,30 +4953,13 @@ impl MetalExecutorInner {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
-                let shared_layout = shared_plan.buffer_layout()?;
-                let total_u32 = shared_layout.total_intermediate_u32;
-                let shared_intermediate_u32 = shared_layout.intermediate_u32;
-                let shared_gate_out =
-                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out = self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out = self.buffer_with_len(shared_layout.router_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
-                let shared_activated =
-                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
-                let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
-                let shared_intermediate_buffer =
-                    self.buffer_with_bytes(u32_as_bytes(&shared_intermediate_u32))?;
-                buffers.push(MetalPhaseBuffer::recyclable(shared_intermediate_buffer));
+                let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
 
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.gate,
                     normed_buffer,
-                    shared_gate_out,
+                    shared_work.gate_out,
                     width_buffer,
                     shared_plan.projection_rows(),
                 );
@@ -4996,7 +4967,7 @@ impl MetalExecutorInner {
                     encoder,
                     shared_metal.up,
                     normed_buffer,
-                    shared_up_out,
+                    shared_work.up_out,
                     width_buffer,
                     shared_plan.projection_rows(),
                 );
@@ -5004,7 +4975,7 @@ impl MetalExecutorInner {
                     encoder,
                     shared_metal.router,
                     normed_buffer,
-                    shared_router_out,
+                    shared_work.router_out,
                     width_buffer,
                     shared_plan.router_rows(),
                 );
@@ -5013,19 +4984,19 @@ impl MetalExecutorInner {
                     sel("setComputePipelineState:"),
                     self.pipelines.shared_expert_activation_pipeline,
                 );
-                set_buffer(encoder, shared_gate_out, 0);
-                set_buffer(encoder, shared_up_out, 1);
-                set_buffer(encoder, shared_router_out, 2);
-                set_buffer(encoder, shared_activated, 3);
-                set_buffer(encoder, shared_intermediate_buffer, 4);
-                set_buffer(encoder, total_buffer, 5);
+                set_buffer(encoder, shared_work.gate_out, 0);
+                set_buffer(encoder, shared_work.up_out, 1);
+                set_buffer(encoder, shared_work.router_out, 2);
+                set_buffer(encoder, shared_work.activated, 3);
+                set_buffer(encoder, shared_work.intermediate, 4);
+                set_buffer(encoder, shared_work.total_intermediate, 5);
                 dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.down,
-                    shared_activated,
+                    shared_work.activated,
                     shared_output_buffer,
-                    total_buffer,
+                    shared_work.total_intermediate,
                     width,
                 );
             } else {
@@ -8292,6 +8263,38 @@ impl MetalExecutorInner {
         buffers.push(phase_buffer);
         source_buffers.insert(source.bytes, buffer);
         Ok(buffer)
+    }
+
+    unsafe fn cmd3_shared_work_buffers(
+        &self,
+        plan: MetalCmd3SharedPhasePlan,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<MetalCmd3SharedWorkBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let gate_out = self.buffer_with_len(layout.projection_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+            let up_out = self.buffer_with_len(layout.projection_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(up_out));
+            let router_out = self.buffer_with_len(layout.router_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(router_out));
+            let activated = self.buffer_with_len(layout.projection_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(activated));
+            let total_intermediate =
+                self.buffer_with_bytes(u32_as_bytes(&layout.total_intermediate_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(total_intermediate));
+            let intermediate = self.buffer_with_bytes(u32_as_bytes(&layout.intermediate_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(intermediate));
+            MetalCmd3SharedWorkBuffers::new(
+                plan,
+                gate_out,
+                up_out,
+                router_out,
+                activated,
+                total_intermediate,
+                intermediate,
+            )
+        }
     }
 
     fn shared_expert_buffers(
