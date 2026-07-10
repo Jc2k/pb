@@ -105,16 +105,16 @@ use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
     MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
-    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3NextNormBuffers,
-    MetalCmd3NextNormPlan, MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan,
-    MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3InputBuffers,
+    MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers,
+    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
+    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
+    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -4842,6 +4842,15 @@ impl MetalExecutorInner {
             }
         };
         let plan = command_plan.phase;
+        let input_buffers = match MetalCmd3InputBuffers::new(plan, normed_buffer, residual_buffer) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Err(error.context(
+                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled input buffers",
+                ));
+            }
+        };
         let next_norm_plan = command_plan.next_norm;
         let layer = plan.layer;
         let width = plan.width;
@@ -4862,8 +4871,8 @@ impl MetalExecutorInner {
 
         unsafe {
             let mut buffers: Vec<MetalPhaseBuffer> = vec![
-                MetalPhaseBuffer::recyclable(normed_buffer),
-                MetalPhaseBuffer::recyclable(residual_buffer),
+                MetalPhaseBuffer::recyclable(input_buffers.normed),
+                MetalPhaseBuffer::recyclable(input_buffers.residual),
             ];
             let output_buffers = self.cmd3_output_buffers(&command_plan, &mut buffers)?;
             let combine_buffers =
@@ -4893,19 +4902,19 @@ impl MetalExecutorInner {
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.gate,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.gate_out,
                 )?;
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.up,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.up_out,
                 )?;
                 self.encode_q4_mmap_projection(
                     encoder,
                     &shared.router,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.router_out,
                 )?;
                 msg_send_void1_id(
@@ -4937,7 +4946,7 @@ impl MetalExecutorInner {
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.gate,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.gate_out,
                     combine_buffers.width,
                     shared_plan.projection_rows(),
@@ -4945,7 +4954,7 @@ impl MetalExecutorInner {
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.up,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.up_out,
                     combine_buffers.width,
                     shared_plan.projection_rows(),
@@ -4953,7 +4962,7 @@ impl MetalExecutorInner {
                 self.encode_dense_matvec(
                     encoder,
                     shared_metal.router,
-                    normed_buffer,
+                    input_buffers.normed,
                     shared_work.router_out,
                     combine_buffers.width,
                     shared_plan.router_rows(),
@@ -4998,7 +5007,7 @@ impl MetalExecutorInner {
                     encoder,
                     &payload.gate,
                     &payload.up,
-                    normed_buffer,
+                    input_buffers.normed,
                     active_work.activated,
                     &mut buffers,
                     &mut q4_source_buffers,
@@ -5018,7 +5027,7 @@ impl MetalExecutorInner {
                     self.encode_q4_matvec(
                         encoder,
                         &payload.gate,
-                        normed_buffer,
+                        input_buffers.normed,
                         gate_out,
                         0,
                         &mut buffers,
@@ -5027,7 +5036,7 @@ impl MetalExecutorInner {
                     self.encode_q4_matvec(
                         encoder,
                         &payload.up,
-                        normed_buffer,
+                        input_buffers.normed,
                         up_out,
                         0,
                         &mut buffers,
@@ -5064,7 +5073,7 @@ impl MetalExecutorInner {
                 sel("setComputePipelineState:"),
                 self.pipelines.combine_expert_phase_pipeline,
             );
-            set_buffer(encoder, residual_buffer, 0);
+            set_buffer(encoder, input_buffers.residual, 0);
             set_buffer(encoder, output_buffers.shared_output, 1);
             set_buffer(encoder, output_buffers.expert_outputs, 2);
             set_buffer(encoder, combine_buffers.routing_weights, 3);

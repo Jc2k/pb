@@ -957,6 +957,35 @@ pub(crate) struct MetalCmd3PhasePlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3InputBuffers {
+    pub(crate) normed: MetalObjcId,
+    pub(crate) residual: MetalObjcId,
+    pub(crate) phase: MetalCmd3PhasePlan,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3InputBuffers {
+    pub(crate) fn new(
+        phase: MetalCmd3PhasePlan,
+        normed: MetalObjcId,
+        residual: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        if normed.is_null() {
+            anyhow::bail!("FlashMoe Metal CMD3 input requires a non-null normed buffer");
+        }
+        if residual.is_null() {
+            anyhow::bail!("FlashMoe Metal CMD3 input requires a non-null residual buffer");
+        }
+        Ok(Self {
+            normed,
+            residual,
+            phase,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3PhasePlan {
     pub(crate) fn new(
         position: usize,
@@ -3945,6 +3974,38 @@ mod tests {
         assert!(
             width_err.to_string().contains("does not fit Metal u32"),
             "{width_err:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_input_buffers_carry_declared_phase_inputs() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
+
+        let inputs = MetalCmd3InputBuffers::new(
+            phase,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        assert_eq!(inputs.normed, 0x1000usize as MetalObjcId);
+        assert_eq!(inputs.residual, 0x2000usize as MetalObjcId);
+        assert_eq!(inputs.phase, phase);
+
+        let missing_normed =
+            MetalCmd3InputBuffers::new(phase, std::ptr::null_mut(), inputs.residual).unwrap_err();
+        assert!(
+            missing_normed.to_string().contains("non-null normed"),
+            "{missing_normed:#}"
+        );
+
+        let missing_residual =
+            MetalCmd3InputBuffers::new(phase, inputs.normed, std::ptr::null_mut()).unwrap_err();
+        assert!(
+            missing_residual.to_string().contains("non-null residual"),
+            "{missing_residual:#}"
         );
     }
 
