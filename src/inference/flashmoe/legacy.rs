@@ -105,11 +105,12 @@ use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
     MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalKvCacheInner, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
-    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -3261,12 +3262,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_key_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.key_dim as u64,
                     height: 1,
                     depth: 1,
@@ -3325,12 +3326,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -3356,12 +3357,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -3614,12 +3615,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_key_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.key_dim as u64,
                     height: 1,
                     depth: 1,
@@ -3680,12 +3681,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -3712,12 +3713,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -4018,12 +4019,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_key_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.key_dim as u64,
                     height: 1,
                     depth: 1,
@@ -4082,12 +4083,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -4113,12 +4114,12 @@ impl MetalExecutorInner {
             msg_send_void2_size(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.num_value_heads as u64,
                     height: 1,
                     depth: 1,
                 },
-                MtlSize {
+                MetalDispatchSize {
                     width: layout.value_dim as u64,
                     height: 1,
                     depth: 1,
@@ -17907,90 +17908,39 @@ unsafe fn metal_buffer_barrier(encoder: ObjcId) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn dispatch_threads(encoder: ObjcId, threads: u64) {
     unsafe {
-        let grid = MtlSize {
-            width: threads,
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup = MtlSize {
-            width: threads.clamp(1, 64),
-            height: 1,
-            depth: 1,
-        };
-        msg_send_void2_size(
-            encoder,
-            sel("dispatchThreads:threadsPerThreadgroup:"),
-            grid,
-            threadgroup,
-        );
+        dispatch_metal_plan(encoder, MetalDispatchPlan::threads(threads));
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn dispatch_q4_threadgroups(encoder: ObjcId, rows: u64) {
     unsafe {
-        const Q4_ROWS_PER_THREADGROUP: u64 = 8;
-        let grid = MtlSize {
-            width: rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1),
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup = MtlSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        };
-        msg_send_void2_size(
-            encoder,
-            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-            grid,
-            threadgroup,
-        );
+        dispatch_metal_plan(encoder, MetalDispatchPlan::q4_threadgroups(rows));
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn dispatch_q4_mmap_threadgroups(encoder: ObjcId, rows: u64) {
     unsafe {
-        const Q4_MMAP_ROWS_PER_THREADGROUP: u64 = 16;
-        let grid = MtlSize {
-            width: rows.div_ceil(Q4_MMAP_ROWS_PER_THREADGROUP).max(1),
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup = MtlSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        };
-        msg_send_void2_size(
-            encoder,
-            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-            grid,
-            threadgroup,
-        );
+        dispatch_metal_plan(encoder, MetalDispatchPlan::q4_mmap_threadgroups(rows));
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn dispatch_single_threadgroup(encoder: ObjcId, threads: u64) {
     unsafe {
-        let grid = MtlSize {
-            width: 1,
-            height: 1,
-            depth: 1,
+        dispatch_metal_plan(encoder, MetalDispatchPlan::single_threadgroup(threads));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn dispatch_metal_plan(encoder: ObjcId, plan: MetalDispatchPlan) {
+    unsafe {
+        let selector = match plan.mode {
+            MetalDispatchMode::Threads => sel("dispatchThreads:threadsPerThreadgroup:"),
+            MetalDispatchMode::Threadgroups => sel("dispatchThreadgroups:threadsPerThreadgroup:"),
         };
-        let threadgroup = MtlSize {
-            width: threads.clamp(1, 256),
-            height: 1,
-            depth: 1,
-        };
-        msg_send_void2_size(
-            encoder,
-            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-            grid,
-            threadgroup,
-        );
+        msg_send_void2_size(encoder, selector, plan.grid, plan.threadgroup);
     }
 }
 
@@ -18033,15 +17983,6 @@ fn u64_as_bytes_slice(values: &[u64]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct MtlSize {
-    width: u64,
-    height: u64,
-    depth: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -18236,9 +18177,14 @@ unsafe fn msg_send_void1_u64(receiver: ObjcId, selector: Sel, arg: u64) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn msg_send_void2_size(receiver: ObjcId, selector: Sel, a: MtlSize, b: MtlSize) {
+unsafe fn msg_send_void2_size(
+    receiver: ObjcId,
+    selector: Sel,
+    a: MetalDispatchSize,
+    b: MetalDispatchSize,
+) {
     unsafe {
-        let f: unsafe extern "C" fn(ObjcId, Sel, MtlSize, MtlSize) =
+        let f: unsafe extern "C" fn(ObjcId, Sel, MetalDispatchSize, MetalDispatchSize) =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector, a, b);
     }

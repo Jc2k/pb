@@ -447,6 +447,78 @@ impl MetalSharedExpertBuffers {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalDispatchSize {
+    pub(crate) width: u64,
+    pub(crate) height: u64,
+    pub(crate) depth: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalDispatchSize {
+    pub(crate) const fn new(width: u64, height: u64, depth: u64) -> Self {
+        Self {
+            width,
+            height,
+            depth,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetalDispatchMode {
+    Threads,
+    Threadgroups,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalDispatchPlan {
+    pub(crate) mode: MetalDispatchMode,
+    pub(crate) grid: MetalDispatchSize,
+    pub(crate) threadgroup: MetalDispatchSize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalDispatchPlan {
+    pub(crate) fn threads(threads: u64) -> Self {
+        Self {
+            mode: MetalDispatchMode::Threads,
+            grid: MetalDispatchSize::new(threads, 1, 1),
+            threadgroup: MetalDispatchSize::new(threads.clamp(1, 64), 1, 1),
+        }
+    }
+
+    pub(crate) fn q4_threadgroups(rows: u64) -> Self {
+        const Q4_ROWS_PER_THREADGROUP: u64 = 8;
+        Self {
+            mode: MetalDispatchMode::Threadgroups,
+            grid: MetalDispatchSize::new(rows.div_ceil(Q4_ROWS_PER_THREADGROUP).max(1), 1, 1),
+            threadgroup: MetalDispatchSize::new(256, 1, 1),
+        }
+    }
+
+    pub(crate) fn q4_mmap_threadgroups(rows: u64) -> Self {
+        const Q4_MMAP_ROWS_PER_THREADGROUP: u64 = 16;
+        Self {
+            mode: MetalDispatchMode::Threadgroups,
+            grid: MetalDispatchSize::new(rows.div_ceil(Q4_MMAP_ROWS_PER_THREADGROUP).max(1), 1, 1),
+            threadgroup: MetalDispatchSize::new(256, 1, 1),
+        }
+    }
+
+    pub(crate) fn single_threadgroup(threads: u64) -> Self {
+        Self {
+            mode: MetalDispatchMode::Threadgroups,
+            grid: MetalDispatchSize::new(1, 1, 1),
+            threadgroup: MetalDispatchSize::new(threads.clamp(1, 256), 1, 1),
+        }
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2970,6 +3042,44 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_dispatch_plans_preserve_command_geometry() {
+        assert_eq!(
+            MetalDispatchPlan::threads(96),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threads,
+                grid: MetalDispatchSize::new(96, 1, 1),
+                threadgroup: MetalDispatchSize::new(64, 1, 1),
+            }
+        );
+        assert_eq!(
+            MetalDispatchPlan::q4_threadgroups(17),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threadgroups,
+                grid: MetalDispatchSize::new(3, 1, 1),
+                threadgroup: MetalDispatchSize::new(256, 1, 1),
+            }
+        );
+        assert_eq!(
+            MetalDispatchPlan::q4_mmap_threadgroups(17),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threadgroups,
+                grid: MetalDispatchSize::new(2, 1, 1),
+                threadgroup: MetalDispatchSize::new(256, 1, 1),
+            }
+        );
+        assert_eq!(
+            MetalDispatchPlan::single_threadgroup(512),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threadgroups,
+                grid: MetalDispatchSize::new(1, 1, 1),
+                threadgroup: MetalDispatchSize::new(256, 1, 1),
+            }
+        );
+        assert_eq!(MetalDispatchPlan::q4_threadgroups(0).grid.width, 1);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

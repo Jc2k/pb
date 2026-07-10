@@ -194,8 +194,8 @@ The validator should reject silent fallbacks such as:
   diagnostics, wait policy, attention placement policy, kernel definitions, post-attention prep
   payloads, projection/attention buffer descriptors, resident dense/shared buffer descriptors,
   KV/linear-state layout validation, reusable buffer records, LM-head cache policy, Q4
-  source-buffer reuse, and phase buffer lifecycle markers now have a module boundary for the
-  CMD1/CMD2/CMD3 builders to move behind.
+  source-buffer reuse, dispatch geometry, and phase buffer lifecycle markers now have a module
+  boundary for the CMD1/CMD2/CMD3 builders to move behind.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
