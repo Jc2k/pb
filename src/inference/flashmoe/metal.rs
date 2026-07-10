@@ -1,4 +1,14 @@
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ffi::c_void;
 use std::time::Duration;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::scheduler::{ScheduledCmd3MetalPostAttentionInput, ScheduledRoutingCommand};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::state::FlashMoePostAttentionPrepState;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type MetalObjcId = *mut c_void;
 
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -292,6 +302,47 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.linear_decay_beta_pipeline);
         release(self.linear_delta_step_pipeline);
         release(self.linear_gated_rms_norm_pipeline);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalPostAttentionPrep {
+    pub(crate) residual_buffer: MetalObjcId,
+    pub(crate) normed_buffer: MetalObjcId,
+    pub(crate) input: ScheduledCmd3MetalPostAttentionInput,
+    pub(crate) state: FlashMoePostAttentionPrepState,
+    pub(crate) width: usize,
+    pub(crate) active: Vec<(usize, f32)>,
+    pub(crate) routing_command: Option<ScheduledRoutingCommand>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalPostAttentionPrep {
+    pub(crate) fn new(
+        layer: usize,
+        width: usize,
+        expert_count: usize,
+        active: Vec<(usize, f32)>,
+        residual_buffer: MetalObjcId,
+        normed_buffer: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        let state = FlashMoePostAttentionPrepState::new(layer, width, expert_count, active.len());
+        if !state.is_declared_graph_state() {
+            anyhow::bail!(
+                "FlashMoe unsupported Metal post-attention input for layer {layer}: prep state is not declared graph state"
+            );
+        }
+        let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
+        Ok(Self {
+            residual_buffer,
+            normed_buffer,
+            input,
+            state,
+            width,
+            active,
+            routing_command: None,
+        })
     }
 }
 
@@ -2300,5 +2351,44 @@ mod tests {
             linear_delta_step_pipeline: 35,
             linear_gated_rms_norm_pipeline: 36,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn post_attention_prep_builds_declared_cmd3_metal_input() {
+        let prep = MetalPostAttentionPrep::new(
+            3,
+            8,
+            16,
+            vec![(2, 0.75), (5, 0.25)],
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(prep.width, 8);
+        assert_eq!(prep.active, vec![(2, 0.75), (5, 0.25)]);
+        assert!(prep.routing_command.is_none());
+        assert_eq!(prep.input.state(), prep.state);
+        assert!(prep.state.is_declared_graph_state());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn post_attention_prep_rejects_undeclared_cmd3_metal_input() {
+        let err = MetalPostAttentionPrep::new(
+            3,
+            0,
+            16,
+            vec![(2, 1.0)],
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Metal post-attention input for layer 3")
+        );
     }
 }

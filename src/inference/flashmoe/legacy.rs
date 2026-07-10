@@ -104,7 +104,7 @@ use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
     MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPipelineNameSet, MetalPipelineSet,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalPostAttentionPrep, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -115,10 +115,9 @@ use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionInput,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualInput, ScheduledCmd3Command,
-    ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
-    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertReadCoordinator as ExpertScheduler, ScheduledExpertSlot,
-    ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
+    ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
+    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
     ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -134,9 +133,9 @@ use super::state::{
     FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
     FlashMoeLinearAttentionCacheShape, FlashMoeLinearAttentionCacheState,
-    FlashMoeLinearAttentionState, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
-    FlashMoeRecurrentLayerState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeLinearAttentionState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
+    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::types::*;
 #[cfg(test)]
@@ -1879,18 +1878,6 @@ impl DeferredMetalInput {
     fn state(self) -> FlashMoeGpuBufferDescriptor {
         self.state
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalPostAttentionPrep {
-    residual_buffer: ObjcId,
-    normed_buffer: ObjcId,
-    input: ScheduledCmd3MetalPostAttentionInput,
-    state: FlashMoePostAttentionPrepState,
-    width: usize,
-    active: Vec<(usize, f32)>,
-    routing_command: Option<ScheduledRoutingCommand>,
 }
 
 impl MetalExecutor {
@@ -4478,19 +4465,14 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             drop(state_guard);
-            let state =
-                FlashMoePostAttentionPrepState::new(layer, residual_len, router.rows, active.len());
-            debug_assert!(state.is_declared_graph_state());
-            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
-            Ok(Some(MetalPostAttentionPrep {
+            Ok(Some(MetalPostAttentionPrep::new(
+                layer,
+                residual_len,
+                router.rows,
+                active,
                 residual_buffer,
                 normed_buffer,
-                input,
-                state,
-                width: residual_len,
-                active,
-                routing_command: None,
-            }))
+            )?))
         }
     }
 
@@ -7450,19 +7432,14 @@ impl MetalExecutorInner {
             ] {
                 self.recycle(buffer);
             }
-            let state =
-                FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
-            debug_assert!(state.is_declared_graph_state());
-            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
-            Ok(Some(MetalPostAttentionPrep {
+            Ok(Some(MetalPostAttentionPrep::new(
+                layer,
+                width,
+                router.rows,
+                active,
                 residual_buffer,
                 normed_buffer,
-                input,
-                state,
-                width,
-                active,
-                routing_command: None,
-            }))
+            )?))
         }
     }
 
@@ -7643,19 +7620,14 @@ impl MetalExecutorInner {
             for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
                 self.recycle(buffer);
             }
-            let state =
-                FlashMoePostAttentionPrepState::new(layer, width, router.rows, active.len());
-            debug_assert!(state.is_declared_graph_state());
-            let input = ScheduledCmd3MetalPostAttentionInput::new(state, active.len())?;
-            Ok(Some(MetalPostAttentionPrep {
+            Ok(Some(MetalPostAttentionPrep::new(
+                layer,
+                width,
+                router.rows,
+                active,
                 residual_buffer,
                 normed_buffer,
-                input,
-                state,
-                width,
-                active,
-                routing_command: None,
-            }))
+            )?))
         }
     }
 
