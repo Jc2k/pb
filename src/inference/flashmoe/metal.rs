@@ -11,6 +11,23 @@ use super::state::FlashMoePostAttentionPrepState;
 pub(crate) type MetalObjcId = *mut c_void;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MetalBatchProjectionInput<'a> {
+    Cpu(&'a [f32]),
+    Buffer { buffer: MetalObjcId, len: usize },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalBatchProjectionInput<'_> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Cpu(input) => input.len(),
+            Self::Buffer { len, .. } => len,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalProjectionBatch {
     pub(crate) output_buffer: MetalObjcId,
@@ -2413,6 +2430,19 @@ mod tests {
             linear_delta_step_pipeline: 35,
             linear_gated_rms_norm_pipeline: 36,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn batch_projection_input_reports_declared_input_len() {
+        let values = [1.0, 2.0, 3.0];
+        assert_eq!(MetalBatchProjectionInput::Cpu(&values).len(), values.len());
+
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        assert_eq!(
+            MetalBatchProjectionInput::Buffer { buffer: id, len: 7 }.len(),
+            7
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

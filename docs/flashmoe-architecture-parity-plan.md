@@ -181,12 +181,12 @@ The validator should reject silent fallbacks such as:
   pipeline-name plan, typed pipeline handle set, release ordering, and kernel-surface coverage.
   Metal post-attention prep now materializes as a Metal-owned typed payload carrying scheduler CMD3
   input state, declared prep state, buffers, active routes, and the optional resolved routing
-  command. Metal projection batches and attention-value outputs now use Metal-owned buffer
-  descriptors for CMD1/CMD2 handoff. CMD3 expert-phase temporary buffers now carry a Metal-owned
-  recyclable/borrowed lifecycle marker. Legacy still owns the concrete encoders and Obj-C buffer
-  lifecycle, but command submission diagnostics, wait policy, kernel definitions, post-attention
-  prep payloads, projection/attention buffer descriptors, and phase buffer lifecycle markers now
-  have a module boundary for the CMD1/CMD2/CMD3 builders to move behind.
+  command. Metal batch-projection inputs, projection batches, and attention-value outputs now use
+  Metal-owned buffer descriptors for CMD1/CMD2 handoff. CMD3 expert-phase temporary buffers now
+  carry a Metal-owned recyclable/borrowed lifecycle marker. Legacy still owns the concrete encoders
+  and Obj-C buffer lifecycle, but command submission diagnostics, wait policy, kernel definitions,
+  post-attention prep payloads, projection/attention buffer descriptors, and phase buffer lifecycle
+  markers now have a module boundary for the CMD1/CMD2/CMD3 builders to move behind.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.

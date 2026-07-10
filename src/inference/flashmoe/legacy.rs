@@ -102,10 +102,10 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalAttentionValues, MetalCommandBufferFailure, MetalCommandContext,
-    MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep,
+    MetalProjectionBatch, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -1802,23 +1802,6 @@ impl DeferredExpertPhase {
     fn finish_without_readback(self) -> Result<()> {
         match self {
             Self::Metal(output) => output.finish_without_readback(),
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-enum MetalBatchProjectionInput<'a> {
-    Cpu(&'a [f32]),
-    Buffer { buffer: ObjcId, len: usize },
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalBatchProjectionInput<'_> {
-    fn len(self) -> usize {
-        match self {
-            Self::Cpu(input) => input.len(),
-            Self::Buffer { len, .. } => len,
         }
     }
 }
