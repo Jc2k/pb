@@ -140,7 +140,8 @@ use super::weights::{
     RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
     SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, build_shared_expert_phase_weights,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -16615,40 +16616,15 @@ impl DenseStore {
         shared_experts: usize,
         intermediate: usize,
     ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
-        if width == 0 || shared_experts == 0 || intermediate == 0 {
-            return Ok(None);
-        }
-        let total_intermediate = shared_experts
-            .checked_mul(intermediate)
-            .context("shared q4 expert intermediate width overflow")?;
-        let gate_name = shared_expert_tensor_name(layer, "gate_proj");
-        let up_name = shared_expert_tensor_name(layer, "up_proj");
-        let down_name = shared_expert_tensor_name(layer, "down_proj");
-        let router_name = shared_expert_gate_tensor_name(layer);
-        let Some(gate) = self.dense_q4_mmap_projection(&gate_name, total_intermediate, width)?
-        else {
-            return Ok(None);
-        };
-        let Some(up) = self.dense_q4_mmap_projection(&up_name, total_intermediate, width)? else {
-            return Ok(None);
-        };
-        let Some(down) = self.dense_q4_mmap_projection(&down_name, width, total_intermediate)?
-        else {
-            return Ok(None);
-        };
-        let Some(router) = self.dense_q4_mmap_projection(&router_name, shared_experts, width)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(SharedExpertPhaseQ4Projections {
-            gate,
-            up,
-            down,
-            router,
+        build_shared_expert_q4_phase_projections(
+            layer,
+            width,
             shared_experts,
             intermediate,
-            width,
-        }))
+            |tensor_name, output_width, input_len| {
+                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
+            },
+        )
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

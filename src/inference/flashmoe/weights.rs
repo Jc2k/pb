@@ -1051,6 +1051,51 @@ impl SharedExpertPhaseQ4Projections {
     }
 }
 
+pub(crate) fn build_shared_expert_q4_phase_projections<F>(
+    layer: usize,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    mut projection: F,
+) -> Result<Option<SharedExpertPhaseQ4Projections>>
+where
+    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+{
+    if width == 0 || shared_experts == 0 || intermediate == 0 {
+        return Ok(None);
+    }
+    let shape = SharedExpertPhaseShape::new(width, shared_experts, intermediate)?;
+
+    let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+    let up_name = shared_expert_tensor_name(layer, "up_proj");
+    let down_name = shared_expert_tensor_name(layer, "down_proj");
+    let router_name = shared_expert_gate_tensor_name(layer);
+    let Some(gate) = projection(&gate_name, shape.total_intermediate, shape.width)? else {
+        return Ok(None);
+    };
+    let Some(up) = projection(&up_name, shape.total_intermediate, shape.width)? else {
+        return Ok(None);
+    };
+    let Some(down) = projection(&down_name, shape.width, shape.total_intermediate)? else {
+        return Ok(None);
+    };
+    let Some(router) = projection(&router_name, shape.shared_experts, shape.width)? else {
+        return Ok(None);
+    };
+
+    let shared = SharedExpertPhaseQ4Projections {
+        gate,
+        up,
+        down,
+        router,
+        shared_experts,
+        intermediate,
+        width,
+    };
+    shared.validated_shape()?;
+    Ok(Some(shared))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1585,6 +1630,115 @@ mod tests {
         assert_eq!(
             shared.validated_shape().unwrap(),
             SharedExpertPhaseShape::new(32, 1, 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_expert_q4_builder_resolves_named_projection_bindings() {
+        let shared = build_shared_expert_q4_phase_projections(
+            4,
+            32,
+            2,
+            16,
+            |name, output_width, input_len| {
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            shared.gate.tensor_name,
+            "model.layers.4.mlp.shared_expert.gate_proj.weight"
+        );
+        assert_eq!(shared.gate.output_width, 32);
+        assert_eq!(shared.gate.cols, 32);
+        assert_eq!(shared.down.output_width, 32);
+        assert_eq!(shared.down.cols, 32);
+        assert_eq!(shared.router.output_width, 2);
+        assert_eq!(shared.router.cols, 32);
+        assert_eq!(
+            shared.validated_shape().unwrap(),
+            SharedExpertPhaseShape::new(32, 2, 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_expert_q4_builder_skips_disabled_or_partial_bindings() {
+        let disabled = build_shared_expert_q4_phase_projections(4, 32, 0, 16, |_, _, _| {
+            panic!("disabled shared Q4 experts must not request projections")
+        })
+        .unwrap();
+        assert!(disabled.is_none());
+
+        let partial = build_shared_expert_q4_phase_projections(
+            4,
+            32,
+            2,
+            16,
+            |name, output_width, input_len| {
+                if name.ends_with("up_proj.weight") {
+                    return Ok(None);
+                }
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap();
+        assert!(partial.is_none());
+    }
+
+    #[test]
+    fn shared_expert_q4_builder_rejects_mismatched_projection_shape() {
+        let err = build_shared_expert_q4_phase_projections(
+            4,
+            32,
+            2,
+            16,
+            |name, output_width, input_len| {
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len + usize::from(name.ends_with("gate_proj.weight")),
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("shared Q4 expert shape is invalid")
         );
     }
 
