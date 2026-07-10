@@ -170,6 +170,10 @@ Baseline reviewed on 2026-07-10:
   projection/state widths, encodes output projection, residual-add/RMS norm, and router projection
   in one command, performs declared CPU top-k readback, and returns GPU-resident residual/normed
   state. `legacy.rs` now only invokes this concrete builder for that stage.
+- `MetalRuntime` now owns device discovery, shader-library compilation, the command queue, every
+  required pipeline, partial-construction cleanup, and final release. `MetalExecutorInner` borrows
+  that runtime through dereference; `legacy.rs` no longer compiles or releases Metal pipelines,
+  queues, or devices.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

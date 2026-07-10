@@ -114,18 +114,16 @@ use super::metal::{
     MetalCmd3SharedWorkBuffers, MetalCommandContext, MetalDenseWeights, MetalDispatchSize,
     MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache,
-    MetalObjcId as ObjcId, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder,
-    MetalQ4SourceBufferCache, MetalResidentQ4TopKBuilder, MetalRuntimeCapabilities,
-    MetalSharedExpertBuffers, commit_and_wait_metal_command_buffer, commit_metal_command_buffer,
-    compile_pipeline, dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups,
-    dispatch_single_threadgroup, dispatch_threads, f32_as_bytes, metal_buffer_barrier,
-    metal_command_failure_requires_release, metal_default_device, msg_send_id0,
-    msg_send_id2_id_error, msg_send_id2_usize_u64, msg_send_id4_ptr_usize_u64_ptr, msg_send_ptr0,
-    msg_send_void0, msg_send_void1_id, msg_send_void2_size, ns_error_localized_description,
-    ns_string, read_f32_buffer, release, retain, sel, set_buffer, set_buffer_with_offset,
-    set_bytes, u32_as_bytes, u32_as_bytes_slice, u64_as_bytes, u64_as_bytes_slice,
-    wait_for_metal_command_buffer, wrap_dense_mmap_as_metal_buffer,
+    MetalObjcId as ObjcId, MetalPhaseBuffer, MetalPipelineNameSet, MetalPostAttentionPrep,
+    MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder, MetalQ4SourceBufferCache,
+    MetalResidentQ4TopKBuilder, MetalRuntime, MetalRuntimeCapabilities, MetalSharedExpertBuffers,
+    commit_and_wait_metal_command_buffer, commit_metal_command_buffer,
+    dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups, dispatch_single_threadgroup,
+    dispatch_threads, f32_as_bytes, metal_buffer_barrier, metal_command_failure_requires_release,
+    msg_send_id0, msg_send_id2_usize_u64, msg_send_id4_ptr_usize_u64_ptr, msg_send_ptr0,
+    msg_send_void0, msg_send_void1_id, msg_send_void2_size, read_f32_buffer, release, retain, sel,
+    set_buffer, set_buffer_with_offset, set_bytes, u32_as_bytes, u32_as_bytes_slice, u64_as_bytes,
+    u64_as_bytes_slice, wait_for_metal_command_buffer, wrap_dense_mmap_as_metal_buffer,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2659,9 +2657,7 @@ impl MetalExecutor {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct MetalExecutorInner {
-    device: ObjcId,
-    command_queue: ObjcId,
-    pipelines: MetalPipelineSet<ObjcId>,
+    metal_runtime: MetalRuntime,
     shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
     dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
@@ -2804,10 +2800,18 @@ unsafe impl Send for MetalExecutorInner {}
 unsafe impl Sync for MetalExecutorInner {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for MetalExecutorInner {
+    type Target = MetalRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metal_runtime
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for MetalExecutorInner {
     fn drop(&mut self) {
         unsafe {
-            self.pipelines.release_with(|pipeline| release(pipeline));
             if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
                 for buffers in shared_buffers.values() {
                     release(buffers.gate);
@@ -2839,8 +2843,6 @@ impl Drop for MetalExecutorInner {
                     release(layer.beta_gate);
                 }
             }
-            release(self.command_queue);
-            release(self.device);
             self.buffers.release_all();
         }
     }
@@ -2854,174 +2856,41 @@ impl MetalExecutorInner {
         runtime: &DenseTransformerRuntime,
         dense: &DenseStore,
     ) -> Result<Self> {
-        unsafe {
-            let device = metal_default_device();
-            if device.is_null() {
-                bail!(
-                    "Metal is required for Flash-MoE on ARM macOS, but no default Metal device is available"
-                );
-            }
-            let source = ns_string(METAL_SHADERS);
-            let mut compile_error = ptr::null_mut();
-            let library = msg_send_id2_id_error(
-                device,
-                sel("newLibraryWithSource:options:error:"),
-                source,
-                ptr::null_mut(),
-                &mut compile_error,
-            );
-            release(source);
-            if library.is_null() {
-                let error = ns_error_localized_description(compile_error)
-                    .unwrap_or_else(|| "unknown Metal compiler error".to_string());
-                release(device);
-                bail!("failed to compile Flash-MoE Metal shader library: {error}");
-            }
+        let metal_runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
+        let device = metal_runtime.device;
+        let dense_weights = wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
 
-            let pipeline_names = MetalPipelineNameSet::new();
-            let q4_pipeline = compile_pipeline(device, library, pipeline_names.q4)?;
-            let q4_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, pipeline_names.q4_bf16_scale_bias)?;
-            let q4_swiglu_pipeline = compile_pipeline(device, library, pipeline_names.q4_swiglu)?;
-            let q4_swiglu_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, pipeline_names.q4_swiglu_bf16_scale_bias)?;
-            let q4_mmap_pipeline = compile_pipeline(device, library, pipeline_names.q4_mmap)?;
-            let q4_mmap_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, pipeline_names.q4_mmap_bf16_scale_bias)?;
-            let q4_mmap_batch_pipeline =
-                compile_pipeline(device, library, pipeline_names.q4_mmap_batch)?;
-            let q4_mmap_batch_bf16_scale_bias_pipeline = compile_pipeline(
-                device,
-                library,
-                pipeline_names.q4_mmap_batch_bf16_scale_bias,
-            )?;
-            let dense_matvec_pipeline =
-                compile_pipeline(device, library, pipeline_names.dense_matvec)?;
-            let dense_matvec_bf16_pipeline =
-                compile_pipeline(device, library, pipeline_names.dense_matvec_bf16)?;
-            let dense_mmap_matvec_pipeline =
-                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec)?;
-            let dense_mmap_matvec_bf16_pipeline =
-                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec_bf16)?;
-            let dense_mmap_matvec_bf16_simd_pipeline =
-                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec_bf16_simd)?;
-            let rms_norm_pipeline = compile_pipeline(device, library, pipeline_names.rms_norm)?;
-            let rms_norm_reduced_pipeline =
-                compile_pipeline(device, library, pipeline_names.rms_norm_reduced)?;
-            let residual_rms_norm_pipeline =
-                compile_pipeline(device, library, pipeline_names.residual_rms_norm)?;
-            let rope_pipeline = compile_pipeline(device, library, pipeline_names.rope)?;
-            let rope_split_half_pipeline =
-                compile_pipeline(device, library, pipeline_names.rope_split_half)?;
-            let attention_pipeline = compile_pipeline(device, library, pipeline_names.attention)?;
-            let kv_write_pipeline = compile_pipeline(device, library, pipeline_names.kv_write)?;
-            let kv_read_attention_pipeline =
-                compile_pipeline(device, library, pipeline_names.kv_read_attention)?;
-            let expert_mlp_pipeline = compile_pipeline(device, library, pipeline_names.expert_mlp)?;
-            let silu_product_pipeline =
-                compile_pipeline(device, library, pipeline_names.silu_product)?;
-            let shared_expert_activation_pipeline =
-                compile_pipeline(device, library, pipeline_names.shared_expert_activation)?;
-            let combine_expert_phase_pipeline =
-                compile_pipeline(device, library, pipeline_names.combine_expert_phase)?;
-            let fill_zero_pipeline = compile_pipeline(device, library, pipeline_names.fill_zero)?;
-            let lm_head_pipeline = compile_pipeline(device, library, pipeline_names.lm_head)?;
-            let topk_vocab_pipeline = compile_pipeline(device, library, pipeline_names.topk_vocab)?;
-            let gqa_scores_pipeline = compile_pipeline(device, library, pipeline_names.gqa_scores)?;
-            let gqa_read_pipeline = compile_pipeline(device, library, pipeline_names.gqa_read)?;
-            let linear_conv1d_pipeline =
-                compile_pipeline(device, library, pipeline_names.linear_conv1d)?;
-            let linear_rms_norm_qk_pipeline =
-                compile_pipeline(device, library, pipeline_names.linear_rms_norm_qk)?;
-            let linear_decay_beta_pipeline =
-                compile_pipeline(device, library, pipeline_names.linear_decay_beta)?;
-            let linear_delta_step_pipeline =
-                compile_pipeline(device, library, pipeline_names.linear_delta_step)?;
-            let linear_gated_rms_norm_pipeline =
-                compile_pipeline(device, library, pipeline_names.linear_gated_rms_norm)?;
-            release(library);
-            let pipelines = MetalPipelineSet {
-                q4_pipeline,
-                q4_bf16_scale_bias_pipeline,
-                q4_swiglu_pipeline,
-                q4_swiglu_bf16_scale_bias_pipeline,
-                q4_mmap_pipeline,
-                q4_mmap_bf16_scale_bias_pipeline,
-                q4_mmap_batch_pipeline,
-                q4_mmap_batch_bf16_scale_bias_pipeline,
-                dense_matvec_pipeline,
-                dense_matvec_bf16_pipeline,
-                dense_mmap_matvec_pipeline,
-                dense_mmap_matvec_bf16_pipeline,
-                dense_mmap_matvec_bf16_simd_pipeline,
-                rms_norm_pipeline,
-                rms_norm_reduced_pipeline,
-                residual_rms_norm_pipeline,
-                rope_pipeline,
-                rope_split_half_pipeline,
-                attention_pipeline,
-                kv_write_pipeline,
-                kv_read_attention_pipeline,
-                expert_mlp_pipeline,
-                silu_product_pipeline,
-                shared_expert_activation_pipeline,
-                combine_expert_phase_pipeline,
-                fill_zero_pipeline,
-                lm_head_pipeline,
-                topk_vocab_pipeline,
-                gqa_scores_pipeline,
-                gqa_read_pipeline,
-                linear_conv1d_pipeline,
-                linear_rms_norm_qk_pipeline,
-                linear_decay_beta_pipeline,
-                linear_delta_step_pipeline,
-                linear_gated_rms_norm_pipeline,
-            };
+        let max_context = metal_kv_max_context_for_layouts(
+            config,
+            &runtime.full_attention,
+            system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
+        );
+        let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
+        let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
+        let linear_attention_state =
+            allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
 
-            let command_queue = msg_send_id0(device, sel("newCommandQueue"));
-            if command_queue.is_null() {
-                pipelines.release_with(|pipeline| release(pipeline));
-                release(device);
-                bail!("failed to create Flash-MoE Metal command queue");
-            }
+        tracing::info!(
+            model = %plan.model,
+            layers = config.num_hidden_layers,
+            max_context,
+            kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
+            experts = config.experts(),
+            dense_resident = dense_weights.is_some(),
+            "Flash-MoE Metal executor initialized"
+        );
 
-            let dense_weights =
-                wrap_dense_mmap_as_metal_buffer(device, dense.mmap.clone(), dense.len)?;
-
-            let max_context = metal_kv_max_context_for_layouts(
-                config,
-                &runtime.full_attention,
-                system_memory_bytes().unwrap_or(64 * 1024 * 1024 * 1024),
-            );
-            let kv_widths = metal_kv_layer_widths(&runtime.full_attention);
-            let kv_cache = allocate_metal_kv_cache(device, max_context, &kv_widths)?;
-            let linear_attention_state =
-                allocate_metal_linear_attention_state(device, &runtime.linear_attention)?;
-
-            tracing::info!(
-                model = %plan.model,
-                layers = config.num_hidden_layers,
-                max_context,
-                kv_cache_mib = (metal_kv_cache_bytes_for_widths(&kv_widths, max_context) / (1024 * 1024)),
-                experts = config.experts(),
-                dense_resident = dense_weights.is_some(),
-                "Flash-MoE Metal executor initialized"
-            );
-
-            Ok(Self {
-                device,
-                command_queue,
-                pipelines,
-                shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
-                dense_weights,
-                lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
-                    metal_lm_head_buffer_budget_bytes(),
-                )),
-                kv_cache: std::sync::Mutex::new(Some(kv_cache)),
-                linear_attention_state: std::sync::Mutex::new(linear_attention_state),
-                buffers: MetalBufferPool::default(),
-            })
-        }
+        Ok(Self {
+            metal_runtime,
+            shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
+            dense_weights,
+            lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
+                metal_lm_head_buffer_budget_bytes(),
+            )),
+            kv_cache: std::sync::Mutex::new(Some(kv_cache)),
+            linear_attention_state: std::sync::Mutex::new(linear_attention_state),
+            buffers: MetalBufferPool::default(),
+        })
     }
 
     fn project_q4_expert(

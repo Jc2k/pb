@@ -975,6 +975,151 @@ impl<T: Copy> MetalPipelineSet<T> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct OwnedMetalObject(MetalObjcId);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl OwnedMetalObject {
+    fn new(id: MetalObjcId) -> anyhow::Result<Self> {
+        if id.is_null() {
+            anyhow::bail!("failed to create required Flash-MoE Metal object");
+        }
+        Ok(Self(id))
+    }
+
+    fn id(&self) -> MetalObjcId {
+        self.0
+    }
+
+    fn into_raw(mut self) -> MetalObjcId {
+        let id = self.0;
+        self.0 = ptr::null_mut();
+        id
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for OwnedMetalObject {
+    fn drop(&mut self) {
+        unsafe { release(self.0) }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalRuntime {
+    pub(crate) device: MetalObjcId,
+    pub(crate) command_queue: MetalObjcId,
+    pub(crate) pipelines: MetalPipelineSet<MetalObjcId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalRuntime {
+    pub(crate) fn compile(
+        shader_source: &str,
+        names: MetalPipelineNameSet,
+    ) -> anyhow::Result<Self> {
+        unsafe {
+            let device = OwnedMetalObject::new(metal_default_device()).map_err(|_| {
+                anyhow::anyhow!(
+                    "Metal is required for Flash-MoE on ARM macOS, but no default Metal device is available"
+                )
+            })?;
+            let source = OwnedMetalObject::new(ns_string(shader_source))?;
+            let mut compile_error = ptr::null_mut();
+            let library_id = msg_send_id2_id_error(
+                device.id(),
+                sel("newLibraryWithSource:options:error:"),
+                source.id(),
+                ptr::null_mut(),
+                &mut compile_error,
+            );
+            if library_id.is_null() {
+                let error = ns_error_localized_description(compile_error)
+                    .unwrap_or_else(|| "unknown Metal compiler error".to_string());
+                anyhow::bail!("failed to compile Flash-MoE Metal shader library: {error}");
+            }
+            let library = OwnedMetalObject::new(library_id)?;
+            let mut compiled = BTreeMap::new();
+            for name in names.kernel_names() {
+                compiled.insert(
+                    name,
+                    OwnedMetalObject::new(compile_pipeline(device.id(), library.id(), name)?)?,
+                );
+            }
+            let command_queue =
+                OwnedMetalObject::new(msg_send_id0(device.id(), sel("newCommandQueue"))).map_err(
+                    |_| anyhow::anyhow!("failed to create Flash-MoE Metal command queue"),
+                )?;
+            let mut take_pipeline = |name: &'static str| -> MetalObjcId {
+                compiled
+                    .remove(name)
+                    .expect("compiled Metal pipeline name disappeared")
+                    .into_raw()
+            };
+            let pipelines = MetalPipelineSet {
+                q4_pipeline: take_pipeline(names.q4),
+                q4_bf16_scale_bias_pipeline: take_pipeline(names.q4_bf16_scale_bias),
+                q4_swiglu_pipeline: take_pipeline(names.q4_swiglu),
+                q4_swiglu_bf16_scale_bias_pipeline: take_pipeline(names.q4_swiglu_bf16_scale_bias),
+                q4_mmap_pipeline: take_pipeline(names.q4_mmap),
+                q4_mmap_bf16_scale_bias_pipeline: take_pipeline(names.q4_mmap_bf16_scale_bias),
+                q4_mmap_batch_pipeline: take_pipeline(names.q4_mmap_batch),
+                q4_mmap_batch_bf16_scale_bias_pipeline: take_pipeline(
+                    names.q4_mmap_batch_bf16_scale_bias,
+                ),
+                dense_matvec_pipeline: take_pipeline(names.dense_matvec),
+                dense_matvec_bf16_pipeline: take_pipeline(names.dense_matvec_bf16),
+                dense_mmap_matvec_pipeline: take_pipeline(names.dense_mmap_matvec),
+                dense_mmap_matvec_bf16_pipeline: take_pipeline(names.dense_mmap_matvec_bf16),
+                dense_mmap_matvec_bf16_simd_pipeline: take_pipeline(
+                    names.dense_mmap_matvec_bf16_simd,
+                ),
+                rms_norm_pipeline: take_pipeline(names.rms_norm),
+                rms_norm_reduced_pipeline: take_pipeline(names.rms_norm_reduced),
+                residual_rms_norm_pipeline: take_pipeline(names.residual_rms_norm),
+                rope_pipeline: take_pipeline(names.rope),
+                rope_split_half_pipeline: take_pipeline(names.rope_split_half),
+                attention_pipeline: take_pipeline(names.attention),
+                kv_write_pipeline: take_pipeline(names.kv_write),
+                kv_read_attention_pipeline: take_pipeline(names.kv_read_attention),
+                expert_mlp_pipeline: take_pipeline(names.expert_mlp),
+                silu_product_pipeline: take_pipeline(names.silu_product),
+                shared_expert_activation_pipeline: take_pipeline(names.shared_expert_activation),
+                combine_expert_phase_pipeline: take_pipeline(names.combine_expert_phase),
+                fill_zero_pipeline: take_pipeline(names.fill_zero),
+                lm_head_pipeline: take_pipeline(names.lm_head),
+                topk_vocab_pipeline: take_pipeline(names.topk_vocab),
+                gqa_scores_pipeline: take_pipeline(names.gqa_scores),
+                gqa_read_pipeline: take_pipeline(names.gqa_read),
+                linear_conv1d_pipeline: take_pipeline(names.linear_conv1d),
+                linear_rms_norm_qk_pipeline: take_pipeline(names.linear_rms_norm_qk),
+                linear_decay_beta_pipeline: take_pipeline(names.linear_decay_beta),
+                linear_delta_step_pipeline: take_pipeline(names.linear_delta_step),
+                linear_gated_rms_norm_pipeline: take_pipeline(names.linear_gated_rms_norm),
+            };
+            debug_assert!(compiled.is_empty());
+            Ok(Self {
+                device: device.into_raw(),
+                command_queue: command_queue.into_raw(),
+                pipelines,
+            })
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalRuntime {
+    fn drop(&mut self) {
+        unsafe {
+            self.pipelines.release_with(|pipeline| release(pipeline));
+            release(self.command_queue);
+            release(self.device);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MetalResidentQ4TopKBuilder<'a> {
     device: MetalObjcId,
     command_queue: MetalObjcId,
