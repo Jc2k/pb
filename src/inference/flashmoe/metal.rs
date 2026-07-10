@@ -408,6 +408,45 @@ impl MetalDenseWeights {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalSharedExpertBuffers {
+    pub(crate) gate: MetalObjcId,
+    pub(crate) up: MetalObjcId,
+    pub(crate) down: MetalObjcId,
+    pub(crate) router: MetalObjcId,
+    pub(crate) width: usize,
+    pub(crate) shared_experts: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) total_intermediate: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalSharedExpertBuffers {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        gate: MetalObjcId,
+        up: MetalObjcId,
+        down: MetalObjcId,
+        router: MetalObjcId,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+        total_intermediate: usize,
+    ) -> Self {
+        Self {
+            gate,
+            up,
+            down,
+            router,
+            width,
+            shared_experts,
+            intermediate,
+            total_intermediate,
+        }
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2931,6 +2970,25 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_shared_expert_buffers_preserve_projection_bindings_and_shape() {
+        let gate = 0x1000usize as MetalObjcId;
+        let up = 0x2000usize as MetalObjcId;
+        let down = 0x3000usize as MetalObjcId;
+        let router = 0x4000usize as MetalObjcId;
+        let buffers = MetalSharedExpertBuffers::new(gate, up, down, router, 8, 2, 4, 8);
+
+        assert_eq!(buffers.gate, gate);
+        assert_eq!(buffers.up, up);
+        assert_eq!(buffers.down, down);
+        assert_eq!(buffers.router, router);
+        assert_eq!(buffers.width, 8);
+        assert_eq!(buffers.shared_experts, 2);
+        assert_eq!(buffers.intermediate, 4);
+        assert_eq!(buffers.total_intermediate, 8);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

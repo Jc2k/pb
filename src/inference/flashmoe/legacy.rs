@@ -109,7 +109,7 @@ use super::metal::{
     MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
     MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
     MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2707,19 +2707,6 @@ struct MetalExecutorInner {
     linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-struct MetalSharedExpertBuffers {
-    gate: ObjcId,
-    up: ObjcId,
-    down: ObjcId,
-    router: ObjcId,
-    width: usize,
-    shared_experts: usize,
-    intermediate: usize,
-    total_intermediate: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8435,16 +8422,16 @@ impl MetalExecutorInner {
                         return Err(err);
                     }
                 };
-            let buffers = MetalSharedExpertBuffers {
+            let buffers = MetalSharedExpertBuffers::new(
                 gate,
                 up,
                 down,
                 router,
-                width: shared.width,
-                shared_experts: shared.shared_experts,
-                intermediate: shared.intermediate,
+                shared.width,
+                shared.shared_experts,
+                shared.intermediate,
                 total_intermediate,
-            };
+            );
             let mut cache = self
                 .shared_expert_buffers
                 .lock()
