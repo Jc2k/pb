@@ -1583,7 +1583,9 @@ pub trait ScheduledCmd3Input {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScheduledCmd3CpuInput<'a> {
+    #[allow(dead_code)]
     pub(crate) normed: &'a [f32],
+    #[allow(dead_code)]
     pub(crate) residual: &'a [f32],
     state: FlashMoeCmd3InputState,
 }
@@ -1886,6 +1888,7 @@ impl<'a> ScheduledSharedExpertPhaseRef<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn dense(self) -> Option<&'a SharedExpertPhaseWeights> {
         match self {
             Self::Dense(shared) => Some(shared),

@@ -20,12 +20,14 @@ use super::experts::{EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32};
 use super::math::top_k;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
-    ScheduledCmd3MetalPostAttentionInput, ScheduledExpertPhaseMlpPayload,
-    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
-    ScheduledSharedExpertPhaseRef,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload,
+    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
+    ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
+use super::state::{
+    FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoePostAttentionPrepState,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
     Cmd2Q4PostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
@@ -541,45 +543,6 @@ impl MetalDenseWeights {
             buffer,
             _mmap: mmap,
             len,
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MetalSharedExpertBuffers {
-    pub(crate) gate: MetalObjcId,
-    pub(crate) up: MetalObjcId,
-    pub(crate) down: MetalObjcId,
-    pub(crate) router: MetalObjcId,
-    pub(crate) width: usize,
-    pub(crate) shared_experts: usize,
-    pub(crate) intermediate: usize,
-    pub(crate) total_intermediate: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalSharedExpertBuffers {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        gate: MetalObjcId,
-        up: MetalObjcId,
-        down: MetalObjcId,
-        router: MetalObjcId,
-        width: usize,
-        shared_experts: usize,
-        intermediate: usize,
-        total_intermediate: usize,
-    ) -> Self {
-        Self {
-            gate,
-            up,
-            down,
-            router,
-            width,
-            shared_experts,
-            intermediate,
-            total_intermediate,
         }
     }
 }
@@ -1608,6 +1571,777 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+pub(crate) struct MetalScheduledCmd3Submission {
+    buffers: Arc<MetalBufferPool>,
+    command_buffer: MetalObjcId,
+    phase_buffers: Vec<MetalPhaseBuffer>,
+    _expert_slots: Arc<[Arc<ScheduledExpertSlot>]>,
+    output: MetalCmd3DeferredOutput,
+    context: MetalCommandContext,
+    scheduled_output: ScheduledCmd3OutputState,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalScheduledCmd3Submission {
+    pub(crate) fn next_normed_buffer(&self) -> Option<(MetalObjcId, usize)> {
+        self.output
+            .next_normed_buffer
+            .zip(self.output.output_state.next_normed())
+            .map(|(buffer, state)| (buffer, state.len()))
+    }
+
+    pub(crate) fn hidden_buffer(&self) -> (MetalObjcId, usize) {
+        (
+            self.output.hidden_buffer,
+            self.output.output_state.hidden().len(),
+        )
+    }
+
+    pub(crate) fn finish_without_readback(self) -> anyhow::Result<()> {
+        unsafe {
+            let wait = wait_for_metal_command_buffer(self.command_buffer, &self.context);
+            release(self.command_buffer);
+            match wait {
+                Ok(()) => {
+                    self.buffers
+                        .recycle_or_release_phase(self.phase_buffers, false);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.buffers
+                        .recycle_or_release_phase(self.phase_buffers, true);
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn wait(self) -> anyhow::Result<FlashMoeExpertPhaseOutput> {
+        unsafe {
+            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
+                release(self.command_buffer);
+                self.buffers
+                    .recycle_or_release_phase(self.phase_buffers, true);
+                return Err(error.into());
+            }
+            let hidden = read_f32_buffer(
+                self.output.hidden_buffer,
+                self.output.output_state.hidden().len(),
+            );
+            let next_normed = self
+                .output
+                .next_normed_buffer
+                .zip(self.output.output_state.next_normed())
+                .map(|(buffer, state)| read_f32_buffer(buffer, state.len()));
+            release(self.command_buffer);
+            self.buffers
+                .recycle_or_release_phase(self.phase_buffers, false);
+            self.scheduled_output
+                .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MetalScheduledCmd3Builder<'a> {
+    runtime: &'a MetalRuntime,
+    dense_weights: &'a MetalDenseWeights,
+    buffers: Arc<MetalBufferPool>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> MetalScheduledCmd3Builder<'a> {
+    pub(crate) fn new(
+        runtime: &'a MetalRuntime,
+        dense_weights: &'a MetalDenseWeights,
+        buffers: Arc<MetalBufferPool>,
+    ) -> Self {
+        Self {
+            runtime,
+            dense_weights,
+            buffers,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit(
+        &self,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
+        routing_weights: &[f32],
+        input: MetalPostAttentionPrep,
+        scheduled_output: ScheduledCmd3OutputState,
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> anyhow::Result<MetalScheduledCmd3Submission> {
+        if scheduled_output.layer != layer {
+            self.recycle_input(input);
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 output layer {} does not match scheduled layer {layer}",
+                scheduled_output.layer
+            );
+        }
+        if input.input.state() != input.state {
+            self.recycle_input(input);
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 typed input state does not match post-attention state for layer {layer}"
+            );
+        }
+        if input.input.state().routing().layer() != layer || input.state.routing().layer() != layer
+        {
+            self.recycle_input(input);
+            anyhow::bail!("FlashMoe Metal CMD3 input layer does not match scheduled layer {layer}");
+        }
+        let width = input.input.width();
+        let output_state = scheduled_output.state();
+        let command_plan = match MetalCmd3ExecutionPlan::new(
+            position,
+            layer,
+            experts.len(),
+            width,
+            routing_weights.len(),
+            output_state,
+            shared,
+            next_norm_weight.map(|weight| weight.len()),
+            payloads,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.recycle_input(input);
+                return Err(error.context(
+                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled command plan",
+                ));
+            }
+        };
+        if let Err(error) = Self::require_shared_implementation(command_plan.shared.source) {
+            self.recycle_input(input);
+            return Err(error);
+        }
+        let input_buffers = match MetalCmd3InputBuffers::new(
+            command_plan.phase,
+            input.normed_buffer,
+            input.residual_buffer,
+        ) {
+            Ok(input_buffers) => input_buffers,
+            Err(error) => {
+                self.recycle_input(input);
+                return Err(error.context(
+                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled input buffers",
+                ));
+            }
+        };
+        unsafe {
+            self.encode_and_submit(
+                command_plan,
+                input_buffers,
+                experts,
+                routing_weights,
+                scheduled_output,
+                shared,
+                next_norm_weight,
+                payloads,
+            )
+        }
+    }
+
+    fn recycle_input(&self, input: MetalPostAttentionPrep) {
+        self.buffers
+            .recycle_or_release(&[input.normed_buffer, input.residual_buffer], false);
+    }
+
+    fn require_shared_implementation(source: MetalCmd3SharedPhaseSource) -> anyhow::Result<()> {
+        match source {
+            MetalCmd3SharedPhaseSource::ResidentQ4 | MetalCmd3SharedPhaseSource::None => Ok(()),
+            MetalCmd3SharedPhaseSource::Dense => anyhow::bail!(
+                "FlashMoe unsupported Metal CMD3 implementation: dense CPU shared-expert weights are not a declared implementation"
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_and_submit(
+        &self,
+        command_plan: MetalCmd3ExecutionPlan,
+        input_buffers: MetalCmd3InputBuffers,
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
+        routing_weights: &[f32],
+        scheduled_output: ScheduledCmd3OutputState,
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> anyhow::Result<MetalScheduledCmd3Submission> {
+        unsafe {
+            let mut phase_buffers = vec![
+                MetalPhaseBuffer::recyclable(input_buffers.normed),
+                MetalPhaseBuffer::recyclable(input_buffers.residual),
+            ];
+            let setup = (|| -> anyhow::Result<_> {
+                let output_buffers = self.output_buffers(&command_plan, &mut phase_buffers)?;
+                let combine_buffers = self.combine_buffers(
+                    command_plan.combine,
+                    routing_weights,
+                    &mut phase_buffers,
+                )?;
+                Ok((output_buffers, combine_buffers))
+            })();
+            let (output_buffers, combine_buffers) = match setup {
+                Ok(setup) => setup,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+
+            let command_buffer = retain(msg_send_id0(
+                self.runtime.command_queue,
+                sel("commandBuffer"),
+            ));
+            if command_buffer.is_null() {
+                self.buffers.recycle_or_release_phase(phase_buffers, true);
+                anyhow::bail!("failed to create Flash-MoE scheduled CMD3 command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.buffers.recycle_or_release_phase(phase_buffers, true);
+                anyhow::bail!("failed to create Flash-MoE scheduled CMD3 compute encoder");
+            }
+
+            let encode_result = (|| -> anyhow::Result<()> {
+                let mut source_buffers = MetalQ4SourceBufferCache::default();
+                self.encode_shared(
+                    encoder,
+                    &command_plan,
+                    input_buffers,
+                    &output_buffers,
+                    combine_buffers,
+                    shared,
+                    &mut phase_buffers,
+                )?;
+                for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
+                    let active_work = self.active_work_buffers(*active_plan, &mut phase_buffers)?;
+                    let active_stage = MetalCmd3ActiveExpertStageBuffers::new(
+                        *active_plan,
+                        input_buffers,
+                        &output_buffers,
+                        active_work,
+                    )?;
+                    let payload = payload.q4();
+                    self.encode_q4_swiglu(
+                        encoder,
+                        payload,
+                        active_stage.normed,
+                        active_stage.activated,
+                        &mut phase_buffers,
+                        &mut source_buffers,
+                    )?;
+                    self.encode_q4_matvec(
+                        encoder,
+                        &payload.down,
+                        payload.down_source(),
+                        active_stage.activated,
+                        active_stage.expert_outputs,
+                        active_stage.output_offset,
+                        &mut phase_buffers,
+                        &mut source_buffers,
+                    )?;
+                }
+                self.encode_combine(
+                    encoder,
+                    command_plan.combine,
+                    input_buffers,
+                    &output_buffers,
+                    combine_buffers,
+                )?;
+                if let (Some(weight), Some(next_normed), Some(next_plan)) = (
+                    next_norm_weight,
+                    output_buffers.next_normed,
+                    command_plan.next_norm,
+                ) {
+                    let next_buffers = self.next_norm_buffers(
+                        next_plan,
+                        weight,
+                        output_buffers.hidden,
+                        next_normed,
+                        combine_buffers.width,
+                        &mut phase_buffers,
+                    )?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.rms_norm_reduced_pipeline,
+                    );
+                    set_buffer(encoder, next_buffers.hidden, 0);
+                    set_buffer(encoder, next_buffers.weight, 1);
+                    set_buffer(encoder, next_buffers.next_normed, 2);
+                    set_buffer(encoder, next_buffers.width, 3);
+                    dispatch_single_threadgroup(encoder, next_plan.dispatch_threads);
+                }
+                msg_send_void0(encoder, sel("endEncoding"));
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                release(encoder);
+                release(command_buffer);
+                self.buffers.recycle_or_release_phase(phase_buffers, true);
+                return Err(error);
+            }
+
+            let output = match MetalCmd3DeferredOutput::new(
+                output_buffers.hidden,
+                output_buffers.next_normed,
+                command_plan.phase.output_state,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    release(encoder);
+                    release(command_buffer);
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+            let expert_ids = experts
+                .iter()
+                .map(|slot| slot.expert().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = command_plan.command_context(expert_ids);
+            commit_metal_command_buffer(command_buffer, &context);
+            release(encoder);
+            Ok(MetalScheduledCmd3Submission {
+                buffers: Arc::clone(&self.buffers),
+                command_buffer,
+                phase_buffers,
+                _expert_slots: experts,
+                output,
+                context,
+                scheduled_output,
+            })
+        }
+    }
+
+    unsafe fn output_buffers(
+        &self,
+        plan: &MetalCmd3ExecutionPlan,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalCmd3OutputBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let expert_outputs = self.phase_buffer(layout.expert_outputs_bytes, buffers)?;
+            let shared_output = self.phase_buffer(layout.shared_output_bytes, buffers)?;
+            let hidden = self.phase_buffer(layout.hidden_output_bytes, buffers)?;
+            let next_normed = layout
+                .next_normed_output_bytes
+                .map(|bytes| self.phase_buffer(bytes, buffers))
+                .transpose()?;
+            MetalCmd3OutputBuffers::new(plan, expert_outputs, shared_output, hidden, next_normed)
+        }
+    }
+
+    unsafe fn combine_buffers(
+        &self,
+        plan: MetalCmd3CombinePlan,
+        routing_weights: &[f32],
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalCmd3CombineBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let weight_bytes = f32_as_bytes(routing_weights);
+            if weight_bytes.len() != layout.routing_weights_bytes {
+                anyhow::bail!(
+                    "FlashMoe Metal CMD3 routing weights byte length {} does not match {}",
+                    weight_bytes.len(),
+                    layout.routing_weights_bytes
+                );
+            }
+            let routing_weights = self.phase_buffer_with_bytes(weight_bytes, buffers)?;
+            let width = self.phase_buffer_with_bytes(u32_as_bytes(&layout.width_u32), buffers)?;
+            let active_count =
+                self.phase_buffer_with_bytes(u32_as_bytes(&layout.active_count_u32), buffers)?;
+            MetalCmd3CombineBuffers::new(plan, routing_weights, width, active_count)
+        }
+    }
+
+    unsafe fn shared_work_buffers(
+        &self,
+        plan: MetalCmd3SharedPhasePlan,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalCmd3SharedWorkBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let gate = self.phase_buffer(layout.projection_output_bytes, buffers)?;
+            let up = self.phase_buffer(layout.projection_output_bytes, buffers)?;
+            let router = self.phase_buffer(layout.router_output_bytes, buffers)?;
+            let activated = self.phase_buffer(layout.projection_output_bytes, buffers)?;
+            let total = self
+                .phase_buffer_with_bytes(u32_as_bytes(&layout.total_intermediate_u32), buffers)?;
+            let intermediate =
+                self.phase_buffer_with_bytes(u32_as_bytes(&layout.intermediate_u32), buffers)?;
+            MetalCmd3SharedWorkBuffers::new(plan, gate, up, router, activated, total, intermediate)
+        }
+    }
+
+    unsafe fn active_work_buffers(
+        &self,
+        plan: MetalCmd3ActiveExpertPlan,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalCmd3ActiveExpertWorkBuffers> {
+        unsafe {
+            let activated = self.phase_buffer(plan.buffer_layout()?.activation_bytes, buffers)?;
+            MetalCmd3ActiveExpertWorkBuffers::new(plan, activated)
+        }
+    }
+
+    unsafe fn next_norm_buffers(
+        &self,
+        plan: MetalCmd3NextNormPlan,
+        weight: &[f32],
+        hidden: MetalObjcId,
+        next_normed: MetalObjcId,
+        width: MetalObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalCmd3NextNormBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let bytes = f32_as_bytes(&weight[..plan.width]);
+            if bytes.len() != layout.weight_bytes {
+                anyhow::bail!(
+                    "FlashMoe Metal CMD3 next-norm weight bytes {} do not match {}",
+                    bytes.len(),
+                    layout.weight_bytes
+                );
+            }
+            let weight = self.phase_buffer_with_bytes(bytes, buffers)?;
+            MetalCmd3NextNormBuffers::new(plan, hidden, weight, next_normed, width)
+        }
+    }
+
+    unsafe fn encode_shared(
+        &self,
+        encoder: MetalObjcId,
+        command: &MetalCmd3ExecutionPlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        combine: MetalCmd3CombineBuffers,
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            match command.shared.source {
+                MetalCmd3SharedPhaseSource::ResidentQ4 => {
+                    let weights = shared.q4().context(
+                        "FlashMoe Metal CMD3 resident-Q4 shared stage has no Q4 projections",
+                    )?;
+                    let work = self.shared_work_buffers(command.shared, buffers)?;
+                    let stage = MetalCmd3SharedStageBuffers::projected(
+                        command.shared,
+                        inputs,
+                        outputs,
+                        combine,
+                        work,
+                    )?;
+                    let work = stage
+                        .work
+                        .context("missing Metal CMD3 shared work buffers")?;
+                    self.encode_q4_projection(encoder, &weights.gate, stage.normed, work.gate_out)?;
+                    self.encode_q4_projection(encoder, &weights.up, stage.normed, work.up_out)?;
+                    self.encode_q4_projection(
+                        encoder,
+                        &weights.router,
+                        stage.normed,
+                        work.router_out,
+                    )?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.shared_expert_activation_pipeline,
+                    );
+                    set_buffer(encoder, work.gate_out, 0);
+                    set_buffer(encoder, work.up_out, 1);
+                    set_buffer(encoder, work.router_out, 2);
+                    set_buffer(encoder, work.activated, 3);
+                    set_buffer(encoder, work.intermediate, 4);
+                    set_buffer(encoder, work.total_intermediate, 5);
+                    dispatch_threads(encoder, command.shared.activation_dispatch_threads());
+                    self.encode_q4_projection(
+                        encoder,
+                        &weights.down,
+                        work.activated,
+                        stage.shared_output,
+                    )?;
+                }
+                MetalCmd3SharedPhaseSource::None => {
+                    let fill_width = u32::try_from(command.shared.fill_zero_width())
+                        .context("Metal CMD3 shared fill width exceeds u32")?;
+                    let stage = MetalCmd3SharedStageBuffers::fill_zero(
+                        command.shared,
+                        inputs,
+                        outputs,
+                        combine,
+                    )?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.fill_zero_pipeline,
+                    );
+                    set_buffer(encoder, stage.shared_output, 0);
+                    set_bytes(encoder, u32_as_bytes(&fill_width), 1);
+                    dispatch_threads(encoder, command.shared.fill_zero_width() as u64);
+                }
+                MetalCmd3SharedPhaseSource::Dense => unreachable!("rejected before encoding"),
+            }
+            Ok(())
+        }
+    }
+
+    unsafe fn encode_combine(
+        &self,
+        encoder: MetalObjcId,
+        plan: MetalCmd3CombinePlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        combine: MetalCmd3CombineBuffers,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let stage = MetalCmd3CombineStageBuffers::new(plan, inputs, outputs, combine)?;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime.pipelines.combine_expert_phase_pipeline,
+            );
+            set_buffer(encoder, stage.residual, 0);
+            set_buffer(encoder, stage.shared_output, 1);
+            set_buffer(encoder, stage.expert_outputs, 2);
+            set_buffer(encoder, stage.routing_weights, 3);
+            set_buffer(encoder, stage.hidden, 4);
+            set_buffer(encoder, stage.width, 5);
+            set_buffer(encoder, stage.active_count, 6);
+            dispatch_threads(encoder, stage.plan.dispatch_threads);
+            Ok(())
+        }
+    }
+
+    unsafe fn encode_q4_projection(
+        &self,
+        encoder: MetalObjcId,
+        projection: &DenseQ4MmapMatvecProjection,
+        input: MetalObjcId,
+        output: MetalObjcId,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let scale_bytes = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
+                std::mem::size_of::<u16>()
+            } else if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_F32 {
+                std::mem::size_of::<f32>()
+            } else {
+                anyhow::bail!(
+                    "FlashMoe Metal CMD3 projection {} has unsupported scale/bias dtype {}",
+                    projection.tensor_name,
+                    projection.scale_bias_dtype
+                );
+            };
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("Metal CMD3 Q4 packed length overflow")?;
+            let groups_len = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bytes))
+                .context("Metal CMD3 Q4 group length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, groups_len),
+                (projection.biases_byte_offset, groups_len),
+            ] {
+                let offset = usize::try_from(offset).context("Metal CMD3 Q4 offset overflow")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > self.dense_weights.len)
+                {
+                    anyhow::bail!(
+                        "FlashMoe Metal CMD3 projection {} exceeds resident dense weights",
+                        projection.tensor_name
+                    );
+                }
+            }
+            let rows = u32::try_from(projection.rows).context("Metal CMD3 Q4 rows exceed u32")?;
+            let cols = u32::try_from(projection.cols).context("Metal CMD3 Q4 cols exceed u32")?;
+            let groups = u32::try_from(projection.groups_per_row)
+                .context("Metal CMD3 Q4 groups exceed u32")?;
+            let group_size = u32::try_from(projection.group_size)
+                .context("Metal CMD3 Q4 group size exceeds u32")?;
+            let pipeline = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
+                self.runtime.pipelines.q4_mmap_bf16_scale_bias_pipeline
+            } else {
+                self.runtime.pipelines.q4_mmap_pipeline
+            };
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, self.dense_weights.buffer, 0);
+            set_buffer(encoder, input, 1);
+            set_buffer(encoder, output, 2);
+            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows), 6);
+            set_bytes(encoder, u32_as_bytes(&cols), 7);
+            set_bytes(encoder, u32_as_bytes(&groups), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size), 9);
+            dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_q4_matvec(
+        &self,
+        encoder: MetalObjcId,
+        payload: &super::experts::Q4MatvecPayload<'_>,
+        source: super::experts::Q4MatvecSource<'_>,
+        input: MetalObjcId,
+        output: MetalObjcId,
+        output_offset: u64,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalQ4SourceBufferCache,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let buffer = self.q4_source_buffer(source, buffers, source_buffers)?;
+            let rows = u32::try_from(payload.rows).context("Metal CMD3 expert rows exceed u32")?;
+            let cols = u32::try_from(payload.cols).context("Metal CMD3 expert cols exceed u32")?;
+            let groups = u32::try_from(payload.cols.div_ceil(payload.group_size).max(1))
+                .context("Metal CMD3 expert groups exceed u32")?;
+            let group_size = u32::try_from(payload.group_size)
+                .context("Metal CMD3 expert group size exceeds u32")?;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime.pipelines.q4_bf16_scale_bias_pipeline,
+            );
+            set_buffer_with_offset(encoder, buffer, source.packed_offset as u64, 0);
+            set_buffer(encoder, input, 1);
+            set_buffer_with_offset(encoder, buffer, source.scale_offset as u64, 2);
+            set_buffer_with_offset(encoder, buffer, source.bias_offset as u64, 3);
+            set_buffer_with_offset(encoder, output, output_offset, 4);
+            set_bytes(encoder, u32_as_bytes(&rows), 5);
+            set_bytes(encoder, u32_as_bytes(&cols), 6);
+            set_bytes(encoder, u32_as_bytes(&groups), 7);
+            set_bytes(encoder, u32_as_bytes(&group_size), 8);
+            dispatch_q4_threadgroups(encoder, payload.rows as u64);
+            Ok(())
+        }
+    }
+
+    unsafe fn encode_q4_swiglu(
+        &self,
+        encoder: MetalObjcId,
+        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
+        input: MetalObjcId,
+        output: MetalObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalQ4SourceBufferCache,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let gate = &payload.gate;
+            let gate_source = payload.gate_source();
+            let up_source = payload.up_source();
+            let buffer = self.q4_source_buffer(gate_source, buffers, source_buffers)?;
+            let rows = u32::try_from(gate.rows).context("Metal CMD3 SwiGLU rows exceed u32")?;
+            let cols = u32::try_from(gate.cols).context("Metal CMD3 SwiGLU cols exceed u32")?;
+            let groups = u32::try_from(gate.cols.div_ceil(gate.group_size).max(1))
+                .context("Metal CMD3 SwiGLU groups exceed u32")?;
+            let group_size = u32::try_from(gate.group_size)
+                .context("Metal CMD3 SwiGLU group size exceeds u32")?;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
+            );
+            set_buffer_with_offset(encoder, buffer, gate_source.packed_offset as u64, 0);
+            set_buffer_with_offset(encoder, buffer, up_source.packed_offset as u64, 1);
+            set_buffer(encoder, input, 2);
+            set_buffer_with_offset(encoder, buffer, gate_source.scale_offset as u64, 3);
+            set_buffer_with_offset(encoder, buffer, gate_source.bias_offset as u64, 4);
+            set_buffer_with_offset(encoder, buffer, up_source.scale_offset as u64, 5);
+            set_buffer_with_offset(encoder, buffer, up_source.bias_offset as u64, 6);
+            set_buffer(encoder, output, 7);
+            set_bytes(encoder, u32_as_bytes(&rows), 8);
+            set_bytes(encoder, u32_as_bytes(&cols), 9);
+            set_bytes(encoder, u32_as_bytes(&groups), 10);
+            set_bytes(encoder, u32_as_bytes(&group_size), 11);
+            dispatch_q4_threadgroups(encoder, gate.rows as u64);
+            Ok(())
+        }
+    }
+
+    unsafe fn q4_source_buffer(
+        &self,
+        source: super::experts::Q4MatvecSource<'_>,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        cache: &mut MetalQ4SourceBufferCache,
+    ) -> anyhow::Result<MetalObjcId> {
+        if let Some(buffer) = cache.get(source.bytes) {
+            return Ok(buffer);
+        }
+        let phase = unsafe { self.borrowed_or_copied_buffer(source.bytes, 16)? };
+        let buffer = phase.id;
+        buffers.push(phase);
+        cache.insert(source.bytes, buffer);
+        Ok(buffer)
+    }
+
+    unsafe fn borrowed_or_copied_buffer(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> anyhow::Result<MetalPhaseBuffer> {
+        unsafe {
+            if !bytes.is_empty() && (bytes.as_ptr() as usize) % alignment == 0 {
+                let buffer = msg_send_id4_ptr_usize_u64_ptr(
+                    self.runtime.device,
+                    sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+                    bytes.as_ptr() as *mut c_void,
+                    bytes.len(),
+                    0,
+                    ptr::null_mut(),
+                );
+                if !buffer.is_null() {
+                    return Ok(MetalPhaseBuffer::borrowed(buffer));
+                }
+            }
+            let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
+            Ok(MetalPhaseBuffer::recyclable(buffer))
+        }
+    }
+
+    unsafe fn phase_buffer(
+        &self,
+        bytes: usize,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            let buffer = self.buffers.buffer_with_len(self.runtime.device, bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(buffer));
+            Ok(buffer)
+        }
+    }
+
+    unsafe fn phase_buffer_with_bytes(
+        &self,
+        bytes: &[u8],
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(buffer));
+            Ok(buffer)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 pub(crate) struct MetalPostAttentionPrep {
     pub(crate) residual_buffer: MetalObjcId,
     pub(crate) normed_buffer: MetalObjcId,
@@ -2257,10 +2991,12 @@ impl MetalCmd3SharedPhasePlan {
         Self::f32_bytes("router output", self.shared_experts)
     }
 
+    #[cfg(test)]
     pub(crate) fn projection_rows(self) -> usize {
         self.total_intermediate
     }
 
+    #[cfg(test)]
     pub(crate) fn router_rows(self) -> usize {
         self.shared_experts
     }
@@ -5931,6 +6667,33 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn scheduled_cmd3_builder_names_missing_shared_implementation() {
+        assert!(
+            MetalScheduledCmd3Builder::require_shared_implementation(
+                MetalCmd3SharedPhaseSource::ResidentQ4
+            )
+            .is_ok()
+        );
+        assert!(
+            MetalScheduledCmd3Builder::require_shared_implementation(
+                MetalCmd3SharedPhaseSource::None
+            )
+            .is_ok()
+        );
+        let error = MetalScheduledCmd3Builder::require_shared_implementation(
+            MetalCmd3SharedPhaseSource::Dense,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dense CPU shared-expert weights are not a declared implementation"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn cmd3_next_norm_plan_declares_weight_slice_and_dispatch() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(16, true);
         let phase = MetalCmd3PhasePlan::new(9, 3, 4, 16, 4, 4, output_state, true).unwrap();
@@ -6366,25 +7129,6 @@ mod tests {
             }
         );
         assert_eq!(MetalDispatchPlan::q4_threadgroups(0).grid.width, 1);
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn metal_shared_expert_buffers_preserve_projection_bindings_and_shape() {
-        let gate = 0x1000usize as MetalObjcId;
-        let up = 0x2000usize as MetalObjcId;
-        let down = 0x3000usize as MetalObjcId;
-        let router = 0x4000usize as MetalObjcId;
-        let buffers = MetalSharedExpertBuffers::new(gate, up, down, router, 8, 2, 4, 8);
-
-        assert_eq!(buffers.gate, gate);
-        assert_eq!(buffers.up, up);
-        assert_eq!(buffers.down, down);
-        assert_eq!(buffers.router, router);
-        assert_eq!(buffers.width, 8);
-        assert_eq!(buffers.shared_experts, 2);
-        assert_eq!(buffers.intermediate, 4);
-        assert_eq!(buffers.total_intermediate, 8);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

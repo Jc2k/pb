@@ -35,8 +35,6 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -84,7 +82,7 @@ use super::experts::{
     ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
     ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
     FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
-    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, aggregate_expert_tensors,
+    Q4MatvecPayload, aggregate_expert_tensor_kind, aggregate_expert_tensors,
     aggregate_native_q4_enabled, build_expert_pack, build_fixed_native_q4_expert_pack,
     build_native_q4_expert_pack, cleanup_stale_expert_temp_files,
     expected_expert_pack_from_records, expected_expert_pack_record_from_source,
@@ -106,28 +104,24 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalBufferPool,
-    MetalCmd3ActiveExpertPlan, MetalCmd3ActiveExpertStageBuffers, MetalCmd3ActiveExpertWorkBuffers,
-    MetalCmd3CombineBuffers, MetalCmd3CombinePlan, MetalCmd3CombineStageBuffers,
-    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3InputBuffers,
-    MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedStageBuffers,
-    MetalCmd3SharedWorkBuffers, MetalCommandContext, MetalDenseWeights, MetalDispatchSize,
-    MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalCommandContext, MetalDenseWeights, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache,
-    MetalObjcId as ObjcId, MetalPhaseBuffer, MetalPipelineNameSet, MetalPostAttentionPrep,
-    MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder, MetalQ4SourceBufferCache,
-    MetalResidentQ4TopKBuilder, MetalRuntime, MetalRuntimeCapabilities, MetalSharedExpertBuffers,
-    commit_and_wait_metal_command_buffer, commit_metal_command_buffer,
-    dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups, dispatch_single_threadgroup,
-    dispatch_threads, f32_as_bytes, metal_buffer_barrier, metal_command_failure_requires_release,
-    msg_send_id0, msg_send_id2_usize_u64, msg_send_id4_ptr_usize_u64_ptr, msg_send_ptr0,
+    MetalObjcId as ObjcId, MetalPipelineNameSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4PostAttentionPrepBuilder, MetalResidentQ4TopKBuilder, MetalRuntime,
+    MetalRuntimeCapabilities, MetalScheduledCmd3Builder, MetalScheduledCmd3Submission,
+    commit_and_wait_metal_command_buffer, dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups,
+    dispatch_single_threadgroup, dispatch_threads, f32_as_bytes, metal_buffer_barrier,
+    metal_command_failure_requires_release, msg_send_id0, msg_send_id2_usize_u64, msg_send_ptr0,
     msg_send_void0, msg_send_void1_id, msg_send_void2_size, read_f32_buffer, release, retain, sel,
     set_buffer, set_buffer_with_offset, set_bytes, u32_as_bytes, u32_as_bytes_slice, u64_as_bytes,
-    u64_as_bytes_slice, wait_for_metal_command_buffer, wrap_dense_mmap_as_metal_buffer,
+    u64_as_bytes_slice, wrap_dense_mmap_as_metal_buffer,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
 use super::model_family::{QwenMoeFamily, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+#[cfg(test)]
+use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
@@ -136,9 +130,8 @@ use super::scheduler::{
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualInput, ScheduledCmd3Command,
     ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
     ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
-    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
-    ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
-    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
+    ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource};
@@ -147,7 +140,7 @@ use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer,
+    FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCpuBuffer,
     FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
     FlashMoeLinearAttentionCacheShape, FlashMoeLinearAttentionCacheState,
@@ -1797,7 +1790,7 @@ enum DeferredExpertPhase {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     Ready(FlashMoeExpertPhaseOutput),
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    Metal(MetalDeferredExpertPhase),
+    ScheduledMetal(MetalScheduledCmd3Submission),
 }
 
 impl DeferredExpertPhase {
@@ -1806,28 +1799,33 @@ impl DeferredExpertPhase {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             Self::Ready(output) => Ok(output),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Self::Metal(output) => output.wait(),
+            Self::ScheduledMetal(output) => output.wait(),
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn next_normed_metal_input(&self) -> Option<DeferredMetalInput> {
         match self {
-            Self::Metal(output) => output.next_normed_input(),
+            Self::ScheduledMetal(output) => output
+                .next_normed_buffer()
+                .map(|(buffer, len)| DeferredMetalInput::next_layer_normed(buffer, len)),
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn hidden_metal_input(&self) -> Option<DeferredMetalInput> {
         match self {
-            Self::Metal(output) => Some(output.hidden_input()),
+            Self::ScheduledMetal(output) => {
+                let (buffer, len) = output.hidden_buffer();
+                Some(DeferredMetalInput::hidden(buffer, len))
+            }
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn finish_without_readback(self) -> Result<()> {
         match self {
-            Self::Metal(output) => output.finish_without_readback(),
+            Self::ScheduledMetal(output) => output.finish_without_readback(),
         }
     }
 }
@@ -1920,51 +1918,39 @@ impl MetalExecutor {
         }
     }
 
-    #[cfg(test)]
-    fn submit_expert_phase(
+    #[allow(clippy::too_many_arguments)]
+    fn submit_scheduled_cmd3(
         &self,
         position: usize,
         layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
-        weights: &[f32],
-        normed: &[f32],
-        residual: &[f32],
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
+        routing_weights: &[f32],
+        input: MetalPostAttentionPrep,
+        output: ScheduledCmd3OutputState,
         shared: SharedExpertPhaseRef<'_>,
         next_norm_weight: Option<&[f32]>,
-    ) -> Result<Option<DeferredExpertPhase>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner
-                .submit_expert_phase(
-                    position,
-                    layer,
-                    experts,
-                    weights,
-                    normed,
-                    residual,
-                    shared,
-                    next_norm_weight,
-                )
-                .map(|pending| pending.map(DeferredExpertPhase::Metal))
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (
-                position,
-                layer,
-                experts,
-                weights,
-                normed,
-                residual,
-                shared,
-                next_norm_weight,
-            );
-            bail!(
-                "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
-            );
-        }
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<MetalScheduledCmd3Submission> {
+        let dense_weights = self.inner.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled CMD3 implementation: resident dense Metal weights are unavailable",
+        )?;
+        MetalScheduledCmd3Builder::new(
+            &self.inner.metal_runtime,
+            dense_weights,
+            Arc::clone(&self.inner.buffers),
+        )
+        .submit(
+            position,
+            layer,
+            experts,
+            routing_weights,
+            input,
+            output,
+            shared,
+            next_norm_weight,
+            payloads,
+        )
     }
-
     fn submit_scheduled_expert_command(
         &self,
         command: ScheduledExpertCommand<'_>,
@@ -1987,99 +1973,30 @@ impl MetalExecutor {
         let next_norm_weight = next_norm_weights.values();
         match input {
             ExpertPhaseInput::Cpu(cpu_input) => {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    let pending = self.inner.submit_scheduled_expert_phase_with_payloads(
-                        position,
-                        layer,
-                        experts,
-                        weights,
-                        cpu_input,
-                        output,
-                        shared,
-                        next_norm_weight,
-                        &payloads,
-                    )?;
-                    Ok(DeferredExpertPhase::Metal(pending))
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    let _ = (cpu_input, output, payloads, shared, next_norm_weight);
-                    bail!(
-                        "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
-                    );
-                }
+                let input_width = cpu_input.width();
+                let input_state = cpu_input.state();
+                let _ = (experts, weights, output, shared, next_norm_weight, payloads);
+                bail!(
+                    "FlashMoe unsupported scheduled CMD3 implementation for layer {layer}: CPU normed/residual upload width {input_width} state {input_state:?} is not declared by the resolved graph"
+                );
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             ExpertPhaseInput::MetalPostAttention(prep) => {
                 debug_assert_eq!(prep.input.state(), prep.state);
                 debug_assert_eq!(prep.input.width(), prep.width);
-                let pending = self
-                    .inner
-                    .submit_scheduled_expert_phase_from_buffers_with_payloads(
-                        position,
-                        layer,
-                        experts,
-                        weights,
-                        prep.normed_buffer,
-                        prep.residual_buffer,
-                        prep.input.width(),
-                        output,
-                        shared,
-                        next_norm_weight,
-                        &payloads,
-                    )?;
-                Ok(DeferredExpertPhase::Metal(pending))
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    fn submit_expert_phase_with_payloads(
-        &self,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
-        weights: &[f32],
-        normed: &[f32],
-        residual: &[f32],
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<Option<DeferredExpertPhase>> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner
-                .submit_expert_phase_with_payloads(
+                let pending = self.submit_scheduled_cmd3(
                     position,
                     layer,
                     experts,
                     weights,
-                    normed,
-                    residual,
+                    prep,
+                    output,
                     shared,
                     next_norm_weight,
-                    payloads,
-                )
-                .map(|pending| pending.map(DeferredExpertPhase::Metal))
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (
-                position,
-                layer,
-                experts,
-                weights,
-                normed,
-                residual,
-                shared,
-                next_norm_weight,
-                payloads,
-            );
-            bail!(
-                "FlashMoe unsupported scheduled CMD3 path: non-Metal expert phase execution is not a declared graph-stage implementation"
-            );
+                    &payloads,
+                )?;
+                Ok(DeferredExpertPhase::ScheduledMetal(pending))
+            }
         }
     }
 
@@ -2658,141 +2575,13 @@ impl MetalExecutor {
 #[derive(Debug)]
 struct MetalExecutorInner {
     metal_runtime: MetalRuntime,
-    shared_expert_buffers: std::sync::Mutex<BTreeMap<usize, MetalSharedExpertBuffers>>,
     dense_weights: Option<MetalDenseWeights>,
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
-    buffers: MetalBufferPool,
+    buffers: Arc<MetalBufferPool>,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-enum MetalExpertRetention {
-    #[cfg(test)]
-    LegacyWeights(Arc<[Arc<ExpertWeights>]>),
-    ScheduledSlots(Arc<[Arc<ScheduledExpertSlot>]>),
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalExpertRetention {
-    fn len(&self) -> usize {
-        match self {
-            #[cfg(test)]
-            Self::LegacyWeights(experts) => experts.len(),
-            Self::ScheduledSlots(slots) => slots.len(),
-        }
-    }
-
-    fn expert_ids(&self) -> String {
-        match self {
-            #[cfg(test)]
-            Self::LegacyWeights(experts) => experts
-                .iter()
-                .map(|expert| expert.expert.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-            Self::ScheduledSlots(slots) => slots
-                .iter()
-                .map(|slot| slot.expert().to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalDeferredExpertPhase {
-    inner: Arc<MetalExecutorInner>,
-    command_buffer: ObjcId,
-    buffers: Vec<MetalPhaseBuffer>,
-    retained_experts: MetalExpertRetention,
-    output: MetalCmd3DeferredOutput,
-    context: MetalCommandContext,
-    scheduled_output: Option<ScheduledCmd3OutputState>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalDeferredExpertPhase {
-    fn next_normed_input(&self) -> Option<DeferredMetalInput> {
-        self.output
-            .next_normed_buffer
-            .zip(self.output.output_state.next_normed())
-            .map(|(buffer, next_normed)| {
-                let input = DeferredMetalInput::next_layer_normed(buffer, next_normed.len());
-                debug_assert_eq!(input.state(), next_normed);
-                debug_assert!(input.state().is_declared_graph_state());
-                input
-            })
-    }
-
-    fn hidden_input(&self) -> DeferredMetalInput {
-        let hidden = self.output.output_state.hidden();
-        let input = DeferredMetalInput::hidden(self.output.hidden_buffer, hidden.len());
-        debug_assert_eq!(input.state(), hidden);
-        debug_assert!(input.state().is_declared_graph_state());
-        input
-    }
-
-    fn finish_without_readback(self) -> Result<()> {
-        unsafe {
-            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
-                release(self.command_buffer);
-                for buffer in self.buffers {
-                    release(buffer.id);
-                }
-                return Err(error.into());
-            }
-            release(self.command_buffer);
-            for buffer in self.buffers {
-                if buffer.recycle {
-                    self.inner.recycle(buffer.id);
-                } else {
-                    release(buffer.id);
-                }
-            }
-            drop(self.retained_experts);
-            Ok(())
-        }
-    }
-
-    fn wait(self) -> Result<FlashMoeExpertPhaseOutput> {
-        unsafe {
-            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
-                release(self.command_buffer);
-                for buffer in self.buffers {
-                    release(buffer.id);
-                }
-                return Err(error.into());
-            }
-            let hidden = read_f32_buffer(
-                self.output.hidden_buffer,
-                self.output.output_state.hidden().len(),
-            );
-            let next_normed = self
-                .output
-                .next_normed_buffer
-                .zip(self.output.output_state.next_normed())
-                .map(|(buffer, next_normed)| read_f32_buffer(buffer, next_normed.len()));
-            release(self.command_buffer);
-            for buffer in self.buffers {
-                if buffer.recycle {
-                    self.inner.recycle(buffer.id);
-                } else {
-                    release(buffer.id);
-                }
-            }
-            drop(self.retained_experts);
-            let output = FlashMoeExpertPhaseOutput::new(hidden, next_normed);
-            if let Some(scheduled_output) = self.scheduled_output {
-                scheduled_output.validate_expert_phase_output(output)
-            } else {
-                Ok(output)
-            }
-        }
-    }
-}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for MetalExecutorInner {}
 
@@ -2812,15 +2601,6 @@ impl std::ops::Deref for MetalExecutorInner {
 impl Drop for MetalExecutorInner {
     fn drop(&mut self) {
         unsafe {
-            if let Ok(shared_buffers) = self.shared_expert_buffers.get_mut() {
-                for buffers in shared_buffers.values() {
-                    release(buffers.gate);
-                    release(buffers.up);
-                    release(buffers.down);
-                    release(buffers.router);
-                }
-                shared_buffers.clear();
-            }
             if let Some(dense_weights) = self.dense_weights.take() {
                 release(dense_weights.buffer);
             }
@@ -2843,7 +2623,6 @@ impl Drop for MetalExecutorInner {
                     release(layer.beta_gate);
                 }
             }
-            self.buffers.release_all();
         }
     }
 }
@@ -2882,14 +2661,13 @@ impl MetalExecutorInner {
 
         Ok(Self {
             metal_runtime,
-            shared_expert_buffers: std::sync::Mutex::new(BTreeMap::new()),
             dense_weights,
             lm_head_buffers: std::sync::Mutex::new(MetalLmHeadBufferCache::with_budget(
                 metal_lm_head_buffer_budget_bytes(),
             )),
             kv_cache: std::sync::Mutex::new(Some(kv_cache)),
             linear_attention_state: std::sync::Mutex::new(linear_attention_state),
-            buffers: MetalBufferPool::default(),
+            buffers: Arc::new(MetalBufferPool::default()),
         })
     }
 
@@ -4396,639 +4174,6 @@ impl MetalExecutorInner {
             Ok(Some(output))
         }
     }
-
-    #[cfg(test)]
-    fn submit_expert_phase(
-        self: &Arc<Self>,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
-        weights: &[f32],
-        normed: &[f32],
-        residual: &[f32],
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-    ) -> Result<Option<MetalDeferredExpertPhase>> {
-        let width = residual.len();
-        if width == 0 || normed.len() < width || weights.len() != experts.len() {
-            return Ok(None);
-        }
-        if let Some(weight) = next_norm_weight
-            && weight.len() < width
-        {
-            return Ok(None);
-        }
-
-        unsafe {
-            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
-            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    self.recycle(normed_buffer);
-                    return Err(error);
-                }
-            };
-            let payloads = match experts
-                .iter()
-                .map(|expert| expert.scheduled_cmd3_expert_phase_payload(width))
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                    return Err(error);
-                }
-            };
-            self.submit_expert_phase_from_buffers_with_payloads(
-                position,
-                layer,
-                MetalExpertRetention::LegacyWeights(experts.clone()),
-                weights,
-                normed_buffer,
-                residual_buffer,
-                width,
-                FlashMoeCmd3OutputState::gpu_resident(width, next_norm_weight.is_some()),
-                shared,
-                next_norm_weight,
-                &payloads,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    fn submit_expert_phase_with_payloads(
-        self: &Arc<Self>,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ExpertWeights>]>,
-        weights: &[f32],
-        normed: &[f32],
-        residual: &[f32],
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<Option<MetalDeferredExpertPhase>> {
-        let width = residual.len();
-        if width == 0 || normed.len() < width || weights.len() != experts.len() {
-            return Ok(None);
-        }
-        if let Some(weight) = next_norm_weight
-            && weight.len() < width
-        {
-            return Ok(None);
-        }
-        unsafe {
-            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(&normed[..width]))?;
-            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(residual)) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    self.recycle(normed_buffer);
-                    return Err(error);
-                }
-            };
-            self.submit_expert_phase_from_buffers_with_payloads(
-                position,
-                layer,
-                MetalExpertRetention::LegacyWeights(experts),
-                weights,
-                normed_buffer,
-                residual_buffer,
-                width,
-                FlashMoeCmd3OutputState::gpu_resident(width, next_norm_weight.is_some()),
-                shared,
-                next_norm_weight,
-                payloads,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn submit_scheduled_expert_phase_with_payloads(
-        self: &Arc<Self>,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ScheduledExpertSlot>]>,
-        weights: &[f32],
-        input: ScheduledCmd3CpuInput<'_>,
-        output: ScheduledCmd3OutputState,
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<MetalDeferredExpertPhase> {
-        let width = input.width();
-        debug_assert_eq!(output.layer, layer);
-        debug_assert_eq!(input.state().layer(), layer);
-        let output_state = output.state();
-        if weights.len() != experts.len() {
-            bail!(
-                "FlashMoe unsupported scheduled CMD3 path: CPU upload input for layer {layer} has weights={} experts={}",
-                weights.len(),
-                experts.len()
-            );
-        }
-        if output_state.width() != width {
-            bail!(
-                "FlashMoe unsupported scheduled CMD3 path: output width {} does not match CPU upload input width {} for layer {layer}",
-                output_state.width(),
-                width
-            );
-        }
-        if let Some(weight) = next_norm_weight
-            && weight.len() < width
-        {
-            bail!(
-                "FlashMoe unsupported scheduled CMD3 path: next-norm weight length {} is smaller than width {} for layer {layer}",
-                weight.len(),
-                width
-            );
-        }
-        unsafe {
-            let normed_buffer = self.buffer_with_bytes(f32_as_bytes(input.normed))?;
-            let residual_buffer = match self.buffer_with_bytes(f32_as_bytes(input.residual)) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    self.recycle(normed_buffer);
-                    return Err(error);
-                }
-            };
-            self.submit_scheduled_expert_phase_from_buffers_with_payloads(
-                position,
-                layer,
-                experts,
-                weights,
-                normed_buffer,
-                residual_buffer,
-                width,
-                output,
-                shared,
-                next_norm_weight,
-                payloads,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn submit_scheduled_expert_phase_from_buffers_with_payloads(
-        self: &Arc<Self>,
-        position: usize,
-        layer: usize,
-        experts: Arc<[Arc<ScheduledExpertSlot>]>,
-        weights: &[f32],
-        normed_buffer: ObjcId,
-        residual_buffer: ObjcId,
-        width: usize,
-        output: ScheduledCmd3OutputState,
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<MetalDeferredExpertPhase> {
-        debug_assert_eq!(output.layer, layer);
-        let output_state = output.state();
-        let scheduled_output = output;
-        self.submit_expert_phase_from_buffers_with_payloads(
-            position,
-            layer,
-            MetalExpertRetention::ScheduledSlots(experts),
-            weights,
-            normed_buffer,
-            residual_buffer,
-            width,
-            output_state,
-            shared,
-            next_norm_weight,
-            payloads,
-        )
-        .and_then(|pending| {
-            pending.map(|mut pending| {
-                pending.scheduled_output = Some(scheduled_output);
-                pending
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "FlashMoe unsupported scheduled CMD3 path: layer {} did not produce a Metal expert phase; missing CMD3 implementation must be represented as an unsupported capability instead of falling back",
-                    layer
-                )
-            })
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn submit_expert_phase_from_buffers_with_payloads(
-        self: &Arc<Self>,
-        position: usize,
-        layer: usize,
-        retained_experts: MetalExpertRetention,
-        weights: &[f32],
-        normed_buffer: ObjcId,
-        residual_buffer: ObjcId,
-        width: usize,
-        output_state: FlashMoeCmd3OutputState,
-        shared: SharedExpertPhaseRef<'_>,
-        next_norm_weight: Option<&[f32]>,
-        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
-    ) -> Result<Option<MetalDeferredExpertPhase>> {
-        let expert_count = retained_experts.len();
-        let command_plan = match MetalCmd3ExecutionPlan::new(
-            position,
-            layer,
-            expert_count,
-            width,
-            weights.len(),
-            output_state,
-            shared,
-            next_norm_weight.map(|weight| weight.len()),
-            payloads,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                return Err(error.context(
-                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled command plan",
-                ));
-            }
-        };
-        let plan = command_plan.phase;
-        let input_buffers = match MetalCmd3InputBuffers::new(plan, normed_buffer, residual_buffer) {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                return Err(error.context(
-                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled input buffers",
-                ));
-            }
-        };
-        let next_norm_plan = command_plan.next_norm;
-        let layer = plan.layer;
-        let width = plan.width;
-        let output_state = plan.output_state;
-        let shared_dense = shared.dense();
-        let shared_q4 = shared.q4();
-        let shared_metal = if let (Some(shared), MetalCmd3SharedPhaseSource::Dense) =
-            (shared_dense, command_plan.shared.source)
-        {
-            Some(self.shared_expert_buffers(
-                layer,
-                shared,
-                command_plan.shared.projection_rows(),
-            )?)
-        } else {
-            None
-        };
-
-        unsafe {
-            let mut buffers: Vec<MetalPhaseBuffer> = vec![
-                MetalPhaseBuffer::recyclable(input_buffers.normed),
-                MetalPhaseBuffer::recyclable(input_buffers.residual),
-            ];
-            let output_buffers = self.cmd3_output_buffers(&command_plan, &mut buffers)?;
-            let combine_buffers =
-                self.cmd3_combine_buffers(command_plan.combine, weights, &mut buffers)?;
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_phase_buffers(buffers, true);
-                bail!("failed to create Flash-MoE deferred expert command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_phase_buffers(buffers, true);
-                bail!("failed to create Flash-MoE deferred expert compute encoder");
-            }
-
-            let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
-
-            if let (Some(shared), MetalCmd3SharedPhaseSource::ResidentQ4) =
-                (shared_q4, command_plan.shared.source)
-            {
-                let shared_plan = command_plan.shared;
-                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
-                let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
-                let shared_stage = MetalCmd3SharedStageBuffers::projected(
-                    shared_plan,
-                    input_buffers,
-                    &output_buffers,
-                    combine_buffers,
-                    shared_work,
-                )?;
-                let shared_work = shared_stage
-                    .work
-                    .context("FlashMoe Metal CMD3 projected shared stage missing work buffers")?;
-
-                self.encode_q4_mmap_projection(
-                    encoder,
-                    &shared.gate,
-                    shared_stage.normed,
-                    shared_work.gate_out,
-                )?;
-                self.encode_q4_mmap_projection(
-                    encoder,
-                    &shared.up,
-                    shared_stage.normed,
-                    shared_work.up_out,
-                )?;
-                self.encode_q4_mmap_projection(
-                    encoder,
-                    &shared.router,
-                    shared_stage.normed,
-                    shared_work.router_out,
-                )?;
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.pipelines.shared_expert_activation_pipeline,
-                );
-                set_buffer(encoder, shared_work.gate_out, 0);
-                set_buffer(encoder, shared_work.up_out, 1);
-                set_buffer(encoder, shared_work.router_out, 2);
-                set_buffer(encoder, shared_work.activated, 3);
-                set_buffer(encoder, shared_work.intermediate, 4);
-                set_buffer(encoder, shared_work.total_intermediate, 5);
-                dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
-                self.encode_q4_mmap_projection(
-                    encoder,
-                    &shared.down,
-                    shared_work.activated,
-                    shared_stage.shared_output,
-                )?;
-            } else if let (Some(_shared), MetalCmd3SharedPhaseSource::Dense) =
-                (shared_dense, command_plan.shared.source)
-            {
-                let shared_plan = command_plan.shared;
-                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
-                let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
-                let shared_work = self.cmd3_shared_work_buffers(shared_plan, &mut buffers)?;
-                let shared_stage = MetalCmd3SharedStageBuffers::projected(
-                    shared_plan,
-                    input_buffers,
-                    &output_buffers,
-                    combine_buffers,
-                    shared_work,
-                )?;
-                let shared_work = shared_stage
-                    .work
-                    .context("FlashMoe Metal CMD3 projected shared stage missing work buffers")?;
-
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.gate,
-                    shared_stage.normed,
-                    shared_work.gate_out,
-                    shared_stage.width,
-                    shared_plan.projection_rows(),
-                );
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.up,
-                    shared_stage.normed,
-                    shared_work.up_out,
-                    shared_stage.width,
-                    shared_plan.projection_rows(),
-                );
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.router,
-                    shared_stage.normed,
-                    shared_work.router_out,
-                    shared_stage.width,
-                    shared_plan.router_rows(),
-                );
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.pipelines.shared_expert_activation_pipeline,
-                );
-                set_buffer(encoder, shared_work.gate_out, 0);
-                set_buffer(encoder, shared_work.up_out, 1);
-                set_buffer(encoder, shared_work.router_out, 2);
-                set_buffer(encoder, shared_work.activated, 3);
-                set_buffer(encoder, shared_work.intermediate, 4);
-                set_buffer(encoder, shared_work.total_intermediate, 5);
-                dispatch_threads(encoder, shared_plan.activation_dispatch_threads());
-                self.encode_dense_matvec(
-                    encoder,
-                    shared_metal.down,
-                    shared_work.activated,
-                    shared_stage.shared_output,
-                    shared_work.total_intermediate,
-                    width,
-                );
-            } else {
-                let shared_plan = command_plan.shared;
-                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::None);
-                let shared_stage = MetalCmd3SharedStageBuffers::fill_zero(
-                    shared_plan,
-                    input_buffers,
-                    &output_buffers,
-                    combine_buffers,
-                )?;
-                self.encode_fill_zero(
-                    encoder,
-                    shared_stage.shared_output,
-                    shared_stage.width,
-                    shared_plan.fill_zero_width(),
-                );
-            }
-
-            for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
-                let payload = payload.q4();
-                let active_work =
-                    self.cmd3_active_expert_work_buffers(*active_plan, &mut buffers)?;
-                let active_stage = MetalCmd3ActiveExpertStageBuffers::new(
-                    *active_plan,
-                    input_buffers,
-                    &output_buffers,
-                    active_work,
-                )?;
-
-                self.encode_q4_swiglu(
-                    encoder,
-                    payload,
-                    active_stage.normed,
-                    active_stage.activated,
-                    &mut buffers,
-                    &mut q4_source_buffers,
-                )?;
-                self.encode_q4_matvec(
-                    encoder,
-                    &payload.down,
-                    payload.down_source(),
-                    active_stage.activated,
-                    active_stage.expert_outputs,
-                    active_stage.output_offset,
-                    &mut buffers,
-                    &mut q4_source_buffers,
-                )?;
-            }
-
-            let combine_plan = command_plan.combine;
-            let combine_stage = MetalCmd3CombineStageBuffers::new(
-                combine_plan,
-                input_buffers,
-                &output_buffers,
-                combine_buffers,
-            )?;
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.combine_expert_phase_pipeline,
-            );
-            set_buffer(encoder, combine_stage.residual, 0);
-            set_buffer(encoder, combine_stage.shared_output, 1);
-            set_buffer(encoder, combine_stage.expert_outputs, 2);
-            set_buffer(encoder, combine_stage.routing_weights, 3);
-            set_buffer(encoder, combine_stage.hidden, 4);
-            set_buffer(encoder, combine_stage.width, 5);
-            set_buffer(encoder, combine_stage.active_count, 6);
-            dispatch_threads(encoder, combine_stage.plan.dispatch_threads);
-
-            if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
-                (next_norm_weight, output_buffers.next_normed, next_norm_plan)
-            {
-                let next_norm_buffers = self.cmd3_next_norm_buffers(
-                    next_norm_plan,
-                    weight,
-                    output_buffers.hidden,
-                    next_normed_buffer,
-                    combine_buffers.width,
-                    &mut buffers,
-                )?;
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    self.pipelines.rms_norm_reduced_pipeline,
-                );
-                set_buffer(encoder, next_norm_buffers.hidden, 0);
-                set_buffer(encoder, next_norm_buffers.weight, 1);
-                set_buffer(encoder, next_norm_buffers.next_normed, 2);
-                set_buffer(encoder, next_norm_buffers.width, 3);
-                dispatch_single_threadgroup(encoder, next_norm_plan.dispatch_threads);
-            }
-
-            msg_send_void0(encoder, sel("endEncoding"));
-            let expert_ids = retained_experts.expert_ids();
-            let context = command_plan.command_context(expert_ids);
-            commit_metal_command_buffer(command_buffer, &context);
-            release(encoder);
-
-            let output = MetalCmd3DeferredOutput::new(
-                output_buffers.hidden,
-                output_buffers.next_normed,
-                output_state,
-            )?;
-            Ok(Some(MetalDeferredExpertPhase {
-                inner: self.clone(),
-                command_buffer,
-                buffers,
-                retained_experts,
-                output,
-                context,
-                scheduled_output: None,
-            }))
-        }
-    }
-
-    unsafe fn encode_q4_matvec(
-        &self,
-        encoder: ObjcId,
-        payload: &Q4MatvecPayload<'_>,
-        source: Q4MatvecSource<'_>,
-        input_buffer: ObjcId,
-        output_buffer: ObjcId,
-        output_offset: u64,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalQ4SourceBufferCache,
-    ) -> Result<()> {
-        unsafe {
-            let buffer = self.q4_source_phase_buffer(source, buffers, source_buffers)?;
-            let rows_u32 = payload.rows as u32;
-            let cols_u32 = payload.cols as u32;
-            let groups_u32 = payload.cols.div_ceil(payload.group_size).max(1) as u32;
-            let group_size_u32 = payload.group_size as u32;
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.q4_bf16_scale_bias_pipeline,
-            );
-            set_buffer_with_offset(encoder, buffer, source.packed_offset as u64, 0);
-            set_buffer(encoder, input_buffer, 1);
-            set_buffer_with_offset(encoder, buffer, source.scale_offset as u64, 2);
-            set_buffer_with_offset(encoder, buffer, source.bias_offset as u64, 3);
-            set_buffer_with_offset(encoder, output_buffer, output_offset, 4);
-            set_bytes(encoder, u32_as_bytes(&rows_u32), 5);
-            set_bytes(encoder, u32_as_bytes(&cols_u32), 6);
-            set_bytes(encoder, u32_as_bytes(&groups_u32), 7);
-            set_bytes(encoder, u32_as_bytes(&group_size_u32), 8);
-            dispatch_q4_threadgroups(encoder, payload.rows as u64);
-            Ok(())
-        }
-    }
-
-    unsafe fn encode_q4_swiglu(
-        &self,
-        encoder: ObjcId,
-        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
-        input_buffer: ObjcId,
-        output_buffer: ObjcId,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalQ4SourceBufferCache,
-    ) -> Result<()> {
-        unsafe {
-            let gate = &payload.gate;
-            let gate_source = payload.gate_source();
-            let up_source = payload.up_source();
-            let buffer = self.q4_source_phase_buffer(gate_source, buffers, source_buffers)?;
-            let rows_u32 = gate.rows as u32;
-            let cols_u32 = gate.cols as u32;
-            let groups_u32 = gate.cols.div_ceil(gate.group_size).max(1) as u32;
-            let group_size_u32 = gate.group_size as u32;
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
-            );
-            set_buffer_with_offset(encoder, buffer, gate_source.packed_offset as u64, 0);
-            set_buffer_with_offset(encoder, buffer, up_source.packed_offset as u64, 1);
-            set_buffer(encoder, input_buffer, 2);
-            set_buffer_with_offset(encoder, buffer, gate_source.scale_offset as u64, 3);
-            set_buffer_with_offset(encoder, buffer, gate_source.bias_offset as u64, 4);
-            set_buffer_with_offset(encoder, buffer, up_source.scale_offset as u64, 5);
-            set_buffer_with_offset(encoder, buffer, up_source.bias_offset as u64, 6);
-            set_buffer(encoder, output_buffer, 7);
-            set_bytes(encoder, u32_as_bytes(&rows_u32), 8);
-            set_bytes(encoder, u32_as_bytes(&cols_u32), 9);
-            set_bytes(encoder, u32_as_bytes(&groups_u32), 10);
-            set_bytes(encoder, u32_as_bytes(&group_size_u32), 11);
-            dispatch_q4_threadgroups(encoder, gate.rows as u64);
-            Ok(())
-        }
-    }
-
-    unsafe fn encode_dense_matvec(
-        &self,
-        encoder: ObjcId,
-        weights_buffer: ObjcId,
-        input_buffer: ObjcId,
-        output_buffer: ObjcId,
-        cols_buffer: ObjcId,
-        rows: usize,
-    ) {
-        unsafe {
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.dense_matvec_pipeline,
-            );
-            set_buffer(encoder, weights_buffer, 0);
-            set_buffer(encoder, input_buffer, 1);
-            set_buffer(encoder, output_buffer, 2);
-            set_buffer(encoder, cols_buffer, 3);
-            dispatch_threads(encoder, rows as u64);
-        }
-    }
-
     unsafe fn encode_q4_mmap_projection(
         &self,
         encoder: ObjcId,
@@ -5097,25 +4242,6 @@ impl MetalExecutorInner {
             dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
         }
         Ok(())
-    }
-
-    unsafe fn encode_fill_zero(
-        &self,
-        encoder: ObjcId,
-        output_buffer: ObjcId,
-        width_buffer: ObjcId,
-        width: usize,
-    ) {
-        unsafe {
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.fill_zero_pipeline,
-            );
-            set_buffer(encoder, output_buffer, 0);
-            set_buffer(encoder, width_buffer, 1);
-            dispatch_threads(encoder, width as u64);
-        }
     }
 
     unsafe fn try_encode_q4_mmap_projection_batch(
@@ -7320,281 +6446,6 @@ impl MetalExecutorInner {
         unsafe { self.buffers.buffer_with_bytes(self.device, bytes) }
     }
 
-    unsafe fn borrowed_buffer_with_bytes(&self, bytes: &[u8]) -> Option<ObjcId> {
-        if bytes.is_empty() {
-            return None;
-        }
-        unsafe {
-            let buffer = msg_send_id4_ptr_usize_u64_ptr(
-                self.device,
-                sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
-                bytes.as_ptr() as *mut c_void,
-                bytes.len(),
-                0,
-                ptr::null_mut(),
-            );
-            (!buffer.is_null()).then_some(buffer)
-        }
-    }
-
-    unsafe fn phase_buffer_with_bytes(&self, bytes: &[u8]) -> Result<MetalPhaseBuffer> {
-        unsafe {
-            self.buffer_with_bytes(bytes)
-                .map(MetalPhaseBuffer::recyclable)
-        }
-    }
-
-    unsafe fn phase_buffer_with_borrowed_bytes(&self, bytes: &[u8]) -> Result<MetalPhaseBuffer> {
-        unsafe {
-            if let Some(buffer) = self.borrowed_buffer_with_bytes(bytes) {
-                return Ok(MetalPhaseBuffer::borrowed(buffer));
-            }
-            self.phase_buffer_with_bytes(bytes)
-        }
-    }
-
-    unsafe fn phase_buffer_with_borrowed_bytes_aligned(
-        &self,
-        bytes: &[u8],
-        alignment: usize,
-    ) -> Result<MetalPhaseBuffer> {
-        if alignment > 1 && (bytes.as_ptr() as usize) % alignment != 0 {
-            return unsafe { self.phase_buffer_with_bytes(bytes) };
-        }
-        unsafe { self.phase_buffer_with_borrowed_bytes(bytes) }
-    }
-
-    unsafe fn q4_source_phase_buffer(
-        &self,
-        source: Q4MatvecSource<'_>,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalQ4SourceBufferCache,
-    ) -> Result<ObjcId> {
-        if let Some(buffer) = source_buffers.get(source.bytes) {
-            return Ok(buffer);
-        }
-        let phase_buffer =
-            unsafe { self.phase_buffer_with_borrowed_bytes_aligned(source.bytes, 16)? };
-        let buffer = phase_buffer.id;
-        buffers.push(phase_buffer);
-        source_buffers.insert(source.bytes, buffer);
-        Ok(buffer)
-    }
-
-    unsafe fn cmd3_output_buffers(
-        &self,
-        plan: &MetalCmd3ExecutionPlan,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3OutputBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let expert_outputs = self.buffer_with_len(layout.expert_outputs_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(expert_outputs));
-            let shared_output = self.buffer_with_len(layout.shared_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(shared_output));
-            let hidden = self.buffer_with_len(layout.hidden_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(hidden));
-            let next_normed = if let Some(bytes) = layout.next_normed_output_bytes {
-                let buffer = self.buffer_with_len(bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(buffer));
-                Some(buffer)
-            } else {
-                None
-            };
-            MetalCmd3OutputBuffers::new(plan, expert_outputs, shared_output, hidden, next_normed)
-        }
-    }
-
-    unsafe fn cmd3_combine_buffers(
-        &self,
-        plan: MetalCmd3CombinePlan,
-        routing_weights: &[f32],
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3CombineBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let routing_weight_bytes = f32_as_bytes(routing_weights);
-            if routing_weight_bytes.len() != layout.routing_weights_bytes {
-                bail!(
-                    "FlashMoe Metal CMD3 combine routing weights byte length {} does not match declared layout {}",
-                    routing_weight_bytes.len(),
-                    layout.routing_weights_bytes
-                );
-            }
-            let routing_weights = self.buffer_with_bytes(routing_weight_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(routing_weights));
-            let width = self.buffer_with_bytes(u32_as_bytes(&layout.width_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(width));
-            let active_count = self.buffer_with_bytes(u32_as_bytes(&layout.active_count_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(active_count));
-            MetalCmd3CombineBuffers::new(plan, routing_weights, width, active_count)
-        }
-    }
-
-    unsafe fn cmd3_next_norm_buffers(
-        &self,
-        plan: MetalCmd3NextNormPlan,
-        weight: &[f32],
-        hidden: ObjcId,
-        next_normed: ObjcId,
-        width: ObjcId,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3NextNormBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let weight_bytes = f32_as_bytes(&weight[..plan.width]);
-            if weight_bytes.len() != layout.weight_bytes {
-                bail!(
-                    "FlashMoe Metal CMD3 next-norm weight byte length {} does not match declared layout {}",
-                    weight_bytes.len(),
-                    layout.weight_bytes
-                );
-            }
-            let weight = self.buffer_with_bytes(weight_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(weight));
-            MetalCmd3NextNormBuffers::new(plan, hidden, weight, next_normed, width)
-        }
-    }
-
-    unsafe fn cmd3_shared_work_buffers(
-        &self,
-        plan: MetalCmd3SharedPhasePlan,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3SharedWorkBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let gate_out = self.buffer_with_len(layout.projection_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-            let up_out = self.buffer_with_len(layout.projection_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(up_out));
-            let router_out = self.buffer_with_len(layout.router_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(router_out));
-            let activated = self.buffer_with_len(layout.projection_output_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(activated));
-            let total_intermediate =
-                self.buffer_with_bytes(u32_as_bytes(&layout.total_intermediate_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(total_intermediate));
-            let intermediate = self.buffer_with_bytes(u32_as_bytes(&layout.intermediate_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(intermediate));
-            MetalCmd3SharedWorkBuffers::new(
-                plan,
-                gate_out,
-                up_out,
-                router_out,
-                activated,
-                total_intermediate,
-                intermediate,
-            )
-        }
-    }
-
-    unsafe fn cmd3_active_expert_work_buffers(
-        &self,
-        plan: MetalCmd3ActiveExpertPlan,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> Result<MetalCmd3ActiveExpertWorkBuffers> {
-        unsafe {
-            let layout = plan.buffer_layout()?;
-            let activated = self.buffer_with_len(layout.activation_bytes)?;
-            buffers.push(MetalPhaseBuffer::recyclable(activated));
-            MetalCmd3ActiveExpertWorkBuffers::new(plan, activated)
-        }
-    }
-
-    fn shared_expert_buffers(
-        &self,
-        layer: usize,
-        shared: &SharedExpertPhaseWeights,
-        total_intermediate: usize,
-    ) -> Result<MetalSharedExpertBuffers> {
-        {
-            let cache = self
-                .shared_expert_buffers
-                .lock()
-                .expect("metal shared expert buffer cache poisoned");
-            if let Some(buffers) = cache.get(&layer).copied() {
-                if buffers.width == shared.width
-                    && buffers.shared_experts == shared.shared_experts
-                    && buffers.intermediate == shared.intermediate
-                    && buffers.total_intermediate == total_intermediate
-                {
-                    return Ok(buffers);
-                }
-                bail!(
-                    "cached Metal shared expert buffers for layer {layer} have dimensions {}x{}x{}, requested {}x{}x{}",
-                    buffers.shared_experts,
-                    buffers.intermediate,
-                    buffers.width,
-                    shared.shared_experts,
-                    shared.intermediate,
-                    shared.width
-                );
-            }
-        }
-
-        unsafe {
-            let gate = self.persistent_buffer_with_bytes(f32_as_bytes(shared.gate.as_slice()))?;
-            let up = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.up.as_slice())) {
-                Ok(buffer) => buffer,
-                Err(err) => {
-                    release(gate);
-                    return Err(err);
-                }
-            };
-            let down = match self.persistent_buffer_with_bytes(f32_as_bytes(shared.down.as_slice()))
-            {
-                Ok(buffer) => buffer,
-                Err(err) => {
-                    release(gate);
-                    release(up);
-                    return Err(err);
-                }
-            };
-            let router =
-                match self.persistent_buffer_with_bytes(f32_as_bytes(shared.router.as_slice())) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        release(gate);
-                        release(up);
-                        release(down);
-                        return Err(err);
-                    }
-                };
-            let buffers = MetalSharedExpertBuffers::new(
-                gate,
-                up,
-                down,
-                router,
-                shared.width,
-                shared.shared_experts,
-                shared.intermediate,
-                total_intermediate,
-            );
-            let mut cache = self
-                .shared_expert_buffers
-                .lock()
-                .expect("metal shared expert buffer cache poisoned");
-            if let Some(existing) = cache.get(&layer).copied() {
-                release(buffers.gate);
-                release(buffers.up);
-                release(buffers.down);
-                release(buffers.router);
-                if existing.width != shared.width
-                    || existing.shared_experts != shared.shared_experts
-                    || existing.intermediate != shared.intermediate
-                    || existing.total_intermediate != total_intermediate
-                {
-                    bail!(
-                        "cached Metal shared expert buffers for layer {layer} changed dimensions while loading"
-                    );
-                }
-                return Ok(existing);
-            }
-            cache.insert(layer, buffers);
-            Ok(buffers)
-        }
-    }
-
     unsafe fn persistent_buffer_with_bytes(&self, bytes: &[u8]) -> Result<ObjcId> {
         unsafe {
             let buffer = msg_send_id2_usize_u64(
@@ -7622,10 +6473,6 @@ impl MetalExecutorInner {
 
     fn recycle_or_release_buffers(&self, buffers: &[ObjcId], release_only: bool) {
         self.buffers.recycle_or_release(buffers, release_only);
-    }
-
-    fn recycle_or_release_phase_buffers(&self, buffers: Vec<MetalPhaseBuffer>, release_only: bool) {
-        self.buffers.recycle_or_release_phase(buffers, release_only);
     }
 }
 
@@ -19888,205 +18735,6 @@ mod tests {
             assert_close(*actual, *expected);
         }
     }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    #[ignore = "requires a local Metal device"]
-    fn arm_macos_fixed_q4_expert_phase_matches_cpu_reference() {
-        use crate::inference::flashmoe::{ExpertSlotView, QwenMoeExpertComponentLayout};
-        use QwenMoeExpertComponentKind::*;
-
-        fn write_component(
-            payload: &mut [u8],
-            layout: QwenMoeQ4ExpertLayout,
-            weight: QwenMoeExpertComponentKind,
-            scale: QwenMoeExpertComponentKind,
-            bias: QwenMoeExpertComponentKind,
-            seed: u8,
-        ) {
-            let weight_component = layout.component(weight);
-            for idx in 0..weight_component.bytes {
-                let lo = ((idx as u8).wrapping_add(seed)) & 0x0f;
-                let hi = ((idx as u8).wrapping_mul(3).wrapping_add(seed + 1)) & 0x0f;
-                payload[weight_component.offset + idx] = lo | (hi << 4);
-            }
-
-            let scale_component = layout.component(scale);
-            let bias_component = layout.component(bias);
-            for group in 0..(scale_component.bytes / 2) {
-                let scale = 0.03125 + (seed as f32) * 0.00390625 + (group as f32) * 0.001953125;
-                let bias = -0.125 + (seed as f32) * 0.0078125 - (group as f32) * 0.0009765625;
-                let offset = group * 2;
-                payload[scale_component.offset + offset..scale_component.offset + offset + 2]
-                    .copy_from_slice(&f32_to_bf16_bits(scale).to_le_bytes());
-                payload[bias_component.offset + offset..bias_component.offset + offset + 2]
-                    .copy_from_slice(&f32_to_bf16_bits(bias).to_le_bytes());
-            }
-        }
-
-        let width = 8;
-        let intermediate = 8;
-        let layout = QwenMoeQ4ExpertLayout {
-            expert_bytes: 192,
-            group_size: 8,
-            components: [
-                QwenMoeExpertComponentLayout {
-                    kind: GateWeight,
-                    offset: 0,
-                    bytes: 32,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: GateScale,
-                    offset: 32,
-                    bytes: 16,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: GateBias,
-                    offset: 48,
-                    bytes: 16,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpWeight,
-                    offset: 64,
-                    bytes: 32,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpScale,
-                    offset: 96,
-                    bytes: 16,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpBias,
-                    offset: 112,
-                    bytes: 16,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownWeight,
-                    offset: 128,
-                    bytes: 32,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownScale,
-                    offset: 160,
-                    bytes: 16,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownBias,
-                    offset: 176,
-                    bytes: 16,
-                },
-            ],
-        };
-        let spec = FixedQ4ExpertSlotSpec {
-            layout,
-            hidden_size: width,
-            intermediate_size: intermediate,
-        };
-        let mut payload = vec![0u8; layout.expert_bytes];
-        write_component(&mut payload, layout, GateWeight, GateScale, GateBias, 1);
-        write_component(&mut payload, layout, UpWeight, UpScale, UpBias, 5);
-        write_component(&mut payload, layout, DownWeight, DownScale, DownBias, 9);
-        let slot = ExpertSlotView::new(0, 0, 1024, layout.expert_bytes, &payload).unwrap();
-        FixedQ4ExpertSlotView::new(slot, layout).unwrap();
-        let expert = Arc::new(ExpertWeights {
-            layer: 0,
-            expert: 0,
-            slot: slot.descriptor(),
-            packed: payload.clone(),
-            records: Vec::new(),
-            fixed_q4: Some(FixedQ4ExpertPayload {
-                spec,
-                bytes: payload,
-                decoded: None,
-                recycle_pool: None,
-            }),
-        });
-        let experts: Arc<[Arc<ExpertWeights>]> = Arc::from(vec![Arc::clone(&expert)]);
-        let weights = [0.625f32];
-        let normed: Vec<f32> = (0..width)
-            .map(|idx| ((idx as f32) * 0.17).sin() - 0.25)
-            .collect();
-        let residual: Vec<f32> = (0..width)
-            .map(|idx| ((idx as f32) * 0.11).cos() * 0.125)
-            .collect();
-        let expected =
-            compute_expert_phase_cpu(experts.as_ref(), &weights, &normed, &residual, None, None)
-                .unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
-        fs::create_dir_all(&plan.runtime_dir).unwrap();
-        fs::write(&plan.non_expert_weights, []).unwrap();
-        let manifest = FlashMoeManifest {
-            model: QWEN35_MODEL.to_string(),
-            cache_version: CACHE_VERSION.to_string(),
-            dense_shards: Vec::new(),
-            expert_tensors: Vec::new(),
-            dense_tensors: Vec::new(),
-        };
-        fs::write(
-            &plan.tensor_manifest,
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        let dense = DenseStore::open(
-            plan.non_expert_weights.clone(),
-            plan.tensor_manifest.clone(),
-        )
-        .unwrap();
-        let config = QwenModelConfig {
-            model_type: Some("qwen3_moe".to_string()),
-            architectures: Some(vec!["Qwen3MoeForCausalLM".to_string()]),
-            num_hidden_layers: 1,
-            hidden_size: width,
-            num_attention_heads: 1,
-            head_dim: None,
-            num_key_value_heads: Some(1),
-            vocab_size: 32,
-            rope_theta: Some(1_000_000.0),
-            partial_rotary_factor: None,
-            torch_dtype: Some("bfloat16".to_string()),
-            num_experts: Some(1),
-            num_experts_per_tok: Some(1),
-            moe_intermediate_size: Some(intermediate),
-            intermediate_size: None,
-            max_position_embeddings: Some(16),
-            mrope_section: None,
-            tie_word_embeddings: None,
-            num_shared_experts: None,
-            shared_expert_intermediate_size: None,
-            vision_config: None,
-        };
-        let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &dense).unwrap();
-        let actual = metal
-            .submit_expert_phase(
-                0,
-                0,
-                Arc::clone(&experts),
-                &weights,
-                &normed,
-                &residual,
-                SharedExpertPhaseRef::None,
-                None,
-            )
-            .unwrap()
-            .expect("fixed q4 expert phase should run on Metal")
-            .wait()
-            .unwrap();
-
-        let (actual_hidden, _) = actual.into_hidden_and_next_normed();
-        let (expected_hidden, _) = expected.into_hidden_and_next_normed();
-        for (idx, (actual, expected)) in
-            actual_hidden.iter().zip(expected_hidden.iter()).enumerate()
-        {
-            assert!(
-                (*actual - *expected).abs() <= 1e-3,
-                "hidden[{idx}] Metal fixed q4 expert phase {actual} diverged from CPU reference {expected}"
-            );
-        }
-    }
-
     #[test]
     fn fixed_q4_expert_payload_recycles_whole_slot_bytes_to_pool() {
         let spec = FixedQ4ExpertSlotSpec {

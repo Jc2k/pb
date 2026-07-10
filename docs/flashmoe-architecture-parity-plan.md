@@ -174,6 +174,14 @@ Baseline reviewed on 2026-07-10:
   required pipeline, partial-construction cleanup, and final release. `MetalExecutorInner` borrows
   that runtime through dereference; `legacy.rs` no longer compiles or releases Metal pipelines,
   queues, or devices.
+- Production scheduled CMD3 now consumes typed GPU-resident post-attention state, scheduler-owned
+  whole-expert slots, resident-Q4 shared projections, routing weights, and typed output state in a
+  single `MetalScheduledCmd3Builder`. Its submitted result owns the command buffer, slot leases,
+  transient/borrowed buffers, deferred GPU handoff, wait/readback, and cleanup. CPU
+  normed/residual upload and dense-CPU shared expert substitutions are precise unsupported-stage
+  errors. The duplicate legacy CMD3 encoder, shared dense upload/cache, deferred-command type, and
+  its model-specific direct-executor test have been removed; typed builder tests plus the required
+  real-model smoke cover the production command.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
