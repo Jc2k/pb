@@ -103,7 +103,7 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput, MetalCmd3PhasePlan,
     MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
     MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
     MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
@@ -4777,23 +4777,40 @@ impl MetalExecutorInner {
         payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
     ) -> Result<Option<MetalDeferredExpertPhase>> {
         let expert_count = retained_experts.len();
-        if width == 0 || weights.len() != expert_count || payloads.len() != expert_count {
-            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-            return Ok(None);
-        }
-        if !output_state.is_declared_graph_state()
-            || output_state.width() != width
-            || output_state.has_next_normed() != next_norm_weight.is_some()
-        {
-            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-            return Ok(None);
-        }
+        let plan = match MetalCmd3PhasePlan::new(
+            position,
+            layer,
+            expert_count,
+            width,
+            weights.len(),
+            payloads.len(),
+            output_state,
+            next_norm_weight.is_some(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                return Err(error.context(
+                    "FlashMoe unsupported Metal CMD3 phase: invalid scheduled command plan",
+                ));
+            }
+        };
         if let Some(weight) = next_norm_weight
-            && weight.len() < width
+            && weight.len() < plan.width
         {
             self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported Metal CMD3 phase: next-norm weight length {} is smaller than width {} for layer {}",
+                weight.len(),
+                plan.width,
+                plan.layer
+            );
         }
+        let position = plan.position;
+        let layer = plan.layer;
+        let expert_count = plan.expert_count;
+        let width = plan.width;
+        let output_state = plan.output_state;
         let shared_dense = shared.dense();
         let shared_q4 = shared.q4();
         let shared_total_intermediate = if let Some(shared) = shared_dense {

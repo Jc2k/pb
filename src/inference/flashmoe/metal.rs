@@ -943,6 +943,69 @@ impl MetalCmd3DeferredOutput {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3PhasePlan {
+    pub(crate) position: usize,
+    pub(crate) layer: usize,
+    pub(crate) expert_count: usize,
+    pub(crate) width: usize,
+    pub(crate) output_state: FlashMoeCmd3OutputState,
+    pub(crate) has_next_norm: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3PhasePlan {
+    pub(crate) fn new(
+        position: usize,
+        layer: usize,
+        expert_count: usize,
+        width: usize,
+        weights_len: usize,
+        payloads_len: usize,
+        output_state: FlashMoeCmd3OutputState,
+        has_next_norm: bool,
+    ) -> anyhow::Result<Self> {
+        if width == 0 {
+            anyhow::bail!("FlashMoe Metal CMD3 phase requires non-zero width");
+        }
+        if expert_count == 0 {
+            anyhow::bail!("FlashMoe Metal CMD3 phase requires at least one active expert");
+        }
+        if weights_len != expert_count || payloads_len != expert_count {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 phase expert count {} does not match weights={} payloads={}",
+                expert_count,
+                weights_len,
+                payloads_len
+            );
+        }
+        if !output_state.is_declared_graph_state() {
+            anyhow::bail!("FlashMoe Metal CMD3 phase output state is not declared graph state");
+        }
+        if output_state.width() != width {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 phase output width {} does not match command width {}",
+                output_state.width(),
+                width
+            );
+        }
+        if output_state.has_next_normed() != has_next_norm {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 phase next-norm output declaration does not match next-norm weights"
+            );
+        }
+        Ok(Self {
+            position,
+            layer,
+            expert_count,
+            width,
+            output_state,
+            has_next_norm,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalPhaseBuffer {
     pub(crate) id: MetalObjcId,
     pub(crate) recycle: bool,
@@ -3146,6 +3209,42 @@ mod tests {
         assert!(
             null_hidden.to_string().contains("non-null hidden buffer"),
             "{null_hidden:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_phase_plan_declares_supported_command_shape() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(16, true);
+
+        let plan = MetalCmd3PhasePlan::new(9, 3, 4, 16, 4, 4, output_state, true).unwrap();
+
+        assert_eq!(plan.position, 9);
+        assert_eq!(plan.layer, 3);
+        assert_eq!(plan.expert_count, 4);
+        assert_eq!(plan.width, 16);
+        assert_eq!(plan.output_state, output_state);
+        assert!(plan.has_next_norm);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_phase_plan_rejects_unsupported_command_shape() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(16, true);
+
+        let count_err = MetalCmd3PhasePlan::new(9, 3, 4, 16, 3, 4, output_state, true).unwrap_err();
+        assert!(
+            count_err.to_string().contains("expert count 4"),
+            "{count_err:#}"
+        );
+
+        let output_err =
+            MetalCmd3PhasePlan::new(9, 3, 4, 16, 4, 4, output_state, false).unwrap_err();
+        assert!(
+            output_err
+                .to_string()
+                .contains("next-norm output declaration"),
+            "{output_err:#}"
         );
     }
 
