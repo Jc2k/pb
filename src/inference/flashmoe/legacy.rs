@@ -68,6 +68,8 @@ use super::experts::FLASHMOE_EXPERT_IO_POLICY;
 #[cfg(test)]
 use super::experts::ReusableExpertBuffer;
 #[cfg(test)]
+use super::experts::parse_pbq4_expert_pack_generic;
+#[cfg(test)]
 use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
@@ -77,9 +79,9 @@ use super::experts::{
     ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
     FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
     PBQ4_EXPERT_MAGIC, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
-    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
-    fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, read_exact_at_positioned,
-    read_expert_layer_pack_metadata,
+    decode_expert_scale_bias_bytes, expert_layer_metadata_path, expert_layer_path, expert_slot_end,
+    expert_slot_offset, fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records,
+    parse_pbq4_expert_pack, read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18864,12 +18866,20 @@ fn fixed_q4_expert_record(
 ) -> Result<PackedExpertTensor> {
     let scale_bytes = view.component(scale_kind).to_vec();
     let bias_bytes = view.component(bias_kind).to_vec();
-    let mut scale_cursor = 0;
-    let scales = read_bf16_vec_le(&scale_bytes, &mut scale_cursor, scale_bytes.len() / 2)
-        .with_context(|| format!("failed to decode fixed Q4 {projection} scales"))?;
-    let mut bias_cursor = 0;
-    let biases = read_bf16_vec_le(&bias_bytes, &mut bias_cursor, bias_bytes.len() / 2)
-        .with_context(|| format!("failed to decode fixed Q4 {projection} biases"))?;
+    let scale_value_bytes = scale_bytes.len() / 2 * 2;
+    let bias_value_bytes = bias_bytes.len() / 2 * 2;
+    let scales = decode_expert_scale_bias_bytes(
+        &scale_bytes[..scale_value_bytes],
+        scale_bytes.len() / 2,
+        EXPERT_SCALE_BIAS_DTYPE_BF16,
+    )
+    .with_context(|| format!("failed to decode fixed Q4 {projection} scales"))?;
+    let biases = decode_expert_scale_bias_bytes(
+        &bias_bytes[..bias_value_bytes],
+        bias_bytes.len() / 2,
+        EXPERT_SCALE_BIAS_DTYPE_BF16,
+    )
+    .with_context(|| format!("failed to decode fixed Q4 {projection} biases"))?;
     Ok(PackedExpertTensor {
         name: format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"),
         dtype: "q4".to_string(),
@@ -18884,317 +18894,6 @@ fn fixed_q4_expert_record(
         scale_bytes,
         bias_bytes,
     })
-}
-
-fn parse_pbq4_expert_pack(
-    bytes: &[u8],
-    metadata: Option<&ExpertPackMetadata>,
-) -> Result<Vec<PackedExpertTensor>> {
-    if let Some(metadata) = metadata {
-        return parse_pbq4_expert_pack_with_metadata(bytes, metadata);
-    }
-    parse_pbq4_expert_pack_generic(bytes, None)
-}
-
-fn parse_pbq4_expert_pack_with_metadata(
-    bytes: &[u8],
-    metadata: &ExpertPackMetadata,
-) -> Result<Vec<PackedExpertTensor>> {
-    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
-        bail!("expert pack is missing PBQ4EXPERT header");
-    }
-    let mut cursor = PBQ4_EXPERT_MAGIC.len();
-    let mut records = Vec::with_capacity(metadata.records.len());
-    for meta in &metadata.records {
-        if cursor as u64 != meta.record_offset {
-            bail!(
-                "expert tensor {} metadata offset mismatch: file cursor {}, metadata has {}",
-                meta.tensor,
-                cursor,
-                meta.record_offset
-            );
-        }
-        let name_len = read_u32_le(bytes, &mut cursor)? as usize;
-        let name_end = cursor
-            .checked_add(name_len)
-            .context("expert tensor name length overflow")?;
-        if name_end > bytes.len() {
-            bail!("expert tensor name extends past end of pack");
-        }
-        let name_bytes = &bytes[cursor..name_end];
-        if name_bytes != meta.tensor.as_bytes() {
-            let file_name =
-                std::str::from_utf8(name_bytes).unwrap_or("<invalid utf-8 expert tensor name>");
-            bail!(
-                "expert tensor metadata name mismatch: file has {file_name}, metadata has {}",
-                meta.tensor
-            );
-        }
-        cursor = name_end;
-        let packed_len = read_u64_le(bytes, &mut cursor)?;
-        if meta.packed_bytes != packed_len {
-            bail!(
-                "expert tensor {} packed length mismatch: file has {packed_len}, metadata has {}",
-                meta.tensor,
-                meta.packed_bytes
-            );
-        }
-        let group_count = usize::try_from(read_u64_le(bytes, &mut cursor)?)
-            .context("expert group count does not fit usize")?;
-        if meta.groups != group_count {
-            bail!(
-                "expert tensor {} group count mismatch: file has {group_count}, metadata has {}",
-                meta.tensor,
-                meta.groups
-            );
-        }
-        let scale_start = cursor;
-        let scales =
-            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, &meta.scale_bias_dtype)
-                .with_context(|| {
-                    format!(
-                        "failed to parse q4 scales for expert tensor {}",
-                        meta.tensor
-                    )
-                })?;
-        let scale_bytes = bytes[scale_start..cursor].to_vec();
-        let bias_start = cursor;
-        let biases =
-            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, &meta.scale_bias_dtype)
-                .with_context(|| {
-                    format!(
-                        "failed to parse q4 biases for expert tensor {}",
-                        meta.tensor
-                    )
-                })?;
-        let bias_bytes = bytes[bias_start..cursor].to_vec();
-        let packed_len =
-            usize::try_from(packed_len).context("expert packed length does not fit usize")?;
-        let packed_end = cursor
-            .checked_add(packed_len)
-            .context("expert packed value range overflow")?;
-        if packed_end > bytes.len() {
-            bail!(
-                "expert packed values for tensor {} extend past end of pack",
-                meta.tensor
-            );
-        }
-        let packed = bytes[cursor..packed_end].to_vec();
-        cursor = packed_end;
-        records.push(PackedExpertTensor {
-            name: meta.tensor.clone(),
-            dtype: meta.dtype.clone(),
-            shape: meta.shape.clone(),
-            source_offsets: meta.source_offsets,
-            source_hash: meta.source_hash.clone(),
-            group_size: meta.group_size,
-            scale_bias_dtype: meta.scale_bias_dtype.clone(),
-            packed,
-            scales,
-            biases,
-            scale_bytes,
-            bias_bytes,
-        });
-    }
-    if cursor != bytes.len() {
-        bail!(
-            "expert pack has {} trailing bytes after metadata records",
-            bytes.len() - cursor
-        );
-    }
-    Ok(records)
-}
-
-fn parse_pbq4_expert_pack_generic(
-    bytes: &[u8],
-    metadata: Option<&ExpertPackMetadata>,
-) -> Result<Vec<PackedExpertTensor>> {
-    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
-        bail!("expert pack is missing PBQ4EXPERT header");
-    }
-    let mut cursor = PBQ4_EXPERT_MAGIC.len();
-    let mut records = Vec::new();
-    while cursor < bytes.len() {
-        let record_start = cursor as u64;
-        let name_len = read_u32_le(bytes, &mut cursor)? as usize;
-        let name_end = cursor
-            .checked_add(name_len)
-            .context("expert tensor name length overflow")?;
-        if name_end > bytes.len() {
-            bail!("expert tensor name extends past end of pack");
-        }
-        let name = std::str::from_utf8(&bytes[cursor..name_end])
-            .context("expert tensor name is not valid UTF-8")?
-            .to_string();
-        cursor = name_end;
-        let packed_len = usize::try_from(read_u64_le(bytes, &mut cursor)?)
-            .context("expert packed length does not fit usize")?;
-        let group_count = usize::try_from(read_u64_le(bytes, &mut cursor)?)
-            .context("expert group count does not fit usize")?;
-
-        let meta = metadata.and_then(|metadata| {
-            metadata
-                .records
-                .iter()
-                .find(|record| record.tensor == name && record.record_offset == record_start)
-                .or_else(|| metadata.records.iter().find(|record| record.tensor == name))
-        });
-        let scale_bias_dtype = meta
-            .map(|record| record.scale_bias_dtype.as_str())
-            .unwrap_or(EXPERT_SCALE_BIAS_DTYPE_F32);
-        let scale_start = cursor;
-        let scales =
-            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, scale_bias_dtype)
-                .with_context(|| format!("failed to parse q4 scales for expert tensor {name}"))?;
-        let scale_bytes = bytes[scale_start..cursor].to_vec();
-        let bias_start = cursor;
-        let biases =
-            read_expert_scale_bias_vec_le(bytes, &mut cursor, group_count, scale_bias_dtype)
-                .with_context(|| format!("failed to parse q4 biases for expert tensor {name}"))?;
-        let bias_bytes = bytes[bias_start..cursor].to_vec();
-        let packed_end = cursor
-            .checked_add(packed_len)
-            .context("expert packed value range overflow")?;
-        if packed_end > bytes.len() {
-            bail!("expert packed values for tensor {name} extend past end of pack");
-        }
-        let packed = bytes[cursor..packed_end].to_vec();
-        cursor = packed_end;
-
-        if let Some(meta) = meta {
-            if meta.packed_bytes != packed_len as u64 {
-                bail!(
-                    "expert tensor {name} packed length mismatch: file has {packed_len}, metadata has {}",
-                    meta.packed_bytes
-                );
-            }
-            if meta.groups != group_count {
-                bail!(
-                    "expert tensor {name} group count mismatch: file has {group_count}, metadata has {}",
-                    meta.groups
-                );
-            }
-        }
-        records.push(PackedExpertTensor {
-            name,
-            dtype: meta
-                .map(|record| record.dtype.clone())
-                .unwrap_or_else(|| "q4".to_string()),
-            shape: meta.map(|record| record.shape.clone()).unwrap_or_default(),
-            source_offsets: meta.map(|record| record.source_offsets).unwrap_or([0, 0]),
-            source_hash: meta.and_then(|record| record.source_hash.clone()),
-            group_size: meta.map(|record| record.group_size).unwrap_or(GROUP_SIZE),
-            scale_bias_dtype: scale_bias_dtype.to_string(),
-            packed,
-            scales,
-            biases,
-            scale_bytes,
-            bias_bytes,
-        });
-    }
-    Ok(records)
-}
-
-fn read_expert_scale_bias_vec_le(
-    bytes: &[u8],
-    cursor: &mut usize,
-    len: usize,
-    dtype: &str,
-) -> Result<Vec<f32>> {
-    match dtype.to_ascii_uppercase().as_str() {
-        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => read_f32_vec_le(bytes, cursor, len),
-        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => read_bf16_vec_le(bytes, cursor, len),
-        other => bail!("unsupported q4 scale/bias dtype {other}"),
-    }
-}
-
-fn decode_expert_scale_bias_bytes(bytes: &[u8], len: usize, dtype: &str) -> Result<Vec<f32>> {
-    let mut cursor = 0;
-    let values = read_expert_scale_bias_vec_le(bytes, &mut cursor, len, dtype)?;
-    if cursor != bytes.len() {
-        bail!(
-            "expert scale/bias payload has {} trailing bytes",
-            bytes.len() - cursor
-        );
-    }
-    Ok(values)
-}
-
-fn read_u32_le(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
-    let end = cursor.checked_add(4).context("u32 cursor overflow")?;
-    if end > bytes.len() {
-        bail!("unexpected end of expert pack while reading u32");
-    }
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(&bytes[*cursor..end]);
-    *cursor = end;
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_u64_le(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
-    let end = cursor.checked_add(8).context("u64 cursor overflow")?;
-    if end > bytes.len() {
-        bail!("unexpected end of expert pack while reading u64");
-    }
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(&bytes[*cursor..end]);
-    *cursor = end;
-    Ok(u64::from_le_bytes(raw))
-}
-
-fn read_f32_vec_le(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<f32>> {
-    let byte_len = len.checked_mul(4).context("f32 vector length overflow")?;
-    let end = cursor
-        .checked_add(byte_len)
-        .context("f32 vector cursor overflow")?;
-    if end > bytes.len() {
-        bail!("unexpected end of expert pack while reading f32 vector");
-    }
-    #[cfg(target_endian = "little")]
-    {
-        let mut values = vec![0.0f32; len];
-        if byte_len > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes[*cursor..end].as_ptr(),
-                    values.as_mut_ptr().cast::<u8>(),
-                    byte_len,
-                );
-            }
-        }
-        *cursor = end;
-        return Ok(values);
-    }
-
-    #[cfg(not(target_endian = "little"))]
-    let values = bytes[*cursor..end]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
-    #[cfg(not(target_endian = "little"))]
-    {
-        *cursor = end;
-        Ok(values)
-    }
-}
-
-fn read_bf16_vec_le(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<f32>> {
-    let byte_len = len.checked_mul(2).context("bf16 vector length overflow")?;
-    let end = cursor
-        .checked_add(byte_len)
-        .context("bf16 vector cursor overflow")?;
-    if end > bytes.len() {
-        bail!("unexpected end of expert pack while reading bf16 vector");
-    }
-    let values = bytes[*cursor..end]
-        .chunks_exact(2)
-        .map(|chunk| {
-            let hi = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
-            f32::from_bits(hi << 16)
-        })
-        .collect();
-    *cursor = end;
-    Ok(values)
 }
 
 fn f32_to_bf16_bits(value: f32) -> u16 {
@@ -26434,36 +26133,6 @@ mod tests {
             err.to_string().contains("metadata offset mismatch"),
             "unexpected error: {err:?}"
         );
-    }
-
-    #[test]
-    fn read_f32_vec_le_bulk_path_decodes_values_and_advances_cursor() {
-        let mut bytes = vec![0xaa, 0xbb, 0xcc];
-        for value in [1.0f32, -2.5, f32::from_bits(0x7fc0_1234)] {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes.extend_from_slice(&[0xdd, 0xee]);
-
-        let mut cursor = 3;
-        let values = read_f32_vec_le(&bytes, &mut cursor, 3).unwrap();
-        assert_eq!(cursor, 15);
-        assert_eq!(values[0], 1.0);
-        assert_eq!(values[1], -2.5);
-        assert_eq!(values[2].to_bits(), 0x7fc0_1234);
-    }
-
-    #[test]
-    fn read_bf16_vec_le_decodes_values_and_advances_cursor() {
-        let mut bytes = vec![0xaa];
-        for value in [0.5f32, -2.0, 1.25] {
-            bytes.extend_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
-        }
-        bytes.push(0xbb);
-
-        let mut cursor = 1;
-        let values = read_bf16_vec_le(&bytes, &mut cursor, 3).unwrap();
-        assert_eq!(cursor, 7);
-        assert_eq!(values, vec![0.5, -2.0, 1.25]);
     }
 
     #[test]
