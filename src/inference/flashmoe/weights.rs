@@ -1350,6 +1350,7 @@ impl DenseMmapMatvecProjection {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn stride(&self) -> usize {
         self.cols
     }

@@ -252,9 +252,6 @@ impl FlashMoeCapabilityPlan {
                 kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
                 kernels::Q4_MMAP_FMA_MATVEC_BATCH,
                 kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-                kernels::RMS_NORM,
-                kernels::ROPE_APPLY,
-                kernels::ROPE_SPLIT_HALF_APPLY,
             ],
         )?;
         require_stage_kernels(

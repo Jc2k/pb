@@ -545,16 +545,8 @@ pub(crate) mod kernels {
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH: &str = "q4_mmap_fma_matvec_batch";
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS: &str =
         "q4_mmap_fma_matvec_batch_bf16_scale_bias";
-    pub(crate) const DENSE_MATVEC: &str = "dense_matvec";
-    pub(crate) const DENSE_MATVEC_BF16: &str = "dense_matvec_bf16";
-    pub(crate) const DENSE_MMAP_MATVEC_F32: &str = "dense_mmap_matvec_f32";
-    pub(crate) const DENSE_MMAP_MATVEC_BF16: &str = "dense_mmap_matvec_bf16";
-    pub(crate) const DENSE_MMAP_MATVEC_BF16_SIMD: &str = "dense_mmap_matvec_bf16_simd";
-    pub(crate) const RMS_NORM: &str = "rms_norm";
     pub(crate) const RMS_NORM_REDUCED: &str = "rms_norm_reduced";
     pub(crate) const RESIDUAL_ADD_RMS_NORM: &str = "residual_add_rms_norm";
-    pub(crate) const ROPE_APPLY: &str = "rope_apply";
-    pub(crate) const ROPE_SPLIT_HALF_APPLY: &str = "rope_split_half_apply";
     pub(crate) const ATTENTION_SCORES: &str = "attention_scores";
     pub(crate) const EXPERT_MLP_FUSED: &str = "expert_mlp_fused";
     pub(crate) const SILU_PRODUCT: &str = "silu_product";
@@ -616,16 +608,8 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-    kernels::DENSE_MATVEC,
-    kernels::DENSE_MATVEC_BF16,
-    kernels::DENSE_MMAP_MATVEC_F32,
-    kernels::DENSE_MMAP_MATVEC_BF16,
-    kernels::DENSE_MMAP_MATVEC_BF16_SIMD,
-    kernels::RMS_NORM,
     kernels::RMS_NORM_REDUCED,
     kernels::RESIDUAL_ADD_RMS_NORM,
-    kernels::ROPE_APPLY,
-    kernels::ROPE_SPLIT_HALF_APPLY,
     kernels::ATTENTION_SCORES,
     kernels::EXPERT_MLP_FUSED,
     kernels::SILU_PRODUCT,
@@ -651,16 +635,8 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4_mmap_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap_batch: &'static str,
     pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
-    pub(crate) dense_matvec: &'static str,
-    pub(crate) dense_matvec_bf16: &'static str,
-    pub(crate) dense_mmap_matvec: &'static str,
-    pub(crate) dense_mmap_matvec_bf16: &'static str,
-    pub(crate) dense_mmap_matvec_bf16_simd: &'static str,
-    pub(crate) rms_norm: &'static str,
     pub(crate) rms_norm_reduced: &'static str,
     pub(crate) residual_rms_norm: &'static str,
-    pub(crate) rope: &'static str,
-    pub(crate) rope_split_half: &'static str,
     pub(crate) attention: &'static str,
     pub(crate) expert_mlp: &'static str,
     pub(crate) silu_product: &'static str,
@@ -687,16 +663,8 @@ impl MetalPipelineNameSet {
             q4_mmap_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
             q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
             q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-            dense_matvec: kernels::DENSE_MATVEC,
-            dense_matvec_bf16: kernels::DENSE_MATVEC_BF16,
-            dense_mmap_matvec: kernels::DENSE_MMAP_MATVEC_F32,
-            dense_mmap_matvec_bf16: kernels::DENSE_MMAP_MATVEC_BF16,
-            dense_mmap_matvec_bf16_simd: kernels::DENSE_MMAP_MATVEC_BF16_SIMD,
-            rms_norm: kernels::RMS_NORM,
             rms_norm_reduced: kernels::RMS_NORM_REDUCED,
             residual_rms_norm: kernels::RESIDUAL_ADD_RMS_NORM,
-            rope: kernels::ROPE_APPLY,
-            rope_split_half: kernels::ROPE_SPLIT_HALF_APPLY,
             attention: kernels::ATTENTION_SCORES,
             expert_mlp: kernels::EXPERT_MLP_FUSED,
             silu_product: kernels::SILU_PRODUCT,
@@ -723,16 +691,8 @@ impl MetalPipelineNameSet {
             self.q4_mmap_bf16_scale_bias,
             self.q4_mmap_batch,
             self.q4_mmap_batch_bf16_scale_bias,
-            self.dense_matvec,
-            self.dense_matvec_bf16,
-            self.dense_mmap_matvec,
-            self.dense_mmap_matvec_bf16,
-            self.dense_mmap_matvec_bf16_simd,
-            self.rms_norm,
             self.rms_norm_reduced,
             self.residual_rms_norm,
-            self.rope,
-            self.rope_split_half,
             self.attention,
             self.expert_mlp,
             self.silu_product,
@@ -760,16 +720,8 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_mmap_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_batch_pipeline: T,
     pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
-    pub(crate) dense_matvec_pipeline: T,
-    pub(crate) dense_matvec_bf16_pipeline: T,
-    pub(crate) dense_mmap_matvec_pipeline: T,
-    pub(crate) dense_mmap_matvec_bf16_pipeline: T,
-    pub(crate) dense_mmap_matvec_bf16_simd_pipeline: T,
-    pub(crate) rms_norm_pipeline: T,
     pub(crate) rms_norm_reduced_pipeline: T,
     pub(crate) residual_rms_norm_pipeline: T,
-    pub(crate) rope_pipeline: T,
-    pub(crate) rope_split_half_pipeline: T,
     pub(crate) attention_pipeline: T,
     pub(crate) expert_mlp_pipeline: T,
     pub(crate) silu_product_pipeline: T,
@@ -795,16 +747,8 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.q4_mmap_bf16_scale_bias_pipeline);
         release(self.q4_mmap_batch_pipeline);
         release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
-        release(self.dense_matvec_pipeline);
-        release(self.dense_matvec_bf16_pipeline);
-        release(self.dense_mmap_matvec_pipeline);
-        release(self.dense_mmap_matvec_bf16_pipeline);
-        release(self.dense_mmap_matvec_bf16_simd_pipeline);
-        release(self.rms_norm_pipeline);
         release(self.rms_norm_reduced_pipeline);
         release(self.residual_rms_norm_pipeline);
-        release(self.rope_pipeline);
-        release(self.rope_split_half_pipeline);
         release(self.attention_pipeline);
         release(self.expert_mlp_pipeline);
         release(self.silu_product_pipeline);
@@ -915,18 +859,8 @@ impl MetalRuntime {
                 q4_mmap_batch_bf16_scale_bias_pipeline: take_pipeline(
                     names.q4_mmap_batch_bf16_scale_bias,
                 ),
-                dense_matvec_pipeline: take_pipeline(names.dense_matvec),
-                dense_matvec_bf16_pipeline: take_pipeline(names.dense_matvec_bf16),
-                dense_mmap_matvec_pipeline: take_pipeline(names.dense_mmap_matvec),
-                dense_mmap_matvec_bf16_pipeline: take_pipeline(names.dense_mmap_matvec_bf16),
-                dense_mmap_matvec_bf16_simd_pipeline: take_pipeline(
-                    names.dense_mmap_matvec_bf16_simd,
-                ),
-                rms_norm_pipeline: take_pipeline(names.rms_norm),
                 rms_norm_reduced_pipeline: take_pipeline(names.rms_norm_reduced),
                 residual_rms_norm_pipeline: take_pipeline(names.residual_rms_norm),
-                rope_pipeline: take_pipeline(names.rope),
-                rope_split_half_pipeline: take_pipeline(names.rope_split_half),
                 attention_pipeline: take_pipeline(names.attention),
                 expert_mlp_pipeline: take_pipeline(names.expert_mlp),
                 silu_product_pipeline: take_pipeline(names.silu_product),
@@ -5773,128 +5707,6 @@ kernel void q4_mmap_fma_matvec_batch_bf16_scale_bias(
     }
 }
 
-kernel void dense_matvec(
-    device const float* weights [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& cols [[buffer(3)]],
-    uint row [[thread_position_in_grid]]) {
-    float acc = 0.0f;
-    for (uint col = 0; col < cols; ++col) {
-        acc = fma(weights[row * cols + col], input[col], acc);
-    }
-    output[row] = acc;
-}
-
-kernel void dense_matvec_bf16(
-    device const ushort* weights [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& cols [[buffer(3)]],
-    uint row [[thread_position_in_grid]]) {
-    float acc = 0.0f;
-    uint row_offset = row * cols;
-    for (uint col = 0; col < cols; ++col) {
-        uint bits = uint(weights[row_offset + col]) << 16u;
-        float weight = as_type<float>(bits);
-        acc = fma(weight, input[col], acc);
-    }
-    output[row] = acc;
-}
-
-kernel void dense_mmap_matvec_f32(
-    device const uchar* weight_bytes [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant ulong& byte_offset [[buffer(3)]],
-    constant uint& rows [[buffer(4)]],
-    constant uint& cols [[buffer(5)]],
-    constant uint& stride [[buffer(6)]],
-    uint row [[thread_position_in_grid]]) {
-    if (row >= rows) { return; }
-    device const float* weights = reinterpret_cast<device const float*>(weight_bytes + byte_offset);
-    float acc = 0.0f;
-    uint row_offset = row * stride;
-    for (uint col = 0; col < cols; ++col) {
-        acc = fma(weights[row_offset + col], input[col], acc);
-    }
-    output[row] = acc;
-}
-
-kernel void dense_mmap_matvec_bf16(
-    device const uchar* weight_bytes [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant ulong& byte_offset [[buffer(3)]],
-    constant uint& rows [[buffer(4)]],
-    constant uint& cols [[buffer(5)]],
-    constant uint& stride [[buffer(6)]],
-    uint row [[thread_position_in_grid]]) {
-    if (row >= rows) { return; }
-    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + byte_offset);
-    float acc = 0.0f;
-    uint row_offset = row * stride;
-    for (uint col = 0; col < cols; ++col) {
-        uint bits = uint(weights[row_offset + col]) << 16u;
-        acc = fma(as_type<float>(bits), input[col], acc);
-    }
-    output[row] = acc;
-}
-
-kernel void dense_mmap_matvec_bf16_simd(
-    device const uchar* weight_bytes [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant ulong& byte_offset [[buffer(3)]],
-    constant uint& rows [[buffer(4)]],
-    constant uint& cols [[buffer(5)]],
-    constant uint& stride [[buffer(6)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    const uint rows_per_threadgroup = 8;
-    const uint input_cache_len = 4096;
-    uint row = tile * rows_per_threadgroup + simd_group;
-    bool use_input_cache = cols <= input_cache_len;
-    threadgroup float input_cache[4096];
-    if (use_input_cache) {
-        for (uint col = lid; col < cols; col += 256) {
-            input_cache[col] = input[col];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (row >= rows) { return; }
-
-    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + byte_offset);
-    uint row_offset = row * stride;
-    float acc = 0.0f;
-    for (uint col = simd_lane; col < cols; col += 32) {
-        uint bits = uint(weights[row_offset + col]) << 16u;
-        float x = use_input_cache ? input_cache[col] : input[col];
-        acc = fma(as_type<float>(bits), x, acc);
-    }
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        output[row] = sum;
-    }
-}
-
-kernel void rms_norm(
-    device const float* input [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& width [[buffer(3)]],
-    uint idx [[thread_position_in_grid]]) {
-    if (idx >= width) { return; }
-    float sum = 0.0f;
-    for (uint i = 0; i < width; ++i) {
-        sum = fma(input[i], input[i], sum);
-    }
-    float scale = rsqrt(sum / float(max(width, 1u)) + 1.0e-6f);
-    output[idx] = input[idx] * scale * weight[idx];
-}
-
 kernel void rms_norm_reduced(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -5954,67 +5766,6 @@ kernel void residual_add_rms_norm(
         hidden[i] = value;
         normed[i] = value * scale * weight[i];
     }
-}
-
-kernel void rope_apply(
-    device float* values [[buffer(0)]],
-    constant uint& position [[buffer(1)]],
-    constant uint& head_dim [[buffer(2)]],
-    constant float& theta [[buffer(3)]],
-    uint idx [[thread_position_in_grid]]) {
-    uint pair = idx * 2u;
-    uint lane = pair % head_dim;
-    float inv_freq = pow(theta, -float(lane) / float(max(head_dim, 1u)));
-    float angle = float(position) * inv_freq;
-    float s = sin(angle);
-    float c = cos(angle);
-    float x = values[pair];
-    float y = values[pair + 1u];
-    values[pair] = x * c - y * s;
-    values[pair + 1u] = x * s + y * c;
-}
-
-kernel void rope_split_half_apply(
-    device float* values [[buffer(0)]],
-    constant uint& temporal_position [[buffer(1)]],
-    constant uint& height_position [[buffer(2)]],
-    constant uint& width_position [[buffer(3)]],
-    constant uint& head_dim [[buffer(4)]],
-    constant uint& rotary_dim [[buffer(5)]],
-    constant float& theta [[buffer(6)]],
-    constant uint& use_mrope [[buffer(7)]],
-    device const uint* mrope_section [[buffer(8)]],
-    uint idx [[thread_position_in_grid]]) {
-    uint safe_head_dim = max(head_dim, 1u);
-    uint safe_rotary = min(rotary_dim, safe_head_dim);
-    safe_rotary -= safe_rotary % 2u;
-    uint rotary_half = max(safe_rotary / 2u, 1u);
-    uint head = idx / rotary_half;
-    uint i = idx % rotary_half;
-    if (i >= rotary_half) { return; }
-
-    uint position = temporal_position;
-    if (use_mrope != 0u) {
-        uint height = mrope_section[1];
-        uint width = mrope_section[2];
-        if ((i % 3u) == 1u && i < height * 3u) {
-            position = height_position;
-        } else if ((i % 3u) == 2u && i < width * 3u) {
-            position = width_position;
-        }
-    }
-
-    float inv_freq = pow(max(theta, 1.0f), -float(2u * i) / float(max(safe_rotary, 1u)));
-    float angle = float(position) * inv_freq;
-    float s = sin(angle);
-    float c = cos(angle);
-    uint base = head * safe_head_dim;
-    uint lo = base + i;
-    uint hi = base + i + rotary_half;
-    float x0 = values[lo];
-    float x1 = values[hi];
-    values[lo] = x0 * c - x1 * s;
-    values[hi] = x0 * s + x1 * c;
 }
 
 kernel void attention_scores(
@@ -6525,12 +6276,6 @@ pub(crate) fn resolve_metal_command_wait(
     MetalCommandWaitResult::Pending
 }
 
-pub(crate) fn metal_command_failure_requires_release(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<MetalCommandBufferFailure>()
-        .is_some_and(MetalCommandBufferFailure::should_release_buffers)
-}
-
 pub(crate) fn format_metal_command_failure(
     kind: MetalCommandFailureKind,
     context: &MetalCommandContext,
@@ -6638,10 +6383,7 @@ mod tests {
             MetalCommandStatus::Error,
             None,
         );
-        let anyhow_error = anyhow::Error::from(error.clone());
-
         assert!(error.should_release_buffers());
-        assert!(metal_command_failure_requires_release(&anyhow_error));
         assert!(error.to_string().contains("none reported"));
     }
 
@@ -6747,7 +6489,7 @@ mod tests {
         let pipelines = test_pipeline_set();
         let mut released = Vec::new();
         pipelines.release_with(|pipeline| released.push(pipeline));
-        assert_eq!(released, (1..=31).collect::<Vec<_>>());
+        assert_eq!(released, (1..=23).collect::<Vec<_>>());
     }
 
     fn test_pipeline_set() -> MetalPipelineSet<i32> {
@@ -6760,29 +6502,21 @@ mod tests {
             q4_mmap_bf16_scale_bias_pipeline: 6,
             q4_mmap_batch_pipeline: 7,
             q4_mmap_batch_bf16_scale_bias_pipeline: 8,
-            dense_matvec_pipeline: 9,
-            dense_matvec_bf16_pipeline: 10,
-            dense_mmap_matvec_pipeline: 11,
-            dense_mmap_matvec_bf16_pipeline: 12,
-            dense_mmap_matvec_bf16_simd_pipeline: 13,
-            rms_norm_pipeline: 14,
-            rms_norm_reduced_pipeline: 15,
-            residual_rms_norm_pipeline: 16,
-            rope_pipeline: 17,
-            rope_split_half_pipeline: 18,
-            attention_pipeline: 19,
-            expert_mlp_pipeline: 20,
-            silu_product_pipeline: 21,
-            shared_expert_activation_pipeline: 22,
-            combine_expert_phase_pipeline: 23,
-            fill_zero_pipeline: 24,
-            lm_head_pipeline: 25,
-            topk_vocab_pipeline: 26,
-            linear_conv1d_pipeline: 27,
-            linear_rms_norm_qk_pipeline: 28,
-            linear_decay_beta_pipeline: 29,
-            linear_delta_step_pipeline: 30,
-            linear_gated_rms_norm_pipeline: 31,
+            rms_norm_reduced_pipeline: 9,
+            residual_rms_norm_pipeline: 10,
+            attention_pipeline: 11,
+            expert_mlp_pipeline: 12,
+            silu_product_pipeline: 13,
+            shared_expert_activation_pipeline: 14,
+            combine_expert_phase_pipeline: 15,
+            fill_zero_pipeline: 16,
+            lm_head_pipeline: 17,
+            topk_vocab_pipeline: 18,
+            linear_conv1d_pipeline: 19,
+            linear_rms_norm_qk_pipeline: 20,
+            linear_decay_beta_pipeline: 21,
+            linear_delta_step_pipeline: 22,
+            linear_gated_rms_norm_pipeline: 23,
         }
     }
 

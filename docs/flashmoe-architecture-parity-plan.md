@@ -204,6 +204,11 @@ Baseline reviewed on 2026-07-10:
   attention stage without a matching scheduled executor is a named unsupported capability. The
   dormant Metal KV cache allocation, runtime branches, four pipelines, shaders, and legacy
   encoders have been deleted, so CPU placement cannot silently switch to an undeclared GPU path.
+- Qwen3.5 full-attention Q/K normalization and rotary preprocessing now match that declared CPU
+  placement directly. The dead optional Metal RoPE/RMS probes, unary dispatcher, shaders,
+  pipelines, and false CMD1 kernel requirements have been removed. The same ownership cleanup
+  deleted F32/BF16 dense Metal matvec, mmap, batch, and router-topK encoders; the resolved graph
+  requires resident Q4 projections and reports non-Q4 dense or router layouts as unsupported.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
