@@ -132,13 +132,16 @@ use super::state::{
     take_reusable_session_cache_entry,
 };
 use super::types::*;
+#[cfg(test)]
+use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
-    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, ScheduledNextNormWeights,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    validate_dense_matvec_shape,
+    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
+    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    apply_qwen3next_norm_offset_if_needed, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -9950,13 +9953,11 @@ impl FlashMoeEngine {
         let Some(mut weight) = self.dense.norm_weight(canonical_name, width)? else {
             return Ok(None);
         };
-        if self.uses_qwen3next_offset_norm(canonical_name)
-            && qwen3next_norm_weight_needs_offset(&weight)
-        {
-            for value in &mut weight {
-                *value += 1.0;
-            }
-        }
+        apply_qwen3next_norm_offset_if_needed(
+            self.config.uses_qwen3next_norm_offsets(),
+            canonical_name,
+            &mut weight,
+        );
         Ok(Some(weight))
     }
 
@@ -9968,7 +9969,7 @@ impl FlashMoeEngine {
     }
 
     fn uses_qwen3next_offset_norm(&self, canonical_name: &str) -> bool {
-        qwen3next_norm_uses_offset(&self.config, canonical_name)
+        qwen3next_norm_uses_offset(self.config.uses_qwen3next_norm_offsets(), canonical_name)
     }
 
     fn sample_next_token(
@@ -10730,24 +10731,14 @@ impl FlashMoeEngine {
             {
                 token_state.mix_active_expert(expert.mix_hash(), weight);
             }
-            let next_norm_name = (deepstack.is_none() && layer + 1 < self.config.num_hidden_layers)
-                .then(|| layer_norm_tensor_name(layer + 1, "input_layernorm"));
-            let next_norm_weight = if let Some(name) = next_norm_name.as_deref() {
-                Some(self.model_norm_weight(name, runtime.width)?.with_context(|| {
-                    format!(
-                        "FlashMoe unsupported scheduled CMD3 path: missing next-layer norm weight {name} for layer {layer}"
-                    )
-                })?)
-            } else {
-                None
-            };
-            let next_norm_weights = if let (Some(name), Some(weight)) =
-                (next_norm_name.as_deref(), next_norm_weight.as_deref())
-            {
-                ScheduledNextNormWeights::cpu_visible(name, weight, runtime.width)?
-            } else {
-                ScheduledNextNormWeights::none()
-            };
+            let prepared_next_norm_weights = prepare_scheduled_next_norm_weights(
+                layer,
+                self.config.num_hidden_layers,
+                runtime.width,
+                deepstack.is_none(),
+                |name, width| self.model_norm_weight(name, width),
+            )?;
+            let next_norm_weights = prepared_next_norm_weights.scheduled()?;
             let shared_descriptor = shared_phase.scheduled_shared_expert_descriptor()?;
             let scheduled_cmd3 = self
                 .scheduled_graph
@@ -12592,30 +12583,6 @@ fn split_q_projection(
 #[cfg_attr(not(test), allow(dead_code))]
 fn rms_norm_in_place(values: &mut [f32]) {
     rms_norm_with_weight_in_place(values, None)
-}
-
-fn qwen3next_norm_uses_offset(config: &QwenModelConfig, canonical_name: &str) -> bool {
-    config.uses_qwen3next_norm_offsets()
-        && (canonical_name == "model.norm.weight"
-            || canonical_name.contains(".input_layernorm.weight")
-            || canonical_name.contains(".post_attention_layernorm.weight")
-            || canonical_name.contains(".self_attn.q_norm.weight")
-            || canonical_name.contains(".self_attn.k_norm.weight"))
-}
-
-fn qwen3next_norm_weight_needs_offset(weight: &[f32]) -> bool {
-    if weight.is_empty() {
-        return false;
-    }
-
-    let mut sum = 0.0f32;
-    let mut has_negative = false;
-    for value in weight {
-        sum += *value;
-        has_negative |= *value < 0.0;
-    }
-
-    has_negative || sum / (weight.len() as f32) < 0.75
 }
 
 fn l2_norm_in_place(values: &mut [f32]) {
@@ -15460,10 +15427,6 @@ fn is_full_attention_layer(layer: usize) -> bool {
 
 fn router_tensor_name(layer: usize) -> String {
     format!("model.layers.{layer}.mlp.gate.weight")
-}
-
-fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
-    format!("model.layers.{layer}.{name}.weight")
 }
 
 fn shared_expert_tensor_name(layer: usize, projection: &str) -> String {
@@ -25311,7 +25274,7 @@ mod tests {
             "model.layers.3.self_attn.k_norm.weight",
         ] {
             assert!(
-                qwen3next_norm_uses_offset(&qwen35, name),
+                qwen3next_norm_uses_offset(qwen35.uses_qwen3next_norm_offsets(), name),
                 "{name} should use Qwen3Next 1+weight RMSNorm semantics"
             );
         }
@@ -25321,13 +25284,13 @@ mod tests {
             "model.layers.0.mlp.shared_expert_gate.weight",
         ] {
             assert!(
-                !qwen3next_norm_uses_offset(&qwen35, name),
+                !qwen3next_norm_uses_offset(qwen35.uses_qwen3next_norm_offsets(), name),
                 "{name} is not a plain Qwen3NextRMSNorm weight"
             );
         }
 
         assert!(!qwen3next_norm_uses_offset(
-            &legacy_qwen3,
+            legacy_qwen3.uses_qwen3next_norm_offsets(),
             "model.norm.weight"
         ));
     }

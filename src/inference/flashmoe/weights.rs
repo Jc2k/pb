@@ -580,6 +580,107 @@ impl<'a> ScheduledNextNormWeights<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreparedScheduledNextNormWeights {
+    tensor_name: Option<String>,
+    values: Option<Vec<f32>>,
+    width: usize,
+}
+
+impl PreparedScheduledNextNormWeights {
+    pub(crate) fn none() -> Self {
+        Self {
+            tensor_name: None,
+            values: None,
+            width: 0,
+        }
+    }
+
+    pub(crate) fn cpu_visible(tensor_name: String, values: Vec<f32>, width: usize) -> Result<Self> {
+        CpuVisibleNextNormWeights::new(&tensor_name, &values, width)?;
+        Ok(Self {
+            tensor_name: Some(tensor_name),
+            values: Some(values),
+            width,
+        })
+    }
+
+    pub(crate) fn scheduled(&self) -> Result<ScheduledNextNormWeights<'_>> {
+        match (self.tensor_name.as_deref(), self.values.as_deref()) {
+            (Some(tensor_name), Some(values)) => {
+                ScheduledNextNormWeights::cpu_visible(tensor_name, values, self.width)
+            }
+            (None, None) => Ok(ScheduledNextNormWeights::none()),
+            _ => bail!("FlashMoe scheduled next-norm weights have incomplete descriptor state"),
+        }
+    }
+}
+
+pub(crate) fn layer_norm_tensor_name(layer: usize, name: &str) -> String {
+    format!("model.layers.{layer}.{name}.weight")
+}
+
+pub(crate) fn prepare_scheduled_next_norm_weights<F>(
+    layer: usize,
+    total_layers: usize,
+    width: usize,
+    needs_next_layer_norm: bool,
+    mut lookup: F,
+) -> Result<PreparedScheduledNextNormWeights>
+where
+    F: FnMut(&str, usize) -> Result<Option<Vec<f32>>>,
+{
+    if !needs_next_layer_norm || layer + 1 >= total_layers {
+        return Ok(PreparedScheduledNextNormWeights::none());
+    }
+
+    let name = layer_norm_tensor_name(layer + 1, "input_layernorm");
+    let values = lookup(&name, width)?.with_context(|| {
+        format!(
+            "FlashMoe unsupported scheduled CMD3 path: missing next-layer norm weight {name} for layer {layer}"
+        )
+    })?;
+    PreparedScheduledNextNormWeights::cpu_visible(name, values, width)
+}
+
+pub(crate) fn qwen3next_norm_uses_offset(norm_offsets_enabled: bool, canonical_name: &str) -> bool {
+    norm_offsets_enabled
+        && (canonical_name == "model.norm.weight"
+            || canonical_name.contains(".input_layernorm.weight")
+            || canonical_name.contains(".post_attention_layernorm.weight")
+            || canonical_name.contains(".self_attn.q_norm.weight")
+            || canonical_name.contains(".self_attn.k_norm.weight"))
+}
+
+pub(crate) fn qwen3next_norm_weight_needs_offset(weight: &[f32]) -> bool {
+    if weight.is_empty() {
+        return false;
+    }
+
+    let mut sum = 0.0f32;
+    let mut has_negative = false;
+    for value in weight {
+        sum += *value;
+        has_negative |= *value < 0.0;
+    }
+
+    has_negative || sum / (weight.len() as f32) < 0.75
+}
+
+pub(crate) fn apply_qwen3next_norm_offset_if_needed(
+    norm_offsets_enabled: bool,
+    canonical_name: &str,
+    weight: &mut [f32],
+) {
+    if qwen3next_norm_uses_offset(norm_offsets_enabled, canonical_name)
+        && qwen3next_norm_weight_needs_offset(weight)
+    {
+        for value in weight {
+            *value += 1.0;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentStaticTensorRef {
     pub(crate) tensor_name: String,
@@ -1385,6 +1486,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(short_err.to_string().contains("smaller than width 3"));
+    }
+
+    #[test]
+    fn prepared_next_norm_weights_resolve_declared_cmd3_descriptor() {
+        let prepared = PreparedScheduledNextNormWeights::cpu_visible(
+            "model.layers.1.input_layernorm.weight".to_string(),
+            vec![1.0, 0.5, 0.25, 0.125],
+            3,
+        )
+        .unwrap();
+        let scheduled = prepared.scheduled().unwrap();
+
+        assert!(scheduled.is_cpu_visible());
+        assert_eq!(scheduled.width(), Some(3));
+        assert_eq!(scheduled.values().unwrap(), &[1.0, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn prepare_next_norm_weights_declares_only_non_terminal_cmd3_layers() {
+        let prepared = prepare_scheduled_next_norm_weights(0, 2, 4, true, |name, width| {
+            assert_eq!(name, "model.layers.1.input_layernorm.weight");
+            assert_eq!(width, 4);
+            Ok(Some(vec![1.0, 1.1, 1.2, 1.3]))
+        })
+        .unwrap();
+        assert!(prepared.scheduled().unwrap().is_cpu_visible());
+
+        let terminal = prepare_scheduled_next_norm_weights(1, 2, 4, true, |_, _| {
+            panic!("terminal layer must not request next-layer norm weights")
+        })
+        .unwrap();
+        assert!(terminal.scheduled().unwrap().is_none());
+
+        let disabled = prepare_scheduled_next_norm_weights(0, 2, 4, false, |_, _| {
+            panic!("disabled next-layer norm must not request weights")
+        })
+        .unwrap();
+        assert!(disabled.scheduled().unwrap().is_none());
+    }
+
+    #[test]
+    fn prepare_next_norm_weights_reports_missing_scheduled_cmd3_weight() {
+        let err = prepare_scheduled_next_norm_weights(2, 4, 8, true, |_, _| Ok(None)).unwrap_err();
+
+        assert!(err.to_string().contains(
+            "missing next-layer norm weight model.layers.3.input_layernorm.weight for layer 2"
+        ));
+    }
+
+    #[test]
+    fn qwen3next_plain_rms_norm_offset_policy_matches_reference_names() {
+        for name in [
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.3.self_attn.q_norm.weight",
+            "model.layers.3.self_attn.k_norm.weight",
+        ] {
+            assert!(
+                qwen3next_norm_uses_offset(true, name),
+                "{name} should use Qwen3Next 1+weight RMSNorm semantics"
+            );
+        }
+
+        for name in [
+            "model.layers.0.linear_attn.norm.weight",
+            "model.layers.0.mlp.shared_expert_gate.weight",
+        ] {
+            assert!(
+                !qwen3next_norm_uses_offset(true, name),
+                "{name} is not a plain Qwen3NextRMSNorm weight"
+            );
+        }
+
+        assert!(!qwen3next_norm_uses_offset(false, "model.norm.weight"));
+    }
+
+    #[test]
+    fn qwen3next_norm_offset_is_applied_only_to_offset_style_weights() {
+        assert!(qwen3next_norm_weight_needs_offset(&[
+            -0.0498, -0.0654, -0.0209, 0.0547
+        ]));
+        assert!(qwen3next_norm_weight_needs_offset(&[
+            0.6679, 0.7187, 0.7265, 0.7031
+        ]));
+        assert!(!qwen3next_norm_weight_needs_offset(&[
+            0.9492, 0.9335, 0.9804, 0.9609
+        ]));
+        assert!(!qwen3next_norm_weight_needs_offset(&[
+            1.6718, 1.7187, 1.7265, 1.7031
+        ]));
+
+        let mut offset = vec![0.6679, 0.7187, 0.7265, 0.7031];
+        apply_qwen3next_norm_offset_if_needed(
+            true,
+            "model.layers.0.input_layernorm.weight",
+            &mut offset,
+        );
+        for (actual, expected) in offset.iter().zip([1.6679, 1.7187, 1.7265, 1.7031]) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+
+        let mut disabled = vec![0.6679, 0.7187, 0.7265, 0.7031];
+        apply_qwen3next_norm_offset_if_needed(false, "model.norm.weight", &mut disabled);
+        assert_eq!(disabled, vec![0.6679, 0.7187, 0.7265, 0.7031]);
     }
 
     #[test]
