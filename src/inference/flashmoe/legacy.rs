@@ -104,11 +104,12 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3ActiveExpertWorkBuffers, MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan,
-    MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource,
-    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
-    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
+    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3OutputBuffers,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers,
+    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
+    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
+    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
     MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
     MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
     MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
@@ -4863,9 +4864,9 @@ impl MetalExecutorInner {
                 MetalPhaseBuffer::recyclable(normed_buffer),
                 MetalPhaseBuffer::recyclable(residual_buffer),
             ];
-            let weights_buffer = self.buffer_with_bytes(f32_as_bytes(weights))?;
-            buffers.push(MetalPhaseBuffer::recyclable(weights_buffer));
             let output_buffers = self.cmd3_output_buffers(&command_plan, &mut buffers)?;
+            let combine_buffers =
+                self.cmd3_combine_buffers(command_plan.combine, weights, &mut buffers)?;
 
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
@@ -4879,9 +4880,6 @@ impl MetalExecutorInner {
                 bail!("failed to create Flash-MoE deferred expert compute encoder");
             }
 
-            let width_u32 = output_buffers.layout.width_u32;
-            let width_buffer = self.buffer_with_bytes(u32_as_bytes(&width_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
             let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
 
             if let (Some(shared), MetalCmd3SharedPhaseSource::ResidentQ4) =
@@ -4940,7 +4938,7 @@ impl MetalExecutorInner {
                     shared_metal.gate,
                     normed_buffer,
                     shared_work.gate_out,
-                    width_buffer,
+                    combine_buffers.width,
                     shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
@@ -4948,7 +4946,7 @@ impl MetalExecutorInner {
                     shared_metal.up,
                     normed_buffer,
                     shared_work.up_out,
-                    width_buffer,
+                    combine_buffers.width,
                     shared_plan.projection_rows(),
                 );
                 self.encode_dense_matvec(
@@ -4956,7 +4954,7 @@ impl MetalExecutorInner {
                     shared_metal.router,
                     normed_buffer,
                     shared_work.router_out,
-                    width_buffer,
+                    combine_buffers.width,
                     shared_plan.router_rows(),
                 );
                 msg_send_void1_id(
@@ -4985,7 +4983,7 @@ impl MetalExecutorInner {
                 self.encode_fill_zero(
                     encoder,
                     output_buffers.shared_output,
-                    width_buffer,
+                    combine_buffers.width,
                     shared_plan.fill_zero_width(),
                 );
             }
@@ -5060,9 +5058,6 @@ impl MetalExecutorInner {
             }
 
             let combine_plan = command_plan.combine;
-            let active_u32 = output_buffers.layout.active_count_u32;
-            let active_buffer = self.buffer_with_bytes(u32_as_bytes(&active_u32))?;
-            buffers.push(MetalPhaseBuffer::recyclable(active_buffer));
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
@@ -5071,10 +5066,10 @@ impl MetalExecutorInner {
             set_buffer(encoder, residual_buffer, 0);
             set_buffer(encoder, output_buffers.shared_output, 1);
             set_buffer(encoder, output_buffers.expert_outputs, 2);
-            set_buffer(encoder, weights_buffer, 3);
+            set_buffer(encoder, combine_buffers.routing_weights, 3);
             set_buffer(encoder, output_buffers.hidden, 4);
-            set_buffer(encoder, width_buffer, 5);
-            set_buffer(encoder, active_buffer, 6);
+            set_buffer(encoder, combine_buffers.width, 5);
+            set_buffer(encoder, combine_buffers.active_count, 6);
             dispatch_threads(encoder, combine_plan.dispatch_threads);
 
             if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
@@ -5091,7 +5086,7 @@ impl MetalExecutorInner {
                 set_buffer(encoder, output_buffers.hidden, 0);
                 set_buffer(encoder, norm_weight_buffer, 1);
                 set_buffer(encoder, next_normed_buffer, 2);
-                set_buffer(encoder, width_buffer, 3);
+                set_buffer(encoder, combine_buffers.width, 3);
                 dispatch_single_threadgroup(encoder, next_norm_plan.dispatch_threads);
             }
 
@@ -8274,6 +8269,32 @@ impl MetalExecutorInner {
                 None
             };
             MetalCmd3OutputBuffers::new(plan, expert_outputs, shared_output, hidden, next_normed)
+        }
+    }
+
+    unsafe fn cmd3_combine_buffers(
+        &self,
+        plan: MetalCmd3CombinePlan,
+        routing_weights: &[f32],
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<MetalCmd3CombineBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let routing_weight_bytes = f32_as_bytes(routing_weights);
+            if routing_weight_bytes.len() != layout.routing_weights_bytes {
+                bail!(
+                    "FlashMoe Metal CMD3 combine routing weights byte length {} does not match declared layout {}",
+                    routing_weight_bytes.len(),
+                    layout.routing_weights_bytes
+                );
+            }
+            let routing_weights = self.buffer_with_bytes(routing_weight_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(routing_weights));
+            let width = self.buffer_with_bytes(u32_as_bytes(&layout.width_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(width));
+            let active_count = self.buffer_with_bytes(u32_as_bytes(&layout.active_count_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(active_count));
+            MetalCmd3CombineBuffers::new(plan, routing_weights, width, active_count)
         }
     }
 

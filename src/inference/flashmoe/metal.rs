@@ -1077,6 +1077,40 @@ pub(crate) struct MetalCmd3CombinePlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3CombineBufferLayout {
+    pub(crate) width_u32: u32,
+    pub(crate) active_count_u32: u32,
+    pub(crate) routing_weights_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3CombineBuffers {
+    pub(crate) routing_weights: MetalObjcId,
+    pub(crate) width: MetalObjcId,
+    pub(crate) active_count: MetalObjcId,
+    pub(crate) layout: MetalCmd3CombineBufferLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3CombineBuffers {
+    pub(crate) fn new(
+        plan: MetalCmd3CombinePlan,
+        routing_weights: MetalObjcId,
+        width: MetalObjcId,
+        active_count: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            routing_weights,
+            width,
+            active_count,
+            layout: plan.buffer_layout()?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3CombinePlan {
     pub(crate) fn new(phase: MetalCmd3PhasePlan) -> Self {
         Self {
@@ -1088,6 +1122,22 @@ impl MetalCmd3CombinePlan {
 
     pub(crate) fn active_count_u32(self) -> u32 {
         self.active_count as u32
+    }
+
+    pub(crate) fn routing_weights_bytes(self) -> anyhow::Result<usize> {
+        self.active_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("FlashMoe Metal CMD3 combine routing weights byte size overflow")
+            })
+    }
+
+    pub(crate) fn buffer_layout(self) -> anyhow::Result<MetalCmd3CombineBufferLayout> {
+        Ok(MetalCmd3CombineBufferLayout {
+            width_u32: self.width as u32,
+            active_count_u32: self.active_count_u32(),
+            routing_weights_bytes: self.routing_weights_bytes()?,
+        })
     }
 }
 
@@ -3814,6 +3864,7 @@ mod tests {
         assert_eq!(combine.active_count, 4);
         assert_eq!(combine.active_count_u32(), 4);
         assert_eq!(combine.dispatch_threads, 16);
+        assert_eq!(combine.routing_weights_bytes().unwrap(), 4 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3844,6 +3895,29 @@ mod tests {
             width_err.to_string().contains("does not fit Metal u32"),
             "{width_err:#}"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_combine_buffers_carry_declared_bindings() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
+        let plan = MetalCmd3CombinePlan::new(phase);
+
+        let buffers = MetalCmd3CombineBuffers::new(
+            plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        assert_eq!(buffers.routing_weights, 0x1000usize as MetalObjcId);
+        assert_eq!(buffers.width, 0x2000usize as MetalObjcId);
+        assert_eq!(buffers.active_count, 0x3000usize as MetalObjcId);
+        assert_eq!(buffers.layout.width_u32, 4);
+        assert_eq!(buffers.layout.active_count_u32, 2);
+        assert_eq!(buffers.layout.routing_weights_bytes, 2 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
