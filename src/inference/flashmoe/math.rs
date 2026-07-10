@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::types::GROUP_SIZE;
 
@@ -143,9 +143,209 @@ pub fn q4_dequantize_rows_with_group_size(
     Ok(out)
 }
 
+pub(crate) struct QuantizedQ4 {
+    pub(crate) values: Vec<u8>,
+    pub(crate) scales: Vec<f32>,
+    pub(crate) biases: Vec<f32>,
+}
+
+struct QuantizedQ4Group {
+    codes: Vec<u8>,
+    scale: f32,
+    bias: f32,
+    error: f32,
+}
+
+pub(crate) fn quantize_q4(
+    values: &[f32],
+    shape: &[usize],
+    group_size: usize,
+) -> Result<QuantizedQ4> {
+    if group_size == 0 {
+        bail!("group_size must be positive");
+    }
+    let cols = shape.last().copied().unwrap_or(values.len());
+    if cols == 0 {
+        bail!("cannot quantize q4 tensor with zero columns");
+    }
+    let rows = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product::<usize>().max(1)
+    } else {
+        1
+    };
+    let expected = rows
+        .checked_mul(cols)
+        .context("q4 tensor element count overflow")?;
+    if expected != values.len() {
+        bail!(
+            "q4 tensor shape {:?} describes {expected} values but decoded tensor has {}",
+            shape,
+            values.len()
+        );
+    }
+    let row_stride = cols.div_ceil(2);
+    let mut packed_values = Vec::with_capacity(rows * row_stride);
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+
+    for row in values.chunks_exact(cols) {
+        let mut pending_low: Option<u8> = None;
+        let row_start_len = packed_values.len();
+        for group in row.chunks(group_size) {
+            let quantized = quantize_q4_group_affine_mse(group);
+            scales.push(quantized.scale);
+            biases.push(quantized.bias);
+            for q in quantized.codes {
+                if let Some(low) = pending_low.take() {
+                    packed_values.push(low | (q << 4));
+                } else {
+                    pending_low = Some(q);
+                }
+            }
+        }
+        if let Some(low) = pending_low {
+            packed_values.push(low);
+        }
+        while packed_values.len() - row_start_len < row_stride {
+            packed_values.push(0);
+        }
+    }
+    Ok(QuantizedQ4 {
+        values: packed_values,
+        scales,
+        biases,
+    })
+}
+
+fn quantize_q4_group_affine_mse(group: &[f32]) -> QuantizedQ4Group {
+    if group.is_empty() {
+        return QuantizedQ4Group {
+            codes: Vec::new(),
+            scale: 1.0,
+            bias: 0.0,
+            error: 0.0,
+        };
+    }
+
+    let finite: Vec<f32> = group
+        .iter()
+        .map(|value| if value.is_finite() { *value } else { 0.0 })
+        .collect();
+    let min = finite.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    quantize_q4_group_from_range(&finite, min, max)
+}
+
+fn quantize_q4_group_from_range(values: &[f32], min: f32, max: f32) -> QuantizedQ4Group {
+    let range = (max - min).abs();
+    if !range.is_finite() || range <= f32::EPSILON {
+        let bias = if min.is_finite() { min } else { 0.0 };
+        let codes = vec![0; values.len()];
+        let error = values
+            .iter()
+            .map(|value| {
+                let delta = *value - bias;
+                delta * delta
+            })
+            .sum();
+        return QuantizedQ4Group {
+            codes,
+            scale: 1.0,
+            bias,
+            error,
+        };
+    }
+
+    let mut scale = range / 15.0;
+    let mut bias = min;
+    let mut codes = quantize_q4_codes(values, scale, bias);
+    let mut best = quantized_q4_group(values, scale, bias, codes.clone());
+
+    for _ in 0..4 {
+        if let Some((fit_scale, fit_bias)) = fit_q4_affine(values, &codes) {
+            scale = fit_scale;
+            bias = fit_bias;
+        }
+        codes = quantize_q4_codes(values, scale, bias);
+        let candidate = quantized_q4_group(values, scale, bias, codes.clone());
+        if candidate.error < best.error {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn quantize_q4_codes(values: &[f32], scale: f32, bias: f32) -> Vec<u8> {
+    let scale = if scale.is_finite() && scale.abs() > f32::EPSILON {
+        scale
+    } else {
+        1.0
+    };
+    values
+        .iter()
+        .map(|value| ((*value - bias) / scale).round().clamp(0.0, 15.0) as u8)
+        .collect()
+}
+
+fn fit_q4_affine(values: &[f32], codes: &[u8]) -> Option<(f32, f32)> {
+    if values.len() != codes.len() || values.is_empty() {
+        return None;
+    }
+    let n = values.len() as f32;
+    let mut sum_q = 0.0f32;
+    let mut sum_x = 0.0f32;
+    let mut sum_qq = 0.0f32;
+    let mut sum_qx = 0.0f32;
+    for (value, code) in values.iter().zip(codes) {
+        let q = *code as f32;
+        sum_q += q;
+        sum_x += *value;
+        sum_qq += q * q;
+        sum_qx += q * *value;
+    }
+    let denom = n.mul_add(sum_qq, -(sum_q * sum_q));
+    if !denom.is_finite() || denom.abs() <= f32::EPSILON {
+        return None;
+    }
+    let scale = (n.mul_add(sum_qx, -(sum_q * sum_x))) / denom;
+    let bias = (sum_x - scale * sum_q) / n;
+    if scale.is_finite() && scale > f32::EPSILON && bias.is_finite() {
+        Some((scale, bias))
+    } else {
+        None
+    }
+}
+
+fn quantized_q4_group(values: &[f32], scale: f32, bias: f32, codes: Vec<u8>) -> QuantizedQ4Group {
+    let error = values
+        .iter()
+        .zip(&codes)
+        .map(|(value, code)| {
+            let decoded = (*code as f32).mul_add(scale, bias);
+            let delta = *value - decoded;
+            delta * delta
+        })
+        .sum();
+    QuantizedQ4Group {
+        codes,
+        scale,
+        bias,
+        error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantize_q4_packs_nibbles_and_group_metadata() {
+        let packed = quantize_q4(&[0.0, 15.0, 30.0], &[1, 3], 2).unwrap();
+
+        assert_eq!(packed.values.len(), 2);
+        assert_eq!(packed.scales.len(), 2);
+        assert_eq!(packed.biases.len(), 2);
+    }
 
     #[test]
     fn q4_dequantize_rows_supports_variable_groups_and_odd_widths() {

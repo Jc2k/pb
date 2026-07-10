@@ -116,6 +116,9 @@ The validator should reject silent fallbacks such as:
 - `model_family.rs` now contains useful parity metadata: Qwen family detection, layer schedule,
   configured K versus scheduled K, shared expert dimensions, Qwen-VL metadata, Qwen3.5 Q4 expert
   offsets, and an `UPSTREAM_PARITY` execution policy.
+- `math.rs` now owns Q4 quantization and Q4 dequant/matvec math used by both dense cache packing
+  and expert pack import/build compatibility. This removes one more math primitive from the legacy
+  runtime while preserving the same byte layout and affine-MSE group metadata.
 - `experts.rs` now owns fixed-slot metadata, the fixed-slot packed-record test fixture, the runtime
   `ExpertSlotStore`, layer reader opening, positioned reads, reusable whole-expert buffers, raw
   expert payload responses, and the expert read worker pool. Production store opening resolves
