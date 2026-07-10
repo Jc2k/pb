@@ -102,8 +102,8 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, kernels,
-    metal_command_failure_requires_release,
+    METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalPipelineNameSet, metal_command_failure_requires_release,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -3265,71 +3265,71 @@ impl MetalExecutorInner {
                 bail!("failed to compile Flash-MoE Metal shader library: {error}");
             }
 
-            let q4_pipeline = compile_pipeline(device, library, kernels::Q4_FMA_MATVEC)?;
+            let pipeline_names = MetalPipelineNameSet::new(route_top4_enabled);
+            let q4_pipeline = compile_pipeline(device, library, pipeline_names.q4)?;
             let q4_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS)?;
-            let q4_swiglu_pipeline = compile_pipeline(device, library, kernels::Q4_SWIGLU_FUSED)?;
+                compile_pipeline(device, library, pipeline_names.q4_bf16_scale_bias)?;
+            let q4_swiglu_pipeline = compile_pipeline(device, library, pipeline_names.q4_swiglu)?;
             let q4_swiglu_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS)?;
-            let q4_mmap_pipeline = compile_pipeline(device, library, kernels::Q4_MMAP_FMA_MATVEC)?;
+                compile_pipeline(device, library, pipeline_names.q4_swiglu_bf16_scale_bias)?;
+            let q4_mmap_pipeline = compile_pipeline(device, library, pipeline_names.q4_mmap)?;
             let q4_mmap_bf16_scale_bias_pipeline =
-                compile_pipeline(device, library, kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS)?;
+                compile_pipeline(device, library, pipeline_names.q4_mmap_bf16_scale_bias)?;
             let q4_mmap_batch_pipeline =
-                compile_pipeline(device, library, kernels::Q4_MMAP_FMA_MATVEC_BATCH)?;
+                compile_pipeline(device, library, pipeline_names.q4_mmap_batch)?;
             let q4_mmap_batch_bf16_scale_bias_pipeline = compile_pipeline(
                 device,
                 library,
-                kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+                pipeline_names.q4_mmap_batch_bf16_scale_bias,
             )?;
-            let route_pipeline = if route_top4_enabled {
-                Some(compile_pipeline(device, library, kernels::ROUTE_TOP4)?)
-            } else {
-                None
-            };
-            let dense_matvec_pipeline = compile_pipeline(device, library, kernels::DENSE_MATVEC)?;
+            let route_pipeline = pipeline_names
+                .route_top4
+                .map(|kernel| compile_pipeline(device, library, kernel))
+                .transpose()?;
+            let dense_matvec_pipeline =
+                compile_pipeline(device, library, pipeline_names.dense_matvec)?;
             let dense_matvec_bf16_pipeline =
-                compile_pipeline(device, library, kernels::DENSE_MATVEC_BF16)?;
+                compile_pipeline(device, library, pipeline_names.dense_matvec_bf16)?;
             let dense_mmap_matvec_pipeline =
-                compile_pipeline(device, library, kernels::DENSE_MMAP_MATVEC_F32)?;
+                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec)?;
             let dense_mmap_matvec_bf16_pipeline =
-                compile_pipeline(device, library, kernels::DENSE_MMAP_MATVEC_BF16)?;
+                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec_bf16)?;
             let dense_mmap_matvec_bf16_simd_pipeline =
-                compile_pipeline(device, library, kernels::DENSE_MMAP_MATVEC_BF16_SIMD)?;
-            let rms_norm_pipeline = compile_pipeline(device, library, kernels::RMS_NORM)?;
+                compile_pipeline(device, library, pipeline_names.dense_mmap_matvec_bf16_simd)?;
+            let rms_norm_pipeline = compile_pipeline(device, library, pipeline_names.rms_norm)?;
             let rms_norm_reduced_pipeline =
-                compile_pipeline(device, library, kernels::RMS_NORM_REDUCED)?;
+                compile_pipeline(device, library, pipeline_names.rms_norm_reduced)?;
             let residual_rms_norm_pipeline =
-                compile_pipeline(device, library, kernels::RESIDUAL_ADD_RMS_NORM)?;
-            let rope_pipeline = compile_pipeline(device, library, kernels::ROPE_APPLY)?;
+                compile_pipeline(device, library, pipeline_names.residual_rms_norm)?;
+            let rope_pipeline = compile_pipeline(device, library, pipeline_names.rope)?;
             let rope_split_half_pipeline =
-                compile_pipeline(device, library, kernels::ROPE_SPLIT_HALF_APPLY)?;
-            let attention_pipeline = compile_pipeline(device, library, kernels::ATTENTION_SCORES)?;
-            let kv_write_pipeline = compile_pipeline(device, library, kernels::KV_CACHE_WRITE)?;
+                compile_pipeline(device, library, pipeline_names.rope_split_half)?;
+            let attention_pipeline = compile_pipeline(device, library, pipeline_names.attention)?;
+            let kv_write_pipeline = compile_pipeline(device, library, pipeline_names.kv_write)?;
             let kv_read_attention_pipeline =
-                compile_pipeline(device, library, kernels::KV_CACHE_READ_ATTENTION)?;
-            let expert_mlp_pipeline = compile_pipeline(device, library, kernels::EXPERT_MLP_FUSED)?;
-            let silu_product_pipeline = compile_pipeline(device, library, kernels::SILU_PRODUCT)?;
+                compile_pipeline(device, library, pipeline_names.kv_read_attention)?;
+            let expert_mlp_pipeline = compile_pipeline(device, library, pipeline_names.expert_mlp)?;
+            let silu_product_pipeline =
+                compile_pipeline(device, library, pipeline_names.silu_product)?;
             let shared_expert_activation_pipeline =
-                compile_pipeline(device, library, kernels::SHARED_EXPERT_ACTIVATION)?;
+                compile_pipeline(device, library, pipeline_names.shared_expert_activation)?;
             let combine_expert_phase_pipeline =
-                compile_pipeline(device, library, kernels::COMBINE_EXPERT_PHASE)?;
-            let fill_zero_pipeline = compile_pipeline(device, library, kernels::FILL_ZERO)?;
-            let lm_head_pipeline = compile_pipeline(device, library, kernels::LM_HEAD_LOGITS)?;
-            let topk_vocab_pipeline = compile_pipeline(device, library, kernels::TOPK_VOCAB)?;
-            let gqa_scores_pipeline =
-                compile_pipeline(device, library, kernels::GQA_ATTENTION_SCORES)?;
-            let gqa_read_pipeline =
-                compile_pipeline(device, library, kernels::GQA_KV_READ_ATTENTION)?;
+                compile_pipeline(device, library, pipeline_names.combine_expert_phase)?;
+            let fill_zero_pipeline = compile_pipeline(device, library, pipeline_names.fill_zero)?;
+            let lm_head_pipeline = compile_pipeline(device, library, pipeline_names.lm_head)?;
+            let topk_vocab_pipeline = compile_pipeline(device, library, pipeline_names.topk_vocab)?;
+            let gqa_scores_pipeline = compile_pipeline(device, library, pipeline_names.gqa_scores)?;
+            let gqa_read_pipeline = compile_pipeline(device, library, pipeline_names.gqa_read)?;
             let linear_conv1d_pipeline =
-                compile_pipeline(device, library, kernels::LINEAR_CONV1D_STEP)?;
+                compile_pipeline(device, library, pipeline_names.linear_conv1d)?;
             let linear_rms_norm_qk_pipeline =
-                compile_pipeline(device, library, kernels::LINEAR_RMS_NORM_QK)?;
+                compile_pipeline(device, library, pipeline_names.linear_rms_norm_qk)?;
             let linear_decay_beta_pipeline =
-                compile_pipeline(device, library, kernels::LINEAR_COMPUTE_DECAY_BETA)?;
+                compile_pipeline(device, library, pipeline_names.linear_decay_beta)?;
             let linear_delta_step_pipeline =
-                compile_pipeline(device, library, kernels::LINEAR_GATED_DELTA_STEP)?;
+                compile_pipeline(device, library, pipeline_names.linear_delta_step)?;
             let linear_gated_rms_norm_pipeline =
-                compile_pipeline(device, library, kernels::LINEAR_GATED_RMS_NORM)?;
+                compile_pipeline(device, library, pipeline_names.linear_gated_rms_norm)?;
             release(library);
 
             let command_queue = msg_send_id0(device, sel("newCommandQueue"));

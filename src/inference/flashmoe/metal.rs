@@ -81,6 +81,134 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::LINEAR_GATED_RMS_NORM,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalPipelineNameSet {
+    pub(crate) q4: &'static str,
+    pub(crate) q4_bf16_scale_bias: &'static str,
+    pub(crate) q4_swiglu: &'static str,
+    pub(crate) q4_swiglu_bf16_scale_bias: &'static str,
+    pub(crate) q4_mmap: &'static str,
+    pub(crate) q4_mmap_bf16_scale_bias: &'static str,
+    pub(crate) q4_mmap_batch: &'static str,
+    pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
+    pub(crate) route_top4: Option<&'static str>,
+    pub(crate) dense_matvec: &'static str,
+    pub(crate) dense_matvec_bf16: &'static str,
+    pub(crate) dense_mmap_matvec: &'static str,
+    pub(crate) dense_mmap_matvec_bf16: &'static str,
+    pub(crate) dense_mmap_matvec_bf16_simd: &'static str,
+    pub(crate) rms_norm: &'static str,
+    pub(crate) rms_norm_reduced: &'static str,
+    pub(crate) residual_rms_norm: &'static str,
+    pub(crate) rope: &'static str,
+    pub(crate) rope_split_half: &'static str,
+    pub(crate) attention: &'static str,
+    pub(crate) kv_write: &'static str,
+    pub(crate) kv_read_attention: &'static str,
+    pub(crate) expert_mlp: &'static str,
+    pub(crate) silu_product: &'static str,
+    pub(crate) shared_expert_activation: &'static str,
+    pub(crate) combine_expert_phase: &'static str,
+    pub(crate) fill_zero: &'static str,
+    pub(crate) lm_head: &'static str,
+    pub(crate) topk_vocab: &'static str,
+    pub(crate) gqa_scores: &'static str,
+    pub(crate) gqa_read: &'static str,
+    pub(crate) linear_conv1d: &'static str,
+    pub(crate) linear_rms_norm_qk: &'static str,
+    pub(crate) linear_decay_beta: &'static str,
+    pub(crate) linear_delta_step: &'static str,
+    pub(crate) linear_gated_rms_norm: &'static str,
+}
+
+impl MetalPipelineNameSet {
+    pub(crate) fn new(route_top4_enabled: bool) -> Self {
+        Self {
+            q4: kernels::Q4_FMA_MATVEC,
+            q4_bf16_scale_bias: kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
+            q4_swiglu: kernels::Q4_SWIGLU_FUSED,
+            q4_swiglu_bf16_scale_bias: kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS,
+            q4_mmap: kernels::Q4_MMAP_FMA_MATVEC,
+            q4_mmap_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
+            q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
+            q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+            route_top4: route_top4_enabled.then_some(kernels::ROUTE_TOP4),
+            dense_matvec: kernels::DENSE_MATVEC,
+            dense_matvec_bf16: kernels::DENSE_MATVEC_BF16,
+            dense_mmap_matvec: kernels::DENSE_MMAP_MATVEC_F32,
+            dense_mmap_matvec_bf16: kernels::DENSE_MMAP_MATVEC_BF16,
+            dense_mmap_matvec_bf16_simd: kernels::DENSE_MMAP_MATVEC_BF16_SIMD,
+            rms_norm: kernels::RMS_NORM,
+            rms_norm_reduced: kernels::RMS_NORM_REDUCED,
+            residual_rms_norm: kernels::RESIDUAL_ADD_RMS_NORM,
+            rope: kernels::ROPE_APPLY,
+            rope_split_half: kernels::ROPE_SPLIT_HALF_APPLY,
+            attention: kernels::ATTENTION_SCORES,
+            kv_write: kernels::KV_CACHE_WRITE,
+            kv_read_attention: kernels::KV_CACHE_READ_ATTENTION,
+            expert_mlp: kernels::EXPERT_MLP_FUSED,
+            silu_product: kernels::SILU_PRODUCT,
+            shared_expert_activation: kernels::SHARED_EXPERT_ACTIVATION,
+            combine_expert_phase: kernels::COMBINE_EXPERT_PHASE,
+            fill_zero: kernels::FILL_ZERO,
+            lm_head: kernels::LM_HEAD_LOGITS,
+            topk_vocab: kernels::TOPK_VOCAB,
+            gqa_scores: kernels::GQA_ATTENTION_SCORES,
+            gqa_read: kernels::GQA_KV_READ_ATTENTION,
+            linear_conv1d: kernels::LINEAR_CONV1D_STEP,
+            linear_rms_norm_qk: kernels::LINEAR_RMS_NORM_QK,
+            linear_decay_beta: kernels::LINEAR_COMPUTE_DECAY_BETA,
+            linear_delta_step: kernels::LINEAR_GATED_DELTA_STEP,
+            linear_gated_rms_norm: kernels::LINEAR_GATED_RMS_NORM,
+        }
+    }
+
+    #[cfg(test)]
+    fn compiled_kernels(self) -> Vec<&'static str> {
+        let mut kernels = vec![
+            self.q4,
+            self.q4_bf16_scale_bias,
+            self.q4_swiglu,
+            self.q4_swiglu_bf16_scale_bias,
+            self.q4_mmap,
+            self.q4_mmap_bf16_scale_bias,
+            self.q4_mmap_batch,
+            self.q4_mmap_batch_bf16_scale_bias,
+            self.dense_matvec,
+            self.dense_matvec_bf16,
+            self.dense_mmap_matvec,
+            self.dense_mmap_matvec_bf16,
+            self.dense_mmap_matvec_bf16_simd,
+            self.rms_norm,
+            self.rms_norm_reduced,
+            self.residual_rms_norm,
+            self.rope,
+            self.rope_split_half,
+            self.attention,
+            self.kv_write,
+            self.kv_read_attention,
+            self.expert_mlp,
+            self.silu_product,
+            self.shared_expert_activation,
+            self.combine_expert_phase,
+            self.fill_zero,
+            self.lm_head,
+            self.topk_vocab,
+            self.gqa_scores,
+            self.gqa_read,
+            self.linear_conv1d,
+            self.linear_rms_norm_qk,
+            self.linear_decay_beta,
+            self.linear_delta_step,
+            self.linear_gated_rms_norm,
+        ];
+        if let Some(route_top4) = self.route_top4 {
+            kernels.push(route_top4);
+        }
+        kernels
+    }
+}
+
 pub const METAL_SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1884,5 +2012,33 @@ mod tests {
             !METAL_SHADERS.contains("uint half"),
             "`half` is a Metal scalar type and cannot be reused as a variable name"
         );
+    }
+
+    #[test]
+    fn pipeline_name_set_declares_optional_route_top4() {
+        let without_route = MetalPipelineNameSet::new(false);
+        assert_eq!(without_route.route_top4, None);
+        assert!(
+            !without_route
+                .compiled_kernels()
+                .contains(&kernels::ROUTE_TOP4)
+        );
+
+        let with_route = MetalPipelineNameSet::new(true);
+        assert_eq!(with_route.route_top4, Some(kernels::ROUTE_TOP4));
+        assert!(with_route.compiled_kernels().contains(&kernels::ROUTE_TOP4));
+    }
+
+    #[test]
+    fn pipeline_name_set_matches_declared_forward_kernel_surface() {
+        let mut compiled = MetalPipelineNameSet::new(true).compiled_kernels();
+        compiled.sort_unstable();
+        compiled.dedup();
+
+        let mut required = REQUIRED_FORWARD_KERNELS.to_vec();
+        required.sort_unstable();
+        required.dedup();
+
+        assert_eq!(compiled, required);
     }
 }
