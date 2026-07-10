@@ -148,7 +148,8 @@ The validator should reject silent fallbacks such as:
   routing-output validation, scheduled CMD3 output readback validation with declared token-state
   application, full-attention KV placement and execution-shape validation for the declared attention
   math implementation, active expert read issue and finish metrics, route normalization, pending
-  read sets, shared-expert source/shape validation, and the scheduled whole-slot handoff.
+  read sets, shared-expert source/shape validation, scheduler-built CMD3 commands from typed
+  input/shared/next-norm descriptors, and the scheduled whole-slot handoff.
   Shared-expert scheduling now carries width, shared-expert count, per-expert intermediate width,
   and total intermediate width as one validated graph shape, so CMD2/CMD3 shared work no longer has
   to infer those dimensions from legacy phase structs alone.
@@ -170,9 +171,9 @@ The validator should reject silent fallbacks such as:
   post-attention prep now resolves through the scheduler-owned CMD2 output before recording the
   approved preselected routing command for the runtime, so CMD2-to-routing handoff is not just a
   loose active-expert vector.
-  Scheduled CMD3 Metal submission now returns a concrete deferred phase from both the wrapper and
-  inner scheduled helpers, and treats "no submitted phase" as an unsupported implementation gap
-  instead of returning to a fallback-shaped caller path.
+  Scheduled CMD3 Metal submission now consumes a scheduler-resolved CMD3 command, returns a concrete
+  deferred phase from both the wrapper and inner scheduled helpers, and treats "no submitted phase"
+  as an unsupported implementation gap instead of returning to a fallback-shaped caller path.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -242,9 +243,10 @@ The validator should reject silent fallbacks such as:
   scheduler-normalized routes instead of a loose layer plus route vector. The old direct
   `read_active_experts`/`ExpertWeights` submission route remains only as test/diagnostic scaffolding;
   production CMD3 submission retains scheduler-owned whole-expert slots. CMD1/CMD2/CMD3 submission is
-  now built through the scheduled graph and resolves scheduler-owned command objects before entering
-  runtime helpers. The remaining gap is to move the Metal command encoding and legacy CPU diagnostic
-  helpers out of `legacy.rs` behind the explicit CMD builder APIs.
+  now built through the scheduled graph, and CMD3 now enters the Metal bridge as a scheduler-owned
+  command object instead of a legacy-built descriptor/submission pair. The remaining gap is to move
+  the Metal command encoding and legacy CPU diagnostic helpers out of `legacy.rs` behind the
+  explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   descriptor and submission construction now flows through the scheduled graph, but the concrete
   command encoders should become explicit command builders used by every supported variant.
@@ -290,8 +292,9 @@ The validator should reject silent fallbacks such as:
   capability checks are now descriptor-backed.
 - Shared experts now enter CMD3 through a scheduler descriptor that carries source and graph shape,
   and the live CMD3 builder derives next-norm source from typed `ScheduledNextNormWeights` instead
-  of a separate legacy-owned branch. The live path now asks the scheduled graph to build CMD3
-  submissions, rejecting stale descriptors that do not match the current graph capability. CPU
+  of a separate legacy-owned branch. The live path now asks the scheduled graph to build resolved
+  CMD3 commands from typed input/shared/next-norm descriptors, rejecting stale descriptors that do
+  not match the current graph capability. CPU
   upload inputs for CMD3 now materialize as scheduler-typed whole-phase inputs before Metal buffer
   allocation, so mismatched normed/residual state is an explicit unsupported input instead of a
   silent no-op/fallback. Metal post-attention prep inputs for CMD3 now also carry scheduler-typed

@@ -56,9 +56,9 @@ use std::io::Write;
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::capabilities::FlashMoeCapabilityPlan;
+use super::capabilities::{FlashMoeCapabilityPlan, FlashMoeGraphStage};
 #[cfg(test)]
-use super::capabilities::{FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement};
+use super::capabilities::{FlashMoeStageCapability, FlashMoeStagePlacement};
 #[cfg(test)]
 use super::experts::ExpertReadPath;
 #[cfg(test)]
@@ -114,8 +114,7 @@ use super::scheduler::{
     ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledCmd3Submission,
     ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
     ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
-    ScheduledRoutingCommand, ScheduledSharedExpert,
-    ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+    ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd2AttentionSource, ScheduledCmd2ResidualSource};
@@ -1941,6 +1940,12 @@ type ScheduledExpertPhase<'a> = ScheduledCmd3Submission<
     ExpertPhaseInput<'a>,
     SharedExpertPhaseRef<'a>,
 >;
+type ScheduledExpertCommand<'a> = ScheduledCmd3Command<
+    'a,
+    Arc<ScheduledExpertSlot>,
+    ExpertPhaseInput<'a>,
+    SharedExpertPhaseRef<'a>,
+>;
 
 #[derive(Debug, Clone)]
 struct LinearAttentionStaticWeights {
@@ -2183,6 +2188,13 @@ impl MetalExecutor {
         phase: ScheduledExpertPhase<'_>,
     ) -> Result<DeferredExpertPhase> {
         let command = phase.into_cmd3_command()?;
+        self.submit_scheduled_expert_command(command)
+    }
+
+    fn submit_scheduled_expert_command(
+        &self,
+        command: ScheduledExpertCommand<'_>,
+    ) -> Result<DeferredExpertPhase> {
         let output = command.resolve_output_state()?;
         debug_assert_eq!(output.layer, command.layer);
         debug_assert_eq!(output.cmd3, command.cmd3);
@@ -10725,36 +10737,19 @@ impl FlashMoeEngine {
                 |name, width| self.model_norm_weight(name, width),
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
-            let shared_descriptor = shared_phase.scheduled_shared_expert_descriptor()?;
-            let scheduled_cmd3 = self
-                .scheduled_graph
-                .build_cmd3_expert_phase_from_descriptors(
-                    layer,
-                    scheduled_experts.len(),
-                    if has_metal_post_attention_prep {
-                        ScheduledCmd3InputSource::MetalPostAttentionPrep
-                    } else {
-                        ScheduledCmd3InputSource::CpuNormedResidualUpload
-                    },
-                    shared_descriptor,
-                    next_norm_weights,
-                )?;
-            debug_assert_eq!(scheduled_cmd3.layer, layer);
-            debug_assert_eq!(scheduled_cmd3.expert_count, scheduled_experts.len());
             let mut submitted_deferred = false;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(metal) = &self.metal
                 && let Some(prep) = metal_post_attention_prep.take()
             {
-                let phase = self.scheduled_graph.build_cmd3_submission(
+                let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
                     position,
-                    scheduled_cmd3,
                     &scheduled_experts,
                     ExpertPhaseInput::MetalPostAttention(prep),
                     shared_phase,
                     next_norm_weights,
                 )?;
-                let pending = metal.submit_scheduled_expert_phase(phase)?;
+                let pending = metal.submit_scheduled_expert_command(command)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;
@@ -10768,20 +10763,18 @@ impl FlashMoeEngine {
                 && let Some(metal) = &self.metal
                 && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
             {
-                let pending = metal.submit_scheduled_expert_phase(
-                    self.scheduled_graph.build_cmd3_submission(
-                        position,
-                        scheduled_cmd3,
-                        &scheduled_experts,
-                        ExpertPhaseInput::Cpu(ScheduledCmd3CpuInput::new(
-                            layer,
-                            &normed,
-                            mlp_residual,
-                        )?),
-                        shared_phase,
-                        next_norm_weights,
-                    )?,
+                let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
+                    position,
+                    &scheduled_experts,
+                    ExpertPhaseInput::Cpu(ScheduledCmd3CpuInput::new(
+                        layer,
+                        &normed,
+                        mlp_residual,
+                    )?),
+                    shared_phase,
+                    next_norm_weights,
                 )?;
+                let pending = metal.submit_scheduled_expert_command(command)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;
@@ -10796,12 +10789,15 @@ impl FlashMoeEngine {
                 if has_metal_post_attention_prep {
                     bail!("Flash-MoE Metal post-attention prep fell through to CPU expert phase");
                 }
+                let cmd3_stage = self
+                    .scheduled_graph
+                    .stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
                 bail!(
                     "FlashMoe unsupported {:?} path: {} is not implemented: scheduled graph declares {} implementation '{}' for layer {}, but no submitted CMD3 phase was produced; CPU expert phase fallback is not a declared graph-stage implementation",
                     self.model_layout.family,
-                    scheduled_cmd3.stage.stage,
-                    scheduled_cmd3.stage.placement.as_str(),
-                    scheduled_cmd3.stage.implementation,
+                    cmd3_stage.stage,
+                    cmd3_stage.placement.as_str(),
+                    cmd3_stage.implementation,
                     layer
                 );
             }

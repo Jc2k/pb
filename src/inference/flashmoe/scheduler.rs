@@ -339,6 +339,30 @@ impl FlashMoeScheduledGraph {
         }
         ScheduledCmd3Submission::new(position, cmd3, scheduled, input, shared, next_norm_weights)
     }
+
+    pub fn build_cmd3_command_from_descriptors<'a, TExpert, TInput, TShared>(
+        &self,
+        position: usize,
+        scheduled: &'a ScheduledExpertSet<TExpert>,
+        input: TInput,
+        shared: TShared,
+        next_norm_weights: ScheduledNextNormWeights<'a>,
+    ) -> Result<ScheduledCmd3Command<'a, TExpert, TInput, TShared>>
+    where
+        TExpert: ScheduledCmd3Expert + ScheduledCmd3ExpertPayload,
+        TInput: ScheduledCmd3Input,
+        TShared: ScheduledSharedExpert,
+    {
+        let cmd3 = self.build_cmd3_expert_phase_from_descriptors(
+            scheduled.layer,
+            scheduled.len(),
+            input.scheduled_cmd3_input_source(),
+            shared.scheduled_shared_expert_descriptor()?,
+            next_norm_weights,
+        )?;
+        self.build_cmd3_submission(position, cmd3, scheduled, input, shared, next_norm_weights)?
+            .into_cmd3_command()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4849,6 +4873,71 @@ mod tests {
         assert!(output_state.has_next_normed());
         assert_eq!(output_state.hidden().len(), 8);
         assert_eq!(output_state.next_normed().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn scheduled_graph_builds_cmd3_command_from_typed_descriptors() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+        let next_norm = [1.0; 8];
+
+        let command = graph
+            .build_cmd3_command_from_descriptors(
+                19,
+                &scheduled,
+                dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
+                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                ScheduledNextNormWeights::cpu_visible(
+                    "model.layers.8.input_layernorm.weight",
+                    &next_norm,
+                    8,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(command.position, 19);
+        assert_eq!(command.layer, 7);
+        assert_eq!(command.cmd3.layer, 7);
+        assert_eq!(command.cmd3.expert_count, 2);
+        assert_eq!(
+            command.cmd3.input,
+            ScheduledCmd3InputSource::CpuNormedResidualUpload
+        );
+        assert_eq!(
+            command.cmd3.shared,
+            ScheduledSharedExpertSource::DenseCpuWeights
+        );
+        assert_eq!(
+            command.cmd3.next_norm,
+            ScheduledNextNormSource::CpuVisibleWeights
+        );
+        assert_eq!(command.input_state.width(), 8);
+        assert_eq!(command.payloads.len(), 2);
+    }
+
+    #[test]
+    fn scheduled_graph_cmd3_command_rejects_mismatched_typed_descriptor() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let scheduled = dummy_scheduled_experts(7, 2);
+
+        let err = graph
+            .build_cmd3_command_from_descriptors(
+                19,
+                &scheduled,
+                dummy_cmd3_input_with_width(ScheduledCmd3InputSource::CpuNormedResidualUpload, 4),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+                ScheduledNextNormWeights::none(),
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("shared expert width 8 does not match input width 4"),
+            "{err:#}"
+        );
     }
 
     #[test]
