@@ -56,7 +56,9 @@ use std::io::Write;
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::capabilities::{FlashMoeCapabilityPlan, FlashMoeGraphStage};
+use super::capabilities::FlashMoeCapabilityPlan;
+#[cfg(test)]
+use super::capabilities::FlashMoeGraphStage;
 #[cfg(test)]
 use super::capabilities::{
     FlashMoeStageCapability, FlashMoeStageImplementation, FlashMoeStagePlacement,
@@ -104,24 +106,24 @@ use super::experts::{
 use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::math::*;
 use super::metal::{
-    METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3ActiveExpertStageBuffers, MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers,
-    MetalCmd3CombinePlan, MetalCmd3CombineStageBuffers, MetalCmd3DeferredOutput,
-    MetalCmd3ExecutionPlan, MetalCmd3InputBuffers, MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan,
-    MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource,
-    MetalCmd3SharedStageBuffers, MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalRuntimeCapabilities,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionValues,
+    MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan, MetalCmd3ActiveExpertStageBuffers,
+    MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
+    MetalCmd3CombineStageBuffers, MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan,
+    MetalCmd3InputBuffers, MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedStageBuffers,
+    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
+    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalRuntimeCapabilities, MetalSharedExpertBuffers, metal_command_failure_requires_release,
+    resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
-use super::model_family::{QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+use super::model_family::{QwenMoeFamily, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
@@ -155,20 +157,20 @@ use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
     Cmd2Q4PostAttentionPrepProjections, DenseMmapMatvecProjection, DenseProjectionRequest,
     DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
-    RouterScoreProjectionScorePlan, RouterScoreProjectionScoreSource,
-    RouterScoreProjectionTopKPlan, RouterScoreProjectionTopKSource, RuntimeTensorEntry,
-    SharedExpertPhaseCache, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
-    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
-    attention_tensor_name, build_dense_q4_mmap_projection,
-    build_required_cmd2_q4_post_attention_prep_projections,
+    ExpertTensorRef, FlashMoeManifest, ResidentDenseLayout, ResidentStaticTensorRef,
+    RouterScoreProjectionDescriptor, RouterScoreProjectionScorePlan,
+    RouterScoreProjectionScoreSource, RouterScoreProjectionTopKPlan,
+    RouterScoreProjectionTopKSource, RuntimeTensorEntry, SharedExpertPhaseCache,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
+    build_dense_q4_mmap_projection, build_required_cmd2_q4_post_attention_prep_projections,
     build_required_shared_expert_q4_phase_projections, build_router_score_projection_descriptor,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
-    layer_norm_tensor_name, linear_attention_input_projection_requests,
-    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
-    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
-    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    full_attention_input_projection_requests, layer_norm_tensor_name,
+    linear_attention_input_projection_requests, linear_attention_scalar_tensor_name,
+    linear_attention_tensor_name, prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset,
+    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -1255,6 +1257,12 @@ where
     let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
     progress("runtime_layout", phase_started.elapsed());
     phase_started = Instant::now();
+    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
+    if model_layout.family == QwenMoeFamily::Qwen35A17B && dense_layout == ResidentDenseLayout::Q4 {
+        validate_qwen35_q4_graph_bindings(&config, &runtime, dense.registry(), dense.len)?;
+    }
+    progress("dense_graph_bindings", phase_started.elapsed());
+    phase_started = Instant::now();
     let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
     progress("vision_encoder", phase_started.elapsed());
     phase_started = Instant::now();
@@ -1270,7 +1278,6 @@ where
     );
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
-    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
     let capability_plan = FlashMoeCapabilityPlan::resolve(
         &model_layout,
         dense_layout,
@@ -2719,18 +2726,6 @@ impl MetalExecutor {
             Ok(vec![0.0; query.len()])
         }
     }
-
-    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.inner.attention_backend(tokens)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = tokens;
-            MetalAttentionBackend::Cpu
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2744,7 +2739,6 @@ struct MetalExecutorInner {
     lm_head_buffers: std::sync::Mutex<MetalLmHeadBufferCache>,
     kv_cache: std::sync::Mutex<Option<MetalKvCacheInner>>,
     linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
-    attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
 }
 
@@ -3108,7 +3102,6 @@ impl MetalExecutorInner {
                 )),
                 kv_cache: std::sync::Mutex::new(Some(kv_cache)),
                 linear_attention_state: std::sync::Mutex::new(linear_attention_state),
-                attention_policy: std::sync::Mutex::new(MetalAttentionPolicy::default()),
                 reusable: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -7846,13 +7839,6 @@ impl MetalExecutorInner {
         }
     }
 
-    fn attention_backend(&self, tokens: usize) -> MetalAttentionBackend {
-        self.attention_policy
-            .lock()
-            .expect("metal attention policy poisoned")
-            .backend(tokens)
-    }
-
     unsafe fn dispatch_unary(
         &self,
         pipeline: ObjcId,
@@ -9191,28 +9177,14 @@ impl FlashMoeEngine {
             );
             return sampler.sample_candidates(candidates);
         }
-        if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
-            Some(&self.metal),
+        let candidates = self.dense.lm_head_top_candidates_with_metal(
+            &self.metal,
             hidden,
             &self.tokenizer,
             sampler,
             prompt_tokens,
             generated,
-        )? {
-            trace_sampling_candidates(
-                progress,
-                &self.tokenizer,
-                prompt_tokens.len(),
-                generated,
-                &candidates,
-                None,
-            );
-            return sampler.sample_candidates(candidates);
-        }
-        let logits =
-            self.dense
-                .lm_head_logits_with_metal(Some(&self.metal), 0, hidden, &self.tokenizer)?;
-        let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+        )?;
         trace_sampling_candidates(
             progress,
             &self.tokenizer,
@@ -9281,9 +9253,7 @@ impl FlashMoeEngine {
                 let normed_candidate = pending_for_layer
                     .as_ref()
                     .and_then(DeferredExpertPhase::next_normed_metal_input);
-                if normed_candidate.is_some()
-                    && self.deferred_attention_input_supported(layer, runtime)
-                {
+                if normed_candidate.is_some() {
                     let residual_candidate = pending_for_layer
                         .as_ref()
                         .and_then(DeferredExpertPhase::hidden_metal_input);
@@ -9630,13 +9600,6 @@ impl FlashMoeEngine {
                 layer_timing.buckets.routing += routing_started.elapsed();
                 active
             };
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let has_metal_post_attention_prep = metal_post_attention_prep.is_some();
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let cpu_mlp_residual =
-                (!has_metal_post_attention_prep).then(|| token_state.residual_snapshot());
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let cpu_mlp_residual = Some(token_state.residual_snapshot());
             layer_timing.active_experts = active.routes.len();
             if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
                 kv_cache
@@ -9658,17 +9621,10 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let shared_q4_phase =
                 self.required_shared_expert_q4_phase_projections(layer, runtime.width)?;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let shared_phase = SharedExpertPhaseRef::Q4(shared_q4_phase.as_ref());
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let shared_q4_phase: Option<SharedExpertPhaseQ4Projections> = None;
-            let shared_dense_phase = if shared_q4_phase.is_some() {
-                None
-            } else {
-                self.shared_expert_phase_weights(layer, runtime.width)?
-            };
-            let shared_phase = SharedExpertPhaseRef::from_options(
-                shared_dense_phase.as_deref(),
-                shared_q4_phase.as_deref(),
-            );
+            let shared_phase = SharedExpertPhaseRef::None;
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let expert_io_started = Instant::now();
             let scheduled_experts = self.scheduler.finish_routes(pending_experts)?;
@@ -9698,9 +9654,18 @@ impl FlashMoeEngine {
                 |name, width| self.model_norm_weight(name, width),
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
-            let mut submitted_deferred = false;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if let Some(prep) = metal_post_attention_prep.take() {
+            let prep = metal_post_attention_prep.take().with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 CMD3 path at layer {layer}: resolved Metal CMD2 did not produce post-attention state; CPU normed/residual upload is not a declared implementation"
+                )
+            })?;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 CMD3 path at layer {layer}: the resolved implementation requires Apple Silicon Metal"
+            );
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
                 let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
                     position,
                     &scheduled_experts,
@@ -9711,57 +9676,13 @@ impl FlashMoeEngine {
                 let pending = self.metal.submit_scheduled_expert_command(command)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
-                    submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
                     token_state.apply_declared_expert_phase(
                         output,
                         FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
                     )?;
-                    submitted_deferred = true;
                 }
-            }
-            if !submitted_deferred && let Some(mlp_residual) = cpu_mlp_residual.as_deref() {
-                let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
-                    position,
-                    &scheduled_experts,
-                    ExpertPhaseInput::Cpu(ScheduledCmd3CpuInput::new(
-                        layer,
-                        &normed,
-                        mlp_residual,
-                    )?),
-                    shared_phase,
-                    next_norm_weights,
-                )?;
-                let pending = self.metal.submit_scheduled_expert_command(command)?;
-                if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
-                    deferred_expert_phase = Some(pending);
-                    submitted_deferred = true;
-                } else {
-                    let output = pending.wait()?;
-                    token_state.apply_declared_expert_phase(
-                        output,
-                        FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
-                    )?;
-                    submitted_deferred = true;
-                }
-            }
-            if !submitted_deferred {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                if has_metal_post_attention_prep {
-                    bail!("Flash-MoE Metal post-attention prep fell through to CPU expert phase");
-                }
-                let cmd3_stage = self
-                    .scheduled_graph
-                    .stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
-                bail!(
-                    "FlashMoe unsupported {:?} path: {} is not implemented: scheduled graph declares {} implementation '{}' for layer {}, but no submitted CMD3 phase was produced; CPU expert phase fallback is not a declared graph-stage implementation",
-                    self.model_layout.family,
-                    cmd3_stage.stage,
-                    cmd3_stage.placement.as_str(),
-                    cmd3_stage.implementation,
-                    layer
-                );
             }
             trace_layer_values(position, layer, "moe", token_state.hidden());
             layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
@@ -9930,63 +9851,49 @@ impl FlashMoeEngine {
             layout.kv_width,
         )?;
         let input_specs = input_requests.requests();
-        let mut batched_input_projections = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(input) = deferred_input {
-            batched_input_projections = self
+        let mut projections = if let Some(input) = deferred_input {
+            self
                 .dense
                 .project_dense_tensors_batched_with_metal_input_buffer(
                     &self.metal,
                     &input_specs,
                     input.buffer,
                     input.len(),
-                )?;
-        }
-        if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
-            bail!("deferred Metal full-attention input projection is unavailable");
-        }
-        if batched_input_projections.is_none() {
-            batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-                Some(&self.metal),
-                &input_specs,
-                normed,
-            )?;
-        }
-        let (q_projected, mut k, v) = if let Some(mut projections) = batched_input_projections {
-            let v = projections
-                .pop()
-                .context("missing batched self_attn.v_proj result")?;
-            let k = projections
-                .pop()
-                .context("missing batched self_attn.k_proj result")?;
-            let q_projected = projections
-                .pop()
-                .context("missing batched self_attn.q_proj result")?;
-            (q_projected, k, v)
+                )?
+                .with_context(|| {
+                    format!(
+                        "FlashMoe unsupported scheduled Qwen3.5 CMD1 path at layer {layer}: resident Q4 full-attention projections do not accept deferred Metal input"
+                    )
+                })?
         } else {
-            let q_projected = self.dense.project_with_metal(
-                Some(&self.metal),
-                layer,
-                "q_proj",
-                normed,
-                layout.q_projection_width,
-            )?;
-            let k = self.dense.project_with_metal(
-                Some(&self.metal),
-                layer,
-                "k_proj",
-                normed,
-                layout.kv_width,
-            )?;
-            let v = self.dense.project_with_metal(
-                Some(&self.metal),
-                layer,
-                "v_proj",
-                normed,
-                layout.kv_width,
-            )?;
-            (q_projected, k, v)
+            self.dense
+                .project_dense_tensors_batched_with_metal(
+                    Some(&self.metal),
+                    &input_specs,
+                    normed,
+                )?
+                .with_context(|| {
+                    format!(
+                        "FlashMoe unsupported scheduled Qwen3.5 CMD1 path at layer {layer}: resident Q4 full-attention projection batch is unavailable"
+                    )
+                })?
         };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mut projections: Vec<Vec<f32>> = {
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 CMD1 path at layer {layer}: the resolved implementation requires Apple Silicon Metal"
+            )
+        };
+        let v = projections
+            .pop()
+            .context("missing batched self_attn.v_proj result")?;
+        let mut k = projections
+            .pop()
+            .context("missing batched self_attn.k_proj result")?;
+        let q_projected = projections
+            .pop()
+            .context("missing batched self_attn.q_proj result")?;
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_input_projection += subphase_started.elapsed();
         }
@@ -10044,37 +9951,9 @@ impl FlashMoeEngine {
         &self,
         position: usize,
         layer: usize,
-        layout: FullAttentionLayout,
+        _layout: FullAttentionLayout,
         kv_record: &FlashMoeFullAttentionKvRecord,
     ) -> Result<ScheduledAttentionMathOutput> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            let tokens = position + 1;
-            if self.metal.attention_backend(tokens) == MetalAttentionBackend::Gpu {
-                let scheduled_attention = self.scheduled_graph.build_attention_math(
-                    layer,
-                    position,
-                    ScheduledAttentionMathImplementation::MetalKvCache,
-                )?;
-                let output = scheduled_attention
-                    .resolve_kv_state(kv_record.state(FlashMoeStatePlacement::GpuResident))?;
-                self.metal
-                    .record_kv(
-                        kv_record.position(),
-                        kv_record.layer(),
-                        layout,
-                        kv_record.key(),
-                        kv_record.value(),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Metal full-attention KV record failed for declared attention stage at layer {layer} position {position}"
-                        )
-                    })?;
-                return Ok(output);
-            }
-        }
-
         let scheduled_attention = self.scheduled_graph.build_attention_math(
             layer,
             position,
@@ -10116,53 +9995,6 @@ impl FlashMoeEngine {
             buckets.attention_output_projection += subphase_started.elapsed();
         }
         Ok(projected)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn deferred_attention_input_supported(
-        &self,
-        layer: usize,
-        runtime: &DenseTransformerRuntime,
-    ) -> bool {
-        let metal = &self.metal;
-        if self.runtime.is_linear_attention_layer(layer) {
-            let Ok(layout) = runtime.linear_attention_layout(layer) else {
-                return false;
-            };
-            let Ok(input_requests) = linear_attention_input_projection_requests(
-                layer,
-                layout.conv_dim,
-                layout.total_value_width,
-                layout.num_value_heads,
-            ) else {
-                return false;
-            };
-            let specs = input_requests.requests();
-            self.dense
-                .can_project_dense_tensors_batched_with_metal_input_buffer(
-                    metal,
-                    &specs,
-                    runtime.width,
-                )
-        } else {
-            let Ok(layout) = runtime.full_attention_layout(layer) else {
-                return false;
-            };
-            let Ok(input_requests) = full_attention_input_projection_requests(
-                layer,
-                layout.q_projection_width,
-                layout.kv_width,
-            ) else {
-                return false;
-            };
-            let specs = input_requests.requests();
-            self.dense
-                .can_project_dense_tensors_batched_with_metal_input_buffer(
-                    metal,
-                    &specs,
-                    runtime.width,
-                )
-        }
     }
 
     fn full_attention_cached(
@@ -10645,34 +10477,13 @@ impl FlashMoeEngine {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn shared_expert_q4_phase_projections(
-        &self,
-        layer: usize,
-        width: usize,
-    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
-        self.shared_expert_phases.q4(
-            layer,
-            width,
-            self.config.shared_experts(),
-            self.config.shared_expert_intermediate_size(),
-            |layer, width, shared_experts, intermediate| {
-                self.dense.shared_expert_q4_phase_projections(
-                    layer,
-                    width,
-                    shared_experts,
-                    intermediate,
-                )
-            },
-        )
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn required_shared_expert_q4_phase_projections(
         &self,
         layer: usize,
         width: usize,
-    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
-        self.shared_expert_phases.q4(
+    ) -> Result<Arc<SharedExpertPhaseQ4Projections>> {
+        self.shared_expert_phases
+            .q4(
             layer,
             width,
             self.config.shared_experts(),
@@ -10685,7 +10496,12 @@ impl FlashMoeEngine {
                     intermediate,
                 )
             },
-        )
+        )?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 CMD3 shared-expert path at layer {layer}: resident Q4 shared projections are unavailable"
+                )
+            })
     }
 
     #[cfg(test)]
@@ -13745,6 +13561,22 @@ fn process_sample_logit(
     processed
 }
 
+fn rerank_resident_lm_head_candidates(
+    raw_candidates: &[(usize, f32)],
+    top_k: usize,
+    repeat_penalty: f32,
+    repeated: &BTreeSet<usize>,
+) -> Vec<(usize, f32)> {
+    let mut candidates = TopKCandidates::new(top_k);
+    for (token, value) in raw_candidates.iter().copied() {
+        candidates.push(
+            token,
+            process_sample_logit(token, value, repeat_penalty, repeated),
+        );
+    }
+    candidates.into_sorted_vec()
+}
+
 #[derive(Debug, Clone)]
 struct TopKCandidates {
     limit: usize,
@@ -13878,6 +13710,201 @@ fn validate_required_tensor_manifest(
         //    or use a naming scheme that doesn't match the exact pattern assumed here.
         //    A rigid per-name loop would cause false rejections for such models.
     }
+    Ok(())
+}
+
+fn validate_qwen35_q4_graph_bindings(
+    config: &QwenModelConfig,
+    runtime: &DenseTransformerRuntime,
+    registry: &TensorRegistry,
+    store_len: u64,
+) -> Result<()> {
+    for layer in 0..config.num_hidden_layers {
+        if runtime.is_linear_attention_layer(layer) {
+            let layout = runtime.linear_attention_layout(layer)?;
+            let requests = linear_attention_input_projection_requests(
+                layer,
+                layout.conv_dim,
+                layout.total_value_width,
+                layout.num_value_heads,
+            )?;
+            for request in requests.requests() {
+                require_resident_q4_graph_projection(
+                    registry,
+                    store_len,
+                    "CMD1 linear-attention projection",
+                    request.tensor_name,
+                    request.output_width,
+                    runtime.width,
+                )?;
+            }
+            require_resident_q4_graph_projection(
+                registry,
+                store_len,
+                "CMD2 linear-attention output projection",
+                &linear_attention_tensor_name(layer, "out_proj"),
+                runtime.width,
+                layout.total_value_width,
+            )?;
+            require_resident_static_graph_tensor(
+                registry,
+                store_len,
+                &linear_attention_tensor_name(layer, "conv1d"),
+                layout.conv_dim * layout.conv_kernel_size,
+                &["BF16", "BFLOAT16"],
+            )?;
+            require_resident_static_graph_tensor(
+                registry,
+                store_len,
+                &linear_attention_scalar_tensor_name(layer, "A_log"),
+                layout.num_value_heads,
+                &["F32", "FLOAT32", "FP32"],
+            )?;
+            require_resident_static_graph_tensor(
+                registry,
+                store_len,
+                &linear_attention_scalar_tensor_name(layer, "dt_bias"),
+                layout.num_value_heads,
+                &["BF16", "BFLOAT16"],
+            )?;
+            require_resident_static_graph_tensor(
+                registry,
+                store_len,
+                &linear_attention_tensor_name(layer, "norm"),
+                layout.value_dim,
+                &["BF16", "BFLOAT16"],
+            )?;
+        } else {
+            let layout = runtime.full_attention_layout(layer)?;
+            let requests = full_attention_input_projection_requests(
+                layer,
+                layout.q_projection_width,
+                layout.kv_width,
+            )?;
+            for request in requests.requests() {
+                require_resident_q4_graph_projection(
+                    registry,
+                    store_len,
+                    "CMD1 full-attention projection",
+                    request.tensor_name,
+                    request.output_width,
+                    runtime.width,
+                )?;
+            }
+            require_resident_q4_graph_projection(
+                registry,
+                store_len,
+                "CMD2 full-attention output projection",
+                &attention_tensor_name(layer, "o_proj"),
+                runtime.width,
+                layout.num_q_heads * layout.head_dim,
+            )?;
+        }
+
+        require_resident_q4_graph_projection(
+            registry,
+            store_len,
+            "CMD2 router projection",
+            &router_tensor_name(layer),
+            config.experts(),
+            runtime.width,
+        )?;
+
+        let shared_experts = config.shared_experts();
+        if shared_experts > 0 {
+            let intermediate = config.shared_expert_intermediate_size();
+            let total_intermediate = shared_experts
+                .checked_mul(intermediate)
+                .context("shared expert projection width overflow")?;
+            for projection in ["gate_proj", "up_proj"] {
+                require_resident_q4_graph_projection(
+                    registry,
+                    store_len,
+                    "CMD3 shared expert projection",
+                    &shared_expert_tensor_name(layer, projection),
+                    total_intermediate,
+                    runtime.width,
+                )?;
+            }
+            require_resident_q4_graph_projection(
+                registry,
+                store_len,
+                "CMD3 shared expert down projection",
+                &shared_expert_tensor_name(layer, "down_proj"),
+                runtime.width,
+                total_intermediate,
+            )?;
+            require_resident_q4_graph_projection(
+                registry,
+                store_len,
+                "CMD3 shared expert gate projection",
+                &shared_expert_gate_tensor_name(layer),
+                shared_experts,
+                runtime.width,
+            )?;
+        }
+    }
+
+    let lm_head_name = if registry.tensor("lm_head.weight").is_some() {
+        "lm_head.weight"
+    } else {
+        "model.embed_tokens.weight"
+    };
+    require_resident_q4_graph_projection(
+        registry,
+        store_len,
+        "LM-head sampling projection",
+        lm_head_name,
+        config.vocab_size,
+        runtime.width,
+    )?;
+    Ok(())
+}
+
+fn require_resident_q4_graph_projection(
+    registry: &TensorRegistry,
+    store_len: u64,
+    stage: &str,
+    tensor_name: &str,
+    output_width: usize,
+    input_width: usize,
+) -> Result<()> {
+    let entry = registry.require(tensor_name)?;
+    DenseQ4MmapMatvecProjection::from_entry(
+        tensor_name,
+        entry,
+        store_len,
+        output_width,
+        input_width,
+    )?
+    .with_context(|| {
+        format!(
+            "FlashMoe unsupported resolved Qwen3.5 Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
+        )
+    })?;
+    Ok(())
+}
+
+fn require_resident_static_graph_tensor(
+    registry: &TensorRegistry,
+    store_len: u64,
+    tensor_name: &str,
+    expected_values: usize,
+    allowed_dtypes: &[&str],
+) -> Result<()> {
+    let entry = registry.require(tensor_name)?;
+    ResidentStaticTensorRef::from_entry(
+        tensor_name,
+        entry,
+        store_len,
+        expected_values,
+        allowed_dtypes,
+    )?
+    .with_context(|| {
+        format!(
+            "FlashMoe unsupported resolved Qwen3.5 Q4 linear-attention state: tensor {tensor_name} cannot bind resident static storage"
+        )
+    })?;
     Ok(())
 }
 
@@ -14560,68 +14587,6 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn can_project_dense_tensors_batched_with_metal_input_buffer(
-        &self,
-        metal: &MetalExecutor,
-        specs: &[DenseProjectionRequest<'_>],
-        input_len: usize,
-    ) -> bool {
-        if !metal.has_resident_dense_weights() || specs.is_empty() {
-            return false;
-        }
-        let mut has_q4 = false;
-        let mut has_dense = false;
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return false;
-            };
-            match entry.quantization {
-                TensorQuantization::None => has_dense = true,
-                TensorQuantization::Q4 { .. } => has_q4 = true,
-            }
-        }
-        if has_q4 && has_dense {
-            return false;
-        }
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return false;
-            };
-            match &entry.quantization {
-                TensorQuantization::None => {
-                    let Some(element_size) = dtype_size(&entry.dtype) else {
-                        return false;
-                    };
-                    if DenseMmapMatvecProjection::from_entry(
-                        spec.tensor_name,
-                        entry,
-                        self.len,
-                        spec.output_width,
-                        input_len,
-                        element_size,
-                    )
-                    .is_err()
-                    {
-                        return false;
-                    }
-                }
-                TensorQuantization::Q4 { .. } => {
-                    let Ok(Some(_)) = DenseQ4MmapMatvecProjection::from_entry(
-                        spec.tensor_name,
-                        entry,
-                        self.len,
-                        spec.output_width,
-                        input_len,
-                    ) else {
-                        return false;
-                    };
-                }
-            }
-        }
-        true
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn linear_attention_static_offsets_for_metal(
         &self,
         layer: usize,
@@ -15231,25 +15196,6 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn shared_expert_q4_phase_projections(
-        &self,
-        layer: usize,
-        width: usize,
-        shared_experts: usize,
-        intermediate: usize,
-    ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
-        build_shared_expert_q4_phase_projections(
-            layer,
-            width,
-            shared_experts,
-            intermediate,
-            |tensor_name, output_width, input_len| {
-                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
-            },
-        )
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn required_shared_expert_q4_phase_projections(
         &self,
         layer: usize,
@@ -15386,20 +15332,20 @@ impl DenseStore {
 
     fn lm_head_top_candidates_with_metal(
         &self,
-        metal: Option<&MetalExecutor>,
+        metal: &MetalExecutor,
         hidden: &[f32],
         tokenizer: &QwenTokenizer,
         sampler: &TokenSampler,
         prompt: &[u32],
         generated: &[u32],
-    ) -> Result<Option<Vec<(usize, f32)>>> {
-        let Some(metal) = metal else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<(usize, f32)>> {
+        if !metal.has_resident_dense_weights() {
+            bail!(
+                "FlashMoe unsupported resolved LM-head path: resident dense Metal weights are unavailable"
+            );
+        }
         let lm_head_name = self.lm_head_tensor_name()?;
-        let Some(entry) = self.registry.tensor(lm_head_name) else {
-            return Ok(None);
-        };
+        let entry = self.registry.require(lm_head_name)?;
         let (rows, cols) = validate_lm_head_matvec_shape(
             entry,
             lm_head_name,
@@ -15410,133 +15356,55 @@ impl DenseStore {
         let vocab_rows = tokenizer.vocab_size();
         let top_k = sampler.top_k.min(vocab_rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
-        if metal.has_resident_dense_weights() && entry.quantization == TensorQuantization::None {
-            if sampler.repeat_penalty <= 1.0
-                && repeated.is_empty()
-                && let Some(candidates) = metal.dense_mmap_top_candidates(
-                    entry.byte_offset,
-                    &entry.dtype,
-                    hidden,
-                    rows,
-                    cols,
-                    cols,
-                    top_k,
-                )?
-            {
-                return Ok(Some(candidates));
-            }
-            let projected =
-                self.metal_matvec_tiled(metal, lm_head_name, hidden, rows, cols, rows)?;
-            let mut candidates = TopKCandidates::new(top_k);
-            for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
-                candidates.push(token, sampler.process_logit(token, value, &repeated));
-            }
-            return Ok(Some(candidates.into_sorted_vec()));
-        }
-
-        if let TensorQuantization::Q4 {
+        let TensorQuantization::Q4 {
             group_size,
             scale_bias_dtype,
             ..
         } = &entry.quantization
-        {
-            if sampler.repeat_penalty <= 1.0 && metal.has_resident_dense_weights() {
-                let layout = dense_q4_layout_with_scale_bias_dtype(
-                    &entry.shape,
-                    *group_size,
-                    scale_bias_dtype,
-                )?;
-                let packed_offset = entry.byte_offset;
-                let scales_offset = entry
-                    .byte_offset
-                    .checked_add(layout.packed_bytes as u64)
-                    .context("LM-head q4 mmap scales offset overflow")?;
-                let biases_offset = scales_offset
-                    .checked_add(layout.scales_bytes as u64)
-                    .context("LM-head q4 mmap biases offset overflow")?;
-                if let Some(candidates) = metal.q4_mmap_top_candidates(
-                    packed_offset,
-                    scales_offset,
-                    biases_offset,
-                    hidden,
-                    vocab_rows.min(rows),
-                    cols,
-                    layout.row_packed_bytes,
-                    layout.groups_per_row,
-                    *group_size,
-                    scale_bias_dtype,
-                    top_k,
-                )? {
-                    return Ok(Some(candidates));
-                }
-            }
-            let projected = self.q4_matvec_tiled(
-                lm_head_name,
+        else {
+            bail!(
+                "FlashMoe unsupported resolved LM-head path: tensor {lm_head_name} is not resident Q4"
+            );
+        };
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+        let scales_offset = entry
+            .byte_offset
+            .checked_add(layout.packed_bytes as u64)
+            .context("LM-head q4 mmap scales offset overflow")?;
+        let biases_offset = scales_offset
+            .checked_add(layout.scales_bytes as u64)
+            .context("LM-head q4 mmap biases offset overflow")?;
+        let repeated_vocab_tokens = repeated.iter().filter(|token| **token < vocab_rows).count();
+        let raw_candidate_count = top_k
+            .saturating_add(repeated_vocab_tokens)
+            .min(vocab_rows)
+            .max(1);
+        let raw_candidates = metal
+            .q4_mmap_top_candidates(
+                entry.byte_offset,
+                scales_offset,
+                biases_offset,
                 hidden,
-                rows,
+                vocab_rows.min(rows),
                 cols,
-                rows,
-                Some((metal, *group_size, Instant::now())),
-            )?;
-            let mut candidates = TopKCandidates::new(top_k);
-            for (token, value) in projected.into_iter().take(vocab_rows).enumerate() {
-                candidates.push(token, sampler.process_logit(token, value, &repeated));
-            }
-            return Ok(Some(candidates.into_sorted_vec()));
-        }
-
-        let lm_head_bytes = vocab_rows
-            .checked_mul(cols)
-            .and_then(|items| items.checked_mul(std::mem::size_of::<f32>()))
-            .context("LM-head decoded byte length overflow")?;
-        if let Some(candidates) = metal.lm_head_top_candidates_from_cached_buffer(
-            lm_head_name,
-            hidden,
-            vocab_rows,
-            cols,
+                layout.row_packed_bytes,
+                layout.groups_per_row,
+                *group_size,
+                scale_bias_dtype,
+                raw_candidate_count,
+            )?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported resolved LM-head path: resident Q4 topK execution is unavailable for {lm_head_name}"
+                )
+            })?;
+        Ok(rerank_resident_lm_head_candidates(
+            &raw_candidates,
             top_k,
             sampler.repeat_penalty,
             &repeated,
-        )? {
-            return Ok(Some(candidates));
-        }
-        if metal.can_cache_lm_head_bytes(lm_head_bytes) {
-            if let Some(weights) = self.read_full_tensor_f32(lm_head_name)? {
-                match metal.cache_lm_head_and_top_candidates(
-                    lm_head_name,
-                    &weights,
-                    hidden,
-                    vocab_rows,
-                    cols,
-                    top_k,
-                    sampler.repeat_penalty,
-                    &repeated,
-                ) {
-                    Ok(Some(candidates)) => return Ok(Some(candidates)),
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::debug!(
-                            error = %err,
-                            tensor = lm_head_name,
-                            "falling back to tiled LM-head sampling after Metal top-k cache failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut candidates = TopKCandidates::new(top_k);
-        let tile_rows = dense_projection_tile_rows(cols, rows);
-        for start in (0..rows).step_by(tile_rows) {
-            let end = (start + tile_rows).min(rows);
-            let tensor = self.read_tensor_rows_f32_cached(lm_head_name, start, end - start)?;
-            let projected = metal.dense_matvec(tensor.as_slice(), hidden, end - start, cols)?;
-            for (offset, value) in projected.into_iter().enumerate() {
-                let token = start + offset;
-                candidates.push(token, sampler.process_logit(token, value, &repeated));
-            }
-        }
-        Ok(Some(candidates.into_sorted_vec()))
+        ))
     }
 
     fn lm_head_logits(
@@ -22314,6 +22182,29 @@ mod tests {
     }
 
     #[test]
+    fn resident_lm_head_candidate_superset_preserves_repeat_penalized_top_k() {
+        let logits = vec![10.0, 9.99, 9.98, 9.97, 9.96, 9.0, 8.0];
+        let sampler = TokenSampler::new(0.7, 2, 99);
+        let prompt = vec![0, 1, 2];
+        let repeated = sampler.repeated_tokens(&prompt, &[]);
+        let raw_count = sampler.top_k + repeated.len();
+        let raw_candidates = top_k(&logits, raw_count);
+
+        let reranked = rerank_resident_lm_head_candidates(
+            &raw_candidates,
+            sampler.top_k,
+            sampler.repeat_penalty,
+            &repeated,
+        );
+
+        assert_eq!(reranked, sampler.top_candidates(&logits, &prompt, &[]));
+        assert_eq!(
+            reranked.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
     fn top_k_candidates_matches_full_top_k_across_tiles() {
         let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0];
         let mut candidates = TopKCandidates::new(3);
@@ -23073,6 +22964,65 @@ mod tests {
 
         assert!(err.to_string().contains("both linear-attention"), "{err:#}");
         assert!(err.to_string().contains("full-attention"), "{err:#}");
+    }
+
+    #[test]
+    fn qwen35_q4_graph_binding_rejects_projection_outside_resident_store() {
+        let shape = vec![4, 4];
+        let group_size = 2;
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&shape, group_size, EXPERT_SCALE_BIAS_DTYPE_BF16)
+                .unwrap();
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let byte_offset = 64u64;
+        let manifest = FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: tensor_name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "U32".to_string(),
+                shape,
+                source_offsets: [0, layout.total_bytes as u64],
+                runtime_offset: byte_offset,
+                byte_len: layout.total_bytes as u64,
+                quantization: TensorQuantization::Q4 {
+                    group_size,
+                    format: DENSE_Q4_FORMAT.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                },
+                q4_sources: None,
+            }],
+        };
+        let registry = TensorRegistry::from_manifest(&manifest);
+        let required_len = byte_offset + layout.total_bytes as u64;
+
+        require_resident_q4_graph_projection(
+            &registry,
+            required_len,
+            "CMD1 full-attention projection",
+            tensor_name,
+            4,
+            4,
+        )
+        .unwrap();
+
+        let err = require_resident_q4_graph_projection(
+            &registry,
+            required_len - 1,
+            "CMD1 full-attention projection",
+            tensor_name,
+            4,
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported resolved Qwen3.5 Q4 CMD1 full-attention projection"),
+            "{err:#}"
+        );
     }
 
     #[test]

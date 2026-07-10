@@ -1627,6 +1627,7 @@ impl SharedExpertPhaseQ4Projections {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_shared_expert_q4_phase_projections<F>(
     layer: usize,
     width: usize,

@@ -173,6 +173,10 @@ Baseline reviewed on 2026-07-10:
   implementation. Missing projections, static offsets, recurrent state, norm weights, or compatible
   dimensions are named errors; the live graph no longer retries through an intermediate
   Metal-values path or CPU recurrence.
+- Load now binds every Qwen3.5 Q4 CMD1, CMD2, shared-CMD3, linear static-state, and LM-head
+  projection against the actual manifest and resident byte ranges before capability resolution.
+  Deferred next-layer state, CPU full-attention placement, resident projection batches, and
+  resident Q4 LM-head sampling are fixed graph policy rather than runtime probes.
 - Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
   no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
@@ -185,17 +189,14 @@ The architecture is not yet at the target:
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
   `VisionEncoder` remain in `legacy.rs`.
-- Deferred input retention, general dense projection batching, LM-head execution, and diagnostic
-  or expert-skipping helpers still contain `Option`, boolean success, and `Ok(None)` continuation
-  APIs. The remaining Gate 1 audit must distinguish graph-stage choices that need concrete
-  resolution from non-stage cache hits and explicitly non-production reference/debug behavior.
+- General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
+  but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this checkpoint, concrete Qwen3.5 Q4 storage/device resolution and required Metal engine
-construction have landed, but stage implementation discovery and execution ownership have not.
-Approximately 50-60% of the architectural work remains.
+At this checkpoint, Gate 1 concrete graph resolution is complete. Execution ownership remains in
+`legacy.rs`, so approximately 45-55% of the architectural work remains.
 
 ## Completion Gates
 
@@ -204,8 +205,8 @@ exit criteria hold in production code and tests.
 
 | Gate | Status | Architectural result |
 | --- | --- | --- |
-| 1. Concrete Graph Resolution | Active | Support is resolved from the real model and device. |
-| 2. Concrete Metal Builders | Pending | Metal command execution is owned by `metal`. |
+| 1. Concrete Graph Resolution | Complete | Support is resolved from the real model and device. |
+| 2. Concrete Metal Builders | Active | Metal command execution is owned by `metal`. |
 | 3. Scheduler-Owned Runtime | Pending | The scheduler executes the layer lifecycle. |
 | 4. Weights And State Ownership | Pending | Runtime storage and state have single owners. |
 | 5. Qwen3.5 Q4 Correctness Closure | Pending | The first production graph has parity evidence. |
@@ -234,6 +235,17 @@ Exit criteria:
 - Capability tests cover successful Qwen3.5 Q4 resolution and named family/dtype/layout/device/stage
   failures.
 - No graph-stage choice depends on trying an implementation and observing `None` or `false`.
+
+Completion evidence:
+
+- The live Qwen3.5 Q4 load resolves real dense byte ranges, fixed expert metadata/files, compiled
+  Metal kernels, routing policy, input adapter, state policy, and all nine stage implementations.
+- Required Metal is a construction invariant; unsupported family, dtype, layout, device, and
+  missing-stage combinations fail before inference.
+- Production Qwen3.5 execution has one declared attention placement, deferred-state policy,
+  CMD1/CMD2/CMD3 flow, whole-slot expert source, and resident Q4 LM-head implementation.
+- Focused capability/parity tests, all-target tests, release build, and the required smoke provide
+  the checkpoint verification recorded by the Gate 1 completion commit.
 
 ### Gate 2: Concrete Metal Builders
 
@@ -440,7 +452,7 @@ Use this prompt for implementation work:
 ```text
 Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
 
-Active gate: Gate 1, Concrete Graph Resolution.
+Active gate: Gate 2, Concrete Metal Builders.
 
 Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
 the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
@@ -457,18 +469,20 @@ North star:
 - No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
   the benchmark lock opens.
 
-For Gate 1:
-1. Replace family-level capability labels with a concrete execution specification built from model
-   config, the actual tensor manifest, expert metadata, platform/device, available Metal pipelines,
-   and execution policy.
-2. Select exactly one dense layout, expert layout, attention implementation, routing
-   implementation, CMD1/CMD2/CMD3 implementation, state policy, and input adapter.
-3. Resolve Qwen3.5 Q4 completely. Keep unimplemented Qwen MoE, Qwen-VL, BF16/F16 expert, layout, or
-   device combinations as precise named errors.
-4. Remove Qwen3.5 fixed-Q4 assumptions from unrelated model-family layouts.
-5. Make required Metal stages impossible to construct with an absent executor or kernel.
-6. Replace live implementation probing through Option/bool/Ok(None) with resolved implementations
-   or unsupported errors for the paths touched by this gate.
+For Gate 2:
+1. Move `MetalExecutor`, `MetalExecutorInner`, device/queue/pipeline ownership, Obj-C buffer
+   lifetime, reusable buffers, command commit/wait, and failure cleanup from `legacy.rs` to
+   `metal.rs` in coherent command-builder slices.
+2. Move complete CMD1 projection/attention-state encoders, fused CMD2 post-attention/routing
+   encoders, fused whole-slot CMD3 encoders, and resident Q4 LM-head builders behind concrete typed
+   `metal` APIs selected by the resolved graph.
+3. Make builders consume typed state plus resident weight/expert handles and return submitted or
+   deferred typed state. The runtime and scheduler must not call low-level `encode_*`, Obj-C, or
+   pipeline helpers.
+4. Delete obsolete CPU-upload, component-upload, fused/unfused, alternate wait, and optional Metal
+   builder paths as their concrete replacements take production ownership.
+5. Keep `legacy.rs` as a shrinking call-through facade during extraction; do not move descriptors
+   without the command execution and live caller that use them.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -481,7 +495,7 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 1 is a checkpoint, not the end of the goal. When every Gate 1 exit criterion is proven, update
-the gate status and this prompt to Gate 2 in the same semantic commit, then continue implementing
+Gate 2 is a checkpoint, not the end of the goal. When every Gate 2 exit criterion is proven, update
+the gate status and this prompt to Gate 3 in the same semantic commit, then continue implementing
 the plan. Do not mark the overall goal complete until Gate 7 is complete.
 ```

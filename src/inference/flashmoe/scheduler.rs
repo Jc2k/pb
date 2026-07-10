@@ -1589,6 +1589,7 @@ pub(crate) struct ScheduledCmd3CpuInput<'a> {
 }
 
 impl<'a> ScheduledCmd3CpuInput<'a> {
+    #[cfg(test)]
     pub(crate) fn new(layer: usize, normed: &'a [f32], residual: &'a [f32]) -> Result<Self> {
         let state =
             FlashMoeCmd3InputState::cpu_normed_residual(layer, normed.len(), residual.len());
@@ -1863,6 +1864,7 @@ pub trait ScheduledSharedExpert {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum ScheduledSharedExpertPhaseRef<'a> {
     None,
     Dense(&'a SharedExpertPhaseWeights),
@@ -1870,6 +1872,7 @@ pub(crate) enum ScheduledSharedExpertPhaseRef<'a> {
 }
 
 impl<'a> ScheduledSharedExpertPhaseRef<'a> {
+    #[allow(dead_code)]
     pub(crate) fn from_options(
         dense: Option<&'a SharedExpertPhaseWeights>,
         q4: Option<&'a SharedExpertPhaseQ4Projections>,

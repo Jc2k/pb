@@ -108,6 +108,7 @@ impl FlashMoeCpuBuffer {
         Self::new(FlashMoeStateBufferRole::Hidden, values)
     }
 
+    #[cfg(test)]
     pub(crate) fn residual(values: Vec<f32>) -> Self {
         Self::new(FlashMoeStateBufferRole::Residual, values)
     }
@@ -142,6 +143,7 @@ impl FlashMoeCpuBuffer {
         self.values = values;
     }
 
+    #[cfg(test)]
     pub(crate) fn clone_values(&self) -> Vec<f32> {
         self.values.clone()
     }
@@ -217,6 +219,7 @@ impl FlashMoeStateBufferDescriptor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cpu(role: FlashMoeStateBufferRole, len: usize) -> Self {
         Self::new(role, len, FlashMoeStatePlacement::CpuVisible)
     }
@@ -468,6 +471,7 @@ pub struct FlashMoeCmd3InputState {
 }
 
 impl FlashMoeCmd3InputState {
+    #[cfg(test)]
     pub(crate) fn cpu_normed_residual(
         layer: usize,
         normed_len: usize,
@@ -713,6 +717,7 @@ impl FlashMoeTokenState {
         self.hidden.replace_values(values);
     }
 
+    #[cfg(test)]
     pub(crate) fn residual_snapshot(&self) -> FlashMoeCpuBuffer {
         FlashMoeCpuBuffer::residual(self.hidden.clone_values())
     }
@@ -1229,10 +1234,12 @@ impl FlashMoeFullAttentionKvRecord {
         self.layer
     }
 
+    #[cfg(test)]
     pub(crate) fn key(&self) -> &[f32] {
         &self.key
     }
 
+    #[cfg(test)]
     pub(crate) fn value(&self) -> &[f32] {
         &self.value
     }
