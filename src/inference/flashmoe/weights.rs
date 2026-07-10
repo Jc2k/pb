@@ -787,7 +787,8 @@ fn validate_cmd2_q4_projection_resident_bounds(
     Ok(())
 }
 
-pub(crate) fn build_cmd2_q4_post_attention_prep_projections<F>(
+#[cfg(test)]
+fn build_cmd2_q4_post_attention_prep_projections<F>(
     layer: usize,
     experts: usize,
     out_proj_name: &str,
@@ -819,6 +820,45 @@ where
         active_experts,
     )
     .map(Some)
+}
+
+pub(crate) fn build_required_cmd2_q4_post_attention_prep_projections<F>(
+    layer: usize,
+    experts: usize,
+    out_proj_name: &str,
+    attention_width: usize,
+    residual_width: usize,
+    active_experts: usize,
+    mut projection: F,
+) -> Result<Cmd2Q4PostAttentionPrepProjections>
+where
+    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+{
+    if experts == 0 || attention_width == 0 || residual_width == 0 {
+        bail!(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: experts {experts}, attention width {attention_width}, and residual width {residual_width} must be non-zero"
+        );
+    }
+    let out_proj = projection(out_proj_name, residual_width, attention_width)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing resident output projection {out_proj_name}"
+        )
+    })?;
+    let router_name = router_tensor_name(layer);
+    let router = projection(&router_name, experts, residual_width)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing resident router projection {router_name}"
+        )
+    })?;
+    Cmd2Q4PostAttentionPrepProjections::new(
+        layer,
+        out_proj,
+        router,
+        experts,
+        residual_width,
+        attention_width,
+        active_experts,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2327,6 +2367,77 @@ mod tests {
             })
             .unwrap();
         assert!(disabled.is_none());
+    }
+
+    #[test]
+    fn required_cmd2_q4_post_attention_prep_projection_errors_on_missing_bindings() {
+        let missing_out = build_required_cmd2_q4_post_attention_prep_projections(
+            7,
+            16,
+            "model.layers.7.self_attn.o_proj.weight",
+            24,
+            32,
+            4,
+            |name, output_width, input_len| {
+                if name.ends_with("o_proj.weight") {
+                    return Ok(None);
+                }
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            missing_out
+                .to_string()
+                .contains("missing resident output projection"),
+            "{missing_out:#}"
+        );
+
+        let missing_router = build_required_cmd2_q4_post_attention_prep_projections(
+            7,
+            16,
+            "model.layers.7.self_attn.o_proj.weight",
+            24,
+            32,
+            4,
+            |name, output_width, input_len| {
+                if name.ends_with("mlp.gate.weight") {
+                    return Ok(None);
+                }
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            missing_router
+                .to_string()
+                .contains("missing resident router projection model.layers.7.mlp.gate.weight"),
+            "{missing_router:#}"
+        );
     }
 
     #[test]

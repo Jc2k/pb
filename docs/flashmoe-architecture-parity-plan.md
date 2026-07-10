@@ -312,9 +312,10 @@ The validator should reject silent fallbacks such as:
   post-attention prep state plus preselected routes into a scheduled routing command, so the runtime
   no longer stitches those graph stages together manually. The Q4 post-attention prep helper now
   receives weight-owned CMD2 projection bindings for output projection and router projection instead
-  of resolving those bindings inside the legacy helper, and its resident execution plan now rejects
-  mismatched attention/residual/norm shapes as unsupported scheduled-CMD2 inputs instead of
-  returning a silent no-prep result. The scheduled router score command now owns raw score
+  of resolving those bindings inside the legacy helper; the live scheduled prep path now requires
+  those resident bindings, while optional lookup is kept only for descriptor discovery. Its resident
+  execution plan now rejects mismatched attention/residual/norm shapes as unsupported
+  scheduled-CMD2 inputs instead of returning a silent no-prep result. The scheduled router score command now owns raw score
   finalization into a declared batch, routing-output validation, and score-based topK selection
   before the runtime receives a `ScheduledRoutingCommand`. Router projection execution,
   Accelerate score production, and Metal router topK now require a weight-built declared resident

@@ -155,14 +155,15 @@ use super::weights::{
     RouterScoreProjectionTopKPlan, RouterScoreProjectionTopKSource, RuntimeTensorEntry,
     SharedExpertPhaseCache, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
     TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
-    attention_tensor_name, build_cmd2_q4_post_attention_prep_projections,
-    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
-    layer_norm_tensor_name, linear_attention_input_projection_requests,
-    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
-    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
-    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
+    attention_tensor_name, build_dense_q4_mmap_projection,
+    build_required_cmd2_q4_post_attention_prep_projections,
+    build_router_score_projection_descriptor, build_shared_expert_q4_phase_projections,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    full_attention_input_projection_requests, layer_norm_tensor_name,
+    linear_attention_input_projection_requests, linear_attention_scalar_tensor_name,
+    linear_attention_tensor_name, prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset,
+    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -15685,7 +15686,7 @@ impl DenseStore {
             return Ok(None);
         }
         let residual_len = residual.len();
-        let Some(projections) = build_cmd2_q4_post_attention_prep_projections(
+        let projections = build_required_cmd2_q4_post_attention_prep_projections(
             layer,
             experts,
             out_proj_name,
@@ -15695,10 +15696,7 @@ impl DenseStore {
             |tensor_name, output_width, input_len| {
                 self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
             },
-        )?
-        else {
-            return Ok(None);
-        };
+        )?;
         metal.q4_post_attention_prep_topk(
             &projections,
             attention_output,
@@ -15723,7 +15721,7 @@ impl DenseStore {
             return Ok(None);
         }
         let residual_len = residual.len();
-        let Some(projections) = build_cmd2_q4_post_attention_prep_projections(
+        let projections = build_required_cmd2_q4_post_attention_prep_projections(
             layer,
             experts,
             out_proj_name,
@@ -15733,10 +15731,7 @@ impl DenseStore {
             |tensor_name, output_width, input_len| {
                 self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
             },
-        )?
-        else {
-            return Ok(None);
-        };
+        )?;
         metal.q4_post_attention_prep_topk_from_buffer(
             &projections,
             attention_output,
