@@ -181,9 +181,11 @@ The validator should reject silent fallbacks such as:
   pipeline-name plan, typed pipeline handle set, release ordering, and kernel-surface coverage.
   Metal post-attention prep now materializes as a Metal-owned typed payload carrying scheduler CMD3
   input state, declared prep state, buffers, active routes, and the optional resolved routing
-  command. Legacy still owns the concrete encoders and Obj-C buffer lifecycle, but command
-  submission diagnostics, wait policy, kernel definitions, and post-attention prep payloads now have
-  a module boundary for the CMD1/CMD2/CMD3 builders to move behind.
+  command. CMD3 expert-phase temporary buffers now carry a Metal-owned recyclable/borrowed
+  lifecycle marker. Legacy still owns the concrete encoders and Obj-C buffer lifecycle, but command
+  submission diagnostics, wait policy, kernel definitions, post-attention prep payloads, and phase
+  buffer lifecycle markers now have a module boundary for the CMD1/CMD2/CMD3 builders to move
+  behind.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.
@@ -310,7 +312,8 @@ The validator should reject silent fallbacks such as:
   allocation, so mismatched normed/residual state is an explicit unsupported input instead of a
   silent no-op/fallback. Metal post-attention prep inputs for CMD3 now materialize as a Metal-owned
   payload carrying scheduler-typed GPU-resident state plus the declared active-route count before
-  the Metal expert phase consumes buffers. The actual shared gate/up/down, next-norm application, and shared down execution still
+  the Metal expert phase consumes buffers. CMD3 phase buffers now carry Metal-owned lifecycle
+  intent before release/recycle. The actual shared gate/up/down, next-norm application, and shared down execution still
   live in the older Metal/CPU phase helpers. That execution should become part of the same CMD2/CMD3
   builder model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position

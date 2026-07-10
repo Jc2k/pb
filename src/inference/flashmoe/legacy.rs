@@ -103,8 +103,9 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPhaseBuffer, MetalPipelineNameSet,
+    MetalPipelineSet, MetalPostAttentionPrep, metal_command_failure_requires_release,
+    resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2896,24 +2897,6 @@ struct MetalLinearAttentionLayerState {
     conv_dim: usize,
     total_value_width: usize,
     num_value_heads: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalPhaseBuffer {
-    id: ObjcId,
-    recycle: bool,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalPhaseBuffer {
-    fn recyclable(id: ObjcId) -> Self {
-        Self { id, recycle: true }
-    }
-
-    fn borrowed(id: ObjcId) -> Self {
-        Self { id, recycle: false }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

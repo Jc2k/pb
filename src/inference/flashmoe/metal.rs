@@ -346,6 +346,24 @@ impl MetalPostAttentionPrep {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalPhaseBuffer {
+    pub(crate) id: MetalObjcId,
+    pub(crate) recycle: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalPhaseBuffer {
+    pub(crate) fn recyclable(id: MetalObjcId) -> Self {
+        Self { id, recycle: true }
+    }
+
+    pub(crate) fn borrowed(id: MetalObjcId) -> Self {
+        Self { id, recycle: false }
+    }
+}
+
 pub const METAL_SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2390,5 +2408,19 @@ mod tests {
             err.to_string()
                 .contains("Metal post-attention input for layer 3")
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn phase_buffer_declares_recyclable_or_borrowed_lifecycle() {
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+
+        let recyclable = MetalPhaseBuffer::recyclable(id);
+        assert_eq!(recyclable.id, id);
+        assert!(recyclable.recycle);
+
+        let borrowed = MetalPhaseBuffer::borrowed(id);
+        assert_eq!(borrowed.id, id);
+        assert!(!borrowed.recycle);
     }
 }
