@@ -102,11 +102,11 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, metal_command_failure_requires_release,
-    resolve_metal_command_wait,
+    METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy, MetalAttentionValues,
+    MetalBatchProjectionInput, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalLinearAttentionStaticOffsets,
+    MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep,
+    MetalProjectionBatch, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -167,7 +167,6 @@ type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
 const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
 const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
 const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
-const METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS: usize = 128;
 #[cfg(test)]
 const DENSE_Q4_GROUP_SIZE: usize = 16;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
@@ -2687,27 +2686,6 @@ impl MetalExecutor {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = tokens;
-            MetalAttentionBackend::Cpu
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetalAttentionBackend {
-    Cpu,
-    Gpu,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
-struct MetalAttentionPolicy;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalAttentionPolicy {
-    fn backend(&self, tokens: usize) -> MetalAttentionBackend {
-        if tokens > METAL_ATTENTION_SHORT_CONTEXT_BENCH_TOKENS {
-            MetalAttentionBackend::Gpu
-        } else {
             MetalAttentionBackend::Cpu
         }
     }

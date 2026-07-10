@@ -10,6 +10,27 @@ use super::state::FlashMoePostAttentionPrepState;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
 
+const DEFAULT_METAL_ATTENTION_CPU_MAX_TOKENS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetalAttentionBackend {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MetalAttentionPolicy;
+
+impl MetalAttentionPolicy {
+    pub(crate) fn backend(&self, tokens: usize) -> MetalAttentionBackend {
+        if tokens > DEFAULT_METAL_ATTENTION_CPU_MAX_TOKENS {
+            MetalAttentionBackend::Gpu
+        } else {
+            MetalAttentionBackend::Cpu
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalLinearAttentionStaticOffsets {
@@ -2456,6 +2477,21 @@ mod tests {
             linear_delta_step_pipeline: 35,
             linear_gated_rms_norm_pipeline: 36,
         }
+    }
+
+    #[test]
+    fn attention_policy_declares_cpu_then_gpu_context_boundary() {
+        let policy = MetalAttentionPolicy;
+
+        assert_eq!(policy.backend(0), MetalAttentionBackend::Cpu);
+        assert_eq!(
+            policy.backend(DEFAULT_METAL_ATTENTION_CPU_MAX_TOKENS),
+            MetalAttentionBackend::Cpu
+        );
+        assert_eq!(
+            policy.backend(DEFAULT_METAL_ATTENTION_CPU_MAX_TOKENS + 1),
+            MetalAttentionBackend::Gpu
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
