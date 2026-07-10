@@ -88,13 +88,16 @@ use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     ScheduledAttentionMathOutput, ScheduledCmd1InputSource, ScheduledCmd2AttentionSource,
     ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource, ScheduledCmd3Command,
-    ScheduledCmd3CpuInput, ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledCmd3Input,
-    ScheduledCmd3InputSource, ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
-    ScheduledCmd3Submission, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertReadCoordinator as ExpertScheduler, ScheduledExpertSlot,
-    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRouterScoreProjectionCommand,
-    ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpert,
+    ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledCmd3Submission,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
+    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCandidateSource,
+    ScheduledRoutingCommand, ScheduledSharedExpert,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
+};
+#[cfg(test)]
+use super::scheduler::{
+    ScheduledCmd3Expert, ScheduledCmd3ExpertPayload, ScheduledQ4ExpertPhaseMlpPayload,
 };
 #[cfg(test)]
 use super::state::reusable_session_prefix_len;
@@ -18089,6 +18092,7 @@ impl AsRef<ExpertWeights> for ExpertWeights {
     }
 }
 
+#[cfg(test)]
 impl ScheduledCmd3Expert for ExpertWeights {
     fn scheduled_expert_layer(&self) -> usize {
         self.layer
@@ -18103,6 +18107,7 @@ impl ScheduledCmd3Expert for ExpertWeights {
     }
 }
 
+#[cfg(test)]
 impl ScheduledCmd3ExpertPayload for ExpertWeights {
     fn scheduled_cmd3_expert_phase_payload(
         &self,

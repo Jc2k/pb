@@ -143,8 +143,8 @@ The validator should reject silent fallbacks such as:
   a Q4 or dense shared expert implementation cannot be accepted without its declared graph shape.
   Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3
   submission retains those scheduled slots instead of adapting them into `ExpertWeights`, and the
-  old direct active-expert read and `ExpertWeights` Metal submission path is now test-only instead
-  of a production fallback. The scheduler now builds resolved
+  old direct active-expert read, `ExpertWeights` scheduled-CMD3 adapter, and `ExpertWeights` Metal
+  submission path are now test-only instead of production fallbacks. The scheduler now builds resolved
   CMD1/attention/CMD2/routing/CMD3 command objects before the legacy Metal encoder or runtime
   helpers are called. CMD3 next-layer norm weights are declared as typed scheduled inputs with
   source, tensor name, and width before the Metal encoder receives the CPU slice; when the graph
