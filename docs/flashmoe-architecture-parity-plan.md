@@ -341,7 +341,9 @@ The validator should reject silent fallbacks such as:
   intent before release/recycle. The Metal CMD3 bridge now builds one `MetalCmd3ExecutionPlan` that
   validates phase shape, shared source/shape, active expert payloads, next-norm, and combine
   dispatch before Obj-C encoding begins, and that plan declares the command-local buffer layout and
-  scalar constants used by the legacy bridge. Shared-expert temporary buffers, active-expert
+  scalar constants used by the legacy bridge. Metal-post-attention CMD3 now requires configured
+  shared experts to resolve as resident Q4 shared-expert projections instead of falling back to
+  dense CPU shared weights. Shared-expert temporary buffers, active-expert
   activation/projection buffers, and submitted command context now resolve through Metal-owned plan
   helpers instead of legacy size/metadata recomputation. The actual shared gate/up/down, next-norm
   application, and shared down execution still live in the older Metal/CPU phase helpers. That

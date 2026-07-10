@@ -157,13 +157,13 @@ use super::weights::{
     TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
     attention_tensor_name, build_dense_q4_mmap_projection,
     build_required_cmd2_q4_post_attention_prep_projections,
-    build_router_score_projection_descriptor, build_shared_expert_q4_phase_projections,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    full_attention_input_projection_requests, layer_norm_tensor_name,
-    linear_attention_input_projection_requests, linear_attention_scalar_tensor_name,
-    linear_attention_tensor_name, prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset,
-    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
-    validate_dense_matvec_shape,
+    build_required_shared_expert_q4_phase_projections, build_router_score_projection_descriptor,
+    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
+    layer_norm_tensor_name, linear_attention_input_projection_requests,
+    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
+    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
+    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -9983,7 +9983,7 @@ impl FlashMoeEngine {
             let shared_compute_started = Instant::now();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let shared_q4_phase = if has_metal_post_attention_prep {
-                self.shared_expert_q4_phase_projections(layer, runtime.width)?
+                self.required_shared_expert_q4_phase_projections(layer, runtime.width)?
             } else {
                 None
             };
@@ -11048,6 +11048,28 @@ impl FlashMoeEngine {
             self.config.shared_expert_intermediate_size(),
             |layer, width, shared_experts, intermediate| {
                 self.dense.shared_expert_q4_phase_projections(
+                    layer,
+                    width,
+                    shared_experts,
+                    intermediate,
+                )
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn required_shared_expert_q4_phase_projections(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
+        self.shared_expert_phases.q4(
+            layer,
+            width,
+            self.config.shared_experts(),
+            self.config.shared_expert_intermediate_size(),
+            |layer, width, shared_experts, intermediate| {
+                self.dense.required_shared_expert_q4_phase_projections(
                     layer,
                     width,
                     shared_experts,
@@ -15594,6 +15616,25 @@ impl DenseStore {
         intermediate: usize,
     ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
         build_shared_expert_q4_phase_projections(
+            layer,
+            width,
+            shared_experts,
+            intermediate,
+            |tensor_name, output_width, input_len| {
+                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn required_shared_expert_q4_phase_projections(
+        &self,
+        layer: usize,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+    ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
+        build_required_shared_expert_q4_phase_projections(
             layer,
             width,
             shared_experts,

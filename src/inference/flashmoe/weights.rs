@@ -1594,6 +1594,59 @@ where
     Ok(Some(shared))
 }
 
+pub(crate) fn build_required_shared_expert_q4_phase_projections<F>(
+    layer: usize,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    mut projection: F,
+) -> Result<Option<SharedExpertPhaseQ4Projections>>
+where
+    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+{
+    if shared_experts == 0 || intermediate == 0 {
+        return Ok(None);
+    }
+    let shape = SharedExpertPhaseShape::new(width, shared_experts, intermediate)?;
+
+    let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+    let up_name = shared_expert_tensor_name(layer, "up_proj");
+    let down_name = shared_expert_tensor_name(layer, "down_proj");
+    let router_name = shared_expert_gate_tensor_name(layer);
+    let gate = projection(&gate_name, shape.total_intermediate, shape.width)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared gate projection {gate_name}"
+        )
+    })?;
+    let up = projection(&up_name, shape.total_intermediate, shape.width)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared up projection {up_name}"
+        )
+    })?;
+    let down = projection(&down_name, shape.width, shape.total_intermediate)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared down projection {down_name}"
+        )
+    })?;
+    let router = projection(&router_name, shape.shared_experts, shape.width)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared router projection {router_name}"
+        )
+    })?;
+
+    let shared = SharedExpertPhaseQ4Projections {
+        gate,
+        up,
+        down,
+        router,
+        shared_experts,
+        intermediate,
+        width,
+    };
+    shared.validated_shape()?;
+    Ok(Some(shared))
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SharedExpertPhaseCache {
     dense: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
@@ -2963,6 +3016,48 @@ mod tests {
         )
         .unwrap();
         assert!(partial.is_none());
+    }
+
+    #[test]
+    fn required_shared_expert_q4_builder_errors_on_missing_configured_binding() {
+        let disabled =
+            build_required_shared_expert_q4_phase_projections(4, 32, 0, 16, |_, _, _| {
+                panic!("disabled shared Q4 experts must not request projections")
+            })
+            .unwrap();
+        assert!(disabled.is_none());
+
+        let missing = build_required_shared_expert_q4_phase_projections(
+            4,
+            32,
+            2,
+            16,
+            |name, output_width, input_len| {
+                if name.ends_with("down_proj.weight") {
+                    return Ok(None);
+                }
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("missing resident shared down projection"),
+            "{missing:#}"
+        );
     }
 
     #[test]
