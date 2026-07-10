@@ -139,9 +139,9 @@ use super::weights::{
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
     RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
     SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    apply_qwen3next_norm_offset_if_needed, build_shared_expert_phase_weights,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    apply_qwen3next_norm_offset_if_needed, build_cmd2_q4_post_attention_prep_projections,
+    build_shared_expert_phase_weights, build_shared_expert_q4_phase_projections,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -16643,20 +16643,24 @@ impl DenseStore {
             return Ok(None);
         }
         let residual_len = residual.len();
-        let router_name = router_tensor_name(layer);
-        let Some(out_proj) =
-            self.dense_q4_mmap_projection(out_proj_name, residual_len, attention_output.len())?
-        else {
-            return Ok(None);
-        };
-        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
+        let Some(projections) = build_cmd2_q4_post_attention_prep_projections(
+            layer,
+            experts,
+            out_proj_name,
+            attention_output.len(),
+            residual_len,
+            active_experts,
+            |tensor_name, output_width, input_len| {
+                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
+            },
+        )?
         else {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk(
             layer,
-            &out_proj,
-            &router,
+            &projections.out_proj,
+            &projections.router,
             attention_output,
             residual,
             post_norm_weight,
@@ -16680,20 +16684,24 @@ impl DenseStore {
             return Ok(None);
         }
         let residual_len = residual.len();
-        let router_name = router_tensor_name(layer);
-        let Some(out_proj) =
-            self.dense_q4_mmap_projection(out_proj_name, residual_len, attention_output.len)?
-        else {
-            return Ok(None);
-        };
-        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
+        let Some(projections) = build_cmd2_q4_post_attention_prep_projections(
+            layer,
+            experts,
+            out_proj_name,
+            attention_output.len,
+            residual_len,
+            active_experts,
+            |tensor_name, output_width, input_len| {
+                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
+            },
+        )?
         else {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk_from_buffer(
             layer,
-            &out_proj,
-            &router,
+            &projections.out_proj,
+            &projections.router,
             attention_output,
             residual,
             post_norm_weight,
