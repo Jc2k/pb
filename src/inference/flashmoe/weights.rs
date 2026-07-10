@@ -355,6 +355,22 @@ pub(crate) struct RouterScoreProjectionScorePlan<'a> {
     pub(crate) source: RouterScoreProjectionScoreSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouterScoreProjectionTopKSource {
+    ResidentDense(DenseMmapMatvecProjection),
+    ResidentQ4(DenseQ4MmapMatvecProjection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouterScoreProjectionTopKPlan {
+    pub(crate) layer: usize,
+    pub(crate) tensor_name: String,
+    pub(crate) experts: usize,
+    pub(crate) hidden_width: usize,
+    pub(crate) active_experts: usize,
+    pub(crate) source: RouterScoreProjectionTopKSource,
+}
+
 impl<'a> RouterScoreProjectionExecution<'a> {
     pub(crate) fn score_plan(
         self,
@@ -483,6 +499,43 @@ impl RouterScoreProjectionDescriptor {
             experts: self.experts,
             hidden_width: self.hidden_width,
             kind,
+        })
+    }
+
+    pub(crate) fn topk_plan(
+        &self,
+        hidden_len: usize,
+        active_experts: usize,
+    ) -> Result<RouterScoreProjectionTopKPlan> {
+        if self.hidden_width != hidden_len {
+            bail!(
+                "Flash-MoE router score projection topK hidden length {} does not match declared width {}",
+                hidden_len,
+                self.hidden_width
+            );
+        }
+        if active_experts == 0 || active_experts > self.experts {
+            bail!(
+                "Flash-MoE router score projection topK active experts {} is outside declared expert range 1..={}",
+                active_experts,
+                self.experts
+            );
+        }
+        let source = match &self.binding {
+            RouterScoreProjectionBinding::ResidentDense(projection) => {
+                RouterScoreProjectionTopKSource::ResidentDense(projection.clone())
+            }
+            RouterScoreProjectionBinding::ResidentQ4(projection) => {
+                RouterScoreProjectionTopKSource::ResidentQ4(projection.clone())
+            }
+        };
+        Ok(RouterScoreProjectionTopKPlan {
+            layer: self.layer,
+            tensor_name: self.tensor_name.clone(),
+            experts: self.experts,
+            hidden_width: self.hidden_width,
+            active_experts,
+            source,
         })
     }
 }
@@ -1790,6 +1843,51 @@ mod tests {
     }
 
     #[test]
+    fn router_score_projection_topk_plan_declares_dense_binding() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 64,
+            byte_len: 32,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 128, 2, 4).unwrap();
+
+        let plan = descriptor.topk_plan(4, 1).unwrap();
+        assert_eq!(plan.layer, 3);
+        assert_eq!(plan.tensor_name, entry.name);
+        assert_eq!(plan.experts, 2);
+        assert_eq!(plan.hidden_width, 4);
+        assert_eq!(plan.active_experts, 1);
+        match plan.source {
+            RouterScoreProjectionTopKSource::ResidentDense(projection) => {
+                assert_eq!(projection.byte_offset, 64);
+                assert_eq!(projection.rows, 2);
+                assert_eq!(projection.cols, 4);
+            }
+            RouterScoreProjectionTopKSource::ResidentQ4(_) => panic!("expected dense topK plan"),
+        }
+
+        let hidden_err = descriptor.topk_plan(3, 1).unwrap_err();
+        assert!(
+            hidden_err
+                .to_string()
+                .contains("topK hidden length 3 does not match declared width 4"),
+            "{hidden_err:#}"
+        );
+        let active_err = descriptor.topk_plan(4, 0).unwrap_err();
+        assert!(
+            active_err
+                .to_string()
+                .contains("active experts 0 is outside declared expert range 1..=2"),
+            "{active_err:#}"
+        );
+    }
+
+    #[test]
     fn router_score_projection_descriptor_resolves_q4_binding() {
         let entry = RuntimeTensorEntry {
             name: "model.layers.3.mlp.gate.weight".to_string(),
@@ -1815,6 +1913,36 @@ mod tests {
                 assert_eq!(projection.cols, 4);
             }
             RouterScoreProjectionBinding::ResidentDense(_) => panic!("expected q4 binding"),
+        }
+    }
+
+    #[test]
+    fn router_score_projection_topk_plan_declares_q4_binding() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 128,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+        let descriptor =
+            RouterScoreProjectionDescriptor::from_entry(3, &entry.name, &entry, 256, 2, 4).unwrap();
+
+        let plan = descriptor.topk_plan(4, 2).unwrap();
+        assert_eq!(plan.active_experts, 2);
+        match plan.source {
+            RouterScoreProjectionTopKSource::ResidentQ4(projection) => {
+                assert_eq!(projection.packed_byte_offset, 128);
+                assert_eq!(projection.output_width, 2);
+                assert_eq!(projection.cols, 4);
+            }
+            RouterScoreProjectionTopKSource::ResidentDense(_) => panic!("expected q4 topK plan"),
         }
     }
 

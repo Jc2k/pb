@@ -150,19 +150,19 @@ use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
     Cmd2Q4PostAttentionPrepProjections, DenseMmapMatvecProjection, DenseProjectionRequest,
     DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
-    RouterScoreProjectionDescriptor, RouterScoreProjectionScorePlan,
-    RouterScoreProjectionScoreSource, RuntimeTensorEntry, SharedExpertPhaseCache,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
-    build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
-    build_router_score_projection_descriptor, build_shared_expert_q4_phase_projections,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    full_attention_input_projection_requests, layer_norm_tensor_name,
-    linear_attention_input_projection_requests, linear_attention_scalar_tensor_name,
-    linear_attention_tensor_name, prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset,
-    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
-    validate_dense_matvec_shape,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
+    RouterScoreProjectionScorePlan, RouterScoreProjectionScoreSource,
+    RouterScoreProjectionTopKPlan, RouterScoreProjectionTopKSource, RuntimeTensorEntry,
+    SharedExpertPhaseCache, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
+    attention_tensor_name, build_cmd2_q4_post_attention_prep_projections,
+    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
+    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
+    layer_norm_tensor_name, linear_attention_input_projection_requests,
+    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
+    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
+    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -2347,6 +2347,46 @@ impl MetalExecutor {
                 top_k,
             );
             Ok(None)
+        }
+    }
+
+    fn router_score_top_candidates(
+        &self,
+        plan: &RouterScoreProjectionTopKPlan,
+        hidden: &[f32],
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        if hidden.len() != plan.hidden_width {
+            bail!(
+                "FlashMoe router topK hidden length {} does not match declared width {} for layer {}",
+                hidden.len(),
+                plan.hidden_width,
+                plan.layer
+            );
+        }
+        match &plan.source {
+            RouterScoreProjectionTopKSource::ResidentDense(projection) => self
+                .dense_mmap_top_candidates(
+                    projection.byte_offset,
+                    &projection.dtype,
+                    hidden,
+                    projection.rows,
+                    projection.cols,
+                    projection.stride(),
+                    plan.active_experts,
+                ),
+            RouterScoreProjectionTopKSource::ResidentQ4(projection) => self.q4_mmap_top_candidates(
+                projection.packed_byte_offset,
+                projection.scales_byte_offset,
+                projection.biases_byte_offset,
+                hidden,
+                projection.rows,
+                projection.cols,
+                projection.row_packed_bytes,
+                projection.groups_per_row,
+                projection.group_size,
+                &projection.scale_bias_dtype,
+                plan.active_experts,
+            ),
         }
     }
 
@@ -15732,31 +15772,8 @@ impl DenseStore {
         else {
             return Ok(None);
         };
-        match descriptor.binding {
-            RouterScoreProjectionBinding::ResidentDense(projection) => metal
-                .dense_mmap_top_candidates(
-                    projection.byte_offset,
-                    &projection.dtype,
-                    hidden,
-                    projection.rows,
-                    projection.cols,
-                    projection.stride(),
-                    active_experts,
-                ),
-            RouterScoreProjectionBinding::ResidentQ4(projection) => metal.q4_mmap_top_candidates(
-                projection.packed_byte_offset,
-                projection.scales_byte_offset,
-                projection.biases_byte_offset,
-                hidden,
-                projection.rows,
-                projection.cols,
-                projection.row_packed_bytes,
-                projection.groups_per_row,
-                projection.group_size,
-                &projection.scale_bias_dtype,
-                active_experts,
-            ),
-        }
+        let plan = descriptor.topk_plan(hidden.len(), active_experts)?;
+        metal.router_score_top_candidates(&plan, hidden)
     }
 
     fn router_scores_with_accelerate(
