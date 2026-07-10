@@ -132,10 +132,11 @@ The validator should reject silent fallbacks such as:
   cleanup, per-expert completeness checks, and missing-pack detection now also live under expert
   storage. Aggregate expert tensor classification, split-layout sizing, slice planning, shape
   validation, native-Q4 consistency checks, direct gate/up/down expert group validation, expert
-  source byte-range validation, native-Q4 slice byte-range planning, and Q4 record byte/group
-  accounting now live in `experts` behind a typed manifest-tensor adapter, leaving legacy cache
-  build code to bridge safetensor byte decoding for now. PBQ4 remains import/build compatibility;
-  execution reads are moving toward fixed whole-expert slots.
+  source byte-range validation, native-Q4 slice byte-range planning, expected pack metadata
+  construction, and Q4 record byte/group accounting now live in `experts` behind a typed
+  manifest-tensor adapter, leaving legacy cache build code to bridge safetensor byte decoding for
+  now. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
+  whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained

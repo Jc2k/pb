@@ -75,18 +75,19 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors,
-    DirectExpertTensorShape, EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16,
-    EXPERT_SCALE_BIAS_DTYPE_F32, ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata,
-    ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore,
-    FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec,
-    NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
-    aggregate_expert_tensor_kind, aggregate_expert_tensors, aggregate_native_q4_enabled,
-    build_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
-    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size, expert_tensor_byte_range,
-    first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
-    fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
-    pbq4_expert_pack_wire_size, q4_record_layout_for_shape, rewrite_expert_layer_pack,
-    rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
+    DirectExpertTensorShape, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
+    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
+    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
+    FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
+    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, aggregate_expert_tensors,
+    aggregate_native_q4_enabled, build_expert_pack, build_fixed_native_q4_expert_pack,
+    build_native_q4_expert_pack, cleanup_stale_expert_temp_files,
+    expected_expert_pack_from_records, expected_expert_pack_record_from_source,
+    expected_native_q4_expert_record_from_input, expert_scale_bias_dtype_size,
+    expert_tensor_byte_range, first_missing_expert_pack_for_shape,
+    fixed_native_q4_aggregate_layout, fixed_q4_payload_from_pbq4_records,
+    native_q4_slice_byte_ranges, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
+    rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
     validate_aggregate_expert_tensor_shape, validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
@@ -22041,19 +22042,7 @@ fn expected_native_q4_expert_record(
         element_offset,
         element_count,
     )?;
-    Ok(ExpectedExpertPackRecord {
-        tensor: input.tensor,
-        dtype: input.dtype,
-        shape: input.shape,
-        source_offsets: input.source_offsets,
-        source_hash: input
-            .source_hash
-            .context("native q4 expert record is missing source hash")?,
-        packed_bytes: input.packed.len() as u64,
-        groups: input.groups,
-        group_size: GROUP_SIZE,
-        scale_bias_dtype: input.scale_bias_dtype,
-    })
+    expected_native_q4_expert_record_from_input(input)
 }
 
 fn expected_expert_pack_record(
@@ -22072,21 +22061,16 @@ fn expected_expert_pack_record(
         element_offset,
         element_count,
     )?;
-    let (packed_bytes, groups) = q4_record_layout_for_shape(&shape)?;
-    Ok(ExpectedExpertPackRecord {
+    expected_expert_pack_record_from_source(
         tensor,
-        dtype: source
+        source
             .dtype
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         shape,
         source_offsets,
         source_hash,
-        packed_bytes,
-        groups,
-        group_size: GROUP_SIZE,
-        scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
-    })
+    )
 }
 
 fn expected_expert_pack(
@@ -22109,12 +22093,7 @@ fn expected_expert_pack(
             element_count,
         )?);
     }
-    let packed_bytes = pbq4_expert_pack_wire_size(&records)?;
-    Ok(ExpectedExpertPack {
-        expert,
-        packed_bytes,
-        records,
-    })
+    expected_expert_pack_from_records(expert, records)
 }
 
 fn decode_expert_tensor_range(

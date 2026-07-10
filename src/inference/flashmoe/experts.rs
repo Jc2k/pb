@@ -716,6 +716,57 @@ pub(crate) struct ExpectedExpertPack {
     pub(crate) records: Vec<ExpectedExpertPackRecord>,
 }
 
+pub(crate) fn expected_expert_pack_record_from_source(
+    tensor: String,
+    dtype: String,
+    shape: Vec<usize>,
+    source_offsets: [u64; 2],
+    source_hash: String,
+) -> Result<ExpectedExpertPackRecord> {
+    let (packed_bytes, groups) = q4_record_layout_for_shape(&shape)?;
+    Ok(ExpectedExpertPackRecord {
+        tensor,
+        dtype,
+        shape,
+        source_offsets,
+        source_hash,
+        packed_bytes,
+        groups,
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: EXPERT_PACK_SCALE_BIAS_DTYPE.to_string(),
+    })
+}
+
+pub(crate) fn expected_native_q4_expert_record_from_input(
+    input: NativeQ4ExpertRecordInput,
+) -> Result<ExpectedExpertPackRecord> {
+    Ok(ExpectedExpertPackRecord {
+        tensor: input.tensor,
+        dtype: input.dtype,
+        shape: input.shape,
+        source_offsets: input.source_offsets,
+        source_hash: input
+            .source_hash
+            .context("native q4 expert record is missing source hash")?,
+        packed_bytes: input.packed.len() as u64,
+        groups: input.groups,
+        group_size: GROUP_SIZE,
+        scale_bias_dtype: input.scale_bias_dtype,
+    })
+}
+
+pub(crate) fn expected_expert_pack_from_records(
+    expert: usize,
+    records: Vec<ExpectedExpertPackRecord>,
+) -> Result<ExpectedExpertPack> {
+    let packed_bytes = pbq4_expert_pack_wire_size(&records)?;
+    Ok(ExpectedExpertPack {
+        expert,
+        packed_bytes,
+        records,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AggregateExpertTensorKind {
     GateUp,
@@ -3515,6 +3566,63 @@ mod tests {
 
         let bounds = expert_tensor_byte_range(&tensor, "F32", 20, 10).unwrap_err();
         assert!(bounds.to_string().contains("exceeds source offsets"));
+    }
+
+    #[test]
+    fn expected_expert_record_from_source_uses_q4_layout_accounting() {
+        let record = expected_expert_pack_record_from_source(
+            "model.layers.0.mlp.experts.1.gate_proj.weight".to_string(),
+            "BF16".to_string(),
+            vec![3, 5],
+            [12, 42],
+            "hash".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(record.packed_bytes, 9);
+        assert_eq!(record.groups, 3);
+        assert_eq!(record.group_size, GROUP_SIZE);
+        assert_eq!(record.scale_bias_dtype, EXPERT_PACK_SCALE_BIAS_DTYPE);
+    }
+
+    #[test]
+    fn expected_native_q4_record_requires_source_hash() {
+        let input = NativeQ4ExpertRecordInput {
+            tensor: "model.layers.0.mlp.experts.1.gate_proj.weight".to_string(),
+            dtype: "U32".to_string(),
+            shape: vec![3, 5],
+            source_offsets: [12, 42],
+            source_hash: None,
+            packed: vec![0; 9],
+            scale_bytes: vec![0; 6],
+            bias_bytes: vec![0; 6],
+            groups: 3,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        };
+
+        let err = expected_native_q4_expert_record_from_input(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native q4 expert record is missing source hash")
+        );
+    }
+
+    #[test]
+    fn expected_expert_pack_from_records_accounts_for_wire_size() {
+        let record = expected_expert_pack_record_from_source(
+            "model.layers.0.mlp.experts.1.gate_proj.weight".to_string(),
+            "BF16".to_string(),
+            vec![3, 5],
+            [12, 42],
+            "hash".to_string(),
+        )
+        .unwrap();
+        let expected_size = pbq4_expert_pack_wire_size(&[record.clone()]).unwrap();
+        let pack = expected_expert_pack_from_records(1, vec![record]).unwrap();
+
+        assert_eq!(pack.expert, 1);
+        assert_eq!(pack.packed_bytes, expected_size);
+        assert_eq!(pack.records.len(), 1);
     }
 
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
