@@ -104,10 +104,10 @@ use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy, MetalAttentionValues,
     MetalBatchProjectionInput, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalLinearAttentionStaticOffsets,
-    MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep,
-    MetalProjectionBatch, MetalQ4SourceBufferCache, metal_command_failure_requires_release,
-    resolve_metal_command_wait,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalKvCacheInner,
+    MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2797,23 +2797,6 @@ struct MetalReusableBuffer {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalKvCacheInner {
-    keys: ObjcId,
-    values: ObjcId,
-    layers: Vec<MetalKvLayer>,
-    max_context: usize,
-    total_items: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-struct MetalKvLayer {
-    offset: usize,
-    width: usize,
-}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
@@ -12481,21 +12464,14 @@ fn allocate_metal_kv_cache(
             release(keys);
             bail!("failed to allocate Flash-MoE Metal KV value buffer ({bytes} bytes)");
         }
-        let mut offset = 0usize;
-        let mut layers = Vec::with_capacity(widths.len());
-        for width in widths.iter().copied() {
-            layers.push(MetalKvLayer { offset, width });
-            offset = offset
-                .checked_add(width.saturating_mul(max_context))
-                .context("Metal KV layer offset overflow")?;
+        match MetalKvCacheInner::new(keys, values, widths, max_context) {
+            Ok(cache) => Ok(cache),
+            Err(error) => {
+                release(keys);
+                release(values);
+                Err(error)
+            }
         }
-        Ok(MetalKvCacheInner {
-            keys,
-            values,
-            layers,
-            max_context,
-            total_items: offset,
-        })
     }
 }
 
@@ -12672,28 +12648,6 @@ fn allocate_metal_linear_attention_state(
         }));
     }
     Ok(MetalLinearAttentionStateCache { layers })
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalKvCacheInner {
-    fn layer(&self, layer: usize) -> Result<MetalKvLayer> {
-        let layer = self
-            .layers
-            .get(layer)
-            .copied()
-            .with_context(|| format!("Metal KV cache has no layer {layer}"))?;
-        if layer.width == 0 {
-            bail!("Metal KV cache layer is not a full-attention layer");
-        }
-        if layer
-            .offset
-            .saturating_add(layer.width.saturating_mul(self.max_context))
-            > self.total_items
-        {
-            bail!("Metal KV cache layer range exceeds allocation");
-        }
-        Ok(layer)
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

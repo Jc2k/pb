@@ -163,6 +163,68 @@ impl MetalQ4SourceBufferCache {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalKvCacheInner {
+    pub(crate) keys: MetalObjcId,
+    pub(crate) values: MetalObjcId,
+    layers: Vec<MetalKvLayer>,
+    pub(crate) max_context: usize,
+    total_items: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalKvCacheInner {
+    pub(crate) fn new(
+        keys: MetalObjcId,
+        values: MetalObjcId,
+        widths: &[usize],
+        max_context: usize,
+    ) -> anyhow::Result<Self> {
+        let mut offset = 0usize;
+        let mut layers = Vec::with_capacity(widths.len());
+        for width in widths.iter().copied() {
+            layers.push(MetalKvLayer { offset, width });
+            offset = offset
+                .checked_add(width.saturating_mul(max_context))
+                .ok_or_else(|| anyhow::anyhow!("Metal KV layer offset overflow"))?;
+        }
+        Ok(Self {
+            keys,
+            values,
+            layers,
+            max_context,
+            total_items: offset,
+        })
+    }
+
+    pub(crate) fn layer(&self, layer: usize) -> anyhow::Result<MetalKvLayer> {
+        let layer = self
+            .layers
+            .get(layer)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Metal KV cache has no layer {layer}"))?;
+        if layer.width == 0 {
+            anyhow::bail!("Metal KV cache layer is not a full-attention layer");
+        }
+        if layer
+            .offset
+            .saturating_add(layer.width.saturating_mul(self.max_context))
+            > self.total_items
+        {
+            anyhow::bail!("Metal KV cache layer range exceeds allocation");
+        }
+        Ok(layer)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalKvLayer {
+    pub(crate) offset: usize,
+    pub(crate) width: usize,
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2627,6 +2689,41 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Metal post-attention input for layer 3")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_kv_cache_declares_layer_offsets_and_rejects_missing_layers() {
+        let keys = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let values = keys;
+        let cache = MetalKvCacheInner::new(keys, values, &[4, 0, 8], 3).unwrap();
+
+        assert_eq!(cache.keys, keys);
+        assert_eq!(cache.values, values);
+        assert_eq!(cache.max_context, 3);
+
+        let first = cache.layer(0).unwrap();
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.width, 4);
+
+        let third = cache.layer(2).unwrap();
+        assert_eq!(third.offset, 12);
+        assert_eq!(third.width, 8);
+
+        assert!(
+            cache
+                .layer(1)
+                .unwrap_err()
+                .to_string()
+                .contains("not a full-attention layer")
+        );
+        assert!(
+            cache
+                .layer(3)
+                .unwrap_err()
+                .to_string()
+                .contains("has no layer 3")
         );
     }
 
