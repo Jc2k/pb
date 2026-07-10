@@ -2463,11 +2463,13 @@ impl FixedQ4ExpertSlotSpec {
     }
 
     pub(crate) fn from_model_layout(layout: &QwenMoeModelLayout) -> Result<Self> {
-        Self::new(
-            layout.q4_expert_layout,
-            layout.hidden_size,
-            layout.moe_intermediate_size,
-        )
+        let q4_layout = layout.q4_expert_layout.with_context(|| {
+            format!(
+                "FlashMoe unsupported {:?} expert storage: fixed-Q4 expert layout is not resolved for this model family",
+                layout.family
+            )
+        })?;
+        Self::new(q4_layout, layout.hidden_size, layout.moe_intermediate_size)
     }
 }
 

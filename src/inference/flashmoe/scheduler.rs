@@ -3005,7 +3005,7 @@ mod tests {
                 records: Vec::new(),
             },
             fixed_q4: FixedQ4ExpertSlotSpec::new(
-                layout.q4_expert_layout,
+                layout.q4_expert_layout.unwrap(),
                 layout.hidden_size,
                 layout.moe_intermediate_size,
             )

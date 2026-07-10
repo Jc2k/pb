@@ -217,7 +217,7 @@ pub struct QwenMoeModelLayout {
     pub partial_rotary_factor: Option<f64>,
     pub mrope_section: Option<[usize; 3]>,
     pub has_vision: bool,
-    pub q4_expert_layout: QwenMoeQ4ExpertLayout,
+    pub q4_expert_layout: Option<QwenMoeQ4ExpertLayout>,
 }
 
 impl QwenMoeModelLayout {
@@ -260,7 +260,10 @@ impl QwenMoeModelLayout {
             partial_rotary_factor: config.partial_rotary_factor,
             mrope_section: config.text_mrope_section(),
             has_vision: config.vision_config.is_some(),
-            q4_expert_layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
+            q4_expert_layout: match family {
+                QwenMoeFamily::Qwen35A17B => Some(QwenMoeQ4ExpertLayout::qwen35_a17b()),
+                QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => None,
+            },
         };
         layout.validate()?;
         Ok(layout)
@@ -314,7 +317,19 @@ impl QwenMoeModelLayout {
                 self.routed_expert_scale
             );
         }
-        self.q4_expert_layout.validate()?;
+        match (self.family, self.q4_expert_layout) {
+            (QwenMoeFamily::Qwen35A17B, Some(layout)) => layout.validate()?,
+            (QwenMoeFamily::Qwen35A17B, None) => {
+                bail!("Qwen3.5-A17B model layout is missing its fixed-Q4 expert layout")
+            }
+            (QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe, Some(_)) => {
+                bail!(
+                    "Qwen MoE family {:?} must resolve its expert layout from concrete model storage instead of inheriting Qwen3.5 fixed-Q4 offsets",
+                    self.family
+                )
+            }
+            (QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe, None) => {}
+        }
         Ok(())
     }
 }
@@ -449,6 +464,10 @@ mod tests {
         assert_eq!(layout.shared_experts, 1);
         assert_eq!(layout.shared_expert_intermediate_size, 1024);
         assert!(!layout.has_vision);
+        assert_eq!(
+            layout.q4_expert_layout,
+            Some(QwenMoeQ4ExpertLayout::qwen35_a17b())
+        );
     }
 
     #[test]
@@ -545,6 +564,7 @@ mod tests {
         assert_eq!(layout.scheduled_active_experts, 2);
         assert_eq!(layout.routed_expert_scale, 1.0);
         assert_eq!(layout.layer_kind(0), QwenMoeLayerKind::FullAttention);
+        assert_eq!(layout.q4_expert_layout, None);
     }
 
     #[test]
@@ -582,5 +602,6 @@ mod tests {
         assert_eq!(layout.routed_expert_scale, 1.0);
         assert!(layout.has_vision);
         assert_eq!(layout.mrope_section, Some(DEFAULT_MROPE_SECTION));
+        assert_eq!(layout.q4_expert_layout, None);
     }
 }
