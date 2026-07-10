@@ -344,6 +344,8 @@ The validator should reject silent fallbacks such as:
   scalar constants used by the legacy bridge. Q4 CMD3 now requires configured shared experts to
   resolve as resident Q4 shared-expert projections instead of falling back to dense CPU shared
   weights, whether CMD3 consumes Metal post-attention prep buffers or CPU-uploaded inputs.
+  The Qwen3.5 Q4 scheduled graph also rejects dense CPU shared weights as a CMD3 implementation, so
+  this is a capability rule rather than only a live-loop convention.
   Shared-expert temporary buffers, active-expert
   activation/projection buffers, and submitted command context now resolve through Metal-owned plan
   helpers instead of legacy size/metadata recomputation. The actual shared gate/up/down, next-norm

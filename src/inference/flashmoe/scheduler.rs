@@ -273,6 +273,15 @@ impl FlashMoeScheduledGraph {
                 "CMD3 expert/shared combine must be implemented as a declared Metal command",
             ));
         }
+        if self.family == QwenMoeFamily::Qwen35A17B
+            && shared == ScheduledSharedExpertSource::DenseCpuWeights
+        {
+            return Err(FlashMoeUnsupportedCapability::new(
+                self.family,
+                stage.stage,
+                "Qwen3.5 Q4 CMD3 shared experts must use resident Q4 projections; dense CPU shared weights are not a declared graph-stage implementation",
+            ));
+        }
         Ok(ScheduledCmd3ExpertPhase {
             stage,
             layer,
@@ -4805,7 +4814,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -4815,7 +4824,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap();
@@ -4856,7 +4865,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -4865,7 +4874,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &next_norm,
@@ -4919,7 +4928,7 @@ mod tests {
                 19,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
                 ScheduledNextNormWeights::cpu_visible(
                     "model.layers.8.input_layernorm.weight",
                     &next_norm,
@@ -4939,7 +4948,7 @@ mod tests {
         );
         assert_eq!(
             command.cmd3.shared,
-            ScheduledSharedExpertSource::DenseCpuWeights
+            ScheduledSharedExpertSource::ResidentQ4Projections
         );
         assert_eq!(
             command.cmd3.next_norm,
@@ -4982,7 +4991,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -4991,7 +5000,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap()
@@ -5019,7 +5028,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -5028,7 +5037,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -5057,7 +5066,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -5066,7 +5075,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -5370,7 +5379,7 @@ mod tests {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
         let shared_descriptor = ScheduledSharedExpertDescriptor::new(
-            ScheduledSharedExpertSource::DenseCpuWeights,
+            ScheduledSharedExpertSource::ResidentQ4Projections,
             Some(ScheduledSharedExpertShape::new(8, 1, 2).unwrap()),
         )
         .unwrap();
@@ -5416,7 +5425,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -5427,7 +5436,7 @@ mod tests {
                 cmd3,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
                 ScheduledNextNormWeights::none(),
             )
             .unwrap();
@@ -5446,7 +5455,7 @@ mod tests {
                 cmd3,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
                 ScheduledNextNormWeights::none(),
             )
             .unwrap_err();
@@ -5466,7 +5475,7 @@ mod tests {
                 7,
                 1,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledSharedExpertSource::ResidentQ4Projections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -5488,7 +5497,7 @@ mod tests {
             cmd3,
             &wrong_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
@@ -5508,11 +5517,39 @@ mod tests {
             cmd3,
             &partial_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::DenseCpuWeights),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("must be a whole-expert slot"));
+    }
+
+    #[test]
+    fn scheduled_graph_rejects_dense_shared_weights_for_qwen35_q4_cmd3() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let err = graph
+            .build_cmd3_expert_phase(
+                7,
+                2,
+                ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                ScheduledSharedExpertSource::DenseCpuWeights,
+                ScheduledNextNormSource::None,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.family, graph.family());
+        assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+        assert!(
+            err.to_string().contains("must use resident Q4 projections"),
+            "{err:#}"
+        );
+        assert!(
+            err.to_string()
+                .contains("not a declared graph-stage implementation"),
+            "{err:#}"
+        );
     }
 
     #[test]
