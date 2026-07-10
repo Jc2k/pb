@@ -104,13 +104,14 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput, MetalCmd3PhasePlan,
-    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
-    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
-    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
-    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -4813,48 +4814,35 @@ impl MetalExecutorInner {
         let output_state = plan.output_state;
         let shared_dense = shared.dense();
         let shared_q4 = shared.q4();
-        let shared_total_intermediate = if let Some(shared) = shared_dense {
-            let total = shared
-                .shared_experts
-                .checked_mul(shared.intermediate)
-                .context("shared expert intermediate width overflow")?;
-            if shared.width != width
-                || shared.gate.len() != total * width
-                || shared.up.len() != total * width
-                || shared.down.len() != width * total
-                || shared.router.len() != shared.shared_experts * width
-            {
-                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                return Ok(None);
+        let shared_dense_plan = if let Some(shared) = shared_dense {
+            match MetalCmd3SharedPhasePlan::dense(width, shared) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Err(error.context(
+                        "FlashMoe unsupported Metal CMD3 phase: invalid dense shared expert plan",
+                    ));
+                }
             }
-            total
-        } else {
-            0
-        };
-        let shared_metal = if let Some(shared) = shared_dense {
-            Some(self.shared_expert_buffers(layer, shared, shared_total_intermediate)?)
         } else {
             None
         };
-        let shared_q4_total_intermediate = if let Some(shared) = shared_q4 {
-            let total = shared
-                .shared_experts
-                .checked_mul(shared.intermediate)
-                .context("shared q4 expert intermediate width overflow")?;
-            if shared.width != width
-                || shared.gate.rows != total
-                || shared.gate.cols != width
-                || shared.up.rows != total
-                || shared.up.cols != width
-                || shared.router.rows != shared.shared_experts
-                || shared.router.cols != width
-                || shared.down.rows != width
-                || shared.down.cols != total
-            {
-                self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-                return Ok(None);
+        let shared_metal =
+            if let (Some(shared), Some(shared_plan)) = (shared_dense, shared_dense_plan) {
+                Some(self.shared_expert_buffers(layer, shared, shared_plan.total_intermediate)?)
+            } else {
+                None
+            };
+        let shared_q4_plan = if let Some(shared) = shared_q4 {
+            match MetalCmd3SharedPhasePlan::resident_q4(width, shared) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Err(error.context(
+                        "FlashMoe unsupported Metal CMD3 phase: invalid resident-Q4 shared expert plan",
+                    ));
+                }
             }
-            Some(total)
         } else {
             None
         };
@@ -4906,11 +4894,11 @@ impl MetalExecutorInner {
             buffers.push(MetalPhaseBuffer::recyclable(width_buffer));
             let mut q4_source_buffers = MetalQ4SourceBufferCache::default();
 
-            if let (Some(shared), Some(shared_total_intermediate)) =
-                (shared_q4, shared_q4_total_intermediate)
-            {
+            if let (Some(shared), Some(shared_plan)) = (shared_q4, shared_q4_plan) {
+                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+                let shared_total_intermediate = shared_plan.total_intermediate;
                 let total_u32 = shared_total_intermediate as u32;
-                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_intermediate_u32 = shared_plan.intermediate as u32;
                 let shared_gate_out =
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
@@ -4918,7 +4906,7 @@ impl MetalExecutorInner {
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
                 let shared_router_out =
-                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.shared_experts * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
@@ -4960,10 +4948,12 @@ impl MetalExecutorInner {
                     shared_activated,
                     shared_output_buffer,
                 )?;
-            } else if let Some(shared) = shared_dense {
+            } else if let (Some(_shared), Some(shared_plan)) = (shared_dense, shared_dense_plan) {
+                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
+                let shared_total_intermediate = shared_plan.total_intermediate;
                 let total_u32 = shared_total_intermediate as u32;
-                let shared_intermediate_u32 = shared.intermediate as u32;
+                let shared_intermediate_u32 = shared_plan.intermediate as u32;
                 let shared_gate_out =
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
@@ -4971,7 +4961,7 @@ impl MetalExecutorInner {
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
                 let shared_router_out =
-                    self.buffer_with_len(shared.shared_experts * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.shared_experts * std::mem::size_of::<f32>())?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
                     self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
@@ -5004,7 +4994,7 @@ impl MetalExecutorInner {
                     normed_buffer,
                     shared_router_out,
                     width_buffer,
-                    shared.shared_experts,
+                    shared_plan.shared_experts,
                 );
                 msg_send_void1_id(
                     encoder,
@@ -5027,7 +5017,14 @@ impl MetalExecutorInner {
                     width,
                 );
             } else {
-                self.encode_fill_zero(encoder, shared_output_buffer, width_buffer, width);
+                let shared_plan = MetalCmd3SharedPhasePlan::none(width);
+                debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::None);
+                self.encode_fill_zero(
+                    encoder,
+                    shared_output_buffer,
+                    width_buffer,
+                    shared_plan.width,
+                );
             }
 
             for (idx, payload) in payloads.iter().enumerate() {

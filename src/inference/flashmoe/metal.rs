@@ -12,6 +12,8 @@ use super::scheduler::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
@@ -1000,6 +1002,71 @@ impl MetalCmd3PhasePlan {
             width,
             output_state,
             has_next_norm,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetalCmd3SharedPhaseSource {
+    None,
+    Dense,
+    ResidentQ4,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3SharedPhasePlan {
+    pub(crate) source: MetalCmd3SharedPhaseSource,
+    pub(crate) width: usize,
+    pub(crate) shared_experts: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) total_intermediate: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3SharedPhasePlan {
+    pub(crate) const fn none(width: usize) -> Self {
+        Self {
+            source: MetalCmd3SharedPhaseSource::None,
+            width,
+            shared_experts: 0,
+            intermediate: 0,
+            total_intermediate: 0,
+        }
+    }
+
+    pub(crate) fn dense(width: usize, shared: &SharedExpertPhaseWeights) -> anyhow::Result<Self> {
+        let shape = shared.validated_shape()?;
+        Self::from_shape(MetalCmd3SharedPhaseSource::Dense, width, shape)
+    }
+
+    pub(crate) fn resident_q4(
+        width: usize,
+        shared: &SharedExpertPhaseQ4Projections,
+    ) -> anyhow::Result<Self> {
+        let shape = shared.validated_shape()?;
+        Self::from_shape(MetalCmd3SharedPhaseSource::ResidentQ4, width, shape)
+    }
+
+    fn from_shape(
+        source: MetalCmd3SharedPhaseSource,
+        width: usize,
+        shape: super::weights::SharedExpertPhaseShape,
+    ) -> anyhow::Result<Self> {
+        if shape.width != width {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 shared expert width {} does not match phase width {}",
+                shape.width,
+                width
+            );
+        }
+        Ok(Self {
+            source,
+            width,
+            shared_experts: shape.shared_experts,
+            intermediate: shape.intermediate,
+            total_intermediate: shape.total_intermediate,
         })
     }
 }
@@ -2790,6 +2857,8 @@ mod tests {
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::scheduler::ScheduledRoutingTopK;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::super::weights::DenseQ4MmapMatvecProjection;
     use super::*;
 
     #[test]
@@ -3246,6 +3315,91 @@ mod tests {
                 .contains("next-norm output declaration"),
             "{output_err:#}"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_shared_phase_plan_declares_dense_shape() {
+        let shared = SharedExpertPhaseWeights::new(
+            Arc::new(vec![1.0; 24]),
+            Arc::new(vec![2.0; 24]),
+            Arc::new(vec![3.0; 24]),
+            Arc::new(vec![4.0; 8]),
+            2,
+            3,
+            4,
+        )
+        .unwrap();
+
+        let plan = MetalCmd3SharedPhasePlan::dense(4, &shared).unwrap();
+
+        assert_eq!(plan.source, MetalCmd3SharedPhaseSource::Dense);
+        assert_eq!(plan.width, 4);
+        assert_eq!(plan.shared_experts, 2);
+        assert_eq!(plan.intermediate, 3);
+        assert_eq!(plan.total_intermediate, 6);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_shared_phase_plan_declares_resident_q4_shape() {
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: test_q4_projection("gate", 6, 4),
+            up: test_q4_projection("up", 6, 4),
+            down: test_q4_projection("down", 4, 6),
+            router: test_q4_projection("router", 2, 4),
+            shared_experts: 2,
+            intermediate: 3,
+            width: 4,
+        };
+
+        let plan = MetalCmd3SharedPhasePlan::resident_q4(4, &shared).unwrap();
+
+        assert_eq!(plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(plan.width, 4);
+        assert_eq!(plan.shared_experts, 2);
+        assert_eq!(plan.intermediate, 3);
+        assert_eq!(plan.total_intermediate, 6);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_shared_phase_plan_rejects_width_mismatch() {
+        let shared = SharedExpertPhaseWeights::new(
+            Arc::new(vec![1.0; 24]),
+            Arc::new(vec![2.0; 24]),
+            Arc::new(vec![3.0; 24]),
+            Arc::new(vec![4.0; 8]),
+            2,
+            3,
+            4,
+        )
+        .unwrap();
+
+        let err = MetalCmd3SharedPhasePlan::dense(8, &shared).unwrap_err();
+
+        assert!(err.to_string().contains("shared expert width 4"), "{err:#}");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_q4_projection(
+        tensor_name: &str,
+        output_width: usize,
+        input_width: usize,
+    ) -> DenseQ4MmapMatvecProjection {
+        DenseQ4MmapMatvecProjection {
+            tensor_name: tensor_name.to_string(),
+            packed_byte_offset: 0,
+            scales_byte_offset: 64,
+            biases_byte_offset: 96,
+            rows: output_width,
+            cols: input_width,
+            output_width,
+            row_packed_bytes: 16,
+            groups_per_row: 1,
+            group_size: 16,
+            scale_bias_dtype: "F32".to_string(),
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
