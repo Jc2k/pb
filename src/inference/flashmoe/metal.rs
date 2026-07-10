@@ -1,5 +1,86 @@
 use std::time::Duration;
 
+pub(crate) mod kernels {
+    pub(crate) const Q4_FMA_MATVEC: &str = "q4_fma_matvec";
+    pub(crate) const Q4_FMA_MATVEC_BF16_SCALE_BIAS: &str = "q4_fma_matvec_bf16_scale_bias";
+    pub(crate) const Q4_SWIGLU_FUSED: &str = "q4_swiglu_fused";
+    pub(crate) const Q4_SWIGLU_FUSED_BF16_SCALE_BIAS: &str = "q4_swiglu_fused_bf16_scale_bias";
+    pub(crate) const Q4_MMAP_FMA_MATVEC: &str = "q4_mmap_fma_matvec";
+    pub(crate) const Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS: &str =
+        "q4_mmap_fma_matvec_bf16_scale_bias";
+    pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH: &str = "q4_mmap_fma_matvec_batch";
+    pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS: &str =
+        "q4_mmap_fma_matvec_batch_bf16_scale_bias";
+    pub(crate) const ROUTE_TOP4: &str = "route_top4";
+    pub(crate) const DENSE_MATVEC: &str = "dense_matvec";
+    pub(crate) const DENSE_MATVEC_BF16: &str = "dense_matvec_bf16";
+    pub(crate) const DENSE_MMAP_MATVEC_F32: &str = "dense_mmap_matvec_f32";
+    pub(crate) const DENSE_MMAP_MATVEC_BF16: &str = "dense_mmap_matvec_bf16";
+    pub(crate) const DENSE_MMAP_MATVEC_BF16_SIMD: &str = "dense_mmap_matvec_bf16_simd";
+    pub(crate) const RMS_NORM: &str = "rms_norm";
+    pub(crate) const RMS_NORM_REDUCED: &str = "rms_norm_reduced";
+    pub(crate) const RESIDUAL_ADD_RMS_NORM: &str = "residual_add_rms_norm";
+    pub(crate) const ROPE_APPLY: &str = "rope_apply";
+    pub(crate) const ROPE_SPLIT_HALF_APPLY: &str = "rope_split_half_apply";
+    pub(crate) const ATTENTION_SCORES: &str = "attention_scores";
+    pub(crate) const KV_CACHE_WRITE: &str = "kv_cache_write";
+    pub(crate) const KV_CACHE_READ_ATTENTION: &str = "kv_cache_read_attention";
+    pub(crate) const EXPERT_MLP_FUSED: &str = "expert_mlp_fused";
+    pub(crate) const SILU_PRODUCT: &str = "silu_product";
+    pub(crate) const SHARED_EXPERT_ACTIVATION: &str = "shared_expert_activation";
+    pub(crate) const COMBINE_EXPERT_PHASE: &str = "combine_expert_phase";
+    pub(crate) const FILL_ZERO: &str = "fill_zero";
+    pub(crate) const LM_HEAD_LOGITS: &str = "lm_head_logits";
+    pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
+    pub(crate) const GQA_ATTENTION_SCORES: &str = "gqa_attention_scores";
+    pub(crate) const GQA_KV_READ_ATTENTION: &str = "gqa_kv_read_attention";
+    pub(crate) const LINEAR_CONV1D_STEP: &str = "linear_conv1d_step";
+    pub(crate) const LINEAR_RMS_NORM_QK: &str = "linear_rms_norm_qk";
+    pub(crate) const LINEAR_COMPUTE_DECAY_BETA: &str = "linear_compute_decay_beta";
+    pub(crate) const LINEAR_GATED_DELTA_STEP: &str = "linear_gated_delta_step";
+    pub(crate) const LINEAR_GATED_RMS_NORM: &str = "linear_gated_rms_norm";
+}
+
+#[cfg(test)]
+const REQUIRED_FORWARD_KERNELS: &[&str] = &[
+    kernels::Q4_FMA_MATVEC,
+    kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
+    kernels::Q4_SWIGLU_FUSED,
+    kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS,
+    kernels::Q4_MMAP_FMA_MATVEC,
+    kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
+    kernels::Q4_MMAP_FMA_MATVEC_BATCH,
+    kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+    kernels::ROUTE_TOP4,
+    kernels::DENSE_MATVEC,
+    kernels::DENSE_MATVEC_BF16,
+    kernels::DENSE_MMAP_MATVEC_F32,
+    kernels::DENSE_MMAP_MATVEC_BF16,
+    kernels::DENSE_MMAP_MATVEC_BF16_SIMD,
+    kernels::RMS_NORM,
+    kernels::RMS_NORM_REDUCED,
+    kernels::RESIDUAL_ADD_RMS_NORM,
+    kernels::ROPE_APPLY,
+    kernels::ROPE_SPLIT_HALF_APPLY,
+    kernels::ATTENTION_SCORES,
+    kernels::KV_CACHE_WRITE,
+    kernels::KV_CACHE_READ_ATTENTION,
+    kernels::EXPERT_MLP_FUSED,
+    kernels::SILU_PRODUCT,
+    kernels::SHARED_EXPERT_ACTIVATION,
+    kernels::COMBINE_EXPERT_PHASE,
+    kernels::FILL_ZERO,
+    kernels::LM_HEAD_LOGITS,
+    kernels::TOPK_VOCAB,
+    kernels::GQA_ATTENTION_SCORES,
+    kernels::GQA_KV_READ_ATTENTION,
+    kernels::LINEAR_CONV1D_STEP,
+    kernels::LINEAR_RMS_NORM_QK,
+    kernels::LINEAR_COMPUTE_DECAY_BETA,
+    kernels::LINEAR_GATED_DELTA_STEP,
+    kernels::LINEAR_GATED_RMS_NORM,
+];
+
 pub const METAL_SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1787,37 +1868,7 @@ mod tests {
 
     #[test]
     fn shader_source_defines_full_forward_kernel_set() {
-        for kernel in [
-            "q4_fma_matvec",
-            "q4_swiglu_fused",
-            "q4_swiglu_fused_bf16_scale_bias",
-            "q4_mmap_fma_matvec",
-            "q4_mmap_fma_matvec_bf16_scale_bias",
-            "route_top4",
-            "dense_matvec",
-            "dense_matvec_bf16",
-            "rms_norm",
-            "rms_norm_reduced",
-            "rope_apply",
-            "rope_split_half_apply",
-            "attention_scores",
-            "kv_cache_write",
-            "kv_cache_read_attention",
-            "expert_mlp_fused",
-            "silu_product",
-            "shared_expert_activation",
-            "combine_expert_phase",
-            "fill_zero",
-            "lm_head_logits",
-            "topk_vocab",
-            "gqa_attention_scores",
-            "gqa_kv_read_attention",
-            "linear_conv1d_step",
-            "linear_rms_norm_qk",
-            "linear_compute_decay_beta",
-            "linear_gated_delta_step",
-            "linear_gated_rms_norm",
-        ] {
+        for kernel in REQUIRED_FORWARD_KERNELS {
             assert!(
                 METAL_SHADERS.contains(&format!("kernel void {kernel}")),
                 "missing Metal kernel {kernel}"
