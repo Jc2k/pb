@@ -182,6 +182,12 @@ Baseline reviewed on 2026-07-10:
   errors. The duplicate legacy CMD3 encoder, shared dense upload/cache, deferred-command type, and
   its model-specific direct-executor test have been removed; typed builder tests plus the required
   real-model smoke cover the production command.
+- `LinearAttentionLayout` now lives with recurrent-state contracts in `state.rs`. The active
+  Qwen3.5 fused linear-attention CMD1/CMD2 command is owned by
+  `MetalFusedLinearAttentionBuilder`: resident Q4 input projections, convolution and recurrent
+  state mutation, gated normalization, output projection, residual/RMS norm, router projection,
+  CPU top-k readback, and GPU-resident CMD3 handoff move together. `legacy.rs` retains only the
+  model-weight lookup and one builder invocation for this resolved stage.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

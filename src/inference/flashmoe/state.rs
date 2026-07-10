@@ -992,6 +992,42 @@ pub(crate) struct FlashMoeLinearAttentionCacheShape {
     pub(crate) value_scratch_len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LinearAttentionLayout {
+    pub(crate) num_value_heads: usize,
+    pub(crate) num_key_heads: usize,
+    pub(crate) key_dim: usize,
+    pub(crate) value_dim: usize,
+    pub(crate) total_key_width: usize,
+    pub(crate) total_value_width: usize,
+    pub(crate) conv_dim: usize,
+    pub(crate) conv_kernel_size: usize,
+}
+
+impl LinearAttentionLayout {
+    pub(crate) fn conv_state_len(self) -> usize {
+        self.conv_kernel_size.saturating_sub(1) * self.conv_dim
+    }
+
+    pub(crate) fn ssm_state_len(self) -> usize {
+        self.num_value_heads * self.value_dim * self.key_dim
+    }
+
+    pub(crate) fn cache_shape(self) -> FlashMoeLinearAttentionCacheShape {
+        FlashMoeLinearAttentionCacheShape::new(
+            self.conv_state_len(),
+            self.ssm_state_len(),
+            self.conv_dim,
+            self.total_value_width,
+            self.value_dim,
+        )
+    }
+
+    pub(crate) fn value_heads_per_key_head(self) -> usize {
+        (self.num_value_heads / self.num_key_heads).max(1)
+    }
+}
+
 impl FlashMoeLinearAttentionCacheShape {
     pub(crate) fn new(
         conv_state_len: usize,

@@ -12,10 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use anyhow::Context as _;
+use anyhow::{Context as _, Result, bail};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::experts::{EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32};
+use super::experts::{
+    EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::math::top_k;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -27,6 +29,7 @@ use super::scheduler::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoePostAttentionPrepState,
+    LinearAttentionLayout,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
@@ -2336,6 +2339,550 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
             buffers.push(MetalPhaseBuffer::recyclable(buffer));
             Ok(buffer)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MetalFusedLinearAttentionBuilder<'a> {
+    runtime: &'a MetalRuntime,
+    dense_weights: Option<&'a MetalDenseWeights>,
+    linear_attention_state: &'a Mutex<MetalLinearAttentionStateCache>,
+    buffers: &'a MetalBufferPool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> MetalFusedLinearAttentionBuilder<'a> {
+    pub(crate) fn new(
+        runtime: &'a MetalRuntime,
+        dense_weights: Option<&'a MetalDenseWeights>,
+        linear_attention_state: &'a Mutex<MetalLinearAttentionStateCache>,
+        buffers: &'a MetalBufferPool,
+    ) -> Self {
+        Self {
+            runtime,
+            dense_weights,
+            linear_attention_state,
+            buffers,
+        }
+    }
+
+    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> anyhow::Result<MetalObjcId> {
+        unsafe { self.buffers.buffer_with_bytes(self.runtime.device, bytes) }
+    }
+
+    unsafe fn buffer_with_len(&self, len: usize) -> anyhow::Result<MetalObjcId> {
+        unsafe { self.buffers.buffer_with_len(self.runtime.device, len) }
+    }
+
+    unsafe fn recycle(&self, buffer: MetalObjcId) {
+        unsafe { self.buffers.recycle(buffer) }
+    }
+
+    fn recycle_or_release_buffers(&self, buffers: &[MetalObjcId], release_only: bool) {
+        self.buffers.recycle_or_release(buffers, release_only);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for MetalFusedLinearAttentionBuilder<'_> {
+    type Target = MetalRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalFusedLinearAttentionBuilder<'_> {
+    pub(crate) fn execute(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<MetalPostAttentionPrep> {
+        let residual_len = residual.len();
+        if top_k == 0
+            || residual_len == 0
+            || residual_len != post_norm_weight.len()
+            || projections.len() != 4
+            || projections[0].output_width != layout.conv_dim
+            || projections[1].output_width != layout.total_value_width
+            || projections[2].output_width != layout.num_value_heads
+            || projections[3].output_width != layout.num_value_heads
+            || out_proj.output_width != residual_len
+            || out_proj.rows != residual_len
+            || out_proj.cols != layout.total_value_width
+            || router.cols != residual_len
+            || router.output_width != router.rows
+            || layout.key_dim == 0
+            || layout.value_dim == 0
+            || layout.key_dim > 256
+            || layout.value_dim > 256
+            || layout.num_key_heads == 0
+            || layout.num_value_heads == 0
+        {
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: incompatible dimensions or routing policy (input projections {}, input width {}, residual width {residual_len}, norm width {}, topK {top_k})",
+                projections.len(),
+                input.len(),
+                post_norm_weight.len()
+            );
+        }
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path: resident dense Metal weights are unavailable",
+        )?;
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0
+                || projection.cols == 0
+                || projection.cols != input_len
+                || projection.output_width != projection.rows
+                || projection.row_packed_bytes != projection.cols.div_ceil(2)
+            {
+                bail!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: projection {} does not match resolved input width {input_len}",
+                    projection.tensor_name
+                );
+            }
+            output_offsets.push(total_rows);
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("linear-attention q4 projection output row overflow")?;
+        }
+        for projection in projections.iter().chain([out_proj, router]) {
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                bail!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} has unaligned scale/bias offsets for {}",
+                    projection.tensor_name,
+                    projection.scale_bias_dtype
+                );
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("linear fused q4 packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("linear fused q4 group byte length overflow")?;
+            for (offset, len) in [
+                (projection.packed_byte_offset, packed_len),
+                (projection.scales_byte_offset, group_bytes),
+                (projection.biases_byte_offset, group_bytes),
+            ] {
+                let offset = usize::try_from(offset).context("linear fused q4 offset overflow")?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    bail!(
+                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} exceeds resident dense store length {}",
+                        projection.tensor_name,
+                        dense_weights.len
+                    );
+                }
+            }
+        }
+
+        let qkv_offset = output_offsets[0]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention qkv projection offset overflow")?
+            as u64;
+        let z_offset = output_offsets[1]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention z projection offset overflow")?
+            as u64;
+        let beta_offset = output_offsets[2]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention beta projection offset overflow")?
+            as u64;
+        let alpha_offset = output_offsets[3]
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("linear-attention alpha projection offset overflow")?
+            as u64;
+
+        let mut state_guard = self
+            .linear_attention_state
+            .lock()
+            .expect("metal linear attention state poisoned");
+        let state = state_guard
+            .layers
+            .get_mut(layer)
+            .and_then(Option::as_mut)
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path: layer {layer} has no resolved Metal recurrent state"
+                )
+            })?;
+        if state.conv_dim != layout.conv_dim
+            || state.total_value_width != layout.total_value_width
+            || state.num_value_heads != layout.num_value_heads
+            || state.conv_state_len != layout.conv_state_len()
+            || state.ssm_state_len != layout.ssm_state_len()
+        {
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path: layer {layer} recurrent state does not match the resolved layout"
+            );
+        }
+
+        unsafe {
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let projection_buffer =
+                self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let attention_output_buffer =
+                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
+            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
+                MetalBatchProjectionInput::Cpu(residual) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
+            let projected_buffer =
+                self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let residual_buffer =
+                self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let normed_buffer = self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
+            let router_logits_buffer =
+                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
+            let mut owned_buffers = vec![
+                projection_buffer,
+                attention_output_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                residual_buffer,
+                normed_buffer,
+                router_logits_buffer,
+            ];
+            if let Some(buffer) = owned_residual_input_buffer {
+                owned_buffers.push(buffer);
+            }
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle_or_release_buffers(&owned_buffers, true);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE fused linear q4 command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle_or_release_buffers(&owned_buffers, true);
+                drop(state_guard);
+                bail!("failed to create Flash-MoE fused linear q4 compute encoder");
+            }
+
+            for (idx, projection) in projections.iter().enumerate() {
+                let output_offset = output_offsets[idx]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .context("linear fused q4 output byte offset overflow")?
+                    as u64;
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.pipelines.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer_with_offset(encoder, projection_buffer, output_offset, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+            }
+
+            let conv_dim_u32 = layout.conv_dim as u32;
+            let kernel_size_u32 = layout.conv_kernel_size as u32;
+            let key_dim_u32 = layout.key_dim as u32;
+            let value_dim_u32 = layout.value_dim as u32;
+            let heads_u32 = layout.num_value_heads as u32;
+            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
+            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+            let eps = 1e-6f32;
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.linear_conv1d_pipeline,
+            );
+            set_buffer(encoder, state.conv_state, 0);
+            set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.conv_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, state.conv_output, 3);
+            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
+            dispatch_threads(encoder, layout.conv_dim as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.linear_rms_norm_qk_pipeline,
+            );
+            set_buffer(encoder, state.conv_output, 0);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                1,
+            );
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MetalDispatchSize {
+                    width: layout.num_key_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MetalDispatchSize {
+                    width: layout.key_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.linear_decay_beta_pipeline,
+            );
+            set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
+            set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.a_log_byte_offset,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.dt_bias_byte_offset,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
+            dispatch_threads(encoder, layout.num_value_heads as u64);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.linear_delta_step_pipeline,
+            );
+            set_buffer(encoder, state.ssm_state, 0);
+            set_buffer(encoder, state.conv_output, 1);
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                2,
+            );
+            set_buffer_with_offset(
+                encoder,
+                state.conv_output,
+                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                3,
+            );
+            set_buffer(encoder, state.g_decay, 4);
+            set_buffer(encoder, state.beta_gate, 5);
+            set_buffer(encoder, state.delta_output, 6);
+            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MetalDispatchSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MetalDispatchSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.linear_gated_rms_norm_pipeline,
+            );
+            set_buffer(encoder, state.delta_output, 0);
+            set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
+            set_buffer_with_offset(
+                encoder,
+                dense_weights.buffer,
+                static_offsets.norm_weight_byte_offset,
+                2,
+            );
+            set_buffer(encoder, attention_output_buffer, 3);
+            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MetalDispatchSize {
+                    width: layout.num_value_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MetalDispatchSize {
+                    width: layout.value_dim as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            for (projection, input_buffer, output_buffer) in [
+                (out_proj, attention_output_buffer, projected_buffer),
+                (router, normed_buffer, router_logits_buffer),
+            ] {
+                let rows_u32 = projection.rows as u32;
+                let cols_u32 = projection.cols as u32;
+                let groups_u32 = projection.groups_per_row as u32;
+                let group_size_u32 = projection.group_size as u32;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    if projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
+                    } else {
+                        self.pipelines.q4_mmap_pipeline
+                    },
+                );
+                set_buffer(encoder, dense_weights.buffer, 0);
+                set_buffer(encoder, input_buffer, 1);
+                set_buffer(encoder, output_buffer, 2);
+                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+
+                if std::ptr::eq(projection, out_proj) {
+                    let width_u32 = residual_len as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.pipelines.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, projected_buffer, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, residual_buffer, 3);
+                    set_buffer(encoder, normed_buffer, 4);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                    dispatch_single_threadgroup(encoder, 256);
+                }
+            }
+
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let active_count = top_k.min(router.rows).max(1);
+            let context = MetalCommandContext::new("linear_attention_q4_fused_post")
+                .with("layer", layer)
+                .with("projections", projections.len())
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("experts", router.rows)
+                .with("top_k", active_count);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(&owned_buffers, error.should_release_buffers());
+                drop(state_guard);
+                return Err(error.into());
+            }
+
+            let router_logits_ptr =
+                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
+            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
+            let active = super::math::top_k(&router_scores, active_count);
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            if let Some(buffer) = owned_residual_input_buffer {
+                self.recycle(buffer);
+            }
+            for buffer in [
+                projection_buffer,
+                attention_output_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                router_logits_buffer,
+            ] {
+                self.recycle(buffer);
+            }
+            drop(state_guard);
+            Ok(MetalPostAttentionPrep::new(
+                layer,
+                residual_len,
+                router.rows,
+                active,
+                residual_buffer,
+                normed_buffer,
+            )?)
         }
     }
 }
