@@ -922,6 +922,28 @@ pub(crate) struct SharedExpertPhaseWeights {
 }
 
 impl SharedExpertPhaseWeights {
+    pub(crate) fn new(
+        gate: Arc<Vec<f32>>,
+        up: Arc<Vec<f32>>,
+        down: Arc<Vec<f32>>,
+        router: Arc<Vec<f32>>,
+        shared_experts: usize,
+        intermediate: usize,
+        width: usize,
+    ) -> Result<Self> {
+        let weights = Self {
+            gate,
+            up,
+            down,
+            router,
+            shared_experts,
+            intermediate,
+            width,
+        };
+        weights.validated_shape()?;
+        Ok(weights)
+    }
+
     pub(crate) fn validated_shape(&self) -> Result<SharedExpertPhaseShape> {
         let shape =
             SharedExpertPhaseShape::new(self.width, self.shared_experts, self.intermediate)?;
@@ -951,6 +973,39 @@ impl SharedExpertPhaseWeights {
         }
         Ok(shape)
     }
+}
+
+pub(crate) fn build_shared_expert_phase_weights<F>(
+    layer: usize,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    mut lookup: F,
+) -> Result<Option<SharedExpertPhaseWeights>>
+where
+    F: FnMut(&str) -> Result<Option<Arc<Vec<f32>>>>,
+{
+    if shared_experts == 0 || intermediate == 0 {
+        return Ok(None);
+    }
+    SharedExpertPhaseShape::new(width, shared_experts, intermediate)?;
+
+    let gate_name = shared_expert_tensor_name(layer, "gate_proj");
+    let up_name = shared_expert_tensor_name(layer, "up_proj");
+    let down_name = shared_expert_tensor_name(layer, "down_proj");
+    let shared_gate_name = shared_expert_gate_tensor_name(layer);
+    let gate = lookup(&gate_name)?
+        .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
+    let up = lookup(&up_name)?
+        .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
+    let down = lookup(&down_name)?
+        .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
+    let router = lookup(&shared_gate_name)?.with_context(|| {
+        format!("missing configured shared expert gate tensor {shared_gate_name}")
+    })?;
+
+    SharedExpertPhaseWeights::new(gate, up, down, router, shared_experts, intermediate, width)
+        .map(Some)
 }
 
 #[derive(Debug, Clone)]
@@ -1380,15 +1435,16 @@ mod tests {
 
     #[test]
     fn shared_expert_dense_descriptor_groups_projection_weights() {
-        let shared = SharedExpertPhaseWeights {
-            gate: Arc::new(vec![1.0, 2.0]),
-            up: Arc::new(vec![3.0, 4.0]),
-            down: Arc::new(vec![5.0, 6.0]),
-            router: Arc::new(vec![7.0]),
-            shared_experts: 1,
-            intermediate: 2,
-            width: 1,
-        };
+        let shared = SharedExpertPhaseWeights::new(
+            Arc::new(vec![1.0, 2.0]),
+            Arc::new(vec![3.0, 4.0]),
+            Arc::new(vec![5.0, 6.0]),
+            Arc::new(vec![7.0]),
+            1,
+            2,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(shared.shared_experts, 1);
         assert_eq!(shared.intermediate, 2);
@@ -1399,6 +1455,81 @@ mod tests {
             shared.validated_shape().unwrap(),
             SharedExpertPhaseShape::new(1, 1, 2).unwrap()
         );
+    }
+
+    #[test]
+    fn shared_expert_weight_builder_loads_named_dense_tensors() {
+        let mut tensors = BTreeMap::<String, Arc<Vec<f32>>>::new();
+        tensors.insert(
+            shared_expert_tensor_name(3, "gate_proj"),
+            Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "up_proj"),
+            Arc::new(vec![5.0, 6.0, 7.0, 8.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "down_proj"),
+            Arc::new(vec![9.0, 10.0, 11.0, 12.0]),
+        );
+        tensors.insert(
+            shared_expert_gate_tensor_name(3),
+            Arc::new(vec![13.0, 14.0]),
+        );
+
+        let shared =
+            build_shared_expert_phase_weights(3, 2, 1, 2, |name| Ok(tensors.get(name).cloned()))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(shared.width, 2);
+        assert_eq!(shared.shared_experts, 1);
+        assert_eq!(shared.intermediate, 2);
+        assert_eq!(shared.gate.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(shared.router.as_slice(), &[13.0, 14.0]);
+    }
+
+    #[test]
+    fn shared_expert_weight_builder_skips_disabled_shared_experts() {
+        let none = build_shared_expert_phase_weights(3, 2, 0, 2, |_| {
+            panic!("disabled shared experts must not request tensors")
+        })
+        .unwrap();
+        assert!(none.is_none());
+
+        let none = build_shared_expert_phase_weights(3, 2, 1, 0, |_| {
+            panic!("zero intermediate shared experts must not request tensors")
+        })
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn shared_expert_weight_builder_rejects_missing_and_mismatched_tensors() {
+        let missing = build_shared_expert_phase_weights(3, 2, 1, 2, |_| Ok(None)).unwrap_err();
+        assert!(missing.to_string().contains(
+            "missing configured shared expert tensor model.layers.3.mlp.shared_expert.gate_proj.weight"
+        ));
+
+        let mut tensors = BTreeMap::<String, Arc<Vec<f32>>>::new();
+        tensors.insert(
+            shared_expert_tensor_name(3, "gate_proj"),
+            Arc::new(vec![1.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "up_proj"),
+            Arc::new(vec![2.0; 4]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "down_proj"),
+            Arc::new(vec![3.0; 4]),
+        );
+        tensors.insert(shared_expert_gate_tensor_name(3), Arc::new(vec![4.0; 2]));
+
+        let mismatch =
+            build_shared_expert_phase_weights(3, 2, 1, 2, |name| Ok(tensors.get(name).cloned()))
+                .unwrap_err();
+        assert!(mismatch.to_string().contains("shape is invalid"));
     }
 
     #[test]

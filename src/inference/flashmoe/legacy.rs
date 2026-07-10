@@ -139,8 +139,8 @@ use super::weights::{
     ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
     RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
     SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    apply_qwen3next_norm_offset_if_needed, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    apply_qwen3next_norm_offset_if_needed, build_shared_expert_phase_weights,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -11924,65 +11924,14 @@ impl FlashMoeEngine {
         layer: usize,
         width: usize,
     ) -> Result<SharedExpertPhaseWeights> {
-        let num_shared = self.config.shared_experts();
-        let shared_inter = self.config.shared_expert_intermediate_size();
-        let total_intermediate = num_shared
-            .checked_mul(shared_inter)
-            .context("shared expert intermediate width overflow")?;
-        let gate_name = shared_expert_tensor_name(layer, "gate_proj");
-        let up_name = shared_expert_tensor_name(layer, "up_proj");
-        let down_name = shared_expert_tensor_name(layer, "down_proj");
-        let shared_gate_name = shared_expert_gate_tensor_name(layer);
-        let gate = self
-            .dense
-            .read_full_tensor_f32_cached(&gate_name)?
-            .with_context(|| format!("missing configured shared expert tensor {gate_name}"))?;
-        let up = self
-            .dense
-            .read_full_tensor_f32_cached(&up_name)?
-            .with_context(|| format!("missing configured shared expert tensor {up_name}"))?;
-        let down = self
-            .dense
-            .read_full_tensor_f32_cached(&down_name)?
-            .with_context(|| format!("missing configured shared expert tensor {down_name}"))?;
-        let router = self
-            .dense
-            .read_full_tensor_f32_cached(&shared_gate_name)?
-            .with_context(|| {
-                format!("missing configured shared expert gate tensor {shared_gate_name}")
-            })?;
-        let expected_gate = total_intermediate
-            .checked_mul(width)
-            .context("shared expert gate/up tensor size overflow")?;
-        let expected_down = width
-            .checked_mul(total_intermediate)
-            .context("shared expert down tensor size overflow")?;
-        let expected_router = num_shared
-            .checked_mul(width)
-            .context("shared expert router tensor size overflow")?;
-        if gate.len() != expected_gate || up.len() != expected_gate || down.len() != expected_down {
-            bail!(
-                "shared expert tensors for layer {layer} do not match config: gate {}, up {}, down {}, expected gate/up {expected_gate}, down {expected_down}",
-                gate.len(),
-                up.len(),
-                down.len()
-            );
-        }
-        if router.len() != expected_router {
-            bail!(
-                "shared expert gate tensor for layer {layer} has {} values; expected {expected_router}",
-                router.len()
-            );
-        }
-        Ok(SharedExpertPhaseWeights {
-            gate,
-            up,
-            down,
-            router,
-            shared_experts: num_shared,
-            intermediate: shared_inter,
+        build_shared_expert_phase_weights(
+            layer,
             width,
-        })
+            self.config.shared_experts(),
+            self.config.shared_expert_intermediate_size(),
+            |name| self.dense.read_full_tensor_f32_cached(name),
+        )?
+        .with_context(|| format!("shared experts are not configured for layer {layer}"))
     }
 
     #[cfg(test)]
