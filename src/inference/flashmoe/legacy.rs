@@ -105,15 +105,16 @@ use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
     MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
-    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3OutputBuffers,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers,
-    MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy,
-    MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan,
-    MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
-    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3NextNormBuffers,
+    MetalCmd3NextNormPlan, MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan,
+    MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -5075,18 +5076,23 @@ impl MetalExecutorInner {
             if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
                 (next_norm_weight, output_buffers.next_normed, next_norm_plan)
             {
-                let norm_weight_buffer =
-                    self.buffer_with_bytes(f32_as_bytes(&weight[..next_norm_plan.width]))?;
-                buffers.push(MetalPhaseBuffer::recyclable(norm_weight_buffer));
+                let next_norm_buffers = self.cmd3_next_norm_buffers(
+                    next_norm_plan,
+                    weight,
+                    output_buffers.hidden,
+                    next_normed_buffer,
+                    combine_buffers.width,
+                    &mut buffers,
+                )?;
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
                     self.pipelines.rms_norm_reduced_pipeline,
                 );
-                set_buffer(encoder, output_buffers.hidden, 0);
-                set_buffer(encoder, norm_weight_buffer, 1);
-                set_buffer(encoder, next_normed_buffer, 2);
-                set_buffer(encoder, combine_buffers.width, 3);
+                set_buffer(encoder, next_norm_buffers.hidden, 0);
+                set_buffer(encoder, next_norm_buffers.weight, 1);
+                set_buffer(encoder, next_norm_buffers.next_normed, 2);
+                set_buffer(encoder, next_norm_buffers.width, 3);
                 dispatch_single_threadgroup(encoder, next_norm_plan.dispatch_threads);
             }
 
@@ -8295,6 +8301,31 @@ impl MetalExecutorInner {
             let active_count = self.buffer_with_bytes(u32_as_bytes(&layout.active_count_u32))?;
             buffers.push(MetalPhaseBuffer::recyclable(active_count));
             MetalCmd3CombineBuffers::new(plan, routing_weights, width, active_count)
+        }
+    }
+
+    unsafe fn cmd3_next_norm_buffers(
+        &self,
+        plan: MetalCmd3NextNormPlan,
+        weight: &[f32],
+        hidden: ObjcId,
+        next_normed: ObjcId,
+        width: ObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<MetalCmd3NextNormBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let weight_bytes = f32_as_bytes(&weight[..plan.width]);
+            if weight_bytes.len() != layout.weight_bytes {
+                bail!(
+                    "FlashMoe Metal CMD3 next-norm weight byte length {} does not match declared layout {}",
+                    weight_bytes.len(),
+                    layout.weight_bytes
+                );
+            }
+            let weight = self.buffer_with_bytes(weight_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(weight));
+            MetalCmd3NextNormBuffers::new(plan, hidden, weight, next_normed, width)
         }
     }
 

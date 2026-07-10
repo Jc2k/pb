@@ -1149,6 +1149,42 @@ pub(crate) struct MetalCmd3NextNormPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3NextNormBufferLayout {
+    pub(crate) width_u32: u32,
+    pub(crate) weight_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3NextNormBuffers {
+    pub(crate) hidden: MetalObjcId,
+    pub(crate) weight: MetalObjcId,
+    pub(crate) next_normed: MetalObjcId,
+    pub(crate) width: MetalObjcId,
+    pub(crate) layout: MetalCmd3NextNormBufferLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3NextNormBuffers {
+    pub(crate) fn new(
+        plan: MetalCmd3NextNormPlan,
+        hidden: MetalObjcId,
+        weight: MetalObjcId,
+        next_normed: MetalObjcId,
+        width: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            hidden,
+            weight,
+            next_normed,
+            width,
+            layout: plan.buffer_layout()?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3NextNormPlan {
     const RMS_NORM_REDUCED_THREADS: u64 = 256;
 
@@ -1179,6 +1215,21 @@ impl MetalCmd3NextNormPlan {
                 }))
             }
         }
+    }
+
+    pub(crate) fn weight_bytes(self) -> anyhow::Result<usize> {
+        self.width
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("FlashMoe Metal CMD3 next-norm weight byte size overflow")
+            })
+    }
+
+    pub(crate) fn buffer_layout(self) -> anyhow::Result<MetalCmd3NextNormBufferLayout> {
+        Ok(MetalCmd3NextNormBufferLayout {
+            width_u32: self.width as u32,
+            weight_bytes: self.weight_bytes()?,
+        })
     }
 }
 
@@ -3918,6 +3969,30 @@ mod tests {
         assert_eq!(buffers.layout.width_u32, 4);
         assert_eq!(buffers.layout.active_count_u32, 2);
         assert_eq!(buffers.layout.routing_weights_bytes, 2 * 4);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_next_norm_buffers_carry_declared_bindings() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, true);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, true).unwrap();
+        let plan = MetalCmd3NextNormPlan::new(phase, Some(4)).unwrap().unwrap();
+
+        let buffers = MetalCmd3NextNormBuffers::new(
+            plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        assert_eq!(buffers.hidden, 0x1000usize as MetalObjcId);
+        assert_eq!(buffers.weight, 0x2000usize as MetalObjcId);
+        assert_eq!(buffers.next_normed, 0x3000usize as MetalObjcId);
+        assert_eq!(buffers.width, 0x4000usize as MetalObjcId);
+        assert_eq!(buffers.layout.width_u32, 4);
+        assert_eq!(buffers.layout.weight_bytes, 4 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
