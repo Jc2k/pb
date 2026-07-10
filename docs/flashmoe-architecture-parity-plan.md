@@ -186,7 +186,8 @@ The validator should reject silent fallbacks such as:
   descriptors also live in `weights`; dense shared-expert weight assembly and Q4 shared-expert
   projection assembly now use the same weight-owned shape validation with runtime lookup callbacks.
   CMD2 Q4 post-attention prep projection assembly now also resolves as a typed weight-owned
-  out-projection/router bundle before the Metal helper runs. The generation loop supplies lookup
+  out-projection/router bundle before the Metal helper runs. Router score projection descriptor
+  lookup also lives in `weights` behind a registry callback. The generation loop supplies lookup
   closures instead of owning those weight-policy branches. Command construction and much of runtime
   score execution still flows through `legacy.rs` shims.
 - `state.rs` owns CPU-visible hidden/residual/normed/next-normed buffers and now also describes
@@ -272,8 +273,8 @@ The validator should reject silent fallbacks such as:
   of resolving those bindings inside the legacy helper. The scheduled router score command now owns
   raw score finalization into a declared batch, routing-output validation, and score-based topK
   selection before the runtime receives a `ScheduledRoutingCommand`. Router projection execution now
-  requires a declared resident dense/Q4 descriptor before the legacy bridge can run it, so missing
-  router storage is an unsupported implementation error rather than a synthetic fallback. The
+  requires a weight-built declared resident dense/Q4 descriptor before the legacy bridge can run it,
+  so missing router storage is an unsupported implementation error rather than a synthetic fallback. The
   remaining gap is score production ownership: projection execution still flows through legacy
   dense/runtime helpers instead of a typed CMD2 builder boundary, even though the inputs and
   capability checks are now descriptor-backed.

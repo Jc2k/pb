@@ -444,6 +444,31 @@ impl RouterScoreProjectionDescriptor {
     }
 }
 
+pub(crate) fn build_router_score_projection_descriptor<'a, F>(
+    layer: usize,
+    experts: usize,
+    hidden_width: usize,
+    store_len: u64,
+    mut lookup: F,
+) -> Result<Option<RouterScoreProjectionDescriptor>>
+where
+    F: FnMut(&str) -> Option<&'a RuntimeTensorEntry>,
+{
+    let tensor_name = router_tensor_name(layer);
+    let Some(entry) = lookup(&tensor_name) else {
+        return Ok(None);
+    };
+    RouterScoreProjectionDescriptor::from_entry(
+        layer,
+        &tensor_name,
+        entry,
+        store_len,
+        experts,
+        hidden_width,
+    )
+    .map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RouterScoreBatch {
     state: FlashMoeRoutingOutputState,
@@ -1396,6 +1421,59 @@ mod tests {
             }
             RouterScoreProjectionBinding::ResidentDense(_) => panic!("expected q4 binding"),
         }
+    }
+
+    #[test]
+    fn router_score_projection_builder_uses_canonical_layer_tensor_name() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 64,
+            byte_len: 32,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+        let mut seen_name = None;
+
+        let descriptor = build_router_score_projection_descriptor(3, 2, 4, 128, |name| {
+            seen_name = Some(name.to_string());
+            (name == entry.name).then_some(&entry)
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(seen_name.unwrap(), "model.layers.3.mlp.gate.weight");
+        assert_eq!(descriptor.tensor_name, entry.name);
+        assert_eq!(descriptor.experts, 2);
+        assert_eq!(descriptor.hidden_width, 4);
+    }
+
+    #[test]
+    fn router_score_projection_builder_returns_none_for_missing_router() {
+        let descriptor = build_router_score_projection_descriptor(3, 2, 4, 128, |_| None).unwrap();
+
+        assert!(descriptor.is_none());
+    }
+
+    #[test]
+    fn router_score_projection_builder_rejects_wrong_shape_without_fallback() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.3.mlp.gate.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![3, 4],
+            byte_offset: 0,
+            byte_len: 48,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+
+        let err = build_router_score_projection_descriptor(3, 2, 4, 64, |name| {
+            (name == entry.name).then_some(&entry)
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("shape mismatch"), "{err:#}");
     }
 
     #[test]
