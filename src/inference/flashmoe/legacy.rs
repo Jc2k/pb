@@ -2431,22 +2431,6 @@ impl MetalExecutor {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn q4_post_attention_prep_topk_from_buffer(
-        &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
-        attention_output: &MetalAttentionValues,
-        residual: MetalBatchProjectionInput<'_>,
-        post_norm_weight: &[f32],
-    ) -> Result<MetalPostAttentionPrep> {
-        self.inner.q4_post_attention_prep_topk_from_buffer(
-            projections,
-            attention_output,
-            residual,
-            post_norm_weight,
-        )
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     fn linear_attention_q4_post_attention_prep(
         &self,
@@ -2460,7 +2444,7 @@ impl MetalExecutor {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         self.inner.linear_attention_q4_post_attention_prep(
             layer,
             layout,
@@ -3830,7 +3814,7 @@ impl MetalExecutorInner {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         let residual_len = residual.len();
         if top_k == 0
             || residual_len == 0
@@ -3852,11 +3836,16 @@ impl MetalExecutorInner {
             || layout.num_key_heads == 0
             || layout.num_value_heads == 0
         {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: incompatible dimensions or routing policy (input projections {}, input width {}, residual width {residual_len}, norm width {}, topK {top_k})",
+                projections.len(),
+                input.len(),
+                post_norm_weight.len()
+            );
         }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path: resident dense Metal weights are unavailable",
+        )?;
         let input_len = input.len();
         let mut total_rows = 0usize;
         let mut output_offsets = Vec::with_capacity(projections.len());
@@ -3867,7 +3856,10 @@ impl MetalExecutorInner {
                 || projection.output_width != projection.rows
                 || projection.row_packed_bytes != projection.cols.div_ceil(2)
             {
-                return Ok(None);
+                bail!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: projection {} does not match resolved input width {input_len}",
+                    projection.tensor_name
+                );
             }
             output_offsets.push(total_rows);
             total_rows = total_rows
@@ -3879,7 +3871,11 @@ impl MetalExecutorInner {
             if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
                 || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
             {
-                return Ok(None);
+                bail!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} has unaligned scale/bias offsets for {}",
+                    projection.tensor_name,
+                    projection.scale_bias_dtype
+                );
             }
             let packed_len = projection
                 .rows
@@ -3900,7 +3896,11 @@ impl MetalExecutorInner {
                     .checked_add(len)
                     .map_or(true, |end| end > dense_weights.len)
                 {
-                    return Ok(None);
+                    bail!(
+                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} exceeds resident dense store length {}",
+                        projection.tensor_name,
+                        dense_weights.len
+                    );
                 }
             }
         }
@@ -3926,16 +3926,24 @@ impl MetalExecutorInner {
             .linear_attention_state
             .lock()
             .expect("metal linear attention state poisoned");
-        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
-            return Ok(None);
-        };
+        let state = state_guard
+            .layers
+            .get_mut(layer)
+            .and_then(Option::as_mut)
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path: layer {layer} has no resolved Metal recurrent state"
+                )
+            })?;
         if state.conv_dim != layout.conv_dim
             || state.total_value_width != layout.total_value_width
             || state.num_value_heads != layout.num_value_heads
             || state.conv_state_len != layout.conv_state_len()
             || state.ssm_state_len != layout.ssm_state_len()
         {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path: layer {layer} recurrent state does not match the resolved layout"
+            );
         }
 
         unsafe {
@@ -4274,14 +4282,14 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             drop(state_guard);
-            Ok(Some(MetalPostAttentionPrep::new(
+            Ok(MetalPostAttentionPrep::new(
                 layer,
                 residual_len,
                 router.rows,
                 active,
                 residual_buffer,
                 normed_buffer,
-            )?))
+            )?)
         }
     }
 
@@ -6946,158 +6954,6 @@ impl MetalExecutorInner {
         }
     }
 
-    fn q4_post_attention_prep_topk_from_buffer(
-        &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
-        attention_output: &MetalAttentionValues,
-        residual: MetalBatchProjectionInput<'_>,
-        post_norm_weight: &[f32],
-    ) -> Result<MetalPostAttentionPrep> {
-        if attention_output.buffer.is_null() {
-            bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: Metal attention buffer is absent"
-            );
-        }
-        let dense_weights = self.dense_weights.as_ref().context(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
-        )?;
-        let plan = projections.resident_plan(
-            dense_weights.len,
-            attention_output.len,
-            residual.len(),
-            post_norm_weight.len(),
-        )?;
-        let out_proj = &projections.out_proj;
-        let router = &projections.router;
-        let width = plan.width;
-        let active_count = plan.active_count;
-
-        unsafe {
-            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
-                MetalBatchProjectionInput::Cpu(residual) => {
-                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
-                    (buffer, Some(buffer))
-                }
-                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
-            };
-            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
-            let projected_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let residual_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let normed_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let router_logits_buffer =
-                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
-            let mut buffers = vec![
-                norm_weight_buffer,
-                projected_buffer,
-                residual_buffer,
-                normed_buffer,
-                router_logits_buffer,
-            ];
-            if let Some(buffer) = owned_residual_input_buffer {
-                buffers.push(buffer);
-            }
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE post-attention prep command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE post-attention prep compute encoder");
-            }
-
-            for (projection, input_buffer, output_buffer) in [
-                (out_proj, attention_output.buffer, projected_buffer),
-                (router, normed_buffer, router_logits_buffer),
-            ] {
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let groups_u32 = projection.groups_per_row as u32;
-                let group_size_u32 = projection.group_size as u32;
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.pipelines.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer(encoder, output_buffer, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
-
-                if std::ptr::eq(projection, out_proj) {
-                    let width_u32 = width as u32;
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        self.pipelines.residual_rms_norm_pipeline,
-                    );
-                    set_buffer(encoder, projected_buffer, 0);
-                    set_buffer(encoder, residual_input_buffer, 1);
-                    set_buffer(encoder, norm_weight_buffer, 2);
-                    set_buffer(encoder, residual_buffer, 3);
-                    set_buffer(encoder, normed_buffer, 4);
-                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
-                    dispatch_single_threadgroup(encoder, 256);
-                }
-            }
-
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let context = MetalCommandContext::new("linear_post_attention_q4_router_buffer")
-                .with("width", width)
-                .with("attention_width", plan.attention_width)
-                .with("experts", plan.experts)
-                .with("top_k", active_count)
-                .with("routing_topk", "cpu")
-                .with("out_proj", out_proj.tensor_name.as_str())
-                .with("router", router.tensor_name.as_str());
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
-                return Err(error.into());
-            }
-
-            let router_logits_ptr =
-                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
-            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
-            let active = super::math::top_k(&router_scores, active_count);
-
-            release(encoder);
-            release(command_buffer);
-            if let Some(buffer) = owned_residual_input_buffer {
-                self.recycle(buffer);
-            }
-            for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
-                self.recycle(buffer);
-            }
-            Ok(MetalPostAttentionPrep::new(
-                plan.layer,
-                width,
-                plan.experts,
-                active,
-                residual_buffer,
-                normed_buffer,
-            )?)
-        }
-    }
-
     fn q4_mmap_matvec_batch(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
@@ -9518,11 +9374,6 @@ impl FlashMoeEngine {
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let mut metal_post_attention_values_for_prep: Option<(
-                String,
-                MetalAttentionValues,
-            )> = None;
             let projected = if self.runtime.is_linear_attention_layer(layer) {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
@@ -9533,46 +9384,28 @@ impl FlashMoeEngine {
                                 len: input.len(),
                             })
                             .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                        if let Some(post_norm_weight) =
-                            self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                            && let Some(prep) = self
-                                .linear_attention_post_attention_prep_with_metal(
-                                    layer,
-                                    &normed,
-                                    deferred_attention_input,
-                                    residual_input,
-                                    &post_norm_weight,
-                                    runtime,
-                                    Some(&mut layer_timing.buckets),
-                                )?
-                        {
-                            if deferred_residual_input.is_some()
-                                && let Some(pending) = pending_for_layer.take()
-                            {
-                                pending.finish_without_readback()?;
-                            }
-                            early_metal_post_attention_prep = Some(prep);
-                        } else if let Some(values) = self.linear_attention_output_values_buffer(
+                        let post_norm_weight = self
+                            .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                            .with_context(|| {
+                                format!(
+                                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path: missing norm tensor {post_norm_name}"
+                                )
+                            })?;
+                        let prep = self.linear_attention_post_attention_prep_with_metal(
                             layer,
                             &normed,
                             deferred_attention_input,
+                            residual_input,
+                            &post_norm_weight,
                             runtime,
                             Some(&mut layer_timing.buckets),
-                        )? {
-                            metal_post_attention_values_for_prep =
-                                Some((linear_attention_tensor_name(layer, "out_proj"), values));
-                        } else {
-                            let values = self.linear_attention_output_values(
-                                layer,
-                                &normed,
-                                deferred_attention_input,
-                                kv_cache,
-                                runtime,
-                                Some(&mut layer_timing.buckets),
-                            )?;
-                            post_attention_values_for_prep =
-                                Some((linear_attention_tensor_name(layer, "out_proj"), values));
+                        )?;
+                        if deferred_residual_input.is_some()
+                            && let Some(pending) = pending_for_layer.take()
+                        {
+                            pending.finish_without_readback()?;
                         }
+                        early_metal_post_attention_prep = Some(prep);
                         Vec::new()
                     } else {
                         self.linear_attention_projected(
@@ -9645,8 +9478,7 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let can_defer_residual_wait_for_post_prep = deferred_residual_input.is_some()
                 && expert_execution != ExpertExecution::Skip
-                && (metal_post_attention_values_for_prep.is_some()
-                    || post_attention_values_for_prep.is_some());
+                && post_attention_values_for_prep.is_some();
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let can_defer_residual_wait_for_post_prep = false;
             if deferred_attention_input.is_some()
@@ -9681,11 +9513,6 @@ impl FlashMoeEngine {
                 .as_ref()
                 .map(|prep| prep.width)
                 .or_else(|| {
-                    metal_post_attention_values_for_prep
-                        .as_ref()
-                        .map(|(_, values)| values.len)
-                })
-                .or_else(|| {
                     post_attention_values_for_prep
                         .as_ref()
                         .map(|(_, values)| values.len())
@@ -9694,9 +9521,7 @@ impl FlashMoeEngine {
             let cmd2_residual_len = deferred_residual_input
                 .map(|input| input.len())
                 .unwrap_or_else(|| token_state.hidden().len());
-            let cmd2_attention_input = if metal_post_attention_prep.is_some()
-                || metal_post_attention_values_for_prep.is_some()
-            {
+            let cmd2_attention_input = if metal_post_attention_prep.is_some() {
                 ScheduledCmd2AttentionInput::metal_values(cmd2_attention_len)
             } else {
                 ScheduledCmd2AttentionInput::cpu_values(cmd2_attention_len)
@@ -9734,54 +9559,6 @@ impl FlashMoeEngine {
                     ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
                 );
                 precomputed_active = Some(prep.attach_routing_command(routing_command)?);
-            }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if let Some((out_proj_name, attention_values)) =
-                metal_post_attention_values_for_prep.take()
-            {
-                let residual_input = deferred_residual_input
-                    .map(|input| MetalBatchProjectionInput::Buffer {
-                        buffer: input.buffer,
-                        len: input.len(),
-                    })
-                    .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                let metal = &self.metal;
-                let post_norm_weight = self
-                    .model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                    .with_context(|| {
-                        format!(
-                            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
-                        )
-                    })?;
-                let prep = self.dense.post_attention_q4_prep_with_metal_buffer(
-                    metal,
-                    layer,
-                    self.config.experts(),
-                    &out_proj_name,
-                    &attention_values,
-                    residual_input,
-                    &post_norm_weight,
-                    scheduled_cmd2.active_experts,
-                );
-                metal.recycle_attention_values(attention_values);
-                let mut prep = prep?;
-                if deferred_residual_input.is_some()
-                    && let Some(pending) = pending_for_layer.take()
-                {
-                    pending.finish_without_readback()?;
-                }
-                let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
-                    &self.scheduled_graph,
-                    prep.state,
-                    &prep.active,
-                )?;
-                debug_assert_eq!(
-                    routing_command.source,
-                    ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
-                );
-                let routing_command = prep.attach_routing_command(routing_command)?;
-                metal_post_attention_prep = Some(prep);
-                precomputed_active = Some(routing_command);
             }
             let active = if let Some(routing_command) = precomputed_active {
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
@@ -10446,63 +10223,6 @@ impl FlashMoeEngine {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_attention_output_values_buffer(
-        &self,
-        layer: usize,
-        normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
-        runtime: &DenseTransformerRuntime,
-        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Option<MetalAttentionValues>> {
-        let metal = &self.metal;
-        let layout = runtime.linear_attention_layout(layer)?;
-        if self
-            .config
-            .linear_attention_qkv_projection_requires_reorder()
-        {
-            return Ok(None);
-        }
-        let Some(static_offsets) = self
-            .dense
-            .linear_attention_static_offsets_for_metal(layer, layout)?
-        else {
-            return Ok(None);
-        };
-        let input_requests = linear_attention_input_projection_requests(
-            layer,
-            layout.conv_dim,
-            layout.total_value_width,
-            layout.num_value_heads,
-        )?;
-        let input_specs = input_requests.requests();
-        let projection_input = if let Some(input) = deferred_input {
-            MetalBatchProjectionInput::Buffer {
-                buffer: input.buffer,
-                len: input.len(),
-            }
-        } else if !normed.is_empty() {
-            MetalBatchProjectionInput::Cpu(normed)
-        } else {
-            return Ok(None);
-        };
-        let started = Instant::now();
-        let values = self.dense.linear_attention_q4_with_metal(
-            metal,
-            layer,
-            layout,
-            &input_specs,
-            projection_input,
-            static_offsets,
-        )?;
-        if values.is_some()
-            && let Some(buckets) = attention_buckets.as_deref_mut()
-        {
-            buckets.attention_input_projection += started.elapsed();
-        }
-        Ok(values)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn linear_attention_post_attention_prep_with_metal(
         &self,
         layer: usize,
@@ -10512,24 +10232,32 @@ impl FlashMoeEngine {
         post_norm_weight: &[f32],
         runtime: &DenseTransformerRuntime,
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         let metal = &self.metal;
         let layout = runtime.linear_attention_layout(layer)?;
         if self
             .config
             .linear_attention_qkv_projection_requires_reorder()
         {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: the resolved implementation does not support QKV projection reorder"
+            );
         }
-        let Some(static_offsets) = self
+        let static_offsets = self
             .dense
             .linear_attention_static_offsets_for_metal(layer, layout)?
-        else {
-            return Ok(None);
-        };
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path at layer {layer}: resident static tensor offsets are unavailable"
+                )
+            })?;
         let residual_len = residual.len();
         if residual_len != runtime.width || residual_len != post_norm_weight.len() {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: residual width {residual_len}, runtime width {}, and norm width {} do not match",
+                runtime.width,
+                post_norm_weight.len()
+            );
         }
         let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
         let input_requests = linear_attention_input_projection_requests(
@@ -10547,7 +10275,9 @@ impl FlashMoeEngine {
         } else if !normed.is_empty() {
             MetalBatchProjectionInput::Cpu(normed)
         } else {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: neither deferred Metal nor CPU normed input is available"
+            );
         };
         let started = Instant::now();
         let prep = self
@@ -10565,9 +10295,7 @@ impl FlashMoeEngine {
                 post_norm_weight,
                 self.routing_policy.active_experts,
             )?;
-        if prep.is_some()
-            && let Some(buckets) = attention_buckets.as_deref_mut()
-        {
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_input_projection += started.elapsed();
         }
         Ok(prep)
@@ -15144,34 +14872,48 @@ impl DenseStore {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         let residual_len = residual.len();
-        if !metal.has_resident_dense_weights()
-            || input_specs.len() != 4
-            || residual_len != post_norm_weight.len()
-        {
-            return Ok(None);
+        if !metal.has_resident_dense_weights() {
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path: resident dense Metal weights are unavailable"
+            );
+        }
+        if input_specs.len() != 4 || residual_len != post_norm_weight.len() {
+            bail!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: expected 4 input projections and equal residual/norm widths, got {} projections and widths {residual_len}/{}",
+                input_specs.len(),
+                post_norm_weight.len()
+            );
         }
         let input_len = input.len();
         let mut input_projections = Vec::with_capacity(input_specs.len());
         for spec in input_specs {
-            let Some(projection) =
-                self.dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
-            else {
-                return Ok(None);
-            };
+            let projection = self
+                .dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
+                .with_context(|| {
+                    format!(
+                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: missing resident Q4 projection {}",
+                        spec.tensor_name
+                    )
+                })?;
             input_projections.push(projection);
         }
         let router_name = router_tensor_name(layer);
-        let Some(out_proj) =
-            self.dense_q4_mmap_projection(out_proj_name, residual_len, layout.total_value_width)?
-        else {
-            return Ok(None);
-        };
-        let Some(router) = self.dense_q4_mmap_projection(&router_name, experts, residual_len)?
-        else {
-            return Ok(None);
-        };
+        let out_proj = self
+            .dense_q4_mmap_projection(out_proj_name, residual_len, layout.total_value_width)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: missing resident output projection {out_proj_name}"
+                )
+            })?;
+        let router = self
+            .dense_q4_mmap_projection(&router_name, experts, residual_len)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: missing resident router projection {router_name}"
+                )
+            })?;
         metal.linear_attention_q4_post_attention_prep(
             layer,
             layout,
@@ -15556,43 +15298,6 @@ impl DenseStore {
             },
         )?;
         metal.q4_post_attention_prep_topk(
-            &projections,
-            attention_output,
-            residual,
-            post_norm_weight,
-        )
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn post_attention_q4_prep_with_metal_buffer(
-        &self,
-        metal: &MetalExecutor,
-        layer: usize,
-        experts: usize,
-        out_proj_name: &str,
-        attention_output: &MetalAttentionValues,
-        residual: MetalBatchProjectionInput<'_>,
-        post_norm_weight: &[f32],
-        active_experts: usize,
-    ) -> Result<MetalPostAttentionPrep> {
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable"
-            );
-        }
-        let residual_len = residual.len();
-        let projections = build_required_cmd2_q4_post_attention_prep_projections(
-            layer,
-            experts,
-            out_proj_name,
-            attention_output.len,
-            residual_len,
-            active_experts,
-            |tensor_name, output_width, input_len| {
-                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
-            },
-        )?;
-        metal.q4_post_attention_prep_topk_from_buffer(
             &projections,
             attention_output,
             residual,

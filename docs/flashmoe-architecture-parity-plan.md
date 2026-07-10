@@ -169,6 +169,10 @@ Baseline reviewed on 2026-07-10:
 - Q4 CMD2 post-attention projection, residual/norm, and routing prep now return one required Metal
   result for both CPU-visible and Metal-resident attention values. Missing resident weights,
   projections, norm weights, or buffers are named errors instead of `Ok(None)` continuations.
+- Normal Qwen3.5 linear-attention layers now require one fused resident-Q4 CMD1/recurrence/CMD2
+  implementation. Missing projections, static offsets, recurrent state, norm weights, or compatible
+  dimensions are named errors; the live graph no longer retries through an intermediate
+  Metal-values path or CPU recurrence.
 - Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
   no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
@@ -181,10 +185,10 @@ The architecture is not yet at the target:
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
   `VisionEncoder` remain in `legacy.rs`.
-- Linear-attention input/recurrence preparation and some general dense helpers still use `Option`,
-  boolean success, and `Ok(None)` to discover particular implementations and continue through
-  another path. These are now the remaining Gate 1 resolution boundary, rather than the
-  engine/device, CMD2, or active-expert CMD3 boundaries.
+- Deferred input retention, general dense projection batching, LM-head execution, and diagnostic
+  or expert-skipping helpers still contain `Option`, boolean success, and `Ok(None)` continuation
+  APIs. The remaining Gate 1 audit must distinguish graph-stage choices that need concrete
+  resolution from non-stage cache hits and explicitly non-production reference/debug behavior.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
