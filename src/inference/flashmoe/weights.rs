@@ -582,6 +582,97 @@ impl Cmd2Q4PostAttentionPrepProjections {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cmd2Q4PostAttentionPrepResidentPlan {
+    pub(crate) layer: usize,
+    pub(crate) width: usize,
+    pub(crate) attention_width: usize,
+    pub(crate) experts: usize,
+    pub(crate) active_count: usize,
+}
+
+impl Cmd2Q4PostAttentionPrepProjections {
+    pub(crate) fn resident_plan(
+        &self,
+        dense_store_len: usize,
+        attention_width: usize,
+        residual_width: usize,
+        post_norm_weight_len: usize,
+    ) -> Result<Option<Cmd2Q4PostAttentionPrepResidentPlan>> {
+        if self.active_experts == 0
+            || residual_width == 0
+            || residual_width != post_norm_weight_len
+            || attention_width == 0
+        {
+            return Ok(None);
+        }
+        if self.out_proj.output_width != residual_width
+            || self.out_proj.rows != residual_width
+            || self.out_proj.cols != attention_width
+            || self.router.cols != residual_width
+            || self.router.output_width != self.router.rows
+        {
+            return Ok(None);
+        }
+        for projection in [&self.out_proj, &self.router] {
+            validate_cmd2_q4_projection_resident_bounds(projection, dense_store_len)?;
+        }
+        Ok(Some(Cmd2Q4PostAttentionPrepResidentPlan {
+            layer: self.layer,
+            width: residual_width,
+            attention_width,
+            experts: self.router.rows,
+            active_count: self.active_experts.min(self.router.rows).max(1),
+        }))
+    }
+}
+
+fn validate_cmd2_q4_projection_resident_bounds(
+    projection: &DenseQ4MmapMatvecProjection,
+    dense_store_len: usize,
+) -> Result<()> {
+    let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+    if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+        || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+    {
+        bail!(
+            "FlashMoe CMD2 Q4 projection {} has unaligned scale/bias offsets for dtype {}",
+            projection.tensor_name,
+            projection.scale_bias_dtype
+        );
+    }
+    let packed_len = projection
+        .rows
+        .checked_mul(projection.row_packed_bytes)
+        .context("CMD2 post-attention q4 packed byte length overflow")?;
+    let groups_len = projection
+        .rows
+        .checked_mul(projection.groups_per_row)
+        .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+        .context("CMD2 post-attention q4 group byte length overflow")?;
+    for (offset, len) in [
+        (projection.packed_byte_offset, packed_len),
+        (projection.scales_byte_offset, groups_len),
+        (projection.biases_byte_offset, groups_len),
+    ] {
+        let offset =
+            usize::try_from(offset).context("CMD2 post-attention q4 offset does not fit usize")?;
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > dense_store_len)
+        {
+            bail!(
+                "FlashMoe CMD2 Q4 projection {} byte range {}..{} exceeds resident dense store length {}",
+                projection.tensor_name,
+                offset,
+                offset.saturating_add(len),
+                dense_store_len
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_cmd2_q4_post_attention_prep_projections<F>(
     layer: usize,
     experts: usize,
@@ -1832,6 +1923,94 @@ mod tests {
         assert_eq!(projections.out_proj.cols, 24);
         assert_eq!(projections.router.output_width, 16);
         assert_eq!(projections.router.cols, 32);
+    }
+
+    #[test]
+    fn cmd2_q4_post_attention_prep_resident_plan_declares_executable_shape() {
+        let projections = build_cmd2_q4_post_attention_prep_projections(
+            7,
+            16,
+            "model.layers.7.self_attn.o_proj.weight",
+            24,
+            32,
+            20,
+            |name, output_width, input_len| {
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let plan = projections
+            .resident_plan(1024, 24, 32, 32)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan,
+            Cmd2Q4PostAttentionPrepResidentPlan {
+                layer: 7,
+                width: 32,
+                attention_width: 24,
+                experts: 16,
+                active_count: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn cmd2_q4_post_attention_prep_resident_plan_rejects_undeclared_inputs() {
+        let projections = build_cmd2_q4_post_attention_prep_projections(
+            7,
+            16,
+            "model.layers.7.self_attn.o_proj.weight",
+            24,
+            32,
+            4,
+            |name, output_width, input_len| {
+                Ok(Some(DenseQ4MmapMatvecProjection {
+                    tensor_name: name.to_string(),
+                    packed_byte_offset: 128,
+                    scales_byte_offset: 256,
+                    biases_byte_offset: 512,
+                    rows: output_width,
+                    cols: input_len,
+                    output_width,
+                    row_packed_bytes: input_len.div_ceil(2),
+                    groups_per_row: input_len.div_ceil(16),
+                    group_size: 16,
+                    scale_bias_dtype: "BF16".to_string(),
+                }))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            projections
+                .resident_plan(1024, 24, 32, 31)
+                .unwrap()
+                .is_none()
+        );
+
+        let err = projections.resident_plan(520, 24, 32, 32).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeds resident dense store length"),
+            "{err:#}"
+        );
     }
 
     #[test]

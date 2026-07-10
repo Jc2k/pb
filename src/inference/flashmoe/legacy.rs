@@ -147,20 +147,21 @@ use super::types::*;
 #[cfg(test)]
 use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
-    DenseMmapMatvecProjection, DenseProjectionRequest, DenseQ4MmapMatvecProjection,
-    DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
-    ResidentStaticTensorRef, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
-    RouterScoreProjectionExecution, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
-    SharedExpertPhaseCache, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
-    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
-    attention_tensor_name, build_cmd2_q4_post_attention_prep_projections,
-    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
-    layer_norm_tensor_name, linear_attention_input_projection_requests,
-    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
-    prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
-    shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
+    Cmd2Q4PostAttentionPrepProjections, DenseMmapMatvecProjection, DenseProjectionRequest,
+    DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
+    RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
+    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseCache,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
+    build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
+    build_router_score_projection_descriptor, build_shared_expert_q4_phase_projections,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    full_attention_input_projection_requests, layer_norm_tensor_name,
+    linear_attention_input_projection_requests, linear_attention_scalar_tensor_name,
+    linear_attention_tensor_name, prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset,
+    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
+    validate_dense_matvec_shape,
 };
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, dense_q4_layout};
@@ -2351,44 +2352,32 @@ impl MetalExecutor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn q4_post_attention_prep_topk(
         &self,
-        layer: usize,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-        top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
         self.inner.q4_post_attention_prep_topk(
-            layer,
-            out_proj,
-            router,
+            projections,
             attention_output,
             residual,
             post_norm_weight,
-            top_k,
         )
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn q4_post_attention_prep_topk_from_buffer(
         &self,
-        layer: usize,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
         attention_output: &MetalAttentionValues,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-        top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
         self.inner.q4_post_attention_prep_topk_from_buffer(
-            layer,
-            out_proj,
-            router,
+            projections,
             attention_output,
             residual,
             post_norm_weight,
-            top_k,
         )
     }
 
@@ -6987,62 +6976,28 @@ impl MetalExecutorInner {
     #[allow(clippy::too_many_arguments)]
     fn q4_post_attention_prep_topk(
         &self,
-        layer: usize,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-        top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
-        let width = residual.len();
-        if top_k == 0 || width == 0 || width != post_norm_weight.len() {
-            return Ok(None);
-        }
-        if out_proj.output_width != width
-            || out_proj.rows != width
-            || out_proj.cols != attention_output.len()
-            || router.cols != width
-            || router.output_width != router.rows
-        {
-            return Ok(None);
-        }
         let Some(dense_weights) = &self.dense_weights else {
             return Ok(None);
         };
-        for projection in [out_proj, router] {
-            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-            {
-                return Ok(None);
-            }
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("post-attention q4 packed byte length overflow")?;
-            let groups_len = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-                .context("post-attention q4 group byte length overflow")?;
-            for (offset, len) in [
-                (projection.packed_byte_offset, packed_len),
-                (projection.scales_byte_offset, groups_len),
-                (projection.biases_byte_offset, groups_len),
-            ] {
-                let offset = usize::try_from(offset)
-                    .context("post-attention q4 offset does not fit usize")?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > dense_weights.len)
-                {
-                    return Ok(None);
-                }
-            }
-        }
+        let Some(plan) = projections.resident_plan(
+            dense_weights.len,
+            attention_output.len(),
+            residual.len(),
+            post_norm_weight.len(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let out_proj = &projections.out_proj;
+        let router = &projections.router;
+        let width = plan.width;
+        let active_count = plan.active_count;
 
-        let active_count = top_k.min(router.rows).max(1);
         unsafe {
             let attention_buffer = self.buffer_with_bytes(f32_as_bytes(attention_output))?;
             let (residual_input_buffer, owned_residual_input_buffer) = match residual {
@@ -7134,8 +7089,8 @@ impl MetalExecutorInner {
 
             let context = MetalCommandContext::new("linear_post_attention_q4_router")
                 .with("width", width)
-                .with("attention_width", attention_output.len())
-                .with("experts", router.rows)
+                .with("attention_width", plan.attention_width)
+                .with("experts", plan.experts)
                 .with("top_k", active_count)
                 .with("routing_topk", "cpu")
                 .with("out_proj", out_proj.tensor_name.as_str())
@@ -7166,9 +7121,9 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some(MetalPostAttentionPrep::new(
-                layer,
+                plan.layer,
                 width,
-                router.rows,
+                plan.experts,
                 active,
                 residual_buffer,
                 normed_buffer,
@@ -7178,66 +7133,31 @@ impl MetalExecutorInner {
 
     fn q4_post_attention_prep_topk_from_buffer(
         &self,
-        layer: usize,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
         attention_output: &MetalAttentionValues,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-        top_k: usize,
     ) -> Result<Option<MetalPostAttentionPrep>> {
-        let width = residual.len();
-        if top_k == 0
-            || width == 0
-            || width != post_norm_weight.len()
-            || attention_output.buffer.is_null()
-        {
-            return Ok(None);
-        }
-        if out_proj.output_width != width
-            || out_proj.rows != width
-            || out_proj.cols != attention_output.len
-            || router.cols != width
-            || router.output_width != router.rows
-        {
+        if attention_output.buffer.is_null() {
             return Ok(None);
         }
         let Some(dense_weights) = &self.dense_weights else {
             return Ok(None);
         };
-        for projection in [out_proj, router] {
-            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-            {
-                return Ok(None);
-            }
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("post-attention q4 packed byte length overflow")?;
-            let groups_len = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-                .context("post-attention q4 group byte length overflow")?;
-            for (offset, len) in [
-                (projection.packed_byte_offset, packed_len),
-                (projection.scales_byte_offset, groups_len),
-                (projection.biases_byte_offset, groups_len),
-            ] {
-                let offset = usize::try_from(offset)
-                    .context("post-attention q4 offset does not fit usize")?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > dense_weights.len)
-                {
-                    return Ok(None);
-                }
-            }
-        }
+        let Some(plan) = projections.resident_plan(
+            dense_weights.len,
+            attention_output.len,
+            residual.len(),
+            post_norm_weight.len(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let out_proj = &projections.out_proj;
+        let router = &projections.router;
+        let width = plan.width;
+        let active_count = plan.active_count;
 
-        let active_count = top_k.min(router.rows).max(1);
         unsafe {
             let (residual_input_buffer, owned_residual_input_buffer) = match residual {
                 MetalBatchProjectionInput::Cpu(residual) => {
@@ -7327,8 +7247,8 @@ impl MetalExecutorInner {
 
             let context = MetalCommandContext::new("linear_post_attention_q4_router_buffer")
                 .with("width", width)
-                .with("attention_width", attention_output.len)
-                .with("experts", router.rows)
+                .with("attention_width", plan.attention_width)
+                .with("experts", plan.experts)
                 .with("top_k", active_count)
                 .with("routing_topk", "cpu")
                 .with("out_proj", out_proj.tensor_name.as_str())
@@ -7354,9 +7274,9 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some(MetalPostAttentionPrep::new(
-                layer,
+                plan.layer,
                 width,
-                router.rows,
+                plan.experts,
                 active,
                 residual_buffer,
                 normed_buffer,
@@ -15778,13 +15698,10 @@ impl DenseStore {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk(
-            layer,
-            &projections.out_proj,
-            &projections.router,
+            &projections,
             attention_output,
             residual,
             post_norm_weight,
-            active_experts,
         )
     }
 
@@ -15819,13 +15736,10 @@ impl DenseStore {
             return Ok(None);
         };
         metal.q4_post_attention_prep_topk_from_buffer(
-            layer,
-            &projections.out_proj,
-            &projections.router,
+            &projections,
             attention_output,
             residual,
             post_norm_weight,
-            active_experts,
         )
     }
 
