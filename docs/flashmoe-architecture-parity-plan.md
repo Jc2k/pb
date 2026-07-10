@@ -116,9 +116,10 @@ The validator should reject silent fallbacks such as:
 - `model_family.rs` now contains useful parity metadata: Qwen family detection, layer schedule,
   configured K versus scheduled K, shared expert dimensions, Qwen-VL metadata, Qwen3.5 Q4 expert
   offsets, and an `UPSTREAM_PARITY` execution policy.
-- `experts.rs` now owns fixed-slot metadata, layer reader opening, positioned reads, reusable
-  whole-expert buffers, raw expert payload responses, and the expert read worker pool. PBQ4 remains
-  import/build compatibility; execution reads are moving toward fixed whole-expert slots.
+- `experts.rs` now owns fixed-slot metadata, the runtime `ExpertSlotStore`, layer reader opening,
+  positioned reads, reusable whole-expert buffers, raw expert payload responses, and the expert read
+  worker pool. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
+  whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -191,8 +192,9 @@ The validator should reject silent fallbacks such as:
 - Fallbacks are not yet consistently modeled as errors. Any branch that silently changes dtype,
   buffer ownership, scheduler, or CPU/GPU placement hides missing implementation work and must be
   made explicit.
-- Expert reads now follow the upstream positioned-read policy under `experts`, and the scheduler
-  owns issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
+- Expert reads now follow the upstream positioned-read policy under `experts`, and the runtime and
+  scheduler hold `ExpertSlotStore` directly instead of a legacy store wrapper. The scheduler owns
+  issue/finish metrics plus scheduled slot completion. Scheduler-owned slots now expose fixed-Q4
   CMD3 payloads with typed offsets and reject PBQ4/component payloads for execution. Active expert
   reads are now issued from the validated `ScheduledRoutingCommand` produced by CPU router scores or
   CMD2 preselected routes. The scheduler turns that routing command into a typed

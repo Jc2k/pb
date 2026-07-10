@@ -73,13 +73,12 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpertLayerPackMetadata, ExpertLayerReader, ExpertPackMetadata, ExpertPackRecord,
-    ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadWorkerPool,
-    ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
-    FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
-    PBQ4_EXPERT_MAGIC, Q4MatvecPayload, Q4MatvecSource, ReusableExpertBytePool,
-    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
-    read_exact_at_positioned, read_expert_layer_pack_metadata,
+    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertRawPayload, ExpertRawRead,
+    ExpertRawReadResponse, ExpertReadWorkerPool, ExpertSlotDescriptor, ExpertSlotStore,
+    ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
+    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, Q4MatvecPayload,
+    Q4MatvecSource, ReusableExpertBytePool, expert_layer_metadata_path, expert_layer_path,
+    expert_slot_end, expert_slot_offset, read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -1403,9 +1402,9 @@ where
     let metal = MetalExecutor::new(plan, &config, &runtime, &dense)?;
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
-    let experts = ExpertStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
+    let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
     let scheduler = ExpertScheduler::new_with_routed_expert_scale(
-        ExpertStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?,
+        ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?,
         model_layout.routed_expert_scale,
     );
     progress("expert_store", phase_started.elapsed());
@@ -1437,7 +1436,7 @@ where
 #[derive(Debug)]
 pub struct FlashMoeEngine {
     plan: FlashMoePlan,
-    experts: ExpertStore,
+    experts: ExpertSlotStore,
     scheduler: ExpertScheduler,
     dense: DenseStore,
     tokenizer: QwenTokenizer,
@@ -11967,7 +11966,7 @@ impl FlashMoeEngine {
         layer: usize,
         experts: &[usize],
     ) -> Result<Vec<ExpertWeights>> {
-        self.experts.read_many(layer, experts)
+        read_expert_weights_many(&self.experts, layer, experts)
     }
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
@@ -15275,8 +15274,8 @@ fn validate_required_tensor_manifest(
         // Reasons:
         // 1. Expert MLP correctness (gate/up/down projection shapes) is enforced per-expert at
         //    pack time by `validate_expert_tensor_group`.
-        // 2. At runtime the packed expert files are managed by `ExpertStore`; the registry records
-        //    their original source metadata but is not used for expert inference.
+        // 2. At runtime the packed expert files are managed by `ExpertSlotStore`; the registry
+        //    records their original source metadata but is not used for expert inference.
         // 3. Real Qwen3 revision checkpoints may differ in expert naming (e.g. shared experts)
         //    or use a naming scheme that doesn't match the exact pattern assumed here.
         //    A rigid per-name loop would cause false rejections for such models.
@@ -18066,60 +18065,23 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(value)
 }
 
-#[derive(Debug, Clone)]
-pub struct ExpertStore {
-    raw: ExpertSlotStore,
-}
-
-impl ExpertStore {
-    pub fn open(root: PathBuf) -> Result<Self> {
-        Ok(Self {
-            raw: ExpertSlotStore::open(root)?,
-        })
-    }
-
-    pub fn open_with_model_layout(root: PathBuf, layout: &QwenMoeModelLayout) -> Result<Self> {
-        Ok(Self {
-            raw: ExpertSlotStore::open_with_model_layout(root, layout)?,
-        })
-    }
-
-    fn open_with_fixed_q4(root: PathBuf, fixed_q4: FixedQ4ExpertSlotSpec) -> Result<Self> {
-        Ok(Self {
-            raw: ExpertSlotStore::open_with_fixed_q4(root, fixed_q4)?,
-        })
-    }
-
-    pub fn read_many(&self, layer: usize, experts: &[usize]) -> Result<Vec<ExpertWeights>> {
-        self.raw
-            .read_many_raw(layer, experts)?
-            .into_iter()
-            .map(ExpertWeights::from_raw_read)
-            .collect()
-    }
-
-    fn layer_reader(&self, layer: usize) -> Result<Arc<ExpertLayerReader>> {
-        self.raw.layer_reader(layer)
-    }
-}
-
 type PendingExpertRead = PendingScheduledRead<ExpertRawReadResponse>;
 type PendingExpertSet = PendingScheduledExpertSet<ExpertRawReadResponse>;
 type ScheduledExpertSet = SchedulerScheduledExpertSet<Arc<ScheduledExpertSlot>>;
 
 #[derive(Debug)]
 struct ExpertScheduler {
-    store: ExpertStore,
+    store: ExpertSlotStore,
     pool: ExpertReadWorkerPool,
     core: ActiveExpertReadScheduler,
 }
 
 impl ExpertScheduler {
-    fn new(store: ExpertStore) -> Self {
+    fn new(store: ExpertSlotStore) -> Self {
         Self::new_with_routed_expert_scale(store, 1.0)
     }
 
-    fn new_with_routed_expert_scale(store: ExpertStore, routed_expert_scale: f32) -> Self {
+    fn new_with_routed_expert_scale(store: ExpertSlotStore, routed_expert_scale: f32) -> Self {
         Self {
             store,
             pool: ExpertReadWorkerPool::default(),
@@ -18476,6 +18438,18 @@ impl ExpertWeights {
         }
         None
     }
+}
+
+fn read_expert_weights_many(
+    store: &ExpertSlotStore,
+    layer: usize,
+    experts: &[usize],
+) -> Result<Vec<ExpertWeights>> {
+    store
+        .read_many_raw(layer, experts)?
+        .into_iter()
+        .map(ExpertWeights::from_raw_read)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18845,7 +18819,8 @@ fn gated_delta_head_step_scalar(
 }
 
 fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWeights> {
-    let mut experts = ExpertStore::open(root.to_path_buf())?.read_many(layer, &[expert])?;
+    let store = ExpertSlotStore::open(root.to_path_buf())?;
+    let mut experts = read_expert_weights_many(&store, layer, &[expert])?;
     experts
         .pop()
         .with_context(|| format!("expert layer {layer} returned no expert {expert}"))
@@ -26397,9 +26372,8 @@ mod tests {
         read_exact_at_positioned(&file, &mut prefix, 0).unwrap();
         assert_ne!(prefix, PBQ4_EXPERT_MAGIC);
 
-        let expert = ExpertStore::open_with_fixed_q4(tmp.path().to_path_buf(), spec)
-            .unwrap()
-            .read_many(layer, &[expert])
+        let store = ExpertSlotStore::open_with_fixed_q4(tmp.path().to_path_buf(), spec).unwrap();
+        let expert = read_expert_weights_many(&store, layer, &[expert])
             .unwrap()
             .pop()
             .unwrap();
@@ -29601,8 +29575,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_expert_tensors_absent_from_registry() {
-        // Expert tensors are packed into ExpertStore files and need not all appear in the dense
-        // registry.  The validator must not reject a registry that has no expert entries.
+        // Expert tensors are packed into ExpertSlotStore files and need not all appear in the
+        // dense registry.  The validator must not reject a registry that has no expert entries.
         let (config, manifest) = minimal_dense_manifest(false);
         assert!(manifest.expert_tensors.is_empty());
         let registry = TensorRegistry::from_manifest(&manifest);
@@ -32935,7 +32909,7 @@ mod tests {
             plan.tensor_manifest.clone(),
         )
         .unwrap();
-        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let experts = ExpertSlotStore::open(plan.experts_dir.clone()).unwrap();
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::new(&config);
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
@@ -33172,7 +33146,7 @@ mod tests {
             plan.tensor_manifest.clone(),
         )
         .unwrap();
-        let experts = ExpertStore::open(plan.experts_dir.clone()).unwrap();
+        let experts = ExpertSlotStore::open(plan.experts_dir.clone()).unwrap();
         let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
         let runtime = DenseTransformerRuntime::new(&config);
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
@@ -33363,7 +33337,7 @@ mod tests {
         write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
 
         let mut scheduler =
-            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+            ExpertScheduler::new(ExpertSlotStore::open(temp.path().to_path_buf()).unwrap());
         let pending = scheduler.issue(0, &[1, 3]).unwrap();
         assert_eq!(scheduler.worker_count(), 2);
         let experts = scheduler.finish(pending).unwrap();
@@ -33436,7 +33410,7 @@ mod tests {
         write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
 
         let mut scheduler =
-            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+            ExpertScheduler::new(ExpertSlotStore::open(temp.path().to_path_buf()).unwrap());
         let pending = scheduler.issue(0, &[7, 1, 3]).unwrap();
         assert_eq!(scheduler.worker_count(), 3);
         let experts = scheduler.finish(pending).unwrap();
@@ -33488,7 +33462,7 @@ mod tests {
         write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
 
         let mut scheduler =
-            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+            ExpertScheduler::new(ExpertSlotStore::open(temp.path().to_path_buf()).unwrap());
         let routes = [(7usize, 2.0f32), (1, 1.0), (3, -1.0)];
         let command = test_routing_command(0, 8, &routes);
         let pending = scheduler.issue_routing_command(&command).unwrap();
@@ -33531,7 +33505,7 @@ mod tests {
             .collect();
         write_test_expert_layer(temp.path(), 0, packs, 8).unwrap();
 
-        let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
+        let store = ExpertSlotStore::open(temp.path().to_path_buf()).unwrap();
         let mut scheduler = ExpertScheduler::new_with_routed_expert_scale(store, 0.9);
         let routes = [(3usize, 2.0f32), (1, 1.0)];
         let command = test_routing_command(0, 4, &routes);
@@ -33551,7 +33525,7 @@ mod tests {
     fn expert_scheduler_rejects_invalid_routes_before_issuing_reads() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path()).unwrap();
-        let store = ExpertStore::open(temp.path().to_path_buf()).unwrap();
+        let store = ExpertSlotStore::open(temp.path().to_path_buf()).unwrap();
         let mut scheduler = ExpertScheduler::new(store);
 
         let command = test_routing_command(0, 4, &[(3usize, f32::INFINITY)]);
@@ -33581,7 +33555,7 @@ mod tests {
             .unwrap();
 
         let mut scheduler =
-            ExpertScheduler::new(ExpertStore::open(temp.path().to_path_buf()).unwrap());
+            ExpertScheduler::new(ExpertSlotStore::open(temp.path().to_path_buf()).unwrap());
         let pending = scheduler.issue(0, &[2]).unwrap();
         let err = scheduler.finish(pending).unwrap_err();
         assert!(
@@ -34589,7 +34563,7 @@ mod tests {
         );
         write_expert_metadata_atomically(&plan.experts_dir, 0, &fixed_metadata).unwrap();
         let experts =
-            ExpertStore::open_with_fixed_q4(plan.experts_dir.clone(), fixed_spec).unwrap();
+            ExpertSlotStore::open_with_fixed_q4(plan.experts_dir.clone(), fixed_spec).unwrap();
         let dense = DenseStore::open(
             plan.non_expert_weights.clone(),
             plan.tensor_manifest.clone(),
