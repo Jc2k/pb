@@ -9604,7 +9604,7 @@ impl FlashMoeEngine {
                 String,
                 MetalAttentionValues,
             )> = None;
-            let mut projected = if self.runtime.is_linear_attention_layer(layer) {
+            let projected = if self.runtime.is_linear_attention_layer(layer) {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     if self.metal.is_some()
@@ -9939,51 +9939,11 @@ impl FlashMoeEngine {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     routing_command
                 } else {
-                    if deferred_attention_input.is_some()
-                        && let Some(pending) = pending_for_layer.take()
-                    {
-                        let wait_started = Instant::now();
-                        let output = pending.wait()?;
-                        let wait_elapsed = wait_started.elapsed();
-                        info!(
-                            token_position = position,
-                            completed_layer = layer.saturating_sub(1),
-                            wait_ms = wait_elapsed.as_millis(),
-                            "flashmoe deferred expert wait complete before CPU post-attention fallback"
-                        );
-                        if let Some(timing) = timing.as_deref_mut() {
-                            timing.buckets.deferred_wait += wait_elapsed;
-                            if let Some(previous_layer) = timing.layers.last_mut() {
-                                previous_layer.buckets.deferred_wait += wait_elapsed;
-                                previous_layer.buckets.total_wall += wait_elapsed;
-                            }
-                        }
-                        token_state.apply_declared_expert_phase(
-                            output,
-                            FlashMoeExpertPhaseApplication::HiddenOnly,
-                        )?;
-                    }
-                    let subphase_started = Instant::now();
-                    projected = self
-                        .dense
-                        .project_dense_tensor_with_metal(
-                            self.metal.as_ref(),
-                            &out_proj_name,
-                            &attention_values,
-                            runtime.width,
-                        )?
-                        .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
-                    layer_timing.buckets.attention_output_projection += subphase_started.elapsed();
-                    add_in_place(token_state.hidden_mut(), &projected);
-                    normed = FlashMoeCpuBuffer::normed(self.rms_norm_with_model_weight(
-                        post_norm_name.as_str(),
-                        token_state.hidden(),
-                    )?);
-                    layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    let routing_started = Instant::now();
-                    let active = self.route_layer(layer, &normed, scheduled_cmd2.active_experts)?;
-                    layer_timing.buckets.routing += routing_started.elapsed();
-                    active
+                    let _ = (out_proj_name, attention_values);
+                    scheduled_cmd2.reject_missing_post_attention_prep(
+                        "CPU attention values cannot fall back to legacy post-attention projection, norm, and routing",
+                    )?;
+                    unreachable!("reject_missing_post_attention_prep always returns an error")
                 }
             } else {
                 add_in_place(token_state.hidden_mut(), &projected);
