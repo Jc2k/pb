@@ -162,6 +162,10 @@ Baseline reviewed on 2026-07-10:
 - Routing now has only the implementation selected by the resolved graph: Qwen3.5 uses declared
   CPU softmax/top-k. The dormant `route_top4` bool probe, optional Metal pipeline, shader, encoder,
   and CPU substitution branch have been deleted.
+- `metal.rs` now owns the reusable transient-buffer pool and the complete resident-Q4 top-k
+  builder: typed projection/range validation, allocation, Q4 logits encoding, vocabulary top-k,
+  submission, readback, and cleanup. Router-score and LM-head callers share that builder, and the
+  resolved LM-head path returns a concrete result instead of probing `Option` availability.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

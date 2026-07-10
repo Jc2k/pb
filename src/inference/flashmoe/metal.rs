@@ -6,7 +6,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ptr;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::Context as _;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::experts::{EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
     ScheduledCmd3MetalPostAttentionInput, ScheduledExpertPhaseMlpPayload,
@@ -23,7 +25,9 @@ use super::scheduler::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
+use super::weights::{
+    DenseQ4MmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
@@ -300,6 +304,105 @@ pub(crate) struct MetalReusableBuffer {
 impl MetalReusableBuffer {
     pub(crate) fn new(id: MetalObjcId, len: usize) -> Self {
         Self { id, len }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+pub(crate) struct MetalBufferPool {
+    reusable: Mutex<Vec<MetalReusableBuffer>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalBufferPool {
+    pub(crate) unsafe fn buffer_with_len(
+        &self,
+        device: MetalObjcId,
+        len: usize,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            {
+                let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+                if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
+                    return Ok(reusable.swap_remove(index).id);
+                }
+            }
+            let buffer =
+                msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
+            if buffer.is_null() {
+                anyhow::bail!("failed to allocate Flash-MoE Metal output buffer");
+            }
+            Ok(buffer)
+        }
+    }
+
+    pub(crate) unsafe fn buffer_with_bytes(
+        &self,
+        device: MetalObjcId,
+        bytes: &[u8],
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            let buffer = self.buffer_with_len(device, bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    pub(crate) unsafe fn recycle(&self, buffer: MetalObjcId) {
+        unsafe {
+            let len = msg_send_usize0(buffer, sel("length"));
+            let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+            if reusable.len() < METAL_REUSABLE_BUFFER_POOL_LIMIT {
+                reusable.push(MetalReusableBuffer::new(buffer, len));
+            } else {
+                release(buffer);
+            }
+        }
+    }
+
+    pub(crate) fn recycle_or_release(&self, buffers: &[MetalObjcId], release_only: bool) {
+        unsafe {
+            for buffer in buffers.iter().copied() {
+                if release_only {
+                    release(buffer);
+                } else {
+                    self.recycle(buffer);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn recycle_or_release_phase(
+        &self,
+        buffers: Vec<MetalPhaseBuffer>,
+        release_only: bool,
+    ) {
+        unsafe {
+            for buffer in buffers {
+                if release_only || !buffer.recycle {
+                    release(buffer.id);
+                } else {
+                    self.recycle(buffer.id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn release_all(&mut self) {
+        let reusable = self.reusable.get_mut().expect("metal buffer pool poisoned");
+        unsafe {
+            for buffer in reusable.drain(..) {
+                release(buffer.id);
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalBufferPool {
+    fn drop(&mut self) {
+        self.release_all();
     }
 }
 
@@ -830,6 +933,251 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.linear_decay_beta_pipeline);
         release(self.linear_delta_step_pipeline);
         release(self.linear_gated_rms_norm_pipeline);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MetalResidentQ4TopKBuilder<'a> {
+    device: MetalObjcId,
+    command_queue: MetalObjcId,
+    q4_pipeline: MetalObjcId,
+    q4_bf16_scale_bias_pipeline: MetalObjcId,
+    topk_pipeline: MetalObjcId,
+    dense_weights: &'a MetalDenseWeights,
+    buffers: &'a MetalBufferPool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> MetalResidentQ4TopKBuilder<'a> {
+    pub(crate) fn new(
+        device: MetalObjcId,
+        command_queue: MetalObjcId,
+        pipelines: &MetalPipelineSet<MetalObjcId>,
+        dense_weights: &'a MetalDenseWeights,
+        buffers: &'a MetalBufferPool,
+    ) -> Self {
+        Self {
+            device,
+            command_queue,
+            q4_pipeline: pipelines.q4_mmap_pipeline,
+            q4_bf16_scale_bias_pipeline: pipelines.q4_mmap_bf16_scale_bias_pipeline,
+            topk_pipeline: pipelines.topk_vocab_pipeline,
+            dense_weights,
+            buffers,
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        input: &[f32],
+        top_k: usize,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        let rows = projection.output_width;
+        if rows == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if rows > projection.rows {
+            anyhow::bail!(
+                "Metal resident Q4 topK output width {} exceeds tensor rows {} for {}",
+                rows,
+                projection.rows,
+                projection.tensor_name
+            );
+        }
+        if input.len() != projection.cols {
+            anyhow::bail!(
+                "Metal resident Q4 topK input length {} does not match cols {} for {}",
+                input.len(),
+                projection.cols,
+                projection.tensor_name
+            );
+        }
+        if projection.group_size == 0
+            || projection.groups_per_row == 0
+            || projection.row_packed_bytes == 0
+        {
+            anyhow::bail!(
+                "Metal resident Q4 topK projection {} has an invalid zero-sized Q4 layout",
+                projection.tensor_name
+            );
+        }
+        let (scale_bias_bytes, q4_pipeline) =
+            if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
+                (std::mem::size_of::<u16>(), self.q4_bf16_scale_bias_pipeline)
+            } else if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_F32 {
+                (std::mem::size_of::<f32>(), self.q4_pipeline)
+            } else {
+                anyhow::bail!(
+                    "Metal resident Q4 topK projection {} has unsupported scale/bias dtype {}",
+                    projection.tensor_name,
+                    projection.scale_bias_dtype
+                );
+            };
+        if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+            || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+        {
+            anyhow::bail!(
+                "Metal resident Q4 topK projection {} has unaligned scale/bias offsets",
+                projection.tensor_name
+            );
+        }
+        let packed_len = rows
+            .checked_mul(projection.row_packed_bytes)
+            .context("Metal resident Q4 topK packed byte length overflow")?;
+        let groups_len = rows
+            .checked_mul(projection.groups_per_row)
+            .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+            .context("Metal resident Q4 topK group byte length overflow")?;
+        for (label, offset, len) in [
+            ("packed", projection.packed_byte_offset, packed_len),
+            ("scales", projection.scales_byte_offset, groups_len),
+            ("biases", projection.biases_byte_offset, groups_len),
+        ] {
+            let offset = usize::try_from(offset).with_context(|| {
+                format!("Metal resident Q4 topK {label} offset does not fit usize")
+            })?;
+            if offset
+                .checked_add(len)
+                .map_or(true, |end| end > self.dense_weights.len)
+            {
+                anyhow::bail!(
+                    "Metal resident Q4 topK {label} range for {} exceeds resident dense weights",
+                    projection.tensor_name
+                );
+            }
+        }
+
+        let top_k = top_k.min(rows).max(1);
+        unsafe { self.encode_and_read(projection, input, rows, top_k, q4_pipeline) }
+    }
+
+    unsafe fn transient_buffer(
+        &self,
+        len: usize,
+        owned: &mut Vec<MetalObjcId>,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            match self.buffers.buffer_with_len(self.device, len) {
+                Ok(buffer) => {
+                    owned.push(buffer);
+                    Ok(buffer)
+                }
+                Err(error) => {
+                    self.buffers.recycle_or_release(owned, true);
+                    owned.clear();
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    unsafe fn encode_and_read(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        input: &[f32],
+        rows: usize,
+        top_k: usize,
+        q4_pipeline: MetalObjcId,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        unsafe {
+            let mut transient = Vec::with_capacity(4);
+            let input_buffer =
+                self.transient_buffer(std::mem::size_of_val(input), &mut transient)?;
+            let input_contents = msg_send_ptr0(input_buffer, sel("contents"));
+            ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                input_contents.cast::<u8>(),
+                std::mem::size_of_val(input),
+            );
+            let logits_buffer =
+                self.transient_buffer(rows * std::mem::size_of::<f32>(), &mut transient)?;
+            let indices_buffer =
+                self.transient_buffer(top_k * std::mem::size_of::<u32>(), &mut transient)?;
+            let values_buffer =
+                self.transient_buffer(top_k * std::mem::size_of::<f32>(), &mut transient)?;
+
+            let constants = (|| -> anyhow::Result<_> {
+                Ok((
+                    u32::try_from(rows).context("resident Q4 topK rows exceed u32")?,
+                    u32::try_from(projection.cols).context("resident Q4 topK cols exceed u32")?,
+                    u32::try_from(projection.groups_per_row)
+                        .context("resident Q4 topK groups per row exceed u32")?,
+                    u32::try_from(projection.group_size)
+                        .context("resident Q4 topK group size exceeds u32")?,
+                    u32::try_from(top_k).context("resident Q4 topK count exceeds u32")?,
+                ))
+            })();
+            let (rows_u32, cols_u32, groups_u32, group_size_u32, top_k_u32) = match constants {
+                Ok(constants) => constants,
+                Err(error) => {
+                    self.buffers.recycle_or_release(&transient, true);
+                    return Err(error);
+                }
+            };
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.buffers.recycle_or_release(&transient, true);
+                anyhow::bail!("failed to create Flash-MoE resident Q4 topK command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.buffers.recycle_or_release(&transient, true);
+                anyhow::bail!("failed to create Flash-MoE resident Q4 topK compute encoder");
+            }
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), q4_pipeline);
+            set_buffer(encoder, self.dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, logits_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
+
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.topk_pipeline);
+            set_buffer(encoder, logits_buffer, 0);
+            set_buffer(encoder, indices_buffer, 1);
+            set_buffer(encoder, values_buffer, 2);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
+            set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
+            dispatch_threads(encoder, 1);
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("resident_q4_topk")
+                .with("tensor", &projection.tensor_name)
+                .with("rows", rows)
+                .with("cols", projection.cols)
+                .with("groups_per_row", projection.groups_per_row)
+                .with("group_size", projection.group_size)
+                .with("scale_bias_dtype", &projection.scale_bias_dtype)
+                .with("top_k", top_k)
+                .with("packed_offset", projection.packed_byte_offset);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.buffers
+                    .recycle_or_release(&transient, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let indices_ptr = msg_send_ptr0(indices_buffer, sel("contents")).cast::<u32>();
+            let values_ptr = msg_send_ptr0(values_buffer, sel("contents")).cast::<f32>();
+            let candidates = (0..top_k)
+                .map(|index| (*indices_ptr.add(index) as usize, *values_ptr.add(index)))
+                .collect();
+
+            release(encoder);
+            release(command_buffer);
+            self.buffers.recycle_or_release(&transient, false);
+            Ok(candidates)
+        }
     }
 }
 
@@ -5629,6 +5977,58 @@ mod tests {
         assert_eq!(dense.buffer, id);
         assert_eq!(dense.len, 16);
         assert_eq!(Arc::strong_count(&mmap), 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn resident_q4_topk_builder_rejects_invalid_bindings_before_encoding() {
+        let mmap = Arc::new(
+            memmap2::MmapMut::map_anon(128)
+                .unwrap()
+                .make_read_only()
+                .unwrap(),
+        );
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let dense = MetalDenseWeights::new(id, mmap, 128);
+        let buffers = MetalBufferPool::default();
+        let builder = MetalResidentQ4TopKBuilder {
+            device: id,
+            command_queue: id,
+            q4_pipeline: id,
+            q4_bf16_scale_bias_pipeline: id,
+            topk_pipeline: id,
+            dense_weights: &dense,
+            buffers: &buffers,
+        };
+
+        let projection = test_q4_projection("lm_head.weight", 4, 16);
+        let input_error = builder.execute(&projection, &[0.0; 15], 2).unwrap_err();
+        assert!(
+            input_error.to_string().contains("input length 15"),
+            "{input_error:#}"
+        );
+
+        let mut unsupported_dtype = projection.clone();
+        unsupported_dtype.scale_bias_dtype = "F16".to_string();
+        let dtype_error = builder
+            .execute(&unsupported_dtype, &[0.0; 16], 2)
+            .unwrap_err();
+        assert!(
+            dtype_error
+                .to_string()
+                .contains("unsupported scale/bias dtype F16"),
+            "{dtype_error:#}"
+        );
+
+        let mut out_of_range = projection;
+        out_of_range.biases_byte_offset = 124;
+        let range_error = builder.execute(&out_of_range, &[0.0; 16], 2).unwrap_err();
+        assert!(
+            range_error
+                .to_string()
+                .contains("biases range for lm_head.weight exceeds resident dense weights"),
+            "{range_error:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
