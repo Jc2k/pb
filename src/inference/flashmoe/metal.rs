@@ -286,6 +286,23 @@ impl MetalLinearAttentionLayerState {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalReusableBuffer {
+    pub(crate) id: MetalObjcId,
+    pub(crate) len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalReusableBuffer {
+    pub(crate) fn new(id: MetalObjcId, len: usize) -> Self {
+        Self { id, len }
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2809,6 +2826,17 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_reusable_buffer_records_pool_entry_shape() {
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let buffer = MetalReusableBuffer::new(id, 4096);
+
+        assert_eq!(buffer.id, id);
+        assert_eq!(buffer.len, 4096);
+        assert_eq!(METAL_REUSABLE_BUFFER_POOL_LIMIT, 64);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

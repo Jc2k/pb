@@ -102,12 +102,12 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy, MetalAttentionValues,
-    MetalBatchProjectionInput, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
     metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
@@ -2788,16 +2788,6 @@ impl MetalLmHeadBufferCache {
         previous
     }
 }
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalReusableBuffer {
-    id: ObjcId,
-    len: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
@@ -8591,7 +8581,7 @@ impl MetalExecutorInner {
             let len = msg_send_usize0(buffer, sel("length"));
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
             if reusable.len() < METAL_REUSABLE_BUFFER_POOL_LIMIT {
-                reusable.push(MetalReusableBuffer { id: buffer, len });
+                reusable.push(MetalReusableBuffer::new(buffer, len));
             } else {
                 release(buffer);
             }
