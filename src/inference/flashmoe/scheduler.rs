@@ -919,6 +919,7 @@ impl<TInputs> ScheduledCmd2Command<TInputs> {
             .command_from_preselected_routes(graph, routes)
     }
 
+    #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
     pub(crate) fn reject_missing_post_attention_prep(&self, reason: &str) -> Result<()> {
         bail!(
             "FlashMoe unsupported scheduled CMD2 path: layer {} declares {} implementation '{}' but no Metal post-attention prep was submitted: {}",

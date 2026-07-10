@@ -166,6 +166,9 @@ Baseline reviewed on 2026-07-10:
   views into one whole-expert slot before encoding. The active-expert encoder has one fused
   whole-slot implementation; its component-upload and unfused SwiGLU substitution have been
   removed.
+- Q4 CMD2 post-attention projection, residual/norm, and routing prep now return one required Metal
+  result for both CPU-visible and Metal-resident attention values. Missing resident weights,
+  projections, norm weights, or buffers are named errors instead of `Ok(None)` continuations.
 - Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
   no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
@@ -178,9 +181,10 @@ The architecture is not yet at the target:
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
   `VisionEncoder` remain in `legacy.rs`.
-- Live dense/attention/CMD2 helpers still use `Option`, boolean success, and `Ok(None)` to discover
-  particular implementations and continue through another path. These are now the remaining Gate 1
-  resolution boundary, rather than the engine/device or active-expert CMD3 boundaries.
+- Linear-attention input/recurrence preparation and some general dense helpers still use `Option`,
+  boolean success, and `Ok(None)` to discover particular implementations and continue through
+  another path. These are now the remaining Gate 1 resolution boundary, rather than the
+  engine/device, CMD2, or active-expert CMD3 boundaries.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.

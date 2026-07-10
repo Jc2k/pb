@@ -2421,7 +2421,7 @@ impl MetalExecutor {
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         self.inner.q4_post_attention_prep_topk(
             projections,
             attention_output,
@@ -2437,7 +2437,7 @@ impl MetalExecutor {
         attention_output: &MetalAttentionValues,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         self.inner.q4_post_attention_prep_topk_from_buffer(
             projections,
             attention_output,
@@ -6798,10 +6798,10 @@ impl MetalExecutorInner {
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-    ) -> Result<Option<MetalPostAttentionPrep>> {
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
+    ) -> Result<MetalPostAttentionPrep> {
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
+        )?;
         let plan = projections.resident_plan(
             dense_weights.len,
             attention_output.len(),
@@ -6935,14 +6935,14 @@ impl MetalExecutorInner {
             ] {
                 self.recycle(buffer);
             }
-            Ok(Some(MetalPostAttentionPrep::new(
+            Ok(MetalPostAttentionPrep::new(
                 plan.layer,
                 width,
                 plan.experts,
                 active,
                 residual_buffer,
                 normed_buffer,
-            )?))
+            )?)
         }
     }
 
@@ -6952,13 +6952,15 @@ impl MetalExecutorInner {
         attention_output: &MetalAttentionValues,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         if attention_output.buffer.is_null() {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: Metal attention buffer is absent"
+            );
         }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
+        )?;
         let plan = projections.resident_plan(
             dense_weights.len,
             attention_output.len,
@@ -7085,14 +7087,14 @@ impl MetalExecutorInner {
             for buffer in [norm_weight_buffer, projected_buffer, router_logits_buffer] {
                 self.recycle(buffer);
             }
-            Ok(Some(MetalPostAttentionPrep::new(
+            Ok(MetalPostAttentionPrep::new(
                 plan.layer,
                 width,
                 plan.experts,
                 active,
                 residual_buffer,
                 normed_buffer,
-            )?))
+            )?)
         }
     }
 
@@ -9737,8 +9739,6 @@ impl FlashMoeEngine {
             if let Some((out_proj_name, attention_values)) =
                 metal_post_attention_values_for_prep.take()
             {
-                let mut attention_values = Some(attention_values);
-                let mut used_buffer = false;
                 let residual_input = deferred_residual_input
                     .map(|input| MetalBatchProjectionInput::Buffer {
                         buffer: input.buffer,
@@ -9746,27 +9746,80 @@ impl FlashMoeEngine {
                     })
                     .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
                 let metal = &self.metal;
-                if let Some(post_norm_weight) =
-                    self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                    && let Some(prep) = self.dense.post_attention_q4_prep_with_metal_buffer(
+                let post_norm_weight = self
+                    .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                    .with_context(|| {
+                        format!(
+                            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
+                        )
+                    })?;
+                let prep = self.dense.post_attention_q4_prep_with_metal_buffer(
+                    metal,
+                    layer,
+                    self.config.experts(),
+                    &out_proj_name,
+                    &attention_values,
+                    residual_input,
+                    &post_norm_weight,
+                    scheduled_cmd2.active_experts,
+                );
+                metal.recycle_attention_values(attention_values);
+                let mut prep = prep?;
+                if deferred_residual_input.is_some()
+                    && let Some(pending) = pending_for_layer.take()
+                {
+                    pending.finish_without_readback()?;
+                }
+                let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
+                    &self.scheduled_graph,
+                    prep.state,
+                    &prep.active,
+                )?;
+                debug_assert_eq!(
+                    routing_command.source,
+                    ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+                );
+                let routing_command = prep.attach_routing_command(routing_command)?;
+                metal_post_attention_prep = Some(prep);
+                precomputed_active = Some(routing_command);
+            }
+            let active = if let Some(routing_command) = precomputed_active {
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                routing_command
+            } else if let Some((out_proj_name, attention_values)) =
+                post_attention_values_for_prep.take()
+            {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let residual_input = deferred_residual_input
+                        .map(|input| MetalBatchProjectionInput::Buffer {
+                            buffer: input.buffer,
+                            len: input.len(),
+                        })
+                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                    let metal = &self.metal;
+                    let post_norm_weight = self
+                        .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                        .with_context(|| {
+                            format!(
+                                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
+                            )
+                        })?;
+                    let mut prep = self.dense.post_attention_q4_prep_with_metal(
                         metal,
                         layer,
                         self.config.experts(),
                         &out_proj_name,
-                        attention_values
-                            .as_ref()
-                            .context("missing Metal attention values for Q4 prep")?,
+                        &attention_values,
                         residual_input,
                         &post_norm_weight,
                         scheduled_cmd2.active_experts,
-                    )?
-                {
+                    )?;
                     if deferred_residual_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
                     {
                         pending.finish_without_readback()?;
                     }
-                    let mut prep = prep;
                     let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
                         &self.scheduled_graph,
                         prep.state,
@@ -9778,78 +9831,14 @@ impl FlashMoeEngine {
                     );
                     let routing_command = prep.attach_routing_command(routing_command)?;
                     metal_post_attention_prep = Some(prep);
-                    precomputed_active = Some(routing_command);
-                    if let Some(attention_values) = attention_values.take() {
-                        metal.recycle_attention_values(attention_values);
-                    }
-                    used_buffer = true;
-                }
-                if !used_buffer {
-                    if let Some(attention_values) = attention_values.take() {
-                        metal.recycle_attention_values(attention_values);
-                    }
-                    scheduled_cmd2.reject_missing_post_attention_prep(
-                        "Metal attention values cannot fall back to CPU post-attention prep",
-                    )?;
-                }
-            }
-            let active = if let Some(routing_command) = precomputed_active {
-                layer_timing.buckets.combine_norm += combine_started.elapsed();
-                routing_command
-            } else if let Some((out_proj_name, attention_values)) =
-                post_attention_values_for_prep.take()
-            {
-                let mut prepared = None;
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    let residual_input = deferred_residual_input
-                        .map(|input| MetalBatchProjectionInput::Buffer {
-                            buffer: input.buffer,
-                            len: input.len(),
-                        })
-                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                    let metal = &self.metal;
-                    if let Some(post_norm_weight) =
-                        self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                        && let Some(prep) = self.dense.post_attention_q4_prep_with_metal(
-                            metal,
-                            layer,
-                            self.config.experts(),
-                            &out_proj_name,
-                            &attention_values,
-                            residual_input,
-                            &post_norm_weight,
-                            scheduled_cmd2.active_experts,
-                        )?
-                    {
-                        if deferred_residual_input.is_some()
-                            && let Some(pending) = pending_for_layer.take()
-                        {
-                            pending.finish_without_readback()?;
-                        }
-                        let mut prep = prep;
-                        let routing_command = scheduled_cmd2
-                            .command_from_post_attention_prep_routes(
-                                &self.scheduled_graph,
-                                prep.state,
-                                &prep.active,
-                            )?;
-                        debug_assert_eq!(
-                            routing_command.source,
-                            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
-                        );
-                        let routing_command = prep.attach_routing_command(routing_command)?;
-                        metal_post_attention_prep = Some(prep);
-                        prepared = Some(routing_command);
-                    }
-                }
-                if let Some(routing_command) = prepared {
                     layer_timing.buckets.combine_norm += combine_started.elapsed();
                     routing_command
-                } else {
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
                     let _ = (out_proj_name, attention_values);
                     scheduled_cmd2.reject_missing_post_attention_prep(
-                        "CPU attention values cannot fall back to legacy post-attention projection, norm, and routing",
+                        "the resolved CMD2 Q4 post-attention prep implementation requires Apple Silicon Metal",
                     )?;
                     unreachable!("reject_missing_post_attention_prep always returns an error")
                 }
@@ -15548,9 +15537,11 @@ impl DenseStore {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         if !metal.has_resident_dense_weights() {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable"
+            );
         }
         let residual_len = residual.len();
         let projections = build_required_cmd2_q4_post_attention_prep_projections(
@@ -15583,9 +15574,11 @@ impl DenseStore {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
-    ) -> Result<Option<MetalPostAttentionPrep>> {
+    ) -> Result<MetalPostAttentionPrep> {
         if !metal.has_resident_dense_weights() {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable"
+            );
         }
         let residual_len = residual.len();
         let projections = build_required_cmd2_q4_post_attention_prep_projections(
@@ -27027,8 +27020,7 @@ mod tests {
                 &post_norm_weight,
                 3,
             )
-            .unwrap()
-            .expect("resident q4 post-attention prep should run");
+            .unwrap();
         assert_eq!(prep.width, width);
         assert_eq!(prep.active.len(), expected_active.len());
         for (slot, ((actual_id, actual_score), (expected_id, expected_score))) in
