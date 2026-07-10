@@ -1151,6 +1151,15 @@ pub(crate) struct MetalCmd3SharedPhasePlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3SharedBufferLayout {
+    pub(crate) total_intermediate_u32: u32,
+    pub(crate) intermediate_u32: u32,
+    pub(crate) projection_output_bytes: usize,
+    pub(crate) router_output_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3SharedPhasePlan {
     pub(crate) const fn none(width: usize) -> Self {
         Self {
@@ -1207,6 +1216,15 @@ impl MetalCmd3SharedPhasePlan {
         self.width
     }
 
+    pub(crate) fn buffer_layout(self) -> anyhow::Result<MetalCmd3SharedBufferLayout> {
+        Ok(MetalCmd3SharedBufferLayout {
+            total_intermediate_u32: self.total_intermediate_u32()?,
+            intermediate_u32: self.intermediate_u32()?,
+            projection_output_bytes: self.projection_output_bytes()?,
+            router_output_bytes: self.router_output_bytes()?,
+        })
+    }
+
     fn from_shape(
         source: MetalCmd3SharedPhaseSource,
         width: usize,
@@ -1253,6 +1271,14 @@ pub(crate) struct MetalCmd3ActiveExpertPlan {
     pub(crate) index: usize,
     pub(crate) intermediate: usize,
     pub(crate) output_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3ActiveExpertBufferLayout {
+    pub(crate) intermediate_u32: u32,
+    pub(crate) activation_bytes: usize,
+    pub(crate) projection_output_bytes: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1307,6 +1333,14 @@ impl MetalCmd3ActiveExpertPlan {
 
     pub(crate) fn dispatch_threads(self) -> u64 {
         self.intermediate as u64
+    }
+
+    pub(crate) fn buffer_layout(self) -> anyhow::Result<MetalCmd3ActiveExpertBufferLayout> {
+        Ok(MetalCmd3ActiveExpertBufferLayout {
+            intermediate_u32: self.intermediate_u32()?,
+            activation_bytes: self.activation_bytes()?,
+            projection_output_bytes: self.projection_output_bytes()?,
+        })
     }
 
     fn usize_to_u32(label: &str, value: usize) -> anyhow::Result<u32> {
@@ -3867,6 +3901,14 @@ mod tests {
         assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
         assert_eq!(plan.output_offset, 4 * 4);
         assert_eq!(plan.dispatch_threads(), 6);
+        assert_eq!(
+            plan.buffer_layout().unwrap(),
+            MetalCmd3ActiveExpertBufferLayout {
+                intermediate_u32: 6,
+                activation_bytes: 6 * 4,
+                projection_output_bytes: 6 * 4,
+            }
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3912,6 +3954,15 @@ mod tests {
         assert_eq!(plan.projection_rows(), 6);
         assert_eq!(plan.router_rows(), 2);
         assert_eq!(plan.activation_dispatch_threads(), 6);
+        assert_eq!(
+            plan.buffer_layout().unwrap(),
+            MetalCmd3SharedBufferLayout {
+                total_intermediate_u32: 6,
+                intermediate_u32: 3,
+                projection_output_bytes: 6 * 4,
+                router_output_bytes: 2 * 4,
+            }
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3941,6 +3992,15 @@ mod tests {
         assert_eq!(plan.projection_rows(), 6);
         assert_eq!(plan.router_rows(), 2);
         assert_eq!(plan.activation_dispatch_threads(), 6);
+        assert_eq!(
+            plan.buffer_layout().unwrap(),
+            MetalCmd3SharedBufferLayout {
+                total_intermediate_u32: 6,
+                intermediate_u32: 3,
+                projection_output_bytes: 6 * 4,
+                router_output_bytes: 2 * 4,
+            }
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

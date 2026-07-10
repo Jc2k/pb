@@ -334,9 +334,11 @@ The validator should reject silent fallbacks such as:
   intent before release/recycle. The Metal CMD3 bridge now builds one `MetalCmd3ExecutionPlan` that
   validates phase shape, shared source/shape, active expert payloads, next-norm, and combine
   dispatch before Obj-C encoding begins, and that plan declares the command-local buffer layout and
-  scalar constants used by the legacy bridge. The actual shared gate/up/down, next-norm
-  application, and shared down execution still live in the older Metal/CPU phase helpers. That
-  execution should become part of the same CMD2/CMD3 builder model as routed experts.
+  scalar constants used by the legacy bridge. Shared-expert temporary buffers and active-expert
+  activation/projection buffers now resolve through Metal-owned layout structs instead of legacy
+  size recomputation. The actual shared gate/up/down, next-norm application, and shared down
+  execution still live in the older Metal/CPU phase helpers. That execution should become part of
+  the same CMD2/CMD3 builder model as routed experts.
 - Qwen-VL needs a typed pre-MoE adapter: image preprocessing, vision embeddings, MRoPE, and position
   plans should feed the same text/MoE runtime rather than spreading multimodal branches through the
   execution loop.

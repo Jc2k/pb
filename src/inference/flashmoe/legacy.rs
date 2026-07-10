@@ -4870,17 +4870,18 @@ impl MetalExecutorInner {
             {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
-                let total_u32 = shared_plan.total_intermediate_u32()?;
-                let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
+                let shared_layout = shared_plan.buffer_layout()?;
+                let total_u32 = shared_layout.total_intermediate_u32;
+                let shared_intermediate_u32 = shared_layout.intermediate_u32;
                 let shared_gate_out =
-                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out = self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                let shared_up_out = self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out = self.buffer_with_len(shared_plan.router_output_bytes()?)?;
+                let shared_router_out = self.buffer_with_len(shared_layout.router_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
-                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
                 let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
                 buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
@@ -4925,17 +4926,18 @@ impl MetalExecutorInner {
                 let shared_plan = command_plan.shared;
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
-                let total_u32 = shared_plan.total_intermediate_u32()?;
-                let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
+                let shared_layout = shared_plan.buffer_layout()?;
+                let total_u32 = shared_layout.total_intermediate_u32;
+                let shared_intermediate_u32 = shared_layout.intermediate_u32;
                 let shared_gate_out =
-                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out = self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                let shared_up_out = self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out = self.buffer_with_len(shared_plan.router_output_bytes()?)?;
+                let shared_router_out = self.buffer_with_len(shared_layout.router_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
-                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
+                    self.buffer_with_len(shared_layout.projection_output_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
                 let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
                 buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
@@ -5000,7 +5002,8 @@ impl MetalExecutorInner {
 
             for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
                 let payload = payload.q4();
-                let activated = self.buffer_with_len(active_plan.activation_bytes()?)?;
+                let active_layout = active_plan.buffer_layout()?;
+                let activated = self.buffer_with_len(active_layout.activation_bytes)?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
 
                 let fused = self.encode_q4_swiglu(
@@ -5013,9 +5016,9 @@ impl MetalExecutorInner {
                     &mut q4_source_buffers,
                 )?;
                 if !fused {
-                    let gate_out = self.buffer_with_len(active_plan.projection_output_bytes()?)?;
+                    let gate_out = self.buffer_with_len(active_layout.projection_output_bytes)?;
                     buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                    let up_out = self.buffer_with_len(active_plan.projection_output_bytes()?)?;
+                    let up_out = self.buffer_with_len(active_layout.projection_output_bytes)?;
                     buffers.push(MetalPhaseBuffer::recyclable(up_out));
                     self.encode_q4_matvec(
                         encoder,
@@ -5035,7 +5038,7 @@ impl MetalExecutorInner {
                         &mut buffers,
                         &mut q4_source_buffers,
                     )?;
-                    let intermediate_u32 = active_plan.intermediate_u32()?;
+                    let intermediate_u32 = active_layout.intermediate_u32;
                     let intermediate_buffer =
                         self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
                     buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
