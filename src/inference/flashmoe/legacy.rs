@@ -136,13 +136,13 @@ use super::types::*;
 use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionDescriptor,
-    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
-    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    apply_qwen3next_norm_offset_if_needed, build_cmd2_q4_post_attention_prep_projections,
-    build_router_score_projection_descriptor, build_shared_expert_phase_weights,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
+    RouterScoreProjectionDescriptor, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, apply_qwen3next_norm_offset_if_needed,
+    build_cmd2_q4_post_attention_prep_projections, build_router_score_projection_descriptor,
+    build_shared_expert_phase_weights, build_shared_expert_q4_phase_projections,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -16715,58 +16715,41 @@ impl DenseStore {
         if active_experts == 0 || !metal.has_resident_dense_weights() {
             return Ok(None);
         }
-        let tensor_name = router_tensor_name(layer);
-        let Some(entry) = self.registry.tensor(&tensor_name) else {
-            return Ok(None);
-        };
-        let (rows, cols) = validate_dense_matvec_shape(entry, &tensor_name, experts, hidden.len())?;
-        if rows != experts || cols != hidden.len() {
-            return Ok(None);
-        }
-
-        if entry.quantization == TensorQuantization::None {
-            return metal.dense_mmap_top_candidates(
-                entry.byte_offset,
-                &entry.dtype,
-                hidden,
-                rows,
-                cols,
-                cols,
-                active_experts,
-            );
-        }
-
-        let TensorQuantization::Q4 {
-            group_size,
-            scale_bias_dtype,
-            ..
-        } = &entry.quantization
+        let Some(descriptor) = build_router_score_projection_descriptor(
+            layer,
+            experts,
+            hidden.len(),
+            self.len,
+            |tensor_name| self.registry.tensor(tensor_name),
+        )?
         else {
             return Ok(None);
         };
-        let layout =
-            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
-        let packed_offset = entry.byte_offset;
-        let scales_offset = entry
-            .byte_offset
-            .checked_add(layout.packed_bytes as u64)
-            .context("router q4 mmap scales offset overflow")?;
-        let biases_offset = scales_offset
-            .checked_add(layout.scales_bytes as u64)
-            .context("router q4 mmap biases offset overflow")?;
-        metal.q4_mmap_top_candidates(
-            packed_offset,
-            scales_offset,
-            biases_offset,
-            hidden,
-            rows,
-            cols,
-            layout.row_packed_bytes,
-            layout.groups_per_row,
-            *group_size,
-            scale_bias_dtype,
-            active_experts,
-        )
+        match descriptor.binding {
+            RouterScoreProjectionBinding::ResidentDense(projection) => metal
+                .dense_mmap_top_candidates(
+                    projection.byte_offset,
+                    &projection.dtype,
+                    hidden,
+                    projection.rows,
+                    projection.cols,
+                    projection.stride(),
+                    active_experts,
+                ),
+            RouterScoreProjectionBinding::ResidentQ4(projection) => metal.q4_mmap_top_candidates(
+                projection.packed_byte_offset,
+                projection.scales_byte_offset,
+                projection.biases_byte_offset,
+                hidden,
+                projection.rows,
+                projection.cols,
+                projection.row_packed_bytes,
+                projection.groups_per_row,
+                projection.group_size,
+                &projection.scale_bias_dtype,
+                active_experts,
+            ),
+        }
     }
 
     fn router_scores_with_accelerate(
