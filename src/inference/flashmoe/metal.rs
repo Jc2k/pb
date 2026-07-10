@@ -17,6 +17,8 @@ use anyhow::Context as _;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::experts::{EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::math::top_k;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
     ScheduledCmd3MetalPostAttentionInput, ScheduledExpertPhaseMlpPayload,
     ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
@@ -26,7 +28,8 @@ use super::scheduler::{
 use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
-    DenseQ4MmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    Cmd2Q4PostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -343,6 +346,41 @@ impl MetalBufferPool {
     ) -> anyhow::Result<MetalObjcId> {
         unsafe {
             let buffer = self.buffer_with_len(device, bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    unsafe fn tracked_buffer_with_len(
+        &self,
+        device: MetalObjcId,
+        len: usize,
+        owned: &mut Vec<MetalObjcId>,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            match self.buffer_with_len(device, len) {
+                Ok(buffer) => {
+                    owned.push(buffer);
+                    Ok(buffer)
+                }
+                Err(error) => {
+                    self.recycle_or_release(owned, true);
+                    owned.clear();
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    unsafe fn tracked_buffer_with_bytes(
+        &self,
+        device: MetalObjcId,
+        bytes: &[u8],
+        owned: &mut Vec<MetalObjcId>,
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            let buffer = self.tracked_buffer_with_len(device, bytes.len(), owned)?;
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
             Ok(buffer)
@@ -1177,6 +1215,248 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
             release(command_buffer);
             self.buffers.recycle_or_release(&transient, false);
             Ok(candidates)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MetalQ4PostAttentionPrepBuilder<'a> {
+    device: MetalObjcId,
+    command_queue: MetalObjcId,
+    q4_pipeline: MetalObjcId,
+    q4_bf16_scale_bias_pipeline: MetalObjcId,
+    residual_rms_norm_pipeline: MetalObjcId,
+    dense_weights: &'a MetalDenseWeights,
+    buffers: &'a MetalBufferPool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
+    pub(crate) fn new(
+        device: MetalObjcId,
+        command_queue: MetalObjcId,
+        pipelines: &MetalPipelineSet<MetalObjcId>,
+        dense_weights: &'a MetalDenseWeights,
+        buffers: &'a MetalBufferPool,
+    ) -> Self {
+        Self {
+            device,
+            command_queue,
+            q4_pipeline: pipelines.q4_mmap_pipeline,
+            q4_bf16_scale_bias_pipeline: pipelines.q4_mmap_bf16_scale_bias_pipeline,
+            residual_rms_norm_pipeline: pipelines.residual_rms_norm_pipeline,
+            dense_weights,
+            buffers,
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
+        attention_output: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+    ) -> anyhow::Result<MetalPostAttentionPrep> {
+        let plan = projections.resident_plan(
+            self.dense_weights.len,
+            attention_output.len(),
+            residual.len(),
+            post_norm_weight.len(),
+        )?;
+        let width_u32 =
+            u32::try_from(plan.width).context("FlashMoe Metal CMD2 residual width exceeds u32")?;
+        let out_constants = Self::projection_constants(&projections.out_proj)?;
+        let router_constants = Self::projection_constants(&projections.router)?;
+
+        unsafe {
+            let mut owned = Vec::with_capacity(7);
+            let attention_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.device,
+                f32_as_bytes(attention_output),
+                &mut owned,
+            )?;
+            let (residual_input_buffer, owned_residual_input) = match residual {
+                MetalBatchProjectionInput::Cpu(residual) => (
+                    self.buffers.tracked_buffer_with_bytes(
+                        self.device,
+                        f32_as_bytes(residual),
+                        &mut owned,
+                    )?,
+                    true,
+                ),
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, false),
+            };
+            let norm_weight_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.device,
+                f32_as_bytes(post_norm_weight),
+                &mut owned,
+            )?;
+            let projected_buffer = self.buffers.tracked_buffer_with_len(
+                self.device,
+                plan.width * std::mem::size_of::<f32>(),
+                &mut owned,
+            )?;
+            let residual_buffer = self.buffers.tracked_buffer_with_len(
+                self.device,
+                plan.width * std::mem::size_of::<f32>(),
+                &mut owned,
+            )?;
+            let normed_buffer = self.buffers.tracked_buffer_with_len(
+                self.device,
+                plan.width * std::mem::size_of::<f32>(),
+                &mut owned,
+            )?;
+            let router_logits_buffer = self.buffers.tracked_buffer_with_len(
+                self.device,
+                projections.router.rows * std::mem::size_of::<f32>(),
+                &mut owned,
+            )?;
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.buffers.recycle_or_release(&owned, true);
+                anyhow::bail!("failed to create Flash-MoE CMD2 post-attention command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.buffers.recycle_or_release(&owned, true);
+                anyhow::bail!("failed to create Flash-MoE CMD2 post-attention compute encoder");
+            }
+
+            self.encode_q4_projection(
+                encoder,
+                &projections.out_proj,
+                out_constants,
+                attention_buffer,
+                projected_buffer,
+            );
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.residual_rms_norm_pipeline,
+            );
+            set_buffer(encoder, projected_buffer, 0);
+            set_buffer(encoder, residual_input_buffer, 1);
+            set_buffer(encoder, norm_weight_buffer, 2);
+            set_buffer(encoder, residual_buffer, 3);
+            set_buffer(encoder, normed_buffer, 4);
+            set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+            dispatch_single_threadgroup(encoder, 256);
+            self.encode_q4_projection(
+                encoder,
+                &projections.router,
+                router_constants,
+                normed_buffer,
+                router_logits_buffer,
+            );
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let context = MetalCommandContext::new("cmd2_q4_post_attention")
+                .with("layer", plan.layer)
+                .with("width", plan.width)
+                .with("attention_width", plan.attention_width)
+                .with("experts", plan.experts)
+                .with("top_k", plan.active_count)
+                .with("routing_topk", "cpu")
+                .with("out_proj", &projections.out_proj.tensor_name)
+                .with("router", &projections.router.tensor_name);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.buffers
+                    .recycle_or_release(&owned, error.should_release_buffers());
+                return Err(error.into());
+            }
+
+            let router_logits_ptr =
+                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
+            let router_scores =
+                std::slice::from_raw_parts(router_logits_ptr, projections.router.rows).to_vec();
+            let active = top_k(&router_scores, plan.active_count);
+            let output = MetalPostAttentionPrep::new(
+                plan.layer,
+                plan.width,
+                plan.experts,
+                active,
+                residual_buffer,
+                normed_buffer,
+            );
+
+            release(encoder);
+            release(command_buffer);
+            if output.is_err() {
+                self.buffers.recycle_or_release(&owned, false);
+                return output;
+            }
+            let transient = owned
+                .into_iter()
+                .filter(|buffer| *buffer != residual_buffer && *buffer != normed_buffer)
+                .collect::<Vec<_>>();
+            debug_assert_eq!(transient.len(), if owned_residual_input { 5 } else { 4 });
+            self.buffers.recycle_or_release(&transient, false);
+            output
+        }
+    }
+
+    fn projection_constants(
+        projection: &DenseQ4MmapMatvecProjection,
+    ) -> anyhow::Result<(u32, u32, u32, u32)> {
+        Ok((
+            u32::try_from(projection.rows).with_context(|| {
+                format!(
+                    "FlashMoe Metal CMD2 rows exceed u32 for {}",
+                    projection.tensor_name
+                )
+            })?,
+            u32::try_from(projection.cols).with_context(|| {
+                format!(
+                    "FlashMoe Metal CMD2 cols exceed u32 for {}",
+                    projection.tensor_name
+                )
+            })?,
+            u32::try_from(projection.groups_per_row).with_context(|| {
+                format!(
+                    "FlashMoe Metal CMD2 groups per row exceed u32 for {}",
+                    projection.tensor_name
+                )
+            })?,
+            u32::try_from(projection.group_size).with_context(|| {
+                format!(
+                    "FlashMoe Metal CMD2 group size exceeds u32 for {}",
+                    projection.tensor_name
+                )
+            })?,
+        ))
+    }
+
+    unsafe fn encode_q4_projection(
+        &self,
+        encoder: MetalObjcId,
+        projection: &DenseQ4MmapMatvecProjection,
+        (rows, cols, groups, group_size): (u32, u32, u32, u32),
+        input_buffer: MetalObjcId,
+        output_buffer: MetalObjcId,
+    ) {
+        unsafe {
+            let pipeline = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
+                self.q4_bf16_scale_bias_pipeline
+            } else {
+                debug_assert_eq!(projection.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_F32);
+                self.q4_pipeline
+            };
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, self.dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows), 6);
+            set_bytes(encoder, u32_as_bytes(&cols), 7);
+            set_bytes(encoder, u32_as_bytes(&groups), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size), 9);
+            dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
         }
     }
 }
@@ -6028,6 +6308,54 @@ mod tests {
                 .to_string()
                 .contains("biases range for lm_head.weight exceeds resident dense weights"),
             "{range_error:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd2_q4_builder_rejects_state_width_mismatch_before_encoding() {
+        let mmap = Arc::new(
+            memmap2::MmapMut::map_anon(4096)
+                .unwrap()
+                .make_read_only()
+                .unwrap(),
+        );
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let dense = MetalDenseWeights::new(id, mmap, 4096);
+        let buffers = MetalBufferPool::default();
+        let builder = MetalQ4PostAttentionPrepBuilder {
+            device: id,
+            command_queue: id,
+            q4_pipeline: id,
+            q4_bf16_scale_bias_pipeline: id,
+            residual_rms_norm_pipeline: id,
+            dense_weights: &dense,
+            buffers: &buffers,
+        };
+        let projections = Cmd2Q4PostAttentionPrepProjections::new(
+            7,
+            test_q4_projection("model.layers.7.self_attn.o_proj.weight", 4, 16),
+            test_q4_projection("model.layers.7.mlp.gate.weight", 8, 4),
+            8,
+            4,
+            16,
+            4,
+        )
+        .unwrap();
+
+        let error = builder
+            .execute(
+                &projections,
+                &[0.0; 15],
+                MetalBatchProjectionInput::Cpu(&[0.0; 4]),
+                &[1.0; 4],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("projection shapes out=4x16 rows=4"),
+            "{error:#}"
         );
     }
 

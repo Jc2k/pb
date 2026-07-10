@@ -115,17 +115,17 @@ use super::metal::{
     MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache,
     MetalObjcId as ObjcId, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache,
-    MetalResidentQ4TopKBuilder, MetalRuntimeCapabilities, MetalSharedExpertBuffers,
-    commit_and_wait_metal_command_buffer, commit_metal_command_buffer, compile_pipeline,
-    dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups, dispatch_single_threadgroup,
-    dispatch_threads, f32_as_bytes, metal_buffer_barrier, metal_command_failure_requires_release,
-    metal_default_device, msg_send_id0, msg_send_id2_id_error, msg_send_id2_usize_u64,
-    msg_send_id4_ptr_usize_u64_ptr, msg_send_ptr0, msg_send_void0, msg_send_void1_id,
-    msg_send_void2_size, ns_error_localized_description, ns_string, read_f32_buffer, release,
-    retain, sel, set_buffer, set_buffer_with_offset, set_bytes, u32_as_bytes, u32_as_bytes_slice,
-    u64_as_bytes, u64_as_bytes_slice, wait_for_metal_command_buffer,
-    wrap_dense_mmap_as_metal_buffer,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder,
+    MetalQ4SourceBufferCache, MetalResidentQ4TopKBuilder, MetalRuntimeCapabilities,
+    MetalSharedExpertBuffers, commit_and_wait_metal_command_buffer, commit_metal_command_buffer,
+    compile_pipeline, dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups,
+    dispatch_single_threadgroup, dispatch_threads, f32_as_bytes, metal_buffer_barrier,
+    metal_command_failure_requires_release, metal_default_device, msg_send_id0,
+    msg_send_id2_id_error, msg_send_id2_usize_u64, msg_send_id4_ptr_usize_u64_ptr, msg_send_ptr0,
+    msg_send_void0, msg_send_void1_id, msg_send_void2_size, ns_error_localized_description,
+    ns_string, read_f32_buffer, release, retain, sel, set_buffer, set_buffer_with_offset,
+    set_bytes, u32_as_bytes, u32_as_bytes_slice, u64_as_bytes, u64_as_bytes_slice,
+    wait_for_metal_command_buffer, wrap_dense_mmap_as_metal_buffer,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -6515,150 +6515,15 @@ impl MetalExecutorInner {
         let dense_weights = self.dense_weights.as_ref().context(
             "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
         )?;
-        let plan = projections.resident_plan(
-            dense_weights.len,
-            attention_output.len(),
-            residual.len(),
-            post_norm_weight.len(),
-        )?;
-        let out_proj = &projections.out_proj;
-        let router = &projections.router;
-        let width = plan.width;
-        let active_count = plan.active_count;
-
-        unsafe {
-            let attention_buffer = self.buffer_with_bytes(f32_as_bytes(attention_output))?;
-            let (residual_input_buffer, owned_residual_input_buffer) = match residual {
-                MetalBatchProjectionInput::Cpu(residual) => {
-                    let buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
-                    (buffer, Some(buffer))
-                }
-                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
-            };
-            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
-            let projected_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let residual_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let normed_buffer = self.buffer_with_len(width * std::mem::size_of::<f32>())?;
-            let router_logits_buffer =
-                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
-            let mut buffers = vec![
-                attention_buffer,
-                norm_weight_buffer,
-                projected_buffer,
-                residual_buffer,
-                normed_buffer,
-                router_logits_buffer,
-            ];
-            if let Some(buffer) = owned_residual_input_buffer {
-                buffers.push(buffer);
-            }
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE post-attention prep command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE post-attention prep compute encoder");
-            }
-
-            for (projection, input_buffer, output_buffer) in [
-                (out_proj, attention_buffer, projected_buffer),
-                (router, normed_buffer, router_logits_buffer),
-            ] {
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let groups_u32 = projection.groups_per_row as u32;
-                let group_size_u32 = projection.group_size as u32;
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.pipelines.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer(encoder, output_buffer, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
-
-                if std::ptr::eq(projection, out_proj) {
-                    let width_u32 = width as u32;
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        self.pipelines.residual_rms_norm_pipeline,
-                    );
-                    set_buffer(encoder, projected_buffer, 0);
-                    set_buffer(encoder, residual_input_buffer, 1);
-                    set_buffer(encoder, norm_weight_buffer, 2);
-                    set_buffer(encoder, residual_buffer, 3);
-                    set_buffer(encoder, normed_buffer, 4);
-                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
-                    dispatch_single_threadgroup(encoder, 256);
-                }
-            }
-
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let context = MetalCommandContext::new("linear_post_attention_q4_router")
-                .with("width", width)
-                .with("attention_width", plan.attention_width)
-                .with("experts", plan.experts)
-                .with("top_k", active_count)
-                .with("routing_topk", "cpu")
-                .with("out_proj", out_proj.tensor_name.as_str())
-                .with("router", router.tensor_name.as_str());
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
-                return Err(error.into());
-            }
-
-            let router_logits_ptr =
-                msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
-            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
-            let active = super::math::top_k(&router_scores, active_count);
-
-            release(encoder);
-            release(command_buffer);
-            if let Some(buffer) = owned_residual_input_buffer {
-                self.recycle(buffer);
-            }
-            for buffer in [
-                attention_buffer,
-                norm_weight_buffer,
-                projected_buffer,
-                router_logits_buffer,
-            ] {
-                self.recycle(buffer);
-            }
-            Ok(MetalPostAttentionPrep::new(
-                plan.layer,
-                width,
-                plan.experts,
-                active,
-                residual_buffer,
-                normed_buffer,
-            )?)
-        }
+        MetalQ4PostAttentionPrepBuilder::new(
+            self.device,
+            self.command_queue,
+            &self.pipelines,
+            dense_weights,
+            &self.buffers,
+        )
+        .execute(projections, attention_output, residual, post_norm_weight)
     }
-
     fn q4_mmap_matvec_batch(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],

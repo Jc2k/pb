@@ -166,6 +166,10 @@ Baseline reviewed on 2026-07-10:
   builder: typed projection/range validation, allocation, Q4 logits encoding, vocabulary top-k,
   submission, readback, and cleanup. Router-score and LM-head callers share that builder, and the
   resolved LM-head path returns a concrete result instead of probing `Option` availability.
+- The fused Q4 CMD2 post-attention builder is also Metal-owned end to end: it validates typed
+  projection/state widths, encodes output projection, residual-add/RMS norm, and router projection
+  in one command, performs declared CPU top-k readback, and returns GPU-resident residual/normed
+  state. `legacy.rs` now only invokes this concrete builder for that stage.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
