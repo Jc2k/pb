@@ -75,6 +75,8 @@ use super::experts::parse_pbq4_expert_pack_generic;
 use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
+#[cfg(test)]
+use super::experts::write_all_at_positioned;
 use super::experts::{
     AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors,
     DirectExpertTensorShape, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
@@ -100,8 +102,6 @@ use super::experts::{
 };
 #[cfg(test)]
 use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
-#[cfg(test)]
-use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
@@ -1276,7 +1276,7 @@ where
         &model_layout,
         dense_layout,
         expert_storage,
-        metal.as_ref().map(MetalExecutor::runtime_capabilities),
+        Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
     progress("capability_graph", phase_started.elapsed());
@@ -1310,7 +1310,7 @@ pub struct FlashMoeEngine {
     scheduler: ExpertScheduler,
     dense: DenseStore,
     tokenizer: QwenTokenizer,
-    metal: Option<MetalExecutor>,
+    metal: MetalExecutor,
     config: QwenModelConfig,
     model_layout: QwenMoeModelLayout,
     capability_plan: FlashMoeCapabilityPlan,
@@ -1866,14 +1866,16 @@ impl MetalExecutor {
         config: &QwenModelConfig,
         runtime: &DenseTransformerRuntime,
         dense: &DenseStore,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
         if !plan.uses_metal {
-            return Ok(None);
+            bail!(
+                "FlashMoe unsupported required Metal execution: the resolved graph cannot be loaded with Metal disabled"
+            );
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let route_top4_enabled = metal_route_top4_enabled();
-            Ok(Some(Self {
+            Ok(Self {
                 inner: Arc::new(MetalExecutorInner::new(
                     plan,
                     config,
@@ -1882,12 +1884,14 @@ impl MetalExecutor {
                     route_top4_enabled,
                 )?),
                 route_top4_enabled,
-            }))
+            })
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = (config, runtime, dense);
-            Ok(None)
+            bail!(
+                "FlashMoe unsupported required Metal execution: the resolved graph requires Apple Silicon Metal"
+            )
         }
     }
 
@@ -8844,10 +8848,8 @@ impl FlashMoeEngine {
                     None,
                 )
             };
-        if prefill_start == 0
-            && let Some(metal) = &self.metal
-        {
-            metal.reset_linear_attention_state();
+        if prefill_start == 0 {
+            self.metal.reset_linear_attention_state();
         }
         let prefill_hidden = if prefill_start == prompt_tokens.len() {
             info!(
@@ -9571,7 +9573,7 @@ impl FlashMoeEngine {
     ) -> Result<u32> {
         if trace_candidates {
             let logits = self.dense.lm_head_logits_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 0,
                 hidden,
                 &self.tokenizer,
@@ -9588,7 +9590,7 @@ impl FlashMoeEngine {
             return sampler.sample_candidates(candidates);
         }
         if let Some(candidates) = self.dense.lm_head_top_candidates_with_metal(
-            self.metal.as_ref(),
+            Some(&self.metal),
             hidden,
             &self.tokenizer,
             sampler,
@@ -9605,12 +9607,9 @@ impl FlashMoeEngine {
             );
             return sampler.sample_candidates(candidates);
         }
-        let logits = self.dense.lm_head_logits_with_metal(
-            self.metal.as_ref(),
-            0,
-            hidden,
-            &self.tokenizer,
-        )?;
+        let logits =
+            self.dense
+                .lm_head_logits_with_metal(Some(&self.metal), 0, hidden, &self.tokenizer)?;
         let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
         trace_sampling_candidates(
             progress,
@@ -9781,10 +9780,7 @@ impl FlashMoeEngine {
             let projected = if self.runtime.is_linear_attention_layer(layer) {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    if self.metal.is_some()
-                        && deepstack.is_none()
-                        && expert_execution != ExpertExecution::Skip
-                    {
+                    if deepstack.is_none() && expert_execution != ExpertExecution::Skip {
                         let residual_input = deferred_residual_input
                             .map(|input| MetalBatchProjectionInput::Buffer {
                                 buffer: input.buffer,
@@ -9857,10 +9853,7 @@ impl FlashMoeEngine {
             } else {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    if self.metal.is_some()
-                        && deepstack.is_none()
-                        && expert_execution != ExpertExecution::Skip
-                    {
+                    if deepstack.is_none() && expert_execution != ExpertExecution::Skip {
                         let values = self.full_attention_output_values(
                             layer,
                             &normed,
@@ -9905,7 +9898,6 @@ impl FlashMoeEngine {
             layer_timing.buckets.attention_projection += attention_started.elapsed();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let can_defer_residual_wait_for_post_prep = deferred_residual_input.is_some()
-                && self.metal.is_some()
                 && expert_execution != ExpertExecution::Skip
                 && (metal_post_attention_values_for_prep.is_some()
                     || post_attention_values_for_prep.is_some());
@@ -10009,9 +10001,9 @@ impl FlashMoeEngine {
                         len: input.len(),
                     })
                     .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                if let Some(metal) = &self.metal
-                    && let Some(post_norm_weight) =
-                        self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                let metal = &self.metal;
+                if let Some(post_norm_weight) =
+                    self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
                     && let Some(prep) = self.dense.post_attention_q4_prep_with_metal_buffer(
                         metal,
                         layer,
@@ -10049,10 +10041,8 @@ impl FlashMoeEngine {
                     used_buffer = true;
                 }
                 if !used_buffer {
-                    if let Some(metal) = &self.metal {
-                        if let Some(attention_values) = attention_values.take() {
-                            metal.recycle_attention_values(attention_values);
-                        }
+                    if let Some(attention_values) = attention_values.take() {
+                        metal.recycle_attention_values(attention_values);
                     }
                     scheduled_cmd2.reject_missing_post_attention_prep(
                         "Metal attention values cannot fall back to CPU post-attention prep",
@@ -10074,9 +10064,9 @@ impl FlashMoeEngine {
                             len: input.len(),
                         })
                         .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                    if let Some(metal) = &self.metal
-                        && let Some(post_norm_weight) =
-                            self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                    let metal = &self.metal;
+                    if let Some(post_norm_weight) =
+                        self.model_norm_weight(post_norm_name.as_str(), runtime.width)?
                         && let Some(prep) = self.dense.post_attention_q4_prep_with_metal(
                             metal,
                             layer,
@@ -10200,9 +10190,7 @@ impl FlashMoeEngine {
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
             let mut submitted_deferred = false;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if let Some(metal) = &self.metal
-                && let Some(prep) = metal_post_attention_prep.take()
-            {
+            if let Some(prep) = metal_post_attention_prep.take() {
                 let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
                     position,
                     &scheduled_experts,
@@ -10210,7 +10198,7 @@ impl FlashMoeEngine {
                     shared_phase,
                     next_norm_weights,
                 )?;
-                let pending = metal.submit_scheduled_expert_command(command)?;
+                let pending = self.metal.submit_scheduled_expert_command(command)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;
@@ -10223,10 +10211,7 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 }
             }
-            if !submitted_deferred
-                && let Some(metal) = &self.metal
-                && let Some(mlp_residual) = cpu_mlp_residual.as_deref()
-            {
+            if !submitted_deferred && let Some(mlp_residual) = cpu_mlp_residual.as_deref() {
                 let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
                     position,
                     &scheduled_experts,
@@ -10238,7 +10223,7 @@ impl FlashMoeEngine {
                     shared_phase,
                     next_norm_weights,
                 )?;
-                let pending = metal.submit_scheduled_expert_command(command)?;
+                let pending = self.metal.submit_scheduled_expert_command(command)?;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                     submitted_deferred = true;
@@ -10437,11 +10422,11 @@ impl FlashMoeEngine {
         let input_specs = input_requests.requests();
         let mut batched_input_projections = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
+        if let Some(input) = deferred_input {
             batched_input_projections = self
                 .dense
                 .project_dense_tensors_batched_with_metal_input_buffer(
-                    metal,
+                    &self.metal,
                     &input_specs,
                     input.buffer,
                     input.len(),
@@ -10452,7 +10437,7 @@ impl FlashMoeEngine {
         }
         if batched_input_projections.is_none() {
             batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 &input_specs,
                 normed,
             )?;
@@ -10470,21 +10455,21 @@ impl FlashMoeEngine {
             (q_projected, k, v)
         } else {
             let q_projected = self.dense.project_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 layer,
                 "q_proj",
                 normed,
                 layout.q_projection_width,
             )?;
             let k = self.dense.project_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 layer,
                 "k_proj",
                 normed,
                 layout.kv_width,
             )?;
             let v = self.dense.project_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 layer,
                 "v_proj",
                 normed,
@@ -10553,9 +10538,9 @@ impl FlashMoeEngine {
         kv_record: &FlashMoeFullAttentionKvRecord,
     ) -> Result<ScheduledAttentionMathOutput> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(metal) = &self.metal {
+        {
             let tokens = position + 1;
-            if metal.attention_backend(tokens) == MetalAttentionBackend::Gpu {
+            if self.metal.attention_backend(tokens) == MetalAttentionBackend::Gpu {
                 let scheduled_attention = self.scheduled_graph.build_attention_math(
                     layer,
                     position,
@@ -10563,7 +10548,7 @@ impl FlashMoeEngine {
                 )?;
                 let output = scheduled_attention
                     .resolve_kv_state(kv_record.state(FlashMoeStatePlacement::GpuResident))?;
-                metal
+                self.metal
                     .record_kv(
                         kv_record.position(),
                         kv_record.layer(),
@@ -10611,7 +10596,7 @@ impl FlashMoeEngine {
         )?;
         let subphase_started = Instant::now();
         let projected = self.dense.project_with_metal(
-            self.metal.as_ref(),
+            Some(&self.metal),
             layer,
             "o_proj",
             &attended,
@@ -10629,9 +10614,7 @@ impl FlashMoeEngine {
         layer: usize,
         runtime: &DenseTransformerRuntime,
     ) -> bool {
-        let Some(metal) = self.metal.as_ref() else {
-            return false;
-        };
+        let metal = &self.metal;
         if self.runtime.is_linear_attention_layer(layer) {
             let Ok(layout) = runtime.linear_attention_layout(layer) else {
                 return false;
@@ -10698,8 +10681,6 @@ impl FlashMoeEngine {
             ScheduledAttentionMathImplementation::CpuKvCache => cpu_attention(kv_cache),
             ScheduledAttentionMathImplementation::MetalKvCache => self
                 .metal
-                .as_ref()
-                .context("FlashMoe scheduled Metal attention is missing a Metal executor")?
                 .causal_attention_cached(position, layer, q, layout)
                 .with_context(|| {
                     format!(
@@ -10728,7 +10709,7 @@ impl FlashMoeEngine {
             normed.len(),
         )?;
         self.dense
-            .router_command_with_metal(self.metal.as_ref(), router_score_command, normed)
+            .router_command_with_metal(Some(&self.metal), router_score_command, normed)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10740,9 +10721,7 @@ impl FlashMoeEngine {
         runtime: &DenseTransformerRuntime,
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Option<MetalAttentionValues>> {
-        let Some(metal) = self.metal.as_ref() else {
-            return Ok(None);
-        };
+        let metal = &self.metal;
         let layout = runtime.linear_attention_layout(layer)?;
         if self
             .config
@@ -10801,9 +10780,7 @@ impl FlashMoeEngine {
         runtime: &DenseTransformerRuntime,
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Option<MetalPostAttentionPrep>> {
-        let Some(metal) = self.metal.as_ref() else {
-            return Ok(None);
-        };
+        let metal = &self.metal;
         let layout = runtime.linear_attention_layout(layer)?;
         if self
             .config
@@ -10882,14 +10859,14 @@ impl FlashMoeEngine {
         )?;
         let input_specs = input_requests.requests();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(metal) = self.metal.as_ref()
-            && !self
-                .config
-                .linear_attention_qkv_projection_requires_reorder()
+        if !self
+            .config
+            .linear_attention_qkv_projection_requires_reorder()
             && let Some(static_offsets) = self
                 .dense
                 .linear_attention_static_offsets_for_metal(layer, layout)?
         {
+            let metal = &self.metal;
             let projection_started = Instant::now();
             let projection_input = if let Some(input) = deferred_input {
                 MetalBatchProjectionInput::Buffer {
@@ -10920,11 +10897,11 @@ impl FlashMoeEngine {
         }
         let mut batched_input_projections = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
+        if let Some(input) = deferred_input {
             batched_input_projections = self
                 .dense
                 .project_dense_tensors_batched_with_metal_input_buffer(
-                    metal,
+                    &self.metal,
                     &input_specs,
                     input.buffer,
                     input.len(),
@@ -10935,7 +10912,7 @@ impl FlashMoeEngine {
         }
         if batched_input_projections.is_none() {
             batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 &input_specs,
                 normed,
             )?;
@@ -10958,7 +10935,7 @@ impl FlashMoeEngine {
             let qkv = self
                 .dense
                 .project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
+                    Some(&self.metal),
                     input_requests.tensor_name(0),
                     normed,
                     layout.conv_dim,
@@ -10967,7 +10944,7 @@ impl FlashMoeEngine {
             let z = self
                 .dense
                 .project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
+                    Some(&self.metal),
                     input_requests.tensor_name(1),
                     normed,
                     layout.total_value_width,
@@ -10976,7 +10953,7 @@ impl FlashMoeEngine {
             let beta = self
                 .dense
                 .project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
+                    Some(&self.metal),
                     input_requests.tensor_name(2),
                     normed,
                     layout.num_value_heads,
@@ -10985,7 +10962,7 @@ impl FlashMoeEngine {
             let alpha = self
                 .dense
                 .project_dense_tensor_with_metal(
-                    self.metal.as_ref(),
+                    Some(&self.metal),
                     input_requests.tensor_name(3),
                     normed,
                     layout.num_value_heads,
@@ -11087,7 +11064,7 @@ impl FlashMoeEngine {
         let projected = self
             .dense
             .project_dense_tensor_with_metal(
-                self.metal.as_ref(),
+                Some(&self.metal),
                 &out_proj_name,
                 &values,
                 runtime.width,
@@ -21913,9 +21890,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &dense)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &dense).unwrap();
         let actual = metal
             .submit_expert_phase(
                 0,
@@ -26774,9 +26749,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
         let input: Vec<f32> = (0..cols)
             .map(|idx| ((idx as f32) * 0.13).cos() - 0.25)
             .collect();
@@ -26907,9 +26880,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
         let input: Vec<f32> = (0..cols)
             .map(|idx| ((idx as f32) * 0.17).cos() - 0.125)
             .collect();
@@ -27095,9 +27066,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
         let input: Vec<f32> = (0..cols)
             .map(|idx| ((idx as f32) * 0.11).cos() - 0.1875)
             .collect();
@@ -27261,9 +27230,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
 
         let attention_output: Vec<f32> = (0..attention_width)
             .map(|idx| ((idx as f32) * 0.11).sin() - 0.375)
@@ -27461,9 +27428,7 @@ mod tests {
             vision_config: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
-        let metal = MetalExecutor::new(&plan, &config, &runtime, &store)
-            .unwrap()
-            .expect("Metal executor should initialize on arm64 macOS");
+        let metal = MetalExecutor::new(&plan, &config, &runtime, &store).unwrap();
         let input: Vec<f32> = (0..cols)
             .map(|idx| ((idx as f32) * 0.017).cos() * 0.125 - 0.015625)
             .collect();
@@ -27852,140 +27817,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_expert_phase_weights_are_cached_per_layer() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dense_path = tmp.path().join("model_weights.bin");
-        let manifest_path = tmp.path().join("model_weights.json");
-        let experts_dir = tmp.path().join("experts");
-        fs::create_dir_all(&experts_dir).unwrap();
-
-        let config: QwenModelConfig = serde_json::from_slice(
-            br#"{
-                "model_type":"qwen3_moe",
-                "num_hidden_layers":1,
-                "hidden_size":2,
-                "num_attention_heads":1,
-                "num_key_value_heads":1,
-                "vocab_size":8,
-                "torch_dtype":"float32",
-                "num_experts":1,
-                "num_experts_per_tok":1,
-                "num_shared_experts":2,
-                "shared_expert_intermediate_size":1
-            }"#,
-        )
-        .unwrap();
-
-        let mut bytes = Vec::new();
-        let mut dense_tensors = Vec::new();
-        let mut append_tensor = |name: String, shape: Vec<usize>, values: &[f32]| {
-            let offset = bytes.len() as u64;
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            let byte_len = bytes.len() as u64 - offset;
-            dense_tensors.push(DenseTensorRef {
-                tensor: name,
-                shard: "dense.safetensors".to_string(),
-                dtype: "F32".to_string(),
-                shape,
-                source_offsets: [0, byte_len],
-                runtime_offset: offset,
-                byte_len,
-                quantization: TensorQuantization::None,
-                q4_sources: None,
-            });
-        };
-        append_tensor(
-            shared_expert_tensor_name(0, "gate_proj"),
-            vec![2, 2],
-            &[1.0, 0.0, 0.0, 1.0],
-        );
-        append_tensor(
-            shared_expert_tensor_name(0, "up_proj"),
-            vec![2, 2],
-            &[0.0, 2.0, 3.0, 0.0],
-        );
-        append_tensor(
-            shared_expert_tensor_name(0, "down_proj"),
-            vec![2, 2],
-            &[1.0, 2.0, -1.0, 0.5],
-        );
-        append_tensor(
-            shared_expert_gate_tensor_name(0),
-            vec![2, 2],
-            &[1.0, 0.0, 0.0, -1.0],
-        );
-        fs::write(&dense_path, &bytes).unwrap();
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec(&FlashMoeManifest {
-                model: QWEN35_MODEL.to_string(),
-                cache_version: CACHE_VERSION.to_string(),
-                dense_shards: vec!["dense.safetensors".to_string()],
-                expert_tensors: Vec::new(),
-                dense_tensors,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let mut plan = plan_unchecked_with_routing(
-            QWEN35_MODEL,
-            tmp.path(),
-            FlashMoeRoutingPolicy::new(Some(1), true),
-        );
-        plan.uses_metal = false;
-        plan.non_expert_weights = dense_path;
-        plan.tensor_manifest = manifest_path;
-        plan.experts_dir = experts_dir;
-
-        let dense = DenseStore::open(
-            plan.non_expert_weights.clone(),
-            plan.tensor_manifest.clone(),
-        )
-        .unwrap();
-        let experts = ExpertSlotStore::open(plan.experts_dir.clone()).unwrap();
-        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
-        let runtime = DenseTransformerRuntime::new(&config);
-        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
-        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
-        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
-        let engine = FlashMoeEngine {
-            plan,
-            experts: experts.clone(),
-            scheduler: ExpertScheduler::new(experts),
-            dense,
-            tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
-            metal: None,
-            config,
-            model_layout,
-            capability_plan,
-            scheduled_graph,
-            routing_policy,
-            runtime,
-            shared_expert_phases: SharedExpertPhaseCache::default(),
-            linear_attention_cache: Mutex::new(BTreeMap::new()),
-            vision_encoder: None,
-            session_cache: BTreeMap::new(),
-        };
-
-        let first = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
-        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
-
-        let second = engine.shared_expert_phase_weights(0, 2).unwrap().unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(Arc::ptr_eq(&first.gate, &second.gate));
-        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
-
-        let contribution = engine
-            .shared_expert_contribution(0, &[2.0, 4.0], 2)
-            .unwrap();
-        assert_eq!(contribution.len(), 2);
-        assert_eq!(engine.dense.decoded_full_tensor_count(), 4);
-    }
-
-    #[test]
     fn dense_q4_mmap_projection_descriptors_are_cached() {
         let tmp = tempfile::tempdir().unwrap();
         let dense_path = tmp.path().join("model_weights.bin");
@@ -28050,178 +27881,6 @@ mod tests {
         assert_eq!(first.biases_byte_offset, second.biases_byte_offset);
         assert_eq!(first.rows, second.rows);
         assert_eq!(first.cols, second.cols);
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn shared_expert_q4_phase_projections_are_cached_per_layer() {
-        fn append_q4_tensor(
-            bytes: &mut Vec<u8>,
-            dense_tensors: &mut Vec<DenseTensorRef>,
-            name: String,
-            shape: Vec<usize>,
-            values: &[f32],
-            group_size: usize,
-        ) {
-            let quantized = quantize_q4(values, &shape, group_size).unwrap();
-            let layout = dense_q4_layout(&shape, group_size).unwrap();
-            let offset = bytes.len() as u64;
-            bytes.extend_from_slice(&quantized.values);
-            for scale in &quantized.scales {
-                bytes.extend_from_slice(&scale.to_le_bytes());
-            }
-            for bias in &quantized.biases {
-                bytes.extend_from_slice(&bias.to_le_bytes());
-            }
-            let byte_len = bytes.len() as u64 - offset;
-            assert_eq!(byte_len as usize, layout.total_bytes);
-            dense_tensors.push(DenseTensorRef {
-                tensor: name,
-                shard: "dense.safetensors".to_string(),
-                dtype: "F32".to_string(),
-                shape,
-                source_offsets: [0, byte_len],
-                runtime_offset: offset,
-                byte_len,
-                quantization: TensorQuantization::Q4 {
-                    group_size,
-                    format: DENSE_Q4_FORMAT.to_string(),
-                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
-                },
-                q4_sources: None,
-            });
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dense_path = tmp.path().join("model_weights.bin");
-        let manifest_path = tmp.path().join("model_weights.json");
-        let experts_dir = tmp.path().join("experts");
-        fs::create_dir_all(&experts_dir).unwrap();
-
-        let config: QwenModelConfig = serde_json::from_slice(
-            br#"{
-                "model_type":"qwen3_moe",
-                "num_hidden_layers":1,
-                "hidden_size":4,
-                "num_attention_heads":1,
-                "num_key_value_heads":1,
-                "vocab_size":8,
-                "torch_dtype":"float32",
-                "num_experts":1,
-                "num_experts_per_tok":1,
-                "moe_intermediate_size":2,
-                "num_shared_experts":1,
-                "shared_expert_intermediate_size":2
-            }"#,
-        )
-        .unwrap();
-
-        let group_size = 2;
-        let mut bytes = Vec::new();
-        let mut dense_tensors = Vec::new();
-        append_q4_tensor(
-            &mut bytes,
-            &mut dense_tensors,
-            shared_expert_tensor_name(0, "gate_proj"),
-            vec![2, 4],
-            &[0.25, -0.5, 1.0, 0.75, -0.125, 0.375, 0.625, -0.875],
-            group_size,
-        );
-        append_q4_tensor(
-            &mut bytes,
-            &mut dense_tensors,
-            shared_expert_tensor_name(0, "up_proj"),
-            vec![2, 4],
-            &[0.5, 0.25, -0.75, 1.25, -0.25, 0.875, -1.0, 0.125],
-            group_size,
-        );
-        append_q4_tensor(
-            &mut bytes,
-            &mut dense_tensors,
-            shared_expert_tensor_name(0, "down_proj"),
-            vec![4, 2],
-            &[0.125, 0.25, -0.375, 0.5, 0.625, -0.75, 0.875, -1.0],
-            group_size,
-        );
-        append_q4_tensor(
-            &mut bytes,
-            &mut dense_tensors,
-            shared_expert_gate_tensor_name(0),
-            vec![1, 4],
-            &[0.5, -0.25, 0.75, -1.0],
-            group_size,
-        );
-        fs::write(&dense_path, &bytes).unwrap();
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec(&FlashMoeManifest {
-                model: QWEN35_MODEL.to_string(),
-                cache_version: CACHE_VERSION.to_string(),
-                dense_shards: vec!["dense.safetensors".to_string()],
-                expert_tensors: Vec::new(),
-                dense_tensors,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let mut plan = plan_unchecked_with_routing(
-            QWEN35_MODEL,
-            tmp.path(),
-            FlashMoeRoutingPolicy::new(Some(1), true),
-        );
-        plan.uses_metal = false;
-        plan.non_expert_weights = dense_path;
-        plan.tensor_manifest = manifest_path;
-        plan.experts_dir = experts_dir;
-
-        let dense = DenseStore::open(
-            plan.non_expert_weights.clone(),
-            plan.tensor_manifest.clone(),
-        )
-        .unwrap();
-        let experts = ExpertSlotStore::open(plan.experts_dir.clone()).unwrap();
-        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
-        let runtime = DenseTransformerRuntime::new(&config);
-        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
-        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
-        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
-        let engine = FlashMoeEngine {
-            plan,
-            experts: experts.clone(),
-            scheduler: ExpertScheduler::new(experts),
-            dense,
-            tokenizer: QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap(),
-            metal: None,
-            config,
-            model_layout,
-            capability_plan,
-            scheduled_graph,
-            routing_policy,
-            runtime,
-            shared_expert_phases: SharedExpertPhaseCache::default(),
-            linear_attention_cache: Mutex::new(BTreeMap::new()),
-            vision_encoder: None,
-            session_cache: BTreeMap::new(),
-        };
-
-        let first = engine
-            .required_shared_expert_q4_phase_projections(0, 4)
-            .unwrap()
-            .unwrap();
-        let second = engine
-            .required_shared_expert_q4_phase_projections(0, 4)
-            .unwrap()
-            .unwrap();
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.shared_experts, 1);
-        assert_eq!(first.intermediate, 2);
-        assert_eq!(first.width, 4);
-        assert_eq!(first.gate.rows, 2);
-        assert_eq!(first.up.rows, 2);
-        assert_eq!(first.down.cols, 2);
-        assert_eq!(first.router.rows, 1);
     }
 
     #[test]
@@ -29444,207 +29103,6 @@ mod tests {
         assert!(message.contains("lm_head.weight"), "{err:#}");
         assert!(message.contains("expected at least [3, 2]"), "{err:#}");
         assert!(message.contains("actual shape [2, 2]"), "{err:#}");
-    }
-
-    #[test]
-    fn generate_without_declared_cmd3_implementation_errors_instead_of_cpu_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
-        std::fs::write(
-            snapshot.join("config.json"),
-            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":1,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"float32","num_experts":8,"num_experts_per_tok":1,"moe_intermediate_size":16,"tie_word_embeddings":true}"#,
-        )
-        .unwrap();
-
-        let mut embedding = vec![0.0f32; 300 * 8];
-        for (token, scale) in [
-            (1usize, 0.5),
-            (2, 0.5),
-            (3, 1.0),
-            (4, 4.0),
-            (5, 0.75),
-            (6, 1.0),
-        ] {
-            embedding[token * 8] = scale;
-        }
-        let mut dense_tensors = vec![
-            (
-                "model.embed_tokens.weight".to_string(),
-                "F32".to_string(),
-                vec![300, 8],
-                f32_tensor_bytes(&embedding),
-            ),
-            (
-                "model.norm.weight".to_string(),
-                "F32".to_string(),
-                vec![8],
-                f32_tensor_bytes(&vec![1.0; 8]),
-            ),
-            (
-                "model.layers.0.input_layernorm.weight".to_string(),
-                "F32".to_string(),
-                vec![8],
-                f32_tensor_bytes(&vec![1.0; 8]),
-            ),
-            (
-                "model.layers.0.post_attention_layernorm.weight".to_string(),
-                "F32".to_string(),
-                vec![8],
-                f32_tensor_bytes(&vec![1.0; 8]),
-            ),
-            (
-                "model.layers.0.mlp.gate.weight".to_string(),
-                "F32".to_string(),
-                vec![8, 8],
-                f32_tensor_bytes(&vec![0.0; 8 * 8]),
-            ),
-        ];
-        for (suffix, shape) in [
-            ("q_proj", vec![8, 8]),
-            ("k_proj", vec![4, 8]),
-            ("v_proj", vec![4, 8]),
-            ("o_proj", vec![8, 8]),
-        ] {
-            let rows = shape[0];
-            let cols = shape[1];
-            dense_tensors.push((
-                format!("model.layers.0.self_attn.{suffix}.weight"),
-                "F32".to_string(),
-                shape,
-                f32_tensor_bytes(&vec![0.0; rows * cols]),
-            ));
-        }
-        let dense_refs = typed_fixture_refs(&dense_tensors);
-        std::fs::write(
-            snapshot.join("dense.safetensors"),
-            make_typed_safetensors(&dense_refs),
-        )
-        .unwrap();
-
-        let expert_tensors = vec![
-            (
-                "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
-                "F32".to_string(),
-                vec![16, 8],
-                f32_tensor_bytes(&vec![0.0; 16 * 8]),
-            ),
-            (
-                "model.layers.0.mlp.experts.0.up_proj.weight".to_string(),
-                "F32".to_string(),
-                vec![16, 8],
-                f32_tensor_bytes(&vec![0.0; 16 * 8]),
-            ),
-            (
-                "model.layers.0.mlp.experts.0.down_proj.weight".to_string(),
-                "F32".to_string(),
-                vec![8, 16],
-                f32_tensor_bytes(&vec![0.0; 8 * 16]),
-            ),
-        ];
-        let expert_refs = typed_fixture_refs(&expert_tensors);
-        std::fs::write(
-            snapshot.join("expert.safetensors"),
-            make_typed_safetensors(&expert_refs),
-        )
-        .unwrap();
-
-        let mut weight_map = serde_json::Map::new();
-        for (name, _, _, _) in &dense_tensors {
-            weight_map.insert(
-                name.clone(),
-                serde_json::Value::String("dense.safetensors".to_string()),
-            );
-        }
-        for (name, _, _, _) in &expert_tensors {
-            weight_map.insert(
-                name.clone(),
-                serde_json::Value::String("expert.safetensors".to_string()),
-            );
-        }
-        std::fs::write(
-            snapshot.join("model.safetensors.index.json"),
-            serde_json::Value::Object(serde_json::Map::from_iter([(
-                "weight_map".to_string(),
-                serde_json::Value::Object(weight_map),
-            )]))
-            .to_string(),
-        )
-        .unwrap();
-        let mut plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
-        plan.routing_policy = FlashMoeRoutingPolicy::new(Some(1), true);
-        let config = QwenModelConfig::from_file(&plan.model_config).unwrap();
-        let fixed_layout = fixed_q4_test_layout(8, 16, 8);
-        let fixed_spec = FixedQ4ExpertSlotSpec {
-            layout: fixed_layout,
-            hidden_size: 8,
-            intermediate_size: 16,
-        };
-        let fixed_slot = vec![0u8; fixed_layout.expert_bytes];
-        std::fs::write(expert_layer_path(&plan.experts_dir, 0), &fixed_slot).unwrap();
-        let fixed_metadata = ExpertLayerPackMetadata::new_fixed_q4(
-            0,
-            fixed_layout.expert_bytes as u64,
-            8,
-            vec![ExpertPackMetadata {
-                layer: 0,
-                expert: 0,
-                packed_bytes: fixed_layout.expert_bytes as u64,
-                records: Vec::new(),
-            }],
-        );
-        write_expert_metadata_atomically(&plan.experts_dir, 0, &fixed_metadata).unwrap();
-        let experts =
-            ExpertSlotStore::open_with_fixed_q4(plan.experts_dir.clone(), fixed_spec).unwrap();
-        let dense = DenseStore::open(
-            plan.non_expert_weights.clone(),
-            plan.tensor_manifest.clone(),
-        )
-        .unwrap();
-        let tokenizer = QwenTokenizer::from_file(&plan.tokenizer).unwrap();
-        let routing_policy = plan.routing_policy.resolve(&plan.model, &config).unwrap();
-        let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry()).unwrap();
-        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
-        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
-        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
-        let mut engine = FlashMoeEngine {
-            plan,
-            experts: experts.clone(),
-            scheduler: ExpertScheduler::new(experts),
-            dense,
-            tokenizer,
-            metal: None,
-            config,
-            model_layout,
-            capability_plan,
-            scheduled_graph,
-            routing_policy,
-            runtime,
-            shared_expert_phases: SharedExpertPhaseCache::default(),
-            linear_attention_cache: Mutex::new(BTreeMap::new()),
-            vision_encoder: None,
-            session_cache: BTreeMap::new(),
-        };
-        let err = engine
-            .generate(&GenerationRequest {
-                prompt: "hello".to_string(),
-                max_tokens: 16,
-                temperature: 0.0,
-                top_k: 1,
-                seed: 1,
-            })
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("CPU expert phase fallback is not a declared graph-stage implementation"),
-            "{err:#}"
-        );
-        assert!(
-            err.to_string()
-                .contains("CMD3 expert/shared combine is not implemented"),
-            "{err:#}"
-        );
     }
 
     #[test]
