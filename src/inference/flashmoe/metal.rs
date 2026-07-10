@@ -1440,6 +1440,20 @@ impl MetalCmd3ExecutionPlan {
             next_normed_output_bytes: self.phase.next_normed_output_bytes()?,
         })
     }
+
+    pub(crate) fn command_context(&self, expert_ids: impl ToString) -> MetalCommandContext {
+        MetalCommandContext::new("deferred_expert_phase_from_buffers")
+            .with("position", self.phase.position)
+            .with("layer", self.phase.layer)
+            .with("active_experts", self.phase.expert_count)
+            .with("experts", expert_ids)
+            .with("width", self.phase.width)
+            .with(
+                "shared",
+                !matches!(self.shared.source, MetalCmd3SharedPhaseSource::None),
+            )
+            .with("next_norm", self.next_norm.is_some())
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3765,6 +3779,12 @@ mod tests {
         assert_eq!(layout.shared_output_bytes, 4 * 4);
         assert_eq!(layout.hidden_output_bytes, 4 * 4);
         assert_eq!(layout.next_normed_output_bytes, Some(4 * 4));
+
+        let context = plan.command_context("1,7");
+        assert_eq!(
+            context.label(),
+            "Flash-MoE deferred_expert_phase_from_buffers position=9 layer=3 active_experts=2 experts=1,7 width=4 shared=true next_norm=true"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

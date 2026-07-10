@@ -4799,9 +4799,7 @@ impl MetalExecutorInner {
         };
         let plan = command_plan.phase;
         let next_norm_plan = command_plan.next_norm;
-        let position = plan.position;
         let layer = plan.layer;
-        let expert_count = plan.expert_count;
         let width = plan.width;
         let output_state = plan.output_state;
         let buffer_layout = match command_plan.buffer_layout() {
@@ -5102,14 +5100,7 @@ impl MetalExecutorInner {
 
             msg_send_void0(encoder, sel("endEncoding"));
             let expert_ids = retained_experts.expert_ids();
-            let context = MetalCommandContext::new("deferred_expert_phase_from_buffers")
-                .with("position", position)
-                .with("layer", layer)
-                .with("active_experts", expert_count)
-                .with("experts", expert_ids)
-                .with("width", width)
-                .with("shared", shared.is_some())
-                .with("next_norm", next_normed_buffer.is_some());
+            let context = command_plan.command_context(expert_ids);
             commit_metal_command_buffer(command_buffer, &context);
             release(encoder);
 

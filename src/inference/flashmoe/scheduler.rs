@@ -1795,10 +1795,6 @@ impl<'a> ScheduledSharedExpertPhaseRef<'a> {
             Self::None | Self::Dense(_) => None,
         }
     }
-
-    pub(crate) fn is_some(self) -> bool {
-        !matches!(self, Self::None)
-    }
 }
 
 impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
@@ -3192,7 +3188,6 @@ mod tests {
         let none_descriptor = none.scheduled_shared_expert_descriptor().unwrap();
         assert_eq!(none_descriptor.source, ScheduledSharedExpertSource::None);
         assert_eq!(none_descriptor.shape, None);
-        assert!(!none.is_some());
         assert!(none.dense().is_none());
         assert!(none.q4().is_none());
 
@@ -3202,7 +3197,6 @@ mod tests {
             dense_descriptor.source,
             ScheduledSharedExpertSource::DenseCpuWeights
         );
-        assert!(dense_ref.is_some());
         assert!(dense_ref.dense().is_some());
         assert!(dense_ref.q4().is_none());
         assert_eq!(
