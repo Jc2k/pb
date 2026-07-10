@@ -180,14 +180,15 @@ The validator should reject silent fallbacks such as:
   explicit unsupported-capability errors.
 - Dense weights are closer to the upstream resident-blob model than experts are. `weights` now owns
   typed resident projection descriptors for dense, Q4, shared expert, and router score bindings plus
-  the router score batch data model. Shared expert dense/Q4 descriptor groups now validate and
-  expose their graph shape before the scheduler accepts them. Canonical router, shared expert, and
-  CMD3 next-layer norm tensor naming, Qwen3Next norm-offset policy, and prepared scheduled next-norm
-  descriptors also live in `weights`; dense shared-expert weight assembly and Q4 shared-expert
-  projection assembly now use the same weight-owned shape validation with runtime lookup callbacks.
-  CMD2 Q4 post-attention prep projection assembly now also resolves as a typed weight-owned
-  out-projection/router bundle before the Metal helper runs. Router score projection descriptor
-  lookup also lives in `weights` behind a registry callback, and Metal router topK now consumes that
+  the router score batch data model. The generic resident Q4 mmap projection cache now keys and
+  builds descriptors through `weights` with a registry callback. Shared expert dense/Q4 descriptor
+  groups now validate and expose their graph shape before the scheduler accepts them. Canonical
+  router, shared expert, and CMD3 next-layer norm tensor naming, Qwen3Next norm-offset policy, and
+  prepared scheduled next-norm descriptors also live in `weights`; dense shared-expert weight
+  assembly and Q4 shared-expert projection assembly now use the same weight-owned shape validation
+  with runtime lookup callbacks. CMD2 Q4 post-attention prep projection assembly now also resolves
+  as a typed weight-owned out-projection/router bundle before the Metal helper runs. Router score
+  projection descriptor lookup also lives in `weights` behind a registry callback, and Metal router topK now consumes that
   same declared dense/Q4 binding instead of re-resolving router layouts in the legacy helper. The
   generation loop supplies lookup closures instead of owning those weight-policy branches. Command
   construction and much of runtime score execution still flows through `legacy.rs` shims.

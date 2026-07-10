@@ -135,15 +135,15 @@ use super::types::*;
 #[cfg(test)]
 use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
-    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
-    ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef, RouterScoreProjectionBinding,
-    RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
+    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey,
+    DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef,
+    RouterScoreProjectionBinding, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
     RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
     SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, build_cmd2_q4_post_attention_prep_projections,
-    build_router_score_projection_descriptor, build_shared_expert_phase_weights,
-    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
+    build_shared_expert_phase_weights, build_shared_expert_q4_phase_projections,
+    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -15464,13 +15464,6 @@ struct DenseNormWeightKey {
     width: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DenseQ4ProjectionKey {
-    name: String,
-    output_width: usize,
-    input_len: usize,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct DenseTileReadTiming {
     total: Duration,
@@ -16563,11 +16556,7 @@ impl DenseStore {
         output_width: usize,
         input_len: usize,
     ) -> Result<Option<DenseQ4MmapMatvecProjection>> {
-        let key = DenseQ4ProjectionKey {
-            name: tensor_name.to_string(),
-            output_width,
-            input_len,
-        };
+        let key = DenseQ4ProjectionKey::new(tensor_name, output_width, input_len);
         if let Some(projection) = self
             .q4_mmap_projections
             .lock()
@@ -16577,15 +16566,12 @@ impl DenseStore {
         {
             return Ok(Some((*projection).clone()));
         }
-        let Some(entry) = self.registry.tensor(tensor_name) else {
-            return Ok(None);
-        };
-        let Some(projection) = DenseQ4MmapMatvecProjection::from_entry(
+        let Some(projection) = build_dense_q4_mmap_projection(
             tensor_name,
-            entry,
-            self.len,
             output_width,
             input_len,
+            self.len,
+            |name| self.registry.tensor(name),
         )?
         else {
             return Ok(None);

@@ -941,6 +941,23 @@ pub(crate) struct DenseQ4MmapMatvecProjection {
     pub(crate) scale_bias_dtype: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DenseQ4ProjectionKey {
+    pub(crate) name: String,
+    pub(crate) output_width: usize,
+    pub(crate) input_len: usize,
+}
+
+impl DenseQ4ProjectionKey {
+    pub(crate) fn new(name: &str, output_width: usize, input_len: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            output_width,
+            input_len,
+        }
+    }
+}
+
 impl DenseQ4MmapMatvecProjection {
     pub(crate) fn from_entry(
         tensor_name: &str,
@@ -996,6 +1013,22 @@ impl DenseQ4MmapMatvecProjection {
             scale_bias_dtype: scale_bias_dtype.clone(),
         }))
     }
+}
+
+pub(crate) fn build_dense_q4_mmap_projection<'a, F>(
+    tensor_name: &str,
+    output_width: usize,
+    input_len: usize,
+    store_len: u64,
+    mut lookup: F,
+) -> Result<Option<DenseQ4MmapMatvecProjection>>
+where
+    F: FnMut(&str) -> Option<&'a RuntimeTensorEntry>,
+{
+    let Some(entry) = lookup(tensor_name) else {
+        return Ok(None);
+    };
+    DenseQ4MmapMatvecProjection::from_entry(tensor_name, entry, store_len, output_width, input_len)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,6 +1796,55 @@ mod tests {
         assert_eq!(projection.row_packed_bytes, projection.cols.div_ceil(2));
         assert_eq!(projection.groups_per_row, 2);
         assert_eq!(projection.output_width, projection.rows);
+    }
+
+    #[test]
+    fn dense_q4_projection_key_names_cached_binding_shape() {
+        let key = DenseQ4ProjectionKey::new("model.layers.0.mlp.gate_proj.weight", 16, 32);
+
+        assert_eq!(key.name, "model.layers.0.mlp.gate_proj.weight");
+        assert_eq!(key.output_width, 16);
+        assert_eq!(key.input_len, 32);
+    }
+
+    #[test]
+    fn dense_q4_projection_builder_uses_lookup_callback() {
+        let entry = RuntimeTensorEntry {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![2, 4],
+            byte_offset: 128,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::Q4 {
+                group_size: 16,
+                format: "dense-q4".to_string(),
+                scale_bias_dtype: "BF16".to_string(),
+            },
+        };
+        let mut seen_name = None;
+
+        let projection = build_dense_q4_mmap_projection(
+            "model.layers.0.mlp.gate_proj.weight",
+            2,
+            4,
+            256,
+            |name| {
+                seen_name = Some(name.to_string());
+                (name == entry.name).then_some(&entry)
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(seen_name.unwrap(), entry.name);
+        assert_eq!(projection.packed_byte_offset, 128);
+        assert_eq!(projection.output_width, 2);
+        assert_eq!(projection.cols, 4);
+
+        let missing =
+            build_dense_q4_mmap_projection("missing.weight", 2, 4, 256, |_| None).unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]
