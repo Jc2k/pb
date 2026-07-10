@@ -155,6 +155,10 @@ Baseline reviewed on 2026-07-10:
 - Several missing CMD2/CMD3 continuations now produce explicit unsupported errors.
 - The Metal shader source, pipeline surface, command diagnostics, and many buffer descriptors live
   in `metal.rs`.
+- `metal.rs` is now the sole owner of the Metal/Objective-C runtime bridge: device discovery,
+  selectors and message sends, pipeline compilation, mmap buffer wrapping, buffer binding and
+  readback, dispatch primitives, command submission, diagnostic waits, retain, and release. The
+  duplicate FFI and command-wait implementation has been removed from `legacy.rs`.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
@@ -189,6 +193,9 @@ The architecture is not yet at the target:
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
   `VisionEncoder` remain in `legacy.rs`.
+- Concrete encoders in `legacy.rs` still call the low-level Metal substrate directly. Gate 2 must
+  move those callers and executor ownership behind typed builders before the substrate can become
+  private to `metal.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.

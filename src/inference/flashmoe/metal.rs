@@ -2,10 +2,17 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::ffi::c_void;
+use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ptr;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::Arc;
-use std::time::Duration;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use anyhow::Context as _;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
@@ -20,6 +27,9 @@ use super::weights::{SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type MetalSelector = *mut c_void;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1841,6 +1851,602 @@ impl MetalPhaseBuffer {
 
     pub(crate) fn borrowed(id: MetalObjcId) -> Self {
         Self { id, recycle: false }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> MetalObjcId;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const c_char) -> MetalObjcId;
+    fn sel_registerName(name: *const c_char) -> MetalSelector;
+    fn objc_msgSend();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn metal_default_device() -> MetalObjcId {
+    unsafe { MTLCreateSystemDefaultDevice() }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn sel(name: &str) -> MetalSelector {
+    let name = CString::new(name).expect("selector contains nul");
+    unsafe { sel_registerName(name.as_ptr()) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn class(name: &str) -> MetalObjcId {
+    let name = CString::new(name).expect("class contains nul");
+    unsafe { objc_getClass(name.as_ptr()) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn ns_string(value: &str) -> MetalObjcId {
+    unsafe {
+        let alloc = msg_send_id0(class("NSString"), sel("alloc"));
+        msg_send_id3_ptr_usize_u64(
+            alloc,
+            sel("initWithBytes:length:encoding:"),
+            value.as_ptr().cast(),
+            value.len(),
+            4,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn ns_error_localized_description(error: MetalObjcId) -> Option<String> {
+    unsafe {
+        if error.is_null() {
+            return None;
+        }
+        let description = msg_send_id0(error, sel("localizedDescription"));
+        if description.is_null() {
+            return None;
+        }
+        let bytes = msg_send_const_char_ptr0(description, sel("UTF8String"));
+        if bytes.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(bytes).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn new_function(library: MetalObjcId, name: &str) -> anyhow::Result<MetalObjcId> {
+    unsafe {
+        let function_name = ns_string(name);
+        let function = msg_send_id1_id(library, sel("newFunctionWithName:"), function_name);
+        release(function_name);
+        if function.is_null() {
+            anyhow::bail!("compiled Flash-MoE Metal library is missing kernel `{name}`");
+        }
+        Ok(function)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn compile_pipeline(
+    device: MetalObjcId,
+    library: MetalObjcId,
+    name: &str,
+) -> anyhow::Result<MetalObjcId> {
+    unsafe {
+        let function = new_function(library, name)?;
+        let pipeline = new_compute_pipeline(device, function)
+            .with_context(|| format!("failed to create {name} Metal pipeline"))?;
+        release(function);
+        Ok(pipeline)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn new_compute_pipeline(
+    device: MetalObjcId,
+    function: MetalObjcId,
+) -> anyhow::Result<MetalObjcId> {
+    unsafe {
+        let pipeline = msg_send_id3(
+            device,
+            sel("newComputePipelineStateWithFunction:error:"),
+            function,
+        );
+        if pipeline.is_null() {
+            anyhow::bail!("failed to create Flash-MoE Metal compute pipeline");
+        }
+        Ok(pipeline)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_page_size() -> usize {
+    unsafe {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if page_size > 0 {
+            page_size as usize
+        } else {
+            16 * 1024
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn wrap_dense_mmap_as_metal_buffer(
+    device: MetalObjcId,
+    mmap: Arc<memmap2::Mmap>,
+    len: u64,
+) -> anyhow::Result<Option<MetalDenseWeights>> {
+    let len = usize::try_from(len).context("dense mmap length does not fit usize")?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let ptr = mmap.as_ptr() as *mut c_void;
+    let page_size = metal_page_size();
+    if (ptr as usize) % page_size != 0 {
+        tracing::debug!(
+            ptr = ?ptr,
+            page_size,
+            "dense mmap is not page-aligned; resident Metal dense buffer disabled"
+        );
+        return Ok(None);
+    }
+    unsafe {
+        let buffer = msg_send_id4_ptr_usize_u64_ptr(
+            device,
+            sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            ptr,
+            len,
+            0,
+            ptr::null_mut(),
+        );
+        if buffer.is_null() {
+            tracing::debug!(len, "failed to wrap dense mmap as resident Metal buffer");
+            return Ok(None);
+        }
+        Ok(Some(MetalDenseWeights::new(buffer, mmap, len)))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn set_buffer(encoder: MetalObjcId, buffer: MetalObjcId, index: u64) {
+    unsafe { set_buffer_with_offset(encoder, buffer, 0, index) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn set_buffer_with_offset(
+    encoder: MetalObjcId,
+    buffer: MetalObjcId,
+    offset: u64,
+    index: u64,
+) {
+    unsafe {
+        msg_send_void4(
+            encoder,
+            sel("setBuffer:offset:atIndex:"),
+            buffer,
+            offset,
+            index,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn set_bytes(encoder: MetalObjcId, bytes: &[u8], index: u64) {
+    unsafe {
+        msg_send_void3_ptr_usize_u64(
+            encoder,
+            sel("setBytes:length:atIndex:"),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            index,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn read_f32_buffer(buffer: MetalObjcId, len: usize) -> Vec<f32> {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        let mut output = vec![0.0f32; len];
+        ptr::copy_nonoverlapping(contents.cast::<f32>(), output.as_mut_ptr(), len);
+        output
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn metal_buffer_barrier(encoder: MetalObjcId) {
+    unsafe {
+        const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
+        msg_send_void1_u64(
+            encoder,
+            sel("memoryBarrierWithScope:"),
+            MTL_BARRIER_SCOPE_BUFFERS,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_threads(encoder: MetalObjcId, threads: u64) {
+    unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::threads(threads)) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_q4_threadgroups(encoder: MetalObjcId, rows: u64) {
+    unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::q4_threadgroups(rows)) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_q4_mmap_threadgroups(encoder: MetalObjcId, rows: u64) {
+    unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::q4_mmap_threadgroups(rows)) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_single_threadgroup(encoder: MetalObjcId, threads: u64) {
+    unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::single_threadgroup(threads)) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_metal_plan(encoder: MetalObjcId, plan: MetalDispatchPlan) {
+    unsafe {
+        let selector = match plan.mode {
+            MetalDispatchMode::Threads => sel("dispatchThreads:threadsPerThreadgroup:"),
+            MetalDispatchMode::Threadgroups => sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+        };
+        msg_send_void2_size(encoder, selector, plan.grid, plan.threadgroup);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn f32_as_bytes(values: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn u32_as_bytes(value: &u32) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (value as *const u32).cast::<u8>(),
+            std::mem::size_of::<u32>(),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn u32_as_bytes_slice(values: &[u32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn u64_as_bytes(value: &u64) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (value as *const u64).cast::<u8>(),
+            std::mem::size_of::<u64>(),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn u64_as_bytes_slice(values: &[u64]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn commit_metal_command_buffer(
+    command_buffer: MetalObjcId,
+    context: &MetalCommandContext,
+) {
+    unsafe {
+        set_metal_command_buffer_label(command_buffer, context);
+        msg_send_void0(command_buffer, sel("commit"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn commit_and_wait_metal_command_buffer(
+    command_buffer: MetalObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    unsafe {
+        commit_metal_command_buffer(command_buffer, context);
+        wait_for_metal_command_buffer(command_buffer, context)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn set_metal_command_buffer_label(
+    command_buffer: MetalObjcId,
+    context: &MetalCommandContext,
+) {
+    unsafe {
+        let label = ns_string(&context.label());
+        msg_send_void1_id(command_buffer, sel("setLabel:"), label);
+        release(label);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn wait_for_metal_command_buffer(
+    command_buffer: MetalObjcId,
+    context: &MetalCommandContext,
+) -> std::result::Result<(), MetalCommandBufferFailure> {
+    let started = Instant::now();
+    let policy = MetalCommandWaitPolicy::default();
+    loop {
+        let status = unsafe { metal_command_buffer_status(command_buffer) };
+        let elapsed = started.elapsed();
+        let timed_out = elapsed >= policy.timeout;
+        let metal_error = if status.is_terminal() || timed_out {
+            unsafe { metal_command_buffer_error(command_buffer) }
+        } else {
+            None
+        };
+        match resolve_metal_command_wait(context, elapsed, status, metal_error, timed_out) {
+            MetalCommandWaitResult::Pending => thread::sleep(policy.poll_interval),
+            MetalCommandWaitResult::Finished(result) => return result,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_status(command_buffer: MetalObjcId) -> MetalCommandStatus {
+    unsafe { MetalCommandStatus::from_raw(msg_send_usize0(command_buffer, sel("status"))) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn metal_command_buffer_error(command_buffer: MetalObjcId) -> Option<String> {
+    unsafe {
+        let error = msg_send_id0(command_buffer, sel("error"));
+        ns_error_localized_description(error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn release(receiver: MetalObjcId) {
+    unsafe {
+        if !receiver.is_null() {
+            msg_send_void0(receiver, sel("release"));
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn retain(receiver: MetalObjcId) -> MetalObjcId {
+    unsafe { msg_send_id0(receiver, sel("retain")) }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id0(receiver: MetalObjcId, selector: MetalSelector) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) -> MetalObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id1_id(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg: MetalObjcId,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, MetalObjcId) -> MetalObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id3(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg: MetalObjcId,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(
+            MetalObjcId,
+            MetalSelector,
+            MetalObjcId,
+            *mut MetalObjcId,
+        ) -> MetalObjcId = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg, ptr::null_mut())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id2_id_error(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg1: MetalObjcId,
+    arg2: MetalObjcId,
+    error: *mut MetalObjcId,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(
+            MetalObjcId,
+            MetalSelector,
+            MetalObjcId,
+            MetalObjcId,
+            *mut MetalObjcId,
+        ) -> MetalObjcId = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id2_usize_u64(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    len: usize,
+    options: u64,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, usize, u64) -> MetalObjcId =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, len, options)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id3_ptr_usize_u64(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    bytes: *const c_void,
+    len: usize,
+    options: u64,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(
+            MetalObjcId,
+            MetalSelector,
+            *const c_void,
+            usize,
+            u64,
+        ) -> MetalObjcId = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_id4_ptr_usize_u64_ptr(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    bytes: *mut c_void,
+    len: usize,
+    options: u64,
+    deallocator: *mut c_void,
+) -> MetalObjcId {
+    unsafe {
+        let f: unsafe extern "C" fn(
+            MetalObjcId,
+            MetalSelector,
+            *mut c_void,
+            usize,
+            u64,
+            *mut c_void,
+        ) -> MetalObjcId = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, options, deallocator)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void0(receiver: MetalObjcId, selector: MetalSelector) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void1_id(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg: MetalObjcId,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, MetalObjcId) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void1_u64(receiver: MetalObjcId, selector: MetalSelector, arg: u64) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void2_size(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    a: MetalDispatchSize,
+    b: MetalDispatchSize,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(
+            MetalObjcId,
+            MetalSelector,
+            MetalDispatchSize,
+            MetalDispatchSize,
+        ) = std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, a, b);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void3_ptr_usize_u64(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    bytes: *const c_void,
+    len: usize,
+    index: u64,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, *const c_void, usize, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, bytes, len, index);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_void4(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg1: MetalObjcId,
+    arg2: u64,
+    arg3: u64,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, MetalObjcId, u64, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg1, arg2, arg3);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_ptr0(receiver: MetalObjcId, selector: MetalSelector) -> *mut c_void {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_const_char_ptr0(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+) -> *const c_char {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) -> *const c_char =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn msg_send_usize0(receiver: MetalObjcId, selector: MetalSelector) -> usize {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector)
     }
 }
 
