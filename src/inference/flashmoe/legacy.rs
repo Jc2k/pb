@@ -79,9 +79,9 @@ use super::experts::{
     ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
     FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
     PBQ4_EXPERT_MAGIC, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
-    decode_expert_scale_bias_bytes, expert_layer_metadata_path, expert_layer_path, expert_slot_end,
-    expert_slot_offset, fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records,
-    parse_pbq4_expert_pack, read_exact_at_positioned, read_expert_layer_pack_metadata,
+    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
+    fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
+    read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -18810,92 +18810,6 @@ fn write_all_at_positioned(file: &fs::File, buf: &[u8], offset: u64) -> Result<(
     }
 }
 
-fn fixed_q4_expert_records(
-    view: &FixedQ4ExpertSlotView<'_>,
-    spec: FixedQ4ExpertSlotSpec,
-) -> Result<Vec<PackedExpertTensor>> {
-    let descriptor = view.descriptor();
-    Ok(vec![
-        fixed_q4_expert_record(
-            view,
-            spec,
-            QwenMoeExpertComponentKind::GateWeight,
-            QwenMoeExpertComponentKind::GateScale,
-            QwenMoeExpertComponentKind::GateBias,
-            "gate_proj",
-            vec![spec.intermediate_size, spec.hidden_size],
-            descriptor.layer,
-            descriptor.expert,
-        )?,
-        fixed_q4_expert_record(
-            view,
-            spec,
-            QwenMoeExpertComponentKind::UpWeight,
-            QwenMoeExpertComponentKind::UpScale,
-            QwenMoeExpertComponentKind::UpBias,
-            "up_proj",
-            vec![spec.intermediate_size, spec.hidden_size],
-            descriptor.layer,
-            descriptor.expert,
-        )?,
-        fixed_q4_expert_record(
-            view,
-            spec,
-            QwenMoeExpertComponentKind::DownWeight,
-            QwenMoeExpertComponentKind::DownScale,
-            QwenMoeExpertComponentKind::DownBias,
-            "down_proj",
-            vec![spec.hidden_size, spec.intermediate_size],
-            descriptor.layer,
-            descriptor.expert,
-        )?,
-    ])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fixed_q4_expert_record(
-    view: &FixedQ4ExpertSlotView<'_>,
-    spec: FixedQ4ExpertSlotSpec,
-    packed_kind: QwenMoeExpertComponentKind,
-    scale_kind: QwenMoeExpertComponentKind,
-    bias_kind: QwenMoeExpertComponentKind,
-    projection: &str,
-    shape: Vec<usize>,
-    layer: usize,
-    expert: usize,
-) -> Result<PackedExpertTensor> {
-    let scale_bytes = view.component(scale_kind).to_vec();
-    let bias_bytes = view.component(bias_kind).to_vec();
-    let scale_value_bytes = scale_bytes.len() / 2 * 2;
-    let bias_value_bytes = bias_bytes.len() / 2 * 2;
-    let scales = decode_expert_scale_bias_bytes(
-        &scale_bytes[..scale_value_bytes],
-        scale_bytes.len() / 2,
-        EXPERT_SCALE_BIAS_DTYPE_BF16,
-    )
-    .with_context(|| format!("failed to decode fixed Q4 {projection} scales"))?;
-    let biases = decode_expert_scale_bias_bytes(
-        &bias_bytes[..bias_value_bytes],
-        bias_bytes.len() / 2,
-        EXPERT_SCALE_BIAS_DTYPE_BF16,
-    )
-    .with_context(|| format!("failed to decode fixed Q4 {projection} biases"))?;
-    Ok(PackedExpertTensor {
-        name: format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"),
-        dtype: "q4".to_string(),
-        shape,
-        source_offsets: [0, 0],
-        source_hash: None,
-        group_size: spec.layout.group_size,
-        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
-        packed: view.component(packed_kind).to_vec(),
-        scales,
-        biases,
-        scale_bytes,
-        bias_bytes,
-    })
-}
-
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -25270,119 +25184,6 @@ mod tests {
             fixed_expert.scheduled_cmd3_expert_phase_payload(2).unwrap(),
             ScheduledExpertPhaseMlpPayload::Q4(_)
         ));
-    }
-
-    #[test]
-    fn fixed_q4_expert_slot_records_are_derived_from_layout_offsets() {
-        use crate::inference::flashmoe::{ExpertSlotView, QwenMoeExpertComponentLayout};
-        use QwenMoeExpertComponentKind::*;
-        let layout = QwenMoeQ4ExpertLayout {
-            expert_bytes: 45,
-            group_size: 2,
-            components: [
-                QwenMoeExpertComponentLayout {
-                    kind: GateWeight,
-                    offset: 0,
-                    bytes: 8,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: GateScale,
-                    offset: 8,
-                    bytes: 4,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: GateBias,
-                    offset: 12,
-                    bytes: 4,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpWeight,
-                    offset: 16,
-                    bytes: 8,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpScale,
-                    offset: 24,
-                    bytes: 4,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: UpBias,
-                    offset: 28,
-                    bytes: 4,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownWeight,
-                    offset: 32,
-                    bytes: 8,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownScale,
-                    offset: 40,
-                    bytes: 3,
-                },
-                QwenMoeExpertComponentLayout {
-                    kind: DownBias,
-                    offset: 43,
-                    bytes: 2,
-                },
-            ],
-        };
-        let mut payload: Vec<u8> = (0..45).collect();
-        payload[8..12].copy_from_slice(
-            &[
-                f32_to_bf16_bits(0.5).to_le_bytes(),
-                f32_to_bf16_bits(1.5).to_le_bytes(),
-            ]
-            .concat(),
-        );
-        payload[12..16].copy_from_slice(
-            &[
-                f32_to_bf16_bits(-1.0).to_le_bytes(),
-                f32_to_bf16_bits(2.0).to_le_bytes(),
-            ]
-            .concat(),
-        );
-        payload[24..28].copy_from_slice(
-            &[
-                f32_to_bf16_bits(3.0).to_le_bytes(),
-                f32_to_bf16_bits(4.0).to_le_bytes(),
-            ]
-            .concat(),
-        );
-        payload[28..32].copy_from_slice(
-            &[
-                f32_to_bf16_bits(5.0).to_le_bytes(),
-                f32_to_bf16_bits(6.0).to_le_bytes(),
-            ]
-            .concat(),
-        );
-
-        let slot = ExpertSlotView::new(2, 9, 128, 45, &payload).unwrap();
-        let view = FixedQ4ExpertSlotView::new(slot, layout).unwrap();
-        let records = fixed_q4_expert_records(
-            &view,
-            FixedQ4ExpertSlotSpec {
-                layout,
-                hidden_size: 2,
-                intermediate_size: 2,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(records.len(), 3);
-        assert_eq!(
-            records[0].name,
-            "model.layers.2.mlp.experts.9.gate_proj.weight"
-        );
-        assert_eq!(records[0].shape, vec![2, 2]);
-        assert_eq!(records[0].packed, payload[0..8]);
-        assert_eq!(records[0].scales, vec![0.5, 1.5]);
-        assert_eq!(records[0].biases, vec![-1.0, 2.0]);
-        assert_eq!(records[1].packed, payload[16..24]);
-        assert_eq!(records[1].scales, vec![3.0, 4.0]);
-        assert_eq!(records[1].biases, vec![5.0, 6.0]);
-        assert_eq!(records[2].shape, vec![2, 2]);
-        assert_eq!(records[2].scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
     }
 
     #[test]
