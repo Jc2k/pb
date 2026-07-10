@@ -135,15 +135,17 @@ use super::types::*;
 #[cfg(test)]
 use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{
-    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, DenseQ4ProjectionKey,
-    DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest, ResidentStaticTensorRef,
-    RouterScoreProjectionBinding, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
-    RouterScoreProjectionExecutionKind, RuntimeTensorEntry, SharedExpertPhaseQ4Projections,
-    SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    apply_qwen3next_norm_offset_if_needed, build_cmd2_q4_post_attention_prep_projections,
-    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
-    build_shared_expert_phase_weights, build_shared_expert_q4_phase_projections,
-    canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    DenseMmapMatvecProjection, DenseProjectionRequest, DenseQ4MmapMatvecProjection,
+    DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
+    ResidentStaticTensorRef, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
+    RouterScoreProjectionExecution, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
+    TensorRegistry, apply_qwen3next_norm_offset_if_needed,
+    build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
+    build_router_score_projection_descriptor, build_shared_expert_phase_weights,
+    build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    linear_attention_scalar_tensor_name, linear_attention_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
 };
@@ -1988,12 +1990,6 @@ impl DeferredExpertPhase {
             Self::Metal(output) => output.finish_without_readback(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DenseProjectionRequest<'a> {
-    tensor_name: &'a str,
-    output_width: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -15333,14 +15329,6 @@ fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
 
 fn attention_tensor_name(layer: usize, projection: &str) -> String {
     format!("model.layers.{layer}.self_attn.{projection}.weight")
-}
-
-fn linear_attention_tensor_name(layer: usize, projection: &str) -> String {
-    format!("model.layers.{layer}.linear_attn.{projection}.weight")
-}
-
-fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
-    format!("model.layers.{layer}.linear_attn.{name}")
 }
 
 fn infer_attention_layer_type(

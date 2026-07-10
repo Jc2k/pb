@@ -747,6 +747,36 @@ pub(crate) fn shared_expert_gate_tensor_name(layer: usize) -> String {
     format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
 }
 
+pub(crate) fn linear_attention_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{projection}.weight")
+}
+
+pub(crate) fn linear_attention_scalar_tensor_name(layer: usize, name: &str) -> String {
+    format!("model.layers.{layer}.linear_attn.{name}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenseProjectionRequest<'a> {
+    pub(crate) tensor_name: &'a str,
+    pub(crate) output_width: usize,
+}
+
+impl<'a> DenseProjectionRequest<'a> {
+    #[cfg(test)]
+    pub(crate) fn new(tensor_name: &'a str, output_width: usize) -> Result<Self> {
+        if tensor_name.is_empty() {
+            bail!("FlashMoe dense projection request requires a tensor name");
+        }
+        if output_width == 0 {
+            bail!("FlashMoe dense projection request requires non-zero output width");
+        }
+        Ok(Self {
+            tensor_name,
+            output_width,
+        })
+    }
+}
+
 pub(crate) fn prepare_scheduled_next_norm_weights<F>(
     layer: usize,
     total_layers: usize,
@@ -2216,6 +2246,43 @@ mod tests {
             shared_expert_gate_tensor_name(7),
             "model.layers.7.mlp.shared_expert_gate.weight"
         );
+    }
+
+    #[test]
+    fn linear_attention_weight_tensor_names_are_canonical_hf_paths() {
+        assert_eq!(
+            linear_attention_tensor_name(7, "in_proj_qkv"),
+            "model.layers.7.linear_attn.in_proj_qkv.weight"
+        );
+        assert_eq!(
+            linear_attention_tensor_name(7, "out_proj"),
+            "model.layers.7.linear_attn.out_proj.weight"
+        );
+        assert_eq!(
+            linear_attention_scalar_tensor_name(7, "A_log"),
+            "model.layers.7.linear_attn.A_log"
+        );
+    }
+
+    #[test]
+    fn dense_projection_request_requires_named_nonzero_output() {
+        let request =
+            DenseProjectionRequest::new("model.layers.7.linear_attn.in_proj_qkv.weight", 128)
+                .unwrap();
+
+        assert_eq!(
+            request.tensor_name,
+            "model.layers.7.linear_attn.in_proj_qkv.weight"
+        );
+        assert_eq!(request.output_width, 128);
+
+        let missing_name = DenseProjectionRequest::new("", 128).unwrap_err();
+        assert!(missing_name.to_string().contains("requires a tensor name"));
+
+        let zero_width =
+            DenseProjectionRequest::new("model.layers.7.linear_attn.in_proj_qkv.weight", 0)
+                .unwrap_err();
+        assert!(zero_width.to_string().contains("non-zero output width"));
     }
 
     #[test]
