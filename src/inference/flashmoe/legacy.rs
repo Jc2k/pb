@@ -58,7 +58,9 @@ use tracing::info;
 
 use super::capabilities::{FlashMoeCapabilityPlan, FlashMoeGraphStage};
 #[cfg(test)]
-use super::capabilities::{FlashMoeStageCapability, FlashMoeStagePlacement};
+use super::capabilities::{
+    FlashMoeStageCapability, FlashMoeStageImplementation, FlashMoeStagePlacement,
+};
 #[cfg(test)]
 use super::experts::ExpertReadPath;
 #[cfg(test)]
@@ -114,8 +116,8 @@ use super::metal::{
     MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
     MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
     MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalRuntimeCapabilities,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -1229,10 +1231,6 @@ where
     let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
-    let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout)?;
-    let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
-    progress("capability_graph", phase_started.elapsed());
-    phase_started = Instant::now();
     let upgraded_expert_layers = ensure_fixed_q4_expert_cache(plan, &model_layout)?;
     if upgraded_expert_layers > 0 {
         tracing::info!(
@@ -1265,11 +1263,23 @@ where
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
     let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
+    let expert_storage = experts
+        .resolve_execution_descriptor(model_layout.layers, model_layout.experts_per_layer)?;
     let scheduler = ExpertScheduler::new_with_routed_expert_scale(
-        ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?,
+        experts.clone(),
         model_layout.routed_expert_scale,
     );
     progress("expert_store", phase_started.elapsed());
+    phase_started = Instant::now();
+    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
+    let capability_plan = FlashMoeCapabilityPlan::resolve(
+        &model_layout,
+        dense_layout,
+        expert_storage,
+        metal.as_ref().map(MetalExecutor::runtime_capabilities),
+    )?;
+    let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
+    progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
     progress("tokenizer", phase_started.elapsed());
@@ -1879,6 +1889,12 @@ impl MetalExecutor {
             let _ = (config, runtime, dense);
             Ok(None)
         }
+    }
+
+    fn runtime_capabilities(&self) -> MetalRuntimeCapabilities {
+        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new(
+            self.route_top4_enabled,
+        ))
     }
 
     fn reset_linear_attention_state(&self) {
@@ -28449,7 +28465,7 @@ mod tests {
                 stage: FlashMoeStageCapability::new(
                     FlashMoeGraphStage::RoutingSoftmaxTopK,
                     FlashMoeStagePlacement::CpuDeclared,
-                    "test CPU routing",
+                    FlashMoeStageImplementation::CpuSoftmaxTopK,
                 ),
                 layer,
                 experts,

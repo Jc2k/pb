@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::capabilities::FlashMoeStageImplementation;
 use super::capabilities::{
     FlashMoeCapabilityPlan, FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
     FlashMoeUnsupportedCapability,
@@ -3612,7 +3614,7 @@ mod tests {
             .iter_mut()
             .find(|stage| stage.stage == FlashMoeGraphStage::Cmd1AttentionProjections)
             .unwrap()
-            .implementation = "different-cmd1-implementation";
+            .implementation = FlashMoeStageImplementation::DeferredMetalCmd3;
 
         let err = stale_graph
             .build_cmd1_submission(cmd1, ScheduledCmd1InputSource::CpuNormedHidden)
@@ -4408,7 +4410,7 @@ mod tests {
             .iter_mut()
             .find(|stage| stage.stage == FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection)
             .unwrap()
-            .implementation = "different-cmd2-implementation";
+            .implementation = FlashMoeStageImplementation::QwenTextInput;
 
         let err = stale_graph
             .build_cmd2_submission(
@@ -5447,7 +5449,7 @@ mod tests {
             .iter_mut()
             .find(|stage| stage.stage == FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
             .unwrap()
-            .implementation = "different-cmd3-implementation";
+            .implementation = FlashMoeStageImplementation::QwenTextInput;
 
         let err = stale_graph
             .build_cmd3_submission(

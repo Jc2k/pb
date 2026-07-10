@@ -155,16 +155,21 @@ Baseline reviewed on 2026-07-10:
 - Several missing CMD2/CMD3 continuations now produce explicit unsupported errors.
 - The Metal shader source, pipeline surface, command diagnostics, and many buffer descriptors live
   in `metal.rs`.
+- Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
+  fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
+  the kernel surface from a successfully compiled Metal executor. The live load path builds the
+  scheduled graph only after those concrete facts resolve.
+- Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
+  no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 
 The architecture is not yet at the target:
 
 - `legacy.rs` remains the production center of gravity and is larger than when this plan began.
-- Capability resolution is family-level. It does not select the actual manifest layout, expert
-  layout, device, or kernel implementation.
-- The Qwen3.5 capability plan advertises multiple dense layouts without resolving the loaded one.
-- The model layout still carries Qwen3.5 Q4 constants into other families.
+- The engine still stores the required Metal executor as `Option`, even though Qwen3.5 Q4 graph
+  resolution rejects an absent executor. The resolved requirement must become a construction/type
+  invariant rather than a checked optional field.
 - `FlashMoeScheduledGraph` validates stage descriptors but does not own the complete per-layer
   execution lifecycle.
 - `forward_hidden`, `MetalExecutor`, concrete command encoders, `DenseStore`, KV/runtime caches, and
@@ -177,8 +182,9 @@ The architecture is not yet at the target:
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this baseline, the enabling data model is roughly halfway built, but only about one third of
-target runtime ownership has moved. Approximately 55-65% of the architectural work remains.
+At this checkpoint, concrete Qwen3.5 Q4 storage/device resolution has landed, but required runtime
+construction and execution ownership have not. Approximately 50-60% of the architectural work
+remains.
 
 ## Completion Gates
 

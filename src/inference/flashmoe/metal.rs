@@ -1,5 +1,6 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::c_void;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -569,6 +570,42 @@ pub(crate) mod kernels {
     pub(crate) const LINEAR_GATED_RMS_NORM: &str = "linear_gated_rms_norm";
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetalRuntimeCapabilities {
+    kernels: BTreeSet<&'static str>,
+}
+
+impl MetalRuntimeCapabilities {
+    pub(crate) fn from_pipeline_names(names: MetalPipelineNameSet) -> Self {
+        Self {
+            kernels: names.kernel_names().into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn supports(&self, kernel: &str) -> bool {
+        self.kernels.contains(kernel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            kernels: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn require_all(&self, kernels: &[&'static str]) -> anyhow::Result<()> {
+        let missing = kernels
+            .iter()
+            .copied()
+            .filter(|kernel| !self.supports(kernel))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!("missing Metal kernels: {}", missing.join(", "));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_FMA_MATVEC,
@@ -691,8 +728,7 @@ impl MetalPipelineNameSet {
         }
     }
 
-    #[cfg(test)]
-    fn compiled_kernels(self) -> Vec<&'static str> {
+    pub(crate) fn kernel_names(self) -> Vec<&'static str> {
         let mut kernels = vec![
             self.q4,
             self.q4_bf16_scale_bias,
@@ -3619,7 +3655,8 @@ pub(crate) fn format_metal_command_failure(
 mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::capabilities::{
-        FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
+        FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStageImplementation,
+        FlashMoeStagePlacement,
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::experts::Q4MatvecPayload;
@@ -3792,20 +3829,16 @@ mod tests {
     fn pipeline_name_set_declares_optional_route_top4() {
         let without_route = MetalPipelineNameSet::new(false);
         assert_eq!(without_route.route_top4, None);
-        assert!(
-            !without_route
-                .compiled_kernels()
-                .contains(&kernels::ROUTE_TOP4)
-        );
+        assert!(!without_route.kernel_names().contains(&kernels::ROUTE_TOP4));
 
         let with_route = MetalPipelineNameSet::new(true);
         assert_eq!(with_route.route_top4, Some(kernels::ROUTE_TOP4));
-        assert!(with_route.compiled_kernels().contains(&kernels::ROUTE_TOP4));
+        assert!(with_route.kernel_names().contains(&kernels::ROUTE_TOP4));
     }
 
     #[test]
     fn pipeline_name_set_matches_declared_forward_kernel_surface() {
-        let mut compiled = MetalPipelineNameSet::new(true).compiled_kernels();
+        let mut compiled = MetalPipelineNameSet::new(true).kernel_names();
         compiled.sort_unstable();
         compiled.dedup();
 
@@ -4964,7 +4997,7 @@ mod tests {
         let stage = FlashMoeStageCapability::new(
             FlashMoeGraphStage::RoutingSoftmaxTopK,
             FlashMoeStagePlacement::CpuDeclared,
-            "test-fused-prep-topk",
+            FlashMoeStageImplementation::CpuSoftmaxTopK,
         );
         let routing = ScheduledRoutingTopK {
             stage,

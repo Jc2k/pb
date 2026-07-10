@@ -2066,6 +2066,19 @@ pub(crate) struct ExpertSlotStore {
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertStorageLayout {
+    FixedQ4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpertStoreExecutionDescriptor {
+    pub(crate) layout: ExpertStorageLayout,
+    pub(crate) fixed_q4: FixedQ4ExpertSlotSpec,
+    pub(crate) layers: usize,
+    pub(crate) experts_per_layer: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct ExpertReadWorkerPool {
     workers: Vec<thread::JoinHandle<()>>,
@@ -2213,6 +2226,78 @@ impl ExpertSlotStore {
             fixed_q4,
             fixed_q4_buffer_pool: Arc::new(Mutex::new(Vec::new())),
             layers: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub(crate) fn resolve_execution_descriptor(
+        &self,
+        layers: usize,
+        experts_per_layer: usize,
+    ) -> Result<ExpertStoreExecutionDescriptor> {
+        if layers == 0 || experts_per_layer == 0 {
+            bail!(
+                "FlashMoe expert storage resolution requires non-zero layers and experts, layers={layers}, experts_per_layer={experts_per_layer}"
+            );
+        }
+        let expected_layer_bytes = (self.fixed_q4.layout.expert_bytes as u64)
+            .checked_mul(experts_per_layer as u64)
+            .context("fixed-Q4 expert layer byte length overflow")?;
+        for layer in 0..layers {
+            let metadata = read_expert_layer_pack_metadata(&self.root, layer)?.with_context(|| {
+                format!(
+                    "FlashMoe unsupported fixed-Q4 expert storage: layer {layer} metadata is missing"
+                )
+            })?;
+            if metadata.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1 {
+                bail!(
+                    "FlashMoe unsupported expert storage at layer {layer}: format {} is import compatibility only; expected {}",
+                    metadata.format,
+                    FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+                );
+            }
+            if metadata.expert_size != self.fixed_q4.layout.expert_bytes as u64 {
+                bail!(
+                    "FlashMoe fixed-Q4 expert storage layer {layer} has slot size {}, expected {}",
+                    metadata.expert_size,
+                    self.fixed_q4.layout.expert_bytes
+                );
+            }
+            if metadata.experts != experts_per_layer || metadata.packs.len() != experts_per_layer {
+                bail!(
+                    "FlashMoe fixed-Q4 expert storage layer {layer} declares {} experts and {} records, expected {experts_per_layer}",
+                    metadata.experts,
+                    metadata.packs.len()
+                );
+            }
+            for expert in 0..experts_per_layer {
+                let pack = metadata.pack_for(expert).with_context(|| {
+                    format!(
+                        "FlashMoe fixed-Q4 expert storage layer {layer} is missing expert {expert}"
+                    )
+                })?;
+                if pack.packed_bytes != metadata.expert_size {
+                    bail!(
+                        "FlashMoe fixed-Q4 expert storage layer {layer} expert {expert} has {} bytes, expected whole-slot payload {}",
+                        pack.packed_bytes,
+                        metadata.expert_size
+                    );
+                }
+            }
+            let path = expert_layer_path(&self.root, layer);
+            let actual_layer_bytes = fs::metadata(&path)
+                .with_context(|| format!("failed to stat expert layer {}", path.display()))?
+                .len();
+            if actual_layer_bytes != expected_layer_bytes {
+                bail!(
+                    "FlashMoe fixed-Q4 expert storage layer {layer} has file size {actual_layer_bytes}, expected {expected_layer_bytes}"
+                );
+            }
+        }
+        Ok(ExpertStoreExecutionDescriptor {
+            layout: ExpertStorageLayout::FixedQ4,
+            fixed_q4: self.fixed_q4,
+            layers,
+            experts_per_layer,
         })
     }
 
@@ -3974,6 +4059,55 @@ mod tests {
             err.to_string().contains("whole-slot payload length 44"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn expert_store_resolves_validated_fixed_q4_execution_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let experts = 2;
+        let bytes = vec![0u8; spec.layout.expert_bytes * experts];
+        fs::write(expert_layer_path(temp.path(), 0), bytes).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            spec.layout.expert_bytes as u64,
+            experts,
+            (0..experts)
+                .map(|expert| tiny_pack_metadata(0, expert, spec.layout.expert_bytes as u64))
+                .collect(),
+        );
+        write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+
+        let descriptor = store.resolve_execution_descriptor(1, experts).unwrap();
+
+        assert_eq!(descriptor.layout, ExpertStorageLayout::FixedQ4);
+        assert_eq!(descriptor.fixed_q4, spec);
+        assert_eq!(descriptor.layers, 1);
+        assert_eq!(descriptor.experts_per_layer, experts);
+    }
+
+    #[test]
+    fn expert_store_rejects_partial_fixed_q4_execution_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        fs::write(
+            expert_layer_path(temp.path(), 0),
+            vec![0u8; spec.layout.expert_bytes],
+        )
+        .unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            0,
+            spec.layout.expert_bytes as u64,
+            2,
+            vec![tiny_pack_metadata(0, 0, spec.layout.expert_bytes as u64)],
+        );
+        write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+
+        let err = store.resolve_execution_descriptor(1, 2).unwrap_err();
+
+        assert!(err.to_string().contains("1 records, expected 2"), "{err:#}");
     }
 
     #[test]

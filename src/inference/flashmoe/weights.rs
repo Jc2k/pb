@@ -14,6 +14,25 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) const TENSOR_ALIGNMENT: u64 = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentDenseLayout {
+    Q4,
+    Bf16,
+    F16,
+    F32,
+}
+
+impl ResidentDenseLayout {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Q4 => "resident Q4",
+            Self::Bf16 => "resident BF16",
+            Self::F16 => "resident F16",
+            Self::F32 => "resident F32",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlashMoeManifest {
     pub model: String,
@@ -199,6 +218,65 @@ impl TensorRegistry {
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
     }
+
+    pub(crate) fn resolve_resident_dense_layout(&self) -> Result<ResidentDenseLayout> {
+        let matrix_tensors = self
+            .tensors
+            .values()
+            .filter(|tensor| tensor.shape.len() >= 2)
+            .filter(|tensor| !is_routed_expert_tensor_name(&tensor.name));
+        let mut found_matrix = false;
+        let mut found_q4 = false;
+        let mut unquantized_layout: Option<ResidentDenseLayout> = None;
+
+        for tensor in matrix_tensors {
+            found_matrix = true;
+            match tensor.quantization {
+                TensorQuantization::Q4 { .. } => found_q4 = true,
+                TensorQuantization::None => {
+                    let layout =
+                        resident_dense_layout_for_dtype(&tensor.dtype).with_context(|| {
+                            format!(
+                                "FlashMoe dense tensor {} has unsupported resident dtype {}",
+                                tensor.name, tensor.dtype
+                            )
+                        })?;
+                    if let Some(existing) = unquantized_layout
+                        && existing != layout
+                    {
+                        bail!(
+                            "FlashMoe dense manifest mixes resident matrix layouts {} and {}",
+                            existing.as_str(),
+                            layout.as_str()
+                        );
+                    }
+                    unquantized_layout = Some(layout);
+                }
+            }
+        }
+
+        if !found_matrix {
+            bail!("FlashMoe dense manifest contains no matrix tensors");
+        }
+        if found_q4 {
+            return Ok(ResidentDenseLayout::Q4);
+        }
+        unquantized_layout
+            .context("FlashMoe dense manifest has no resolvable resident matrix layout")
+    }
+}
+
+fn resident_dense_layout_for_dtype(dtype: &str) -> Option<ResidentDenseLayout> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "BF16" | "BFLOAT16" => Some(ResidentDenseLayout::Bf16),
+        "F16" | "FLOAT16" | "FP16" => Some(ResidentDenseLayout::F16),
+        "F32" | "FLOAT32" | "FP32" => Some(ResidentDenseLayout::F32),
+        _ => None,
+    }
+}
+
+fn is_routed_expert_tensor_name(name: &str) -> bool {
+    name.contains(".mlp.experts.") || name.contains(".switch_mlp.")
 }
 
 fn insert_tensor_entry_with_aliases(
@@ -1774,6 +1852,22 @@ fn validate_cached_shared_width(
 mod tests {
     use super::*;
 
+    fn runtime_matrix(
+        name: &str,
+        dtype: &str,
+        quantization: TensorQuantization,
+    ) -> RuntimeTensorEntry {
+        RuntimeTensorEntry {
+            name: name.to_string(),
+            dtype: dtype.to_string(),
+            shape: vec![4, 8],
+            byte_offset: 0,
+            byte_len: 128,
+            alignment: TENSOR_ALIGNMENT,
+            quantization,
+        }
+    }
+
     #[test]
     fn tensor_quantization_defaults_to_unquantized_dense() {
         assert_eq!(TensorQuantization::default(), TensorQuantization::None);
@@ -1791,6 +1885,120 @@ mod tests {
                 format: "dense-q4".to_string(),
                 scale_bias_dtype: "F32".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn tensor_registry_resolves_one_concrete_dense_layout() {
+        for (dtype, expected) in [
+            ("BF16", ResidentDenseLayout::Bf16),
+            ("F16", ResidentDenseLayout::F16),
+            ("F32", ResidentDenseLayout::F32),
+        ] {
+            let registry = TensorRegistry {
+                tensors: BTreeMap::from([(
+                    "model.layers.0.self_attn.q_proj.weight".to_string(),
+                    runtime_matrix(
+                        "model.layers.0.self_attn.q_proj.weight",
+                        dtype,
+                        TensorQuantization::None,
+                    ),
+                )]),
+            };
+
+            assert_eq!(registry.resolve_resident_dense_layout().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn tensor_registry_resolves_q4_with_unquantized_auxiliary_matrices() {
+        let registry = TensorRegistry {
+            tensors: BTreeMap::from([
+                (
+                    "model.layers.0.self_attn.q_proj.weight".to_string(),
+                    runtime_matrix(
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "U32",
+                        TensorQuantization::Q4 {
+                            group_size: 64,
+                            format: "mlx-q4".to_string(),
+                            scale_bias_dtype: "BF16".to_string(),
+                        },
+                    ),
+                ),
+                (
+                    "model.embed_tokens.weight".to_string(),
+                    runtime_matrix(
+                        "model.embed_tokens.weight",
+                        "BF16",
+                        TensorQuantization::None,
+                    ),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            registry.resolve_resident_dense_layout().unwrap(),
+            ResidentDenseLayout::Q4
+        );
+    }
+
+    #[test]
+    fn tensor_registry_ignores_routed_expert_storage_when_resolving_dense_layout() {
+        let registry = TensorRegistry {
+            tensors: BTreeMap::from([
+                (
+                    "model.layers.0.self_attn.q_proj.weight".to_string(),
+                    runtime_matrix(
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "BF16",
+                        TensorQuantization::None,
+                    ),
+                ),
+                (
+                    "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+                    runtime_matrix(
+                        "model.layers.0.mlp.experts.0.gate_proj.weight",
+                        "U32",
+                        TensorQuantization::Q4 {
+                            group_size: 64,
+                            format: "expert-q4".to_string(),
+                            scale_bias_dtype: "F32".to_string(),
+                        },
+                    ),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            registry.resolve_resident_dense_layout().unwrap(),
+            ResidentDenseLayout::Bf16
+        );
+    }
+
+    #[test]
+    fn tensor_registry_rejects_mixed_unquantized_matrix_layouts() {
+        let registry = TensorRegistry {
+            tensors: BTreeMap::from([
+                (
+                    "model.layers.0.self_attn.q_proj.weight".to_string(),
+                    runtime_matrix(
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "BF16",
+                        TensorQuantization::None,
+                    ),
+                ),
+                (
+                    "lm_head.weight".to_string(),
+                    runtime_matrix("lm_head.weight", "F32", TensorQuantization::None),
+                ),
+            ]),
+        };
+
+        let err = registry.resolve_resident_dense_layout().unwrap_err();
+        assert!(
+            err.to_string().contains("mixes resident matrix layouts"),
+            "{err:#}"
         );
     }
 
