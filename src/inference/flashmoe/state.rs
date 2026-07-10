@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
@@ -977,6 +978,153 @@ impl FlashMoeLinearAttentionCacheState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeLinearAttentionCacheShape {
+    pub(crate) conv_state_len: usize,
+    pub(crate) ssm_state_len: usize,
+    pub(crate) conv_output_len: usize,
+    pub(crate) output_len: usize,
+    pub(crate) value_scratch_len: usize,
+}
+
+impl FlashMoeLinearAttentionCacheShape {
+    pub(crate) fn new(
+        conv_state_len: usize,
+        ssm_state_len: usize,
+        conv_output_len: usize,
+        output_len: usize,
+        value_scratch_len: usize,
+    ) -> Self {
+        Self {
+            conv_state_len,
+            ssm_state_len,
+            conv_output_len,
+            output_len,
+            value_scratch_len,
+        }
+    }
+
+    pub(crate) fn state(
+        self,
+        layer: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> FlashMoeLinearAttentionCacheState {
+        FlashMoeLinearAttentionCacheState::new(
+            layer,
+            self.conv_state_len,
+            self.ssm_state_len,
+            self.conv_output_len,
+            self.output_len,
+            placement,
+        )
+    }
+
+    pub(crate) fn is_declared_graph_shape(self) -> bool {
+        self.conv_state_len > 0
+            && self.ssm_state_len > 0
+            && self.conv_output_len > 0
+            && self.output_len > 0
+            && self.value_scratch_len > 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlashMoeLinearAttentionStateData {
+    pub(crate) conv_state: Vec<f32>,
+    pub(crate) ssm_state: Vec<f32>,
+    pub(crate) conv_out: Vec<f32>,
+    pub(crate) out_values: Vec<f32>,
+    pub(crate) kv_mem: Vec<f32>,
+    pub(crate) delta: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlashMoeLinearAttentionState {
+    inner: Arc<FlashMoeLinearAttentionStateData>,
+}
+
+impl FlashMoeLinearAttentionState {
+    pub(crate) fn new(shape: FlashMoeLinearAttentionCacheShape) -> Self {
+        debug_assert!(shape.is_declared_graph_shape());
+        Self {
+            inner: Arc::new(FlashMoeLinearAttentionStateData {
+                conv_state: vec![0.0; shape.conv_state_len],
+                ssm_state: vec![0.0; shape.ssm_state_len],
+                conv_out: vec![0.0; shape.conv_output_len],
+                out_values: vec![0.0; shape.output_len],
+                kv_mem: vec![0.0; shape.value_scratch_len],
+                delta: vec![0.0; shape.value_scratch_len],
+            }),
+        }
+    }
+
+    pub(crate) fn expected_state(
+        layer: usize,
+        shape: FlashMoeLinearAttentionCacheShape,
+        placement: FlashMoeStatePlacement,
+    ) -> FlashMoeLinearAttentionCacheState {
+        match placement {
+            FlashMoeStatePlacement::CpuVisible => FlashMoeLinearAttentionCacheState::cpu_visible(
+                layer,
+                shape.conv_state_len,
+                shape.ssm_state_len,
+                shape.conv_output_len,
+                shape.output_len,
+            ),
+            FlashMoeStatePlacement::GpuResident => FlashMoeLinearAttentionCacheState::gpu_resident(
+                layer,
+                shape.conv_state_len,
+                shape.ssm_state_len,
+                shape.conv_output_len,
+                shape.output_len,
+            ),
+        }
+    }
+
+    pub(crate) fn state(
+        &self,
+        layer: usize,
+        placement: FlashMoeStatePlacement,
+    ) -> FlashMoeLinearAttentionCacheState {
+        FlashMoeLinearAttentionCacheShape::new(
+            self.conv_state.len(),
+            self.ssm_state.len(),
+            self.conv_out.len(),
+            self.out_values.len(),
+            self.kv_mem.len(),
+        )
+        .state(layer, placement)
+    }
+
+    pub(crate) fn matches_shape(&self, shape: FlashMoeLinearAttentionCacheShape) -> bool {
+        self.conv_state.len() == shape.conv_state_len
+            && self.ssm_state.len() == shape.ssm_state_len
+            && self.conv_out.len() == shape.conv_output_len
+            && self.out_values.len() == shape.output_len
+            && self.kv_mem.len() == shape.value_scratch_len
+            && self.delta.len() == shape.value_scratch_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Deref for FlashMoeLinearAttentionState {
+    type Target = FlashMoeLinearAttentionStateData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for FlashMoeLinearAttentionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.inner)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FlashMoeExpertPhaseOutput {
     hidden: Vec<f32>,
@@ -1651,6 +1799,37 @@ mod tests {
         assert!(
             !FlashMoeLinearAttentionCacheState::gpu_resident(3, 8, 16, 4, 0)
                 .is_declared_graph_state()
+        );
+    }
+
+    #[test]
+    fn linear_attention_state_owns_recurrent_buffers_for_declared_shape() {
+        let shape = FlashMoeLinearAttentionCacheShape::new(8, 16, 4, 6, 2);
+        assert!(shape.is_declared_graph_shape());
+
+        let mut state = FlashMoeLinearAttentionState::new(shape);
+        assert_eq!(state.conv_state.len(), 8);
+        assert_eq!(state.ssm_state.len(), 16);
+        assert_eq!(state.conv_out.len(), 4);
+        assert_eq!(state.out_values.len(), 6);
+        assert_eq!(state.kv_mem.len(), 2);
+        assert_eq!(state.delta.len(), 2);
+        assert!(state.matches_shape(shape));
+        assert!(!state.matches_shape(FlashMoeLinearAttentionCacheShape::new(8, 16, 4, 6, 3)));
+
+        state.conv_state[0] = 1.5;
+        assert_eq!(state.conv_state[0], 1.5);
+        assert_eq!(
+            FlashMoeLinearAttentionState::expected_state(
+                3,
+                shape,
+                FlashMoeStatePlacement::CpuVisible
+            ),
+            FlashMoeLinearAttentionCacheState::cpu_visible(3, 8, 16, 4, 6)
+        );
+        assert_eq!(
+            state.state(3, FlashMoeStatePlacement::GpuResident),
+            FlashMoeLinearAttentionCacheState::gpu_resident(3, 8, 16, 4, 6)
         );
     }
 

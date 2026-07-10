@@ -128,7 +128,8 @@ use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer,
     FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoeLinearAttentionCacheState, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
+    FlashMoeLinearAttentionCacheShape, FlashMoeLinearAttentionCacheState,
+    FlashMoeLinearAttentionState, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
     FlashMoeRecurrentLayerState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
     stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
@@ -11972,6 +11973,16 @@ impl LinearAttentionLayout {
         self.num_value_heads * self.value_dim * self.key_dim
     }
 
+    fn cache_shape(self) -> FlashMoeLinearAttentionCacheShape {
+        FlashMoeLinearAttentionCacheShape::new(
+            self.conv_state_len(),
+            self.ssm_state_len(),
+            self.conv_dim,
+            self.total_value_width,
+            self.value_dim,
+        )
+    }
+
     fn value_heads_per_key_head(self) -> usize {
         (self.num_value_heads / self.num_key_heads).max(1)
     }
@@ -14470,97 +14481,6 @@ fn byte_level_piece_to_bytes(piece: &str) -> Option<Vec<u8>> {
     piece.chars().map(unicode_to_byte).collect()
 }
 
-#[derive(Debug, Clone)]
-struct LinearAttentionStateData {
-    conv_state: Vec<f32>,
-    ssm_state: Vec<f32>,
-    conv_out: Vec<f32>,
-    out_values: Vec<f32>,
-    kv_mem: Vec<f32>,
-    delta: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct LinearAttentionState {
-    inner: Arc<LinearAttentionStateData>,
-}
-
-impl LinearAttentionState {
-    fn new(layout: LinearAttentionLayout) -> Self {
-        Self {
-            inner: Arc::new(LinearAttentionStateData {
-                conv_state: vec![0.0; layout.conv_state_len()],
-                ssm_state: vec![0.0; layout.ssm_state_len()],
-                conv_out: vec![0.0; layout.conv_dim],
-                out_values: vec![0.0; layout.total_value_width],
-                kv_mem: vec![0.0; layout.value_dim],
-                delta: vec![0.0; layout.value_dim],
-            }),
-        }
-    }
-
-    fn expected_state(
-        layer: usize,
-        layout: LinearAttentionLayout,
-        placement: FlashMoeStatePlacement,
-    ) -> FlashMoeLinearAttentionCacheState {
-        match placement {
-            FlashMoeStatePlacement::CpuVisible => FlashMoeLinearAttentionCacheState::cpu_visible(
-                layer,
-                layout.conv_state_len(),
-                layout.ssm_state_len(),
-                layout.conv_dim,
-                layout.total_value_width,
-            ),
-            FlashMoeStatePlacement::GpuResident => FlashMoeLinearAttentionCacheState::gpu_resident(
-                layer,
-                layout.conv_state_len(),
-                layout.ssm_state_len(),
-                layout.conv_dim,
-                layout.total_value_width,
-            ),
-        }
-    }
-
-    fn state(
-        &self,
-        layer: usize,
-        placement: FlashMoeStatePlacement,
-    ) -> FlashMoeLinearAttentionCacheState {
-        FlashMoeLinearAttentionCacheState::new(
-            layer,
-            self.conv_state.len(),
-            self.ssm_state.len(),
-            self.conv_out.len(),
-            self.out_values.len(),
-            placement,
-        )
-    }
-
-    fn matches_layout(&self, layout: LinearAttentionLayout) -> bool {
-        self.conv_state.len() == layout.conv_state_len()
-            && self.ssm_state.len() == layout.ssm_state_len()
-            && self.conv_out.len() == layout.conv_dim
-            && self.out_values.len() == layout.total_value_width
-            && self.kv_mem.len() == layout.value_dim
-            && self.delta.len() == layout.value_dim
-    }
-}
-
-impl std::ops::Deref for LinearAttentionState {
-    type Target = LinearAttentionStateData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for LinearAttentionState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.inner)
-    }
-}
-
 type KvEntry = (Arc<[f32]>, Arc<[f32]>);
 
 #[derive(Debug, Clone)]
@@ -14571,7 +14491,7 @@ struct KvCache {
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
     kv: Vec<Vec<Option<KvEntry>>>,
-    linear_states: BTreeMap<usize, LinearAttentionState>,
+    linear_states: BTreeMap<usize, FlashMoeLinearAttentionState>,
 }
 
 impl KvCache {
@@ -14703,23 +14623,27 @@ impl KvCache {
         &mut self,
         layer: usize,
         layout: LinearAttentionLayout,
-    ) -> Result<&mut LinearAttentionState> {
+    ) -> Result<&mut FlashMoeLinearAttentionState> {
         if layer >= self.layers {
             bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
         }
-        let expected_state =
-            LinearAttentionState::expected_state(layer, layout, FlashMoeStatePlacement::CpuVisible);
+        let shape = layout.cache_shape();
+        let expected_state = FlashMoeLinearAttentionState::expected_state(
+            layer,
+            shape,
+            FlashMoeStatePlacement::CpuVisible,
+        );
         if !expected_state.is_declared_graph_state() {
             bail!("FlashMoe linear-attention cache state is not declared graph state");
         }
         let state = self
             .linear_states
             .entry(layer)
-            .or_insert_with(|| LinearAttentionState::new(layout));
-        if !state.matches_layout(layout)
+            .or_insert_with(|| FlashMoeLinearAttentionState::new(shape));
+        if !state.matches_shape(shape)
             || state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state
         {
-            *state = LinearAttentionState::new(layout);
+            *state = FlashMoeLinearAttentionState::new(shape);
         }
         if state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state {
             bail!("FlashMoe linear-attention cache state does not match declared layout");
@@ -26261,10 +26185,13 @@ mod tests {
         let (snapshot_key, snapshot_value) = snapshot.kv[0][1].as_ref().unwrap();
         assert!(Arc::ptr_eq(live_key, snapshot_key));
         assert!(Arc::ptr_eq(live_value, snapshot_value));
-        assert!(Arc::ptr_eq(
-            &kv_cache.linear_states.get(&1).unwrap().inner,
-            &snapshot.linear_states.get(&1).unwrap().inner
-        ));
+        assert!(
+            kv_cache
+                .linear_states
+                .get(&1)
+                .unwrap()
+                .shares_storage_with(snapshot.linear_states.get(&1).unwrap())
+        );
 
         kv_cache
             .record_kv(2, 0, vec![5.0, 5.1], vec![6.0, 6.1])
@@ -26277,7 +26204,7 @@ mod tests {
         }
         let live_linear = kv_cache.linear_states.get(&1).unwrap();
         let snapshot_linear = snapshot.linear_states.get(&1).unwrap();
-        assert!(!Arc::ptr_eq(&live_linear.inner, &snapshot_linear.inner));
+        assert!(!live_linear.shares_storage_with(snapshot_linear));
         assert_eq!(snapshot_linear.conv_state, expected_conv_state);
         assert_eq!(snapshot_linear.ssm_state, expected_ssm_state);
     }

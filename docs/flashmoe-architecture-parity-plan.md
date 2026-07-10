@@ -214,7 +214,8 @@ The validator should reject silent fallbacks such as:
   before using CPU attention or writing the Metal KV cache.
   Recurrent per-layer records now expose CPU-visible recurrent state descriptors before they are
   recorded into the session/cache state. Linear-attention cache state now exposes CPU-visible and
-  GPU-resident descriptors for conv state, SSM state, conv output, and value output lengths before
+  GPU-resident descriptors for conv state, SSM state, conv output, and value output lengths, and
+  `state` owns the CPU-visible linear-attention recurrent buffers for those declared shapes before
   cache mutation or Metal allocation. The Metal object handles still live in `legacy.rs`, but
   deferred GPU inputs, post-attention prep, CMD3 inputs, deferred expert outputs, declared CMD3
   token-state application modes, full-attention KV updates, recurrent layer records, and
