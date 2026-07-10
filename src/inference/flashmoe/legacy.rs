@@ -126,11 +126,11 @@ use super::scheduler::{
 use super::state::reusable_session_prefix_len;
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCmd3OutputState, FlashMoeCpuBuffer,
-    FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord,
-    FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord, FlashMoeLinearAttentionCacheState,
-    FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
-    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
+    FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
+    FlashMoeLinearAttentionCacheState, FlashMoePostAttentionPrepState, FlashMoePromptTokenRecord,
+    FlashMoeRecurrentLayerState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 #[cfg(test)]
@@ -10183,7 +10183,10 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                token_state.apply_declared_expert_phase_output(output)?;
+                token_state.apply_declared_expert_phase(
+                    output,
+                    FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+                )?;
             }
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
@@ -10395,7 +10398,10 @@ impl FlashMoeEngine {
                         previous_layer.buckets.total_wall += wait_elapsed;
                     }
                 }
-                token_state.apply_declared_expert_phase_hidden_only(output)?;
+                token_state.apply_declared_expert_phase(
+                    output,
+                    FlashMoeExpertPhaseApplication::HiddenOnly,
+                )?;
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
@@ -10530,7 +10536,10 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        token_state.apply_declared_expert_phase_hidden_only(output)?;
+                        token_state.apply_declared_expert_phase(
+                            output,
+                            FlashMoeExpertPhaseApplication::HiddenOnly,
+                        )?;
                     }
                     if let Some(metal) = &self.metal {
                         let attention_values = metal.read_and_recycle_attention_values(
@@ -10617,7 +10626,10 @@ impl FlashMoeEngine {
                                 previous_layer.buckets.total_wall += wait_elapsed;
                             }
                         }
-                        token_state.apply_declared_expert_phase_hidden_only(output)?;
+                        token_state.apply_declared_expert_phase(
+                            output,
+                            FlashMoeExpertPhaseApplication::HiddenOnly,
+                        )?;
                     }
                     let subphase_started = Instant::now();
                     projected = self
@@ -10741,7 +10753,10 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    token_state.apply_declared_expert_phase_output(output)?;
+                    token_state.apply_declared_expert_phase(
+                        output,
+                        FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+                    )?;
                     submitted_deferred = true;
                 }
             }
@@ -10766,7 +10781,10 @@ impl FlashMoeEngine {
                     submitted_deferred = true;
                 } else {
                     let output = pending.wait()?;
-                    token_state.apply_declared_expert_phase_output(output)?;
+                    token_state.apply_declared_expert_phase(
+                        output,
+                        FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+                    )?;
                     submitted_deferred = true;
                 }
             }
@@ -10912,7 +10930,10 @@ impl FlashMoeEngine {
                     previous_layer.buckets.total_wall += wait_elapsed;
                 }
             }
-            token_state.apply_declared_expert_phase_output(output)?;
+            token_state.apply_declared_expert_phase(
+                output,
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )?;
         }
         token_state.clear_next_layer_normed();
 

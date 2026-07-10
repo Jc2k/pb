@@ -685,6 +685,12 @@ pub(crate) struct FlashMoeTokenState {
     recurrent: FlashMoeRecurrentState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeExpertPhaseApplication {
+    HiddenAndNextNormed,
+    HiddenOnly,
+}
+
 impl FlashMoeTokenState {
     pub(crate) fn new(hidden_values: Vec<f32>, recurrent_seed: u64) -> Self {
         Self {
@@ -730,25 +736,22 @@ impl FlashMoeTokenState {
         self.clear_next_layer_normed();
     }
 
-    pub(crate) fn apply_declared_expert_phase_output(
+    pub(crate) fn apply_declared_expert_phase(
         &mut self,
         output: FlashMoeExpertPhaseOutput,
+        application: FlashMoeExpertPhaseApplication,
     ) -> Result<()> {
         if output.declared_cmd3_output().is_none() {
             bail!("FlashMoe token state refused undeclared expert phase output");
         }
-        self.apply_expert_phase_output(output);
-        Ok(())
-    }
-
-    pub(crate) fn apply_declared_expert_phase_hidden_only(
-        &mut self,
-        output: FlashMoeExpertPhaseOutput,
-    ) -> Result<()> {
-        if output.declared_cmd3_output().is_none() {
-            bail!("FlashMoe token state refused undeclared expert phase hidden output");
+        match application {
+            FlashMoeExpertPhaseApplication::HiddenAndNextNormed => {
+                self.apply_expert_phase_output(output)
+            }
+            FlashMoeExpertPhaseApplication::HiddenOnly => {
+                self.apply_expert_phase_hidden_only(output)
+            }
         }
-        self.apply_expert_phase_hidden_only(output);
         Ok(())
     }
 
@@ -1562,10 +1565,10 @@ mod tests {
     fn token_state_requires_declared_expert_output_for_scheduled_application() {
         let mut state = FlashMoeTokenState::new(vec![1.0, 2.0], 10);
         let raw_err = state
-            .apply_declared_expert_phase_output(FlashMoeExpertPhaseOutput::new(
-                vec![3.0, 4.0],
-                Some(vec![5.0, 6.0]),
-            ))
+            .apply_declared_expert_phase(
+                FlashMoeExpertPhaseOutput::new(vec![3.0, 4.0], Some(vec![5.0, 6.0])),
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )
             .unwrap_err();
         assert!(
             raw_err
@@ -1576,7 +1579,12 @@ mod tests {
 
         let declared = FlashMoeExpertPhaseOutput::new(vec![3.0, 4.0], Some(vec![5.0, 6.0]))
             .with_declared_cmd3_output(FlashMoeCmd3OutputState::gpu_resident(2, true));
-        state.apply_declared_expert_phase_output(declared).unwrap();
+        state
+            .apply_declared_expert_phase(
+                declared,
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )
+            .unwrap();
         assert_eq!(&state.hidden()[..], &[3.0, 4.0]);
         let normed = state.take_next_layer_normed_as_normed().unwrap();
         assert_eq!(&normed[..], &[5.0, 6.0]);
@@ -1585,7 +1593,10 @@ mod tests {
             FlashMoeExpertPhaseOutput::new(vec![7.0, 8.0], Some(vec![9.0, 10.0]))
                 .with_declared_cmd3_output(FlashMoeCmd3OutputState::gpu_resident(2, true));
         state
-            .apply_declared_expert_phase_hidden_only(declared_hidden_only)
+            .apply_declared_expert_phase(
+                declared_hidden_only,
+                FlashMoeExpertPhaseApplication::HiddenOnly,
+            )
             .unwrap();
         assert_eq!(&state.hidden()[..], &[7.0, 8.0]);
         assert!(state.take_next_layer_normed_as_normed().is_none());
