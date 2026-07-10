@@ -104,7 +104,7 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3DeferredOutput, MetalCmd3PhasePlan, MetalCmd3SharedPhasePlan,
+    MetalCmd3DeferredOutput, MetalCmd3NextNormPlan, MetalCmd3PhasePlan, MetalCmd3SharedPhasePlan,
     MetalCmd3SharedPhaseSource, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
     MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
     MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
@@ -4796,17 +4796,15 @@ impl MetalExecutorInner {
                 ));
             }
         };
-        if let Some(weight) = next_norm_weight
-            && weight.len() < plan.width
-        {
-            self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
-            bail!(
-                "FlashMoe unsupported Metal CMD3 phase: next-norm weight length {} is smaller than width {} for layer {}",
-                weight.len(),
-                plan.width,
-                plan.layer
-            );
-        }
+        let next_norm_plan =
+            match MetalCmd3NextNormPlan::new(plan, next_norm_weight.map(|weight| weight.len())) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&[normed_buffer, residual_buffer], false);
+                    return Err(error
+                        .context("FlashMoe unsupported Metal CMD3 phase: invalid next-norm plan"));
+                }
+            };
         let position = plan.position;
         let layer = plan.layer;
         let expert_count = plan.expert_count;
@@ -5095,9 +5093,11 @@ impl MetalExecutorInner {
             set_buffer(encoder, active_buffer, 6);
             dispatch_threads(encoder, width as u64);
 
-            if let (Some(weight), Some(next_normed_buffer)) = (next_norm_weight, next_normed_buffer)
+            if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
+                (next_norm_weight, next_normed_buffer, next_norm_plan)
             {
-                let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(&weight[..width]))?;
+                let norm_weight_buffer =
+                    self.buffer_with_bytes(f32_as_bytes(&weight[..next_norm_plan.width]))?;
                 buffers.push(MetalPhaseBuffer::recyclable(norm_weight_buffer));
                 msg_send_void1_id(
                     encoder,
@@ -5108,7 +5108,7 @@ impl MetalExecutorInner {
                 set_buffer(encoder, norm_weight_buffer, 1);
                 set_buffer(encoder, next_normed_buffer, 2);
                 set_buffer(encoder, width_buffer, 3);
-                dispatch_single_threadgroup(encoder, 256);
+                dispatch_single_threadgroup(encoder, next_norm_plan.dispatch_threads);
             }
 
             msg_send_void0(encoder, sel("endEncoding"));

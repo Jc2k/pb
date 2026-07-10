@@ -1073,6 +1073,47 @@ impl MetalCmd3PhasePlan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3NextNormPlan {
+    pub(crate) width: usize,
+    pub(crate) dispatch_threads: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3NextNormPlan {
+    const RMS_NORM_REDUCED_THREADS: u64 = 256;
+
+    pub(crate) fn new(
+        phase: MetalCmd3PhasePlan,
+        weight_len: Option<usize>,
+    ) -> anyhow::Result<Option<Self>> {
+        match (phase.has_next_norm, weight_len) {
+            (false, None) => Ok(None),
+            (false, Some(_)) => anyhow::bail!(
+                "FlashMoe Metal CMD3 next-norm weights were provided for a no-next-norm phase"
+            ),
+            (true, None) => anyhow::bail!(
+                "FlashMoe Metal CMD3 next-norm output is declared but no next-norm weights were provided"
+            ),
+            (true, Some(weight_len)) => {
+                if weight_len < phase.width {
+                    anyhow::bail!(
+                        "FlashMoe Metal CMD3 next-norm weight length {} is smaller than width {} for layer {}",
+                        weight_len,
+                        phase.width,
+                        phase.layer
+                    );
+                }
+                Ok(Some(Self {
+                    width: phase.width,
+                    dispatch_threads: Self::RMS_NORM_REDUCED_THREADS,
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetalCmd3SharedPhaseSource {
     None,
     Dense,
@@ -3513,6 +3554,66 @@ mod tests {
         assert!(
             width_err.to_string().contains("does not fit Metal u32"),
             "{width_err:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_next_norm_plan_declares_weight_slice_and_dispatch() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(16, true);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 4, 16, 4, 4, output_state, true).unwrap();
+
+        let plan = MetalCmd3NextNormPlan::new(phase, Some(32))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(plan.width, 16);
+        assert_eq!(plan.dispatch_threads, 256);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_next_norm_plan_rejects_undeclared_or_short_weights() {
+        let with_next = MetalCmd3PhasePlan::new(
+            9,
+            3,
+            4,
+            16,
+            4,
+            4,
+            FlashMoeCmd3OutputState::gpu_resident(16, true),
+            true,
+        )
+        .unwrap();
+        let short = MetalCmd3NextNormPlan::new(with_next, Some(15)).unwrap_err();
+        assert!(
+            short.to_string().contains("smaller than width 16"),
+            "{short:#}"
+        );
+
+        let missing = MetalCmd3NextNormPlan::new(with_next, None).unwrap_err();
+        assert!(
+            missing.to_string().contains("no next-norm weights"),
+            "{missing:#}"
+        );
+
+        let without_next = MetalCmd3PhasePlan::new(
+            9,
+            3,
+            4,
+            16,
+            4,
+            4,
+            FlashMoeCmd3OutputState::gpu_resident(16, false),
+            false,
+        )
+        .unwrap();
+        let unexpected = MetalCmd3NextNormPlan::new(without_next, Some(16)).unwrap_err();
+        assert!(
+            unexpected
+                .to_string()
+                .contains("provided for a no-next-norm phase"),
+            "{unexpected:#}"
         );
     }
 
