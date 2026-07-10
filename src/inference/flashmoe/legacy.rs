@@ -103,7 +103,8 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalPipelineNameSet, MetalPipelineSet, metal_command_failure_requires_release,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPipelineNameSet, MetalPipelineSet,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -171,7 +172,6 @@ const DENSE_Q4_GROUP_SIZE: usize = 16;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
-const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "macos")]
 const CBLAS_ROW_MAJOR: c_int = 101;
 #[cfg(target_os = "macos")]
@@ -211,10 +211,6 @@ unsafe extern "C" {
 
 fn metal_route_top4_enabled() -> bool {
     false
-}
-
-fn metal_command_timeout() -> Duration {
-    DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18409,34 +18405,20 @@ unsafe fn wait_for_metal_command_buffer(
     context: &MetalCommandContext,
 ) -> std::result::Result<(), MetalCommandBufferFailure> {
     let started = Instant::now();
-    let timeout = metal_command_timeout();
-    let poll_interval = Duration::from_millis(2);
+    let policy = MetalCommandWaitPolicy::default();
     loop {
         let status = unsafe { metal_command_buffer_status(command_buffer) };
-        if status.is_terminal() {
-            let elapsed = started.elapsed();
-            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
-            return match status {
-                MetalCommandStatus::Completed if metal_error.is_none() => Ok(()),
-                _ => Err(MetalCommandBufferFailure::failed(
-                    context,
-                    elapsed,
-                    status,
-                    metal_error,
-                )),
-            };
+        let elapsed = started.elapsed();
+        let timed_out = elapsed >= policy.timeout;
+        let metal_error = if status.is_terminal() || timed_out {
+            unsafe { metal_command_buffer_error(command_buffer) }
+        } else {
+            None
+        };
+        match resolve_metal_command_wait(context, elapsed, status, metal_error, timed_out) {
+            MetalCommandWaitResult::Pending => thread::sleep(policy.poll_interval),
+            MetalCommandWaitResult::Finished(result) => return result,
         }
-        if started.elapsed() >= timeout {
-            let elapsed = started.elapsed();
-            let metal_error = unsafe { metal_command_buffer_error(command_buffer) };
-            return Err(MetalCommandBufferFailure::timeout(
-                context,
-                elapsed,
-                status,
-                metal_error,
-            ));
-        }
-        thread::sleep(poll_interval);
     }
 }
 

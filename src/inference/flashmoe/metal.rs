@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
 pub(crate) mod kernels {
     pub(crate) const Q4_FMA_MATVEC: &str = "q4_fma_matvec";
     pub(crate) const Q4_FMA_MATVEC_BF16_SCALE_BIAS: &str = "q4_fma_matvec_bf16_scale_bias";
@@ -1970,6 +1973,58 @@ impl std::fmt::Display for MetalCommandBufferFailure {
 
 impl std::error::Error for MetalCommandBufferFailure {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCommandWaitPolicy {
+    pub(crate) timeout: Duration,
+    pub(crate) poll_interval: Duration,
+}
+
+impl Default for MetalCommandWaitPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT,
+            poll_interval: DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MetalCommandWaitResult {
+    Pending,
+    Finished(std::result::Result<(), MetalCommandBufferFailure>),
+}
+
+pub(crate) fn resolve_metal_command_wait(
+    context: &MetalCommandContext,
+    elapsed: Duration,
+    status: MetalCommandStatus,
+    metal_error: Option<String>,
+    timed_out: bool,
+) -> MetalCommandWaitResult {
+    if status.is_terminal() {
+        return match status {
+            MetalCommandStatus::Completed if metal_error.is_none() => {
+                MetalCommandWaitResult::Finished(Ok(()))
+            }
+            _ => MetalCommandWaitResult::Finished(Err(MetalCommandBufferFailure::failed(
+                context,
+                elapsed,
+                status,
+                metal_error,
+            ))),
+        };
+    }
+    if timed_out {
+        return MetalCommandWaitResult::Finished(Err(MetalCommandBufferFailure::timeout(
+            context,
+            elapsed,
+            status,
+            metal_error,
+        )));
+    }
+    MetalCommandWaitResult::Pending
+}
+
 pub(crate) fn metal_command_failure_requires_release(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<MetalCommandBufferFailure>()
@@ -2075,6 +2130,70 @@ mod tests {
         assert!(error.should_release_buffers());
         assert!(metal_command_failure_requires_release(&anyhow_error));
         assert!(error.to_string().contains("none reported"));
+    }
+
+    #[test]
+    fn command_wait_policy_uses_upstream_shaped_timeout_defaults() {
+        let policy = MetalCommandWaitPolicy::default();
+        assert_eq!(policy.timeout, Duration::from_secs(120));
+        assert_eq!(policy.poll_interval, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn command_wait_resolution_handles_completed_failed_timeout_and_pending() {
+        let context = MetalCommandContext::new("cmd3");
+
+        assert_eq!(
+            resolve_metal_command_wait(
+                &context,
+                Duration::from_millis(4),
+                MetalCommandStatus::Completed,
+                None,
+                false,
+            ),
+            MetalCommandWaitResult::Finished(Ok(()))
+        );
+
+        let failed = resolve_metal_command_wait(
+            &context,
+            Duration::from_millis(5),
+            MetalCommandStatus::Error,
+            Some("encoder failed".to_string()),
+            false,
+        );
+        assert!(matches!(
+            failed,
+            MetalCommandWaitResult::Finished(Err(MetalCommandBufferFailure {
+                kind: MetalCommandFailureKind::Failed,
+                ..
+            }))
+        ));
+
+        let timed_out = resolve_metal_command_wait(
+            &context,
+            Duration::from_secs(120),
+            MetalCommandStatus::Scheduled,
+            Some("still running".to_string()),
+            true,
+        );
+        assert!(matches!(
+            timed_out,
+            MetalCommandWaitResult::Finished(Err(MetalCommandBufferFailure {
+                kind: MetalCommandFailureKind::Timeout,
+                ..
+            }))
+        ));
+
+        assert_eq!(
+            resolve_metal_command_wait(
+                &context,
+                Duration::from_millis(1),
+                MetalCommandStatus::Scheduled,
+                None,
+                false,
+            ),
+            MetalCommandWaitResult::Pending
+        );
     }
 
     #[test]
