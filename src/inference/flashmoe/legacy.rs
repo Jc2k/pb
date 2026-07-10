@@ -4888,19 +4888,17 @@ impl MetalExecutorInner {
             if let (Some(shared), Some(shared_plan)) = (shared_q4, shared_q4_plan) {
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
                 let shared_total_intermediate = shared_plan.total_intermediate;
-                let total_u32 = shared_total_intermediate as u32;
-                let shared_intermediate_u32 = shared_plan.intermediate as u32;
+                let total_u32 = shared_plan.total_intermediate_u32()?;
+                let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
                 let shared_gate_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                let shared_up_out = self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out =
-                    self.buffer_with_len(shared_plan.shared_experts * std::mem::size_of::<f32>())?;
+                let shared_router_out = self.buffer_with_len(shared_plan.router_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
                 let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
                 buffers.push(MetalPhaseBuffer::recyclable(total_buffer));
@@ -4943,19 +4941,17 @@ impl MetalExecutorInner {
                 debug_assert_eq!(shared_plan.source, MetalCmd3SharedPhaseSource::Dense);
                 let shared_metal = shared_metal.context("missing Metal shared expert buffers")?;
                 let shared_total_intermediate = shared_plan.total_intermediate;
-                let total_u32 = shared_total_intermediate as u32;
-                let shared_intermediate_u32 = shared_plan.intermediate as u32;
+                let total_u32 = shared_plan.total_intermediate_u32()?;
+                let shared_intermediate_u32 = shared_plan.intermediate_u32()?;
                 let shared_gate_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_gate_out));
-                let shared_up_out =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                let shared_up_out = self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_up_out));
-                let shared_router_out =
-                    self.buffer_with_len(shared_plan.shared_experts * std::mem::size_of::<f32>())?;
+                let shared_router_out = self.buffer_with_len(shared_plan.router_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_router_out));
                 let shared_activated =
-                    self.buffer_with_len(shared_total_intermediate * std::mem::size_of::<f32>())?;
+                    self.buffer_with_len(shared_plan.projection_output_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(shared_activated));
                 let total_buffer = self.buffer_with_bytes(u32_as_bytes(&total_u32))?;
                 buffers.push(MetalPhaseBuffer::recyclable(total_buffer));

@@ -1113,6 +1113,22 @@ impl MetalCmd3SharedPhasePlan {
         Self::from_shape(MetalCmd3SharedPhaseSource::ResidentQ4, width, shape)
     }
 
+    pub(crate) fn total_intermediate_u32(self) -> anyhow::Result<u32> {
+        Self::usize_to_u32("total intermediate width", self.total_intermediate)
+    }
+
+    pub(crate) fn intermediate_u32(self) -> anyhow::Result<u32> {
+        Self::usize_to_u32("per-shared-expert intermediate width", self.intermediate)
+    }
+
+    pub(crate) fn projection_output_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("projection output", self.total_intermediate)
+    }
+
+    pub(crate) fn router_output_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("router output", self.shared_experts)
+    }
+
     fn from_shape(
         source: MetalCmd3SharedPhaseSource,
         width: usize,
@@ -1125,6 +1141,8 @@ impl MetalCmd3SharedPhasePlan {
                 width
             );
         }
+        Self::usize_to_u32("total intermediate width", shape.total_intermediate)?;
+        Self::usize_to_u32("per-shared-expert intermediate width", shape.intermediate)?;
         Ok(Self {
             source,
             width,
@@ -1132,6 +1150,22 @@ impl MetalCmd3SharedPhasePlan {
             intermediate: shape.intermediate,
             total_intermediate: shape.total_intermediate,
         })
+    }
+
+    fn usize_to_u32(label: &str, value: usize) -> anyhow::Result<u32> {
+        u32::try_from(value).map_err(|_| {
+            anyhow::anyhow!(
+                "FlashMoe Metal CMD3 shared expert {label} {value} does not fit Metal u32 constants"
+            )
+        })
+    }
+
+    fn f32_bytes(label: &str, items: usize) -> anyhow::Result<usize> {
+        items
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("FlashMoe Metal CMD3 shared expert {label} byte size overflow")
+            })
     }
 }
 
@@ -2923,6 +2957,8 @@ mod tests {
     use super::super::scheduler::ScheduledRoutingTopK;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::weights::DenseQ4MmapMatvecProjection;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::super::weights::SharedExpertPhaseShape;
     use super::*;
 
     #[test]
@@ -3419,6 +3455,10 @@ mod tests {
         assert_eq!(plan.shared_experts, 2);
         assert_eq!(plan.intermediate, 3);
         assert_eq!(plan.total_intermediate, 6);
+        assert_eq!(plan.total_intermediate_u32().unwrap(), 6);
+        assert_eq!(plan.intermediate_u32().unwrap(), 3);
+        assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
+        assert_eq!(plan.router_output_bytes().unwrap(), 2 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3441,6 +3481,10 @@ mod tests {
         assert_eq!(plan.shared_experts, 2);
         assert_eq!(plan.intermediate, 3);
         assert_eq!(plan.total_intermediate, 6);
+        assert_eq!(plan.total_intermediate_u32().unwrap(), 6);
+        assert_eq!(plan.intermediate_u32().unwrap(), 3);
+        assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
+        assert_eq!(plan.router_output_bytes().unwrap(), 2 * 4);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3460,6 +3504,15 @@ mod tests {
         let err = MetalCmd3SharedPhasePlan::dense(8, &shared).unwrap_err();
 
         assert!(err.to_string().contains("shared expert width 4"), "{err:#}");
+
+        let huge_shape = SharedExpertPhaseShape::new(1, u32::MAX as usize + 1, 1).unwrap();
+        let huge_err =
+            MetalCmd3SharedPhasePlan::from_shape(MetalCmd3SharedPhaseSource::Dense, 1, huge_shape)
+                .unwrap_err();
+        assert!(
+            huge_err.to_string().contains("does not fit Metal u32"),
+            "{huge_err:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
