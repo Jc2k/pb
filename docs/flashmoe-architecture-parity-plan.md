@@ -188,6 +188,11 @@ Baseline reviewed on 2026-07-10:
   state mutation, gated normalization, output projection, residual/RMS norm, router projection,
   CPU top-k readback, and GPU-resident CMD3 handoff move together. `legacy.rs` retains only the
   model-weight lookup and one builder invocation for this resolved stage.
+- `MetalQ4ProjectionBatchBuilder` now owns the resident-Q4 projection batch used by full-attention
+  CMD1 and deferred state: CPU or GPU input binding, fused compatible-projection dispatch,
+  per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
+  cleanup are one implementation. The three duplicate encoders and fused-batch helper have been
+  removed from `legacy.rs`.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the

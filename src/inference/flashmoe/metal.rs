@@ -43,6 +43,21 @@ pub(crate) type MetalObjcId = *mut c_void;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalSelector = *mut c_void;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MetalMatvecTiming {
+    pub(crate) buffer_upload: Duration,
+    pub(crate) dispatch: Duration,
+    pub(crate) readback: Duration,
+}
+
+impl MetalMatvecTiming {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.buffer_upload += other.buffer_upload;
+        self.dispatch += other.dispatch;
+        self.readback += other.readback;
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalLinearAttentionStaticOffsets {
@@ -2884,6 +2899,761 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 normed_buffer,
             )?)
         }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MetalQ4ProjectionBatchBuilder<'a> {
+    runtime: &'a MetalRuntime,
+    dense_weights: Option<&'a MetalDenseWeights>,
+    buffers: &'a MetalBufferPool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> MetalQ4ProjectionBatchBuilder<'a> {
+    pub(crate) fn new(
+        runtime: &'a MetalRuntime,
+        dense_weights: Option<&'a MetalDenseWeights>,
+        buffers: &'a MetalBufferPool,
+    ) -> Self {
+        Self {
+            runtime,
+            dense_weights,
+            buffers,
+        }
+    }
+
+    unsafe fn buffer_with_bytes(&self, bytes: &[u8]) -> Result<MetalObjcId> {
+        unsafe { self.buffers.buffer_with_bytes(self.runtime.device, bytes) }
+    }
+
+    unsafe fn buffer_with_len(&self, len: usize) -> Result<MetalObjcId> {
+        unsafe { self.buffers.buffer_with_len(self.runtime.device, len) }
+    }
+
+    unsafe fn recycle(&self, buffer: MetalObjcId) {
+        unsafe { self.buffers.recycle(buffer) }
+    }
+
+    fn recycle_or_release_buffers(&self, buffers: &[MetalObjcId], release_only: bool) {
+        self.buffers.recycle_or_release(buffers, release_only);
+    }
+
+    unsafe fn try_encode_q4_mmap_projection_batch(
+        &self,
+        encoder: MetalObjcId,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input_buffer: MetalObjcId,
+        output_buffer: MetalObjcId,
+        output_offsets: &[usize],
+        total_rows: usize,
+        buffers: &mut Vec<MetalObjcId>,
+    ) -> Result<bool> {
+        unsafe {
+            if projections.len() < 2 || output_offsets.len() != projections.len() {
+                return Ok(false);
+            }
+            let Some(dense_weights) = &self.dense_weights else {
+                return Ok(false);
+            };
+            let first = &projections[0];
+            if first.cols == 0 || first.cols > 4096 || first.group_size == 0 {
+                return Ok(false);
+            }
+            let scale_bias_dtype = first.scale_bias_dtype.as_str();
+            if !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_F32)
+                && !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+            {
+                return Ok(false);
+            }
+            if projections.iter().any(|projection| {
+                projection.cols != first.cols
+                    || projection.group_size != first.group_size
+                    || projection.row_packed_bytes != first.row_packed_bytes
+                    || !projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(scale_bias_dtype)
+            }) {
+                return Ok(false);
+            }
+
+            let packed_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.packed_byte_offset)
+                .collect();
+            let scale_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.scales_byte_offset)
+                .collect();
+            let bias_offsets: Vec<u64> = projections
+                .iter()
+                .map(|projection| projection.biases_byte_offset)
+                .collect();
+            let row_offsets: Vec<u32> = output_offsets
+                .iter()
+                .map(|offset| u32::try_from(*offset))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch row offset does not fit u32")?;
+            let rows: Vec<u32> = projections
+                .iter()
+                .map(|projection| u32::try_from(projection.rows))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch row count does not fit u32")?;
+            let groups_per_rows: Vec<u32> = projections
+                .iter()
+                .map(|projection| u32::try_from(projection.groups_per_row))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dense q4 mmap batch group count does not fit u32")?;
+            let projection_count = u32::try_from(projections.len())
+                .context("dense q4 mmap batch projection count does not fit u32")?;
+            let cols = first.cols as u32;
+            let group_size = first.group_size as u32;
+
+            let packed_offsets_buffer =
+                self.buffer_with_bytes(u64_as_bytes_slice(&packed_offsets))?;
+            let scale_offsets_buffer =
+                self.buffer_with_bytes(u64_as_bytes_slice(&scale_offsets))?;
+            let bias_offsets_buffer = self.buffer_with_bytes(u64_as_bytes_slice(&bias_offsets))?;
+            let row_offsets_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&row_offsets))?;
+            let rows_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&rows))?;
+            let groups_buffer = self.buffer_with_bytes(u32_as_bytes_slice(&groups_per_rows))?;
+            buffers.extend_from_slice(&[
+                packed_offsets_buffer,
+                scale_offsets_buffer,
+                bias_offsets_buffer,
+                row_offsets_buffer,
+                rows_buffer,
+                groups_buffer,
+            ]);
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                if scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16) {
+                    self.pipelines.q4_mmap_batch_bf16_scale_bias_pipeline
+                } else {
+                    self.pipelines.q4_mmap_batch_pipeline
+                },
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_buffer(encoder, packed_offsets_buffer, 3);
+            set_buffer(encoder, scale_offsets_buffer, 4);
+            set_buffer(encoder, bias_offsets_buffer, 5);
+            set_buffer(encoder, row_offsets_buffer, 6);
+            set_buffer(encoder, rows_buffer, 7);
+            set_buffer(encoder, groups_buffer, 8);
+            set_bytes(encoder, u32_as_bytes(&projection_count), 9);
+            set_bytes(encoder, u32_as_bytes(&cols), 10);
+            set_bytes(encoder, u32_as_bytes(&group_size), 11);
+            dispatch_q4_mmap_threadgroups(encoder, total_rows as u64);
+            Ok(true)
+        }
+    }
+
+    pub(crate) fn execute_to_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((
+                MetalProjectionBatch::empty(),
+                MetalMatvecTiming::default(),
+                0,
+            )));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let input_len = input.len();
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        let mut output_widths = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len {
+                bail!(
+                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input_len,
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                bail!(
+                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
+                    projection.tensor_name,
+                    projection.row_packed_bytes,
+                    projection.cols
+                );
+            }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("dense q4 mmap batch packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("dense q4 mmap batch group byte length overflow")?;
+            for (offset, len, label) in [
+                (projection.packed_byte_offset, packed_len, "packed"),
+                (projection.scales_byte_offset, group_bytes, "scales"),
+                (projection.biases_byte_offset, group_bytes, "biases"),
+            ] {
+                let offset = usize::try_from(offset).with_context(|| {
+                    format!(
+                        "dense q4 mmap batch {label} offset for {} does not fit usize",
+                        projection.tensor_name
+                    )
+                })?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense q4 mmap batch output row count overflow")?;
+            output_offsets.push(output_offset);
+            output_widths.push(projection.output_width);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let (input_buffer, owned_input_buffer) = match input {
+                MetalBatchProjectionInput::Cpu(input) => {
+                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+                    (buffer, Some(buffer))
+                }
+                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
+            };
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle(buffer);
+                }
+                self.recycle(output_buffer);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
+            }
+
+            let mut transient_buffers = Vec::new();
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut transient_buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.pipelines.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch_buffer")
+                .with("projections", projections.len())
+                .with("dispatches", dispatch_count)
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                for buffer in transient_buffers {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
+                }
+                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            release(encoder);
+            release(command_buffer);
+            if let Some(buffer) = owned_input_buffer {
+                self.recycle(buffer);
+            }
+            for buffer in transient_buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((
+                MetalProjectionBatch::new(output_buffer, output_offsets, output_widths, total_rows),
+                timing,
+                projections.len(),
+            )))
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input.len() {
+                bail!(
+                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input.len(),
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                bail!(
+                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
+                    projection.tensor_name,
+                    projection.row_packed_bytes,
+                    projection.cols
+                );
+            }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("dense q4 mmap batch packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("dense q4 mmap batch group byte length overflow")?;
+            for (offset, len, label) in [
+                (projection.packed_byte_offset, packed_len, "packed"),
+                (projection.scales_byte_offset, group_bytes, "scales"),
+                (projection.biases_byte_offset, group_bytes, "biases"),
+            ] {
+                let offset = usize::try_from(offset).with_context(|| {
+                    format!(
+                        "dense q4 mmap batch {label} offset for {} does not fit usize",
+                        projection.tensor_name
+                    )
+                })?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense q4 mmap batch output row count overflow")?;
+            output_offsets.push(output_offset);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![input_buffer, output_buffer];
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
+            }
+
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.pipelines.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch")
+                .with("projections", projections.len())
+                .with("dispatches", dispatch_count)
+                .with("rows", total_rows)
+                .with("input_len", input.len())
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            timing.readback += readback_started.elapsed();
+
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, output_offset) in projections.iter().zip(output_offsets.iter()) {
+                let start = *output_offset;
+                let end = start + projection.rows;
+                let mut output = vec![0.0f32; projection.output_width];
+                output[..projection.rows].copy_from_slice(&packed_output[start..end]);
+                outputs.push(output);
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((outputs, timing, dispatch_count)))
+        }
+    }
+
+    pub(crate) fn execute_with_input_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input_buffer: MetalObjcId,
+        input_len: usize,
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if projection.rows == 0 || projection.cols == 0 {
+                return Ok(None);
+            }
+            if projection.cols != input_len {
+                bail!(
+                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
+                    projection.tensor_name,
+                    input_len,
+                    projection.cols
+                );
+            }
+            if projection.output_width != projection.rows {
+                bail!(
+                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
+                    projection.tensor_name,
+                    projection.output_width,
+                    projection.rows
+                );
+            }
+            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
+                bail!(
+                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
+                    projection.tensor_name,
+                    projection.row_packed_bytes,
+                    projection.cols
+                );
+            }
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
+            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
+                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
+            {
+                return Ok(None);
+            }
+            let packed_len = projection
+                .rows
+                .checked_mul(projection.row_packed_bytes)
+                .context("dense q4 mmap batch packed byte length overflow")?;
+            let group_bytes = projection
+                .rows
+                .checked_mul(projection.groups_per_row)
+                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
+                .context("dense q4 mmap batch group byte length overflow")?;
+            for (offset, len, label) in [
+                (projection.packed_byte_offset, packed_len, "packed"),
+                (projection.scales_byte_offset, group_bytes, "scales"),
+                (projection.biases_byte_offset, group_bytes, "biases"),
+            ] {
+                let offset = usize::try_from(offset).with_context(|| {
+                    format!(
+                        "dense q4 mmap batch {label} offset for {} does not fit usize",
+                        projection.tensor_name
+                    )
+                })?;
+                if offset
+                    .checked_add(len)
+                    .map_or(true, |end| end > dense_weights.len)
+                {
+                    return Ok(None);
+                }
+            }
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows)
+                .context("dense q4 mmap batch output row count overflow")?;
+            output_offsets.push(output_offset);
+        }
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![output_buffer];
+            timing.buffer_upload += upload_started.elapsed();
+
+            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
+            }
+
+            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                projections,
+                input_buffer,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut buffers,
+            )? {
+                1
+            } else {
+                for (idx, projection) in projections.iter().enumerate() {
+                    let output_offset = output_offsets[idx]
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("dense q4 mmap batch output byte offset overflow")?
+                        as u64;
+                    let rows_u32 = projection.rows as u32;
+                    let cols_u32 = projection.cols as u32;
+                    let groups_u32 = projection.groups_per_row as u32;
+                    let group_size_u32 = projection.group_size as u32;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        if projection
+                            .scale_bias_dtype
+                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+                        {
+                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
+                        } else {
+                            self.pipelines.q4_mmap_pipeline
+                        },
+                    );
+                    set_buffer(encoder, dense_weights.buffer, 0);
+                    set_buffer(encoder, input_buffer, 1);
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
+                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                }
+                projections.len()
+            };
+            msg_send_void0(encoder, sel("endEncoding"));
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(|projection| projection.tensor_name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch_deferred_input")
+                .with("projections", projections.len())
+                .with("dispatches", dispatch_count)
+                .with("rows", total_rows)
+                .with("input_len", input_len)
+                .with("tensors", names);
+            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
+                release(encoder);
+                release(command_buffer);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            timing.readback += readback_started.elapsed();
+
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, output_offset) in projections.iter().zip(output_offsets.iter()) {
+                let start = *output_offset;
+                let end = start + projection.rows;
+                let mut output = vec![0.0f32; projection.output_width];
+                output[..projection.rows].copy_from_slice(&packed_output[start..end]);
+                outputs.push(output);
+            }
+
+            release(encoder);
+            release(command_buffer);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((outputs, timing, dispatch_count)))
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for MetalQ4ProjectionBatchBuilder<'_> {
+    type Target = MetalRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
     }
 }
 
