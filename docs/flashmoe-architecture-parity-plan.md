@@ -119,8 +119,9 @@ The validator should reject silent fallbacks such as:
 - `experts.rs` now owns fixed-slot metadata, the runtime `ExpertSlotStore`, layer reader opening,
   positioned reads, reusable whole-expert buffers, raw expert payload responses, and the expert read
   worker pool. Production store opening resolves through the model layout; default Qwen3.5 raw
-  multi-read helpers are kept test-only. PBQ4 remains import/build compatibility; execution reads
-  are moving toward fixed whole-expert slots.
+  multi-read helpers are kept test-only. Packed expert tensor records and PBQ4-to-fixed-Q4
+  compatibility conversion now live with expert storage instead of the legacy runtime. PBQ4 remains
+  import/build compatibility; execution reads are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -195,7 +196,8 @@ The validator should reject silent fallbacks such as:
 - `legacy.rs` remains the center of gravity. New architecture work should extract ownership
   boundaries from it instead of adding more production paths inside it.
 - The runtime has both fixed-slot Q4 concepts and older PBQ4/component concepts. PBQ4 should become
-  import/build compatibility only; execution should consume typed whole-expert slots.
+  import/build compatibility only; its packed tensor data model and fixed-slot conversion now live in
+  `experts`, while execution should consume typed whole-expert slots.
 - Fallbacks are not yet consistently modeled as errors. Any branch that silently changes dtype,
   buffer ownership, scheduler, or CPU/GPU placement hides missing implementation work and must be
   made explicit.
