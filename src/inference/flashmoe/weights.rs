@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::experts::{
     AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertSourceTensor,
@@ -1349,6 +1349,129 @@ where
     Ok(Some(shared))
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SharedExpertPhaseCache {
+    dense: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    q4: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseQ4Projections>>>,
+}
+
+impl SharedExpertPhaseCache {
+    pub(crate) fn dense<F>(
+        &self,
+        layer: usize,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+        lookup: F,
+    ) -> Result<Option<Arc<SharedExpertPhaseWeights>>>
+    where
+        F: FnMut(&str) -> Result<Option<Arc<Vec<f32>>>>,
+    {
+        if shared_experts == 0 || intermediate == 0 {
+            return Ok(None);
+        }
+        if let Some(shared) = self.cached_dense(layer, width)? {
+            return Ok(Some(shared));
+        }
+
+        let Some(shared) =
+            build_shared_expert_phase_weights(layer, width, shared_experts, intermediate, lookup)?
+        else {
+            return Ok(None);
+        };
+        let shared = Arc::new(shared);
+        let mut cache = self.dense.lock().expect("shared expert cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            validate_cached_shared_width("shared expert tensors", layer, existing.width, width)?;
+            Ok(Some(existing))
+        } else {
+            cache.insert(layer, shared.clone());
+            Ok(Some(shared))
+        }
+    }
+
+    fn cached_dense(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<Arc<SharedExpertPhaseWeights>>> {
+        let cache = self.dense.lock().expect("shared expert cache poisoned");
+        let Some(shared) = cache.get(&layer).cloned() else {
+            return Ok(None);
+        };
+        validate_cached_shared_width("shared expert tensors", layer, shared.width, width)?;
+        Ok(Some(shared))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn q4<F>(
+        &self,
+        layer: usize,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+        load: F,
+    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>>
+    where
+        F: FnOnce(usize, usize, usize, usize) -> Result<Option<SharedExpertPhaseQ4Projections>>,
+    {
+        if shared_experts == 0 || intermediate == 0 {
+            return Ok(None);
+        }
+        if let Some(shared) = self.cached_q4(layer, width)? {
+            return Ok(Some(shared));
+        }
+
+        let Some(shared) = load(layer, width, shared_experts, intermediate)? else {
+            return Ok(None);
+        };
+        shared.validated_shape()?;
+        let shared = Arc::new(shared);
+        let mut cache = self.q4.lock().expect("shared q4 expert cache poisoned");
+        if let Some(existing) = cache.get(&layer).cloned() {
+            validate_cached_shared_width(
+                "shared q4 expert projections",
+                layer,
+                existing.width,
+                width,
+            )?;
+            Ok(Some(existing))
+        } else {
+            cache.insert(layer, shared.clone());
+            Ok(Some(shared))
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn cached_q4(
+        &self,
+        layer: usize,
+        width: usize,
+    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
+        let cache = self.q4.lock().expect("shared q4 expert cache poisoned");
+        let Some(shared) = cache.get(&layer).cloned() else {
+            return Ok(None);
+        };
+        validate_cached_shared_width("shared q4 expert projections", layer, shared.width, width)?;
+        Ok(Some(shared))
+    }
+}
+
+fn validate_cached_shared_width(
+    label: &str,
+    layer: usize,
+    cached_width: usize,
+    requested_width: usize,
+) -> Result<()> {
+    if cached_width != requested_width {
+        bail!(
+            "cached {label} for layer {layer} have width {cached_width}, requested {requested_width}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2021,6 +2144,96 @@ mod tests {
         })
         .unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn shared_expert_phase_cache_reuses_weight_owned_dense_phase() {
+        let cache = SharedExpertPhaseCache::default();
+        let mut tensors = BTreeMap::<String, Arc<Vec<f32>>>::new();
+        tensors.insert(
+            shared_expert_tensor_name(3, "gate_proj"),
+            Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "up_proj"),
+            Arc::new(vec![5.0, 6.0, 7.0, 8.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "down_proj"),
+            Arc::new(vec![9.0, 10.0, 11.0, 12.0]),
+        );
+        tensors.insert(
+            shared_expert_gate_tensor_name(3),
+            Arc::new(vec![13.0, 14.0]),
+        );
+        let mut lookup_count = 0usize;
+
+        let first = cache
+            .dense(3, 2, 1, 2, |name| {
+                lookup_count += 1;
+                Ok(tensors.get(name).cloned())
+            })
+            .unwrap()
+            .unwrap();
+        let second = cache
+            .dense(3, 2, 1, 2, |_| {
+                panic!("cached shared expert phase must not reload tensors")
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(lookup_count, 4);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn shared_expert_phase_cache_skips_disabled_shared_experts() {
+        let cache = SharedExpertPhaseCache::default();
+
+        let none = cache
+            .dense(3, 2, 0, 2, |_| {
+                panic!("disabled shared experts must not request tensors")
+            })
+            .unwrap();
+
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn shared_expert_phase_cache_rejects_width_mismatch_without_reload() {
+        let cache = SharedExpertPhaseCache::default();
+        let mut tensors = BTreeMap::<String, Arc<Vec<f32>>>::new();
+        tensors.insert(
+            shared_expert_tensor_name(3, "gate_proj"),
+            Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "up_proj"),
+            Arc::new(vec![5.0, 6.0, 7.0, 8.0]),
+        );
+        tensors.insert(
+            shared_expert_tensor_name(3, "down_proj"),
+            Arc::new(vec![9.0, 10.0, 11.0, 12.0]),
+        );
+        tensors.insert(
+            shared_expert_gate_tensor_name(3),
+            Arc::new(vec![13.0, 14.0]),
+        );
+
+        cache
+            .dense(3, 2, 1, 2, |name| Ok(tensors.get(name).cloned()))
+            .unwrap()
+            .unwrap();
+        let err = cache
+            .dense(3, 4, 1, 2, |_| {
+                panic!("mismatched cached shared expert phase must fail before reload")
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cached shared expert tensors for layer 3 have width 2, requested 4")
+        );
     }
 
     #[test]

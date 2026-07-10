@@ -188,8 +188,9 @@ The validator should reject silent fallbacks such as:
   `weights`; full-attention and linear-attention CMD1 projection request groups are weight-owned
   descriptors used by the legacy bridge.
   Dense shared-expert weight assembly and Q4 shared-expert projection assembly now use the same
-  weight-owned shape validation with runtime lookup callbacks. CMD2 Q4 post-attention prep
-  projection assembly now also resolves as a typed weight-owned out-projection/router bundle before
+  weight-owned shape validation with runtime lookup callbacks, and shared-expert phase cache/reuse
+  policy is owned by `weights` instead of the engine. CMD2 Q4 post-attention prep projection
+  assembly now also resolves as a typed weight-owned out-projection/router bundle before
   the Metal helper runs. Router score projection descriptor lookup also lives in `weights` behind a
   registry callback, and Metal router topK now consumes that
   same declared dense/Q4 binding instead of re-resolving router layouts in the legacy helper. The

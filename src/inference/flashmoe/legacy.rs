@@ -139,10 +139,10 @@ use super::weights::{
     DenseQ4ProjectionKey, DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
     ResidentStaticTensorRef, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
     RouterScoreProjectionExecution, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
-    build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
-    build_router_score_projection_descriptor, build_shared_expert_phase_weights,
+    SharedExpertPhaseCache, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry, apply_qwen3next_norm_offset_if_needed,
+    attention_tensor_name, build_cmd2_q4_post_attention_prep_projections,
+    build_dense_q4_mmap_projection, build_router_score_projection_descriptor,
     build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
     dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
     layer_norm_tensor_name, linear_attention_input_projection_requests,
@@ -1459,9 +1459,7 @@ where
         scheduled_graph,
         routing_policy,
         runtime,
-        shared_expert_cache: Mutex::new(BTreeMap::new()),
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
+        shared_expert_phases: SharedExpertPhaseCache::default(),
         linear_attention_cache: Mutex::new(BTreeMap::new()),
         session_cache: BTreeMap::new(),
     })
@@ -1481,9 +1479,7 @@ pub struct FlashMoeEngine {
     scheduled_graph: FlashMoeScheduledGraph,
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
-    shared_expert_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    shared_expert_q4_cache: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseQ4Projections>>>,
+    shared_expert_phases: SharedExpertPhaseCache,
     linear_attention_cache: Mutex<BTreeMap<usize, Arc<LinearAttentionStaticWeights>>>,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
@@ -11746,43 +11742,13 @@ impl FlashMoeEngine {
         layer: usize,
         width: usize,
     ) -> Result<Option<Arc<SharedExpertPhaseWeights>>> {
-        let num_shared = self.config.shared_experts();
-        let shared_inter = self.config.shared_expert_intermediate_size();
-        if num_shared == 0 || shared_inter == 0 {
-            return Ok(None);
-        }
-        {
-            let cache = self
-                .shared_expert_cache
-                .lock()
-                .expect("shared expert cache poisoned");
-            if let Some(shared) = cache.get(&layer).cloned() {
-                if shared.width != width {
-                    bail!(
-                        "cached shared expert tensors for layer {layer} have width {}, requested {width}",
-                        shared.width
-                    );
-                }
-                return Ok(Some(shared));
-            }
-        }
-        let shared = Arc::new(self.load_shared_expert_phase_weights(layer, width)?);
-        let mut cache = self
-            .shared_expert_cache
-            .lock()
-            .expect("shared expert cache poisoned");
-        if let Some(existing) = cache.get(&layer).cloned() {
-            if existing.width != width {
-                bail!(
-                    "cached shared expert tensors for layer {layer} have width {}, requested {width}",
-                    existing.width
-                );
-            }
-            Ok(Some(existing))
-        } else {
-            cache.insert(layer, shared.clone());
-            Ok(Some(shared))
-        }
+        self.shared_expert_phases.dense(
+            layer,
+            width,
+            self.config.shared_experts(),
+            self.config.shared_expert_intermediate_size(),
+            |name| self.dense.read_full_tensor_f32_cached(name),
+        )
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -11791,67 +11757,20 @@ impl FlashMoeEngine {
         layer: usize,
         width: usize,
     ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
-        let num_shared = self.config.shared_experts();
-        let shared_inter = self.config.shared_expert_intermediate_size();
-        if num_shared == 0 || shared_inter == 0 {
-            return Ok(None);
-        }
-        {
-            let cache = self
-                .shared_expert_q4_cache
-                .lock()
-                .expect("shared q4 expert cache poisoned");
-            if let Some(shared) = cache.get(&layer).cloned() {
-                if shared.width != width {
-                    bail!(
-                        "cached shared q4 expert projections for layer {layer} have width {}, requested {width}",
-                        shared.width
-                    );
-                }
-                return Ok(Some(shared));
-            }
-        }
-        let Some(shared) = self.dense.shared_expert_q4_phase_projections(
-            layer,
-            width,
-            num_shared,
-            shared_inter,
-        )?
-        else {
-            return Ok(None);
-        };
-        let shared = Arc::new(shared);
-        let mut cache = self
-            .shared_expert_q4_cache
-            .lock()
-            .expect("shared q4 expert cache poisoned");
-        if let Some(existing) = cache.get(&layer).cloned() {
-            if existing.width != width {
-                bail!(
-                    "cached shared q4 expert projections for layer {layer} have width {}, requested {width}",
-                    existing.width
-                );
-            }
-            Ok(Some(existing))
-        } else {
-            cache.insert(layer, shared.clone());
-            Ok(Some(shared))
-        }
-    }
-
-    fn load_shared_expert_phase_weights(
-        &self,
-        layer: usize,
-        width: usize,
-    ) -> Result<SharedExpertPhaseWeights> {
-        build_shared_expert_phase_weights(
+        self.shared_expert_phases.q4(
             layer,
             width,
             self.config.shared_experts(),
             self.config.shared_expert_intermediate_size(),
-            |name| self.dense.read_full_tensor_f32_cached(name),
-        )?
-        .with_context(|| format!("shared experts are not configured for layer {layer}"))
+            |layer, width, shared_experts, intermediate| {
+                self.dense.shared_expert_q4_phase_projections(
+                    layer,
+                    width,
+                    shared_experts,
+                    intermediate,
+                )
+            },
+        )
     }
 
     #[cfg(test)]
@@ -30424,9 +30343,7 @@ mod tests {
             scheduled_graph,
             routing_policy,
             runtime,
-            shared_expert_cache: Mutex::new(BTreeMap::new()),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
+            shared_expert_phases: SharedExpertPhaseCache::default(),
             linear_attention_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
@@ -30661,8 +30578,7 @@ mod tests {
             scheduled_graph,
             routing_policy,
             runtime,
-            shared_expert_cache: Mutex::new(BTreeMap::new()),
-            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
+            shared_expert_phases: SharedExpertPhaseCache::default(),
             linear_attention_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
@@ -32084,9 +32000,7 @@ mod tests {
             scheduled_graph,
             routing_policy,
             runtime,
-            shared_expert_cache: Mutex::new(BTreeMap::new()),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            shared_expert_q4_cache: Mutex::new(BTreeMap::new()),
+            shared_expert_phases: SharedExpertPhaseCache::default(),
             linear_attention_cache: Mutex::new(BTreeMap::new()),
             vision_encoder: None,
             session_cache: BTreeMap::new(),
