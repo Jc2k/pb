@@ -747,6 +747,10 @@ pub(crate) fn shared_expert_gate_tensor_name(layer: usize) -> String {
     format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
 }
 
+pub(crate) fn attention_tensor_name(layer: usize, projection: &str) -> String {
+    format!("model.layers.{layer}.self_attn.{projection}.weight")
+}
+
 pub(crate) fn linear_attention_tensor_name(layer: usize, projection: &str) -> String {
     format!("model.layers.{layer}.linear_attn.{projection}.weight")
 }
@@ -762,19 +766,90 @@ pub(crate) struct DenseProjectionRequest<'a> {
 }
 
 impl<'a> DenseProjectionRequest<'a> {
-    #[cfg(test)]
-    pub(crate) fn new(tensor_name: &'a str, output_width: usize) -> Result<Self> {
+    fn validate(tensor_name: &str, output_width: usize) -> Result<()> {
         if tensor_name.is_empty() {
             bail!("FlashMoe dense projection request requires a tensor name");
         }
         if output_width == 0 {
             bail!("FlashMoe dense projection request requires non-zero output width");
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(tensor_name: &'a str, output_width: usize) -> Result<Self> {
+        Self::validate(tensor_name, output_width)?;
         Ok(Self {
             tensor_name,
             output_width,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DenseProjectionRequestGroup<const N: usize> {
+    tensor_names: [String; N],
+    output_widths: [usize; N],
+}
+
+impl<const N: usize> DenseProjectionRequestGroup<N> {
+    fn new(tensor_names: [String; N], output_widths: [usize; N]) -> Result<Self> {
+        for (tensor_name, output_width) in tensor_names.iter().zip(output_widths.iter().copied()) {
+            DenseProjectionRequest::validate(tensor_name, output_width)?;
+        }
+        Ok(Self {
+            tensor_names,
+            output_widths,
+        })
+    }
+
+    pub(crate) fn requests(&self) -> [DenseProjectionRequest<'_>; N] {
+        std::array::from_fn(|idx| DenseProjectionRequest {
+            tensor_name: &self.tensor_names[idx],
+            output_width: self.output_widths[idx],
+        })
+    }
+
+    pub(crate) fn tensor_name(&self, idx: usize) -> &str {
+        &self.tensor_names[idx]
+    }
+}
+
+pub(crate) fn full_attention_input_projection_requests(
+    layer: usize,
+    q_projection_width: usize,
+    kv_width: usize,
+) -> Result<DenseProjectionRequestGroup<3>> {
+    DenseProjectionRequestGroup::new(
+        [
+            attention_tensor_name(layer, "q_proj"),
+            attention_tensor_name(layer, "k_proj"),
+            attention_tensor_name(layer, "v_proj"),
+        ],
+        [q_projection_width, kv_width, kv_width],
+    )
+}
+
+pub(crate) fn linear_attention_input_projection_requests(
+    layer: usize,
+    conv_dim: usize,
+    total_value_width: usize,
+    num_value_heads: usize,
+) -> Result<DenseProjectionRequestGroup<4>> {
+    DenseProjectionRequestGroup::new(
+        [
+            linear_attention_tensor_name(layer, "in_proj_qkv"),
+            linear_attention_tensor_name(layer, "in_proj_z"),
+            linear_attention_tensor_name(layer, "in_proj_b"),
+            linear_attention_tensor_name(layer, "in_proj_a"),
+        ],
+        [
+            conv_dim,
+            total_value_width,
+            num_value_heads,
+            num_value_heads,
+        ],
+    )
 }
 
 pub(crate) fn prepare_scheduled_next_norm_weights<F>(
@@ -2237,6 +2312,14 @@ mod tests {
             layer_norm_tensor_name(7, "post_attention_layernorm"),
             "model.layers.7.post_attention_layernorm.weight"
         );
+        assert_eq!(
+            attention_tensor_name(7, "q_proj"),
+            "model.layers.7.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            attention_tensor_name(7, "o_proj"),
+            "model.layers.7.self_attn.o_proj.weight"
+        );
         assert_eq!(router_tensor_name(7), "model.layers.7.mlp.gate.weight");
         assert_eq!(
             shared_expert_tensor_name(7, "gate_proj"),
@@ -2283,6 +2366,60 @@ mod tests {
             DenseProjectionRequest::new("model.layers.7.linear_attn.in_proj_qkv.weight", 0)
                 .unwrap_err();
         assert!(zero_width.to_string().contains("non-zero output width"));
+    }
+
+    #[test]
+    fn full_attention_projection_requests_use_canonical_self_attention_names() {
+        let requests = full_attention_input_projection_requests(3, 24, 8).unwrap();
+        let specs = requests.requests();
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.tensor_name, spec.output_width))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model.layers.3.self_attn.q_proj.weight", 24),
+                ("model.layers.3.self_attn.k_proj.weight", 8),
+                ("model.layers.3.self_attn.v_proj.weight", 8),
+            ]
+        );
+        assert_eq!(
+            requests.tensor_name(0),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
+    }
+
+    #[test]
+    fn linear_attention_projection_requests_use_canonical_gated_delta_names() {
+        let requests = linear_attention_input_projection_requests(5, 16, 32, 4).unwrap();
+        let specs = requests.requests();
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.tensor_name, spec.output_width))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model.layers.5.linear_attn.in_proj_qkv.weight", 16),
+                ("model.layers.5.linear_attn.in_proj_z.weight", 32),
+                ("model.layers.5.linear_attn.in_proj_b.weight", 4),
+                ("model.layers.5.linear_attn.in_proj_a.weight", 4),
+            ]
+        );
+        assert_eq!(
+            requests.tensor_name(3),
+            "model.layers.5.linear_attn.in_proj_a.weight"
+        );
+    }
+
+    #[test]
+    fn projection_request_groups_reject_zero_width_without_fallback() {
+        let full = full_attention_input_projection_requests(3, 0, 8).unwrap_err();
+        assert!(full.to_string().contains("non-zero output width"));
+
+        let linear = linear_attention_input_projection_requests(5, 16, 32, 0).unwrap_err();
+        assert!(linear.to_string().contains("non-zero output width"));
     }
 
     #[test]

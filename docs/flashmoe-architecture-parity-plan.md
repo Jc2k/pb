@@ -183,9 +183,10 @@ The validator should reject silent fallbacks such as:
   the router score batch data model. The generic resident Q4 mmap projection cache now keys and
   builds descriptors through `weights` with a registry callback. Shared expert dense/Q4 descriptor
   groups now validate and expose their graph shape before the scheduler accepts them. Canonical
-  router, shared expert, linear-attention, and CMD3 next-layer norm tensor naming, Qwen3Next
-  norm-offset policy, and prepared scheduled next-norm descriptors also live in `weights`;
-  linear-attention projection requests are weight-owned descriptors used by the legacy bridge.
+  router, shared expert, full-attention, linear-attention, and CMD3 next-layer norm tensor naming,
+  Qwen3Next norm-offset policy, and prepared scheduled next-norm descriptors also live in
+  `weights`; full-attention and linear-attention CMD1 projection request groups are weight-owned
+  descriptors used by the legacy bridge.
   Dense shared-expert weight assembly and Q4 shared-expert projection assembly now use the same
   weight-owned shape validation with runtime lookup callbacks. CMD2 Q4 post-attention prep
   projection assembly now also resolves as a typed weight-owned out-projection/router bundle before

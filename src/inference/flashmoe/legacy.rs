@@ -140,11 +140,12 @@ use super::weights::{
     ResidentStaticTensorRef, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
     RouterScoreProjectionExecution, RouterScoreProjectionExecutionKind, RuntimeTensorEntry,
     SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights, TENSOR_ALIGNMENT, TensorQuantization,
-    TensorRegistry, apply_qwen3next_norm_offset_if_needed,
+    TensorRegistry, apply_qwen3next_norm_offset_if_needed, attention_tensor_name,
     build_cmd2_q4_post_attention_prep_projections, build_dense_q4_mmap_projection,
     build_router_score_projection_descriptor, build_shared_expert_phase_weights,
     build_shared_expert_q4_phase_projections, canonical_hf_tensor_name,
-    dense_q4_layout_with_scale_bias_dtype, layer_norm_tensor_name,
+    dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
+    layer_norm_tensor_name, linear_attention_input_projection_requests,
     linear_attention_scalar_tensor_name, linear_attention_tensor_name,
     prepare_scheduled_next_norm_weights, qwen3next_norm_uses_offset, router_tensor_name,
     shared_expert_gate_tensor_name, shared_expert_tensor_name, validate_dense_matvec_shape,
@@ -10976,25 +10977,13 @@ impl FlashMoeEngine {
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Vec<f32>> {
         let layout = runtime.full_attention_layout(layer)?;
-        let q_name = attention_tensor_name(layer, "q_proj");
-        let k_name = attention_tensor_name(layer, "k_proj");
-        let v_name = attention_tensor_name(layer, "v_proj");
-
         let subphase_started = Instant::now();
-        let input_specs = [
-            DenseProjectionRequest {
-                tensor_name: &q_name,
-                output_width: layout.q_projection_width,
-            },
-            DenseProjectionRequest {
-                tensor_name: &k_name,
-                output_width: layout.kv_width,
-            },
-            DenseProjectionRequest {
-                tensor_name: &v_name,
-                output_width: layout.kv_width,
-            },
-        ];
+        let input_requests = full_attention_input_projection_requests(
+            layer,
+            layout.q_projection_width,
+            layout.kv_width,
+        )?;
+        let input_specs = input_requests.requests();
         let mut batched_input_projections = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let (Some(metal), Some(input)) = (self.metal.as_ref(), deferred_input) {
@@ -11196,28 +11185,15 @@ impl FlashMoeEngine {
             let Ok(layout) = runtime.linear_attention_layout(layer) else {
                 return false;
             };
-            let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
-            let z_name = linear_attention_tensor_name(layer, "in_proj_z");
-            let b_name = linear_attention_tensor_name(layer, "in_proj_b");
-            let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-            let specs = [
-                DenseProjectionRequest {
-                    tensor_name: &qkv_name,
-                    output_width: layout.conv_dim,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &z_name,
-                    output_width: layout.total_value_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &b_name,
-                    output_width: layout.num_value_heads,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &a_name,
-                    output_width: layout.num_value_heads,
-                },
-            ];
+            let Ok(input_requests) = linear_attention_input_projection_requests(
+                layer,
+                layout.conv_dim,
+                layout.total_value_width,
+                layout.num_value_heads,
+            ) else {
+                return false;
+            };
+            let specs = input_requests.requests();
             self.dense
                 .can_project_dense_tensors_batched_with_metal_input_buffer(
                     metal,
@@ -11228,23 +11204,14 @@ impl FlashMoeEngine {
             let Ok(layout) = runtime.full_attention_layout(layer) else {
                 return false;
             };
-            let q_name = attention_tensor_name(layer, "q_proj");
-            let k_name = attention_tensor_name(layer, "k_proj");
-            let v_name = attention_tensor_name(layer, "v_proj");
-            let specs = [
-                DenseProjectionRequest {
-                    tensor_name: &q_name,
-                    output_width: layout.q_projection_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &k_name,
-                    output_width: layout.kv_width,
-                },
-                DenseProjectionRequest {
-                    tensor_name: &v_name,
-                    output_width: layout.kv_width,
-                },
-            ];
+            let Ok(input_requests) = full_attention_input_projection_requests(
+                layer,
+                layout.q_projection_width,
+                layout.kv_width,
+            ) else {
+                return false;
+            };
+            let specs = input_requests.requests();
             self.dense
                 .can_project_dense_tensors_batched_with_metal_input_buffer(
                     metal,
@@ -11338,28 +11305,13 @@ impl FlashMoeEngine {
         else {
             return Ok(None);
         };
-        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
-        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
-        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
-        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-        let input_specs = [
-            DenseProjectionRequest {
-                tensor_name: &qkv_name,
-                output_width: layout.conv_dim,
-            },
-            DenseProjectionRequest {
-                tensor_name: &z_name,
-                output_width: layout.total_value_width,
-            },
-            DenseProjectionRequest {
-                tensor_name: &b_name,
-                output_width: layout.num_value_heads,
-            },
-            DenseProjectionRequest {
-                tensor_name: &a_name,
-                output_width: layout.num_value_heads,
-            },
-        ];
+        let input_requests = linear_attention_input_projection_requests(
+            layer,
+            layout.conv_dim,
+            layout.total_value_width,
+            layout.num_value_heads,
+        )?;
+        let input_specs = input_requests.requests();
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
                 buffer: input.buffer,
@@ -11418,29 +11370,14 @@ impl FlashMoeEngine {
         if residual_len != runtime.width || residual_len != post_norm_weight.len() {
             return Ok(None);
         }
-        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
-        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
-        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
-        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
         let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
-        let input_specs = [
-            DenseProjectionRequest {
-                tensor_name: &qkv_name,
-                output_width: layout.conv_dim,
-            },
-            DenseProjectionRequest {
-                tensor_name: &z_name,
-                output_width: layout.total_value_width,
-            },
-            DenseProjectionRequest {
-                tensor_name: &b_name,
-                output_width: layout.num_value_heads,
-            },
-            DenseProjectionRequest {
-                tensor_name: &a_name,
-                output_width: layout.num_value_heads,
-            },
-        ];
+        let input_requests = linear_attention_input_projection_requests(
+            layer,
+            layout.conv_dim,
+            layout.total_value_width,
+            layout.num_value_heads,
+        )?;
+        let input_specs = input_requests.requests();
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
                 buffer: input.buffer,
@@ -11485,30 +11422,14 @@ impl FlashMoeEngine {
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Vec<f32>> {
         let layout = runtime.linear_attention_layout(layer)?;
-        let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
-        let z_name = linear_attention_tensor_name(layer, "in_proj_z");
-        let b_name = linear_attention_tensor_name(layer, "in_proj_b");
-        let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-
         let subphase_started = Instant::now();
-        let input_specs = [
-            DenseProjectionRequest {
-                tensor_name: &qkv_name,
-                output_width: layout.conv_dim,
-            },
-            DenseProjectionRequest {
-                tensor_name: &z_name,
-                output_width: layout.total_value_width,
-            },
-            DenseProjectionRequest {
-                tensor_name: &b_name,
-                output_width: layout.num_value_heads,
-            },
-            DenseProjectionRequest {
-                tensor_name: &a_name,
-                output_width: layout.num_value_heads,
-            },
-        ];
+        let input_requests = linear_attention_input_projection_requests(
+            layer,
+            layout.conv_dim,
+            layout.total_value_width,
+            layout.num_value_heads,
+        )?;
+        let input_specs = input_requests.requests();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(metal) = self.metal.as_ref()
             && !self
@@ -11587,7 +11508,7 @@ impl FlashMoeEngine {
                 .dense
                 .project_dense_tensor_with_metal(
                     self.metal.as_ref(),
-                    &qkv_name,
+                    input_requests.tensor_name(0),
                     normed,
                     layout.conv_dim,
                 )?
@@ -11596,7 +11517,7 @@ impl FlashMoeEngine {
                 .dense
                 .project_dense_tensor_with_metal(
                     self.metal.as_ref(),
-                    &z_name,
+                    input_requests.tensor_name(1),
                     normed,
                     layout.total_value_width,
                 )?
@@ -11605,7 +11526,7 @@ impl FlashMoeEngine {
                 .dense
                 .project_dense_tensor_with_metal(
                     self.metal.as_ref(),
-                    &b_name,
+                    input_requests.tensor_name(2),
                     normed,
                     layout.num_value_heads,
                 )?
@@ -11614,7 +11535,7 @@ impl FlashMoeEngine {
                 .dense
                 .project_dense_tensor_with_metal(
                     self.metal.as_ref(),
-                    &a_name,
+                    input_requests.tensor_name(3),
                     normed,
                     layout.num_value_heads,
                 )?
@@ -15325,10 +15246,6 @@ fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
             "Flash-MoE tensor {tensor_name} is unavailable; synthetic runtime fallback is disabled outside tests"
         )
     }
-}
-
-fn attention_tensor_name(layer: usize, projection: &str) -> String {
-    format!("model.layers.{layer}.self_attn.{projection}.weight")
 }
 
 fn infer_attention_layer_type(
