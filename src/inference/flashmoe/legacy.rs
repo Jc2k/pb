@@ -105,8 +105,8 @@ use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
     MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
-    MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan, MetalCmd3InputBuffers,
-    MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
+    MetalCmd3CombineStageBuffers, MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan,
+    MetalCmd3InputBuffers, MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
     MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedStageBuffers,
     MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
     MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
@@ -5094,19 +5094,25 @@ impl MetalExecutorInner {
             }
 
             let combine_plan = command_plan.combine;
+            let combine_stage = MetalCmd3CombineStageBuffers::new(
+                combine_plan,
+                input_buffers,
+                &output_buffers,
+                combine_buffers,
+            )?;
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
                 self.pipelines.combine_expert_phase_pipeline,
             );
-            set_buffer(encoder, input_buffers.residual, 0);
-            set_buffer(encoder, output_buffers.shared_output, 1);
-            set_buffer(encoder, output_buffers.expert_outputs, 2);
-            set_buffer(encoder, combine_buffers.routing_weights, 3);
-            set_buffer(encoder, output_buffers.hidden, 4);
-            set_buffer(encoder, combine_buffers.width, 5);
-            set_buffer(encoder, combine_buffers.active_count, 6);
-            dispatch_threads(encoder, combine_plan.dispatch_threads);
+            set_buffer(encoder, combine_stage.residual, 0);
+            set_buffer(encoder, combine_stage.shared_output, 1);
+            set_buffer(encoder, combine_stage.expert_outputs, 2);
+            set_buffer(encoder, combine_stage.routing_weights, 3);
+            set_buffer(encoder, combine_stage.hidden, 4);
+            set_buffer(encoder, combine_stage.width, 5);
+            set_buffer(encoder, combine_stage.active_count, 6);
+            dispatch_threads(encoder, combine_stage.plan.dispatch_threads);
 
             if let (Some(weight), Some(next_normed_buffer), Some(next_norm_plan)) =
                 (next_norm_weight, output_buffers.next_normed, next_norm_plan)

@@ -348,7 +348,7 @@ The validator should reject silent fallbacks such as:
   this is a capability rule rather than only a live-loop convention.
   CMD3 normed/residual input buffers, shared-expert stage input/output bindings and temporary
   buffers, active-expert activation/projection temporary buffers, CMD3 combine
-  routing-weight/width/active-count bindings, next-norm bindings, and CMD3
+  stage input/output plus routing-weight/width/active-count bindings, next-norm bindings, and CMD3
   hidden/shared/expert/next-normed output buffers now materialize as Metal-owned records derived
   from the command plan; submitted command context also resolves through Metal-owned plan helpers
   instead of legacy size/metadata recomputation. The actual shared gate/up/down, next-norm

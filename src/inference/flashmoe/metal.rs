@@ -1123,6 +1123,49 @@ pub(crate) struct MetalCmd3CombineBuffers {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3CombineStageBuffers {
+    pub(crate) residual: MetalObjcId,
+    pub(crate) shared_output: MetalObjcId,
+    pub(crate) expert_outputs: MetalObjcId,
+    pub(crate) routing_weights: MetalObjcId,
+    pub(crate) hidden: MetalObjcId,
+    pub(crate) width: MetalObjcId,
+    pub(crate) active_count: MetalObjcId,
+    pub(crate) plan: MetalCmd3CombinePlan,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3CombineStageBuffers {
+    pub(crate) fn new(
+        plan: MetalCmd3CombinePlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        combine: MetalCmd3CombineBuffers,
+    ) -> anyhow::Result<Self> {
+        let layout = plan.buffer_layout()?;
+        if combine.layout != layout {
+            anyhow::bail!("FlashMoe Metal CMD3 combine stage constants do not match plan");
+        }
+        if outputs.layout.width_u32 != layout.width_u32
+            || outputs.layout.active_count_u32 != layout.active_count_u32
+        {
+            anyhow::bail!("FlashMoe Metal CMD3 combine stage outputs do not match plan layout");
+        }
+        Ok(Self {
+            residual: inputs.residual,
+            shared_output: outputs.shared_output,
+            expert_outputs: outputs.expert_outputs,
+            routing_weights: combine.routing_weights,
+            hidden: outputs.hidden,
+            width: combine.width,
+            active_count: combine.active_count,
+            plan,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3CombineBuffers {
     pub(crate) fn new(
         plan: MetalCmd3CombinePlan,
@@ -4087,6 +4130,73 @@ mod tests {
         assert_eq!(buffers.layout.width_u32, 4);
         assert_eq!(buffers.layout.active_count_u32, 2);
         assert_eq!(buffers.layout.routing_weights_bytes, 2 * 4);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_combine_stage_buffers_match_declared_layout() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let payloads = vec![
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(5, 4)),
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(7, 4)),
+        ];
+        let execution = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            2,
+            4,
+            2,
+            output_state,
+            ScheduledSharedExpertPhaseRef::None,
+            None,
+            &payloads,
+        )
+        .unwrap();
+        let inputs = MetalCmd3InputBuffers::new(
+            execution.phase,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+        )
+        .unwrap();
+        let outputs = MetalCmd3OutputBuffers::new(
+            &execution,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+            0x5000usize as MetalObjcId,
+            None,
+        )
+        .unwrap();
+        let combine = MetalCmd3CombineBuffers::new(
+            execution.combine,
+            0x6000usize as MetalObjcId,
+            0x7000usize as MetalObjcId,
+            0x8000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        let stage = MetalCmd3CombineStageBuffers::new(execution.combine, inputs, &outputs, combine)
+            .unwrap();
+
+        assert_eq!(stage.residual, inputs.residual);
+        assert_eq!(stage.shared_output, outputs.shared_output);
+        assert_eq!(stage.expert_outputs, outputs.expert_outputs);
+        assert_eq!(stage.routing_weights, combine.routing_weights);
+        assert_eq!(stage.hidden, outputs.hidden);
+        assert_eq!(stage.width, combine.width);
+        assert_eq!(stage.active_count, combine.active_count);
+        assert_eq!(stage.plan, execution.combine);
+
+        let stale_plan = MetalCmd3CombinePlan {
+            width: execution.combine.width,
+            active_count: execution.combine.active_count + 1,
+            dispatch_threads: execution.combine.dispatch_threads,
+        };
+        let stale =
+            MetalCmd3CombineStageBuffers::new(stale_plan, inputs, &outputs, combine).unwrap_err();
+        assert!(
+            stale.to_string().contains("constants do not match plan"),
+            "{stale:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
