@@ -1323,6 +1323,48 @@ pub(crate) struct MetalCmd3ActiveExpertBufferLayout {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3ActiveExpertWorkBuffers {
+    pub(crate) activated: MetalObjcId,
+    pub(crate) gate_out: Option<MetalObjcId>,
+    pub(crate) up_out: Option<MetalObjcId>,
+    pub(crate) intermediate: Option<MetalObjcId>,
+    pub(crate) layout: MetalCmd3ActiveExpertBufferLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3ActiveExpertWorkBuffers {
+    pub(crate) fn fused(
+        plan: MetalCmd3ActiveExpertPlan,
+        activated: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            activated,
+            gate_out: None,
+            up_out: None,
+            intermediate: None,
+            layout: plan.buffer_layout()?,
+        })
+    }
+
+    pub(crate) fn unfused(
+        plan: MetalCmd3ActiveExpertPlan,
+        activated: MetalObjcId,
+        gate_out: MetalObjcId,
+        up_out: MetalObjcId,
+        intermediate: MetalObjcId,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            activated,
+            gate_out: Some(gate_out),
+            up_out: Some(up_out),
+            intermediate: Some(intermediate),
+            layout: plan.buffer_layout()?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3ActiveExpertPlan {
     pub(crate) fn new(
         phase: MetalCmd3PhasePlan,
@@ -3941,6 +3983,41 @@ mod tests {
                 .contains("does not match declared output state"),
             "{unexpected_next:#}"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_active_expert_work_buffers_carry_declared_layout() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
+        let payload = test_q4_expert_payload(6, 4);
+        let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
+
+        let fused =
+            MetalCmd3ActiveExpertWorkBuffers::fused(plan, 0x1000usize as MetalObjcId).unwrap();
+
+        assert_eq!(fused.activated, 0x1000usize as MetalObjcId);
+        assert_eq!(fused.gate_out, None);
+        assert_eq!(fused.up_out, None);
+        assert_eq!(fused.intermediate, None);
+        assert_eq!(fused.layout.intermediate_u32, 6);
+        assert_eq!(fused.layout.activation_bytes, 6 * 4);
+        assert_eq!(fused.layout.projection_output_bytes, 6 * 4);
+
+        let unfused = MetalCmd3ActiveExpertWorkBuffers::unfused(
+            plan,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+        )
+        .unwrap();
+
+        assert_eq!(unfused.activated, 0x1000usize as MetalObjcId);
+        assert_eq!(unfused.gate_out, Some(0x2000usize as MetalObjcId));
+        assert_eq!(unfused.up_out, Some(0x3000usize as MetalObjcId));
+        assert_eq!(unfused.intermediate, Some(0x4000usize as MetalObjcId));
+        assert_eq!(unfused.layout, fused.layout);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

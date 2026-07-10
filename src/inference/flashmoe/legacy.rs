@@ -103,16 +103,16 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput,
-    MetalCmd3ExecutionPlan, MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan,
-    MetalCmd3SharedPhaseSource, MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
+    MetalCmd3ActiveExpertWorkBuffers, MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan,
+    MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource,
+    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
+    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -4992,24 +4992,30 @@ impl MetalExecutorInner {
 
             for (active_plan, payload) in command_plan.active_experts.iter().zip(payloads) {
                 let payload = payload.q4();
-                let active_layout = active_plan.buffer_layout()?;
-                let activated = self.buffer_with_len(active_layout.activation_bytes)?;
-                buffers.push(MetalPhaseBuffer::recyclable(activated));
+                let mut active_work =
+                    self.cmd3_active_expert_work_buffers(*active_plan, &mut buffers)?;
 
                 let fused = self.encode_q4_swiglu(
                     encoder,
                     &payload.gate,
                     &payload.up,
                     normed_buffer,
-                    activated,
+                    active_work.activated,
                     &mut buffers,
                     &mut q4_source_buffers,
                 )?;
                 if !fused {
-                    let gate_out = self.buffer_with_len(active_layout.projection_output_bytes)?;
-                    buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                    let up_out = self.buffer_with_len(active_layout.projection_output_bytes)?;
-                    buffers.push(MetalPhaseBuffer::recyclable(up_out));
+                    active_work = self.cmd3_active_expert_unfused_work_buffers(
+                        *active_plan,
+                        active_work.activated,
+                        &mut buffers,
+                    )?;
+                    let gate_out = active_work.gate_out.context(
+                        "FlashMoe Metal CMD3 active expert unfused work missing gate output",
+                    )?;
+                    let up_out = active_work.up_out.context(
+                        "FlashMoe Metal CMD3 active expert unfused work missing up output",
+                    )?;
                     self.encode_q4_matvec(
                         encoder,
                         &payload.gate,
@@ -5028,10 +5034,9 @@ impl MetalExecutorInner {
                         &mut buffers,
                         &mut q4_source_buffers,
                     )?;
-                    let intermediate_u32 = active_layout.intermediate_u32;
-                    let intermediate_buffer =
-                        self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
-                    buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
+                    let intermediate_buffer = active_work.intermediate.context(
+                        "FlashMoe Metal CMD3 active expert unfused work missing intermediate constant",
+                    )?;
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
@@ -5039,14 +5044,14 @@ impl MetalExecutorInner {
                     );
                     set_buffer(encoder, gate_out, 0);
                     set_buffer(encoder, up_out, 1);
-                    set_buffer(encoder, activated, 2);
+                    set_buffer(encoder, active_work.activated, 2);
                     set_buffer(encoder, intermediate_buffer, 3);
                     dispatch_threads(encoder, active_plan.dispatch_threads());
                 }
                 self.encode_q4_matvec(
                     encoder,
                     &payload.down,
-                    activated,
+                    active_work.activated,
                     output_buffers.expert_outputs,
                     active_plan.output_offset,
                     &mut buffers,
@@ -8299,6 +8304,43 @@ impl MetalExecutorInner {
                 router_out,
                 activated,
                 total_intermediate,
+                intermediate,
+            )
+        }
+    }
+
+    unsafe fn cmd3_active_expert_work_buffers(
+        &self,
+        plan: MetalCmd3ActiveExpertPlan,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<MetalCmd3ActiveExpertWorkBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let activated = self.buffer_with_len(layout.activation_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(activated));
+            MetalCmd3ActiveExpertWorkBuffers::fused(plan, activated)
+        }
+    }
+
+    unsafe fn cmd3_active_expert_unfused_work_buffers(
+        &self,
+        plan: MetalCmd3ActiveExpertPlan,
+        activated: ObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+    ) -> Result<MetalCmd3ActiveExpertWorkBuffers> {
+        unsafe {
+            let layout = plan.buffer_layout()?;
+            let gate_out = self.buffer_with_len(layout.projection_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(gate_out));
+            let up_out = self.buffer_with_len(layout.projection_output_bytes)?;
+            buffers.push(MetalPhaseBuffer::recyclable(up_out));
+            let intermediate = self.buffer_with_bytes(u32_as_bytes(&layout.intermediate_u32))?;
+            buffers.push(MetalPhaseBuffer::recyclable(intermediate));
+            MetalCmd3ActiveExpertWorkBuffers::unfused(
+                plan,
+                activated,
+                gate_out,
+                up_out,
                 intermediate,
             )
         }
