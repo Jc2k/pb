@@ -128,8 +128,10 @@ The validator should reject silent fallbacks such as:
   compatibility conversion now live with expert storage instead of the legacy runtime. Expert layer
   rewrite/reuse policy, positioned slot writes, fixed-slot reuse validation, and atomic expert
   metadata commits are also owned by `experts`; legacy conversion code now supplies build callbacks
-  while the storage module decides reuse and layout. PBQ4 remains import/build compatibility;
-  execution reads are moving toward fixed whole-expert slots.
+  while the storage module decides reuse and layout. PBQ4-to-fixed-Q4 layer upgrades, stale temp
+  cleanup, per-expert completeness checks, and missing-pack detection now also live under expert
+  storage. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
+  whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -316,9 +318,10 @@ The refactor should break the current monolith by ownership boundary, not by "fa
 3. Extract expert storage and readers from `legacy.rs`.
    Move fixed-slot layout validation, layer reader opening, positioned read helpers, reusable
    buffers, read metrics, fixed-slot packed-record fixture coverage, PBQ4 parsing/writing/wire-size
-   accounting, scale/bias decoding, layer rewrite/reuse policy, and PBQ4 import/build compatibility
-   into `experts`. Runtime reads should return typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split
-   gate/up/down owners.
+   accounting, scale/bias decoding, layer rewrite/reuse policy, cache completeness checks, fixed-Q4
+   upgrade compatibility, and PBQ4 import/build compatibility into `experts`. Runtime reads should
+   return typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split gate/up/down
+   owners.
 
 4. Introduce the scheduler API before optimizing it.
    Create a scheduler that owns per-token/per-layer state: active expert IDs, pending read jobs,

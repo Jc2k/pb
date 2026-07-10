@@ -75,20 +75,25 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertLayerPackMetadata, ExpertPackMetadata,
-    ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore,
-    FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
-    FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PBQ4_EXPERT_MAGIC, PackedExpertTensor,
+    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
+    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
+    FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
     Q4MatvecPayload, Q4MatvecSource, build_expert_pack, build_fixed_native_q4_expert_pack,
-    build_native_q4_expert_pack, expert_layer_metadata_path, expert_layer_path,
-    expert_scale_bias_dtype_size, expert_slot_offset, finish_expert_pack_atomically,
-    fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
-    pbq4_expert_pack_wire_size, read_exact_at_positioned, read_expert_layer_pack_metadata,
-    read_layer_slot_bytes, rewrite_expert_layer_pack, temp_pack_path, write_all_at_positioned,
-    write_expert_metadata_atomically,
+    build_native_q4_expert_pack, cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
+    first_missing_expert_pack_for_shape, fixed_q4_payload_from_pbq4_records,
+    parse_pbq4_expert_pack, pbq4_expert_pack_wire_size, rewrite_expert_layer_pack,
+    rewrite_pbq4_layer_to_fixed_q4,
+};
+#[cfg(test)]
+use super::experts::{
+    ExpertLayerPackMetadata, FIXED_Q4_EXPERT_LAYER_FORMAT_V1, PBQ4_EXPERT_MAGIC,
+    expert_layer_metadata_path, expert_layer_path, expert_pack_is_complete, expert_slot_offset,
+    read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 #[cfg(test)]
 use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
+#[cfg(test)]
+use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -18692,105 +18697,6 @@ fn ensure_fixed_q4_expert_cache(plan: &FlashMoePlan, layout: &QwenMoeModelLayout
     Ok(rewritten)
 }
 
-fn rewrite_pbq4_layer_to_fixed_q4(
-    root: &Path,
-    layer: usize,
-    experts: usize,
-    spec: FixedQ4ExpertSlotSpec,
-) -> Result<bool> {
-    let Some(old_metadata) = read_expert_layer_pack_metadata(root, layer)? else {
-        return Ok(false);
-    };
-    if old_metadata.format == FIXED_Q4_EXPERT_LAYER_FORMAT_V1
-        && old_metadata.expert_size == spec.layout.expert_bytes as u64
-    {
-        return Ok(false);
-    }
-    if old_metadata.experts < experts || old_metadata.expert_size == 0 {
-        return Ok(false);
-    }
-    let layer_path = expert_layer_path(root, layer);
-    let old_file = match fs::File::open(&layer_path) {
-        Ok(file) => file,
-        Err(_) => return Ok(false),
-    };
-    if !pbq4_layer_looks_fixed_q4_compatible(&old_file, &old_metadata, spec)? {
-        return Ok(false);
-    }
-
-    let temp_path = temp_pack_path(&layer_path);
-    let out = fs::File::create(&temp_path).with_context(|| {
-        format!(
-            "failed to create temporary fixed Q4 expert layer {}",
-            temp_path.display()
-        )
-    })?;
-    let fixed_slot_size = spec.layout.expert_bytes as u64;
-    out.set_len(
-        (experts as u64)
-            .checked_mul(fixed_slot_size)
-            .context("fixed Q4 expert layer file size overflow")?,
-    )
-    .with_context(|| format!("failed to preallocate {}", temp_path.display()))?;
-
-    let mut packs = Vec::with_capacity(experts);
-    for expert in 0..experts {
-        let metadata = old_metadata
-            .pack_for(expert)
-            .cloned()
-            .with_context(|| format!("expert layer {layer} has no metadata for expert {expert}"))?;
-        let bytes = read_layer_slot_bytes(&layer_path, &old_metadata, expert, &metadata)?;
-        if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
-            bail!("expert layer {layer} expert {expert} is already not PBQ4");
-        }
-        let records = parse_pbq4_expert_pack(&bytes, Some(&metadata))?;
-        let (fixed_bytes, fixed_metadata) =
-            fixed_q4_pack_from_pbq4_records(layer, expert, spec, &records)?;
-        write_all_at_positioned(
-            &out,
-            &fixed_bytes,
-            expert_slot_offset(expert, fixed_slot_size)?,
-        )
-        .with_context(|| {
-            format!(
-                "failed to write fixed Q4 layer {layer} expert {expert} into {}",
-                temp_path.display()
-            )
-        })?;
-        packs.push(fixed_metadata);
-    }
-
-    finish_expert_pack_atomically(out, &temp_path, &layer_path)?;
-    let metadata = ExpertLayerPackMetadata::new_fixed_q4(layer, fixed_slot_size, experts, packs);
-    write_expert_metadata_atomically(root, layer, &metadata)?;
-    Ok(true)
-}
-
-fn pbq4_layer_looks_fixed_q4_compatible(
-    file: &fs::File,
-    metadata: &ExpertLayerPackMetadata,
-    spec: FixedQ4ExpertSlotSpec,
-) -> Result<bool> {
-    let Some(first) = metadata.packs.first() else {
-        return Ok(false);
-    };
-    if first.packed_bytes > metadata.expert_size {
-        return Ok(false);
-    }
-    let offset = expert_slot_offset(first.expert, metadata.expert_size)?;
-    let mut bytes = vec![
-        0u8;
-        usize::try_from(first.packed_bytes)
-            .context("expert pack length does not fit usize")?
-    ];
-    read_exact_at_positioned(file, &mut bytes, offset)?;
-    if !bytes.starts_with(PBQ4_EXPERT_MAGIC) {
-        return Ok(false);
-    }
-    let records = parse_pbq4_expert_pack(&bytes, Some(first))?;
-    Ok(fixed_q4_pack_from_pbq4_records(metadata.layer, first.expert, spec, &records).is_ok())
-}
-
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -21841,30 +21747,6 @@ fn aggregate_expert_tensor_kind(name: &str) -> Option<AggregateExpertTensorKind>
     }
 }
 
-fn cleanup_stale_expert_temp_files(experts_dir: &Path) -> Result<usize> {
-    if !experts_dir.is_dir() {
-        return Ok(0);
-    }
-    let mut deleted = 0usize;
-    for entry in fs::read_dir(experts_dir)
-        .with_context(|| format!("failed to read {}", experts_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if file_name.contains(".tmp-") {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to delete stale temp file {}", path.display()))?;
-            deleted += 1;
-        }
-    }
-    Ok(deleted)
-}
-
 fn pack_aggregate_expert_layer(
     snapshot_dir: &Path,
     plan: &FlashMoePlan,
@@ -22416,24 +22298,6 @@ fn expected_expert_pack(
     })
 }
 
-fn expert_pack_is_complete(root: &Path, layer: usize, expert: usize) -> bool {
-    let path = expert_layer_path(root, layer);
-    let Ok(file) = fs::File::open(&path) else {
-        return false;
-    };
-    let Ok(Some(layer_metadata)) = read_expert_layer_pack_metadata(root, layer) else {
-        return false;
-    };
-    let Some(_metadata) = layer_metadata.pack_for(expert) else {
-        return false;
-    };
-    let Ok(offset) = expert_slot_offset(expert, layer_metadata.expert_size) else {
-        return false;
-    };
-    let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
-    read_exact_at_positioned(&file, &mut magic, offset).is_ok() && magic == PBQ4_EXPERT_MAGIC
-}
-
 fn single_aggregate_expert_tensor<'a>(
     tensors: &[&'a ExpertTensorRef],
     kind: AggregateExpertTensorKind,
@@ -22900,34 +22764,7 @@ fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<
         Ok(config) => (config.num_hidden_layers, config.experts()),
         Err(_) => (NUM_LAYERS, NUM_EXPERTS),
     };
-    for layer in 0..layers {
-        let path = expert_layer_path(experts_dir, layer);
-        if !path.is_file() {
-            return Ok(Some(path));
-        }
-        let metadata_path = expert_layer_metadata_path(experts_dir, layer);
-        let Some(metadata) = read_expert_layer_pack_metadata(experts_dir, layer)? else {
-            return Ok(Some(metadata_path));
-        };
-        if metadata.experts < experts {
-            return Ok(Some(metadata_path));
-        }
-        let file_len = fs::metadata(&path)
-            .with_context(|| format!("failed to stat {}", path.display()))?
-            .len();
-        let required = (experts as u64)
-            .checked_mul(metadata.expert_size)
-            .context("expert layer size overflow")?;
-        if file_len < required {
-            return Ok(Some(path));
-        }
-        for expert in 0..experts {
-            if metadata.pack_for(expert).is_none() {
-                return Ok(Some(metadata_path));
-            }
-        }
-    }
-    Ok(None)
+    first_missing_expert_pack_for_shape(experts_dir, layers, experts)
 }
 
 fn is_expert_tensor_name(name: &str) -> bool {
