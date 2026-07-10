@@ -1563,6 +1563,39 @@ pub(crate) struct MetalCmd3ActiveExpertWorkBuffers {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3ActiveExpertStageBuffers {
+    pub(crate) normed: MetalObjcId,
+    pub(crate) activated: MetalObjcId,
+    pub(crate) expert_outputs: MetalObjcId,
+    pub(crate) output_offset: u64,
+    pub(crate) plan: MetalCmd3ActiveExpertPlan,
+    pub(crate) work: MetalCmd3ActiveExpertWorkBuffers,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3ActiveExpertStageBuffers {
+    pub(crate) fn new(
+        plan: MetalCmd3ActiveExpertPlan,
+        inputs: MetalCmd3InputBuffers,
+        outputs: &MetalCmd3OutputBuffers,
+        work: MetalCmd3ActiveExpertWorkBuffers,
+    ) -> anyhow::Result<Self> {
+        if work.layout != plan.buffer_layout()? {
+            anyhow::bail!("FlashMoe Metal CMD3 active expert work layout does not match plan");
+        }
+        Ok(Self {
+            normed: inputs.normed,
+            activated: work.activated,
+            expert_outputs: outputs.expert_outputs,
+            output_offset: plan.output_offset,
+            plan,
+            work,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCmd3ActiveExpertWorkBuffers {
     pub(crate) fn fused(
         plan: MetalCmd3ActiveExpertPlan,
@@ -4494,6 +4527,68 @@ mod tests {
         assert_eq!(unfused.up_out, Some(0x3000usize as MetalObjcId));
         assert_eq!(unfused.intermediate, Some(0x4000usize as MetalObjcId));
         assert_eq!(unfused.layout, fused.layout);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_active_expert_stage_buffers_match_declared_layout() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let payloads = vec![
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(5, 4)),
+            ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(7, 4)),
+        ];
+        let execution = MetalCmd3ExecutionPlan::new(
+            9,
+            3,
+            2,
+            4,
+            2,
+            output_state,
+            ScheduledSharedExpertPhaseRef::None,
+            None,
+            &payloads,
+        )
+        .unwrap();
+        let inputs = MetalCmd3InputBuffers::new(
+            execution.phase,
+            0x1000usize as MetalObjcId,
+            0x2000usize as MetalObjcId,
+        )
+        .unwrap();
+        let outputs = MetalCmd3OutputBuffers::new(
+            &execution,
+            0x3000usize as MetalObjcId,
+            0x4000usize as MetalObjcId,
+            0x5000usize as MetalObjcId,
+            None,
+        )
+        .unwrap();
+        let active_plan = execution.active_experts[1];
+        let work = MetalCmd3ActiveExpertWorkBuffers::fused(active_plan, 0x6000usize as MetalObjcId)
+            .unwrap();
+
+        let stage =
+            MetalCmd3ActiveExpertStageBuffers::new(active_plan, inputs, &outputs, work).unwrap();
+
+        assert_eq!(stage.normed, inputs.normed);
+        assert_eq!(stage.activated, work.activated);
+        assert_eq!(stage.expert_outputs, outputs.expert_outputs);
+        assert_eq!(stage.output_offset, active_plan.output_offset);
+        assert_eq!(stage.plan, active_plan);
+        assert_eq!(stage.work, work);
+
+        let stale_plan = MetalCmd3ActiveExpertPlan {
+            intermediate: active_plan.intermediate + 1,
+            ..active_plan
+        };
+        let stale =
+            MetalCmd3ActiveExpertStageBuffers::new(stale_plan, inputs, &outputs, work).unwrap_err();
+        assert!(
+            stale
+                .to_string()
+                .contains("work layout does not match plan"),
+            "{stale:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

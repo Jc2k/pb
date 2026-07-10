@@ -104,17 +104,18 @@ use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
-    MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers, MetalCmd3CombinePlan,
-    MetalCmd3CombineStageBuffers, MetalCmd3DeferredOutput, MetalCmd3ExecutionPlan,
-    MetalCmd3InputBuffers, MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan, MetalCmd3OutputBuffers,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCmd3SharedStageBuffers,
-    MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
-    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
-    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
-    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalCmd3ActiveExpertStageBuffers, MetalCmd3ActiveExpertWorkBuffers, MetalCmd3CombineBuffers,
+    MetalCmd3CombinePlan, MetalCmd3CombineStageBuffers, MetalCmd3DeferredOutput,
+    MetalCmd3ExecutionPlan, MetalCmd3InputBuffers, MetalCmd3NextNormBuffers, MetalCmd3NextNormPlan,
+    MetalCmd3OutputBuffers, MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource,
+    MetalCmd3SharedStageBuffers, MetalCmd3SharedWorkBuffers, MetalCommandBufferFailure,
+    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
+    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
+    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -5028,13 +5029,19 @@ impl MetalExecutorInner {
                 let payload = payload.q4();
                 let mut active_work =
                     self.cmd3_active_expert_work_buffers(*active_plan, &mut buffers)?;
+                let mut active_stage = MetalCmd3ActiveExpertStageBuffers::new(
+                    *active_plan,
+                    input_buffers,
+                    &output_buffers,
+                    active_work,
+                )?;
 
                 let fused = self.encode_q4_swiglu(
                     encoder,
                     &payload.gate,
                     &payload.up,
-                    input_buffers.normed,
-                    active_work.activated,
+                    active_stage.normed,
+                    active_stage.activated,
                     &mut buffers,
                     &mut q4_source_buffers,
                 )?;
@@ -5043,6 +5050,12 @@ impl MetalExecutorInner {
                         *active_plan,
                         active_work.activated,
                         &mut buffers,
+                    )?;
+                    active_stage = MetalCmd3ActiveExpertStageBuffers::new(
+                        *active_plan,
+                        input_buffers,
+                        &output_buffers,
+                        active_work,
                     )?;
                     let gate_out = active_work.gate_out.context(
                         "FlashMoe Metal CMD3 active expert unfused work missing gate output",
@@ -5053,7 +5066,7 @@ impl MetalExecutorInner {
                     self.encode_q4_matvec(
                         encoder,
                         &payload.gate,
-                        input_buffers.normed,
+                        active_stage.normed,
                         gate_out,
                         0,
                         &mut buffers,
@@ -5062,7 +5075,7 @@ impl MetalExecutorInner {
                     self.encode_q4_matvec(
                         encoder,
                         &payload.up,
-                        input_buffers.normed,
+                        active_stage.normed,
                         up_out,
                         0,
                         &mut buffers,
@@ -5078,16 +5091,16 @@ impl MetalExecutorInner {
                     );
                     set_buffer(encoder, gate_out, 0);
                     set_buffer(encoder, up_out, 1);
-                    set_buffer(encoder, active_work.activated, 2);
+                    set_buffer(encoder, active_stage.activated, 2);
                     set_buffer(encoder, intermediate_buffer, 3);
-                    dispatch_threads(encoder, active_plan.dispatch_threads());
+                    dispatch_threads(encoder, active_stage.plan.dispatch_threads());
                 }
                 self.encode_q4_matvec(
                     encoder,
                     &payload.down,
-                    active_work.activated,
-                    output_buffers.expert_outputs,
-                    active_plan.output_offset,
+                    active_stage.activated,
+                    active_stage.expert_outputs,
+                    active_stage.output_offset,
                     &mut buffers,
                     &mut q4_source_buffers,
                 )?;
