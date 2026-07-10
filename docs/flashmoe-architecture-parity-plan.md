@@ -118,8 +118,9 @@ The validator should reject silent fallbacks such as:
   offsets, and an `UPSTREAM_PARITY` execution policy.
 - `experts.rs` now owns fixed-slot metadata, the runtime `ExpertSlotStore`, layer reader opening,
   positioned reads, reusable whole-expert buffers, raw expert payload responses, and the expert read
-  worker pool. PBQ4 remains import/build compatibility; execution reads are moving toward fixed
-  whole-expert slots.
+  worker pool. Production store opening resolves through the model layout; default Qwen3.5 raw
+  multi-read helpers are kept test-only. PBQ4 remains import/build compatibility; execution reads
+  are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -142,11 +143,13 @@ The validator should reject silent fallbacks such as:
   a Q4 or dense shared expert implementation cannot be accepted without its declared graph shape.
   Scheduler-owned fixed-Q4 slots now resolve typed CMD3 expert payloads directly, runtime CMD3
   submission retains those scheduled slots instead of adapting them into `ExpertWeights`, and the
-  scheduler now builds resolved CMD1/attention/CMD2/routing/CMD3 command objects before the legacy
-  Metal encoder or runtime helpers are called. CMD3 next-layer norm weights are declared as typed
-  scheduled inputs with source, tensor name, and width before the Metal encoder receives the CPU
-  slice; when the graph expects the next-layer norm transition, a missing norm tensor is now an
-  unsupported scheduled-CMD3 error rather than a silent no-next-norm path. Fused Metal
+  old direct active-expert read and `ExpertWeights` Metal submission path is now test-only instead
+  of a production fallback. The scheduler now builds resolved
+  CMD1/attention/CMD2/routing/CMD3 command objects before the legacy Metal encoder or runtime
+  helpers are called. CMD3 next-layer norm weights are declared as typed scheduled inputs with
+  source, tensor name, and width before the Metal encoder receives the CPU slice; when the graph
+  expects the next-layer norm transition, a missing norm tensor is now an unsupported scheduled-CMD3
+  error rather than a silent no-next-norm path. Fused Metal
   post-attention prep now resolves through the scheduler-owned CMD2 output before recording the
   approved preselected routing command for the runtime, so CMD2-to-routing handoff is not just a
   loose active-expert vector.
@@ -205,10 +208,12 @@ The validator should reject silent fallbacks such as:
   turns that routing command into a typed
   `ScheduledExpertReadSet` containing normalized `ScheduledExpertRoutes` plus issued read IDs/warm
   flags before positioned file reads are submitted, and the pending read set carries those
-  scheduler-normalized routes instead of a loose layer plus route vector. CMD1/CMD2/CMD3 submission
-  is now built through the scheduled graph and resolves scheduler-owned command objects before
-  entering runtime helpers. The remaining gap is to move the Metal command encoding and legacy CPU
-  diagnostic helpers out of `legacy.rs` behind the explicit CMD builder APIs.
+  scheduler-normalized routes instead of a loose layer plus route vector. The old direct
+  `read_active_experts`/`ExpertWeights` submission route remains only as test/diagnostic scaffolding;
+  production CMD3 submission retains scheduler-owned whole-expert slots. CMD1/CMD2/CMD3 submission is
+  now built through the scheduled graph and resolves scheduler-owned command objects before entering
+  runtime helpers. The remaining gap is to move the Metal command encoding and legacy CPU diagnostic
+  helpers out of `legacy.rs` behind the explicit CMD builder APIs.
 - Command-buffer topology is still implicit inside the runtime and Metal helpers. CMD1/CMD2/CMD3
   descriptor and submission construction now flows through the scheduled graph, but the concrete
   command encoders should become explicit command builders used by every supported variant.

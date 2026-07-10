@@ -16,7 +16,9 @@ use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
     QwenMoeQ4ExpertLayout,
 };
-use super::types::{ACTIVE_EXPERTS_PER_TOKEN, HIDDEN_DIM};
+use super::types::ACTIVE_EXPERTS_PER_TOKEN;
+#[cfg(test)]
+use super::types::HIDDEN_DIM;
 
 pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
 
@@ -386,6 +388,7 @@ pub(crate) struct ExpertRawReadResponse {
 }
 
 impl ExpertSlotStore {
+    #[cfg(test)]
     pub(crate) fn open(root: PathBuf) -> Result<Self> {
         Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::qwen35_a17b()?)
     }
@@ -412,6 +415,7 @@ impl ExpertSlotStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn read_many_raw(
         &self,
         layer: usize,
@@ -652,6 +656,7 @@ impl FixedQ4ExpertSlotSpec {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn qwen35_a17b() -> Result<Self> {
         Self::new(QwenMoeQ4ExpertLayout::qwen35_a17b(), HIDDEN_DIM, 1024)
     }

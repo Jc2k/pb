@@ -2089,6 +2089,7 @@ impl MetalExecutor {
         }
     }
 
+    #[cfg(test)]
     fn project_q4_expert(
         &self,
         expert: &ExpertWeights,
@@ -2105,6 +2106,7 @@ impl MetalExecutor {
         }
     }
 
+    #[cfg(test)]
     fn submit_expert_phase(
         &self,
         position: usize,
@@ -2220,6 +2222,7 @@ impl MetalExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn submit_expert_phase_with_payloads(
         &self,
         position: usize,
@@ -3168,6 +3171,7 @@ impl MetalQ4SourceBufferCache {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 enum MetalExpertRetention {
+    #[cfg(test)]
     LegacyWeights(Arc<[Arc<ExpertWeights>]>),
     ScheduledSlots(Arc<[Arc<ScheduledExpertSlot>]>),
 }
@@ -3176,6 +3180,7 @@ enum MetalExpertRetention {
 impl MetalExpertRetention {
     fn len(&self) -> usize {
         match self {
+            #[cfg(test)]
             Self::LegacyWeights(experts) => experts.len(),
             Self::ScheduledSlots(slots) => slots.len(),
         }
@@ -3183,6 +3188,7 @@ impl MetalExpertRetention {
 
     fn expert_ids(&self) -> String {
         match self {
+            #[cfg(test)]
             Self::LegacyWeights(experts) => experts
                 .iter()
                 .map(|expert| expert.expert.to_string())
@@ -5067,6 +5073,7 @@ impl MetalExecutorInner {
         }
     }
 
+    #[cfg(test)]
     fn submit_expert_phase(
         self: &Arc<Self>,
         position: usize,
@@ -5125,6 +5132,7 @@ impl MetalExecutorInner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn submit_expert_phase_with_payloads(
         self: &Arc<Self>,
         position: usize,
@@ -11960,6 +11968,7 @@ impl FlashMoeEngine {
         })
     }
 
+    #[cfg(test)]
     pub fn read_active_experts(
         &mut self,
         layer: usize,
@@ -18321,6 +18330,7 @@ impl ExpertWeights {
     }
 }
 
+#[cfg(test)]
 fn read_expert_weights_many(
     store: &ExpertSlotStore,
     layer: usize,
@@ -18699,6 +18709,7 @@ fn gated_delta_head_step_scalar(
     }
 }
 
+#[cfg(test)]
 fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWeights> {
     let store = ExpertSlotStore::open(root.to_path_buf())?;
     let mut experts = read_expert_weights_many(&store, layer, &[expert])?;
