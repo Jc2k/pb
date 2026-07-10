@@ -19,6 +19,7 @@ pub use capabilities::*;
 pub use experts::*;
 pub use legacy::*;
 pub use math::*;
+pub use metal::METAL_SHADERS;
 pub use model_family::*;
 pub use scheduler::*;
 pub use types::*;
