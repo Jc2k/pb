@@ -8,7 +8,8 @@ use std::time::Duration;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
-    ScheduledCmd3MetalPostAttentionInput, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledQ4ExpertPhaseMlpPayload,
+    ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{FlashMoeCmd3OutputState, FlashMoePostAttentionPrepState};
@@ -1165,6 +1166,85 @@ impl MetalCmd3SharedPhasePlan {
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| {
                 anyhow::anyhow!("FlashMoe Metal CMD3 shared expert {label} byte size overflow")
+            })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalCmd3ActiveExpertPlan {
+    pub(crate) index: usize,
+    pub(crate) intermediate: usize,
+    pub(crate) output_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCmd3ActiveExpertPlan {
+    pub(crate) fn new(
+        phase: MetalCmd3PhasePlan,
+        index: usize,
+        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
+    ) -> anyhow::Result<Self> {
+        if payload.gate.rows == 0 {
+            anyhow::bail!("FlashMoe Metal CMD3 active expert requires non-zero intermediate width");
+        }
+        if payload.gate.rows != payload.up.rows || payload.down.cols != payload.gate.rows {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 active expert payload has mismatched intermediate widths: gate={} up={} down_cols={}",
+                payload.gate.rows,
+                payload.up.rows,
+                payload.down.cols
+            );
+        }
+        if payload.gate.cols != phase.width
+            || payload.up.cols != phase.width
+            || payload.down.rows != phase.width
+        {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 active expert payload width does not match phase width {}: gate={} up={} down_rows={}",
+                phase.width,
+                payload.gate.cols,
+                payload.up.cols,
+                payload.down.rows
+            );
+        }
+        Self::usize_to_u32("intermediate width", payload.gate.rows)?;
+        Ok(Self {
+            index,
+            intermediate: payload.gate.rows,
+            output_offset: phase.expert_output_offset(index)?,
+        })
+    }
+
+    pub(crate) fn intermediate_u32(self) -> anyhow::Result<u32> {
+        Self::usize_to_u32("intermediate width", self.intermediate)
+    }
+
+    pub(crate) fn activation_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("activation", self.intermediate)
+    }
+
+    pub(crate) fn projection_output_bytes(self) -> anyhow::Result<usize> {
+        Self::f32_bytes("projection output", self.intermediate)
+    }
+
+    pub(crate) fn dispatch_threads(self) -> u64 {
+        self.intermediate as u64
+    }
+
+    fn usize_to_u32(label: &str, value: usize) -> anyhow::Result<u32> {
+        u32::try_from(value).map_err(|_| {
+            anyhow::anyhow!(
+                "FlashMoe Metal CMD3 active expert {label} {value} does not fit Metal u32 constants"
+            )
+        })
+    }
+
+    fn f32_bytes(label: &str, items: usize) -> anyhow::Result<usize> {
+        items
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("FlashMoe Metal CMD3 active expert {label} byte size overflow")
             })
     }
 }
@@ -2954,6 +3034,8 @@ mod tests {
         FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::super::experts::Q4MatvecPayload;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::scheduler::ScheduledRoutingTopK;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::weights::DenseQ4MmapMatvecProjection;
@@ -3436,6 +3518,39 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn cmd3_active_expert_plan_declares_payload_layout() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
+        let payload = test_q4_expert_payload(6, 4);
+
+        let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
+
+        assert_eq!(plan.index, 1);
+        assert_eq!(plan.intermediate, 6);
+        assert_eq!(plan.intermediate_u32().unwrap(), 6);
+        assert_eq!(plan.activation_bytes().unwrap(), 6 * 4);
+        assert_eq!(plan.projection_output_bytes().unwrap(), 6 * 4);
+        assert_eq!(plan.output_offset, 4 * 4);
+        assert_eq!(plan.dispatch_threads(), 6);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cmd3_active_expert_plan_rejects_mismatched_payload() {
+        let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
+        let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
+        let payload = test_q4_expert_payload(6, 5);
+
+        let err = MetalCmd3ActiveExpertPlan::new(phase, 0, &payload).unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not match phase width 4"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn cmd3_shared_phase_plan_declares_dense_shape() {
         let shared = SharedExpertPhaseWeights::new(
             Arc::new(vec![1.0; 24]),
@@ -3513,6 +3628,34 @@ mod tests {
             huge_err.to_string().contains("does not fit Metal u32"),
             "{huge_err:#}"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_q4_expert_payload(
+        intermediate: usize,
+        width: usize,
+    ) -> ScheduledQ4ExpertPhaseMlpPayload<'static> {
+        let gate = test_q4_matvec_payload(intermediate, width);
+        let up = test_q4_matvec_payload(intermediate, width);
+        let down = test_q4_matvec_payload(width, intermediate);
+        ScheduledQ4ExpertPhaseMlpPayload::new(3, 1, width, gate, up, down).unwrap()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_q4_matvec_payload(rows: usize, cols: usize) -> Q4MatvecPayload<'static> {
+        Q4MatvecPayload {
+            rows,
+            cols,
+            group_size: 16,
+            packed: &[],
+            scales: &[],
+            biases: &[],
+            scale_bias_groups: 0,
+            scale_bias_dtype: "F32",
+            scale_bytes: &[],
+            bias_bytes: &[],
+            source: None,
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

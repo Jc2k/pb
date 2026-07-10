@@ -103,15 +103,15 @@ use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
-    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3DeferredOutput, MetalCmd3PhasePlan,
-    MetalCmd3SharedPhasePlan, MetalCmd3SharedPhaseSource, MetalCommandBufferFailure,
-    MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalDenseWeights, MetalDispatchMode, MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, MetalSharedExpertBuffers,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalAttentionValues, MetalBatchProjectionInput, MetalCmd3ActiveExpertPlan,
+    MetalCmd3DeferredOutput, MetalCmd3PhasePlan, MetalCmd3SharedPhasePlan,
+    MetalCmd3SharedPhaseSource, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
+    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalDenseWeights, MetalDispatchMode,
+    MetalDispatchPlan, MetalDispatchSize, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    MetalSharedExpertBuffers, metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -5016,8 +5016,8 @@ impl MetalExecutorInner {
 
             for (idx, payload) in payloads.iter().enumerate() {
                 let payload = payload.q4();
-                let activated =
-                    self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                let active_plan = MetalCmd3ActiveExpertPlan::new(plan, idx, payload)?;
+                let activated = self.buffer_with_len(active_plan.activation_bytes()?)?;
                 buffers.push(MetalPhaseBuffer::recyclable(activated));
 
                 let fused = self.encode_q4_swiglu(
@@ -5030,11 +5030,9 @@ impl MetalExecutorInner {
                     &mut q4_source_buffers,
                 )?;
                 if !fused {
-                    let gate_out =
-                        self.buffer_with_len(payload.gate.rows * std::mem::size_of::<f32>())?;
+                    let gate_out = self.buffer_with_len(active_plan.projection_output_bytes()?)?;
                     buffers.push(MetalPhaseBuffer::recyclable(gate_out));
-                    let up_out =
-                        self.buffer_with_len(payload.up.rows * std::mem::size_of::<f32>())?;
+                    let up_out = self.buffer_with_len(active_plan.projection_output_bytes()?)?;
                     buffers.push(MetalPhaseBuffer::recyclable(up_out));
                     self.encode_q4_matvec(
                         encoder,
@@ -5054,7 +5052,7 @@ impl MetalExecutorInner {
                         &mut buffers,
                         &mut q4_source_buffers,
                     )?;
-                    let intermediate_u32 = payload.gate.rows as u32;
+                    let intermediate_u32 = active_plan.intermediate_u32()?;
                     let intermediate_buffer =
                         self.buffer_with_bytes(u32_as_bytes(&intermediate_u32))?;
                     buffers.push(MetalPhaseBuffer::recyclable(intermediate_buffer));
@@ -5067,15 +5065,14 @@ impl MetalExecutorInner {
                     set_buffer(encoder, up_out, 1);
                     set_buffer(encoder, activated, 2);
                     set_buffer(encoder, intermediate_buffer, 3);
-                    dispatch_threads(encoder, payload.gate.rows as u64);
+                    dispatch_threads(encoder, active_plan.dispatch_threads());
                 }
-                let expert_offset = plan.expert_output_offset(idx)?;
                 self.encode_q4_matvec(
                     encoder,
                     &payload.down,
                     activated,
                     expert_outputs_buffer,
-                    expert_offset,
+                    active_plan.output_offset,
                     &mut buffers,
                     &mut q4_source_buffers,
                 )?;
