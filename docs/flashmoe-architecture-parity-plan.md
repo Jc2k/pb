@@ -194,6 +194,12 @@ Baseline reviewed on 2026-07-10:
   and diagnostic expert skipping now fail as undeclared graph behavior at the layer boundary.
   Deferred full-attention CMD1 likewise requires resident Q4 projections and cannot select the
   removed dense BF16/F32 encoder through runtime probing.
+- Single Q4 projections now use the same resident `MetalQ4ProjectionBatchBuilder` as projection
+  batches. The packed/component upload retry, direct single-mmap encoder, and their tests have been
+  removed. The unused application-owned F32 LM-head buffer cache and command were also deleted;
+  sampling has only the resolved resident-Q4 topK builder. As a result, `legacy.rs` no longer
+  creates command buffers or encoders, dispatches pipelines, or waits for Metal commands. Gate 2
+  still needs to move `MetalExecutorInner` and recurrent buffer allocation/lifetime ownership.
 - `MetalQ4ProjectionBatchBuilder` now owns the resident-Q4 projection batch used by full-attention
   CMD1 and deferred state: CPU or GPU input binding, fused compatible-projection dispatch,
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
