@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::experts::EXPERT_SCALE_BIAS_DTYPE_F32;
+use super::experts::{EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size};
 use super::state::{FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState};
 use super::types::{ExpertQuantization, GROUP_SIZE};
 use anyhow::{Context, Result, bail};
@@ -250,7 +250,7 @@ pub(crate) fn dense_q4_layout_with_scale_bias_dtype(
     let groups = rows
         .checked_mul(groups_per_row)
         .context("dense q4 group count overflow")?;
-    let scale_bias_bytes = dense_scale_bias_dtype_size(scale_bias_dtype)
+    let scale_bias_bytes = expert_scale_bias_dtype_size(scale_bias_dtype)
         .with_context(|| format!("unsupported dense q4 scale/bias dtype {scale_bias_dtype}"))?;
     let scales_bytes = groups
         .checked_mul(scale_bias_bytes)
@@ -269,14 +269,6 @@ pub(crate) fn dense_q4_layout_with_scale_bias_dtype(
         scale_bias_bytes,
         total_bytes,
     })
-}
-
-fn dense_scale_bias_dtype_size(dtype: &str) -> Result<usize> {
-    match dtype.to_ascii_uppercase().as_str() {
-        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => Ok(4),
-        "BF16" | "BFLOAT16" => Ok(2),
-        other => bail!("unsupported q4 scale/bias dtype {other}"),
-    }
 }
 
 pub(crate) fn validate_dense_matvec_shape(

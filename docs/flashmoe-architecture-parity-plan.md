@@ -120,9 +120,10 @@ The validator should reject silent fallbacks such as:
   `ExpertSlotStore`, layer reader opening, positioned reads, reusable whole-expert buffers, raw
   expert payload responses, and the expert read worker pool. Production store opening resolves
   through the model layout; default Qwen3.5 raw multi-read helpers are kept test-only. Packed expert
-  tensor records, PBQ4 pack parsing, scale/bias payload decoding, and PBQ4-to-fixed-Q4 compatibility
-  conversion now live with expert storage instead of the legacy runtime. PBQ4 remains import/build
-  compatibility; execution reads are moving toward fixed whole-expert slots.
+  tensor records, PBQ4 pack parsing, PBQ4 wire-size accounting, scale/bias payload decoding, shared
+  scale/bias dtype sizing, and PBQ4-to-fixed-Q4 compatibility conversion now live with expert
+  storage instead of the legacy runtime. PBQ4 remains import/build compatibility; execution reads
+  are moving toward fixed whole-expert slots.
 - `scheduler.rs` now owns graph-stage resolution, CMD1 resolved input-state handoff, CMD2/CMD3
   descriptors, CMD2 typed input-state validation and resolved input-state handoff, CMD2
   post-attention prep output resolution tied to that input state, CMD3 input validation, retained
@@ -308,9 +309,10 @@ The refactor should break the current monolith by ownership boundary, not by "fa
 
 3. Extract expert storage and readers from `legacy.rs`.
    Move fixed-slot layout validation, layer reader opening, positioned read helpers, reusable
-   buffers, read metrics, fixed-slot packed-record fixture coverage, PBQ4 parsing/scale-bias
-   decoding, and PBQ4 import compatibility into `experts`. Runtime reads should return typed
-   `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split gate/up/down owners.
+   buffers, read metrics, fixed-slot packed-record fixture coverage, PBQ4 parsing/wire-size
+   accounting/scale-bias decoding, and PBQ4 import compatibility into `experts`. Runtime reads
+   should return typed `ExpertSlot` or `ExpertMetalSlot` handles with offsets, not split
+   gate/up/down owners.
 
 4. Introduce the scheduler API before optimizing it.
    Create a scheduler that owns per-token/per-layer state: active expert IDs, pending read jobs,

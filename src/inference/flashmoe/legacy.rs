@@ -75,13 +75,14 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertRawPayload, ExpertRawRead,
-    ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView, FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
-    FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView,
-    PBQ4_EXPERT_MAGIC, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
-    expert_layer_metadata_path, expert_layer_path, expert_slot_end, expert_slot_offset,
+    ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord, ExpertPackWireRecord,
+    ExpertRawPayload, ExpertRawRead, ExpertSlotDescriptor, ExpertSlotStore, ExpertSlotView,
+    FIXED_Q4_EXPERT_LAYER_FORMAT_V1, FixedQ4ExpertPayload, FixedQ4ExpertProjection,
+    FixedQ4ExpertSlotSpec, FixedQ4ExpertSlotView, PBQ4_EXPERT_MAGIC, PackedExpertTensor,
+    Q4MatvecPayload, Q4MatvecSource, expert_layer_metadata_path, expert_layer_path,
+    expert_scale_bias_dtype_size, expert_slot_end, expert_slot_offset,
     fixed_q4_pack_from_pbq4_records, fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
-    read_exact_at_positioned, read_expert_layer_pack_metadata,
+    pbq4_expert_pack_wire_size, read_exact_at_positioned, read_expert_layer_pack_metadata,
 };
 use super::math::*;
 use super::model_family::{QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
@@ -22423,35 +22424,6 @@ fn expected_expert_pack(
     })
 }
 
-fn pbq4_expert_pack_wire_size(records: &[ExpectedExpertPackRecord]) -> Result<u64> {
-    let mut size = PBQ4_EXPERT_MAGIC.len() as u64;
-    for record in records {
-        let scale_bias_bytes = expert_scale_bias_dtype_size(&record.scale_bias_dtype)
-            .with_context(|| {
-                format!(
-                    "cannot compute expert pack wire size for q4 scale/bias dtype {}",
-                    record.scale_bias_dtype
-                )
-            })?;
-        let record_size = 4u64
-            .checked_add(record.tensor.len() as u64)
-            .and_then(|size| size.checked_add(8))
-            .and_then(|size| size.checked_add(8))
-            .and_then(|size| {
-                size.checked_add((record.groups as u64).checked_mul(scale_bias_bytes as u64)?)
-            })
-            .and_then(|size| {
-                size.checked_add((record.groups as u64).checked_mul(scale_bias_bytes as u64)?)
-            })
-            .and_then(|size| size.checked_add(record.packed_bytes))
-            .context("expert pack record wire size overflow")?;
-        size = size
-            .checked_add(record_size)
-            .context("expert pack wire size overflow")?;
-    }
-    Ok(size)
-}
-
 fn expert_pack_records_match_expected(
     actual: &[ExpertPackRecord],
     expected: &[ExpectedExpertPackRecord],
@@ -22468,14 +22440,6 @@ fn expert_pack_records_match_expected(
                 && actual.group_size == expected.group_size
                 && actual.scale_bias_dtype == expected.scale_bias_dtype
         })
-}
-
-fn expert_scale_bias_dtype_size(dtype: &str) -> Result<usize> {
-    match dtype.to_ascii_uppercase().as_str() {
-        EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => Ok(4),
-        EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => Ok(2),
-        other => bail!("unsupported q4 scale/bias dtype {other}"),
-    }
 }
 
 fn rewrite_expert_layer_pack(
@@ -23435,6 +23399,24 @@ struct ExpectedExpertPackRecord {
     groups: usize,
     group_size: usize,
     scale_bias_dtype: String,
+}
+
+impl ExpertPackWireRecord for ExpectedExpertPackRecord {
+    fn tensor_name(&self) -> &str {
+        &self.tensor
+    }
+
+    fn packed_bytes(&self) -> u64 {
+        self.packed_bytes
+    }
+
+    fn scale_bias_groups(&self) -> usize {
+        self.groups
+    }
+
+    fn scale_bias_dtype(&self) -> &str {
+        &self.scale_bias_dtype
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -25934,37 +25916,6 @@ mod tests {
             err.to_string().contains("metadata offset mismatch"),
             "unexpected error: {err:?}"
         );
-    }
-
-    #[test]
-    fn pbq4_expert_wire_size_accounts_for_bf16_scale_bias_metadata() {
-        let records: Vec<ExpectedExpertPackRecord> = [
-            ("gate_proj.weight", 2_097_152, 65_536),
-            ("up_proj.weight", 2_097_152, 65_536),
-            ("down_proj.weight", 2_097_152, 65_536),
-        ]
-        .into_iter()
-        .map(|(tensor, packed_bytes, groups)| ExpectedExpertPackRecord {
-            tensor: tensor.to_string(),
-            dtype: "BF16".to_string(),
-            shape: vec![1024, 4096],
-            source_offsets: [0, 0],
-            source_hash: "hash".to_string(),
-            packed_bytes,
-            groups,
-            group_size: GROUP_SIZE,
-            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
-        })
-        .collect();
-        let f32_size = pbq4_expert_pack_wire_size(&records).unwrap();
-        let mut bf16_records = records.clone();
-        for record in &mut bf16_records {
-            record.scale_bias_dtype = EXPERT_SCALE_BIAS_DTYPE_BF16.to_string();
-        }
-        let bf16_size = pbq4_expert_pack_wire_size(&bf16_records).unwrap();
-
-        assert_eq!(f32_size - bf16_size, 786_432);
-        assert!(bf16_size < f32_size);
     }
 
     #[test]
