@@ -9811,8 +9811,7 @@ impl FlashMoeEngine {
                     routing_command.source,
                     ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
                 );
-                prep.routing_command = Some(routing_command.clone());
-                precomputed_active = Some(routing_command);
+                precomputed_active = Some(prep.attach_routing_command(routing_command)?);
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some((out_proj_name, attention_values)) =
@@ -9857,7 +9856,7 @@ impl FlashMoeEngine {
                         routing_command.source,
                         ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
                     );
-                    prep.routing_command = Some(routing_command.clone());
+                    let routing_command = prep.attach_routing_command(routing_command)?;
                     metal_post_attention_prep = Some(prep);
                     precomputed_active = Some(routing_command);
                     if let Some(attention_values) = attention_values.take() {
@@ -9947,7 +9946,7 @@ impl FlashMoeEngine {
                             routing_command.source,
                             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
                         );
-                        prep.routing_command = Some(routing_command.clone());
+                        let routing_command = prep.attach_routing_command(routing_command)?;
                         metal_post_attention_prep = Some(prep);
                         prepared = Some(routing_command);
                     }
@@ -27208,7 +27207,7 @@ mod tests {
                 "active expert score at slot {slot} diverged: actual={actual_score}, expected={expected_score}"
             );
         }
-        assert!(prep.routing_command.is_none());
+        assert!(prep.routing_command().is_none());
         let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
         let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
         let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
@@ -27240,8 +27239,11 @@ mod tests {
             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
         );
         assert_eq!(routing_command.routes, expected_active);
-        prep.routing_command = Some(routing_command.clone());
-        assert_eq!(prep.routing_command, Some(routing_command));
+        let attached = prep
+            .attach_routing_command(routing_command.clone())
+            .unwrap();
+        assert_eq!(attached, routing_command);
+        assert_eq!(prep.routing_command(), Some(&routing_command));
 
         unsafe {
             let residual_ptr = msg_send_ptr0(prep.residual_buffer, sel("contents")).cast::<f32>();

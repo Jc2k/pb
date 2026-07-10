@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::scheduler::{ScheduledCmd3MetalPostAttentionInput, ScheduledRoutingCommand};
+use super::scheduler::{
+    ScheduledCmd3MetalPostAttentionInput, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::FlashMoePostAttentionPrepState;
 
@@ -823,7 +825,7 @@ pub(crate) struct MetalPostAttentionPrep {
     pub(crate) state: FlashMoePostAttentionPrepState,
     pub(crate) width: usize,
     pub(crate) active: Vec<(usize, f32)>,
-    pub(crate) routing_command: Option<ScheduledRoutingCommand>,
+    routing_command: Option<ScheduledRoutingCommand>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -852,6 +854,56 @@ impl MetalPostAttentionPrep {
             active,
             routing_command: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn routing_command(&self) -> Option<&ScheduledRoutingCommand> {
+        self.routing_command.as_ref()
+    }
+
+    pub(crate) fn attach_routing_command(
+        &mut self,
+        command: ScheduledRoutingCommand,
+    ) -> anyhow::Result<ScheduledRoutingCommand> {
+        let routing = self.state.routing();
+        if command.layer != routing.layer() || command.routing.layer != routing.layer() {
+            anyhow::bail!(
+                "FlashMoe CMD2 Metal post-attention prep routing layer {} does not match command layer {}",
+                routing.layer(),
+                command.layer
+            );
+        }
+        if command.routing.experts != routing.experts() {
+            anyhow::bail!(
+                "FlashMoe CMD2 Metal post-attention prep expert count {} does not match command experts {}",
+                routing.experts(),
+                command.routing.experts
+            );
+        }
+        if command.active_experts != routing.active_experts()
+            || command.routing.active_experts != routing.active_experts()
+            || command.routes.len() != self.active.len()
+        {
+            anyhow::bail!(
+                "FlashMoe CMD2 Metal post-attention prep active route count {} does not match command active_experts={} routes={}",
+                self.active.len(),
+                command.active_experts,
+                command.routes.len()
+            );
+        }
+        if command.source != ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
+            anyhow::bail!(
+                "FlashMoe CMD2 Metal post-attention prep requires fused-prep CPU topK routing, got {:?}",
+                command.source
+            );
+        }
+        if command.routes != self.active {
+            anyhow::bail!(
+                "FlashMoe CMD2 Metal post-attention prep routes do not match the scheduler routing command"
+            );
+        }
+        self.routing_command = Some(command.clone());
+        Ok(command)
     }
 }
 
@@ -2635,6 +2687,12 @@ pub(crate) fn format_metal_command_failure(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::super::capabilities::{
+        FlashMoeGraphStage, FlashMoeStageCapability, FlashMoeStagePlacement,
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::super::scheduler::ScheduledRoutingTopK;
     use super::*;
 
     #[test]
@@ -2950,7 +3008,7 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn post_attention_prep_builds_declared_cmd3_metal_input() {
-        let prep = MetalPostAttentionPrep::new(
+        let mut prep = MetalPostAttentionPrep::new(
             3,
             8,
             16,
@@ -2962,9 +3020,33 @@ mod tests {
 
         assert_eq!(prep.width, 8);
         assert_eq!(prep.active, vec![(2, 0.75), (5, 0.25)]);
-        assert!(prep.routing_command.is_none());
+        assert!(prep.routing_command().is_none());
         assert_eq!(prep.input.state(), prep.state);
         assert!(prep.state.is_declared_graph_state());
+
+        let command = test_fused_prep_routing_command(3, 16, &prep.active);
+        let attached = prep.attach_routing_command(command.clone()).unwrap();
+        assert_eq!(attached, command);
+        assert_eq!(prep.routing_command(), Some(&command));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn post_attention_prep_rejects_mismatched_routing_command() {
+        let mut prep = MetalPostAttentionPrep::new(
+            3,
+            8,
+            16,
+            vec![(2, 0.75), (5, 0.25)],
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
+        let command = test_fused_prep_routing_command(4, 16, &prep.active);
+
+        let err = prep.attach_routing_command(command).unwrap_err();
+        assert!(err.to_string().contains("routing layer 3"), "{err:#}");
+        assert!(prep.routing_command().is_none());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2984,6 +3066,33 @@ mod tests {
             err.to_string()
                 .contains("Metal post-attention input for layer 3")
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_fused_prep_routing_command(
+        layer: usize,
+        experts: usize,
+        routes: &[(usize, f32)],
+    ) -> ScheduledRoutingCommand {
+        let stage = FlashMoeStageCapability::new(
+            FlashMoeGraphStage::RoutingSoftmaxTopK,
+            FlashMoeStagePlacement::CpuDeclared,
+            "test-fused-prep-topk",
+        );
+        let routing = ScheduledRoutingTopK {
+            stage,
+            layer,
+            experts,
+            active_experts: routes.len(),
+            source: ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+        };
+        ScheduledRoutingCommand {
+            routing,
+            layer,
+            active_experts: routes.len(),
+            source: ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            routes: routes.to_vec(),
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

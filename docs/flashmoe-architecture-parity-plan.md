@@ -181,7 +181,9 @@ The validator should reject silent fallbacks such as:
   pipeline-name plan, typed pipeline handle set, release ordering, and kernel-surface coverage.
   Metal post-attention prep now materializes as a Metal-owned typed payload carrying scheduler CMD3
   input state, declared prep state, buffers, active routes, and the optional resolved routing
-  command. Metal attention placement policy, batch-projection inputs, projection batches,
+  command. That routing command is attached through a Metal-owned validation method rather than a
+  public mutable field, so CMD2 fused-prep routes must match the scheduler command before expert
+  reads can be issued. Metal attention placement policy, batch-projection inputs, projection batches,
   attention-value outputs, and linear-attention static offsets now use Metal-owned descriptors for
   CMD1/CMD2 handoff. Metal KV cache layer layout/range validation and linear-attention GPU state
   cache descriptors now live with the Metal module, while allocation is still bridged through
