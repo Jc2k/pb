@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+#[cfg(test)]
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -911,6 +912,7 @@ impl FlashMoeLinearAttentionCacheState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cpu_visible(
         layer: usize,
         conv_state_len: usize,
@@ -983,6 +985,7 @@ impl FlashMoeLinearAttentionCacheState {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FlashMoeLinearAttentionCacheShape {
     pub(crate) conv_state_len: usize,
@@ -1013,21 +1016,12 @@ impl LinearAttentionLayout {
         self.num_value_heads * self.value_dim * self.key_dim
     }
 
-    pub(crate) fn cache_shape(self) -> FlashMoeLinearAttentionCacheShape {
-        FlashMoeLinearAttentionCacheShape::new(
-            self.conv_state_len(),
-            self.ssm_state_len(),
-            self.conv_dim,
-            self.total_value_width,
-            self.value_dim,
-        )
-    }
-
     pub(crate) fn value_heads_per_key_head(self) -> usize {
         (self.num_value_heads / self.num_key_heads).max(1)
     }
 }
 
+#[cfg(test)]
 impl FlashMoeLinearAttentionCacheShape {
     pub(crate) fn new(
         conv_state_len: usize,
@@ -1069,6 +1063,7 @@ impl FlashMoeLinearAttentionCacheShape {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeLinearAttentionStateData {
     pub(crate) conv_state: Vec<f32>,
@@ -1079,11 +1074,13 @@ pub(crate) struct FlashMoeLinearAttentionStateData {
     pub(crate) delta: Vec<f32>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeLinearAttentionState {
     inner: Arc<FlashMoeLinearAttentionStateData>,
 }
 
+#[cfg(test)]
 impl FlashMoeLinearAttentionState {
     pub(crate) fn new(shape: FlashMoeLinearAttentionCacheShape) -> Self {
         debug_assert!(shape.is_declared_graph_shape());
@@ -1145,13 +1142,9 @@ impl FlashMoeLinearAttentionState {
             && self.kv_mem.len() == shape.value_scratch_len
             && self.delta.len() == shape.value_scratch_len
     }
-
-    #[cfg(test)]
-    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
 }
 
+#[cfg(test)]
 impl Deref for FlashMoeLinearAttentionState {
     type Target = FlashMoeLinearAttentionStateData;
 
@@ -1160,6 +1153,7 @@ impl Deref for FlashMoeLinearAttentionState {
     }
 }
 
+#[cfg(test)]
 impl DerefMut for FlashMoeLinearAttentionState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         Arc::make_mut(&mut self.inner)

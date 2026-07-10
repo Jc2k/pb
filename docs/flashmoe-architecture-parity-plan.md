@@ -188,6 +188,12 @@ Baseline reviewed on 2026-07-10:
   state mutation, gated normalization, output projection, residual/RMS norm, router projection,
   CPU top-k readback, and GPU-resident CMD3 handoff move together. `legacy.rs` retains only the
   model-weight lookup and one builder invocation for this resolved stage.
+- The previous split linear-attention runtime has been deleted: intermediate projection buffers,
+  separate recurrence encoders, CPU recurrence and static-weight caches, CPU recurrent session
+  state, and `Ok(None)` retries no longer sit beside the fused implementation. Qwen-VL deepstack
+  and diagnostic expert skipping now fail as undeclared graph behavior at the layer boundary.
+  Deferred full-attention CMD1 likewise requires resident Q4 projections and cannot select the
+  removed dense BF16/F32 encoder through runtime probing.
 - `MetalQ4ProjectionBatchBuilder` now owns the resident-Q4 projection batch used by full-attention
   CMD1 and deferred state: CPU or GPU input binding, fused compatible-projection dispatch,
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and

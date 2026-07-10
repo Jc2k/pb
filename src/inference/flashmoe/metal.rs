@@ -102,50 +102,6 @@ impl MetalBatchProjectionInput<'_> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-pub(crate) struct MetalProjectionBatch {
-    pub(crate) output_buffer: MetalObjcId,
-    pub(crate) output_offsets: Vec<usize>,
-    pub(crate) output_widths: Vec<usize>,
-    pub(crate) total_rows: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalProjectionBatch {
-    pub(crate) fn new(
-        output_buffer: MetalObjcId,
-        output_offsets: Vec<usize>,
-        output_widths: Vec<usize>,
-        total_rows: usize,
-    ) -> Self {
-        Self {
-            output_buffer,
-            output_offsets,
-            output_widths,
-            total_rows,
-        }
-    }
-
-    pub(crate) fn empty() -> Self {
-        Self::new(std::ptr::null_mut(), Vec::new(), Vec::new(), 0)
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-pub(crate) struct MetalAttentionValues {
-    pub(crate) buffer: MetalObjcId,
-    pub(crate) len: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalAttentionValues {
-    pub(crate) fn new(buffer: MetalObjcId, len: usize) -> Self {
-        Self { buffer, len }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetalQ4SourceBufferKey {
     ptr: usize,
@@ -2958,217 +2914,6 @@ impl<'a> MetalQ4ProjectionBatchBuilder<'a> {
         }
     }
 
-    pub(crate) fn execute_to_buffer(
-        &self,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
-        if projections.is_empty() {
-            return Ok(Some((
-                MetalProjectionBatch::empty(),
-                MetalMatvecTiming::default(),
-                0,
-            )));
-        }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
-
-        let input_len = input.len();
-        let mut total_rows = 0usize;
-        let mut output_offsets = Vec::with_capacity(projections.len());
-        let mut output_widths = Vec::with_capacity(projections.len());
-        for projection in projections {
-            if projection.rows == 0 || projection.cols == 0 {
-                return Ok(None);
-            }
-            if projection.cols != input_len {
-                bail!(
-                    "dense q4 mmap batch projection {} input len {} does not match cols {}",
-                    projection.tensor_name,
-                    input_len,
-                    projection.cols
-                );
-            }
-            if projection.output_width != projection.rows {
-                bail!(
-                    "dense q4 mmap batch projection {} output width {} does not match rows {}",
-                    projection.tensor_name,
-                    projection.output_width,
-                    projection.rows
-                );
-            }
-            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
-                bail!(
-                    "dense q4 mmap batch projection {} row packed bytes {} do not match cols {}",
-                    projection.tensor_name,
-                    projection.row_packed_bytes,
-                    projection.cols
-                );
-            }
-            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-            {
-                return Ok(None);
-            }
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("dense q4 mmap batch packed byte length overflow")?;
-            let group_bytes = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-                .context("dense q4 mmap batch group byte length overflow")?;
-            for (offset, len, label) in [
-                (projection.packed_byte_offset, packed_len, "packed"),
-                (projection.scales_byte_offset, group_bytes, "scales"),
-                (projection.biases_byte_offset, group_bytes, "biases"),
-            ] {
-                let offset = usize::try_from(offset).with_context(|| {
-                    format!(
-                        "dense q4 mmap batch {label} offset for {} does not fit usize",
-                        projection.tensor_name
-                    )
-                })?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > dense_weights.len)
-                {
-                    return Ok(None);
-                }
-            }
-            let output_offset = total_rows;
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("dense q4 mmap batch output row count overflow")?;
-            output_offsets.push(output_offset);
-            output_widths.push(projection.output_width);
-        }
-
-        unsafe {
-            let mut timing = MetalMatvecTiming::default();
-            let upload_started = Instant::now();
-            let (input_buffer, owned_input_buffer) = match input {
-                MetalBatchProjectionInput::Cpu(input) => {
-                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
-                    (buffer, Some(buffer))
-                }
-                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
-            };
-            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
-            timing.buffer_upload += upload_started.elapsed();
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(output_buffer);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(output_buffer);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
-            }
-
-            let mut transient_buffers = Vec::new();
-            let dispatch_count = if self.try_encode_q4_mmap_projection_batch(
-                encoder,
-                projections,
-                input_buffer,
-                output_buffer,
-                &output_offsets,
-                total_rows,
-                &mut transient_buffers,
-            )? {
-                1
-            } else {
-                for (idx, projection) in projections.iter().enumerate() {
-                    let output_offset = output_offsets[idx]
-                        .checked_mul(std::mem::size_of::<f32>())
-                        .context("dense q4 mmap batch output byte offset overflow")?
-                        as u64;
-                    let rows_u32 = projection.rows as u32;
-                    let cols_u32 = projection.cols as u32;
-                    let groups_u32 = projection.groups_per_row as u32;
-                    let group_size_u32 = projection.group_size as u32;
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        if projection
-                            .scale_bias_dtype
-                            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                        {
-                            self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                        } else {
-                            self.pipelines.q4_mmap_pipeline
-                        },
-                    );
-                    set_buffer(encoder, dense_weights.buffer, 0);
-                    set_buffer(encoder, input_buffer, 1);
-                    set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                    set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                    set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                    set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                    set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                    set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                    set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                    set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                    dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
-                }
-                projections.len()
-            };
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let dispatch_started = Instant::now();
-            let names = projections
-                .iter()
-                .map(|projection| projection.tensor_name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let context = MetalCommandContext::new("dense_q4_mmap_matvec_batch_buffer")
-                .with("projections", projections.len())
-                .with("dispatches", dispatch_count)
-                .with("rows", total_rows)
-                .with("input_len", input_len)
-                .with("tensors", names);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                for buffer in transient_buffers {
-                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
-                }
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
-                }
-                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
-                return Err(error.into());
-            }
-            timing.dispatch += dispatch_started.elapsed();
-
-            release(encoder);
-            release(command_buffer);
-            if let Some(buffer) = owned_input_buffer {
-                self.recycle(buffer);
-            }
-            for buffer in transient_buffers {
-                self.recycle(buffer);
-            }
-            Ok(Some((
-                MetalProjectionBatch::new(output_buffer, output_offsets, output_widths, total_rows),
-                timing,
-                projections.len(),
-            )))
-        }
-    }
-
     pub(crate) fn execute(
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
@@ -4779,18 +4524,6 @@ pub(crate) unsafe fn read_f32_buffer(buffer: MetalObjcId, len: usize) -> Vec<f32
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn metal_buffer_barrier(encoder: MetalObjcId) {
-    unsafe {
-        const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
-        msg_send_void1_u64(
-            encoder,
-            sel("memoryBarrierWithScope:"),
-            MTL_BARRIER_SCOPE_BUFFERS,
-        );
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn dispatch_threads(encoder: MetalObjcId, threads: u64) {
     unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::threads(threads)) }
 }
@@ -5078,15 +4811,6 @@ pub(crate) unsafe fn msg_send_void1_id(
 ) {
     unsafe {
         let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, MetalObjcId) =
-            std::mem::transmute(objc_msgSend as *const ());
-        f(receiver, selector, arg);
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn msg_send_void1_u64(receiver: MetalObjcId, selector: MetalSelector, arg: u64) {
-    unsafe {
-        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, u64) =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector, arg);
     }
@@ -7084,34 +6808,6 @@ mod tests {
             MetalBatchProjectionInput::Buffer { buffer: id, len: 7 }.len(),
             7
         );
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn projection_batch_declares_metal_output_layout() {
-        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-        let batch = MetalProjectionBatch::new(id, vec![0, 4, 12], vec![4, 8, 2], 14);
-
-        assert_eq!(batch.output_buffer, id);
-        assert_eq!(batch.output_offsets, vec![0, 4, 12]);
-        assert_eq!(batch.output_widths, vec![4, 8, 2]);
-        assert_eq!(batch.total_rows, 14);
-
-        let empty = MetalProjectionBatch::empty();
-        assert!(empty.output_buffer.is_null());
-        assert!(empty.output_offsets.is_empty());
-        assert!(empty.output_widths.is_empty());
-        assert_eq!(empty.total_rows, 0);
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn attention_values_declares_metal_buffer_and_len() {
-        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-        let values = MetalAttentionValues::new(id, 64);
-
-        assert_eq!(values.buffer, id);
-        assert_eq!(values.len, 64);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

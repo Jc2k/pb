@@ -1133,6 +1133,7 @@ impl<const N: usize> DenseProjectionRequestGroup<N> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn tensor_name(&self, idx: usize) -> &str {
         &self.tensor_names[idx]
     }

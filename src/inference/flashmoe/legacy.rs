@@ -38,7 +38,9 @@ use std::ffi::c_int;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -103,19 +105,18 @@ use super::experts::{
 use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalBufferPool,
-    MetalCommandContext, MetalDenseWeights, MetalDispatchSize, MetalFusedLinearAttentionBuilder,
-    MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache,
-    MetalMatvecTiming, MetalObjcId as ObjcId, MetalPipelineNameSet, MetalPostAttentionPrep,
-    MetalProjectionBatch, MetalQ4PostAttentionPrepBuilder, MetalQ4ProjectionBatchBuilder,
+    METAL_SHADERS, MetalBatchProjectionInput, MetalBufferPool, MetalCommandContext,
+    MetalDenseWeights, MetalFusedLinearAttentionBuilder, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalMatvecTiming, MetalObjcId as ObjcId, MetalPipelineNameSet,
+    MetalPostAttentionPrep, MetalQ4PostAttentionPrepBuilder, MetalQ4ProjectionBatchBuilder,
     MetalResidentQ4TopKBuilder, MetalRuntime, MetalRuntimeCapabilities, MetalScheduledCmd3Builder,
     MetalScheduledCmd3Submission, commit_and_wait_metal_command_buffer,
     dispatch_q4_mmap_threadgroups, dispatch_q4_threadgroups, dispatch_threads, f32_as_bytes,
-    metal_buffer_barrier, metal_command_failure_requires_release, msg_send_id0,
-    msg_send_id2_usize_u64, msg_send_ptr0, msg_send_void0, msg_send_void1_id, msg_send_void2_size,
-    read_f32_buffer, release, retain, sel, set_buffer, set_buffer_with_offset, set_bytes,
-    u32_as_bytes, u32_as_bytes_slice, u64_as_bytes, wrap_dense_mmap_as_metal_buffer,
+    metal_command_failure_requires_release, msg_send_id0, msg_send_id2_usize_u64, msg_send_ptr0,
+    msg_send_void0, msg_send_void1_id, read_f32_buffer, release, retain, sel, set_buffer,
+    set_buffer_with_offset, set_bytes, u32_as_bytes, u32_as_bytes_slice, u64_as_bytes,
+    wrap_dense_mmap_as_metal_buffer,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -143,9 +144,9 @@ use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd3InputState, FlashMoeCpuBuffer,
     FlashMoeExpertPhaseApplication, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvRecord,
     FlashMoeGeneratedTokenRecord, FlashMoeGpuBufferDescriptor, FlashMoeLayerStateRecord,
-    FlashMoeLinearAttentionCacheState, FlashMoeLinearAttentionState, FlashMoePromptTokenRecord,
-    FlashMoeRecurrentLayerState, FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState,
-    LinearAttentionLayout, stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoeLinearAttentionCacheState, FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState,
+    FlashMoeSessionState, FlashMoeStatePlacement, FlashMoeTokenState, LinearAttentionLayout,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 #[cfg(test)]
@@ -1296,7 +1297,6 @@ where
         routing_policy,
         runtime,
         shared_expert_phases: SharedExpertPhaseCache::default(),
-        linear_attention_cache: Mutex::new(BTreeMap::new()),
         session_cache: BTreeMap::new(),
     })
 }
@@ -1316,7 +1316,6 @@ pub struct FlashMoeEngine {
     routing_policy: ResolvedRoutingPolicy,
     runtime: DenseTransformerRuntime,
     shared_expert_phases: SharedExpertPhaseCache,
-    linear_attention_cache: Mutex<BTreeMap<usize, Arc<LinearAttentionStaticWeights>>>,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
     session_cache: BTreeMap<String, FlashMoeSessionState<KvCache>>,
@@ -1775,15 +1774,6 @@ type ScheduledExpertCommand<'a> = ScheduledCmd3Command<
     SharedExpertPhaseRef<'a>,
 >;
 
-#[derive(Debug, Clone)]
-struct LinearAttentionStaticWeights {
-    conv_weight: Arc<Vec<f32>>,
-    a_log: Arc<Vec<f32>>,
-    dt_bias: Arc<Vec<f32>>,
-    norm_weight: Option<Arc<Vec<f32>>>,
-    layout: LinearAttentionLayout,
-}
-
 #[derive(Debug)]
 enum DeferredExpertPhase {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2165,27 +2155,6 @@ impl MetalExecutor {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn dense_mmap_matvec_batch_with_input_buffer(
-        &self,
-        projections: &[DenseMmapMatvecProjection],
-        input_buffer: ObjcId,
-        input_len: usize,
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
-        self.inner
-            .dense_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn dense_mmap_matvec_batch_to_buffer(
-        &self,
-        projections: &[DenseMmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
-        self.inner
-            .dense_mmap_matvec_batch_to_buffer(projections, input)
-    }
-
     fn dense_mmap_top_candidates(
         &self,
         byte_offset: u64,
@@ -2333,56 +2302,6 @@ impl MetalExecutor {
     ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
         self.inner
             .q4_mmap_matvec_batch_with_input_buffer(projections, input_buffer, input_len)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn q4_mmap_matvec_batch_to_buffer(
-        &self,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
-        self.inner
-            .q4_mmap_matvec_batch_to_buffer(projections, input)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_attention_q4_mmap_batch(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-    ) -> Result<Option<MetalAttentionValues>> {
-        self.inner
-            .linear_attention_q4_mmap_batch(layer, layout, projections, input, static_offsets)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_attention_from_projection_batch(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        batch: MetalProjectionBatch,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-    ) -> Result<Option<Vec<f32>>> {
-        self.inner
-            .linear_attention_from_projection_batch(layer, layout, batch, static_offsets)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn recycle_projection_batch(&self, batch: MetalProjectionBatch) {
-        self.inner.recycle_projection_batch(batch);
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn read_and_recycle_attention_values(&self, values: MetalAttentionValues) -> Vec<f32> {
-        self.inner.read_and_recycle_attention_values(values)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn recycle_attention_values(&self, values: MetalAttentionValues) {
-        self.inner.recycle_attention_values(values);
     }
 
     fn lm_head_top_candidates_from_cached_buffer(
@@ -2617,666 +2536,6 @@ impl MetalExecutorInner {
         }
     }
 
-    fn recycle_projection_batch(&self, batch: MetalProjectionBatch) {
-        if !batch.output_buffer.is_null() {
-            unsafe {
-                self.recycle(batch.output_buffer);
-            }
-        }
-    }
-
-    fn recycle_attention_values(&self, values: MetalAttentionValues) {
-        if !values.buffer.is_null() {
-            unsafe {
-                self.recycle(values.buffer);
-            }
-        }
-    }
-
-    fn read_and_recycle_attention_values(&self, values: MetalAttentionValues) -> Vec<f32> {
-        unsafe {
-            let output = read_f32_buffer(values.buffer, values.len);
-            self.recycle(values.buffer);
-            output
-        }
-    }
-
-    fn linear_attention_from_projection_batch(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        batch: MetalProjectionBatch,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-    ) -> Result<Option<Vec<f32>>> {
-        if batch.output_offsets.len() != 4
-            || batch.output_widths.len() != 4
-            || batch.output_widths[0] != layout.conv_dim
-            || batch.output_widths[1] != layout.total_value_width
-            || batch.output_widths[2] != layout.num_value_heads
-            || batch.output_widths[3] != layout.num_value_heads
-            || batch.total_rows
-                != batch
-                    .output_offsets
-                    .iter()
-                    .zip(batch.output_widths.iter())
-                    .map(|(offset, width)| offset.saturating_add(*width))
-                    .max()
-                    .unwrap_or(0)
-            || layout.key_dim == 0
-            || layout.value_dim == 0
-            || layout.key_dim > 256
-            || layout.value_dim > 256
-            || layout.num_key_heads == 0
-            || layout.num_value_heads == 0
-        {
-            self.recycle_projection_batch(batch);
-            return Ok(None);
-        }
-        let Some(dense_weights) = &self.dense_weights else {
-            self.recycle_projection_batch(batch);
-            return Ok(None);
-        };
-        let qkv_offset = batch.output_offsets[0]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention qkv projection offset overflow")?
-            as u64;
-        let z_offset = batch.output_offsets[1]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention z projection offset overflow")?
-            as u64;
-        let beta_offset = batch.output_offsets[2]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention beta projection offset overflow")?
-            as u64;
-        let alpha_offset = batch.output_offsets[3]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention alpha projection offset overflow")?
-            as u64;
-
-        let mut state_guard = self
-            .linear_attention_state
-            .lock()
-            .expect("metal linear attention state poisoned");
-        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
-            drop(state_guard);
-            self.recycle_projection_batch(batch);
-            return Ok(None);
-        };
-        if state.conv_dim != layout.conv_dim
-            || state.total_value_width != layout.total_value_width
-            || state.num_value_heads != layout.num_value_heads
-            || state.conv_state_len != layout.conv_state_len()
-            || state.ssm_state_len != layout.ssm_state_len()
-        {
-            drop(state_guard);
-            self.recycle_projection_batch(batch);
-            return Ok(None);
-        }
-
-        unsafe {
-            let output_buffer =
-                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle(output_buffer);
-                drop(state_guard);
-                self.recycle_projection_batch(batch);
-                bail!("failed to create Flash-MoE linear-attention Metal command buffer");
-            }
-
-            let conv_dim_u32 = layout.conv_dim as u32;
-            let kernel_size_u32 = layout.conv_kernel_size as u32;
-            let key_dim_u32 = layout.key_dim as u32;
-            let value_dim_u32 = layout.value_dim as u32;
-            let heads_u32 = layout.num_value_heads as u32;
-            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
-            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
-            let eps = 1e-6f32;
-
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle(output_buffer);
-                drop(state_guard);
-                self.recycle_projection_batch(batch);
-                bail!("failed to create Flash-MoE linear-attention Metal compute encoder");
-            }
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_conv1d_pipeline,
-            );
-            set_buffer(encoder, state.conv_state, 0);
-            set_buffer_with_offset(encoder, batch.output_buffer, qkv_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.conv_weight_byte_offset,
-                2,
-            );
-            set_buffer(encoder, state.conv_output, 3);
-            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
-            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
-            dispatch_threads(encoder, layout.conv_dim as u64);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_rms_norm_qk_pipeline,
-            );
-            set_buffer(encoder, state.conv_output, 0);
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                1,
-            );
-            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
-            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_key_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.key_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_decay_beta_pipeline,
-            );
-            set_buffer_with_offset(encoder, batch.output_buffer, alpha_offset, 0);
-            set_buffer_with_offset(encoder, batch.output_buffer, beta_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.a_log_byte_offset,
-                2,
-            );
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.dt_bias_byte_offset,
-                3,
-            );
-            set_buffer(encoder, state.g_decay, 4);
-            set_buffer(encoder, state.beta_gate, 5);
-            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
-            dispatch_threads(encoder, layout.num_value_heads as u64);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_delta_step_pipeline,
-            );
-            set_buffer(encoder, state.ssm_state, 0);
-            set_buffer(encoder, state.conv_output, 1);
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                2,
-            );
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                3,
-            );
-            set_buffer(encoder, state.g_decay, 4);
-            set_buffer(encoder, state.beta_gate, 5);
-            set_buffer(encoder, state.delta_output, 6);
-            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
-            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
-            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_value_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.value_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_gated_rms_norm_pipeline,
-            );
-            set_buffer(encoder, state.delta_output, 0);
-            set_buffer_with_offset(encoder, batch.output_buffer, z_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.norm_weight_byte_offset,
-                2,
-            );
-            set_buffer(encoder, output_buffer, 3);
-            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
-            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_value_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.value_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let context = MetalCommandContext::new("linear_attention_gated_delta")
-                .with("layer", layer)
-                .with("conv_dim", layout.conv_dim)
-                .with("key_dim", layout.key_dim)
-                .with("value_dim", layout.value_dim)
-                .with("value_heads", layout.num_value_heads);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
-                drop(state_guard);
-                self.recycle_projection_batch(batch);
-                return Err(error.into());
-            }
-
-            let output = read_f32_buffer(output_buffer, layout.total_value_width);
-            release(encoder);
-            release(command_buffer);
-            self.recycle(output_buffer);
-            drop(state_guard);
-            self.recycle_projection_batch(batch);
-            Ok(Some(output))
-        }
-    }
-
-    fn linear_attention_q4_mmap_batch(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-    ) -> Result<Option<MetalAttentionValues>> {
-        if projections.len() != 4
-            || projections[0].output_width != layout.conv_dim
-            || projections[1].output_width != layout.total_value_width
-            || projections[2].output_width != layout.num_value_heads
-            || projections[3].output_width != layout.num_value_heads
-            || layout.key_dim == 0
-            || layout.value_dim == 0
-            || layout.key_dim > 256
-            || layout.value_dim > 256
-            || layout.num_key_heads == 0
-            || layout.num_value_heads == 0
-        {
-            return Ok(None);
-        }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
-        let input_len = input.len();
-        let mut total_rows = 0usize;
-        let mut output_offsets = Vec::with_capacity(projections.len());
-        for projection in projections {
-            if projection.rows == 0 || projection.cols == 0 {
-                return Ok(None);
-            }
-            if projection.cols != input_len || projection.output_width != projection.rows {
-                return Ok(None);
-            }
-            if projection.row_packed_bytes != projection.cols.div_ceil(2) {
-                return Ok(None);
-            }
-            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-            {
-                return Ok(None);
-            }
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("linear-attention q4 projection packed byte length overflow")?;
-            let group_bytes = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-                .context("linear-attention q4 projection group byte length overflow")?;
-            for (offset, len) in [
-                (projection.packed_byte_offset, packed_len),
-                (projection.scales_byte_offset, group_bytes),
-                (projection.biases_byte_offset, group_bytes),
-            ] {
-                let offset =
-                    usize::try_from(offset).context("linear-attention q4 offset overflow")?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > dense_weights.len)
-                {
-                    return Ok(None);
-                }
-            }
-            output_offsets.push(total_rows);
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("linear-attention q4 projection output row overflow")?;
-        }
-
-        let qkv_offset = output_offsets[0]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention qkv projection offset overflow")?
-            as u64;
-        let z_offset = output_offsets[1]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention z projection offset overflow")?
-            as u64;
-        let beta_offset = output_offsets[2]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention beta projection offset overflow")?
-            as u64;
-        let alpha_offset = output_offsets[3]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention alpha projection offset overflow")?
-            as u64;
-
-        let mut state_guard = self
-            .linear_attention_state
-            .lock()
-            .expect("metal linear attention state poisoned");
-        let Some(state) = state_guard.layers.get_mut(layer).and_then(Option::as_mut) else {
-            return Ok(None);
-        };
-        if state.conv_dim != layout.conv_dim
-            || state.total_value_width != layout.total_value_width
-            || state.num_value_heads != layout.num_value_heads
-            || state.conv_state_len != layout.conv_state_len()
-            || state.ssm_state_len != layout.ssm_state_len()
-        {
-            return Ok(None);
-        }
-
-        unsafe {
-            let (input_buffer, owned_input_buffer) = match input {
-                MetalBatchProjectionInput::Cpu(input) => {
-                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
-                    (buffer, Some(buffer))
-                }
-                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
-            };
-            let projection_buffer =
-                self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
-            let output_buffer =
-                self.buffer_with_len(layout.total_value_width * std::mem::size_of::<f32>())?;
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(projection_buffer);
-                self.recycle(output_buffer);
-                drop(state_guard);
-                bail!("failed to create Flash-MoE linear-attention q4 CMD1 command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(projection_buffer);
-                self.recycle(output_buffer);
-                drop(state_guard);
-                bail!("failed to create Flash-MoE linear-attention q4 CMD1 compute encoder");
-            }
-
-            for (idx, projection) in projections.iter().enumerate() {
-                let output_offset = output_offsets[idx]
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("linear-attention q4 output byte offset overflow")?
-                    as u64;
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let groups_u32 = projection.groups_per_row as u32;
-                let group_size_u32 = projection.group_size as u32;
-                msg_send_void1_id(
-                    encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.pipelines.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, projection_buffer, output_offset, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
-            }
-            metal_buffer_barrier(encoder);
-
-            let conv_dim_u32 = layout.conv_dim as u32;
-            let kernel_size_u32 = layout.conv_kernel_size as u32;
-            let key_dim_u32 = layout.key_dim as u32;
-            let value_dim_u32 = layout.value_dim as u32;
-            let heads_u32 = layout.num_value_heads as u32;
-            let heads_per_key_u32 = layout.value_heads_per_key_head() as u32;
-            let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
-            let eps = 1e-6f32;
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_conv1d_pipeline,
-            );
-            set_buffer(encoder, state.conv_state, 0);
-            set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.conv_weight_byte_offset,
-                2,
-            );
-            set_buffer(encoder, state.conv_output, 3);
-            set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
-            set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
-            dispatch_threads(encoder, layout.conv_dim as u64);
-            metal_buffer_barrier(encoder);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_rms_norm_qk_pipeline,
-            );
-            set_buffer(encoder, state.conv_output, 0);
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                1,
-            );
-            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
-            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_key_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.key_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            metal_buffer_barrier(encoder);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_decay_beta_pipeline,
-            );
-            set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
-            set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.a_log_byte_offset,
-                2,
-            );
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.dt_bias_byte_offset,
-                3,
-            );
-            set_buffer(encoder, state.g_decay, 4);
-            set_buffer(encoder, state.beta_gate, 5);
-            set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
-            dispatch_threads(encoder, layout.num_value_heads as u64);
-            metal_buffer_barrier(encoder);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_delta_step_pipeline,
-            );
-            set_buffer(encoder, state.ssm_state, 0);
-            set_buffer(encoder, state.conv_output, 1);
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                2,
-            );
-            set_buffer_with_offset(
-                encoder,
-                state.conv_output,
-                (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
-                3,
-            );
-            set_buffer(encoder, state.g_decay, 4);
-            set_buffer(encoder, state.beta_gate, 5);
-            set_buffer(encoder, state.delta_output, 6);
-            set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
-            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
-            set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_value_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.value_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            metal_buffer_barrier(encoder);
-
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.linear_gated_rms_norm_pipeline,
-            );
-            set_buffer(encoder, state.delta_output, 0);
-            set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
-            set_buffer_with_offset(
-                encoder,
-                dense_weights.buffer,
-                static_offsets.norm_weight_byte_offset,
-                2,
-            );
-            set_buffer(encoder, output_buffer, 3);
-            set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
-            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
-            msg_send_void2_size(
-                encoder,
-                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MetalDispatchSize {
-                    width: layout.num_value_heads as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MetalDispatchSize {
-                    width: layout.value_dim as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let context = MetalCommandContext::new("linear_attention_q4_cmd1")
-                .with("layer", layer)
-                .with("projections", projections.len())
-                .with("rows", total_rows)
-                .with("input_len", input_len)
-                .with("conv_dim", layout.conv_dim)
-                .with("value_heads", layout.num_value_heads);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
-                }
-                self.recycle_or_release_buffers(
-                    &[projection_buffer, output_buffer],
-                    error.should_release_buffers(),
-                );
-                drop(state_guard);
-                return Err(error.into());
-            }
-
-            release(encoder);
-            release(command_buffer);
-            if let Some(buffer) = owned_input_buffer {
-                self.recycle(buffer);
-            }
-            self.recycle(projection_buffer);
-            drop(state_guard);
-            Ok(Some(MetalAttentionValues::new(
-                output_buffer,
-                layout.total_value_width,
-            )))
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn linear_attention_q4_post_attention_prep(
         &self,
         layer: usize,
@@ -4122,369 +3381,6 @@ impl MetalExecutorInner {
             for buffer in buffers {
                 self.recycle(buffer);
             }
-            Ok(Some((outputs, timing, projections.len())))
-        }
-    }
-
-    fn q4_mmap_matvec_batch_to_buffer(
-        &self,
-        projections: &[DenseQ4MmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
-        MetalQ4ProjectionBatchBuilder::new(
-            &self.metal_runtime,
-            self.dense_weights.as_ref(),
-            &self.buffers,
-        )
-        .execute_to_buffer(projections, input)
-    }
-    fn dense_mmap_matvec_batch_to_buffer(
-        &self,
-        projections: &[DenseMmapMatvecProjection],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
-        if projections.is_empty() {
-            return Ok(Some((
-                MetalProjectionBatch::empty(),
-                MetalMatvecTiming::default(),
-                0,
-            )));
-        }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
-
-        let input_len = input.len();
-        let mut total_rows = 0usize;
-        let mut dispatches = Vec::with_capacity(projections.len());
-        let mut output_offsets = Vec::with_capacity(projections.len());
-        let mut output_widths = Vec::with_capacity(projections.len());
-        for projection in projections {
-            if projection.rows == 0 || projection.cols == 0 {
-                return Ok(None);
-            }
-            if projection.cols != input_len {
-                bail!(
-                    "dense mmap batch projection {} input len {} does not match cols {}",
-                    projection.tensor_name,
-                    input_len,
-                    projection.cols
-                );
-            }
-            if projection.output_width != projection.rows {
-                bail!(
-                    "dense mmap batch projection {} output width {} does not match rows {}",
-                    projection.tensor_name,
-                    projection.output_width,
-                    projection.rows
-                );
-            }
-            let dtype = projection.dtype.to_ascii_uppercase();
-            let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
-                "F32" | "FLOAT32" | "FP32" => (
-                    std::mem::size_of::<f32>(),
-                    self.pipelines.dense_mmap_matvec_pipeline,
-                    false,
-                ),
-                "BF16" | "BFLOAT16" => (
-                    std::mem::size_of::<u16>(),
-                    self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
-                    true,
-                ),
-                _ => return Ok(None),
-            };
-            let stride = projection.stride();
-            if stride < projection.cols {
-                bail!(
-                    "dense mmap batch projection {} stride {} is smaller than cols {}",
-                    projection.tensor_name,
-                    stride,
-                    projection.cols
-                );
-            }
-            let last_row = projection.rows.saturating_sub(1);
-            let values = last_row
-                .checked_mul(stride)
-                .and_then(|base| base.checked_add(projection.cols))
-                .context("dense mmap batch value range overflow")?;
-            let byte_len = values
-                .checked_mul(element_size)
-                .context("dense mmap batch byte length overflow")?;
-            let byte_offset = usize::try_from(projection.byte_offset)
-                .context("dense mmap batch offset does not fit usize")?;
-            if byte_offset
-                .checked_add(byte_len)
-                .map_or(true, |end| end > dense_weights.len)
-            {
-                return Ok(None);
-            }
-            if byte_offset % element_size != 0 {
-                return Ok(None);
-            }
-            let output_offset = total_rows;
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("dense mmap batch output row count overflow")?;
-            dispatches.push((pipeline, output_offset, simd_reduced));
-            output_offsets.push(output_offset);
-            output_widths.push(projection.output_width);
-        }
-
-        unsafe {
-            let mut timing = MetalMatvecTiming::default();
-            let upload_started = Instant::now();
-            let (input_buffer, owned_input_buffer) = match input {
-                MetalBatchProjectionInput::Cpu(input) => {
-                    let buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
-                    (buffer, Some(buffer))
-                }
-                MetalBatchProjectionInput::Buffer { buffer, .. } => (buffer, None),
-            };
-            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
-            timing.buffer_upload += upload_started.elapsed();
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(output_buffer);
-                bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle(output_buffer);
-                bail!("failed to create Flash-MoE dense mmap batch Metal compute encoder");
-            }
-
-            for (idx, projection) in projections.iter().enumerate() {
-                let (pipeline, output_offset_rows, simd_reduced) = dispatches[idx];
-                let output_offset = output_offset_rows
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("dense mmap batch output byte offset overflow")?
-                    as u64;
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let stride_u32 = projection.stride() as u32;
-                msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
-                set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
-                if simd_reduced {
-                    dispatch_q4_threadgroups(encoder, projection.rows as u64);
-                } else {
-                    dispatch_threads(encoder, projection.rows as u64);
-                }
-            }
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let dispatch_started = Instant::now();
-            let names = projections
-                .iter()
-                .map(|projection| projection.tensor_name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let context = MetalCommandContext::new("dense_mmap_matvec_batch_buffer")
-                .with("projections", projections.len())
-                .with("dispatches", projections.len())
-                .with("rows", total_rows)
-                .with("input_len", input_len)
-                .with("tensors", names);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
-                }
-                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
-                return Err(error.into());
-            }
-            timing.dispatch += dispatch_started.elapsed();
-
-            release(encoder);
-            release(command_buffer);
-            if let Some(buffer) = owned_input_buffer {
-                self.recycle(buffer);
-            }
-            Ok(Some((
-                MetalProjectionBatch::new(output_buffer, output_offsets, output_widths, total_rows),
-                timing,
-                projections.len(),
-            )))
-        }
-    }
-
-    fn dense_mmap_matvec_batch_with_input_buffer(
-        &self,
-        projections: &[DenseMmapMatvecProjection],
-        input_buffer: ObjcId,
-        input_len: usize,
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
-        if projections.is_empty() {
-            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
-        }
-        let Some(dense_weights) = &self.dense_weights else {
-            return Ok(None);
-        };
-
-        let mut total_rows = 0usize;
-        let mut dispatches = Vec::with_capacity(projections.len());
-        for projection in projections {
-            if projection.rows == 0 || projection.cols == 0 {
-                return Ok(None);
-            }
-            if projection.cols != input_len {
-                bail!(
-                    "dense mmap batch projection {} input len {} does not match cols {}",
-                    projection.tensor_name,
-                    input_len,
-                    projection.cols
-                );
-            }
-            if projection.output_width != projection.rows {
-                bail!(
-                    "dense mmap batch projection {} output width {} does not match rows {}",
-                    projection.tensor_name,
-                    projection.output_width,
-                    projection.rows
-                );
-            }
-            let dtype = projection.dtype.to_ascii_uppercase();
-            let (element_size, pipeline, simd_reduced) = match dtype.as_str() {
-                "F32" | "FLOAT32" | "FP32" => (
-                    std::mem::size_of::<f32>(),
-                    self.pipelines.dense_mmap_matvec_pipeline,
-                    false,
-                ),
-                "BF16" | "BFLOAT16" => (
-                    std::mem::size_of::<u16>(),
-                    self.pipelines.dense_mmap_matvec_bf16_simd_pipeline,
-                    true,
-                ),
-                _ => return Ok(None),
-            };
-            let stride = projection.stride();
-            if stride < projection.cols {
-                bail!(
-                    "dense mmap batch projection {} stride {} is smaller than cols {}",
-                    projection.tensor_name,
-                    stride,
-                    projection.cols
-                );
-            }
-            let last_row = projection.rows.saturating_sub(1);
-            let values = last_row
-                .checked_mul(stride)
-                .and_then(|base| base.checked_add(projection.cols))
-                .context("dense mmap batch value range overflow")?;
-            let byte_len = values
-                .checked_mul(element_size)
-                .context("dense mmap batch byte length overflow")?;
-            let byte_offset = usize::try_from(projection.byte_offset)
-                .context("dense mmap batch offset does not fit usize")?;
-            if byte_offset
-                .checked_add(byte_len)
-                .map_or(true, |end| end > dense_weights.len)
-            {
-                return Ok(None);
-            }
-            if byte_offset % element_size != 0 {
-                return Ok(None);
-            }
-            let output_offset = total_rows;
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("dense mmap batch output row count overflow")?;
-            dispatches.push((pipeline, output_offset, simd_reduced));
-        }
-
-        unsafe {
-            let mut timing = MetalMatvecTiming::default();
-            let upload_started = Instant::now();
-            let output_buffer = self.buffer_with_len(total_rows * std::mem::size_of::<f32>())?;
-            timing.buffer_upload += upload_started.elapsed();
-
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_buffers(&[output_buffer], true);
-                bail!("failed to create Flash-MoE dense mmap batch Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_buffers(&[output_buffer], true);
-                bail!("failed to create Flash-MoE dense mmap batch Metal compute encoder");
-            }
-
-            for (idx, projection) in projections.iter().enumerate() {
-                let (pipeline, output_offset_rows, simd_reduced) = dispatches[idx];
-                let output_offset = output_offset_rows
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("dense mmap batch output byte offset overflow")?
-                    as u64;
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let stride_u32 = projection.stride() as u32;
-                msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 4);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 5);
-                set_bytes(encoder, u32_as_bytes(&stride_u32), 6);
-                if simd_reduced {
-                    dispatch_q4_threadgroups(encoder, projection.rows as u64);
-                } else {
-                    dispatch_threads(encoder, projection.rows as u64);
-                }
-            }
-            msg_send_void0(encoder, sel("endEncoding"));
-
-            let dispatch_started = Instant::now();
-            let names = projections
-                .iter()
-                .map(|projection| projection.tensor_name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let context = MetalCommandContext::new("dense_mmap_matvec_batch_deferred_input")
-                .with("projections", projections.len())
-                .with("dispatches", projections.len())
-                .with("rows", total_rows)
-                .with("input_len", input_len)
-                .with("tensors", names);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
-                self.recycle_or_release_buffers(&[output_buffer], error.should_release_buffers());
-                return Err(error.into());
-            }
-            timing.dispatch += dispatch_started.elapsed();
-
-            let readback_started = Instant::now();
-            let packed_output = read_f32_buffer(output_buffer, total_rows);
-            timing.readback += readback_started.elapsed();
-
-            let mut outputs = Vec::with_capacity(projections.len());
-            for (projection, (_, output_offset, _)) in projections.iter().zip(dispatches.iter()) {
-                let start = *output_offset;
-                let end = start + projection.rows;
-                let mut output = vec![0.0f32; projection.output_width];
-                output.copy_from_slice(&packed_output[start..end]);
-                outputs.push(output);
-            }
-
-            release(encoder);
-            release(command_buffer);
-            self.recycle(output_buffer);
             Ok(Some((outputs, timing, projections.len())))
         }
     }
@@ -6107,59 +5003,53 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             let projected = if self.runtime.is_linear_attention_layer(layer) {
+                if deepstack.is_some() {
+                    bail!(
+                        "FlashMoe unsupported linear-attention input adapter at layer {layer}: Qwen-VL deepstack is not resolved by the scheduled graph"
+                    );
+                }
+                if expert_execution == ExpertExecution::Skip {
+                    bail!(
+                        "FlashMoe unsupported linear-attention execution at layer {layer}: skipping expert stages is not a declared graph implementation"
+                    );
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    if deepstack.is_none() && expert_execution != ExpertExecution::Skip {
-                        let residual_input = deferred_residual_input
-                            .map(|input| MetalBatchProjectionInput::Buffer {
-                                buffer: input.buffer,
-                                len: input.len(),
-                            })
-                            .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                        let post_norm_weight = self
-                            .model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                            .with_context(|| {
-                                format!(
-                                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path: missing norm tensor {post_norm_name}"
-                                )
-                            })?;
-                        let prep = self.linear_attention_post_attention_prep_with_metal(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            residual_input,
-                            &post_norm_weight,
-                            runtime,
-                            Some(&mut layer_timing.buckets),
-                        )?;
-                        if deferred_residual_input.is_some()
-                            && let Some(pending) = pending_for_layer.take()
-                        {
-                            pending.finish_without_readback()?;
-                        }
-                        early_metal_post_attention_prep = Some(prep);
-                        Vec::new()
-                    } else {
-                        self.linear_attention_projected(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            kv_cache,
-                            runtime,
-                            Some(&mut layer_timing.buckets),
-                        )?
-                    }
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    self.linear_attention_projected(
+                    let residual_input = deferred_residual_input
+                        .map(|input| MetalBatchProjectionInput::Buffer {
+                            buffer: input.buffer,
+                            len: input.len(),
+                        })
+                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                    let post_norm_weight = self
+                        .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                        .with_context(|| {
+                            format!(
+                                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path: missing norm tensor {post_norm_name}"
+                            )
+                        })?;
+                    let prep = self.linear_attention_post_attention_prep_with_metal(
                         layer,
                         &normed,
                         deferred_attention_input,
-                        kv_cache,
+                        residual_input,
+                        &post_norm_weight,
                         runtime,
                         Some(&mut layer_timing.buckets),
-                    )?
+                    )?;
+                    if deferred_residual_input.is_some()
+                        && let Some(pending) = pending_for_layer.take()
+                    {
+                        pending.finish_without_readback()?;
+                    }
+                    early_metal_post_attention_prep = Some(prep);
+                    Vec::new()
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    bail!(
+                        "FlashMoe unsupported scheduled linear-attention implementation at layer {layer}: Apple Silicon Metal is required"
+                    )
                 }
             } else {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6615,19 +5505,12 @@ impl FlashMoeEngine {
         let input_specs = input_requests.requests();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let mut projections = if let Some(input) = deferred_input {
-            self
-                .dense
-                .project_dense_tensors_batched_with_metal_input_buffer(
-                    &self.metal,
-                    &input_specs,
-                    input.buffer,
-                    input.len(),
-                )?
-                .with_context(|| {
-                    format!(
-                        "FlashMoe unsupported scheduled Qwen3.5 CMD1 path at layer {layer}: resident Q4 full-attention projections do not accept deferred Metal input"
-                    )
-                })?
+            self.dense.project_q4_tensors_from_metal_input(
+                &self.metal,
+                &input_specs,
+                input.buffer,
+                input.len(),
+            )?
         } else {
             self.dense
                 .project_dense_tensors_batched_with_metal(
@@ -6878,318 +5761,6 @@ impl FlashMoeEngine {
             buckets.attention_input_projection += started.elapsed();
         }
         Ok(prep)
-    }
-
-    fn linear_attention_output_values(
-        &self,
-        layer: usize,
-        normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
-        kv_cache: &mut KvCache,
-        runtime: &DenseTransformerRuntime,
-        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Vec<f32>> {
-        let layout = runtime.linear_attention_layout(layer)?;
-        let subphase_started = Instant::now();
-        let input_requests = linear_attention_input_projection_requests(
-            layer,
-            layout.conv_dim,
-            layout.total_value_width,
-            layout.num_value_heads,
-        )?;
-        let input_specs = input_requests.requests();
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if !self
-            .config
-            .linear_attention_qkv_projection_requires_reorder()
-            && let Some(static_offsets) = self
-                .dense
-                .linear_attention_static_offsets_for_metal(layer, layout)?
-        {
-            let metal = &self.metal;
-            let projection_started = Instant::now();
-            let projection_input = if let Some(input) = deferred_input {
-                MetalBatchProjectionInput::Buffer {
-                    buffer: input.buffer,
-                    len: input.len(),
-                }
-            } else if !normed.is_empty() {
-                MetalBatchProjectionInput::Cpu(normed)
-            } else {
-                MetalBatchProjectionInput::Cpu(&[])
-            };
-            if projection_input.len() > 0 {
-                if let Some(values) = self.dense.linear_attention_q4_with_metal(
-                    metal,
-                    layer,
-                    layout,
-                    &input_specs,
-                    projection_input,
-                    static_offsets,
-                )? {
-                    if let Some(buckets) = attention_buckets.as_deref_mut() {
-                        buckets.attention_input_projection += projection_started.elapsed();
-                    }
-                    let values = metal.read_and_recycle_attention_values(values);
-                    return Ok(values);
-                }
-            }
-        }
-        let mut batched_input_projections = None;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(input) = deferred_input {
-            batched_input_projections = self
-                .dense
-                .project_dense_tensors_batched_with_metal_input_buffer(
-                    &self.metal,
-                    &input_specs,
-                    input.buffer,
-                    input.len(),
-                )?;
-        }
-        if deferred_input.is_some() && batched_input_projections.is_none() && normed.is_empty() {
-            bail!("deferred Metal linear-attention input projection is unavailable");
-        }
-        if batched_input_projections.is_none() {
-            batched_input_projections = self.dense.project_dense_tensors_batched_with_metal(
-                Some(&self.metal),
-                &input_specs,
-                normed,
-            )?;
-        }
-        let (mut qkv, z, beta, alpha) = if let Some(mut projections) = batched_input_projections {
-            let alpha = projections
-                .pop()
-                .context("missing batched linear_attn.in_proj_a result")?;
-            let beta = projections
-                .pop()
-                .context("missing batched linear_attn.in_proj_b result")?;
-            let z = projections
-                .pop()
-                .context("missing batched linear_attn.in_proj_z result")?;
-            let qkv = projections
-                .pop()
-                .context("missing batched linear_attn.in_proj_qkv result")?;
-            (qkv, z, beta, alpha)
-        } else {
-            let qkv = self
-                .dense
-                .project_dense_tensor_with_metal(
-                    Some(&self.metal),
-                    input_requests.tensor_name(0),
-                    normed,
-                    layout.conv_dim,
-                )?
-                .context("missing linear_attn.in_proj_qkv tensor for GatedDeltaNet layer")?;
-            let z = self
-                .dense
-                .project_dense_tensor_with_metal(
-                    Some(&self.metal),
-                    input_requests.tensor_name(1),
-                    normed,
-                    layout.total_value_width,
-                )?
-                .context("missing linear_attn.in_proj_z tensor for GatedDeltaNet layer")?;
-            let beta = self
-                .dense
-                .project_dense_tensor_with_metal(
-                    Some(&self.metal),
-                    input_requests.tensor_name(2),
-                    normed,
-                    layout.num_value_heads,
-                )?
-                .context("missing linear_attn.in_proj_b tensor for GatedDeltaNet layer")?;
-            let alpha = self
-                .dense
-                .project_dense_tensor_with_metal(
-                    Some(&self.metal),
-                    input_requests.tensor_name(3),
-                    normed,
-                    layout.num_value_heads,
-                )?
-                .context("missing linear_attn.in_proj_a tensor for GatedDeltaNet layer")?;
-            (qkv, z, beta, alpha)
-        };
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
-            buckets.attention_input_projection += subphase_started.elapsed();
-        }
-
-        let subphase_started = Instant::now();
-        let static_weights = self.linear_attention_static_weights(layer, layout)?;
-        if self
-            .config
-            .linear_attention_qkv_projection_requires_reorder()
-        {
-            reorder_grouped_linear_qkv_projection(&mut qkv, layout)?;
-        }
-        let state = kv_cache.linear_state_mut(layer, layout)?;
-        let state = &mut **state;
-        conv1d_step(
-            &state.conv_state,
-            &qkv,
-            &static_weights.conv_weight,
-            &mut state.conv_out,
-            layout.conv_dim,
-            layout.conv_kernel_size,
-        );
-        state.conv_state.copy_within(
-            layout.conv_dim..layout.conv_kernel_size.saturating_sub(1) * layout.conv_dim,
-            0,
-        );
-        state.conv_state[layout.conv_kernel_size.saturating_sub(2) * layout.conv_dim..]
-            .copy_from_slice(&qkv);
-        qkv.clear();
-
-        let (lin_q, rest) = state.conv_out.split_at_mut(layout.total_key_width);
-        let (lin_k, lin_v) = rest.split_at_mut(layout.total_key_width);
-        normalize_linear_attention_qk_in_place(layout, lin_q, lin_k)?;
-
-        apply_gated_delta_recurrence_with_scratch(
-            layout,
-            &mut state.ssm_state,
-            lin_q,
-            lin_k,
-            lin_v,
-            &alpha,
-            &beta,
-            &static_weights.a_log,
-            &static_weights.dt_bias,
-            &mut state.kv_mem,
-            &mut state.delta,
-            &mut state.out_values,
-        );
-
-        for vh in 0..layout.num_value_heads {
-            let start = vh * layout.value_dim;
-            let end = start + layout.value_dim;
-            let chunk = &mut state.out_values[start..end];
-            rms_norm_with_weight_in_place(
-                chunk,
-                static_weights
-                    .norm_weight
-                    .as_deref()
-                    .map(|weight| &weight[..]),
-            );
-            for (idx, value) in chunk.iter_mut().enumerate() {
-                let z_idx = start + idx;
-                *value *= silu(*z.get(z_idx).unwrap_or(&0.0));
-            }
-        }
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
-            buckets.attention_kernel += subphase_started.elapsed();
-        }
-        Ok(state.out_values.clone())
-    }
-
-    fn linear_attention_projected(
-        &self,
-        layer: usize,
-        normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
-        kv_cache: &mut KvCache,
-        runtime: &DenseTransformerRuntime,
-        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Vec<f32>> {
-        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
-        let values = self.linear_attention_output_values(
-            layer,
-            normed,
-            deferred_input,
-            kv_cache,
-            runtime,
-            attention_buckets.as_deref_mut(),
-        )?;
-
-        let subphase_started = Instant::now();
-        let projected = self
-            .dense
-            .project_dense_tensor_with_metal(
-                Some(&self.metal),
-                &out_proj_name,
-                &values,
-                runtime.width,
-            )?
-            .context("missing linear_attn.out_proj tensor for GatedDeltaNet layer")?;
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
-            buckets.attention_output_projection += subphase_started.elapsed();
-        }
-        Ok(projected)
-    }
-
-    fn linear_attention_static_weights(
-        &self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-    ) -> Result<Arc<LinearAttentionStaticWeights>> {
-        {
-            let cache = self
-                .linear_attention_cache
-                .lock()
-                .expect("linear attention cache poisoned");
-            if let Some(weights) = cache.get(&layer).cloned() {
-                if weights.layout != layout {
-                    bail!(
-                        "cached linear-attention weights for layer {layer} no longer match layout"
-                    );
-                }
-                return Ok(weights);
-            }
-        }
-
-        let conv_name = linear_attention_tensor_name(layer, "conv1d");
-        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
-        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
-        let norm_name = linear_attention_tensor_name(layer, "norm");
-        let conv_weight = self
-            .dense
-            .read_full_tensor_f32_cached(&conv_name)?
-            .context("missing linear_attn.conv1d tensor for GatedDeltaNet layer")?;
-        let a_log = self
-            .dense
-            .read_full_tensor_f32_cached(&a_log_name)?
-            .context("missing linear_attn.A_log tensor for GatedDeltaNet layer")?;
-        let dt_bias = self
-            .dense
-            .read_full_tensor_f32_cached(&dt_bias_name)?
-            .context("missing linear_attn.dt_bias tensor for GatedDeltaNet layer")?;
-        let norm_weight = self
-            .model_norm_weight(&norm_name, layout.value_dim)?
-            .map(Arc::new);
-        if conv_weight.len() != layout.conv_dim * layout.conv_kernel_size {
-            bail!(
-                "linear_attn.conv1d tensor for layer {layer} has {} values; expected {}",
-                conv_weight.len(),
-                layout.conv_dim * layout.conv_kernel_size
-            );
-        }
-        if a_log.len() != layout.num_value_heads || dt_bias.len() != layout.num_value_heads {
-            bail!(
-                "linear-attention scalar tensors for layer {layer} do not match value heads {}: A_log {}, dt_bias {}",
-                layout.num_value_heads,
-                a_log.len(),
-                dt_bias.len()
-            );
-        }
-        let weights = Arc::new(LinearAttentionStaticWeights {
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            layout,
-        });
-        let mut cache = self
-            .linear_attention_cache
-            .lock()
-            .expect("linear attention cache poisoned");
-        if let Some(existing) = cache.get(&layer).cloned() {
-            if existing.layout != layout {
-                bail!("cached linear-attention weights for layer {layer} changed while loading");
-            }
-            Ok(existing)
-        } else {
-            cache.insert(layer, weights.clone());
-            Ok(weights)
-        }
     }
 
     fn shared_expert_contribution(
@@ -9817,7 +8388,6 @@ struct KvCache {
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
     kv: Vec<Vec<Option<KvEntry>>>,
-    linear_states: BTreeMap<usize, FlashMoeLinearAttentionState>,
 }
 
 impl KvCache {
@@ -9829,7 +8399,6 @@ impl KvCache {
             generated_tokens: Vec::new(),
             layer_states: Vec::new(),
             kv: vec![vec![None; capacity]; layers],
-            linear_states: BTreeMap::new(),
         }
     }
 
@@ -9943,38 +8512,6 @@ impl KvCache {
             kv_heads,
             head_dim,
         ))
-    }
-
-    fn linear_state_mut(
-        &mut self,
-        layer: usize,
-        layout: LinearAttentionLayout,
-    ) -> Result<&mut FlashMoeLinearAttentionState> {
-        if layer >= self.layers {
-            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
-        }
-        let shape = layout.cache_shape();
-        let expected_state = FlashMoeLinearAttentionState::expected_state(
-            layer,
-            shape,
-            FlashMoeStatePlacement::CpuVisible,
-        );
-        if !expected_state.is_declared_graph_state() {
-            bail!("FlashMoe linear-attention cache state is not declared graph state");
-        }
-        let state = self
-            .linear_states
-            .entry(layer)
-            .or_insert_with(|| FlashMoeLinearAttentionState::new(shape));
-        if !state.matches_shape(shape)
-            || state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state
-        {
-            *state = FlashMoeLinearAttentionState::new(shape);
-        }
-        if state.state(layer, FlashMoeStatePlacement::CpuVisible) != expected_state {
-            bail!("FlashMoe linear-attention cache state does not match declared layout");
-        }
-        Ok(state)
     }
 
     #[allow(dead_code)]
@@ -11259,172 +9796,6 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn project_dense_tensors_batched_with_metal_buffer(
-        &self,
-        metal: &MetalExecutor,
-        specs: &[DenseProjectionRequest<'_>],
-        input: MetalBatchProjectionInput<'_>,
-    ) -> Result<Option<MetalProjectionBatch>> {
-        if !metal.has_resident_dense_weights() || specs.is_empty() {
-            return Ok(None);
-        }
-        let projection_started = Instant::now();
-        let input_len = input.len();
-        let mut has_q4 = false;
-        let mut has_dense = false;
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return Ok(None);
-            };
-            match entry.quantization {
-                TensorQuantization::None => has_dense = true,
-                TensorQuantization::Q4 { .. } => has_q4 = true,
-            }
-        }
-        if has_q4 {
-            if has_dense {
-                return Ok(None);
-            }
-            let mut q4_projections = Vec::with_capacity(specs.len());
-            let mut total_rows = 0usize;
-            for spec in specs {
-                let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                    return Ok(None);
-                };
-                let Some(projection) = DenseQ4MmapMatvecProjection::from_entry(
-                    spec.tensor_name,
-                    entry,
-                    self.len,
-                    spec.output_width,
-                    input_len,
-                )?
-                else {
-                    return Ok(None);
-                };
-                total_rows = total_rows
-                    .checked_add(projection.rows)
-                    .context("dense q4 tensor batch total row count overflow")?;
-                q4_projections.push(projection);
-            }
-
-            let Some((batch, timing, dispatch_count)) =
-                metal.q4_mmap_matvec_batch_to_buffer(&q4_projections, input)?
-            else {
-                return Ok(None);
-            };
-            let total = projection_started.elapsed();
-            if total >= Duration::from_millis(100) {
-                let names = specs
-                    .iter()
-                    .map(|spec| spec.tensor_name)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                info!(
-                    projection_batch = %names,
-                    projection_count = specs.len(),
-                    dispatch_count,
-                    input_len,
-                    total_rows,
-                    metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
-                    metal_dispatch_ms = duration_ms(timing.dispatch),
-                    total_ms = duration_ms(total),
-                    "flashmoe dense q4 projection batch buffer complete"
-                );
-            }
-            return Ok(Some(batch));
-        }
-
-        let mut projections = Vec::with_capacity(specs.len());
-        let mut total_rows = 0usize;
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return Ok(None);
-            };
-            if entry.quantization != TensorQuantization::None {
-                return Ok(None);
-            }
-            let Some(element_size) = dtype_size(&entry.dtype) else {
-                return Ok(None);
-            };
-            let projection = match DenseMmapMatvecProjection::from_entry(
-                spec.tensor_name,
-                entry,
-                self.len,
-                spec.output_width,
-                input_len,
-                element_size,
-            ) {
-                Ok(projection) => projection,
-                Err(_) => return Ok(None),
-            };
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("dense tensor batch total row count overflow")?;
-            projections.push(projection);
-        }
-
-        let Some((batch, timing, dispatch_count)) =
-            metal.dense_mmap_matvec_batch_to_buffer(&projections, input)?
-        else {
-            return Ok(None);
-        };
-        let total = projection_started.elapsed();
-        if total >= Duration::from_millis(100) {
-            let names = specs
-                .iter()
-                .map(|spec| spec.tensor_name)
-                .collect::<Vec<_>>()
-                .join(",");
-            info!(
-                projection_batch = %names,
-                projection_count = specs.len(),
-                dispatch_count,
-                input_len,
-                total_rows,
-                metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
-                metal_dispatch_ms = duration_ms(timing.dispatch),
-                total_ms = duration_ms(total),
-                "flashmoe dense projection batch buffer complete"
-            );
-        }
-        Ok(Some(batch))
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_attention_q4_with_metal(
-        &self,
-        metal: &MetalExecutor,
-        layer: usize,
-        layout: LinearAttentionLayout,
-        specs: &[DenseProjectionRequest<'_>],
-        input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-    ) -> Result<Option<MetalAttentionValues>> {
-        if !metal.has_resident_dense_weights() || specs.len() != 4 {
-            return Ok(None);
-        }
-        let input_len = input.len();
-        let mut q4_projections = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return Ok(None);
-            };
-            let Some(projection) = DenseQ4MmapMatvecProjection::from_entry(
-                spec.tensor_name,
-                entry,
-                self.len,
-                spec.output_width,
-                input_len,
-            )?
-            else {
-                return Ok(None);
-            };
-            q4_projections.push(projection);
-        }
-        metal.linear_attention_q4_mmap_batch(layer, layout, &q4_projections, input, static_offsets)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     fn linear_attention_q4_post_attention_prep_with_metal(
         &self,
@@ -11496,142 +9867,39 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn project_dense_tensors_batched_with_metal_input_buffer(
+    fn project_q4_tensors_from_metal_input(
         &self,
         metal: &MetalExecutor,
         specs: &[DenseProjectionRequest<'_>],
         input_buffer: ObjcId,
         input_len: usize,
-    ) -> Result<Option<Vec<Vec<f32>>>> {
-        if !metal.has_resident_dense_weights() || specs.is_empty() {
-            return Ok(None);
+    ) -> Result<Vec<Vec<f32>>> {
+        if specs.is_empty() {
+            bail!("FlashMoe scheduled Q4 projection batch has no projections");
         }
-        let projection_started = Instant::now();
-        let mut has_q4 = false;
-        let mut has_dense = false;
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return Ok(None);
-            };
-            match entry.quantization {
-                TensorQuantization::None => has_dense = true,
-                TensorQuantization::Q4 { .. } => has_q4 = true,
-            }
-        }
-        if has_q4 {
-            if has_dense {
-                return Ok(None);
-            }
-            let mut q4_projections = Vec::with_capacity(specs.len());
-            let mut total_rows = 0usize;
-            for spec in specs {
-                let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                    return Ok(None);
-                };
-                let Some(projection) = DenseQ4MmapMatvecProjection::from_entry(
-                    spec.tensor_name,
-                    entry,
-                    self.len,
-                    spec.output_width,
-                    input_len,
-                )?
-                else {
-                    return Ok(None);
-                };
-                total_rows = total_rows
-                    .checked_add(projection.rows)
-                    .context("dense q4 tensor batch total row count overflow")?;
-                q4_projections.push(projection);
-            }
-
-            let Some((outputs, timing, dispatch_count)) = metal
-                .q4_mmap_matvec_batch_with_input_buffer(&q4_projections, input_buffer, input_len)?
-            else {
-                return Ok(None);
-            };
-
-            let total = projection_started.elapsed();
-            if total >= Duration::from_millis(100) {
-                let names = specs
-                    .iter()
-                    .map(|spec| spec.tensor_name)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                info!(
-                    projection_batch = %names,
-                    projection_count = specs.len(),
-                    dispatch_count,
-                    input_len,
-                    total_rows,
-                    metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
-                    metal_dispatch_ms = duration_ms(timing.dispatch),
-                    metal_readback_ms = duration_ms(timing.readback),
-                    total_ms = duration_ms(total),
-                    "flashmoe dense q4 projection batch from deferred input complete"
-                );
-            }
-
-            return Ok(Some(outputs));
-        }
-
-        let mut projections = Vec::with_capacity(specs.len());
-        let mut total_rows = 0usize;
-        for spec in specs {
-            let Some(entry) = self.registry.tensor(spec.tensor_name) else {
-                return Ok(None);
-            };
-            if entry.quantization != TensorQuantization::None {
-                return Ok(None);
-            }
-            let Some(element_size) = dtype_size(&entry.dtype) else {
-                bail!(
-                    "Flash-MoE dense tensor {} has unsupported dtype {}",
-                    spec.tensor_name,
-                    entry.dtype
-                );
-            };
-            let projection = DenseMmapMatvecProjection::from_entry(
-                spec.tensor_name,
-                entry,
-                self.len,
-                spec.output_width,
-                input_len,
-                element_size,
-            )?;
-            total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("dense tensor batch total row count overflow")?;
-            projections.push(projection);
-        }
-
-        let Some((outputs, timing, dispatch_count)) = metal
-            .dense_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?
-        else {
-            return Ok(None);
-        };
-
-        let total = projection_started.elapsed();
-        if total >= Duration::from_millis(100) {
-            let names = specs
-                .iter()
-                .map(|spec| spec.tensor_name)
-                .collect::<Vec<_>>()
-                .join(",");
-            info!(
-                projection_batch = %names,
-                projection_count = specs.len(),
-                dispatch_count,
-                input_len,
-                total_rows,
-                metal_buffer_upload_ms = duration_ms(timing.buffer_upload),
-                metal_dispatch_ms = duration_ms(timing.dispatch),
-                metal_readback_ms = duration_ms(timing.readback),
-                total_ms = duration_ms(total),
-                "flashmoe dense projection batch from deferred input complete"
+        if !metal.has_resident_dense_weights() {
+            bail!(
+                "FlashMoe unsupported scheduled Q4 projection batch: resident dense Metal weights are unavailable"
             );
         }
-
-        Ok(Some(outputs))
+        let mut projections = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let projection = self
+                .dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
+                .with_context(|| {
+                    format!(
+                        "FlashMoe unsupported scheduled Q4 projection batch: missing resident Q4 projection {}",
+                        spec.tensor_name
+                    )
+                })?;
+            projections.push(projection);
+        }
+        let (outputs, _, _) = metal
+            .q4_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?
+            .context(
+                "FlashMoe unsupported scheduled Q4 projection batch: Metal builder did not resolve",
+            )?;
+        Ok(outputs)
     }
 
     /// Project using a fully-qualified canonical tensor name (e.g. for shared
@@ -19013,7 +17281,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_reuse_moves_state_and_shallow_snapshots_prompt_cache() {
+    fn session_cache_reuse_moves_state_and_shallow_snapshots_cpu_kv_cache() {
         let cached_tokens = vec![10, 20];
         let mut cache = KvCache::new(2, 2);
         for (position, token) in cached_tokens.iter().copied().enumerate() {
@@ -19025,28 +17293,6 @@ mod tests {
         cache
             .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
             .unwrap();
-
-        let linear_layout = LinearAttentionLayout {
-            num_value_heads: 1,
-            num_key_heads: 1,
-            key_dim: 2,
-            value_dim: 2,
-            total_key_width: 2,
-            total_value_width: 2,
-            conv_dim: 6,
-            conv_kernel_size: 3,
-        };
-        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
-            .map(|idx| idx as f32 + 0.25)
-            .collect();
-        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
-            .map(|idx| idx as f32 + 10.5)
-            .collect();
-        {
-            let state = cache.linear_state_mut(1, linear_layout).unwrap();
-            state.conv_state.clone_from(&expected_conv_state);
-            state.ssm_state.clone_from(&expected_ssm_state);
-        }
 
         let mut sessions = BTreeMap::new();
         sessions.insert(
@@ -19076,28 +17322,10 @@ mod tests {
         let (snapshot_key, snapshot_value) = snapshot.kv[0][1].as_ref().unwrap();
         assert!(Arc::ptr_eq(live_key, snapshot_key));
         assert!(Arc::ptr_eq(live_value, snapshot_value));
-        assert!(
-            kv_cache
-                .linear_states
-                .get(&1)
-                .unwrap()
-                .shares_storage_with(snapshot.linear_states.get(&1).unwrap())
-        );
-
         kv_cache
             .record_kv(2, 0, vec![5.0, 5.1], vec![6.0, 6.1])
             .unwrap();
         assert!(snapshot.kv[0][2].is_none());
-
-        {
-            let state = kv_cache.linear_state_mut(1, linear_layout).unwrap();
-            state.conv_state[0] = -99.0;
-        }
-        let live_linear = kv_cache.linear_states.get(&1).unwrap();
-        let snapshot_linear = snapshot.linear_states.get(&1).unwrap();
-        assert!(!live_linear.shares_storage_with(snapshot_linear));
-        assert_eq!(snapshot_linear.conv_state, expected_conv_state);
-        assert_eq!(snapshot_linear.ssm_state, expected_ssm_state);
     }
 
     #[test]
@@ -19124,38 +17352,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_attention_cache_state_rejects_undeclared_layout_without_fallback() {
-        let mut cache = KvCache::new(2, 2);
-        let valid = LinearAttentionLayout {
-            num_value_heads: 1,
-            num_key_heads: 1,
-            key_dim: 2,
-            value_dim: 2,
-            total_key_width: 2,
-            total_value_width: 2,
-            conv_dim: 6,
-            conv_kernel_size: 3,
-        };
-        let state = cache.linear_state_mut(1, valid).unwrap();
-        assert_eq!(
-            state.state(1, FlashMoeStatePlacement::CpuVisible),
-            FlashMoeLinearAttentionCacheState::cpu_visible(1, 12, 4, 6, 2)
-        );
-
-        let invalid = LinearAttentionLayout {
-            conv_dim: 0,
-            ..valid
-        };
-        let err = cache.linear_state_mut(1, invalid).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("linear-attention cache state is not declared graph state"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn session_prefix_reuse_preserves_kv_and_linear_attention_state_boundaries() {
+    fn session_prefix_reuse_preserves_cpu_kv_boundaries() {
         let cached_tokens = vec![10, 20];
         let mut cache = KvCache::new(2, 2);
         for (position, token) in cached_tokens.iter().copied().enumerate() {
@@ -19167,28 +17364,6 @@ mod tests {
         cache
             .record_kv(1, 0, vec![3.0, 3.1], vec![4.0, 4.1])
             .unwrap();
-
-        let linear_layout = LinearAttentionLayout {
-            num_value_heads: 1,
-            num_key_heads: 1,
-            key_dim: 2,
-            value_dim: 2,
-            total_key_width: 2,
-            total_value_width: 2,
-            conv_dim: 6,
-            conv_kernel_size: 3,
-        };
-        let expected_conv_state: Vec<f32> = (0..linear_layout.conv_state_len())
-            .map(|idx| idx as f32 + 0.25)
-            .collect();
-        let expected_ssm_state: Vec<f32> = (0..linear_layout.ssm_state_len())
-            .map(|idx| idx as f32 + 10.5)
-            .collect();
-        {
-            let state = cache.linear_state_mut(1, linear_layout).unwrap();
-            state.conv_state.clone_from(&expected_conv_state);
-            state.ssm_state.clone_from(&expected_ssm_state);
-        }
 
         let session_state = FlashMoeSessionState {
             tokens: cached_tokens,
@@ -19204,11 +17379,6 @@ mod tests {
         assert_eq!(reused.keys_values(1, 0).unwrap().len(), prefix_len);
         assert_eq!(reused.keys_values(2, 0).unwrap().len(), prefix_len);
         assert_eq!(reused.kv[0][2], None);
-        assert!(reused.linear_states.get(&0).is_none());
-
-        let linear_state = reused.linear_states.get(&1).unwrap();
-        assert_eq!(linear_state.conv_state, expected_conv_state);
-        assert_eq!(linear_state.ssm_state, expected_ssm_state);
         assert_eq!(session_state.last_hidden, vec![9.0, 9.1]);
 
         assert_eq!(
