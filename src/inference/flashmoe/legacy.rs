@@ -106,9 +106,10 @@ use super::metal::{
     MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
     MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
     MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
-    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
-    metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    MetalQ4SourceBufferCache, MetalReusableBuffer, metal_command_failure_requires_release,
+    resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2730,66 +2731,6 @@ struct MetalSharedExpertBuffers {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-struct MetalLmHeadBuffer {
-    weights: ObjcId,
-    rows: usize,
-    cols: usize,
-    bytes: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalLmHeadBufferCache {
-    buffers: BTreeMap<String, MetalLmHeadBuffer>,
-    bytes: usize,
-    max_bytes: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalLmHeadBufferCache {
-    fn with_budget(max_bytes: usize) -> Self {
-        Self {
-            buffers: BTreeMap::new(),
-            bytes: 0,
-            max_bytes,
-        }
-    }
-
-    fn get(&self, key: &str, rows: usize, cols: usize) -> Option<MetalLmHeadBuffer> {
-        let buffer = self.buffers.get(key).copied()?;
-        (buffer.rows == rows && buffer.cols == cols).then_some(buffer)
-    }
-
-    unsafe fn insert(
-        &mut self,
-        key: String,
-        buffer: MetalLmHeadBuffer,
-    ) -> Option<MetalLmHeadBuffer> {
-        if buffer.bytes > self.max_bytes {
-            return Some(buffer);
-        }
-        while self.bytes.saturating_add(buffer.bytes) > self.max_bytes && !self.buffers.is_empty() {
-            let Some(victim) = self.buffers.keys().next().cloned() else {
-                break;
-            };
-            if let Some(previous) = self.buffers.remove(&victim) {
-                self.bytes = self.bytes.saturating_sub(previous.bytes);
-                unsafe {
-                    release(previous.weights);
-                }
-            }
-        }
-        let previous = self.buffers.insert(key, buffer);
-        if let Some(previous_buffer) = previous.as_ref() {
-            self.bytes = self.bytes.saturating_sub(previous_buffer.bytes);
-        }
-        self.bytes = self.bytes.saturating_add(buffer.bytes);
-        previous
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 enum MetalExpertRetention {
     #[cfg(test)]
@@ -2938,11 +2879,7 @@ impl Drop for MetalExecutorInner {
                 release(dense_weights.buffer);
             }
             if let Ok(lm_head_buffers) = self.lm_head_buffers.get_mut() {
-                for buffer in lm_head_buffers.buffers.values() {
-                    release(buffer.weights);
-                }
-                lm_head_buffers.buffers.clear();
-                lm_head_buffers.bytes = 0;
+                lm_head_buffers.release_all(|buffer| release(buffer.weights));
             }
             if let Ok(kv_cache) = self.kv_cache.get_mut()
                 && let Some(kv_cache) = kv_cache.take()
@@ -7879,7 +7816,7 @@ impl MetalExecutorInner {
                 .lm_head_buffers
                 .lock()
                 .expect("metal LM-head buffer cache poisoned");
-            if bytes > cache.max_bytes {
+            if bytes > cache.max_bytes() {
                 return Ok(None);
             }
             if let Some(buffer) = cache.get(key, rows, cols) {
@@ -7893,12 +7830,12 @@ impl MetalExecutorInner {
         unsafe {
             let weights_buffer =
                 self.persistent_buffer_with_bytes(f32_as_bytes(&weights[..expected_len]))?;
-            let new_buffer = MetalLmHeadBuffer {
-                weights: weights_buffer,
+            let new_buffer = MetalLmHeadBuffer::new(
+                weights_buffer,
                 rows,
                 cols,
-                bytes: expected_len * std::mem::size_of::<f32>(),
-            };
+                expected_len * std::mem::size_of::<f32>(),
+            );
             let buffer = {
                 let mut cache = self
                     .lm_head_buffers
@@ -7908,7 +7845,9 @@ impl MetalExecutorInner {
                     release(weights_buffer);
                     existing
                 } else {
-                    if let Some(previous) = cache.insert(key.to_string(), new_buffer) {
+                    if let Some(previous) = cache.insert(key.to_string(), new_buffer, |buffer| {
+                        release(buffer.weights)
+                    }) {
                         release(previous.weights);
                     }
                     new_buffer
@@ -7923,7 +7862,7 @@ impl MetalExecutorInner {
         self.lm_head_buffers
             .lock()
             .expect("metal LM-head buffer cache poisoned")
-            .max_bytes
+            .max_bytes()
             >= bytes
     }
 

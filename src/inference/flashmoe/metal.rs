@@ -1,4 +1,6 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::collections::BTreeMap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -300,6 +302,88 @@ pub(crate) struct MetalReusableBuffer {
 impl MetalReusableBuffer {
     pub(crate) fn new(id: MetalObjcId, len: usize) -> Self {
         Self { id, len }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalLmHeadBuffer {
+    pub(crate) weights: MetalObjcId,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLmHeadBuffer {
+    pub(crate) fn new(weights: MetalObjcId, rows: usize, cols: usize, bytes: usize) -> Self {
+        Self {
+            weights,
+            rows,
+            cols,
+            bytes,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalLmHeadBufferCache {
+    buffers: BTreeMap<String, MetalLmHeadBuffer>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLmHeadBufferCache {
+    pub(crate) fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            buffers: BTreeMap::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    pub(crate) fn get(&self, key: &str, rows: usize, cols: usize) -> Option<MetalLmHeadBuffer> {
+        let buffer = self.buffers.get(key).copied()?;
+        (buffer.rows == rows && buffer.cols == cols).then_some(buffer)
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: String,
+        buffer: MetalLmHeadBuffer,
+        mut release_evicted: impl FnMut(MetalLmHeadBuffer),
+    ) -> Option<MetalLmHeadBuffer> {
+        if buffer.bytes > self.max_bytes {
+            return Some(buffer);
+        }
+        while self.bytes.saturating_add(buffer.bytes) > self.max_bytes && !self.buffers.is_empty() {
+            let Some(victim) = self.buffers.keys().next().cloned() else {
+                break;
+            };
+            if let Some(previous) = self.buffers.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(previous.bytes);
+                release_evicted(previous);
+            }
+        }
+        let previous = self.buffers.insert(key, buffer);
+        if let Some(previous_buffer) = previous.as_ref() {
+            self.bytes = self.bytes.saturating_sub(previous_buffer.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(buffer.bytes);
+        previous
+    }
+
+    pub(crate) fn release_all(&mut self, mut release: impl FnMut(MetalLmHeadBuffer)) {
+        for (_, buffer) in std::mem::take(&mut self.buffers) {
+            release(buffer);
+        }
+        self.bytes = 0;
     }
 }
 
@@ -2826,6 +2910,52 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_lm_head_buffer_cache_owns_budget_and_eviction_policy() {
+        let first_id = 0x1000usize as MetalObjcId;
+        let second_id = 0x2000usize as MetalObjcId;
+        let oversized_id = 0x3000usize as MetalObjcId;
+        let mut cache = MetalLmHeadBufferCache::with_budget(10);
+        let mut released = Vec::new();
+
+        assert_eq!(cache.max_bytes(), 10);
+        assert_eq!(
+            cache.insert(
+                "first".to_string(),
+                MetalLmHeadBuffer::new(first_id, 2, 3, 6),
+                |buffer| released.push(buffer.weights),
+            ),
+            None
+        );
+        assert_eq!(cache.get("first", 2, 3).unwrap().weights, first_id);
+        assert!(cache.get("first", 3, 2).is_none());
+
+        assert_eq!(
+            cache.insert(
+                "second".to_string(),
+                MetalLmHeadBuffer::new(second_id, 2, 3, 6),
+                |buffer| released.push(buffer.weights),
+            ),
+            None
+        );
+        assert_eq!(released, vec![first_id]);
+        assert!(cache.get("first", 2, 3).is_none());
+        assert_eq!(cache.get("second", 2, 3).unwrap().weights, second_id);
+
+        let oversized = MetalLmHeadBuffer::new(oversized_id, 4, 4, 16);
+        assert_eq!(
+            cache.insert("oversized".to_string(), oversized, |buffer| {
+                released.push(buffer.weights)
+            }),
+            Some(oversized)
+        );
+
+        cache.release_all(|buffer| released.push(buffer.weights));
+        assert_eq!(released, vec![first_id, second_id]);
+        assert!(cache.get("second", 2, 3).is_none());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
