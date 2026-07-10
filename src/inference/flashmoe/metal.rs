@@ -2,6 +2,8 @@
 use std::collections::BTreeMap;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::c_void;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -384,6 +386,25 @@ impl MetalLmHeadBufferCache {
             release(buffer);
         }
         self.bytes = 0;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalDenseWeights {
+    pub(crate) buffer: MetalObjcId,
+    _mmap: Arc<memmap2::Mmap>,
+    pub(crate) len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalDenseWeights {
+    pub(crate) fn new(buffer: MetalObjcId, mmap: Arc<memmap2::Mmap>, len: usize) -> Self {
+        Self {
+            buffer,
+            _mmap: mmap,
+            len,
+        }
     }
 }
 
@@ -2910,6 +2931,23 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_dense_weights_hold_buffer_len_and_mmap_owner() {
+        let mmap = Arc::new(
+            memmap2::MmapMut::map_anon(16)
+                .unwrap()
+                .make_read_only()
+                .unwrap(),
+        );
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let dense = MetalDenseWeights::new(id, Arc::clone(&mmap), 16);
+
+        assert_eq!(dense.buffer, id);
+        assert_eq!(dense.len, 16);
+        assert_eq!(Arc::strong_count(&mmap), 2);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

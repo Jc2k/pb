@@ -187,13 +187,14 @@ The validator should reject silent fallbacks such as:
   cache descriptors now live with the Metal module, while allocation is still bridged through
   legacy Obj-C helpers. CMD3 expert-phase temporary buffers and command-local fixed-Q4 source-buffer
   reuse now carry Metal-owned lifecycle/cache markers, and reusable transient Metal buffer entries
-  are typed in the Metal module. LM-head Metal buffer cache budget, shape matching, eviction, and
-  release-all policy also live in `metal.rs`. Legacy still owns the concrete encoders and Obj-C
+  are typed in the Metal module. Resident dense Metal buffers now have a Metal-owned descriptor
+  that retains the wrapped mmap, and LM-head Metal buffer cache budget, shape matching, eviction,
+  and release-all policy also live in `metal.rs`. Legacy still owns the concrete encoders and Obj-C
   buffer lifecycle, but command submission diagnostics, wait policy, attention placement policy,
   kernel definitions, post-attention prep payloads, projection/attention buffer descriptors,
-  KV/linear-state layout validation, reusable buffer records, LM-head cache policy, Q4
-  source-buffer reuse, and phase buffer lifecycle markers now have a module boundary for the
-  CMD1/CMD2/CMD3 builders to move behind.
+  resident dense buffer descriptors, KV/linear-state layout validation, reusable buffer records,
+  LM-head cache policy, Q4 source-buffer reuse, and phase buffer lifecycle markers now have a
+  module boundary for the CMD1/CMD2/CMD3 builders to move behind.
 - Existing code has moved fixed-slot and Q4 handling toward whole-expert payload ownership, but
   runtime behavior still lives in the historical monolith and still has fallbacks and component
   pathways that can bypass the target data flow.

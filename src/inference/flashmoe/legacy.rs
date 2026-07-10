@@ -105,11 +105,11 @@ use super::metal::{
     METAL_REUSABLE_BUFFER_POOL_LIMIT, METAL_SHADERS, MetalAttentionBackend, MetalAttentionPolicy,
     MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
     MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalKvCacheInner, MetalLinearAttentionLayerState, MetalLinearAttentionStateCache,
-    MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer, MetalLmHeadBufferCache, MetalPhaseBuffer,
-    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
-    MetalQ4SourceBufferCache, MetalReusableBuffer, metal_command_failure_requires_release,
-    resolve_metal_command_wait,
+    MetalDenseWeights, MetalKvCacheInner, MetalLinearAttentionLayerState,
+    MetalLinearAttentionStateCache, MetalLinearAttentionStaticOffsets, MetalLmHeadBuffer,
+    MetalLmHeadBufferCache, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, MetalQ4SourceBufferCache, MetalReusableBuffer,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -2707,14 +2707,6 @@ struct MetalExecutorInner {
     linear_attention_state: std::sync::Mutex<MetalLinearAttentionStateCache>,
     attention_policy: std::sync::Mutex<MetalAttentionPolicy>,
     reusable: std::sync::Mutex<Vec<MetalReusableBuffer>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalDenseWeights {
-    buffer: ObjcId,
-    _mmap: Arc<memmap2::Mmap>,
-    len: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -17866,11 +17858,7 @@ fn wrap_dense_mmap_as_metal_buffer(
             tracing::debug!(len, "failed to wrap dense mmap as resident Metal buffer");
             return Ok(None);
         }
-        Ok(Some(MetalDenseWeights {
-            buffer,
-            _mmap: mmap,
-            len,
-        }))
+        Ok(Some(MetalDenseWeights::new(buffer, mmap, len)))
     }
 }
 
