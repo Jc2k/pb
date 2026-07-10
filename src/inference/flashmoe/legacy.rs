@@ -84,8 +84,8 @@ use super::experts::{
     build_native_q4_expert_pack, cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
     first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
     fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
-    rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
-    validate_aggregate_expert_tensor_shape,
+    q4_record_layout_for_shape, rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4,
+    single_aggregate_expert_tensor, validate_aggregate_expert_tensor_shape,
 };
 #[cfg(test)]
 use super::experts::{
@@ -22070,7 +22070,7 @@ fn expected_expert_pack_record(
         element_offset,
         element_count,
     )?;
-    let (packed_bytes, groups) = q4_layout_for_shape(&shape)?;
+    let (packed_bytes, groups) = q4_record_layout_for_shape(&shape)?;
     Ok(ExpectedExpertPackRecord {
         tensor,
         dtype: source
@@ -22113,25 +22113,6 @@ fn expected_expert_pack(
         packed_bytes,
         records,
     })
-}
-
-fn q4_layout_for_shape(shape: &[usize]) -> Result<(u64, usize)> {
-    let cols = shape.last().copied().unwrap_or(0);
-    if cols == 0 {
-        bail!("cannot compute q4 layout for zero-column tensor");
-    }
-    let rows = if shape.len() > 1 {
-        shape[..shape.len() - 1].iter().product::<usize>().max(1)
-    } else {
-        1
-    };
-    let packed_bytes = rows
-        .checked_mul(cols.div_ceil(2))
-        .context("q4 packed byte count overflow")?;
-    let groups = rows
-        .checked_mul(cols.div_ceil(GROUP_SIZE))
-        .context("q4 group count overflow")?;
-    Ok((packed_bytes as u64, groups))
 }
 
 fn decode_expert_tensor_range(

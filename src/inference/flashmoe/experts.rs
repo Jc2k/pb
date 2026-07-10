@@ -936,6 +936,25 @@ pub(crate) fn validate_aggregate_expert_tensor_shape<T: AggregateExpertTensor>(
     Ok(())
 }
 
+pub(crate) fn q4_record_layout_for_shape(shape: &[usize]) -> Result<(u64, usize)> {
+    let cols = shape.last().copied().unwrap_or(0);
+    if cols == 0 {
+        bail!("cannot compute q4 layout for zero-column tensor");
+    }
+    let rows = if shape.len() > 1 {
+        shape[..shape.len() - 1].iter().product::<usize>().max(1)
+    } else {
+        1
+    };
+    let packed_bytes = rows
+        .checked_mul(cols.div_ceil(2))
+        .context("q4 packed byte count overflow")?;
+    let groups = rows
+        .checked_mul(cols.div_ceil(GROUP_SIZE))
+        .context("q4 group count overflow")?;
+    Ok((packed_bytes as u64, groups))
+}
+
 fn optional_aggregate_expert_tensor<'a, T: AggregateExpertTensor>(
     tensors: &[&'a T],
     kind: AggregateExpertTensorKind,
@@ -3079,6 +3098,21 @@ mod tests {
             err.to_string().contains(
                 "aggregate expert tensors must be all native MLX Q4 or all decoded tensors"
             )
+        );
+    }
+
+    #[test]
+    fn q4_record_layout_counts_packed_bytes_and_groups_from_shape() {
+        assert_eq!(q4_record_layout_for_shape(&[3, 5]).unwrap(), (9, 3));
+        assert_eq!(q4_record_layout_for_shape(&[2, 3, 33]).unwrap(), (102, 6));
+    }
+
+    #[test]
+    fn q4_record_layout_rejects_zero_column_shape() {
+        let err = q4_record_layout_for_shape(&[3, 0]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot compute q4 layout for zero-column tensor")
         );
     }
 
