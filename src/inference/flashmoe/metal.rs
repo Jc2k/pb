@@ -11,6 +11,32 @@ use super::state::FlashMoePostAttentionPrepState;
 pub(crate) type MetalObjcId = *mut c_void;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalLinearAttentionStaticOffsets {
+    pub(crate) conv_weight_byte_offset: u64,
+    pub(crate) a_log_byte_offset: u64,
+    pub(crate) dt_bias_byte_offset: u64,
+    pub(crate) norm_weight_byte_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLinearAttentionStaticOffsets {
+    pub(crate) fn new(
+        conv_weight_byte_offset: u64,
+        a_log_byte_offset: u64,
+        dt_bias_byte_offset: u64,
+        norm_weight_byte_offset: u64,
+    ) -> Self {
+        Self {
+            conv_weight_byte_offset,
+            a_log_byte_offset,
+            dt_bias_byte_offset,
+            norm_weight_byte_offset,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MetalBatchProjectionInput<'a> {
     Cpu(&'a [f32]),
@@ -2430,6 +2456,17 @@ mod tests {
             linear_delta_step_pipeline: 35,
             linear_gated_rms_norm_pipeline: 36,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn linear_attention_static_offsets_preserve_resident_weight_bindings() {
+        let offsets = MetalLinearAttentionStaticOffsets::new(16, 32, 48, 64);
+
+        assert_eq!(offsets.conv_weight_byte_offset, 16);
+        assert_eq!(offsets.a_log_byte_offset, 32);
+        assert_eq!(offsets.dt_bias_byte_offset, 48);
+        assert_eq!(offsets.norm_weight_byte_offset, 64);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

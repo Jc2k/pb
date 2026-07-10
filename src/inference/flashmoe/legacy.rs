@@ -104,8 +104,9 @@ use super::math::*;
 use super::metal::{
     METAL_SHADERS, MetalAttentionValues, MetalBatchProjectionInput, MetalCommandBufferFailure,
     MetalCommandContext, MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult,
-    MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep,
-    MetalProjectionBatch, metal_command_failure_requires_release, resolve_metal_command_wait,
+    MetalLinearAttentionStaticOffsets, MetalPhaseBuffer, MetalPipelineNameSet, MetalPipelineSet,
+    MetalPostAttentionPrep, MetalProjectionBatch, metal_command_failure_requires_release,
+    resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -1804,15 +1805,6 @@ impl DeferredExpertPhase {
             Self::Metal(output) => output.finish_without_readback(),
         }
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
-struct MetalLinearAttentionStaticOffsets {
-    conv_weight_byte_offset: u64,
-    a_log_byte_offset: u64,
-    dt_bias_byte_offset: u64,
-    norm_weight_byte_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15401,12 +15393,12 @@ impl DenseStore {
         else {
             return Ok(None);
         };
-        Ok(Some(MetalLinearAttentionStaticOffsets {
+        Ok(Some(MetalLinearAttentionStaticOffsets::new(
             conv_weight_byte_offset,
             a_log_byte_offset,
             dt_bias_byte_offset,
             norm_weight_byte_offset,
-        }))
+        )))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
