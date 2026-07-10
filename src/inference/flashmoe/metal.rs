@@ -10,6 +10,50 @@ use super::state::FlashMoePostAttentionPrepState;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalProjectionBatch {
+    pub(crate) output_buffer: MetalObjcId,
+    pub(crate) output_offsets: Vec<usize>,
+    pub(crate) output_widths: Vec<usize>,
+    pub(crate) total_rows: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalProjectionBatch {
+    pub(crate) fn new(
+        output_buffer: MetalObjcId,
+        output_offsets: Vec<usize>,
+        output_widths: Vec<usize>,
+        total_rows: usize,
+    ) -> Self {
+        Self {
+            output_buffer,
+            output_offsets,
+            output_widths,
+            total_rows,
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self::new(std::ptr::null_mut(), Vec::new(), Vec::new(), 0)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalAttentionValues {
+    pub(crate) buffer: MetalObjcId,
+    pub(crate) len: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalAttentionValues {
+    pub(crate) fn new(buffer: MetalObjcId, len: usize) -> Self {
+        Self { buffer, len }
+    }
+}
+
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -2369,6 +2413,34 @@ mod tests {
             linear_delta_step_pipeline: 35,
             linear_gated_rms_norm_pipeline: 36,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn projection_batch_declares_metal_output_layout() {
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let batch = MetalProjectionBatch::new(id, vec![0, 4, 12], vec![4, 8, 2], 14);
+
+        assert_eq!(batch.output_buffer, id);
+        assert_eq!(batch.output_offsets, vec![0, 4, 12]);
+        assert_eq!(batch.output_widths, vec![4, 8, 2]);
+        assert_eq!(batch.total_rows, 14);
+
+        let empty = MetalProjectionBatch::empty();
+        assert!(empty.output_buffer.is_null());
+        assert!(empty.output_offsets.is_empty());
+        assert!(empty.output_widths.is_empty());
+        assert_eq!(empty.total_rows, 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn attention_values_declares_metal_buffer_and_len() {
+        let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let values = MetalAttentionValues::new(id, 64);
+
+        assert_eq!(values.buffer, id);
+        assert_eq!(values.len, 64);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

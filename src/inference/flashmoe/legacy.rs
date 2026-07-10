@@ -102,10 +102,10 @@ use super::experts::{ExpertPackRecord, expert_layer_slot_is_reusable};
 use super::experts::{write_all_at_positioned, write_expert_metadata_atomically};
 use super::math::*;
 use super::metal::{
-    METAL_SHADERS, MetalCommandBufferFailure, MetalCommandContext, MetalCommandStatus,
-    MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPhaseBuffer, MetalPipelineNameSet,
-    MetalPipelineSet, MetalPostAttentionPrep, metal_command_failure_requires_release,
-    resolve_metal_command_wait,
+    METAL_SHADERS, MetalAttentionValues, MetalCommandBufferFailure, MetalCommandContext,
+    MetalCommandStatus, MetalCommandWaitPolicy, MetalCommandWaitResult, MetalPhaseBuffer,
+    MetalPipelineNameSet, MetalPipelineSet, MetalPostAttentionPrep, MetalProjectionBatch,
+    metal_command_failure_requires_release, resolve_metal_command_wait,
 };
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
@@ -1807,15 +1807,6 @@ impl DeferredExpertPhase {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalProjectionBatch {
-    output_buffer: ObjcId,
-    output_offsets: Vec<usize>,
-    output_widths: Vec<usize>,
-    total_rows: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy)]
 enum MetalBatchProjectionInput<'a> {
     Cpu(&'a [f32]),
@@ -1839,13 +1830,6 @@ struct MetalLinearAttentionStaticOffsets {
     a_log_byte_offset: u64,
     dt_bias_byte_offset: u64,
     norm_weight_byte_offset: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalAttentionValues {
-    buffer: ObjcId,
-    len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3377,6 +3361,14 @@ impl MetalExecutorInner {
             || batch.output_widths[1] != layout.total_value_width
             || batch.output_widths[2] != layout.num_value_heads
             || batch.output_widths[3] != layout.num_value_heads
+            || batch.total_rows
+                != batch
+                    .output_offsets
+                    .iter()
+                    .zip(batch.output_widths.iter())
+                    .map(|(offset, width)| offset.saturating_add(*width))
+                    .max()
+                    .unwrap_or(0)
             || layout.key_dim == 0
             || layout.value_dim == 0
             || layout.key_dim > 256
@@ -3984,10 +3976,10 @@ impl MetalExecutorInner {
             }
             self.recycle(projection_buffer);
             drop(state_guard);
-            Ok(Some(MetalAttentionValues {
-                buffer: output_buffer,
-                len: layout.total_value_width,
-            }))
+            Ok(Some(MetalAttentionValues::new(
+                output_buffer,
+                layout.total_value_width,
+            )))
         }
     }
 
@@ -6369,12 +6361,7 @@ impl MetalExecutorInner {
     ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
         if projections.is_empty() {
             return Ok(Some((
-                MetalProjectionBatch {
-                    output_buffer: ptr::null_mut(),
-                    output_offsets: Vec::new(),
-                    output_widths: Vec::new(),
-                    total_rows: 0,
-                },
+                MetalProjectionBatch::empty(),
                 MetalMatvecTiming::default(),
                 0,
             )));
@@ -6571,12 +6558,7 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some((
-                MetalProjectionBatch {
-                    output_buffer,
-                    output_offsets,
-                    output_widths,
-                    total_rows,
-                },
+                MetalProjectionBatch::new(output_buffer, output_offsets, output_widths, total_rows),
                 timing,
                 projections.len(),
             )))
@@ -6590,12 +6572,7 @@ impl MetalExecutorInner {
     ) -> Result<Option<(MetalProjectionBatch, MetalMatvecTiming, usize)>> {
         if projections.is_empty() {
             return Ok(Some((
-                MetalProjectionBatch {
-                    output_buffer: ptr::null_mut(),
-                    output_offsets: Vec::new(),
-                    output_widths: Vec::new(),
-                    total_rows: 0,
-                },
+                MetalProjectionBatch::empty(),
                 MetalMatvecTiming::default(),
                 0,
             )));
@@ -6765,12 +6742,7 @@ impl MetalExecutorInner {
                 self.recycle(buffer);
             }
             Ok(Some((
-                MetalProjectionBatch {
-                    output_buffer,
-                    output_offsets,
-                    output_widths,
-                    total_rows,
-                },
+                MetalProjectionBatch::new(output_buffer, output_offsets, output_widths, total_rows),
                 timing,
                 projections.len(),
             )))
