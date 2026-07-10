@@ -955,6 +955,93 @@ pub(crate) fn q4_record_layout_for_shape(shape: &[usize]) -> Result<(u64, usize)
     Ok((packed_bytes as u64, groups))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectExpertTensorShape {
+    pub(crate) hidden: usize,
+    pub(crate) intermediate: usize,
+}
+
+impl DirectExpertTensorShape {
+    pub(crate) fn new(hidden: usize, intermediate: usize) -> Result<Self> {
+        if hidden == 0 || intermediate == 0 {
+            bail!(
+                "direct expert tensor shape must have non-zero hidden and intermediate dimensions"
+            );
+        }
+        Ok(Self {
+            hidden,
+            intermediate,
+        })
+    }
+}
+
+pub(crate) fn validate_direct_expert_tensor_group<T: AggregateExpertTensor>(
+    layer: usize,
+    expert: usize,
+    tensors: &[&T],
+    shape: Option<DirectExpertTensorShape>,
+) -> Result<()> {
+    let mut seen = BTreeMap::<&'static str, &T>::new();
+    for suffix in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+        let matches: Vec<&T> = tensors
+            .iter()
+            .copied()
+            .filter(|tensor| tensor.aggregate_tensor_name().ends_with(suffix))
+            .collect();
+        match matches.as_slice() {
+            [tensor] => {
+                seen.insert(suffix, *tensor);
+            }
+            [] => {
+                bail!(
+                    "Flash-MoE expert layer {layer} expert {expert} is missing required tensor {suffix}"
+                );
+            }
+            _ => {
+                bail!(
+                    "Flash-MoE expert layer {layer} expert {expert} has duplicate tensors ending in {suffix}"
+                );
+            }
+        }
+    }
+
+    if let Some(shape) = shape {
+        validate_direct_expert_matrix_shape(
+            seen["gate_proj.weight"],
+            &[shape.intermediate, shape.hidden],
+            "gate_proj.weight",
+        )?;
+        validate_direct_expert_matrix_shape(
+            seen["up_proj.weight"],
+            &[shape.intermediate, shape.hidden],
+            "up_proj.weight",
+        )?;
+        validate_direct_expert_matrix_shape(
+            seen["down_proj.weight"],
+            &[shape.hidden, shape.intermediate],
+            "down_proj.weight",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_direct_expert_matrix_shape<T: AggregateExpertTensor>(
+    tensor: &T,
+    expected: &[usize; 2],
+    suffix: &str,
+) -> Result<()> {
+    if tensor.aggregate_tensor_shape() != expected {
+        bail!(
+            "Flash-MoE expert tensor {} has shape {:?}; expected {:?} for {suffix}",
+            tensor.aggregate_tensor_name(),
+            tensor.aggregate_tensor_shape(),
+            expected
+        );
+    }
+    Ok(())
+}
+
 fn optional_aggregate_expert_tensor<'a, T: AggregateExpertTensor>(
     tensors: &[&'a T],
     kind: AggregateExpertTensorKind,
@@ -3113,6 +3200,104 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("cannot compute q4 layout for zero-column tensor")
+        );
+    }
+
+    #[test]
+    fn direct_expert_tensor_group_accepts_gate_up_down_shapes() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.up_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.down_proj.weight",
+            shape: vec![3, 2],
+            native_q4: false,
+        };
+
+        validate_direct_expert_tensor_group(
+            0,
+            7,
+            &[&gate, &up, &down],
+            Some(DirectExpertTensorShape::new(3, 2).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_expert_tensor_group_rejects_missing_or_duplicate_projection() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let duplicate_gate = TestAggregateTensor {
+            name: "alias.model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.up_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.down_proj.weight",
+            shape: vec![3, 2],
+            native_q4: false,
+        };
+
+        let missing = validate_direct_expert_tensor_group(0, 7, &[&gate, &up], None).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("is missing required tensor down_proj.weight")
+        );
+
+        let duplicate =
+            validate_direct_expert_tensor_group(0, 7, &[&gate, &duplicate_gate, &up, &down], None)
+                .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("has duplicate tensors ending in gate_proj.weight")
+        );
+    }
+
+    #[test]
+    fn direct_expert_tensor_group_rejects_shape_mismatch() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.gate_proj.weight",
+            shape: vec![2, 3],
+            native_q4: false,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.up_proj.weight",
+            shape: vec![2, 4],
+            native_q4: false,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.0.mlp.experts.7.down_proj.weight",
+            shape: vec![3, 2],
+            native_q4: false,
+        };
+
+        let err = validate_direct_expert_tensor_group(
+            0,
+            7,
+            &[&gate, &up, &down],
+            Some(DirectExpertTensorShape::new(3, 2).unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected [2, 3] for up_proj.weight")
         );
     }
 

@@ -75,17 +75,19 @@ use super::experts::read_expert_pack_metadata;
 use super::experts::take_reusable_expert_bytes;
 use super::experts::{
     AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors,
-    EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
-    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
-    FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
-    Q4MatvecPayload, Q4MatvecSource, aggregate_expert_tensor_kind, aggregate_expert_tensors,
-    aggregate_native_q4_enabled, build_expert_pack, build_fixed_native_q4_expert_pack,
-    build_native_q4_expert_pack, cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
+    DirectExpertTensorShape, EXPERT_PACK_SCALE_BIAS_DTYPE, EXPERT_SCALE_BIAS_DTYPE_BF16,
+    EXPERT_SCALE_BIAS_DTYPE_F32, ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata,
+    ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore,
+    FixedQ4ExpertPayload, FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec,
+    NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload, Q4MatvecSource,
+    aggregate_expert_tensor_kind, aggregate_expert_tensors, aggregate_native_q4_enabled,
+    build_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
+    cleanup_stale_expert_temp_files, expert_scale_bias_dtype_size,
     first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
     fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
     q4_record_layout_for_shape, rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4,
     single_aggregate_expert_tensor, validate_aggregate_expert_tensor_shape,
+    validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
 use super::experts::{
@@ -22416,70 +22418,19 @@ fn validate_expert_tensor_group(
     tensors: &[&ExpertTensorRef],
     config: Option<&QwenModelConfig>,
 ) -> Result<()> {
-    let mut seen = BTreeMap::<&'static str, &ExpertTensorRef>::new();
-    for suffix in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
-        let matches: Vec<&ExpertTensorRef> = tensors
-            .iter()
-            .copied()
-            .filter(|tensor| tensor.tensor.ends_with(suffix))
-            .collect();
-        match matches.as_slice() {
-            [tensor] => {
-                seen.insert(suffix, *tensor);
-            }
-            [] => {
-                bail!(
-                    "Flash-MoE expert layer {layer} expert {expert} is missing required tensor {suffix}"
-                );
-            }
-            _ => {
-                bail!(
-                    "Flash-MoE expert layer {layer} expert {expert} has duplicate tensors ending in {suffix}"
-                );
-            }
-        }
-    }
-
-    if let Some(config) = config {
-        let hidden = config.hidden_size;
+    let shape = if let Some(config) = config {
         let intermediate = config
             .moe_intermediate_size
             .or(config.intermediate_size)
             .context("Qwen config is missing moe_intermediate_size/intermediate_size for expert validation")?;
-        validate_expert_matrix_shape(
-            seen["gate_proj.weight"],
-            &[intermediate, hidden],
-            "gate_proj.weight",
-        )?;
-        validate_expert_matrix_shape(
-            seen["up_proj.weight"],
-            &[intermediate, hidden],
-            "up_proj.weight",
-        )?;
-        validate_expert_matrix_shape(
-            seen["down_proj.weight"],
-            &[hidden, intermediate],
-            "down_proj.weight",
-        )?;
-    }
-
-    Ok(())
-}
-
-fn validate_expert_matrix_shape(
-    tensor: &ExpertTensorRef,
-    expected: &[usize; 2],
-    suffix: &str,
-) -> Result<()> {
-    if tensor.shape.as_slice() != expected {
-        bail!(
-            "Flash-MoE expert tensor {} has shape {:?}; expected {:?} for {suffix}",
-            tensor.tensor,
-            tensor.shape,
-            expected
-        );
-    }
-    Ok(())
+        Some(DirectExpertTensorShape::new(
+            config.hidden_size,
+            intermediate,
+        )?)
+    } else {
+        None
+    };
+    validate_direct_expert_tensor_group(layer, expert, tensors, shape)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
