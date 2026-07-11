@@ -1839,6 +1839,10 @@ impl FlashMoeGenerationState {
 }
 
 #[cfg(test)]
+#[path = "state_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

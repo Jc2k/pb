@@ -324,6 +324,10 @@ Baseline reviewed on 2026-07-11:
   config validation, and patch-order parity in `vision_parity_tests.rs`. The 741-line adapter test
   block and its broad legacy imports were removed from `legacy.rs`; these tests remain explicitly
   upstream of the shared decoder graph.
+- State now owns tool-call rerender prefix reuse in `state_parity_tests.rs`; its existing tests
+  already cover cache transfer, shallow CPU KV snapshots, recurrent placement rejection, and prefix
+  boundaries. The five-test legacy session block and the now-dead state imports were removed rather
+  than duplicating those owner contracts.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
