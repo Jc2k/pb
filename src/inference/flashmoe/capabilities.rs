@@ -1156,6 +1156,54 @@ mod tests {
     }
 
     #[test]
+    fn qwen_text_and_vl_typed_dense_experts_resolve_the_same_graph() {
+        for (layout, input_adapter) in [
+            (qwen3_moe_layout(Some(true)), text_adapter()),
+            (qwen3_vl_layout(), qwen_vl_adapter()),
+        ] {
+            for dense_layout in [
+                ResidentDenseLayout::Bf16,
+                ResidentDenseLayout::F16,
+                ResidentDenseLayout::F32,
+            ] {
+                for expert_dtype in [DenseExpertDtype::Bf16, DenseExpertDtype::F16] {
+                    let plan = FlashMoeCapabilityPlan::resolve(
+                        &layout,
+                        input_adapter,
+                        dense_layout,
+                        fixed_dense_experts(&layout, expert_dtype),
+                        &attention_layers(&layout),
+                        Some(full_metal()),
+                    )
+                    .unwrap();
+
+                    plan.validate_complete().unwrap();
+                    assert_eq!(plan.family, layout.family);
+                    assert_eq!(plan.dense_layout, dense_layout);
+                    assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
+                    assert!(
+                        plan.attention_layers
+                            .iter()
+                            .all(|kind| *kind == QwenMoeLayerKind::FullAttention)
+                    );
+                    assert_eq!(
+                        plan.stage(FlashMoeGraphStage::ActiveExpertReads)
+                            .unwrap()
+                            .implementation,
+                        FlashMoeStageImplementation::ParallelPositionedWholeExpertReads
+                    );
+                    assert_eq!(
+                        plan.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
+                            .unwrap()
+                            .implementation,
+                        FlashMoeStageImplementation::MetalTypedExpertResidentSharedCombine
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qwen35_q4_capability_plan_rejects_incomplete_kernel_surface() {
         let layout = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(

@@ -406,6 +406,10 @@ Baseline reviewed on 2026-07-11:
   the same manifest/range binding validation to both text families. Metal kernel requirements are
   resolved from layer and shared-expert metadata: hybrid Qwen3.5 requires its linear kernels, while
   no-shared Qwen MoE does not falsely require the shared-activation kernel.
+- Capability coverage now resolves Qwen3 text and Qwen3-VL through the same graph for every
+  supported BF16/F16/F32 resident-dense layout paired with fixed-BF16 or fixed-F16 whole-expert
+  slots. Family, input adapter, dense dtype, and expert dtype change typed stage inputs only; all
+  combinations retain the same attention, positioned-read, CMD3, and LM-head stage contracts.
 - Expert count and active K are concrete graph values rather than generation-loop inputs. The
   resolved CLI/model routing policy is applied to model metadata before capability resolution, and
   production CMD1/CMD2/router construction consumes the resulting scheduler-owned values.
@@ -670,7 +674,9 @@ Completion evidence:
   ignored; the release binary rebuilt and the required smoke still printed `4` on 2026-07-11.
   After capability resolution took ownership of the manifest-validated per-layer attention
   schedule, 676 tests passed with seven ignored; web assets and the release binary rebuilt, and the
-  required smoke again printed `4` on 2026-07-11.
+  required smoke again printed `4` on 2026-07-11. The subsequent Qwen3/Qwen3-VL typed dense-expert
+  matrix raised the suite to 677 passing tests with seven ignored without changing production
+  execution.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations
@@ -702,7 +708,7 @@ Current capability matrix:
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit BF16 cache emits fixed-BF16 slots | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
-| Other supported families | BF16/F16 expert slots | Capability-resolved only when exact model layout, fixed slot metadata, and required Metal kernels are present; no production policy currently selects them | Storage, scheduler, capability, and local-Metal fixtures; real checkpoint pending |
+| Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Capability-resolved only when exact model layout, fixed slot metadata, typed adapter, and required Metal kernels are present; no production cache policy currently selects them | Cross-family 12-combination graph matrix plus storage, scheduler, and local-Metal fixtures; real checkpoint pending |
 
 ### Gate 7: Legacy Removal And Benchmarking
 
