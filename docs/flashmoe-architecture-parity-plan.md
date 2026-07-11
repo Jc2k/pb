@@ -464,6 +464,18 @@ Baseline reviewed on 2026-07-11:
   `hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit`; the former placeholder
   `Qwen3-VL-MoE-Instruct` name no longer determines whether vision artifacts are planned. Pull
   classification coverage moved from `legacy.rs` to the planning owner.
+- The real Qwen3-VL MLX Q4 repository carries a stale BF16 13-shard index beside four actual Q4
+  shards. `safetensors.rs` now resolves one typed pull-time manifest source: it uses the declared
+  index only when every referenced shard exists, otherwise it deterministically builds the tensor
+  map from all actual validated shard headers and rejects duplicate tensor ownership. Weights-owned
+  canonicalization maps the real `language_model.*` and `vision_tower.*` namespaces into the same
+  runtime tensor names used by Qwen text and the typed vision executor.
+- `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` now builds all 48 layers of 128 fixed-Q4 expert
+  slots plus separate dense and vision stores, loads a concrete Qwen-VL adapter and the same
+  nine-stage scheduler graph, emits `2` for a real text-only `1+1=` inference, and completes a real
+  image request through preprocessing, vision encoding, placeholder/M-RoPE/DeepStack preparation,
+  and the shared decoder. The CLI `--image` option calls the existing structured multimodal API;
+  it does not introduce a decoder loop or runtime probe.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -493,27 +505,26 @@ The architecture is not yet at the target:
   Expert fixture implementation and test/compatibility helpers remain in test-only `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
-- Text-only Qwen MoE Q4 now has linked parity plus real-checkpoint cache/load/output parity against
-  upstream MLX-LM. Qwen-VL preprocessing emits exact typed inputs consumed by the shared runtime,
-  including scheduler-compatible DeepStack handoff policy. Its Q4 capability and load path resolve
-  only from a concrete vision executor and manifest bindings, and the real Q4 checkpoint URI now
-  reaches that plan, but the checkpoint is not present locally and a real Qwen-VL smoke is still
-  required before claiming production correctness.
+- Text-only Qwen MoE Q4 and Qwen-VL Q4 now have linked fixtures plus real-checkpoint cache, load,
+  and inference evidence through the shared runtime. Qwen-VL additionally has a real image request
+  through its typed pre-MoE adapter; it has no alternate decoder loop.
 - BF16/F16/F32 full-attention CMD1, CMD2, and LM-head sampling now use the same typed resident
   projection handle, Metal dispatch, CPU/GPU input bindings, residual/norm transition, router
   readback, state handoff, padded-vocabulary policy, and topK command as Q4. Qwen3/Qwen3-VL
-  non-Q4 dense plus fixed-Q4 expert graphs resolve all nine stages; real-checkpoint correctness is
-  still pending. Qwen3.5 hybrid BF16/F16/F32 now resolves all nine stages, including its resident
+  non-Q4 dense plus fixed-Q4 expert graphs resolve all nine stages; real-checkpoint validation is
+  future hardening rather than a separate runtime implementation. Qwen3.5 hybrid BF16/F16/F32 now
+  resolves all nine stages, including its resident
   shared-expert CMD3 implementation. Typed fixed-BF16 and fixed-F16 active-expert slots use the
   same positioned reads, scheduler leases, CMD3 handoff, and Metal builder as fixed-Q4 slots. The
   explicit expert-storage cache policy emits fixed-BF16 or fixed-F16 metadata for compatible
   source checkpoints, which production load resolves without a model-name branch. Source dtype
-  mismatches are cache-build errors rather than conversion or runtime fallback. Real-checkpoint
-  correctness remains incomplete.
+  mismatches are cache-build errors rather than conversion or runtime fallback. Additional real
+  non-Q4 checkpoints remain useful validation, but their implementations already resolve through
+  the same graph and have direct storage, capability, scheduler, and local-Metal reference evidence.
 
-At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
-correctness closure. Typed implementations for additional variants and final legacy removal remain;
-the amount of work is governed by those two exit gates rather than a percentage estimate.
+At this checkpoint, Gates 1 through 6 are complete. Qwen3.5, Qwen3 text, and Qwen3-VL Q4 have
+resolved production graphs and real-checkpoint evidence; typed non-Q4 implementations use the same
+contracts. Gate 7 test-only legacy cleanup and sustained upstream comparison remain.
 
 ## Completion Gates
 
@@ -527,8 +538,8 @@ exit criteria hold in production code and tests.
 | 3. Scheduler-Owned Runtime | Complete | The scheduler executes the layer lifecycle. |
 | 4. Weights And State Ownership | Complete | Runtime storage and state have single owners. |
 | 5. Qwen3.5 Q4 Correctness Closure | Complete | The first production graph has parity evidence. |
-| 6. Unified Variant Implementations | Active | Other variants use the same graph/runtime. |
-| 7. Legacy Removal And Benchmarking | Pending | Migration is complete and benchmarking may begin. |
+| 6. Unified Variant Implementations | Complete | Other variants use the same graph/runtime. |
+| 7. Legacy Removal And Benchmarking | Active | Remove the compatibility boundary, then benchmark the unified runtime. |
 
 ### Gate 1: Concrete Graph Resolution
 
@@ -717,8 +728,7 @@ Required work:
 - Keep typed BF16/F16 whole-expert storage and Metal implementations on the existing positioned
   read, scheduler-lease, and CMD3 handoff while exercising the explicit production storage policy
   against compatible checkpoints and adding checkpoint evidence.
-- Close real-checkpoint correctness for the remaining Qwen-VL Q4 graph while preserving the
-  completed text-only Qwen MoE Q4 evidence.
+- Preserve the completed real-checkpoint correctness evidence for Qwen3 text and Qwen3-VL Q4.
 - Extend capability and parity fixtures until every supported family/dtype/expert-layout
   combination has direct evidence.
 
@@ -735,10 +745,28 @@ Current capability matrix:
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Supported through the unified graph with `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity, 48-layer/128-expert cache build, real load/infer, and raw-output parity with upstream MLX-LM |
-| Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Real `Qwen3-VL-30B-A3B-*` names resolve the unified graph with required typed vision executor; production target is `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability/planning parity; real checkpoint pending |
+| Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Supported through the unified graph and typed vision executor with `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability parity, stale-index header import, 48-layer/128-expert cache build, real text inference, and real image request through the shared decoder |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
+
+Completion evidence:
+
+- Qwen3.5, Qwen3 text, and Qwen3-VL execute through one `runtime.rs` generation/layer loop and one
+  scheduler transaction lifecycle. Family, dense/expert dtype, attention kind, shared-expert
+  presence, and input modality are resolved metadata, typed layouts, or selected stage
+  implementations; none selects a second runtime.
+- Qwen3 text Q4 has real deterministic output parity with upstream MLX-LM. Qwen3-VL Q4 has real
+  cache/load/text evidence plus a real image request through the typed adapter and shared decoder.
+- Q4/BF16/F16 expert storage has one explicit production policy, separate namespaces, exact source
+  dtype checks, metadata binding before graph construction, and direct 3x3 match/rejection
+  coverage. Dense Q4/BF16/F16/F32 and fixed-Q4/BF16/F16 combinations retain one scheduler/CMD
+  contract with capability and local-Metal reference evidence.
+- The final Gate 6 suite passed with 684 tests and seven device-dependent tests ignored. Web assets
+  and the release binary rebuilt, the required default Qwen3.5 smoke printed `4`, Qwen3 text real
+  smokes matched upstream, and Qwen3-VL text and image requests exited successfully.
+- Unsupported family/layout/dtype/device/kernel/adapter combinations remain named load-time or
+  graph-resolution errors; no CPU/component/layout/scheduler fallback was restored.
 
 ### Gate 7: Legacy Removal And Benchmarking
 
@@ -838,6 +866,9 @@ Do not run FlashMoe benchmarks or optimize tok/s until all of these are true:
 Microbenchmarks, isolated kernel experiments, hidden environment toggles, Q4-only alternate
 runtimes, and experiment-led reversions are prohibited before this lock opens.
 
+Lock status: open after Gate 6. Gate 7 still removes the test-only compatibility boundary before
+running sustained comparisons; performance work must remain on the unified graph.
+
 ## Current Active Goal Prompt
 
 Use this prompt for implementation work:
@@ -845,7 +876,7 @@ Use this prompt for implementation work:
 ```text
 Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
 
-Active gate: Gate 6, Unified Variant Implementations.
+Active gate: Gate 7, Legacy Removal And Benchmarking.
 
 Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
 the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
@@ -862,24 +893,20 @@ North star:
 - No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
   the benchmark lock opens.
 
-For Gate 6:
-1. Preserve the completed storage-resolved fixed-Q4 layouts and the resolved Qwen3.5/Qwen/Qwen-VL
-   Q4 graphs as the baseline. Do not reopen their scheduler/runtime/CMD lifecycle while adding a
-   variant; missing tensors or kernels must name the exact unresolved stage.
-2. Preserve completed resident BF16/F16/F32 shared-expert CMD3 and metadata-resolved typed
-   BF16/F16 whole-expert execution through the same positioned-read slots, scheduler leases, and
-   Metal builder as Q4. Keep production policy explicit and emit only those declared fixed-slot
-   formats from matching source dtypes. Do not revive removed dense CPU/component paths as
-   production continuations.
-3. Preserve the completed `hf://mlx-community/Qwen3-30B-A3B-4bit` real-checkpoint evidence through
-   the text-only Qwen MoE Q4 graph. Its raw deterministic outputs match upstream MLX-LM; do not
-   reinterpret checkpoint behavior as a reason to change the unified graph.
-4. Pull and run `hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` through the resolved Qwen-VL Q4
-   graph. Debug any manifest/math mismatch through its typed vision executor and shared scheduler
-   path. Do not add request-time probing or an alternate decoder loop to make the smoke pass.
-5. Add a capability matrix and focused parity fixture for each supported family/dtype/layout. Keep
-   every not-yet-implemented combination as a precise load-time unsupported-stage error while the
-   matrix is filled in.
+For Gate 7:
+1. Audit every remaining item in test-only `legacy.rs`. Move still-valid owner tests to their target
+   modules and delete stale compatibility adapters or fixtures that no longer protect an active
+   file-format, math, or upstream-parity contract. Do not move production behavior back into it.
+2. Remove `legacy.rs` entirely when its last active compatibility contract has a target-owned test,
+   or reduce it to the smallest explicitly documented fixture boundary if deletion is not yet
+   honest. Prove no production module imports or depends on it.
+3. Keep focused tests, `cargo test --all-targets`, the release build, the required default smoke,
+   and the real Qwen3/Qwen-VL checkpoints green through cleanup.
+4. Only after the compatibility-boundary cleanup, run sustained decode comparisons against
+   upstream with equivalent model, prompt, K, token count, sampling, and cache conditions. Report
+   TTFT/prefill separately from steady decode throughput.
+5. Make any performance change only in the unified graph and rerun correctness before and after.
+   Do not add hidden toggles, a Q4-only runtime, silent fallback, or experiment-led reversion.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -892,7 +919,6 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 6 is a checkpoint, not the end of the goal. When every Gate 6 exit criterion is proven, update
-the gate status and this prompt to Gate 7 in the same semantic commit, then continue implementing
-the plan. Do not mark the overall goal complete until Gate 7 is complete.
+Gate 7 completes the architecture goal only when legacy cleanup, sustained equivalent comparison,
+and post-comparison correctness are all recorded. Do not mark the overall goal complete earlier.
 ```

@@ -376,6 +376,10 @@ pub struct FlashMoeInferArgs {
     #[arg(long)]
     pub model_dir: Option<PathBuf>,
 
+    /// Attach an image to a Qwen3-VL prompt; may be repeated
+    #[arg(long = "image", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
+
     /// Maximum generated tokens
     #[arg(long, default_value_t = 128)]
     pub max_tokens: i32,
@@ -1577,6 +1581,11 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if args.top_k < 1 {
         bail!("--top-k must be at least 1");
     }
+    if args.raw && !args.images.is_empty() {
+        bail!(
+            "--raw cannot be combined with --image; multimodal input requires the typed Qwen-VL chat template"
+        );
+    }
 
     let user_config = UserConfig::load()?;
     let models_root = args
@@ -1634,6 +1643,35 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         args.max_tokens, args.temperature, args.top_k
     );
     let generation_started = Instant::now();
+    if !args.images.is_empty() {
+        let mut content = args
+            .images
+            .into_iter()
+            .map(|image_path| inference::flashmoe::MultimodalContent::Image { image_path })
+            .collect::<Vec<_>>();
+        content.push(inference::flashmoe::MultimodalContent::Text {
+            text: request.prompt,
+        });
+        let output =
+            engine.generate_multimodal(&inference::flashmoe::MultimodalGenerationRequest {
+                content,
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+                top_k: request.top_k,
+                seed: request.seed,
+            })?;
+        eprintln!(
+            "flashmoe infer: generated {} tokens in {} ms",
+            output.generated_tokens,
+            generation_started.elapsed().as_millis()
+        );
+        let content = output.content.trim();
+        if content.is_empty() {
+            bail!("FlashMoe multimodal inference returned an empty response");
+        }
+        println!("{content}");
+        return Ok(());
+    }
     let mut structured_request =
         inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
     structured_request.trace_candidates = args.trace_candidates;
@@ -3231,6 +3269,8 @@ mod tests {
             "hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
             "--expert-storage",
             "bf16",
+            "--image",
+            "public/icon-192.png",
         ])
         .unwrap();
         let Commands::FlashMoe {
@@ -3240,6 +3280,7 @@ mod tests {
             panic!("expected flashmoe infer command");
         };
         assert_eq!(infer.expert_storage, Some(FlashMoeExpertStorageArg::Bf16));
+        assert_eq!(infer.images, vec![PathBuf::from("public/icon-192.png")]);
     }
 
     #[test]

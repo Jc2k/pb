@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -214,27 +214,28 @@ pub(super) fn build_manifest(
     snapshot_dir: &Path,
     index_json: &Path,
 ) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
-    let index: SafetensorsIndex = serde_json::from_slice(
-        &fs::read(index_json)
-            .with_context(|| format!("failed to read {}", index_json.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", index_json.display()))?;
+    let resolved_manifest = resolve_safetensors_manifest(snapshot_dir, index_json)?;
+    if resolved_manifest.source == SafetensorsManifestSource::ActualShardHeaders {
+        tracing::info!(
+            snapshot = %snapshot_dir.display(),
+            "resolved safetensors manifest from actual shard headers because the declared index references missing shards"
+        );
+    }
+    let weight_map = resolved_manifest.weight_map;
     let mut dense_shards = BTreeSet::new();
     let mut dense_tensor_refs = Vec::new();
     let mut visual_tensor_refs = Vec::new();
     let mut expert_tensors = Vec::new();
-    let mut shard_cache = BTreeMap::<String, SafetensorShard>::new();
+    let mut shard_cache = resolved_manifest.shards;
     let mut runtime_offset = 0u64;
     let mut visual_offset = 0u64;
-    for (tensor, shard) in &index.weight_map {
+    for (tensor, shard) in &weight_map {
         let canonical_tensor = canonical_hf_tensor_name(&tensor);
         if skip_flashmoe_runtime_tensor(&canonical_tensor) {
             continue;
         }
         if is_q4_aux_tensor_name(&canonical_tensor)
-            && index
-                .weight_map
-                .contains_key(q4_weight_name_for_aux(&tensor).as_str())
+            && weight_map.contains_key(q4_weight_name_for_aux(&tensor).as_str())
         {
             continue;
         }
@@ -257,12 +258,8 @@ pub(super) fn build_manifest(
         let tensor_source_offsets = tensor_info.data_offsets;
         if is_expert_tensor_name(&canonical_tensor) {
             let (layer, expert) = parse_layer_expert(&canonical_tensor);
-            let native_q4 = dense_native_q4_sources(
-                snapshot_dir,
-                &index.weight_map,
-                &mut shard_cache,
-                &tensor,
-            )?;
+            let native_q4 =
+                dense_native_q4_sources(snapshot_dir, &weight_map, &mut shard_cache, &tensor)?;
             let runtime_shape = if native_q4.is_some() {
                 logical_shape_for_mlx_q4(&tensor_shape)?
             } else {
@@ -301,12 +298,8 @@ pub(super) fn build_manifest(
             let source_byte_len = tensor_source_offsets[1]
                 .checked_sub(tensor_source_offsets[0])
                 .with_context(|| format!("invalid data_offsets for tensor {tensor}"))?;
-            let native_q4 = dense_native_q4_sources(
-                snapshot_dir,
-                &index.weight_map,
-                &mut shard_cache,
-                &tensor,
-            )?;
+            let native_q4 =
+                dense_native_q4_sources(snapshot_dir, &weight_map, &mut shard_cache, &tensor)?;
             let quantization =
                 dense_tensor_quantization(&canonical_tensor, &tensor_dtype, &native_q4);
             let runtime_shape = if native_q4.is_some() {

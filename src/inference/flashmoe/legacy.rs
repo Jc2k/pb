@@ -3824,35 +3824,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_hf_tensor_names_are_canonicalized_for_runtime() {
-        assert_eq!(
-            canonical_hf_tensor_name("model.language_model.embed_tokens.weight"),
-            "model.embed_tokens.weight"
-        );
-        assert_eq!(
-            canonical_hf_tensor_name("model.language_model.layers.7.self_attn.q_proj.weight"),
-            "model.layers.7.self_attn.q_proj.weight"
-        );
-        assert_eq!(
-            canonical_hf_tensor_name("language_model.model.embed_tokens.weight"),
-            "model.embed_tokens.weight"
-        );
-        assert_eq!(
-            canonical_hf_tensor_name("language_model.model.layers.3.self_attn.q_proj.weight"),
-            "model.layers.3.self_attn.q_proj.weight"
-        );
-        assert_eq!(
-            canonical_hf_tensor_name("language_model.lm_head.weight"),
-            "lm_head.weight"
-        );
-        assert_eq!(
-            canonical_hf_tensor_name("model.visual.patch_embed.proj.weight"),
-            "visual.patch_embed.proj.weight"
-        );
-        assert_eq!(canonical_hf_tensor_name("lm_head.weight"), "lm_head.weight");
-    }
-
-    #[test]
     fn qwen_config_deserializes_qwen3_moe_extra_fields() {
         // Real Qwen3 MoE checkpoints include additional config fields that should be parsed
         // without error and reflected in the struct.

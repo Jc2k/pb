@@ -1450,14 +1450,23 @@ fn insert_tensor_entry_with_aliases(
 }
 
 pub(crate) fn canonical_hf_tensor_name(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
+    let canonical = if let Some(rest) = name.strip_prefix("model.language_model.") {
         format!("model.{rest}")
     } else if let Some(rest) = name.strip_prefix("language_model.") {
         rest.to_string()
     } else if let Some(rest) = name.strip_prefix("model.visual.") {
         format!("visual.{rest}")
+    } else if let Some(rest) = name.strip_prefix("vision_tower.") {
+        format!("visual.{rest}")
     } else {
         name.to_string()
+    };
+    if canonical.starts_with("visual.") {
+        canonical
+            .replace(".mlp.linear_fc1.", ".mlp.fc1.")
+            .replace(".mlp.linear_fc2.", ".mlp.fc2.")
+    } else {
+        canonical
     }
 }
 
@@ -4944,6 +4953,35 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_family_tensor_names_are_canonicalized_for_runtime() {
+        assert_eq!(
+            canonical_hf_tensor_name("model.language_model.embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("language_model.model.layers.3.self_attn.q_proj.weight"),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("language_model.lm_head.weight"),
+            "lm_head.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("model.visual.patch_embed.proj.weight"),
+            "visual.patch_embed.proj.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("vision_tower.blocks.7.mlp.linear_fc1.weight"),
+            "visual.blocks.7.mlp.fc1.weight"
+        );
+        assert_eq!(
+            canonical_hf_tensor_name("vision_tower.merger.linear_fc2.weight"),
+            "visual.merger.linear_fc2.weight"
+        );
+        assert_eq!(canonical_hf_tensor_name("lm_head.weight"), "lm_head.weight");
+    }
 
     fn layout_config() -> QwenModelConfig {
         QwenModelConfig {
