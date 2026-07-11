@@ -138,6 +138,9 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
   recurrent-state operations, Obj-C buffer ownership, command diagnostics, and wait policy.
 - `state`: hidden, residual, normed, KV, recurrent, next-layer, position, and session state with
   explicit CPU-visible and GPU-resident transitions.
+- `text`: tokenizer loading and validation, Qwen chat-template rendering, tool-call parsing,
+  candidate sampling, and text-generation progress diagnostics. It owns no model execution or
+  graph-stage selection.
 - `runtime`: engine state, the load transaction, and the model-family-agnostic generation loop that
   asks the scheduler to execute resolved graph stages. It does not inspect storage formats or probe
   optional implementations.
@@ -148,7 +151,7 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 
 ## Reviewed Baseline
 
-Baseline reviewed on 2026-07-10:
+Baseline reviewed on 2026-07-11:
 
 - `experts.rs` substantially owns fixed-slot metadata, cache compatibility, layer readers,
   positioned reads, reusable whole-expert buffers, raw payloads, and the worker pool.
@@ -243,10 +246,14 @@ Baseline reviewed on 2026-07-10:
   and Metal encoder as CMD1, CMD2, and LM-head sampling, so Q4/BF16/F16/F32 differ only by the
   selected resident projection implementation.
 - `runtime.rs` now owns `forward_token_input`, the production token/layer loop, deferred CMD3 handoff,
-  attention execution, CMD2/routing composition, active expert issue/finish, CMD3 submission, and
-  final norm/state recording. Generation, prefill, tokenizer, and sampling entry points remain
-  outside that hot loop. The dead CPU dense shared-expert runtime branch was removed; supported
-  CMD3 preparation requires load-resolved resident shared projections.
+  attention execution, CMD2/routing composition, active expert issue/finish, CMD3 submission,
+  final norm/state recording, and public text/session/multimodal generation orchestration. The
+  dead CPU dense shared-expert runtime branch was removed; supported CMD3 preparation requires
+  load-resolved resident shared projections.
+- `text.rs` now owns tokenizer loading/validation, Qwen chat templates, tool-call rendering and
+  parsing, candidate sampling, and generation progress diagnostics. Runtime and weights consume
+  that owner directly. The duplicate hand-rolled word-level/byte-BPE test adapters were deleted
+  rather than carrying `legacy.rs`'s broad dead-code allowance into the extracted module.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -270,9 +277,9 @@ Baseline reviewed on 2026-07-10:
   are no longer dormant production continuations hidden by `legacy.rs`'s broad dead-code allowance.
 - `state.rs` now owns the CPU-visible `KvCache`, prompt/generated/recurrent records, full-attention
   KV insertion and causal lookup, capacity growth, and shallow session snapshots. The pure causal
-  attention math moved to `math.rs`; `legacy.rs` retains generation/session orchestration but no KV
-  storage implementation or direct access to cache internals. Focused state tests prove shared
-  snapshot storage, independent growth, and explicit rejection of undeclared GPU recurrent state.
+  attention math moved to `math.rs`; `runtime.rs` owns generation/session orchestration without
+  direct access to cache internals. Focused state tests prove shared snapshot storage, independent
+  growth, and explicit rejection of undeclared GPU recurrent state.
 - `FlashMoeGenerationState` and `FlashMoeSessionCache` now own the complete CPU-visible generation
   lifecycle: rendered prompt tokens, KV cache, reusable-prefix position, cached final hidden state,
   prompt snapshot, generated tokens, decode position, EOS/length stop state, and session-map
@@ -399,9 +406,10 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- The engine container and load path are now in `runtime.rs`, but the public generation/session
-  methods, tokenizer implementation, dense runtime-layout builder, and several math helpers remain
-  as sibling implementations in `legacy.rs`.
+- The engine container, load path, and public generation/session orchestration are now in
+  `runtime.rs`, and tokenizer/sampling ownership is in `text.rs`. The dense runtime-layout builder,
+  pull-time cache assembly, expert fixture implementation, and several math helpers still remain
+  in `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs

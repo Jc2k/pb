@@ -11,11 +11,9 @@ use super::experts::{
     AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertSourceTensor,
     expert_scale_bias_dtype_size,
 };
+use super::legacy::dense_f32_matvec_rows;
 #[cfg(test)]
 use super::legacy::rms_norm_with_weight_in_place;
-use super::legacy::{
-    QwenTokenizer, TokenSampler, dense_f32_matvec_rows, rerank_resident_lm_head_candidates,
-};
 #[cfg(test)]
 use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
 use super::math::q4_dequantize_rows_with_group_size;
@@ -27,6 +25,7 @@ use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCo
 use super::state::{
     FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, LinearAttentionLayout,
 };
+use super::text::{QwenTokenizer, TokenSampler, rerank_resident_lm_head_candidates};
 use super::types::{ExpertQuantization, GROUP_SIZE};
 use anyhow::{Context, Result, bail};
 

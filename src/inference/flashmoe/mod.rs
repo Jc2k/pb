@@ -14,6 +14,7 @@ mod planning;
 mod runtime;
 mod scheduler;
 mod state;
+mod text;
 mod types;
 mod vision;
 mod weights;

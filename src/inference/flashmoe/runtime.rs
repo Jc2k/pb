@@ -14,6 +14,7 @@ use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
 use super::planning::{FlashMoePlan, ResolvedRoutingPolicy};
 use super::scheduler::*;
 use super::state::*;
+use super::text::*;
 use super::types::*;
 use super::vision::{
     FlashMoeInputAdapterExecutor, FlashMoeTokenInput, ImagePreprocessor, MropePosition,
@@ -59,7 +60,6 @@ pub(super) type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(Str
 
 struct SampledDecode {
     token: u32,
-    hidden: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -1744,15 +1744,6 @@ impl FlashMoeEngine {
         })
     }
 
-    fn prefill(
-        &mut self,
-        prompt_tokens: &[u32],
-        kv_cache: &mut KvCache,
-        timing: Option<&mut FlashMoeGenerationTiming>,
-    ) -> Result<Vec<f32>> {
-        self.prefill_from(prompt_tokens, 0, kv_cache, timing, None)
-    }
-
     fn prefill_from(
         &mut self,
         prompt_tokens: &[u32],
@@ -2074,10 +2065,6 @@ impl FlashMoeEngine {
         Ok(out)
     }
 
-    fn uses_qwen3next_offset_norm(&self, canonical_name: &str) -> bool {
-        qwen3next_norm_uses_offset(self.config.uses_qwen3next_norm_offsets(), canonical_name)
-    }
-
     fn sample_next_token(
         &mut self,
         sampler: &mut TokenSampler,
@@ -2129,7 +2116,7 @@ impl FlashMoeEngine {
         if let Some(timing) = timing {
             timing.tokens.push(token_timing);
         }
-        Ok(SampledDecode { token, hidden })
+        Ok(SampledDecode { token })
     }
 
     fn sample_from_hidden(
