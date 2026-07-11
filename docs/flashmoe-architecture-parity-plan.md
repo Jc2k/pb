@@ -298,6 +298,14 @@ Baseline reviewed on 2026-07-10:
   residual/hidden state, declared CMD3 output, and next-layer RMSNorm. The stale ignored test that
   mislabeled a tiny Qwen3 model as the production Qwen3.5 URI was deleted rather than preserved as
   an alternate runtime fixture.
+- A second deterministic fixture now carries the resolved graph across a fused linear-attention
+  layer and a declared CPU-KV full-attention layer. It proves deferred hidden/next-normed handoff,
+  recurrent mixing, eight scheduler-owned K=4 positioned reads, terminal hidden state, logits, and
+  top candidates without entering another runtime.
+- Local-Metal reference tests exercise the resident-Q4 projection batch, fused CMD2 preparation,
+  and scheduler-issued CMD3 active-expert plus shared-expert combine against independent CPU math.
+  Route IDs are exact and floating-point route scores use an explicit numerical tolerance rather
+  than bitwise equality across CPU and Metal implementations.
 
 The architecture is not yet at the target:
 
@@ -306,13 +314,12 @@ The architecture is not yet at the target:
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
-- One complete K=4 layer golden is established, but multi-layer deferred/recurrent state and final
-  logit-candidate parity through the resolved graph are not yet established.
+- BF16/F16 dense and expert storage have import/reference support but no typed production graph
+  implementations.
 
-At this checkpoint, Gates 1 through 4 are complete. Dense, CPU-KV, CPU generation/session,
-recurrent-session, and deferred GPU ownership have moved; Qwen3.5 Q4 parity closure, additional
-variants, and final legacy removal remain, so approximately 15-25% of the architectural work
-remains.
+At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
+correctness closure. Typed implementations for additional variants and final legacy removal remain;
+the amount of work is governed by those two exit gates rather than a percentage estimate.
 
 ## Completion Gates
 
@@ -325,8 +332,8 @@ exit criteria hold in production code and tests.
 | 2. Concrete Metal Builders | Complete | Metal command execution is owned by `metal`. |
 | 3. Scheduler-Owned Runtime | Complete | The scheduler executes the layer lifecycle. |
 | 4. Weights And State Ownership | Complete | Runtime storage and state have single owners. |
-| 5. Qwen3.5 Q4 Correctness Closure | Active | The first production graph has parity evidence. |
-| 6. Unified Variant Implementations | Pending | Other variants use the same graph/runtime. |
+| 5. Qwen3.5 Q4 Correctness Closure | Complete | The first production graph has parity evidence. |
+| 6. Unified Variant Implementations | Active | Other variants use the same graph/runtime. |
 | 7. Legacy Removal And Benchmarking | Pending | Migration is complete and benchmarking may begin. |
 
 ### Gate 1: Concrete Graph Resolution
@@ -477,6 +484,20 @@ Exit criteria:
 - Focused parity tests, `cargo test --all-targets`, and the required smoke pass.
 - No performance benchmark has been used to choose architecture during Gates 1-5.
 
+Completion evidence:
+
+- The supported Qwen3.5 Q4 load resolves one resident-Q4/fixed-Q4 graph and the runtime contains no
+  component expert upload, CPU expert substitution, alternate scheduler, or implementation probe
+  that can change that graph.
+- Independent single-layer and multi-layer fixtures cover attention math, router scores, K=4
+  routes/weights, whole-slot expert reads, active/shared expert output, residual/norm transitions,
+  recurrent state, deferred CMD3 handoff, terminal hidden state, logits, and candidates.
+- Local-Metal reference tests cover resident-Q4 CMD1 projection batches, CMD2 preparation, and the
+  scheduler-owned CMD3 active/shared combine. The full all-target suite passed with 635 tests and
+  five device-dependent tests ignored, the release build completed, and the required smoke printed
+  `4` on 2026-07-11.
+- No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
+
 ### Gate 6: Unified Variant Implementations
 
 Objective: add variants as stage implementations, not runtimes.
@@ -600,7 +621,7 @@ Use this prompt for implementation work:
 ```text
 Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
 
-Active gate: Gate 5, Qwen3.5 Q4 Correctness Closure.
+Active gate: Gate 6, Unified Variant Implementations.
 
 Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
 the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
@@ -617,22 +638,22 @@ North star:
 - No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
   the benchmark lock opens.
 
-For Gate 5:
-1. Inventory the existing reference tests and add one deterministic parity fixture that follows a
-   complete Qwen3.5 Q4 layer through CMD1 attention, CMD2 router scores, K=4 routes/weights, whole-
-   slot expert/shared combine, residual/norm state, and CMD3 output. Reuse production builders and
-   scheduler contracts; do not create a second inference path.
-2. Add a multi-layer state-transition fixture covering a linear-attention layer, a full-attention
-   CPU-KV layer, deferred CMD3 hidden/next-normed handoff, recurrent state, and final hidden/logit
-   candidates. Fixtures must be derived from upstream/reference math with provenance recorded in
-   the test, not captured from the implementation under test.
-3. Audit the supported Qwen3.5 Q4 graph for component uploads, CPU expert execution, alternate
-   scheduling, optional implementation probes, synthetic values, and undeclared readback/upload.
-   Delete them or make the missing stage a precise unsupported error.
-4. Debug any fixture or `2+2=` drift through router/logit/state deltas in the resolved graph. Do not
-   restore a legacy path, reduce K=4, or weaken the fixture.
-5. Keep Qwen MoE, Qwen-VL, BF16, F16, and F32 capability failures explicit until Gate 6 adds typed
-   implementations through the same graph. Do not broaden variants during parity closure.
+For Gate 6:
+1. Make expert layout a concrete storage-resolved input to graph resolution. Generalize fixed-Q4
+   slot validation around typed dimensions and offsets so Qwen MoE can use its own layout without
+   inheriting Qwen3.5 constants.
+2. Resolve the text-only Qwen MoE Q4 graph first. Add its full-attention, Q/K norm, routing-scale,
+   shared-expert, and K policy as typed stage metadata while keeping the scheduler/runtime/CMD
+   lifecycle unchanged. Missing tensors or kernels must name the exact unresolved stage.
+3. Add resident BF16/F16 dense projection and whole-expert slot implementations through the same
+   weight handles, scheduler leases, CMD builders, and state handoffs. Do not revive removed dense
+   CPU/component paths as production continuations.
+4. Create `vision.rs` and move Qwen-VL preprocessing, embeddings, DeepStack, and MRoPE ownership
+   there. The adapter must emit typed token/position/embedding inputs before the shared MoE runtime;
+   it must not branch inside the layer loop.
+5. Add a capability matrix and focused parity fixture for each supported family/dtype/layout. Keep
+   every not-yet-implemented combination as a precise load-time unsupported-stage error while the
+   matrix is filled in.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -645,7 +666,7 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 5 is a checkpoint, not the end of the goal. When every Gate 5 exit criterion is proven, update
-the gate status and this prompt to Gate 6 in the same semantic commit, then continue implementing
+Gate 6 is a checkpoint, not the end of the goal. When every Gate 6 exit criterion is proven, update
+the gate status and this prompt to Gate 7 in the same semantic commit, then continue implementing
 the plan. Do not mark the overall goal complete until Gate 7 is complete.
 ```
