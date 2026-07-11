@@ -12,8 +12,8 @@ use super::model_family::QwenMoeFamily;
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvState,
-    FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState,
-    FlashMoeStateBufferRole, FlashMoeStatePlacement,
+    FlashMoeGpuBufferDescriptor, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
+    FlashMoeRoutingOutputState, FlashMoeStateBufferRole, FlashMoeStatePlacement,
 };
 use super::weights::{
     RouterScoreBatch, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
@@ -370,17 +370,63 @@ impl FlashMoeScheduledGraph {
 pub(crate) struct FlashMoeExecutionScheduler {
     graph: FlashMoeScheduledGraph,
     expert_reads: ScheduledExpertReadCoordinator,
+    attention_layers: Box<[ScheduledLayerAttentionImplementation]>,
 }
 
 impl FlashMoeExecutionScheduler {
     pub(crate) fn new(
         graph: FlashMoeScheduledGraph,
         expert_reads: ScheduledExpertReadCoordinator,
-    ) -> Self {
-        Self {
+        attention_layers: Vec<ScheduledLayerAttentionImplementation>,
+    ) -> Result<Self> {
+        if attention_layers.is_empty() {
+            bail!(
+                "FlashMoe execution scheduler requires a resolved attention implementation for every layer"
+            );
+        }
+        Ok(Self {
             graph,
             expert_reads,
+            attention_layers: attention_layers.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn begin_layer(
+        &self,
+        position: usize,
+        layer: usize,
+        layers: usize,
+        active_experts: usize,
+        previous: ScheduledPreviousCmd3Handoff,
+        allow_deferred_output: bool,
+    ) -> Result<ScheduledLayerCmd1> {
+        if layers == 0 || layer >= layers {
+            bail!("FlashMoe scheduled layer {layer} is outside resolved layer count {layers}");
         }
+        if layers != self.attention_layers.len() {
+            bail!(
+                "FlashMoe scheduled layer count {layers} does not match resolved attention implementation count {}",
+                self.attention_layers.len()
+            );
+        }
+        if active_experts == 0 {
+            bail!("FlashMoe scheduled layer {layer} requires at least one active expert");
+        }
+        previous.validate(layer)?;
+        Ok(ScheduledLayerCmd1 {
+            identity: ScheduledLayerIdentity {
+                position,
+                layer,
+                active_experts,
+                attention: self.attention_layers[layer],
+                output_handoff: if allow_deferred_output && layer + 1 < layers {
+                    ScheduledCmd3OutputHandoff::DeferredToNextLayer
+                } else {
+                    ScheduledCmd3OutputHandoff::CompleteHere
+                },
+            },
+            previous,
+        })
     }
 
     pub(crate) fn resolve_cmd1(
@@ -441,10 +487,7 @@ impl FlashMoeExecutionScheduler {
         )
     }
 
-    pub(crate) fn issue_cmd3(
-        &mut self,
-        routing: &ScheduledRoutingCommand,
-    ) -> Result<PendingScheduledCmd3> {
+    fn issue_cmd3(&mut self, routing: &ScheduledRoutingCommand) -> Result<PendingScheduledCmd3> {
         let before = self.expert_reads.snapshot();
         let issue_started = Instant::now();
         let pending = self.expert_reads.issue_routing_command(routing)?;
@@ -455,7 +498,7 @@ impl FlashMoeExecutionScheduler {
         })
     }
 
-    pub(crate) fn finish_cmd3<TInput, TShared, TSubmission>(
+    fn finish_cmd3<TInput, TShared, TSubmission>(
         &mut self,
         pending: PendingScheduledCmd3,
         position: usize,
@@ -510,6 +553,277 @@ impl FlashMoeExecutionScheduler {
     pub(crate) fn expert_store(&self) -> &ExpertSlotStore {
         &self.expert_reads.store
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledPreviousCmd3Handoff {
+    InitialToken {
+        hidden_len: usize,
+    },
+    CpuVisible {
+        previous_layer: usize,
+        hidden_len: usize,
+    },
+    DeferredGpu {
+        previous_layer: usize,
+        hidden: FlashMoeGpuBufferDescriptor,
+        next_normed: FlashMoeGpuBufferDescriptor,
+    },
+}
+
+impl ScheduledPreviousCmd3Handoff {
+    pub(crate) const fn initial(hidden_len: usize) -> Self {
+        Self::InitialToken { hidden_len }
+    }
+
+    pub(crate) const fn cpu_visible(previous_layer: usize, hidden_len: usize) -> Self {
+        Self::CpuVisible {
+            previous_layer,
+            hidden_len,
+        }
+    }
+
+    pub(crate) const fn deferred_gpu(
+        previous_layer: usize,
+        hidden: FlashMoeGpuBufferDescriptor,
+        next_normed: FlashMoeGpuBufferDescriptor,
+    ) -> Self {
+        Self::DeferredGpu {
+            previous_layer,
+            hidden,
+            next_normed,
+        }
+    }
+
+    fn validate(self, layer: usize) -> Result<()> {
+        match self {
+            Self::InitialToken { hidden_len } => {
+                if layer != 0 {
+                    bail!(
+                        "FlashMoe scheduled layer {layer} cannot start from an initial-token handoff"
+                    );
+                }
+                if hidden_len == 0 {
+                    bail!("FlashMoe scheduled initial-token handoff has empty hidden state");
+                }
+            }
+            Self::CpuVisible {
+                previous_layer,
+                hidden_len,
+            } => {
+                if previous_layer.checked_add(1) != Some(layer) {
+                    bail!(
+                        "FlashMoe scheduled CPU handoff from layer {previous_layer} does not feed layer {layer}"
+                    );
+                }
+                if hidden_len == 0 {
+                    bail!("FlashMoe scheduled CPU handoff has empty hidden state");
+                }
+            }
+            Self::DeferredGpu {
+                previous_layer,
+                hidden,
+                next_normed,
+            } => {
+                if previous_layer.checked_add(1) != Some(layer) {
+                    bail!(
+                        "FlashMoe scheduled deferred GPU handoff from layer {previous_layer} does not feed layer {layer}"
+                    );
+                }
+                if !hidden.is_declared_graph_state()
+                    || hidden.role() != FlashMoeStateBufferRole::Hidden
+                    || !next_normed.is_declared_graph_state()
+                    || next_normed.role() != FlashMoeStateBufferRole::NextLayerNormed
+                    || hidden.len() != next_normed.len()
+                {
+                    bail!(
+                        "FlashMoe scheduled deferred GPU handoff requires equal non-empty Hidden and NextLayerNormed buffers"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd1_source(self) -> ScheduledCmd1InputSource {
+        match self {
+            Self::InitialToken { .. } | Self::CpuVisible { .. } => {
+                ScheduledCmd1InputSource::CpuNormedHidden
+            }
+            Self::DeferredGpu { .. } => ScheduledCmd1InputSource::DeferredMetalNextNormed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScheduledLayerIdentity {
+    position: usize,
+    layer: usize,
+    active_experts: usize,
+    attention: ScheduledLayerAttentionImplementation,
+    output_handoff: ScheduledCmd3OutputHandoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledLayerAttentionImplementation {
+    FullAttentionCpuKv,
+    FusedLinearAttentionMetal,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerCmd1 {
+    identity: ScheduledLayerIdentity,
+    previous: ScheduledPreviousCmd3Handoff,
+}
+
+impl ScheduledLayerCmd1 {
+    pub(crate) fn attention_implementation(&self) -> ScheduledLayerAttentionImplementation {
+        self.identity.attention
+    }
+
+    pub(crate) fn resolve(
+        self,
+        scheduler: &FlashMoeExecutionScheduler,
+        input: ScheduledCmd1InputSource,
+        input_state: FlashMoeCmd1InputState,
+    ) -> Result<(
+        ScheduledCmd1ResolvedCommand<ScheduledCmd1InputSource>,
+        ScheduledLayerCmd2,
+    )> {
+        let expected = self.previous.cmd1_source();
+        if input != expected {
+            bail!(
+                "FlashMoe scheduled layer {} previous CMD3 handoff requires CMD1 input {:?}, got {:?}",
+                self.identity.layer,
+                expected,
+                input
+            );
+        }
+        let cmd1 = scheduler.resolve_cmd1(self.identity.layer, input, input_state)?;
+        Ok((
+            cmd1,
+            ScheduledLayerCmd2 {
+                identity: self.identity,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerCmd2 {
+    identity: ScheduledLayerIdentity,
+}
+
+impl ScheduledLayerCmd2 {
+    pub(crate) fn resolve(
+        self,
+        scheduler: &FlashMoeExecutionScheduler,
+        inputs: ScheduledCmd2PhaseInputs,
+    ) -> Result<(
+        ScheduledCmd2Command<ScheduledCmd2PhaseInputs>,
+        ScheduledLayerRouting,
+    )> {
+        let cmd2 =
+            scheduler.resolve_cmd2(self.identity.layer, self.identity.active_experts, inputs)?;
+        Ok((
+            cmd2,
+            ScheduledLayerRouting {
+                identity: self.identity,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerRouting {
+    identity: ScheduledLayerIdentity,
+}
+
+impl ScheduledLayerRouting {
+    pub(crate) fn resolve(self, routing: &ScheduledRoutingCommand) -> Result<ScheduledLayerRouted> {
+        routing.validate_for_active_expert_issue()?;
+        if routing.layer != self.identity.layer
+            || routing.active_experts != self.identity.active_experts
+        {
+            bail!(
+                "FlashMoe scheduled routing layer {} K={} does not match layer transaction {} K={}",
+                routing.layer,
+                routing.active_experts,
+                self.identity.layer,
+                self.identity.active_experts
+            );
+        }
+        Ok(ScheduledLayerRouted {
+            identity: self.identity,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerRouted {
+    identity: ScheduledLayerIdentity,
+}
+
+impl ScheduledLayerRouted {
+    pub(crate) fn issue_cmd3(
+        self,
+        scheduler: &mut FlashMoeExecutionScheduler,
+        routing: &ScheduledRoutingCommand,
+    ) -> Result<ScheduledLayerPendingCmd3> {
+        let pending = scheduler.issue_cmd3(routing)?;
+        Ok(ScheduledLayerPendingCmd3 {
+            identity: self.identity,
+            pending,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerPendingCmd3 {
+    identity: ScheduledLayerIdentity,
+    pending: PendingScheduledCmd3,
+}
+
+impl ScheduledLayerPendingCmd3 {
+    pub(crate) fn finish<TInput, TShared, TSubmission>(
+        self,
+        scheduler: &mut FlashMoeExecutionScheduler,
+        input: TInput,
+        shared: TShared,
+        next_norm_weights: ScheduledNextNormWeights<'_>,
+        submit: impl FnOnce(
+            ScheduledCmd3Command<'_, Arc<ScheduledExpertSlot>, TInput, TShared>,
+        ) -> Result<TSubmission>,
+    ) -> Result<ScheduledLayerExecution<TSubmission>>
+    where
+        TInput: ScheduledCmd3Input,
+        TShared: ScheduledSharedExpert,
+    {
+        let cmd3 = scheduler.finish_cmd3(
+            self.pending,
+            self.identity.position,
+            input,
+            shared,
+            next_norm_weights,
+            submit,
+        )?;
+        Ok(ScheduledLayerExecution {
+            cmd3,
+            output_handoff: self.identity.output_handoff,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduledCmd3OutputHandoff {
+    CompleteHere,
+    DeferredToNextLayer,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerExecution<TSubmission> {
+    pub(crate) cmd3: ScheduledCmd3Execution<TSubmission>,
+    pub(crate) output_handoff: ScheduledCmd3OutputHandoff,
 }
 
 #[derive(Debug)]
@@ -3379,15 +3693,29 @@ mod tests {
         let reads = ScheduledExpertReadCoordinator::new(store);
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        (temp, FlashMoeExecutionScheduler::new(graph, reads))
+        let attention_layers = vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv; 5];
+        (
+            temp,
+            FlashMoeExecutionScheduler::new(graph, reads, attention_layers).unwrap(),
+        )
     }
 
     #[test]
     fn execution_scheduler_resolves_cmd1_cmd2_and_routing_with_one_graph_owner() {
         let (_temp, scheduler) = test_execution_scheduler();
-        let cmd1 = scheduler
-            .resolve_cmd1(
+        let layer = scheduler
+            .begin_layer(
+                17,
                 3,
+                5,
+                2,
+                ScheduledPreviousCmd3Handoff::cpu_visible(2, 8),
+                true,
+            )
+            .unwrap();
+        let (cmd1, layer) = layer
+            .resolve(
+                &scheduler,
                 ScheduledCmd1InputSource::CpuNormedHidden,
                 FlashMoeCmd1InputState::cpu_normed(3, 8),
             )
@@ -3395,10 +3723,9 @@ mod tests {
         assert_eq!(cmd1.layer, 3);
         assert_eq!(cmd1.input_state.layer(), 3);
 
-        let cmd2 = scheduler
-            .resolve_cmd2(
-                3,
-                2,
+        let (cmd2, layer) = layer
+            .resolve(
+                &scheduler,
                 ScheduledCmd2PhaseInputs::from_inputs(
                     ScheduledCmd2AttentionInput::metal_values(8),
                     ScheduledCmd2ResidualInput::metal_buffer(8),
@@ -3409,24 +3736,98 @@ mod tests {
         let routing = scheduler
             .routing_from_post_attention_prep(&cmd2, state, &[(4, 3.0), (1, 2.0)])
             .unwrap();
+        let routed = layer.resolve(&routing).unwrap();
 
         assert_eq!(routing.layer, 3);
         assert_eq!(routing.active_experts, 2);
         assert_eq!(routing.routes, vec![(4, 3.0), (1, 2.0)]);
+        assert_eq!(
+            routed.identity.output_handoff,
+            ScheduledCmd3OutputHandoff::DeferredToNextLayer
+        );
+    }
+
+    #[test]
+    fn execution_scheduler_rejects_mismatched_previous_cmd3_handoffs() {
+        let (_temp, scheduler) = test_execution_scheduler();
+        let err = scheduler
+            .begin_layer(
+                17,
+                3,
+                5,
+                2,
+                ScheduledPreviousCmd3Handoff::cpu_visible(1, 8),
+                true,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does not feed layer 3"), "{err:#}");
+
+        let layer = scheduler
+            .begin_layer(
+                17,
+                3,
+                5,
+                2,
+                ScheduledPreviousCmd3Handoff::deferred_gpu(
+                    2,
+                    FlashMoeGpuBufferDescriptor::hidden(8),
+                    FlashMoeGpuBufferDescriptor::next_layer_normed(8),
+                ),
+                true,
+            )
+            .unwrap();
+        let err = layer
+            .resolve(
+                &scheduler,
+                ScheduledCmd1InputSource::CpuNormedHidden,
+                FlashMoeCmd1InputState::cpu_normed(3, 8),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires CMD1 input DeferredMetalNextNormed"),
+            "{err:#}"
+        );
     }
 
     #[test]
     fn execution_scheduler_finishes_whole_slot_reads_and_submits_cmd3_transaction() {
         let (_temp, mut scheduler) = test_execution_scheduler();
-        let routes = ScheduledExpertRoutes::from_routes(
-            3,
-            vec![ExpertRoute {
-                expert: 8,
-                score: 1.0,
-            }],
-            1.0,
-        )
-        .unwrap();
+        let layer = scheduler
+            .begin_layer(
+                19,
+                3,
+                5,
+                1,
+                ScheduledPreviousCmd3Handoff::cpu_visible(2, 2),
+                true,
+            )
+            .unwrap();
+        let (_, layer) = layer
+            .resolve(
+                &scheduler,
+                ScheduledCmd1InputSource::CpuNormedHidden,
+                FlashMoeCmd1InputState::cpu_normed(3, 2),
+            )
+            .unwrap();
+        let (cmd2, layer) = layer
+            .resolve(
+                &scheduler,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(2),
+                    ScheduledCmd2ResidualInput::metal_buffer(2),
+                ),
+            )
+            .unwrap();
+        let routing = scheduler
+            .routing_from_post_attention_prep(
+                &cmd2,
+                FlashMoePostAttentionPrepState::new(3, 2, 9, 1),
+                &[(8, 1.0)],
+            )
+            .unwrap();
+        let routed = layer.resolve(&routing).unwrap();
+        let routes = ScheduledExpertRoutes::from_routing_command(&routing, 1.0).unwrap();
         let (tx, rx) = mpsc::channel();
         let pending =
             PendingScheduledExpertSet::new(routes, vec![PendingScheduledRead::new(77, rx)]);
@@ -3450,10 +3851,13 @@ mod tests {
             Some(ScheduledSharedExpertShape::new(2, 1, 2).unwrap()),
         );
 
-        let execution = scheduler
-            .finish_cmd3(
-                transaction,
-                19,
+        let pending_layer = ScheduledLayerPendingCmd3 {
+            identity: routed.identity,
+            pending: transaction,
+        };
+        let execution = pending_layer
+            .finish(
+                &mut scheduler,
                 dummy_cmd3_input_with_width(ScheduledCmd3InputSource::CpuNormedResidualUpload, 2),
                 shared,
                 ScheduledNextNormWeights::none(),
@@ -3464,16 +3868,21 @@ mod tests {
                 },
             )
             .unwrap();
+        let cmd3 = execution.cmd3;
 
-        assert_eq!(execution.submission, 3);
-        assert_eq!(execution.expert_delta.positioned_reads, 1);
         assert_eq!(
-            execution.expert_delta.bytes_read,
+            execution.output_handoff,
+            ScheduledCmd3OutputHandoff::DeferredToNextLayer
+        );
+        assert_eq!(cmd3.submission, 3);
+        assert_eq!(cmd3.expert_delta.positioned_reads, 1);
+        assert_eq!(
+            cmd3.expert_delta.bytes_read,
             tiny_fixed_q4_layout().expert_bytes as u64
         );
-        assert_eq!(execution.expert_mixes.len(), 1);
-        assert_eq!(execution.expert_mixes[0].1, 1.0);
-        assert!(execution.expert_io_elapsed >= Duration::from_millis(1));
+        assert_eq!(cmd3.expert_mixes.len(), 1);
+        assert_eq!(cmd3.expert_mixes[0].1, 1.0);
+        assert!(cmd3.expert_io_elapsed >= Duration::from_millis(1));
     }
 
     fn dummy_shared_dense_phase() -> SharedExpertPhaseWeights {

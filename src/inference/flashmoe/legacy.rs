@@ -121,7 +121,8 @@ use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeExecutionScheduler, FlashMoeScheduledGraph,
     ScheduledCmd3Command, ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
     ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator,
-    ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand,
+    ScheduledExpertSlot, ScheduledLayerAttentionImplementation,
+    ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
 #[cfg(test)]
@@ -1270,7 +1271,17 @@ where
         Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
-    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, expert_reads);
+    let attention_layers = (0..config.num_hidden_layers)
+        .map(|layer| {
+            if runtime.is_linear_attention_layer(layer) {
+                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal
+            } else {
+                ScheduledLayerAttentionImplementation::FullAttentionCpuKv
+            }
+        })
+        .collect();
+    let scheduler =
+        FlashMoeExecutionScheduler::new(scheduled_graph, expert_reads, attention_layers)?;
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
@@ -1310,62 +1321,10 @@ pub struct FlashMoeEngine {
     session_cache: BTreeMap<String, FlashMoeSessionState<KvCache>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExpertExecution {
-    Normal,
-    Skip,
-}
-
-impl ExpertExecution {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Skip => "skip",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrefillInputKind {
-    Text,
-    Visual,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrefillExpertStrategy {
-    ComputeAllExperts,
-    SkipIntermediateExpertsForTinySingleLayerTextFixture,
-}
-
-impl PrefillExpertStrategy {
-    fn expert_execution_for_position(
-        self,
-        position: usize,
-        prompt_tokens: usize,
-    ) -> ExpertExecution {
-        match self {
-            Self::ComputeAllExperts => ExpertExecution::Normal,
-            Self::SkipIntermediateExpertsForTinySingleLayerTextFixture => {
-                if position + 1 < prompt_tokens {
-                    ExpertExecution::Skip
-                } else {
-                    ExpertExecution::Normal
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 struct SampledDecode {
     token: u32,
     hidden: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct DeepstackTokenContext<'a> {
-    pub(super) features: &'a [Vec<Vec<f32>>],
-    pub(super) visual_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2531,7 +2490,6 @@ impl FlashMoeEngine {
                 prompt_tokens.len()
             );
         }
-        let prefill_strategy = self.text_prefill_expert_strategy();
         let mut last_hidden = None;
         let progress_started = Instant::now();
         let mut last_progress = Instant::now();
@@ -2544,16 +2502,13 @@ impl FlashMoeEngine {
             kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
             let mut token_timing =
                 FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
-            let expert_execution =
-                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len());
             report_generation_progress(
                 &progress,
                 format!(
-                    "prefill token begin processed={} remaining={} position={} expert_execution={}",
+                    "prefill token begin processed={} remaining={} position={}",
                     position.saturating_sub(start_position) + 1,
                     prompt_tokens.len().saturating_sub(position + 1),
-                    position,
-                    expert_execution.as_str()
+                    position
                 ),
             );
             // Populate the causal KV cache with the prompt tokens so decode can
@@ -2561,13 +2516,10 @@ impl FlashMoeEngine {
             // generated token.
             last_hidden = Some(self.forward_hidden(
                 token,
-                None,
                 kv_cache,
                 position,
                 MropePosition::text(position),
-                None,
                 false,
-                expert_execution,
                 if timing.is_some() {
                     Some(&mut token_timing)
                 } else {
@@ -2625,24 +2577,7 @@ impl FlashMoeEngine {
         );
     }
 
-    fn text_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
-        prefill_expert_strategy(
-            &self.config,
-            self.vision_encoder.is_some(),
-            PrefillInputKind::Text,
-        )
-    }
-
-    fn visual_prefill_expert_strategy(&self) -> PrefillExpertStrategy {
-        prefill_expert_strategy(
-            &self.config,
-            self.vision_encoder.is_some(),
-            PrefillInputKind::Visual,
-        )
-    }
-
-    /// Prefill the KV cache for a vision prompt, substituting visual embeddings
-    /// in place of `image_pad_token` positions.
+    /// Qwen-VL remains outside the text runtime until its typed input adapter resolves.
     fn prefill_with_vision(
         &mut self,
         prompt_tokens: &[u32],
@@ -2652,68 +2587,17 @@ impl FlashMoeEngine {
         mrope_positions: &[MropePosition],
         kv_cache: &mut KvCache,
     ) -> Result<Vec<f32>> {
-        if mrope_positions.len() != prompt_tokens.len() {
-            bail!(
-                "vision M-RoPE positions length {} does not match prompt length {}",
-                mrope_positions.len(),
-                prompt_tokens.len()
-            );
-        }
-        let prefill_strategy = self.visual_prefill_expert_strategy();
-        if prefill_strategy != PrefillExpertStrategy::ComputeAllExperts {
-            bail!("Qwen3-VL visual prefill must compute intermediate experts");
-        }
-        let image_placeholder_tokens = prompt_tokens
-            .iter()
-            .filter(|&&token| token == image_pad_token)
-            .count();
-        if image_placeholder_tokens != visual_embeddings.len() {
-            bail!(
-                "image placeholder token count {image_placeholder_tokens} does not match visual embedding count {}; check placeholder expansion and image_grid_thw",
-                visual_embeddings.len()
-            );
-        }
-        let mut vis_idx = 0usize;
-        let mut last_hidden = None;
-        for (position, &token) in prompt_tokens.iter().enumerate() {
-            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
-            let visual_index = if token == image_pad_token {
-                if vis_idx >= visual_embeddings.len() {
-                    bail!(
-                        "image placeholder at token {position} has no corresponding visual embedding"
-                    );
-                }
-                let idx = vis_idx;
-                vis_idx += 1;
-                Some(idx)
-            } else {
-                None
-            };
-            let override_emb = visual_index.map(|idx| visual_embeddings[idx].clone());
-            let deepstack = visual_index.map(|idx| DeepstackTokenContext {
-                features: deepstack_features,
-                visual_index: idx,
-            });
-            last_hidden = Some(self.forward_hidden(
-                token,
-                override_emb,
-                kv_cache,
-                position,
-                mrope_positions[position],
-                deepstack,
-                false,
-                prefill_strategy.expert_execution_for_position(position, prompt_tokens.len()),
-                None,
-                None,
-            )?);
-        }
-        if vis_idx != visual_embeddings.len() {
-            bail!(
-                "consumed {vis_idx} visual embeddings but {} were provided",
-                visual_embeddings.len()
-            );
-        }
-        last_hidden.context("cannot generate from an empty vision prompt")
+        let _ = (
+            prompt_tokens,
+            visual_embeddings,
+            deepstack_features,
+            image_pad_token,
+            mrope_positions,
+            kv_cache,
+        );
+        bail!(
+            "FlashMoe unsupported Qwen-VL input adapter: vision embeddings, DeepStack features, and M-RoPE inputs are not resolved into the shared runtime graph"
+        )
     }
 
     /// Generate text from ordered text and image content using the Qwen3-VL vision encoder.
@@ -3014,13 +2898,10 @@ impl FlashMoeEngine {
         );
         let hidden = self.forward_hidden(
             previous,
-            None,
             kv_cache,
             position,
             rope_position,
-            None,
             true,
-            ExpertExecution::Normal,
             if timing.is_some() {
                 Some(&mut token_timing)
             } else {
@@ -3117,15 +2998,6 @@ impl FlashMoeEngine {
             active_experts_per_token: Some(self.routing_policy.active_experts),
             moe_intermediate_size: nonzero_usize(self.model_layout.moe_intermediate_size),
             shared_experts: nonzero_usize(self.model_layout.shared_experts),
-        }
-    }
-
-    pub(super) fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
-        let runtime_kind = self.runtime.layer_kind(layer);
-        if runtime_kind == FlashMoeLayerKind::Unknown {
-            self.model_layout.layer_kind(layer).into()
-        } else {
-            runtime_kind
         }
     }
 
@@ -3227,13 +3099,9 @@ impl DenseTransformerRuntime {
             .is_some()
     }
 
+    #[cfg(test)]
     fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
-        if self
-            .linear_attention
-            .get(layer)
-            .and_then(|layout| *layout)
-            .is_some()
-        {
+        if self.is_linear_attention_layer(layer) {
             FlashMoeLayerKind::LinearAttention
         } else if self
             .full_attention
@@ -5578,43 +5446,6 @@ impl KvCache {
         }
         Ok(())
     }
-}
-
-fn prefill_expert_strategy(
-    config: &QwenModelConfig,
-    has_vision_encoder: bool,
-    input_kind: PrefillInputKind,
-) -> PrefillExpertStrategy {
-    if prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
-        config,
-        has_vision_encoder,
-        input_kind,
-    ) {
-        PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
-    } else {
-        PrefillExpertStrategy::ComputeAllExperts
-    }
-}
-
-fn prefill_intermediate_expert_skip_is_allowed_for_tiny_text_fixture(
-    config: &QwenModelConfig,
-    has_vision_encoder: bool,
-    input_kind: PrefillInputKind,
-) -> bool {
-    // Upstream flash-moe can skip intermediate prefill experts for its narrow
-    // Qwen3.5 target because those hidden states are not sampled. pb supports
-    // other Qwen MoE variants and Qwen3-VL: in real multi-layer models, skipped
-    // expert output changes the hidden state that feeds later layers at the same
-    // token, poisoning full-attention KV writes and linear-attention recurrent
-    // state. Visual prefill is even more fragile because image embeddings,
-    // DeepStack features, and M-RoPE positions all participate in those states.
-    // Keep the optimization limited to intentionally tiny single-layer text
-    // fixtures where there is no later layer state to corrupt.
-    input_kind == PrefillInputKind::Text
-        && config.vision_config.is_none()
-        && !has_vision_encoder
-        && config.num_hidden_layers == 1
-        && config.num_experts.unwrap_or(0) > 0
 }
 
 #[derive(Debug, Clone)]
@@ -13841,60 +13672,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prefill_strategy_skips_only_for_tiny_single_layer_text_fixture() {
-        let (single_layer, _) = minimal_dense_manifest(true);
-        let fixture_strategy =
-            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Text);
-        assert_eq!(
-            fixture_strategy,
-            PrefillExpertStrategy::SkipIntermediateExpertsForTinySingleLayerTextFixture
-        );
-        assert_eq!(
-            fixture_strategy.expert_execution_for_position(0, 3),
-            ExpertExecution::Skip
-        );
-        assert_eq!(
-            fixture_strategy.expert_execution_for_position(2, 3),
-            ExpertExecution::Normal
-        );
-
-        let mut multi_layer = single_layer.clone();
-        multi_layer.num_hidden_layers = 2;
-        assert_eq!(
-            prefill_expert_strategy(&multi_layer, false, PrefillInputKind::Text),
-            PrefillExpertStrategy::ComputeAllExperts
-        );
-
-        let real_qwen: QwenModelConfig = serde_json::from_slice(
-            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":4}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            prefill_expert_strategy(&real_qwen, false, PrefillInputKind::Text),
-            PrefillExpertStrategy::ComputeAllExperts
-        );
-
-        let mut vision = single_layer.clone();
-        vision.vision_config = Some(
-            serde_json::from_slice(br#"{"depth":1,"hidden_size":8,"num_heads":2,"mlp_ratio":4.0}"#)
-                .unwrap(),
-        );
-        assert_eq!(
-            prefill_expert_strategy(&vision, false, PrefillInputKind::Text),
-            PrefillExpertStrategy::ComputeAllExperts
-        );
-        assert_eq!(
-            prefill_expert_strategy(&single_layer, true, PrefillInputKind::Text),
-            PrefillExpertStrategy::ComputeAllExperts
-        );
-        assert_eq!(
-            prefill_expert_strategy(&single_layer, false, PrefillInputKind::Visual),
-            PrefillExpertStrategy::ComputeAllExperts
-        );
-    }
-
-    #[test]
     fn session_cache_reuse_requires_entire_cached_token_prefix() {
         assert_eq!(
             reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),

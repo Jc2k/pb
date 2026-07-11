@@ -17,31 +17,16 @@ impl FlashMoeEngine {
     pub(super) fn forward_hidden(
         &mut self,
         previous: u32,
-        embedding_override: Option<Vec<f32>>,
         kv_cache: &mut KvCache,
         position: usize,
         rope_position: MropePosition,
-        deepstack: Option<DeepstackTokenContext<'_>>,
         record_generated: bool,
-        expert_execution: ExpertExecution,
         mut timing: Option<&mut FlashMoeTokenTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
         let token_started = Instant::now();
-        let hidden_values = if let Some(mut emb) = embedding_override {
-            if emb.len() != runtime.width {
-                tracing::warn!(
-                    got = emb.len(),
-                    expected = runtime.width,
-                    "vision embedding dimension mismatch; zero-padding to runtime width"
-                );
-                emb.resize(runtime.width, 0.0);
-            }
-            emb
-        } else {
-            self.dense.embedding(previous, runtime.width)?
-        };
+        let hidden_values = self.dense.embedding(previous, runtime.width)?;
         let mut token_state = FlashMoeTokenState::new(
             hidden_values,
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
@@ -67,7 +52,7 @@ impl FlashMoeEngine {
             }
             let mut pending_for_layer = deferred_expert_phase.take();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let (deferred_attention_input, deferred_residual_input) = if deepstack.is_none() {
+            let (deferred_attention_input, deferred_residual_input) = {
                 let normed_candidate = pending_for_layer
                     .as_ref()
                     .and_then(DeferredExpertPhase::next_normed_metal_input);
@@ -79,8 +64,6 @@ impl FlashMoeEngine {
                 } else {
                     (None, None)
                 }
-            } else {
-                (None, None)
             };
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let deferred_attention_input: Option<DeferredMetalInput> = None;
@@ -110,10 +93,49 @@ impl FlashMoeEngine {
                     FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
                 )?;
             }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let previous_handoff = if let Some(next_normed) = deferred_attention_input {
+                let hidden = deferred_residual_input.with_context(|| {
+                    format!(
+                        "FlashMoe scheduled layer {layer} has deferred next-normed input without deferred hidden state"
+                    )
+                })?;
+                ScheduledPreviousCmd3Handoff::deferred_gpu(
+                    layer.saturating_sub(1),
+                    hidden.state(),
+                    next_normed.state(),
+                )
+            } else if layer == 0 {
+                ScheduledPreviousCmd3Handoff::initial(token_state.hidden().len())
+            } else {
+                ScheduledPreviousCmd3Handoff::cpu_visible(layer - 1, token_state.hidden().len())
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let previous_handoff = if layer == 0 {
+                ScheduledPreviousCmd3Handoff::initial(token_state.hidden().len())
+            } else {
+                ScheduledPreviousCmd3Handoff::cpu_visible(layer - 1, token_state.hidden().len())
+            };
+            let layer_schedule = self.scheduler.begin_layer(
+                position,
+                layer,
+                self.config.num_hidden_layers,
+                self.routing_policy.active_experts,
+                previous_handoff,
+                true,
+            )?;
+            let attention_implementation = layer_schedule.attention_implementation();
             let layer_started = Instant::now();
             let mut layer_timing = FlashMoeLayerTiming {
                 layer,
-                layer_kind: self.layer_kind(layer),
+                layer_kind: match attention_implementation {
+                    ScheduledLayerAttentionImplementation::FullAttentionCpuKv => {
+                        FlashMoeLayerKind::FullAttention
+                    }
+                    ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal => {
+                        FlashMoeLayerKind::LinearAttention
+                    }
+                },
                 active_experts: 0,
                 dimensions: self.layer_dimensions(layer),
                 buckets: FlashMoeTimingBuckets::default(),
@@ -143,9 +165,8 @@ impl FlashMoeEngine {
             } else {
                 FlashMoeCmd1InputState::cpu_normed(layer, normed.len())
             };
-            let scheduled_cmd1 =
-                self.scheduler
-                    .resolve_cmd1(layer, cmd1_input, cmd1_input_state)?;
+            let (scheduled_cmd1, layer_schedule) =
+                layer_schedule.resolve(&self.scheduler, cmd1_input, cmd1_input_state)?;
             debug_assert_eq!(scheduled_cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
@@ -155,59 +176,50 @@ impl FlashMoeEngine {
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
-            let projected = if self.runtime.is_linear_attention_layer(layer) {
-                if deepstack.is_some() {
-                    bail!(
-                        "FlashMoe unsupported linear-attention input adapter at layer {layer}: Qwen-VL deepstack is not resolved by the scheduled graph"
-                    );
-                }
-                if expert_execution == ExpertExecution::Skip {
-                    bail!(
-                        "FlashMoe unsupported linear-attention execution at layer {layer}: skipping expert stages is not a declared graph implementation"
-                    );
-                }
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    let residual_input = deferred_residual_input
-                        .map(|input| MetalBatchProjectionInput::Buffer {
-                            buffer: input.buffer,
-                            len: input.len(),
-                        })
-                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                    let post_norm_weight = self
+            let projected = match attention_implementation {
+                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal => {
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    {
+                        let residual_input = deferred_residual_input
+                            .map(|input| MetalBatchProjectionInput::Buffer {
+                                buffer: input.buffer,
+                                len: input.len(),
+                            })
+                            .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                        let post_norm_weight = self
                         .model_norm_weight(post_norm_name.as_str(), runtime.width)?
                         .with_context(|| {
                             format!(
                                 "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path: missing norm tensor {post_norm_name}"
                             )
                         })?;
-                    let prep = self.linear_attention_post_attention_prep_with_metal(
-                        layer,
-                        &normed,
-                        deferred_attention_input,
-                        residual_input,
-                        &post_norm_weight,
-                        runtime,
-                        Some(&mut layer_timing.buckets),
-                    )?;
-                    if deferred_residual_input.is_some()
-                        && let Some(pending) = pending_for_layer.take()
-                    {
-                        pending.finish_without_readback()?;
+                        let prep = self.linear_attention_post_attention_prep_with_metal(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            residual_input,
+                            &post_norm_weight,
+                            runtime,
+                            Some(&mut layer_timing.buckets),
+                        )?;
+                        if deferred_residual_input.is_some()
+                            && let Some(pending) = pending_for_layer.take()
+                        {
+                            pending.finish_without_readback()?;
+                        }
+                        early_metal_post_attention_prep = Some(prep);
+                        Vec::new()
                     }
-                    early_metal_post_attention_prep = Some(prep);
-                    Vec::new()
+                    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                    {
+                        bail!(
+                            "FlashMoe unsupported scheduled linear-attention implementation at layer {layer}: Apple Silicon Metal is required"
+                        )
+                    }
                 }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    bail!(
-                        "FlashMoe unsupported scheduled linear-attention implementation at layer {layer}: Apple Silicon Metal is required"
-                    )
-                }
-            } else {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    if deepstack.is_none() && expert_execution != ExpertExecution::Skip {
+                ScheduledLayerAttentionImplementation::FullAttentionCpuKv => {
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    {
                         let values = self.full_attention_output_values(
                             layer,
                             &normed,
@@ -221,39 +233,20 @@ impl FlashMoeEngine {
                         post_attention_values_for_prep =
                             Some((attention_tensor_name(layer, "o_proj"), values));
                         Vec::new()
-                    } else {
-                        self.full_attention_projected(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            kv_cache,
-                            position,
-                            rope_position,
-                            runtime,
-                            Some(&mut layer_timing.buckets),
-                        )?
                     }
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    self.full_attention_projected(
-                        layer,
-                        &normed,
-                        deferred_attention_input,
-                        kv_cache,
-                        position,
-                        rope_position,
-                        runtime,
-                        Some(&mut layer_timing.buckets),
-                    )?
+                    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                    {
+                        bail!(
+                            "FlashMoe unsupported scheduled full-attention CMD1/CMD2 implementation at layer {layer}: Apple Silicon Metal is required"
+                        )
+                    }
                 }
             };
             trace_layer_values(position, layer, "attention", &projected);
             layer_timing.buckets.attention_projection += attention_started.elapsed();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let can_defer_residual_wait_for_post_prep = deferred_residual_input.is_some()
-                && expert_execution != ExpertExecution::Skip
-                && post_attention_values_for_prep.is_some();
+            let can_defer_residual_wait_for_post_prep =
+                deferred_residual_input.is_some() && post_attention_values_for_prep.is_some();
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let can_defer_residual_wait_for_post_prep = false;
             if deferred_attention_input.is_some()
@@ -306,9 +299,8 @@ impl FlashMoeEngine {
             } else {
                 ScheduledCmd2ResidualInput::cpu_hidden(cmd2_residual_len)
             };
-            let scheduled_cmd2 = self.scheduler.resolve_cmd2(
-                layer,
-                self.routing_policy.active_experts,
+            let (scheduled_cmd2, layer_schedule) = layer_schedule.resolve(
+                &self.scheduler,
                 ScheduledCmd2PhaseInputs::from_inputs(cmd2_attention_input, cmd2_residual_input),
             )?;
             debug_assert_eq!(scheduled_cmd2.input_state().layer(), layer);
@@ -406,17 +398,8 @@ impl FlashMoeEngine {
                 active
             };
             layer_timing.active_experts = active.routes.len();
-            if expert_execution == ExpertExecution::Skip && deepstack.is_none() {
-                kv_cache
-                    .record_layer_state_record(token_state.layer_state_record(position, layer))?;
-                layer_timing.buckets.total_wall = layer_started.elapsed();
-                if let Some(timing) = timing.as_deref_mut() {
-                    timing.buckets.add(layer_timing.buckets);
-                    timing.layers.push(layer_timing);
-                }
-                continue;
-            }
-            let pending_cmd3 = self.scheduler.issue_cmd3(&active)?;
+            let layer_schedule = layer_schedule.resolve(&active)?;
+            let pending_cmd3 = layer_schedule.issue_cmd3(&mut self.scheduler, &active)?;
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
@@ -433,7 +416,7 @@ impl FlashMoeEngine {
                 layer,
                 self.config.num_hidden_layers,
                 runtime.width,
-                deepstack.is_none(),
+                true,
                 |name, width| self.model_norm_weight(name, width),
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
@@ -451,14 +434,14 @@ impl FlashMoeEngine {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let expert_delta = {
                 let metal = &self.metal;
-                let cmd3_execution = self.scheduler.finish_cmd3(
-                    pending_cmd3,
-                    position,
+                let layer_execution = pending_cmd3.finish(
+                    &mut self.scheduler,
                     ExpertPhaseInput::MetalPostAttention(prep),
                     shared_phase,
                     next_norm_weights,
                     |command| metal.submit_scheduled_expert_command(command),
                 )?;
+                let cmd3_execution = layer_execution.cmd3;
                 let expert_delta = cmd3_execution.expert_delta;
                 layer_timing.buckets.expert_io += cmd3_execution.expert_io_elapsed;
                 layer_timing
@@ -469,14 +452,17 @@ impl FlashMoeEngine {
                 }
                 layer_timing.buckets.expert_compute += cmd3_execution.submit_elapsed;
                 let pending = cmd3_execution.submission;
-                if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
-                    deferred_expert_phase = Some(pending);
-                } else {
-                    let output = pending.wait()?;
-                    token_state.apply_declared_expert_phase(
-                        output,
-                        FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
-                    )?;
+                match layer_execution.output_handoff {
+                    ScheduledCmd3OutputHandoff::DeferredToNextLayer => {
+                        deferred_expert_phase = Some(pending);
+                    }
+                    ScheduledCmd3OutputHandoff::CompleteHere => {
+                        let output = pending.wait()?;
+                        token_state.apply_declared_expert_phase(
+                            output,
+                            FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+                        )?;
+                    }
                 }
                 expert_delta
             };
@@ -527,26 +513,6 @@ impl FlashMoeEngine {
                     timing.layers.push(layer_timing);
                 }
                 continue;
-            }
-            if let Some(context) = deepstack
-                && let Some(features_for_layer) = context.features.get(layer)
-            {
-                let feature = features_for_layer
-                    .get(context.visual_index)
-                    .with_context(|| {
-                        format!(
-                            "deepstack layer {layer} has no feature for visual token {}",
-                            context.visual_index
-                        )
-                    })?;
-                if feature.len() != token_state.hidden().len() {
-                    bail!(
-                        "deepstack feature for layer {layer} has len {}; expected {}",
-                        feature.len(),
-                        token_state.hidden().len()
-                    );
-                }
-                add_in_place(token_state.hidden_mut(), feature);
             }
             kv_cache.record_layer_state_record(token_state.layer_state_record(position, layer))?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
@@ -737,41 +703,6 @@ impl FlashMoeEngine {
     ) -> Result<ScheduledAttentionMathOutput> {
         let scheduled_attention = self.scheduler.resolve_attention_math(layer, position)?;
         scheduled_attention.resolve_kv_state(kv_record.state(FlashMoeStatePlacement::CpuVisible))
-    }
-
-    fn full_attention_projected(
-        &self,
-        layer: usize,
-        normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
-        kv_cache: &mut KvCache,
-        position: usize,
-        rope_position: MropePosition,
-        runtime: &DenseTransformerRuntime,
-        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Vec<f32>> {
-        let attended = self.full_attention_output_values(
-            layer,
-            normed,
-            deferred_input,
-            kv_cache,
-            position,
-            rope_position,
-            runtime,
-            attention_buckets.as_deref_mut(),
-        )?;
-        let subphase_started = Instant::now();
-        let projected = self.dense.project_with_metal(
-            Some(&self.metal),
-            layer,
-            "o_proj",
-            &attended,
-            runtime.width,
-        )?;
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
-            buckets.attention_output_projection += subphase_started.elapsed();
-        }
-        Ok(projected)
     }
 
     fn full_attention_cached(
