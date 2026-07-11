@@ -21,7 +21,10 @@ mod types;
 mod vision;
 mod weights;
 
-pub use cache::{build_cache_from_hf_snapshot, expected_hf_files, expected_vl_hf_files};
+pub use cache::{
+    build_cache_from_hf_snapshot, build_cache_from_hf_snapshot_with_quantization,
+    expected_hf_files, expected_vl_hf_files,
+};
 pub use capabilities::*;
 pub use experts::*;
 pub use math::*;

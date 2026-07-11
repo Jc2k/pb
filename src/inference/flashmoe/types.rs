@@ -17,6 +17,7 @@ pub const QWEN3_VL_MODEL: &str = "hf://Qwen/Qwen3-VL-MoE-Instruct";
 pub const QWEN3_VL_MODEL_MARKER: &str = "qwen3-vl-moe";
 pub const CACHE_VERSION: &str = "flashmoe-v2-mlxq4";
 pub const QWEN35_BF16_CACHE_VERSION: &str = "flashmoe-v2-bf16";
+pub const F16_CACHE_VERSION: &str = "flashmoe-v2-f16";
 pub const NUM_LAYERS: usize = 60;
 pub const NUM_EXPERTS: usize = 512;
 pub const ACTIVE_EXPERTS_PER_TOKEN: usize = 4;
@@ -73,6 +74,14 @@ impl ExpertQuantization {
             Self::FourBitProduction => "4-bit expert weights",
             Self::Bf16 => "BF16 expert weights",
             Self::F16 => "F16 expert weights",
+        }
+    }
+
+    pub const fn cache_version(self) -> &'static str {
+        match self {
+            Self::FourBitProduction => CACHE_VERSION,
+            Self::Bf16 => QWEN35_BF16_CACHE_VERSION,
+            Self::F16 => F16_CACHE_VERSION,
         }
     }
 }

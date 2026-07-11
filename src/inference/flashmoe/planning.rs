@@ -8,7 +8,7 @@ use super::model_family::{QwenModelConfig, is_qwen3_moe, is_qwen3_vl, is_qwen35_
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CACHE_VERSION, CacheStatus, EXPECTED_EXPERT_BYTES,
     ExpertQuantization, HIDDEN_DIM, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS, NUM_LAYERS,
-    QWEN35_BF16_CACHE_VERSION, QWEN35_BF16_MODEL, QWEN35_MODEL,
+    QWEN35_BF16_MODEL, QWEN35_MODEL,
 };
 
 const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
@@ -148,10 +148,14 @@ pub fn canonical_model(model: &str) -> String {
 }
 
 pub fn cache_version_for_model(model: &str) -> &'static str {
+    default_expert_quantization(model).cache_version()
+}
+
+pub fn default_expert_quantization(model: &str) -> ExpertQuantization {
     if canonical_model(model) == QWEN35_BF16_MODEL {
-        QWEN35_BF16_CACHE_VERSION
+        ExpertQuantization::Bf16
     } else {
-        CACHE_VERSION
+        ExpertQuantization::FourBitProduction
     }
 }
 
@@ -161,6 +165,19 @@ pub fn plan(model: &str, models_root: &Path) -> Option<FlashMoePlan> {
 
 pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
     plan_unchecked_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
+}
+
+pub fn plan_unchecked_with_quantization(
+    model: &str,
+    models_root: &Path,
+    quantization: ExpertQuantization,
+) -> FlashMoePlan {
+    plan_unchecked_with_routing_and_quantization(
+        model,
+        models_root,
+        FlashMoeRoutingPolicy::default(),
+        quantization,
+    )
 }
 
 pub fn plan_with_routing(
@@ -177,11 +194,26 @@ pub fn plan_unchecked_with_routing(
     models_root: &Path,
     routing_policy: FlashMoeRoutingPolicy,
 ) -> FlashMoePlan {
-    plan_unchecked_with_cache_version(
+    plan_unchecked_with_routing_and_quantization(
         model,
         models_root,
         routing_policy,
-        cache_version_for_model(model),
+        default_expert_quantization(model),
+    )
+}
+
+pub fn plan_unchecked_with_routing_and_quantization(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+    quantization: ExpertQuantization,
+) -> FlashMoePlan {
+    plan_unchecked_with_cache_version_and_quantization(
+        model,
+        models_root,
+        routing_policy,
+        quantization.cache_version(),
+        quantization,
     )
 }
 
@@ -191,15 +223,26 @@ pub fn plan_unchecked_with_cache_version(
     routing_policy: FlashMoeRoutingPolicy,
     cache_version: &str,
 ) -> FlashMoePlan {
+    plan_unchecked_with_cache_version_and_quantization(
+        model,
+        models_root,
+        routing_policy,
+        cache_version,
+        default_expert_quantization(model),
+    )
+}
+
+fn plan_unchecked_with_cache_version_and_quantization(
+    model: &str,
+    models_root: &Path,
+    routing_policy: FlashMoeRoutingPolicy,
+    cache_version: &str,
+    quantization: ExpertQuantization,
+) -> FlashMoePlan {
     let model = canonical_model(model);
     let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
     let runtime_dir = model_cache_dir.join(cache_version);
     let vl = is_qwen3_vl(&model);
-    let quantization = if model == QWEN35_BF16_MODEL {
-        ExpertQuantization::Bf16
-    } else {
-        ExpertQuantization::FourBitProduction
-    };
     FlashMoePlan {
         vision_weights: vl.then(|| runtime_dir.join("vision_weights.bin")),
         vision_manifest: vl.then(|| runtime_dir.join("vision_weights.json")),

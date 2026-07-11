@@ -1,7 +1,7 @@
 #![allow(clippy::items_after_test_module, clippy::too_many_arguments)]
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode;
@@ -342,6 +342,23 @@ pub enum FlashMoeCommand {
     CacheClean(FlashMoeCacheCleanArgs),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FlashMoeExpertStorageArg {
+    Q4,
+    Bf16,
+    F16,
+}
+
+impl FlashMoeExpertStorageArg {
+    fn quantization(self) -> inference::flashmoe::ExpertQuantization {
+        match self {
+            Self::Q4 => inference::flashmoe::ExpertQuantization::FourBitProduction,
+            Self::Bf16 => inference::flashmoe::ExpertQuantization::Bf16,
+            Self::F16 => inference::flashmoe::ExpertQuantization::F16,
+        }
+    }
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct FlashMoeInferArgs {
     /// Prompt to send to Qwen3.5-397B-A17B
@@ -350,6 +367,10 @@ pub struct FlashMoeInferArgs {
     /// FlashMoe model identifier to load
     #[arg(long, default_value = inference::flashmoe::QWEN35_MODEL)]
     pub model: String,
+
+    /// Expert cache storage; defaults to Q4 except for the official Qwen3.5 BF16 checkpoint
+    #[arg(long, value_enum)]
+    pub expert_storage: Option<FlashMoeExpertStorageArg>,
 
     /// Directory containing pulled model blobs; defaults to the configured model dir
     #[arg(long)]
@@ -397,6 +418,10 @@ pub struct FlashMoeBenchArgs {
     /// FlashMoe model identifier to load
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Expert cache storage; must match the cache prepared by `pb pull`
+    #[arg(long, value_enum)]
+    pub expert_storage: Option<FlashMoeExpertStorageArg>,
 
     /// Directory containing pulled model blobs; defaults to the configured model dir
     #[arg(long)]
@@ -464,6 +489,10 @@ pub struct FlashMoeCacheCleanArgs {
     /// FlashMoe model identifier whose cache should be cleaned
     #[arg(long, default_value = inference::flashmoe::QWEN35_BF16_MODEL)]
     pub model: String,
+
+    /// Expert cache storage namespace to inspect
+    #[arg(long, value_enum)]
+    pub expert_storage: Option<FlashMoeExpertStorageArg>,
 
     /// Directory containing pulled model blobs; defaults to the configured model dir
     #[arg(long)]
@@ -566,6 +595,10 @@ pub struct PullArgs {
     /// For FlashMoe Hugging Face pulls, delete source safetensor shards after the runtime cache is built
     #[arg(long)]
     pub flashmoe_prune_source_shards: bool,
+
+    /// FlashMoe expert cache storage; source tensor dtype must match BF16/F16 selections
+    #[arg(long = "flashmoe-expert-storage", value_enum)]
+    pub flashmoe_expert_storage: Option<FlashMoeExpertStorageArg>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1471,7 +1504,14 @@ fn run_flashmoe_cache_clean(args: FlashMoeCacheCleanArgs) -> Result<()> {
         .clone()
         .or_else(|| user_config.effective_model_dir())
         .unwrap_or_else(default_models_dir);
-    let plan = inference::flashmoe::plan_unchecked(&args.model, &models_root);
+    let plan = match args.expert_storage {
+        Some(storage) => inference::flashmoe::plan_unchecked_with_quantization(
+            &args.model,
+            &models_root,
+            storage.quantization(),
+        ),
+        None => inference::flashmoe::plan_unchecked(&args.model, &models_root),
+    };
     let report = inference::flashmoe::clean_cache(&plan, args.source_shards, args.yes)?;
     let action = if report.deleted {
         "deleted"
@@ -1553,8 +1593,19 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         args.model,
         models_root.display()
     );
-    let plan =
-        inference::flashmoe::plan_unchecked_with_routing(&args.model, &models_root, routing_policy);
+    let plan = match args.expert_storage {
+        Some(storage) => inference::flashmoe::plan_unchecked_with_routing_and_quantization(
+            &args.model,
+            &models_root,
+            routing_policy,
+            storage.quantization(),
+        ),
+        None => inference::flashmoe::plan_unchecked_with_routing(
+            &args.model,
+            &models_root,
+            routing_policy,
+        ),
+    };
     let load_started = Instant::now();
     eprintln!("flashmoe infer: loading backend");
     let mut engine = if args.verbose {
@@ -1647,8 +1698,17 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
         args.active_experts,
         args.force_active_experts,
     );
-    let plan =
-        inference::flashmoe::plan_unchecked_with_routing(&model, &models_root, routing_policy);
+    let plan = match args.expert_storage {
+        Some(storage) => inference::flashmoe::plan_unchecked_with_routing_and_quantization(
+            &model,
+            &models_root,
+            routing_policy,
+            storage.quantization(),
+        ),
+        None => {
+            inference::flashmoe::plan_unchecked_with_routing(&model, &models_root, routing_policy)
+        }
+    };
     let load_started = Instant::now();
     eprintln!("flashmoe bench: loading backend");
     let mut engine = if args.verbose {
@@ -2329,6 +2389,7 @@ pub async fn pull_model(args: &PullArgs) -> Result<()> {
             args.parallel,
             args.retries,
             args.flashmoe_prune_source_shards,
+            args.flashmoe_expert_storage,
         )
         .await
     } else {
@@ -2521,6 +2582,7 @@ async fn pull_flashmoe_from_hf(
     parallel: usize,
     retries: u32,
     prune_source_shards: bool,
+    expert_storage: Option<FlashMoeExpertStorageArg>,
 ) -> Result<()> {
     let siblings = list_hf_files(client, owner, repo).await?;
     let wanted: Vec<&HfSibling> = siblings
@@ -2580,7 +2642,16 @@ async fn pull_flashmoe_from_hf(
     }
     progress.finish_with_message("download complete");
 
-    let plan = crate::inference::flashmoe::build_cache_from_hf_snapshot(hf_uri, &cache_dir)?;
+    let plan = match expert_storage {
+        Some(storage) => {
+            crate::inference::flashmoe::build_cache_from_hf_snapshot_with_quantization(
+                hf_uri,
+                &cache_dir,
+                storage.quantization(),
+            )?
+        }
+        None => crate::inference::flashmoe::build_cache_from_hf_snapshot(hf_uri, &cache_dir)?,
+    };
     if prune_source_shards {
         let report = crate::inference::flashmoe::clean_source_shards(&plan, true)?;
         println!(
@@ -2604,6 +2675,7 @@ async fn pull_from_hf(
     parallel: usize,
     retries: u32,
     flashmoe_prune_source_shards: bool,
+    flashmoe_expert_storage: Option<FlashMoeExpertStorageArg>,
 ) -> Result<()> {
     if crate::inference::flashmoe::is_flashmoe_hf_model(hf_uri) {
         let flashmoe_hf_uri = crate::inference::flashmoe::canonical_model(hf_uri);
@@ -2618,6 +2690,7 @@ async fn pull_from_hf(
             parallel,
             retries,
             flashmoe_prune_source_shards,
+            flashmoe_expert_storage,
         )
         .await;
     }

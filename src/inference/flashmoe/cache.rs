@@ -10,6 +10,7 @@ use super::metal::METAL_SHADERS;
 use super::model_family::QwenModelConfig;
 use super::planning::*;
 use super::safetensors::*;
+use super::types::ExpertQuantization;
 use super::weights::*;
 
 #[cfg(test)]
@@ -43,7 +44,23 @@ pub fn expected_vl_hf_files() -> Vec<OsString> {
 }
 
 pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<FlashMoePlan> {
-    let plan = plan_unchecked(model, snapshot_dir.parent().unwrap_or(snapshot_dir));
+    build_cache_from_hf_snapshot_with_quantization(
+        model,
+        snapshot_dir,
+        default_expert_quantization(model),
+    )
+}
+
+pub fn build_cache_from_hf_snapshot_with_quantization(
+    model: &str,
+    snapshot_dir: &Path,
+    quantization: ExpertQuantization,
+) -> Result<FlashMoePlan> {
+    let plan = plan_unchecked_with_quantization(
+        model,
+        snapshot_dir.parent().unwrap_or(snapshot_dir),
+        quantization,
+    );
     fs::create_dir_all(&plan.runtime_dir)
         .with_context(|| format!("failed to create {}", plan.runtime_dir.display()))?;
     fs::create_dir_all(&plan.experts_dir)
@@ -79,7 +96,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
     prepare_tokenizer_artifacts(snapshot_dir, &plan)?;
 
     let index_json = snapshot_dir.join("model.safetensors.index.json");
-    let (manifest, visual_tensor_refs) = if index_json.is_file() {
+    let (mut manifest, visual_tensor_refs) = if index_json.is_file() {
         build_manifest(model, snapshot_dir, &index_json)?
     } else {
         (
@@ -93,6 +110,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
             Vec::new(),
         )
     };
+    manifest.cache_version = plan.quantization.cache_version().to_string();
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).context("failed to encode Flash-MoE manifest")?;
     fs::write(&plan.tensor_manifest, manifest_bytes).with_context(|| {
@@ -122,7 +140,7 @@ pub fn build_cache_from_hf_snapshot(model: &str, snapshot_dir: &Path) -> Result<
             write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
             let vision_manifest_data = FlashMoeManifest {
                 model: canonical_model(model),
-                cache_version: cache_version_for_model(model).to_string(),
+                cache_version: plan.quantization.cache_version().to_string(),
                 dense_shards: Vec::new(),
                 expert_tensors: Vec::new(),
                 dense_tensors: visual_tensor_refs,
