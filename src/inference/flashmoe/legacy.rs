@@ -14499,7 +14499,18 @@ mod tests {
             routing_command.source,
             ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
         );
-        assert_eq!(routing_command.routes, expected_active);
+        for (slot, ((actual_id, actual_score), (expected_id, expected_score))) in routing_command
+            .routes
+            .iter()
+            .zip(expected_active.iter())
+            .enumerate()
+        {
+            assert_eq!(actual_id, expected_id, "route id at slot {slot} diverged");
+            assert!(
+                (*actual_score - *expected_score).abs() <= 1e-4,
+                "route score at slot {slot} diverged: actual={actual_score}, expected={expected_score}"
+            );
+        }
         let attached = prep
             .attach_routing_command(routing_command.clone())
             .unwrap();

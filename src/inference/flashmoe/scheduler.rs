@@ -3458,9 +3458,15 @@ mod tests {
         FixedQ4ExpertSlotSpec, expert_layer_path, write_expert_metadata_atomically,
     };
     use crate::inference::flashmoe::math::causal_attention;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::inference::flashmoe::metal::{
+        MetalExecutionContext, MetalPostAttentionPrep, MetalScheduledCmd3Builder,
+    };
     use crate::inference::flashmoe::model_family::{
         QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::inference::flashmoe::runtime::ExpertPhaseInput;
     use crate::inference::flashmoe::state::{
         FlashMoeExpertPhaseApplication, FlashMoeGpuBufferDescriptor, FlashMoeTokenState,
     };
@@ -3779,17 +3785,114 @@ mod tests {
     }
 
     fn test_execution_scheduler() -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
+        test_execution_scheduler_with_attention(vec![
+            ScheduledLayerAttentionImplementation::FullAttentionCpuKv;
+            5
+        ])
+    }
+
+    fn test_execution_scheduler_with_attention(
+        attention_layers: Vec<ScheduledLayerAttentionImplementation>,
+    ) -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
         let temp = tempfile::tempdir().unwrap();
         let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
         let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
         let reads = ScheduledExpertReadCoordinator::new(store);
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        let attention_layers = vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv; 5];
         (
             temp,
             FlashMoeExecutionScheduler::new(graph, reads, attention_layers).unwrap(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_identity_k4_layer(
+        scheduler: &mut FlashMoeExecutionScheduler,
+        position: usize,
+        layer: usize,
+        layers: usize,
+        previous: ScheduledPreviousCmd3Handoff,
+        cmd1_input: ScheduledCmd1InputSource,
+        cmd1_state: FlashMoeCmd1InputState,
+        residual: &[f32],
+        normed: &[f32],
+        shared_output: &[f32],
+        next_norm_weights: Option<&[f32]>,
+    ) -> ScheduledLayerExecution<FlashMoeExpertPhaseOutput> {
+        let active_experts = 4;
+        let experts = 9;
+        let width = residual.len();
+        let scheduled = scheduler
+            .begin_layer(position, layer, layers, active_experts, previous, true)
+            .unwrap();
+        let (_, scheduled) = scheduled
+            .resolve(scheduler, cmd1_input, cmd1_state)
+            .unwrap();
+        let (cmd2, scheduled) = scheduled
+            .resolve(
+                scheduler,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(width),
+                    ScheduledCmd2ResidualInput::metal_buffer(width),
+                ),
+            )
+            .unwrap();
+        let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
+        let active = top_k(&router_scores, active_experts);
+        let prep_state = FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
+        let routing = scheduler
+            .routing_from_post_attention_prep(&cmd2, prep_state, &active)
+            .unwrap();
+        let pending = scheduled
+            .resolve(&routing)
+            .unwrap()
+            .issue_cmd3(scheduler, &routing)
+            .unwrap();
+        let input = DummyCmd3InputState {
+            source: ScheduledCmd3InputSource::MetalPostAttentionPrep,
+            state: FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep_state),
+        };
+        let shared = dummy_shared_expert_with_shape(
+            ScheduledSharedExpertSource::ResidentQ4Projections,
+            Some(ScheduledSharedExpertShape::new(width, 1, width).unwrap()),
+        );
+        let next_norm = match next_norm_weights {
+            Some(weights) => ScheduledNextNormWeights::cpu_visible(
+                "model.layers.next.input_layernorm.weight",
+                weights,
+                width,
+            )
+            .unwrap(),
+            None => ScheduledNextNormWeights::none(),
+        };
+        pending
+            .finish(scheduler, input, shared, next_norm, |command| {
+                let mut expert_output = vec![0.0f32; width];
+                for (payload, weight) in command.payloads.iter().zip(command.weights.iter()) {
+                    let output = reference_q4_swiglu(payload.q4(), normed);
+                    for (combined, value) in expert_output.iter_mut().zip(output.iter()) {
+                        *combined += value * weight;
+                    }
+                }
+                let hidden: Vec<f32> = residual
+                    .iter()
+                    .zip(expert_output.iter())
+                    .zip(shared_output.iter())
+                    .map(|((residual, expert), shared)| residual + expert + shared)
+                    .collect();
+                let next_normed = command
+                    .next_norm_weights
+                    .values()
+                    .map(|weights| reference_rms_norm(&hidden, weights));
+                command
+                    .resolve_output_state()?
+                    .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(
+                        hidden,
+                        next_normed,
+                    ))
+            })
+            .unwrap()
     }
 
     #[test]
@@ -4154,6 +4257,328 @@ mod tests {
         let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
         for (actual, expected) in next_normed.iter().zip([1.404337, 0.08342207]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn qwen35_q4_multi_layer_parity_preserves_deferred_state_and_logits() {
+        let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
+            ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+        ]);
+        write_identity_fixed_q4_layer(temp.path(), 0, 9);
+        write_identity_fixed_q4_layer(temp.path(), 1, 9);
+        assert_eq!(
+            scheduler.attention_layers.as_ref(),
+            [
+                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
+                ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+            ]
+        );
+
+        let shared_output = [0.25, -0.5];
+        let residual_0 = [0.5, -1.0];
+        let normed_0 = reference_rms_norm(&residual_0, &[1.0, 1.0]);
+        let next_norm_weights = [1.0, 0.5];
+        let layer_0 = run_identity_k4_layer(
+            &mut scheduler,
+            11,
+            0,
+            2,
+            ScheduledPreviousCmd3Handoff::initial(2),
+            ScheduledCmd1InputSource::CpuNormedHidden,
+            FlashMoeCmd1InputState::cpu_normed(0, 2),
+            &residual_0,
+            &normed_0,
+            &shared_output,
+            Some(&next_norm_weights),
+        );
+        assert_eq!(
+            layer_0.output_handoff,
+            ScheduledCmd3OutputHandoff::DeferredToNextLayer
+        );
+        let mut token_state = FlashMoeTokenState::new(vec![0.0; 2], 0);
+        for (mix_hash, weight) in &layer_0.cmd3.expert_mixes {
+            token_state.mix_active_expert(*mix_hash, *weight);
+        }
+        token_state
+            .apply_declared_expert_phase(
+                layer_0.cmd3.submission,
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )
+            .unwrap();
+        let hidden_0 = token_state.hidden().to_vec();
+        for (actual, expected) in hidden_0.iter().zip([1.011218, -1.1477928]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        let next_normed_0 = token_state
+            .take_next_layer_normed_as_normed()
+            .unwrap()
+            .into_values();
+        for (actual, expected) in next_normed_0.iter().zip([0.9348729, -0.5305683]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        let recurrent_after_linear = token_state.recurrent_value();
+        assert_ne!(recurrent_after_linear, 0);
+
+        let key_0 = [1.0, 0.0];
+        let value_0 = [1.0, 0.5];
+        let key_1 = [0.0, 1.0];
+        let value_1 = [-0.5, 1.5];
+        let attention_1 = causal_attention(
+            &next_normed_0,
+            &[(&key_0, &value_0), (&key_1, &value_1)],
+            1,
+            1,
+            2,
+        );
+        for (actual, expected) in attention_1.iter().zip([0.6071810, 0.7618793]) {
+            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
+        let residual_1 = [hidden_0[0] + attention_1[0], hidden_0[1] + attention_1[1]];
+        let normed_1 = reference_rms_norm(&residual_1, &[1.0, 1.0]);
+        let layer_1 = run_identity_k4_layer(
+            &mut scheduler,
+            11,
+            1,
+            2,
+            ScheduledPreviousCmd3Handoff::deferred_gpu(
+                0,
+                FlashMoeGpuBufferDescriptor::hidden(2),
+                FlashMoeGpuBufferDescriptor::next_layer_normed(2),
+            ),
+            ScheduledCmd1InputSource::DeferredMetalNextNormed,
+            FlashMoeCmd1InputState::gpu_next_layer_normed(
+                1,
+                FlashMoeGpuBufferDescriptor::next_layer_normed(2),
+            ),
+            &residual_1,
+            &normed_1,
+            &shared_output,
+            None,
+        );
+        assert_eq!(
+            layer_1.output_handoff,
+            ScheduledCmd3OutputHandoff::CompleteHere
+        );
+        for (mix_hash, weight) in &layer_1.cmd3.expert_mixes {
+            token_state.mix_active_expert(*mix_hash, *weight);
+        }
+        token_state
+            .apply_declared_expert_phase(
+                layer_1.cmd3.submission,
+                FlashMoeExpertPhaseApplication::HiddenOnly,
+            )
+            .unwrap();
+        assert_ne!(token_state.recurrent_value(), recurrent_after_linear);
+        let hidden_1 = token_state.hidden().to_vec();
+        for (actual, expected) in hidden_1.iter().zip([3.379081, -0.8408583]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        assert!(token_state.take_next_layer_normed_as_normed().is_none());
+
+        let logits = [
+            hidden_1[0],
+            hidden_1[1],
+            -hidden_1[0] + 0.5 * hidden_1[1],
+            0.25 * hidden_1[0] - 0.75 * hidden_1[1],
+        ];
+        for (actual, expected) in logits
+            .iter()
+            .zip([3.379081, -0.8408583, -3.7995102, 1.475414])
+        {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        let candidates = top_k(&logits, 2);
+        assert_eq!(candidates[0].0, 0);
+        assert_eq!(candidates[1].0, 3);
+        assert!((candidates[0].1 - 3.379081).abs() <= 1e-5);
+        assert!((candidates[1].1 - 1.475414).abs() <= 1e-5);
+        let metrics = scheduler.snapshot();
+        assert_eq!(metrics.positioned_reads, 8);
+        assert_eq!(metrics.bytes_read, 8 * 48);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn qwen35_q4_cmd3_metal_output_matches_layer_reference() {
+        let position = 7;
+        let layer = 0;
+        let width = 2;
+        let experts = 9;
+        let active_experts = 4;
+        let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
+            ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+        ]);
+        write_identity_fixed_q4_layer(temp.path(), layer, experts);
+
+        let residual = [1.5092846, 0.6604769];
+        let normed = [1.2955897, 0.5669620];
+        let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
+        let active = top_k(&router_scores, active_experts);
+        let scheduled = scheduler
+            .begin_layer(
+                position,
+                layer,
+                1,
+                active_experts,
+                ScheduledPreviousCmd3Handoff::initial(width),
+                true,
+            )
+            .unwrap();
+        let (_, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd1InputSource::CpuNormedHidden,
+                FlashMoeCmd1InputState::cpu_normed(layer, width),
+            )
+            .unwrap();
+        let (cmd2, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(width),
+                    ScheduledCmd2ResidualInput::metal_buffer(width),
+                ),
+            )
+            .unwrap();
+        let prep_state = FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
+        let routing = scheduler
+            .routing_from_post_attention_prep(&cmd2, prep_state, &active)
+            .unwrap();
+        let pending = scheduled
+            .resolve(&routing)
+            .unwrap()
+            .issue_cmd3(&mut scheduler, &routing)
+            .unwrap();
+
+        let dense_path = temp.path().join("cmd3-parity-dense.bin");
+        let mut dense_bytes = vec![0u8; 16 * 1024];
+        let one_bf16 = 0x3f80u16.to_le_bytes();
+        let mut write_identity_q4 = |packed: usize, scales: usize, rows: usize| {
+            dense_bytes[packed] = 0x01;
+            if rows > 1 {
+                dense_bytes[packed + 1] = 0x10;
+            }
+            for row in 0..rows {
+                dense_bytes[scales + row * 2..scales + row * 2 + 2].copy_from_slice(&one_bf16);
+            }
+        };
+        write_identity_q4(0, 16, 2);
+        write_identity_q4(64, 80, 2);
+        write_identity_q4(128, 144, 2);
+        dense_bytes[208..210].copy_from_slice(&one_bf16);
+        std::fs::write(&dense_path, dense_bytes).unwrap();
+        let dense_file = std::fs::File::open(&dense_path).unwrap();
+        let dense_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&dense_file).unwrap() });
+        let metal = MetalExecutionContext::compile(
+            Arc::clone(&dense_mmap),
+            dense_mmap.len() as u64,
+            &[None],
+        )
+        .unwrap();
+        let f32_bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let normed_buffer = unsafe {
+            metal
+                .buffers()
+                .buffer_with_bytes(metal.runtime().device, &f32_bytes(&normed))
+                .unwrap()
+        };
+        let residual_buffer = unsafe {
+            metal
+                .buffers()
+                .buffer_with_bytes(metal.runtime().device, &f32_bytes(&residual))
+                .unwrap()
+        };
+        let mut prep = MetalPostAttentionPrep::new(
+            layer,
+            width,
+            experts,
+            active.clone(),
+            residual_buffer,
+            normed_buffer,
+        )
+        .unwrap();
+        prep.attach_routing_command(routing.clone()).unwrap();
+        let q4_projection = |tensor_name: &str,
+                             packed_byte_offset,
+                             scales_byte_offset,
+                             biases_byte_offset,
+                             rows| {
+            DenseQ4MmapMatvecProjection {
+                tensor_name: tensor_name.to_string(),
+                packed_byte_offset,
+                scales_byte_offset,
+                biases_byte_offset,
+                rows,
+                cols: width,
+                output_width: rows,
+                row_packed_bytes: 1,
+                groups_per_row: 1,
+                group_size: 2,
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        };
+        let shared = SharedExpertPhaseQ4Projections {
+            gate: q4_projection("shared.gate", 0, 16, 32, 2),
+            up: q4_projection("shared.up", 64, 80, 96, 2),
+            down: q4_projection("shared.down", 128, 144, 160, 2),
+            router: q4_projection("shared.router", 192, 208, 224, 1),
+            shared_experts: 1,
+            intermediate: 2,
+            width,
+        };
+        let dense_weights = metal.dense_weights().unwrap();
+        let execution = pending
+            .finish(
+                &mut scheduler,
+                ExpertPhaseInput::MetalPostAttention(prep),
+                ScheduledSharedExpertPhaseRef::Q4(&shared),
+                ScheduledNextNormWeights::none(),
+                |command| {
+                    let output = command.resolve_output_state()?;
+                    let ScheduledCmd3Command {
+                        position,
+                        layer,
+                        experts,
+                        weights,
+                        input,
+                        shared,
+                        next_norm_weights,
+                        payloads,
+                        ..
+                    } = command;
+                    let ExpertPhaseInput::MetalPostAttention(input) = input;
+                    MetalScheduledCmd3Builder::new(
+                        metal.runtime(),
+                        dense_weights,
+                        Arc::clone(metal.buffers()),
+                    )
+                    .submit(
+                        position,
+                        layer,
+                        experts,
+                        weights,
+                        input,
+                        output,
+                        shared,
+                        next_norm_weights.values(),
+                        &payloads,
+                    )
+                },
+            )
+            .unwrap();
+        let output = execution.cmd3.submission.wait().unwrap();
+        let (hidden, next_normed) = output.into_hidden_and_next_normed();
+        assert!(next_normed.is_none());
+        for (actual, expected) in hidden.iter().zip([3.4860115, 0.9681305]) {
+            assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
         }
     }
 
