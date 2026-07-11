@@ -1204,28 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn pbq4_metadata_parser_matches_generic_parser() {
-        let (pack, metadata) = tiny_q4_expert_pack();
-        let generic = parse_pbq4_expert_pack_generic(&pack, Some(&metadata)).unwrap();
-        let metadata_fast = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
-
-        assert_eq!(metadata_fast, generic);
-    }
-
-    #[test]
-    fn pbq4_metadata_parser_rejects_record_offset_drift() {
-        let (pack, mut metadata) = tiny_q4_expert_pack();
-        metadata.records[1].record_offset += 1;
-
-        let err = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap_err();
-
-        assert!(
-            err.to_string().contains("metadata offset mismatch"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
     fn build_expert_pack_writes_bf16_scale_bias_metadata_and_stays_projectable() {
         let input_values: Vec<f32> = (0..64).map(|idx| (idx as f32 - 32.0) * 0.125).collect();
         let (pack, metadata) = build_expert_pack(
@@ -1903,22 +1881,6 @@ mod tests {
             legacy_qwen3.uses_qwen3next_norm_offsets(),
             "model.norm.weight"
         ));
-    }
-
-    #[test]
-    fn qwen3next_norm_offset_is_applied_only_to_offset_style_weights() {
-        assert!(qwen3next_norm_weight_needs_offset(&[
-            -0.0498, -0.0654, -0.0209, 0.0547
-        ]));
-        assert!(qwen3next_norm_weight_needs_offset(&[
-            0.6679, 0.7187, 0.7265, 0.7031
-        ]));
-        assert!(!qwen3next_norm_weight_needs_offset(&[
-            0.9492, 0.9335, 0.9804, 0.9609
-        ]));
-        assert!(!qwen3next_norm_weight_needs_offset(&[
-            1.6718, 1.7187, 1.7265, 1.7031
-        ]));
     }
 
     #[test]

@@ -303,6 +303,8 @@ Baseline reviewed on 2026-07-11:
 - Gate 7 removed the duplicate Accelerate-backed gated-delta execution path, CBLAS bridge, and
   scratch dispatch from the test-only legacy boundary. Recurrence parity retains one direct scalar
   oracle; production recurrence remains solely the resolved Metal stage.
+- Exact duplicate PBQ4 metadata parser/error tests and Qwen3Next norm-offset detection coverage
+  were deleted from `legacy.rs`; their registered `experts.rs` and `weights.rs` owner tests remain.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
