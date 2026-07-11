@@ -2300,11 +2300,7 @@ impl DenseStore {
         if specs.is_empty() {
             bail!("FlashMoe scheduled Q4 projection batch has no projections");
         }
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported scheduled Q4 projection batch: resident dense Metal weights are unavailable"
-            );
-        }
+        metal.require_resident_dense_weights()?;
         let mut projections = Vec::with_capacity(specs.len());
         for spec in specs {
             let projection = self
@@ -2317,9 +2313,7 @@ impl DenseStore {
                 })?;
             projections.push(projection);
         }
-        let (outputs, _, _) = metal.q4_mmap_matvec_batch(&projections, input)?.context(
-            "FlashMoe unsupported scheduled Q4 projection batch: Metal builder did not resolve",
-        )?;
+        let (outputs, _, _) = metal.q4_mmap_matvec_batch(&projections, input)?;
         Ok(outputs)
     }
 
@@ -2410,11 +2404,7 @@ impl DenseStore {
         active_experts: usize,
     ) -> Result<MetalPostAttentionPrep> {
         let residual_len = residual.len();
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path: resident dense Metal weights are unavailable"
-            );
-        }
+        metal.require_resident_dense_weights()?;
         if input_specs.len() != 4 || residual_len != post_norm_weight.len() {
             bail!(
                 "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: expected 4 input projections and equal residual/norm widths, got {} projections and widths {residual_len}/{}",
@@ -2475,11 +2465,7 @@ impl DenseStore {
         if specs.is_empty() {
             bail!("FlashMoe scheduled Q4 projection batch has no projections");
         }
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported scheduled Q4 projection batch: resident dense Metal weights are unavailable"
-            );
-        }
+        metal.require_resident_dense_weights()?;
         let mut projections = Vec::with_capacity(specs.len());
         for spec in specs {
             let projection = self
@@ -2492,11 +2478,8 @@ impl DenseStore {
                 })?;
             projections.push(projection);
         }
-        let (outputs, _, _) = metal
-            .q4_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?
-            .context(
-                "FlashMoe unsupported scheduled Q4 projection batch: Metal builder did not resolve",
-            )?;
+        let (outputs, _, _) =
+            metal.q4_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?;
         Ok(outputs)
     }
 
@@ -2700,11 +2683,7 @@ impl DenseStore {
         post_norm_weight: &[f32],
         active_experts: usize,
     ) -> Result<MetalPostAttentionPrep> {
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable"
-            );
-        }
+        metal.require_resident_dense_weights()?;
         let residual_len = residual.len();
         let projections = build_required_cmd2_q4_post_attention_prep_projections(
             layer,
@@ -2815,11 +2794,7 @@ impl DenseStore {
         prompt: &[u32],
         generated: &[u32],
     ) -> Result<Vec<(usize, f32)>> {
-        if !metal.has_resident_dense_weights() {
-            bail!(
-                "FlashMoe unsupported resolved LM-head path: resident dense Metal weights are unavailable"
-            );
-        }
+        metal.require_resident_dense_weights()?;
         let lm_head_name = self.lm_head_tensor_name()?;
         let entry = self.registry.require(lm_head_name)?;
         let (rows, cols) = validate_lm_head_matvec_shape(
@@ -2999,13 +2974,8 @@ impl DenseStore {
                     "FlashMoe unsupported scheduled Q4 projection: missing resident descriptor for {canonical_name}"
                 )
             })?;
-        let (mut outputs, _, _) = metal
-            .q4_mmap_matvec_batch(std::slice::from_ref(&projection), input)?
-            .with_context(|| {
-                format!(
-                    "FlashMoe unsupported scheduled Q4 projection: Metal builder did not resolve {canonical_name}"
-                )
-            })?;
+        let (mut outputs, _, _) =
+            metal.q4_mmap_matvec_batch(std::slice::from_ref(&projection), input)?;
         outputs
             .pop()
             .with_context(|| format!("Metal Q4 projection {canonical_name} returned no output"))

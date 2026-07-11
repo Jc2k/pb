@@ -14300,10 +14300,8 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let (actual, _timing, dispatches) = metal
-            .q4_mmap_matvec_batch(&projections, &input)
-            .unwrap()
-            .expect("resident dense mmap buffer should be available");
+        let (actual, _timing, dispatches) =
+            metal.q4_mmap_matvec_batch(&projections, &input).unwrap();
 
         assert_eq!(dispatches, 1);
         assert_eq!(actual.len(), tensors.len());

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::{Context as _, Result, bail};
 
@@ -28,7 +30,7 @@ use super::scheduler::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
-    FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeLinearAttentionCacheState,
+    FlashMoeCmd3OutputState, FlashMoeLinearAttentionCacheState,
     FlashMoeLinearAttentionLayerSnapshot, FlashMoeLinearAttentionSessionSnapshot,
     FlashMoePostAttentionPrepState, LinearAttentionLayout,
 };
@@ -40,6 +42,41 @@ use super::weights::{
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalObjcId = *mut c_void;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalStateBuffer {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    buffer: MetalObjcId,
+    state: FlashMoeGpuBufferDescriptor,
+}
+
+impl MetalStateBuffer {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn new(buffer: MetalObjcId, state: FlashMoeGpuBufferDescriptor) -> anyhow::Result<Self> {
+        if buffer.is_null() {
+            anyhow::bail!("FlashMoe Metal state buffer requires a non-null buffer");
+        }
+        if !state.is_declared_graph_state()
+            || state.placement() != super::state::FlashMoeStatePlacement::GpuResident
+        {
+            anyhow::bail!("FlashMoe Metal state buffer requires declared GpuResident state");
+        }
+        Ok(Self { buffer, state })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn buffer(self) -> MetalObjcId {
+        self.buffer
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.state.len()
+    }
+
+    pub(crate) fn state(self) -> FlashMoeGpuBufferDescriptor {
+        self.state
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type MetalSelector = *mut c_void;
@@ -1598,32 +1635,38 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalScheduledCmd3Submission {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     buffers: Arc<MetalBufferPool>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     command_buffer: MetalObjcId,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     phase_buffers: Vec<MetalPhaseBuffer>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     _expert_slots: Arc<[Arc<ScheduledExpertSlot>]>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     output: MetalCmd3DeferredOutput,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     context: MetalCommandContext,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     scheduled_output: ScheduledCmd3OutputState,
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    unsupported: std::convert::Infallible,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalScheduledCmd3Submission {
-    pub(crate) fn next_normed_buffer(&self) -> Option<(MetalObjcId, usize)> {
+    pub(crate) fn next_normed_input(&self) -> anyhow::Result<Option<MetalStateBuffer>> {
         self.output
             .next_normed_buffer
             .zip(self.output.output_state.next_normed())
-            .map(|(buffer, state)| (buffer, state.len()))
+            .map(|(buffer, state)| MetalStateBuffer::new(buffer, state))
+            .transpose()
     }
 
-    pub(crate) fn hidden_buffer(&self) -> (MetalObjcId, usize) {
-        (
-            self.output.hidden_buffer,
-            self.output.output_state.hidden().len(),
-        )
+    pub(crate) fn hidden_input(&self) -> anyhow::Result<MetalStateBuffer> {
+        MetalStateBuffer::new(self.output.hidden_buffer, self.output.output_state.hidden())
     }
 
     pub(crate) fn finish_without_readback(self) -> anyhow::Result<()> {
@@ -1668,6 +1711,25 @@ impl MetalScheduledCmd3Submission {
             self.scheduled_output
                 .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
         }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl MetalScheduledCmd3Submission {
+    pub(crate) fn next_normed_input(&self) -> anyhow::Result<Option<MetalStateBuffer>> {
+        match self.unsupported {}
+    }
+
+    pub(crate) fn hidden_input(&self) -> anyhow::Result<MetalStateBuffer> {
+        match self.unsupported {}
+    }
+
+    pub(crate) fn finish_without_readback(self) -> anyhow::Result<()> {
+        match self.unsupported {}
+    }
+
+    pub(crate) fn wait(self) -> anyhow::Result<FlashMoeExpertPhaseOutput> {
+        match self.unsupported {}
     }
 }
 
@@ -7979,6 +8041,33 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_state_buffer_carries_validated_gpu_state_with_raw_binding() {
+        let buffer = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let hidden = MetalStateBuffer::new(buffer, FlashMoeGpuBufferDescriptor::hidden(8)).unwrap();
+        assert_eq!(hidden.buffer(), buffer);
+        assert_eq!(hidden.len(), 8);
+        assert_eq!(hidden.state(), FlashMoeGpuBufferDescriptor::hidden(8));
+
+        let null_err = MetalStateBuffer::new(
+            std::ptr::null_mut(),
+            FlashMoeGpuBufferDescriptor::next_layer_normed(8),
+        )
+        .unwrap_err();
+        assert!(
+            null_err.to_string().contains("non-null buffer"),
+            "{null_err:#}"
+        );
+
+        let empty_err =
+            MetalStateBuffer::new(buffer, FlashMoeGpuBufferDescriptor::hidden(0)).unwrap_err();
+        assert!(
+            empty_err.to_string().contains("declared GpuResident state"),
+            "{empty_err:#}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

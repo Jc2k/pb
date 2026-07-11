@@ -45,84 +45,6 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
 type ScheduledExpertCommand<'a> =
     ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
 
-#[derive(Debug)]
-pub(super) enum DeferredExpertPhase {
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    Ready(FlashMoeExpertPhaseOutput),
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    ScheduledMetal(MetalScheduledCmd3Submission),
-}
-
-impl DeferredExpertPhase {
-    pub(super) fn wait(self) -> Result<FlashMoeExpertPhaseOutput> {
-        match self {
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            Self::Ready(output) => Ok(output),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Self::ScheduledMetal(output) => output.wait(),
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn next_normed_metal_input(&self) -> Option<DeferredMetalInput> {
-        match self {
-            Self::ScheduledMetal(output) => output
-                .next_normed_buffer()
-                .map(|(buffer, len)| DeferredMetalInput::next_layer_normed(buffer, len)),
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn hidden_metal_input(&self) -> Option<DeferredMetalInput> {
-        match self {
-            Self::ScheduledMetal(output) => {
-                let (buffer, len) = output.hidden_buffer();
-                Some(DeferredMetalInput::hidden(buffer, len))
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn finish_without_readback(self) -> Result<()> {
-        match self {
-            Self::ScheduledMetal(output) => output.finish_without_readback(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct DeferredMetalInput {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) buffer: ObjcId,
-    pub(super) state: FlashMoeGpuBufferDescriptor,
-}
-
-impl DeferredMetalInput {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn hidden(buffer: ObjcId, len: usize) -> Self {
-        Self {
-            buffer,
-            state: FlashMoeGpuBufferDescriptor::hidden(len),
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn next_layer_normed(buffer: ObjcId, len: usize) -> Self {
-        Self {
-            buffer,
-            state: FlashMoeGpuBufferDescriptor::next_layer_normed(len),
-        }
-    }
-
-    pub(super) fn len(self) -> usize {
-        self.state.len()
-    }
-
-    pub(super) fn state(self) -> FlashMoeGpuBufferDescriptor {
-        self.state
-    }
-}
-
 impl MetalExecutionFacade {
     pub(super) fn new(
         plan: &FlashMoePlan,
@@ -247,7 +169,7 @@ impl MetalExecutionFacade {
     pub(super) fn submit_scheduled_expert_command(
         &self,
         command: ScheduledExpertCommand<'_>,
-    ) -> Result<DeferredExpertPhase> {
+    ) -> Result<MetalScheduledCmd3Submission> {
         let output = command.resolve_output_state()?;
         debug_assert_eq!(output.layer, command.layer);
         debug_assert_eq!(output.cmd3, command.cmd3);
@@ -280,11 +202,30 @@ impl MetalExecutionFacade {
                     next_norm_weight,
                     &payloads,
                 )?;
-                Ok(DeferredExpertPhase::ScheduledMetal(pending))
+                Ok(pending)
             }
         }
     }
 
+    pub(super) fn require_resident_dense_weights(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if !self.inner.has_resident_dense_weights() {
+                bail!(
+                    "FlashMoe unsupported required Metal execution: resident dense weights are unavailable"
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "FlashMoe unsupported required Metal execution: Apple Silicon Metal is unavailable"
+            )
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn has_resident_dense_weights(&self) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -390,15 +331,19 @@ impl MetalExecutionFacade {
         &self,
         projections: &[DenseQ4MmapMatvecProjection],
         input: &[f32],
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+    ) -> Result<(Vec<Vec<f32>>, MetalMatvecTiming, usize)> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.q4_projection_batch(projections, input)
+            self.inner
+                .q4_projection_batch(projections, input)?
+                .context("FlashMoe required Q4 Metal projection batch did not resolve")
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = (projections, input);
-            Ok(None)
+            bail!(
+                "FlashMoe unsupported required Q4 projection batch: Apple Silicon Metal is unavailable"
+            )
         }
     }
 
@@ -408,13 +353,15 @@ impl MetalExecutionFacade {
         projections: &[DenseQ4MmapMatvecProjection],
         input_buffer: ObjcId,
         input_len: usize,
-    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+    ) -> Result<(Vec<Vec<f32>>, MetalMatvecTiming, usize)> {
         self.inner
-            .q4_projection_batch_with_input_buffer(projections, input_buffer, input_len)
+            .q4_projection_batch_with_input_buffer(projections, input_buffer, input_len)?
+            .context("FlashMoe required Q4 Metal projection batch did not resolve")
     }
 }
 
 impl FlashMoeEngine {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn forward_hidden(
         &mut self,
         previous: u32,
@@ -433,7 +380,7 @@ impl FlashMoeEngine {
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
         );
         debug_assert!(token_state.hidden().is_declared_graph_state());
-        let mut deferred_expert_phase: Option<DeferredExpertPhase> = None;
+        let mut deferred_expert_phase: Option<MetalScheduledCmd3Submission> = None;
 
         for layer in 0..self.config.num_hidden_layers {
             let report_layer_progress = progress.is_some()
@@ -452,22 +399,24 @@ impl FlashMoeEngine {
                 );
             }
             let mut pending_for_layer = deferred_expert_phase.take();
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let (deferred_attention_input, deferred_residual_input) = {
                 let normed_candidate = pending_for_layer
                     .as_ref()
-                    .and_then(DeferredExpertPhase::next_normed_metal_input);
+                    .map(MetalScheduledCmd3Submission::next_normed_input)
+                    .transpose()?
+                    .flatten();
                 if normed_candidate.is_some() {
-                    let residual_candidate = pending_for_layer
-                        .as_ref()
-                        .and_then(DeferredExpertPhase::hidden_metal_input);
+                    let residual_candidate = Some(
+                        pending_for_layer
+                            .as_ref()
+                            .context("missing deferred Metal CMD3 submission")?
+                            .hidden_input()?,
+                    );
                     (normed_candidate, residual_candidate)
                 } else {
                     (None, None)
                 }
             };
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let deferred_attention_input: Option<DeferredMetalInput> = None;
 
             if pending_for_layer.is_some() && deferred_attention_input.is_none() {
                 let pending = pending_for_layer
@@ -494,7 +443,6 @@ impl FlashMoeEngine {
                     FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
                 )?;
             }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let previous_handoff = if let Some(next_normed) = deferred_attention_input {
                 let hidden = deferred_residual_input.with_context(|| {
                     format!(
@@ -507,12 +455,6 @@ impl FlashMoeEngine {
                     next_normed.state(),
                 )
             } else if layer == 0 {
-                ScheduledPreviousCmd3Handoff::initial(token_state.hidden().len())
-            } else {
-                ScheduledPreviousCmd3Handoff::cpu_visible(layer - 1, token_state.hidden().len())
-            };
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let previous_handoff = if layer == 0 {
                 ScheduledPreviousCmd3Handoff::initial(token_state.hidden().len())
             } else {
                 ScheduledPreviousCmd3Handoff::cpu_visible(layer - 1, token_state.hidden().len())
@@ -575,81 +517,59 @@ impl FlashMoeEngine {
             debug_assert!(scheduled_cmd1.input_state.is_declared_graph_state());
             let mut post_attention_values_for_prep = None;
             let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut early_metal_post_attention_prep: Option<MetalPostAttentionPrep> = None;
             let projected = match attention_implementation {
                 ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal => {
-                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                    {
-                        let residual_input = deferred_residual_input
-                            .map(|input| MetalBatchProjectionInput::Buffer {
-                                buffer: input.buffer,
-                                len: input.len(),
-                            })
-                            .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                        let post_norm_weight = self
+                    let residual_input = deferred_residual_input
+                        .map(|input| MetalBatchProjectionInput::Buffer {
+                            buffer: input.buffer(),
+                            len: input.len(),
+                        })
+                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                    let post_norm_weight = self
                         .model_norm_weight(post_norm_name.as_str(), runtime.width)?
                         .with_context(|| {
                             format!(
                                 "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path: missing norm tensor {post_norm_name}"
                             )
                         })?;
-                        let prep = self.linear_attention_post_attention_prep_with_metal(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            residual_input,
-                            &post_norm_weight,
-                            runtime,
-                            Some(&mut layer_timing.buckets),
-                        )?;
-                        if deferred_residual_input.is_some()
-                            && let Some(pending) = pending_for_layer.take()
-                        {
-                            pending.finish_without_readback()?;
-                        }
-                        early_metal_post_attention_prep = Some(prep);
-                        Vec::new()
-                    }
-                    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                    let prep = self.linear_attention_post_attention_prep_with_metal(
+                        layer,
+                        &normed,
+                        deferred_attention_input,
+                        residual_input,
+                        &post_norm_weight,
+                        runtime,
+                        Some(&mut layer_timing.buckets),
+                    )?;
+                    if deferred_residual_input.is_some()
+                        && let Some(pending) = pending_for_layer.take()
                     {
-                        bail!(
-                            "FlashMoe unsupported scheduled linear-attention implementation at layer {layer}: Apple Silicon Metal is required"
-                        )
+                        pending.finish_without_readback()?;
                     }
+                    early_metal_post_attention_prep = Some(prep);
+                    Vec::new()
                 }
                 ScheduledLayerAttentionImplementation::FullAttentionCpuKv => {
-                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                    {
-                        let values = self.full_attention_output_values(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            kv_cache,
-                            position,
-                            rope_position,
-                            runtime,
-                            Some(&mut layer_timing.buckets),
-                        )?;
-                        post_attention_values_for_prep =
-                            Some((attention_tensor_name(layer, "o_proj"), values));
-                        Vec::new()
-                    }
-                    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                    {
-                        bail!(
-                            "FlashMoe unsupported scheduled full-attention CMD1/CMD2 implementation at layer {layer}: Apple Silicon Metal is required"
-                        )
-                    }
+                    let values = self.full_attention_output_values(
+                        layer,
+                        &normed,
+                        deferred_attention_input,
+                        kv_cache,
+                        position,
+                        rope_position,
+                        runtime,
+                        Some(&mut layer_timing.buckets),
+                    )?;
+                    post_attention_values_for_prep =
+                        Some((attention_tensor_name(layer, "o_proj"), values));
+                    Vec::new()
                 }
             };
             trace_layer_values(position, layer, "attention", &projected);
             layer_timing.buckets.attention_projection += attention_started.elapsed();
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let can_defer_residual_wait_for_post_prep =
                 deferred_residual_input.is_some() && post_attention_values_for_prep.is_some();
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let can_defer_residual_wait_for_post_prep = false;
             if deferred_attention_input.is_some()
                 && let Some(pending) = pending_for_layer.take()
                 && !can_defer_residual_wait_for_post_prep
@@ -675,7 +595,6 @@ impl FlashMoeEngine {
                     FlashMoeExpertPhaseApplication::HiddenOnly,
                 )?;
             }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let mut metal_post_attention_prep: Option<MetalPostAttentionPrep> =
                 early_metal_post_attention_prep;
             let cmd2_attention_len = metal_post_attention_prep
@@ -715,7 +634,6 @@ impl FlashMoeEngine {
             );
             let combine_started = Instant::now();
             let mut precomputed_active: Option<ScheduledRoutingCommand> = None;
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(prep) = metal_post_attention_prep.as_mut() {
                 let routing_command = self.scheduler.routing_from_post_attention_prep(
                     &scheduled_cmd2,
@@ -734,59 +652,48 @@ impl FlashMoeEngine {
             } else if let Some((out_proj_name, attention_values)) =
                 post_attention_values_for_prep.take()
             {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let residual_input = deferred_residual_input
+                    .map(|input| MetalBatchProjectionInput::Buffer {
+                        buffer: input.buffer(),
+                        len: input.len(),
+                    })
+                    .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                let metal = &self.metal;
+                let post_norm_weight = self
+                    .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                    .with_context(|| {
+                        format!(
+                            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
+                        )
+                    })?;
+                let mut prep = self.dense.post_attention_q4_prep_with_metal(
+                    metal,
+                    layer,
+                    self.config.experts(),
+                    &out_proj_name,
+                    &attention_values,
+                    residual_input,
+                    &post_norm_weight,
+                    scheduled_cmd2.active_experts,
+                )?;
+                if deferred_residual_input.is_some()
+                    && let Some(pending) = pending_for_layer.take()
                 {
-                    let residual_input = deferred_residual_input
-                        .map(|input| MetalBatchProjectionInput::Buffer {
-                            buffer: input.buffer,
-                            len: input.len(),
-                        })
-                        .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
-                    let metal = &self.metal;
-                    let post_norm_weight = self
-                        .model_norm_weight(post_norm_name.as_str(), runtime.width)?
-                        .with_context(|| {
-                            format!(
-                                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
-                            )
-                        })?;
-                    let mut prep = self.dense.post_attention_q4_prep_with_metal(
-                        metal,
-                        layer,
-                        self.config.experts(),
-                        &out_proj_name,
-                        &attention_values,
-                        residual_input,
-                        &post_norm_weight,
-                        scheduled_cmd2.active_experts,
-                    )?;
-                    if deferred_residual_input.is_some()
-                        && let Some(pending) = pending_for_layer.take()
-                    {
-                        pending.finish_without_readback()?;
-                    }
-                    let routing_command = self.scheduler.routing_from_post_attention_prep(
-                        &scheduled_cmd2,
-                        prep.state,
-                        &prep.active,
-                    )?;
-                    debug_assert_eq!(
-                        routing_command.source,
-                        ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
-                    );
-                    let routing_command = prep.attach_routing_command(routing_command)?;
-                    metal_post_attention_prep = Some(prep);
-                    layer_timing.buckets.combine_norm += combine_started.elapsed();
-                    routing_command
+                    pending.finish_without_readback()?;
                 }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    let _ = (out_proj_name, attention_values);
-                    scheduled_cmd2.reject_missing_post_attention_prep(
-                        "the resolved CMD2 Q4 post-attention prep implementation requires Apple Silicon Metal",
-                    )?;
-                    unreachable!("reject_missing_post_attention_prep always returns an error")
-                }
+                let routing_command = self.scheduler.routing_from_post_attention_prep(
+                    &scheduled_cmd2,
+                    prep.state,
+                    &prep.active,
+                )?;
+                debug_assert_eq!(
+                    routing_command.source,
+                    ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
+                );
+                let routing_command = prep.attach_routing_command(routing_command)?;
+                metal_post_attention_prep = Some(prep);
+                layer_timing.buckets.combine_norm += combine_started.elapsed();
+                routing_command
             } else {
                 add_in_place(token_state.hidden_mut(), &projected);
                 normed = FlashMoeCpuBuffer::normed(
@@ -804,13 +711,9 @@ impl FlashMoeEngine {
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let shared_q4_phase =
                 self.required_shared_expert_q4_phase_projections(layer, runtime.width)?;
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let shared_phase = SharedExpertPhaseRef::Q4(shared_q4_phase.as_ref());
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let shared_phase = SharedExpertPhaseRef::None;
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let cmd3_prepare_started = Instant::now();
             let prepared_next_norm_weights = prepare_scheduled_next_norm_weights(
@@ -822,17 +725,11 @@ impl FlashMoeEngine {
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
             layer_timing.buckets.expert_compute += cmd3_prepare_started.elapsed();
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let prep = metal_post_attention_prep.take().with_context(|| {
                 format!(
                     "FlashMoe unsupported scheduled Qwen3.5 CMD3 path at layer {layer}: resolved Metal CMD2 did not produce post-attention state; CPU normed/residual upload is not a declared implementation"
                 )
             })?;
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            bail!(
-                "FlashMoe unsupported scheduled Qwen3.5 CMD3 path at layer {layer}: the resolved implementation requires Apple Silicon Metal"
-            );
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let expert_delta = {
                 let metal = &self.metal;
                 let layer_execution = pending_cmd3.finish(
@@ -867,8 +764,6 @@ impl FlashMoeEngine {
                 }
                 expert_delta
             };
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let expert_delta = ExpertSchedulerSnapshot::default();
             trace_layer_values(position, layer, "moe", token_state.hidden());
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
@@ -996,11 +891,36 @@ impl FlashMoeEngine {
         Ok(token_state.into_hidden_values())
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub(super) fn forward_hidden(
+        &mut self,
+        previous: u32,
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        record_generated: bool,
+        timing: Option<&mut FlashMoeTokenTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<Vec<f32>> {
+        let _ = (
+            previous,
+            kv_cache,
+            position,
+            rope_position,
+            record_generated,
+            timing,
+            progress,
+        );
+        bail!(
+            "FlashMoe unsupported scheduled token execution: the resolved graph requires Apple Silicon Metal"
+        )
+    }
+
     fn full_attention_output_values(
         &self,
         layer: usize,
         normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
+        deferred_input: Option<MetalStateBuffer>,
         kv_cache: &mut KvCache,
         position: usize,
         rope_position: MropePosition,
@@ -1020,7 +940,7 @@ impl FlashMoeEngine {
             self.dense.project_q4_tensors_from_metal_input(
                 &self.metal,
                 &input_specs,
-                input.buffer,
+                input.buffer(),
                 input.len(),
             )?
         } else {
@@ -1157,7 +1077,7 @@ impl FlashMoeEngine {
         &self,
         layer: usize,
         normed: &[f32],
-        deferred_input: Option<DeferredMetalInput>,
+        deferred_input: Option<MetalStateBuffer>,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         runtime: &DenseTransformerRuntime,
@@ -1199,7 +1119,7 @@ impl FlashMoeEngine {
         let input_specs = input_requests.requests();
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
-                buffer: input.buffer,
+                buffer: input.buffer(),
                 len: input.len(),
             }
         } else if !normed.is_empty() {

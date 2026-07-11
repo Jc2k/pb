@@ -248,6 +248,12 @@ Baseline reviewed on 2026-07-10:
   mismatched recurrent layers, restores recurrent bytes, and clears transient conv/delta/gate
   outputs. Reset lock failure is also an error rather than a silent no-op. State tests cover typed
   snapshot shape/order and lifecycle transfer; a local-Metal test proves the real buffer round trip.
+- Deferred CMD3 ownership is now Metal-native. `MetalScheduledCmd3Submission` owns command/buffer
+  lifetime and exposes validated `MetalStateBuffer` views for hidden and next-layer normed state;
+  `runtime.rs` no longer wraps raw pointers or carries a non-Metal ready continuation. The
+  unsupported-platform submission representation is uninhabited, while token execution has one
+  Apple-Silicon scheduled body and one entry-point unsupported error. Required resident-Q4 facade
+  calls return concrete results/errors instead of boolean probes or `Ok(None)` continuations.
 - Full-attention placement is now resolved by the scheduled graph rather than supplied by the
   runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
   attention stage without a matching scheduled executor is a named unsupported capability. The
@@ -290,19 +296,16 @@ The architecture is not yet at the target:
 
 - The legacy engine shell still stores the weights-owned `DenseStore` and state-owned session-cache
   owner; runtime layout metadata and `VisionEncoder` also remain defined in `legacy.rs`.
-- CPU-visible generation/session lifecycle and recurrent prompt snapshots are state/Metal-owned.
-  Deferred CMD3 handles and their next-layer buffer adapters still live in `runtime.rs`, so Gate 4's
-  single-owner GPU boundary is incomplete.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this checkpoint, Gates 1 through 3 are complete. Dense, CPU-KV, CPU generation/session, and
-recurrent session-snapshot ownership have moved; deferred GPU state ownership, parity closure,
-additional variants, and final legacy removal remain, so approximately 20-30% of the architectural
-work remains.
+At this checkpoint, Gates 1 through 4 are complete. Dense, CPU-KV, CPU generation/session,
+recurrent-session, and deferred GPU ownership have moved; Qwen3.5 Q4 parity closure, additional
+variants, and final legacy removal remain, so approximately 15-25% of the architectural work
+remains.
 
 ## Completion Gates
 
@@ -314,8 +317,8 @@ exit criteria hold in production code and tests.
 | 1. Concrete Graph Resolution | Complete | Support is resolved from the real model and device. |
 | 2. Concrete Metal Builders | Complete | Metal command execution is owned by `metal`. |
 | 3. Scheduler-Owned Runtime | Complete | The scheduler executes the layer lifecycle. |
-| 4. Weights And State Ownership | Active | Runtime storage and state have single owners. |
-| 5. Qwen3.5 Q4 Correctness Closure | Pending | The first production graph has parity evidence. |
+| 4. Weights And State Ownership | Complete | Runtime storage and state have single owners. |
+| 5. Qwen3.5 Q4 Correctness Closure | Active | The first production graph has parity evidence. |
 | 6. Unified Variant Implementations | Pending | Other variants use the same graph/runtime. |
 | 7. Legacy Removal And Benchmarking | Pending | Migration is complete and benchmarking may begin. |
 
@@ -418,10 +421,10 @@ Completion evidence:
 - Runtime no longer branches on family, dtype, Qwen-VL, optional executors, or implementation
   probes. The expert-skip fixture runtime and Qwen-VL embedding/DeepStack layer-loop branch were
   deleted; Qwen-VL remains a named unresolved input adapter.
-- The concrete required-Metal facade, CMD3 input adapter, deferred submission, and GPU handoff
-  types moved with production execution into `runtime.rs`. The undeclared CPU CMD3 input is
-  test-only, and source audits show no production graph builder, expert issue/finish, or layer
-  execution adapter in `legacy.rs`.
+- The concrete required-Metal facade and CMD3 input adapter moved with production execution into
+  `runtime.rs`; deferred submission and typed GPU handoff ownership live in `metal.rs`. The
+  undeclared CPU CMD3 input is test-only, and source audits show no production graph builder,
+  expert issue/finish, or layer execution adapter in `legacy.rs`.
 - Focused scheduler/runtime tests cover phase order, previous-handoff validation, whole-slot CMD3
   completion, metrics, and output policy. FlashMoe tests, all-target tests, release build, and the
   required real-model smoke provide checkpoint verification.
@@ -443,7 +446,8 @@ Exit criteria:
 
 - `legacy.rs` owns no dense store/cache and no generation state/cache.
 - Each runtime buffer has one owner and an explicit placement transition.
-- Dense Q4/BF16/F16/F32 bindings use the same scheduler/command-builder flow.
+- Qwen3.5 Q4 dense bindings use the scheduler/command-builder flow; unresolved BF16/F16/F32
+  bindings are named load-time errors and Gate 6 must add them through those same contracts.
 - State tests cover full-attention KV, linear recurrence, deferred CMD3, and session reuse through
   the resolved graph.
 
@@ -589,7 +593,7 @@ Use this prompt for implementation work:
 ```text
 Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
 
-Active gate: Gate 4, Weights And State Ownership.
+Active gate: Gate 5, Qwen3.5 Q4 Correctness Closure.
 
 Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
 the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
@@ -606,20 +610,22 @@ North star:
 - No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
   the benchmark lock opens.
 
-For Gate 4:
-1. Move `DenseStore` as a complete owner into `weights.rs`: mmap/blob, registry, resident bindings,
-   projection execution, norm/projection caches, decoded/raw tile caches, and their focused tests.
-   Route load, runtime, and sampling through that owner in the same ownership slices.
-2. Remove obsolete CPU recurrent-state implementations and any remaining legacy orchestration that
-   reaches across the state/Metal session boundary. Preserve the typed prompt snapshot and exact
-   recurrent layer-table validation for every future attention implementation.
-3. Move deferred CMD3 buffers and next-layer hidden/normed transition ownership to `state.rs` and
-   `metal.rs` so `runtime.rs` carries typed state handles rather than legacy-owned adapters.
-4. Audit every CPU readback/upload in the live graph. Keep only declared graph boundaries; turn a
-   missing placement implementation into a precise unsupported-capability error.
-5. Remove duplicate stores, generation caches, and component/dense fallback state from
-   `legacy.rs`. Unsupported BF16/F16/F32 bindings remain named load-time errors until Gate 6 adds
-   implementations through the same scheduler and command-builder contracts.
+For Gate 5:
+1. Inventory the existing reference tests and add one deterministic parity fixture that follows a
+   complete Qwen3.5 Q4 layer through CMD1 attention, CMD2 router scores, K=4 routes/weights, whole-
+   slot expert/shared combine, residual/norm state, and CMD3 output. Reuse production builders and
+   scheduler contracts; do not create a second inference path.
+2. Add a multi-layer state-transition fixture covering a linear-attention layer, a full-attention
+   CPU-KV layer, deferred CMD3 hidden/next-normed handoff, recurrent state, and final hidden/logit
+   candidates. Fixtures must be derived from upstream/reference math with provenance recorded in
+   the test, not captured from the implementation under test.
+3. Audit the supported Qwen3.5 Q4 graph for component uploads, CPU expert execution, alternate
+   scheduling, optional implementation probes, synthetic values, and undeclared readback/upload.
+   Delete them or make the missing stage a precise unsupported error.
+4. Debug any fixture or `2+2=` drift through router/logit/state deltas in the resolved graph. Do not
+   restore a legacy path, reduce K=4, or weaken the fixture.
+5. Keep Qwen MoE, Qwen-VL, BF16, F16, and F32 capability failures explicit until Gate 6 adds typed
+   implementations through the same graph. Do not broaden variants during parity closure.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -632,7 +638,7 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 4 is a checkpoint, not the end of the goal. When every Gate 4 exit criterion is proven, update
-the gate status and this prompt to Gate 5 in the same semantic commit, then continue implementing
+Gate 5 is a checkpoint, not the end of the goal. When every Gate 5 exit criterion is proven, update
+the gate status and this prompt to Gate 6 in the same semantic commit, then continue implementing
 the plan. Do not mark the overall goal complete until Gate 7 is complete.
 ```
