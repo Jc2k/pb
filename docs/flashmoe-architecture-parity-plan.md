@@ -336,6 +336,10 @@ Baseline reviewed on 2026-07-11:
   now live in the explicit `cfg(test)` `test_fixtures` module. Cache, expert, and weights tests can
   move independently without importing helper ownership from `legacy.rs`; the duplicate helper
   block has been removed there.
+- Experts now owns PBQ4 quantization/projectability, native-Q4 fixed-slot adaptation, on-disk PBQ4
+  rewrite, import-only record projection, and metadata encoding parity in
+  `experts_parity_tests.rs`. Reusable expert-layer fixture construction moved to `test_fixtures`;
+  the corresponding legacy tests, helpers, and dead imports were removed.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the

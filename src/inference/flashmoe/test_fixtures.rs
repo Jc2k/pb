@@ -2,6 +2,15 @@
 
 use std::path::Path;
 
+use anyhow::{Context, Result};
+
+use super::experts::{
+    EXPERT_SCALE_BIAS_DTYPE_F32, ExpertLayerPackMetadata, ExpertPackMetadata, ExpertPackRecord,
+    PBQ4_EXPERT_MAGIC, expert_layer_metadata_path, expert_layer_path, expert_slot_offset,
+    write_all_at_positioned,
+};
+use super::types::GROUP_SIZE;
+
 pub(super) fn make_safetensors(tensors: &[(&str, &[u8])]) -> Vec<u8> {
     let typed: Vec<(&str, &str, Vec<usize>, &[u8])> = tensors
         .iter()
@@ -124,4 +133,72 @@ pub(super) fn assert_close_with_tolerance(actual: f32, expected: f32, tolerance:
         (actual - expected).abs() <= tolerance,
         "{actual:.8} != {expected:.8} within {tolerance:.8}"
     );
+}
+
+pub(super) fn test_expert_pack(name: &str) -> Vec<u8> {
+    let mut pack = Vec::new();
+    pack.extend_from_slice(PBQ4_EXPERT_MAGIC);
+    pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    pack.extend_from_slice(name.as_bytes());
+    pack.extend_from_slice(&2u64.to_le_bytes());
+    pack.extend_from_slice(&1u64.to_le_bytes());
+    pack.extend_from_slice(&0.5f32.to_le_bytes());
+    pack.extend_from_slice(&1.0f32.to_le_bytes());
+    pack.extend_from_slice(&[0x21, 0x43]);
+    pack
+}
+
+pub(super) fn test_expert_pack_metadata(
+    layer: usize,
+    expert: usize,
+    tensor: &str,
+    packed_bytes: usize,
+) -> ExpertPackMetadata {
+    ExpertPackMetadata {
+        layer,
+        expert,
+        packed_bytes: packed_bytes as u64,
+        records: vec![ExpertPackRecord {
+            tensor: tensor.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1, 4],
+            source_offsets: [0, 4],
+            source_hash: Some(format!("hash-{layer}-{expert}")),
+            record_offset: PBQ4_EXPERT_MAGIC.len() as u64,
+            packed_bytes: 2,
+            groups: 1,
+            group_size: GROUP_SIZE,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+        }],
+    }
+}
+
+pub(super) fn write_test_expert_layer(
+    root: &Path,
+    layer: usize,
+    packs: Vec<(usize, Vec<u8>, ExpertPackMetadata)>,
+    experts: usize,
+) -> Result<()> {
+    let slot_size = packs
+        .iter()
+        .map(|(_, pack, _)| pack.len() as u64)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let path = expert_layer_path(root, layer);
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create test layer {}", path.display()))?;
+    file.set_len((experts as u64) * slot_size)?;
+    let mut metadata = Vec::new();
+    for (expert, pack, mut pack_metadata) in packs {
+        pack_metadata.packed_bytes = pack.len() as u64;
+        write_all_at_positioned(&file, &pack, expert_slot_offset(expert, slot_size)?)?;
+        metadata.push(pack_metadata);
+    }
+    let layer_metadata = ExpertLayerPackMetadata::new(layer, slot_size, experts, metadata);
+    std::fs::write(
+        expert_layer_metadata_path(root, layer),
+        serde_json::to_vec(&layer_metadata)?,
+    )?;
+    Ok(())
 }

@@ -5012,6 +5012,10 @@ pub(super) fn project_packed_expert_record(
 }
 
 #[cfg(test)]
+#[path = "experts_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::model_family::QwenModelConfig;
     use super::*;
