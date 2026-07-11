@@ -371,6 +371,10 @@ pub(super) fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
 }
 
 #[cfg(test)]
+#[path = "cache_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

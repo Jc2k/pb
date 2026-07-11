@@ -340,6 +340,9 @@ Baseline reviewed on 2026-07-11:
   rewrite, import-only record projection, and metadata encoding parity in
   `experts_parity_tests.rs`. Reusable expert-layer fixture construction moved to `test_fixtures`;
   the corresponding legacy tests, helpers, and dead imports were removed.
+- Cache now owns runtime artifact emission, Qwen-VL artifact readiness, safetensors-index ingestion,
+  and Qwen3 QK-norm/shared-expert manifest classification in `cache_parity_tests.rs`. These assembly
+  tests no longer sit between unrelated math, weights, and expert tests in `legacy.rs`.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
