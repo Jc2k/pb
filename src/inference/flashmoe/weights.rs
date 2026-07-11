@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::experts::{
@@ -1455,6 +1457,12 @@ pub(crate) enum ResidentMmapMatvecProjection {
     Dense(DenseMmapMatvecProjection),
 }
 
+impl From<DenseQ4MmapMatvecProjection> for ResidentMmapMatvecProjection {
+    fn from(projection: DenseQ4MmapMatvecProjection) -> Self {
+        Self::Q4(projection)
+    }
+}
+
 impl ResidentMmapMatvecProjection {
     pub(crate) fn from_entry(
         tensor_name: &str,
@@ -1717,43 +1725,43 @@ where
         .map(Some)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SharedExpertPhaseQ4Projections {
-    pub(crate) gate: DenseQ4MmapMatvecProjection,
-    pub(crate) up: DenseQ4MmapMatvecProjection,
-    pub(crate) down: DenseQ4MmapMatvecProjection,
-    pub(crate) router: DenseQ4MmapMatvecProjection,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedExpertPhaseResidentProjections {
+    pub(crate) gate: ResidentMmapMatvecProjection,
+    pub(crate) up: ResidentMmapMatvecProjection,
+    pub(crate) down: ResidentMmapMatvecProjection,
+    pub(crate) router: ResidentMmapMatvecProjection,
     pub(crate) shared_experts: usize,
     pub(crate) intermediate: usize,
     pub(crate) width: usize,
 }
 
-impl SharedExpertPhaseQ4Projections {
+impl SharedExpertPhaseResidentProjections {
     pub(crate) fn validated_shape(&self) -> Result<SharedExpertPhaseShape> {
         let shape =
             SharedExpertPhaseShape::new(self.width, self.shared_experts, self.intermediate)?;
-        if self.gate.cols != shape.width
-            || self.up.cols != shape.width
-            || self.router.cols != shape.width
-            || self.down.cols != shape.total_intermediate
-            || self.gate.output_width != shape.total_intermediate
-            || self.up.output_width != shape.total_intermediate
-            || self.down.output_width != shape.width
-            || self.router.output_width != shape.shared_experts
+        if self.gate.cols() != shape.width
+            || self.up.cols() != shape.width
+            || self.router.cols() != shape.width
+            || self.down.cols() != shape.total_intermediate
+            || self.gate.output_width() != shape.total_intermediate
+            || self.up.output_width() != shape.total_intermediate
+            || self.down.output_width() != shape.width
+            || self.router.output_width() != shape.shared_experts
         {
             bail!(
-                "FlashMoe scheduled shared Q4 expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
+                "FlashMoe scheduled resident shared-expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
                 self.width,
                 self.shared_experts,
                 self.intermediate,
-                self.gate.output_width,
-                self.gate.cols,
-                self.up.output_width,
-                self.up.cols,
-                self.down.output_width,
-                self.down.cols,
-                self.router.output_width,
-                self.router.cols
+                self.gate.output_width(),
+                self.gate.cols(),
+                self.up.output_width(),
+                self.up.cols(),
+                self.down.output_width(),
+                self.down.cols(),
+                self.router.output_width(),
+                self.router.cols()
             );
         }
         Ok(shape)
@@ -1761,15 +1769,16 @@ impl SharedExpertPhaseQ4Projections {
 }
 
 #[cfg(test)]
-pub(crate) fn build_shared_expert_q4_phase_projections<F>(
+pub(crate) fn build_shared_expert_resident_phase_projections<F, P>(
     layer: usize,
     width: usize,
     shared_experts: usize,
     intermediate: usize,
     mut projection: F,
-) -> Result<Option<SharedExpertPhaseQ4Projections>>
+) -> Result<Option<SharedExpertPhaseResidentProjections>>
 where
-    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+    F: FnMut(&str, usize, usize) -> Result<Option<P>>,
+    P: Into<ResidentMmapMatvecProjection>,
 {
     if width == 0 || shared_experts == 0 || intermediate == 0 {
         return Ok(None);
@@ -1793,11 +1802,11 @@ where
         return Ok(None);
     };
 
-    let shared = SharedExpertPhaseQ4Projections {
-        gate,
-        up,
-        down,
-        router,
+    let shared = SharedExpertPhaseResidentProjections {
+        gate: gate.into(),
+        up: up.into(),
+        down: down.into(),
+        router: router.into(),
         shared_experts,
         intermediate,
         width,
@@ -1806,17 +1815,18 @@ where
     Ok(Some(shared))
 }
 
-pub(crate) fn build_required_shared_expert_q4_phase_projections<F>(
+pub(crate) fn build_required_shared_expert_resident_phase_projections<F, P>(
     layer: usize,
     width: usize,
     shared_experts: usize,
     intermediate: usize,
     mut projection: F,
-) -> Result<Option<SharedExpertPhaseQ4Projections>>
+) -> Result<Option<SharedExpertPhaseResidentProjections>>
 where
-    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+    F: FnMut(&str, usize, usize) -> Result<Option<P>>,
+    P: Into<ResidentMmapMatvecProjection>,
 {
-    if shared_experts == 0 || intermediate == 0 {
+    if shared_experts == 0 {
         return Ok(None);
     }
     let shape = SharedExpertPhaseShape::new(width, shared_experts, intermediate)?;
@@ -1827,30 +1837,30 @@ where
     let router_name = shared_expert_gate_tensor_name(layer);
     let gate = projection(&gate_name, shape.total_intermediate, shape.width)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared gate projection {gate_name}"
+            "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared gate projection {gate_name}"
         )
     })?;
     let up = projection(&up_name, shape.total_intermediate, shape.width)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared up projection {up_name}"
+            "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared up projection {up_name}"
         )
     })?;
     let down = projection(&down_name, shape.width, shape.total_intermediate)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared down projection {down_name}"
+            "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared down projection {down_name}"
         )
     })?;
     let router = projection(&router_name, shape.shared_experts, shape.width)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD3 shared Q4 path: missing resident shared router projection {router_name}"
+            "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared router projection {router_name}"
         )
     })?;
 
-    let shared = SharedExpertPhaseQ4Projections {
-        gate,
-        up,
-        down,
-        router,
+    let shared = SharedExpertPhaseResidentProjections {
+        gate: gate.into(),
+        up: up.into(),
+        down: down.into(),
+        router: router.into(),
         shared_experts,
         intermediate,
         width,
@@ -1859,16 +1869,33 @@ where
     Ok(Some(shared))
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct SharedExpertPhaseCache {
-    #[cfg(test)]
-    dense: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    q4: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseQ4Projections>>>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SharedExpertLayerWeights {
+    None,
+    Resident(SharedExpertPhaseResidentProjections),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedExpertWeightTable {
+    layers: Vec<SharedExpertLayerWeights>,
+}
+
+impl SharedExpertWeightTable {
+    pub(crate) fn layer(&self, layer: usize) -> Result<&SharedExpertLayerWeights> {
+        self.layers.get(layer).with_context(|| {
+            format!("FlashMoe scheduled shared-expert weight table has no entry for layer {layer}")
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SharedExpertPhaseCache {
+    dense: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
+}
+
+#[cfg(test)]
 impl SharedExpertPhaseCache {
-    #[cfg(test)]
     pub(crate) fn dense<F>(
         &self,
         layer: usize,
@@ -1903,7 +1930,6 @@ impl SharedExpertPhaseCache {
         }
     }
 
-    #[cfg(test)]
     fn cached_dense(
         &self,
         layer: usize,
@@ -1916,61 +1942,9 @@ impl SharedExpertPhaseCache {
         validate_cached_shared_width("shared expert tensors", layer, shared.width, width)?;
         Ok(Some(shared))
     }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn q4<F>(
-        &self,
-        layer: usize,
-        width: usize,
-        shared_experts: usize,
-        intermediate: usize,
-        load: F,
-    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>>
-    where
-        F: FnOnce(usize, usize, usize, usize) -> Result<Option<SharedExpertPhaseQ4Projections>>,
-    {
-        if shared_experts == 0 || intermediate == 0 {
-            return Ok(None);
-        }
-        if let Some(shared) = self.cached_q4(layer, width)? {
-            return Ok(Some(shared));
-        }
-
-        let Some(shared) = load(layer, width, shared_experts, intermediate)? else {
-            return Ok(None);
-        };
-        shared.validated_shape()?;
-        let shared = Arc::new(shared);
-        let mut cache = self.q4.lock().expect("shared q4 expert cache poisoned");
-        if let Some(existing) = cache.get(&layer).cloned() {
-            validate_cached_shared_width(
-                "shared q4 expert projections",
-                layer,
-                existing.width,
-                width,
-            )?;
-            Ok(Some(existing))
-        } else {
-            cache.insert(layer, shared.clone());
-            Ok(Some(shared))
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn cached_q4(
-        &self,
-        layer: usize,
-        width: usize,
-    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
-        let cache = self.q4.lock().expect("shared q4 expert cache poisoned");
-        let Some(shared) = cache.get(&layer).cloned() else {
-            return Ok(None);
-        };
-        validate_cached_shared_width("shared q4 expert projections", layer, shared.width, width)?;
-        Ok(Some(shared))
-    }
 }
 
+#[cfg(test)]
 fn validate_cached_shared_width(
     label: &str,
     layer: usize,
@@ -2833,23 +2807,31 @@ impl DenseStore {
         .map(Some)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn required_shared_expert_q4_phase_projections(
+    pub(super) fn resolve_shared_expert_weight_table(
         &self,
-        layer: usize,
+        layer_count: usize,
         width: usize,
         shared_experts: usize,
         intermediate: usize,
-    ) -> Result<Option<SharedExpertPhaseQ4Projections>> {
-        build_required_shared_expert_q4_phase_projections(
-            layer,
-            width,
-            shared_experts,
-            intermediate,
-            |tensor_name, output_width, input_len| {
-                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
-            },
-        )
+    ) -> Result<SharedExpertWeightTable> {
+        let layers = (0..layer_count)
+            .map(|layer| {
+                build_required_shared_expert_resident_phase_projections(
+                    layer,
+                    width,
+                    shared_experts,
+                    intermediate,
+                    |tensor_name, output_width, input_len| {
+                        self.resident_mmap_projection(tensor_name, output_width, input_len)
+                    },
+                )
+                .map(|weights| match weights {
+                    Some(weights) => SharedExpertLayerWeights::Resident(weights),
+                    None => SharedExpertLayerWeights::None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SharedExpertWeightTable { layers })
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5067,6 +5049,137 @@ mod tests {
     }
 
     #[test]
+    fn shared_expert_weight_table_resolves_all_resident_dense_layouts_at_load() {
+        fn append_tensor(
+            bytes: &mut Vec<u8>,
+            tensors: &mut Vec<DenseTensorRef>,
+            name: String,
+            dtype: &str,
+            shape: Vec<usize>,
+        ) {
+            while !(bytes.len() as u64).is_multiple_of(TENSOR_ALIGNMENT) {
+                bytes.push(0);
+            }
+            let runtime_offset = bytes.len() as u64;
+            let byte_len = shape.iter().product::<usize>() * dense_dtype_size(dtype).unwrap();
+            bytes.resize(bytes.len() + byte_len, 0);
+            tensors.push(DenseTensorRef {
+                tensor: name,
+                shard: "fixture.safetensors".to_string(),
+                dtype: dtype.to_string(),
+                shape,
+                source_offsets: [0, byte_len as u64],
+                runtime_offset,
+                byte_len: byte_len as u64,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            });
+        }
+
+        fn fixture(dtype: &str, omit_down_layer: Option<usize>) -> (tempfile::TempDir, DenseStore) {
+            let width = 4;
+            let shared_experts = 2;
+            let intermediate = 3;
+            let total_intermediate = shared_experts * intermediate;
+            let mut bytes = Vec::new();
+            let mut tensors = Vec::new();
+            for layer in 0..2 {
+                for projection in ["gate_proj", "up_proj"] {
+                    append_tensor(
+                        &mut bytes,
+                        &mut tensors,
+                        shared_expert_tensor_name(layer, projection),
+                        dtype,
+                        vec![total_intermediate, width],
+                    );
+                }
+                if omit_down_layer != Some(layer) {
+                    append_tensor(
+                        &mut bytes,
+                        &mut tensors,
+                        shared_expert_tensor_name(layer, "down_proj"),
+                        dtype,
+                        vec![width, total_intermediate],
+                    );
+                }
+                append_tensor(
+                    &mut bytes,
+                    &mut tensors,
+                    shared_expert_gate_tensor_name(layer),
+                    dtype,
+                    vec![shared_experts, width],
+                );
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            let dense_path = temp.path().join("non-expert.bin");
+            let manifest_path = temp.path().join("manifest.json");
+            fs::write(&dense_path, bytes).unwrap();
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&FlashMoeManifest {
+                    model: "fixture".to_string(),
+                    cache_version: "test".to_string(),
+                    dense_shards: vec!["fixture.safetensors".to_string()],
+                    expert_tensors: Vec::new(),
+                    dense_tensors: tensors,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let store = DenseStore::open(dense_path, manifest_path).unwrap();
+            (temp, store)
+        }
+
+        for dtype in ["BF16", "F16", "F32"] {
+            let (_temp, store) = fixture(dtype, None);
+            let table = store
+                .resolve_shared_expert_weight_table(2, 4, 2, 3)
+                .unwrap();
+            for layer in 0..2 {
+                let SharedExpertLayerWeights::Resident(shared) = table.layer(layer).unwrap() else {
+                    panic!("configured shared experts must resolve resident bindings");
+                };
+                for projection in [&shared.gate, &shared.up, &shared.down, &shared.router] {
+                    let ResidentMmapMatvecProjection::Dense(projection) = projection else {
+                        panic!("{dtype} fixture resolved a Q4 projection");
+                    };
+                    assert_eq!(projection.dtype, dtype);
+                }
+                assert_eq!(
+                    shared.validated_shape().unwrap(),
+                    SharedExpertPhaseShape::new(4, 2, 3).unwrap()
+                );
+            }
+
+            let disabled = store
+                .resolve_shared_expert_weight_table(2, 4, 0, 0)
+                .unwrap();
+            assert!(matches!(
+                disabled.layer(0).unwrap(),
+                SharedExpertLayerWeights::None
+            ));
+        }
+
+        let (_temp, store) = fixture("BF16", Some(1));
+        let error = store
+            .resolve_shared_expert_weight_table(2, 4, 2, 3)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing resident shared down projection"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("model.layers.1.mlp.shared_expert.down_proj.weight"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn dense_q4_projection_descriptor_carries_one_binding_shape() {
         let projection = DenseQ4MmapMatvecProjection {
             tensor_name: "model.layers.0.mlp.gate_proj.weight".to_string(),
@@ -5326,7 +5439,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_expert_q4_descriptor_groups_resident_projection_bindings() {
+    fn shared_expert_resident_descriptor_groups_projection_bindings() {
         let gate = DenseQ4MmapMatvecProjection {
             tensor_name: "model.layers.0.mlp.shared_expert.gate_proj.weight".to_string(),
             packed_byte_offset: 128,
@@ -5359,19 +5472,19 @@ mod tests {
             output_width: 1,
             ..gate.clone()
         };
-        let shared = SharedExpertPhaseQ4Projections {
-            gate,
-            up,
-            down,
-            router,
+        let shared = SharedExpertPhaseResidentProjections {
+            gate: gate.into(),
+            up: up.into(),
+            down: down.into(),
+            router: router.into(),
             shared_experts: 1,
             intermediate: 16,
             width: 32,
         };
 
-        assert_eq!(shared.gate.packed_byte_offset, 128);
-        assert_eq!(shared.down.output_width, 32);
-        assert_eq!(shared.router.cols, 32);
+        assert_eq!(shared.gate.q4().unwrap().packed_byte_offset, 128);
+        assert_eq!(shared.down.output_width(), 32);
+        assert_eq!(shared.router.cols(), 32);
         assert_eq!(shared.shared_experts, 1);
         assert_eq!(shared.intermediate, 16);
         assert_eq!(shared.width, 32);
@@ -5382,8 +5495,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_expert_q4_builder_resolves_named_projection_bindings() {
-        let shared = build_shared_expert_q4_phase_projections(
+    fn shared_expert_resident_builder_resolves_named_projection_bindings() {
+        let shared = build_shared_expert_resident_phase_projections(
             4,
             32,
             2,
@@ -5408,15 +5521,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            shared.gate.tensor_name,
+            shared.gate.tensor_name(),
             "model.layers.4.mlp.shared_expert.gate_proj.weight"
         );
-        assert_eq!(shared.gate.output_width, 32);
-        assert_eq!(shared.gate.cols, 32);
-        assert_eq!(shared.down.output_width, 32);
-        assert_eq!(shared.down.cols, 32);
-        assert_eq!(shared.router.output_width, 2);
-        assert_eq!(shared.router.cols, 32);
+        assert_eq!(shared.gate.output_width(), 32);
+        assert_eq!(shared.gate.cols(), 32);
+        assert_eq!(shared.down.output_width(), 32);
+        assert_eq!(shared.down.cols(), 32);
+        assert_eq!(shared.router.output_width(), 2);
+        assert_eq!(shared.router.cols(), 32);
         assert_eq!(
             shared.validated_shape().unwrap(),
             SharedExpertPhaseShape::new(32, 2, 16).unwrap()
@@ -5424,14 +5537,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_expert_q4_builder_skips_disabled_or_partial_bindings() {
-        let disabled = build_shared_expert_q4_phase_projections(4, 32, 0, 16, |_, _, _| {
-            panic!("disabled shared Q4 experts must not request projections")
-        })
+    fn shared_expert_resident_builder_skips_disabled_or_partial_bindings() {
+        let disabled = build_shared_expert_resident_phase_projections(
+            4,
+            32,
+            0,
+            16,
+            |_, _, _| -> Result<Option<DenseQ4MmapMatvecProjection>> {
+                panic!("disabled shared experts must not request projections")
+            },
+        )
         .unwrap();
         assert!(disabled.is_none());
 
-        let partial = build_shared_expert_q4_phase_projections(
+        let partial = build_shared_expert_resident_phase_projections(
             4,
             32,
             2,
@@ -5460,15 +5579,35 @@ mod tests {
     }
 
     #[test]
-    fn required_shared_expert_q4_builder_errors_on_missing_configured_binding() {
-        let disabled =
-            build_required_shared_expert_q4_phase_projections(4, 32, 0, 16, |_, _, _| {
-                panic!("disabled shared Q4 experts must not request projections")
-            })
-            .unwrap();
+    fn required_shared_expert_resident_builder_errors_on_missing_configured_binding() {
+        let disabled = build_required_shared_expert_resident_phase_projections(
+            4,
+            32,
+            0,
+            16,
+            |_, _, _| -> Result<Option<DenseQ4MmapMatvecProjection>> {
+                panic!("disabled shared experts must not request projections")
+            },
+        )
+        .unwrap();
         assert!(disabled.is_none());
 
-        let missing = build_required_shared_expert_q4_phase_projections(
+        let invalid = build_required_shared_expert_resident_phase_projections(
+            4,
+            32,
+            2,
+            0,
+            |_, _, _| -> Result<Option<DenseQ4MmapMatvecProjection>> {
+                panic!("invalid shared-expert shape must fail before requesting projections")
+            },
+        )
+        .unwrap_err();
+        assert!(
+            invalid.to_string().contains("requires non-zero width"),
+            "{invalid:#}"
+        );
+
+        let missing = build_required_shared_expert_resident_phase_projections(
             4,
             32,
             2,
@@ -5502,8 +5641,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_expert_q4_builder_rejects_mismatched_projection_shape() {
-        let err = build_shared_expert_q4_phase_projections(
+    fn shared_expert_resident_builder_rejects_mismatched_projection_shape() {
+        let err = build_shared_expert_resident_phase_projections(
             4,
             32,
             2,
@@ -5528,7 +5667,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("shared Q4 expert shape is invalid")
+                .contains("resident shared-expert shape is invalid")
         );
     }
 

@@ -93,7 +93,7 @@ pub enum FlashMoeStageImplementation {
     MetalResidentPostAttention,
     CpuSoftmaxTopK,
     ParallelPositionedFixedQ4Reads,
-    MetalFixedQ4ExpertSharedCombine,
+    MetalFixedQ4ExpertResidentSharedCombine,
     MetalResidentLmHeadSampler,
 }
 
@@ -115,8 +115,8 @@ impl FlashMoeStageImplementation {
             Self::ParallelPositionedFixedQ4Reads => {
                 "parallel positioned reads into fixed-Q4 whole-expert slots"
             }
-            Self::MetalFixedQ4ExpertSharedCombine => {
-                "Metal fixed-Q4 active experts and declared shared/no-shared combine"
+            Self::MetalFixedQ4ExpertResidentSharedCombine => {
+                "Metal fixed-Q4 active experts and resident Q4/BF16/F16/F32 shared/no-shared combine"
             }
             Self::MetalResidentLmHeadSampler => {
                 "Metal resident Q4/BF16/F16/F32 LM-head and sampler"
@@ -344,18 +344,8 @@ impl FlashMoeCapabilityPlan {
                 layout.family,
                 &metal,
                 FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
-                &[kernels::SHARED_EXPERT_ACTIVATION],
+                &[cmd2_projection_kernel, kernels::SHARED_EXPERT_ACTIVATION],
             )?;
-        }
-        if dense_layout != ResidentDenseLayout::Q4 && layout.shared_experts > 0 {
-            return Err(FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
-                format!(
-                    "CMD2 resolves {}, but the unified CMD3 shared-expert builder does not yet consume that layout",
-                    dense_layout.as_str()
-                ),
-            ));
         }
         let lm_head_projection_kernel = match dense_layout {
             ResidentDenseLayout::Q4 => kernels::Q4_MMAP_FMA_MATVEC,
@@ -409,7 +399,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
                 FlashMoeStagePlacement::Metal,
-                FlashMoeStageImplementation::MetalFixedQ4ExpertSharedCombine,
+                FlashMoeStageImplementation::MetalFixedQ4ExpertResidentSharedCombine,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::LmHeadAndSampling,
@@ -827,7 +817,7 @@ mod tests {
             plan.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
                 .unwrap()
                 .implementation,
-            FlashMoeStageImplementation::MetalFixedQ4ExpertSharedCombine
+            FlashMoeStageImplementation::MetalFixedQ4ExpertResidentSharedCombine
         );
     }
 
@@ -852,25 +842,31 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_non_q4_dense_resolves_fused_linear_then_fails_at_shared_cmd3() {
+    fn qwen35_non_q4_dense_resolves_complete_unified_graph() {
         let layout = qwen35_layout();
         for dense_layout in [
             ResidentDenseLayout::Bf16,
             ResidentDenseLayout::F16,
             ResidentDenseLayout::F32,
         ] {
-            let err = FlashMoeCapabilityPlan::resolve(
+            let plan = FlashMoeCapabilityPlan::resolve(
                 &layout,
                 text_adapter(),
                 dense_layout,
                 fixed_q4_experts(&layout),
                 Some(full_metal()),
             )
-            .unwrap_err();
+            .unwrap();
 
-            assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
-            assert!(err.reason.contains("CMD2 resolves"), "{err}");
-            assert!(err.reason.contains(dense_layout.as_str()), "{err}");
+            plan.validate_complete().unwrap();
+            assert_eq!(plan.dense_layout, dense_layout);
+            assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
+            assert_eq!(
+                plan.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
+                    .unwrap()
+                    .implementation,
+                FlashMoeStageImplementation::MetalFixedQ4ExpertResidentSharedCombine
+            );
         }
     }
 

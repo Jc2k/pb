@@ -38,7 +38,7 @@ use super::state::{
 use super::weights::{
     Cmd2ResidentPostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
     LinearAttentionResidentBindings, ResidentMmapMatvecProjection, ResidentStaticDtype,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1753,7 +1753,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
 
     fn require_shared_implementation(source: MetalCmd3SharedPhaseSource) -> anyhow::Result<()> {
         match source {
-            MetalCmd3SharedPhaseSource::ResidentQ4 | MetalCmd3SharedPhaseSource::None => Ok(()),
+            MetalCmd3SharedPhaseSource::Resident | MetalCmd3SharedPhaseSource::None => Ok(()),
             MetalCmd3SharedPhaseSource::Dense => anyhow::bail!(
                 "FlashMoe unsupported Metal CMD3 implementation: dense CPU shared-expert weights are not a declared implementation"
             ),
@@ -2030,9 +2030,9 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
     ) -> anyhow::Result<()> {
         unsafe {
             match command.shared.source {
-                MetalCmd3SharedPhaseSource::ResidentQ4 => {
-                    let weights = shared.q4().context(
-                        "FlashMoe Metal CMD3 resident-Q4 shared stage has no Q4 projections",
+                MetalCmd3SharedPhaseSource::Resident => {
+                    let weights = shared.resident().context(
+                        "FlashMoe Metal CMD3 resident shared stage has no resolved projections",
                     )?;
                     let work = self.shared_work_buffers(command.shared, buffers)?;
                     let stage = MetalCmd3SharedStageBuffers::projected(
@@ -2045,13 +2045,32 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     let work = stage
                         .work
                         .context("missing Metal CMD3 shared work buffers")?;
-                    self.encode_q4_projection(encoder, &weights.gate, stage.normed, work.gate_out)?;
-                    self.encode_q4_projection(encoder, &weights.up, stage.normed, work.up_out)?;
-                    self.encode_q4_projection(
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
                         encoder,
+                        self.dense_weights,
+                        &weights.gate,
+                        stage.normed,
+                        work.gate_out,
+                        0,
+                    )?;
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
+                        encoder,
+                        self.dense_weights,
+                        &weights.up,
+                        stage.normed,
+                        work.up_out,
+                        0,
+                    )?;
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
+                        encoder,
+                        self.dense_weights,
                         &weights.router,
                         stage.normed,
                         work.router_out,
+                        0,
                     )?;
                     msg_send_void1_id(
                         encoder,
@@ -2065,11 +2084,14 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     set_buffer(encoder, work.intermediate, 4);
                     set_buffer(encoder, work.total_intermediate, 5);
                     dispatch_threads(encoder, command.shared.activation_dispatch_threads());
-                    self.encode_q4_projection(
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
                         encoder,
+                        self.dense_weights,
                         &weights.down,
                         work.activated,
                         stage.shared_output,
+                        0,
                     )?;
                 }
                 MetalCmd3SharedPhaseSource::None => {
@@ -2119,77 +2141,6 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             set_buffer(encoder, stage.width, 5);
             set_buffer(encoder, stage.active_count, 6);
             dispatch_threads(encoder, stage.plan.dispatch_threads);
-            Ok(())
-        }
-    }
-
-    unsafe fn encode_q4_projection(
-        &self,
-        encoder: MetalObjcId,
-        projection: &DenseQ4MmapMatvecProjection,
-        input: MetalObjcId,
-        output: MetalObjcId,
-    ) -> anyhow::Result<()> {
-        unsafe {
-            let scale_bytes = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
-                std::mem::size_of::<u16>()
-            } else if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_F32 {
-                std::mem::size_of::<f32>()
-            } else {
-                anyhow::bail!(
-                    "FlashMoe Metal CMD3 projection {} has unsupported scale/bias dtype {}",
-                    projection.tensor_name,
-                    projection.scale_bias_dtype
-                );
-            };
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("Metal CMD3 Q4 packed length overflow")?;
-            let groups_len = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bytes))
-                .context("Metal CMD3 Q4 group length overflow")?;
-            for (offset, len) in [
-                (projection.packed_byte_offset, packed_len),
-                (projection.scales_byte_offset, groups_len),
-                (projection.biases_byte_offset, groups_len),
-            ] {
-                let offset = usize::try_from(offset).context("Metal CMD3 Q4 offset overflow")?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > self.dense_weights.len)
-                {
-                    anyhow::bail!(
-                        "FlashMoe Metal CMD3 projection {} exceeds resident dense weights",
-                        projection.tensor_name
-                    );
-                }
-            }
-            let rows = u32::try_from(projection.rows).context("Metal CMD3 Q4 rows exceed u32")?;
-            let cols = u32::try_from(projection.cols).context("Metal CMD3 Q4 cols exceed u32")?;
-            let groups = u32::try_from(projection.groups_per_row)
-                .context("Metal CMD3 Q4 groups exceed u32")?;
-            let group_size = u32::try_from(projection.group_size)
-                .context("Metal CMD3 Q4 group size exceeds u32")?;
-            let pipeline = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
-                self.runtime.pipelines.q4_mmap_bf16_scale_bias_pipeline
-            } else {
-                self.runtime.pipelines.q4_mmap_pipeline
-            };
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer(encoder, self.dense_weights.buffer, 0);
-            set_buffer(encoder, input, 1);
-            set_buffer(encoder, output, 2);
-            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-            set_bytes(encoder, u32_as_bytes(&rows), 6);
-            set_bytes(encoder, u32_as_bytes(&cols), 7);
-            set_bytes(encoder, u32_as_bytes(&groups), 8);
-            set_bytes(encoder, u32_as_bytes(&group_size), 9);
-            dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
             Ok(())
         }
     }
@@ -3975,7 +3926,7 @@ impl MetalCmd3NextNormPlan {
 pub(crate) enum MetalCmd3SharedPhaseSource {
     None,
     Dense,
-    ResidentQ4,
+    Resident,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4112,12 +4063,12 @@ impl MetalCmd3SharedPhasePlan {
         Self::from_shape(MetalCmd3SharedPhaseSource::Dense, width, shape)
     }
 
-    pub(crate) fn resident_q4(
+    pub(crate) fn resident(
         width: usize,
-        shared: &SharedExpertPhaseQ4Projections,
+        shared: &SharedExpertPhaseResidentProjections,
     ) -> anyhow::Result<Self> {
         let shape = shared.validated_shape()?;
-        Self::from_shape(MetalCmd3SharedPhaseSource::ResidentQ4, width, shape)
+        Self::from_shape(MetalCmd3SharedPhaseSource::Resident, width, shape)
     }
 
     pub(crate) fn total_intermediate_u32(self) -> anyhow::Result<u32> {
@@ -4433,8 +4384,8 @@ impl MetalCmd3ExecutionPlan {
             ScheduledSharedExpertPhaseRef::Dense(shared) => {
                 MetalCmd3SharedPhasePlan::dense(width, shared)?
             }
-            ScheduledSharedExpertPhaseRef::Q4(shared) => {
-                MetalCmd3SharedPhasePlan::resident_q4(width, shared)?
+            ScheduledSharedExpertPhaseRef::Resident(shared) => {
+                MetalCmd3SharedPhasePlan::resident(width, shared)?
             }
         };
         let active_experts = payloads
@@ -7452,11 +7403,11 @@ mod tests {
     #[test]
     fn cmd3_shared_stage_buffers_require_declared_source() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
-        let shared = SharedExpertPhaseQ4Projections {
-            gate: test_q4_projection("gate", 6, 4),
-            up: test_q4_projection("up", 6, 4),
-            down: test_q4_projection("down", 4, 6),
-            router: test_q4_projection("router", 2, 4),
+        let shared = SharedExpertPhaseResidentProjections {
+            gate: test_resident_q4_projection("gate", 6, 4),
+            up: test_resident_q4_projection("up", 6, 4),
+            down: test_resident_q4_projection("down", 4, 6),
+            router: test_resident_q4_projection("router", 2, 4),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -7472,7 +7423,7 @@ mod tests {
             4,
             2,
             output_state,
-            ScheduledSharedExpertPhaseRef::Q4(&shared),
+            ScheduledSharedExpertPhaseRef::Resident(&shared),
             None,
             &payloads,
         )
@@ -7513,7 +7464,7 @@ mod tests {
             MetalCmd3SharedStageBuffers::projected(plan.shared, inputs, &outputs, combine, work)
                 .unwrap();
 
-        assert_eq!(projected.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(projected.source, MetalCmd3SharedPhaseSource::Resident);
         assert_eq!(projected.normed, inputs.normed);
         assert_eq!(projected.width, combine.width);
         assert_eq!(projected.shared_output, outputs.shared_output);
@@ -7551,11 +7502,11 @@ mod tests {
     #[test]
     fn cmd3_execution_plan_declares_full_command_topology() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, true);
-        let shared = SharedExpertPhaseQ4Projections {
-            gate: test_q4_projection("gate", 6, 4),
-            up: test_q4_projection("up", 6, 4),
-            down: test_q4_projection("down", 4, 6),
-            router: test_q4_projection("router", 2, 4),
+        let shared = SharedExpertPhaseResidentProjections {
+            gate: test_resident_q4_projection("gate", 6, 4),
+            up: test_resident_q4_projection("up", 6, 4),
+            down: test_resident_q4_projection("down", 4, 6),
+            router: test_resident_q4_projection("router", 2, 4),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -7572,7 +7523,7 @@ mod tests {
             4,
             2,
             output_state,
-            ScheduledSharedExpertPhaseRef::Q4(&shared),
+            ScheduledSharedExpertPhaseRef::Resident(&shared),
             Some(4),
             &payloads,
         )
@@ -7581,7 +7532,7 @@ mod tests {
         assert_eq!(plan.phase.position, 9);
         assert_eq!(plan.phase.layer, 3);
         assert_eq!(plan.phase.output_state, output_state);
-        assert_eq!(plan.shared.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(plan.shared.source, MetalCmd3SharedPhaseSource::Resident);
         assert_eq!(plan.shared.total_intermediate, 6);
         assert_eq!(plan.active_experts.len(), 2);
         assert_eq!(plan.active_experts[0].intermediate, 5);
@@ -7828,7 +7779,7 @@ mod tests {
     fn scheduled_cmd3_builder_names_missing_shared_implementation() {
         assert!(
             MetalScheduledCmd3Builder::require_shared_implementation(
-                MetalCmd3SharedPhaseSource::ResidentQ4
+                MetalCmd3SharedPhaseSource::Resident
             )
             .is_ok()
         );
@@ -7991,20 +7942,20 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn cmd3_shared_phase_plan_declares_resident_q4_shape() {
-        let shared = SharedExpertPhaseQ4Projections {
-            gate: test_q4_projection("gate", 6, 4),
-            up: test_q4_projection("up", 6, 4),
-            down: test_q4_projection("down", 4, 6),
-            router: test_q4_projection("router", 2, 4),
+    fn cmd3_shared_phase_plan_declares_resident_shape() {
+        let shared = SharedExpertPhaseResidentProjections {
+            gate: test_resident_q4_projection("gate", 6, 4),
+            up: test_resident_q4_projection("up", 6, 4),
+            down: test_resident_q4_projection("down", 4, 6),
+            router: test_resident_q4_projection("router", 2, 4),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
         };
 
-        let plan = MetalCmd3SharedPhasePlan::resident_q4(4, &shared).unwrap();
+        let plan = MetalCmd3SharedPhasePlan::resident(4, &shared).unwrap();
 
-        assert_eq!(plan.source, MetalCmd3SharedPhaseSource::ResidentQ4);
+        assert_eq!(plan.source, MetalCmd3SharedPhaseSource::Resident);
         assert_eq!(plan.width, 4);
         assert_eq!(plan.shared_experts, 2);
         assert_eq!(plan.intermediate, 3);
@@ -8030,16 +7981,16 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn cmd3_shared_work_buffers_carry_declared_layout() {
-        let shared = SharedExpertPhaseQ4Projections {
-            gate: test_q4_projection("gate", 6, 4),
-            up: test_q4_projection("up", 6, 4),
-            down: test_q4_projection("down", 4, 6),
-            router: test_q4_projection("router", 2, 4),
+        let shared = SharedExpertPhaseResidentProjections {
+            gate: test_resident_q4_projection("gate", 6, 4),
+            up: test_resident_q4_projection("up", 6, 4),
+            down: test_resident_q4_projection("down", 4, 6),
+            router: test_resident_q4_projection("router", 2, 4),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
         };
-        let plan = MetalCmd3SharedPhasePlan::resident_q4(4, &shared).unwrap();
+        let plan = MetalCmd3SharedPhasePlan::resident(4, &shared).unwrap();
 
         let buffers = MetalCmd3SharedWorkBuffers::new(
             plan,
@@ -8164,6 +8115,15 @@ mod tests {
             group_size: 16,
             scale_bias_dtype: "F32".to_string(),
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_resident_q4_projection(
+        tensor_name: &str,
+        output_width: usize,
+        input_width: usize,
+    ) -> ResidentMmapMatvecProjection {
+        test_q4_projection(tensor_name, output_width, input_width).into()
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -178,7 +178,8 @@ Baseline reviewed on 2026-07-10:
   owns that runtime together with resident dense and recurrent state; `legacy.rs` no longer
   compiles or releases Metal pipelines, queues, devices, or buffers.
 - Production scheduled CMD3 now consumes typed GPU-resident post-attention state, scheduler-owned
-  whole-expert slots, resident-Q4 shared projections, routing weights, and typed output state in a
+  whole-expert slots, resident Q4/BF16/F16/F32 shared projections, routing weights, and typed output
+  state in a
   single `MetalScheduledCmd3Builder`. Its submitted result owns the command buffer, slot leases,
   transient/borrowed buffers, deferred GPU handoff, wait/readback, and cleanup. CPU
   normed/residual upload and dense-CPU shared expert substitutions are precise unsupported-stage
@@ -214,11 +215,16 @@ Baseline reviewed on 2026-07-10:
   binding, fused compatible-Q4 dispatch, typed per-projection dispatch otherwise, packed GPU
   output handoff, optional readback, timing, and cleanup remain one implementation. The three
   duplicate encoders and fused-batch helper have been removed from `legacy.rs`.
+- `weights` now resolves every configured shared-expert gate/up/down/router projection into one
+  per-layer `SharedExpertWeightTable` during model load. The generation loop no longer discovers or
+  caches Q4 shared bindings per token. CMD3 consumes the same `ResidentMmapMatvecProjection` type
+  and Metal encoder as CMD1, CMD2, and LM-head sampling, so Q4/BF16/F16/F32 differ only by the
+  selected resident projection implementation.
 - `runtime.rs` now owns `forward_token_input`, the production token/layer loop, deferred CMD3 handoff,
   attention execution, CMD2/routing composition, active expert issue/finish, CMD3 submission, and
   final norm/state recording. Generation, prefill, tokenizer, and sampling entry points remain
   outside that hot loop. The dead CPU dense shared-expert runtime branch was removed; supported
-  CMD3 preparation requires the resolved resident-Q4 shared projections.
+  CMD3 preparation requires load-resolved resident shared projections.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -313,9 +319,9 @@ Baseline reviewed on 2026-07-10:
   Q and K RMSNorm bindings; an absent tensor is an explicit load/runtime error instead of silently
   running unnormalized attention.
 - CMD3 treats a model configuration with zero shared experts as the declared no-shared-expert
-  implementation. Models that declare shared experts must resolve every resident Q4 shared
-  projection; a missing projection is an unsupported binding error and cannot collapse into the
-  no-shared case.
+  implementation. Models that declare shared experts must resolve every resident
+  Q4/BF16/F16/F32 shared projection; a missing projection or invalid declared shape is an
+  unsupported binding error and cannot collapse into the no-shared case.
 - Text-only Qwen MoE Q4 now resolves the same nine-stage scheduler graph as Qwen3.5 Q4. Its model
   metadata selects full attention, configured K, routed scale 1.0, selected-route normalization,
   dimension-derived fixed-Q4 slots, and the declared no-shared CMD3 source. Production load applies
@@ -364,7 +370,8 @@ Baseline reviewed on 2026-07-10:
   top candidates without entering another runtime.
 - Local-Metal reference tests exercise both the resident-Q4 fused projection batch and one mixed
   BF16/F16/F32 batch, Q4 and BF16/F16/F32 fused CMD2 preparation, and scheduler-issued CMD3
-  active-expert plus shared-expert combine against independent CPU math. Route IDs are exact and
+  active-expert plus Q4/BF16/F16/F32 shared-expert combine against independent CPU math. Route IDs
+  are exact and
   floating-point route scores use an explicit numerical tolerance rather than bitwise equality
   across CPU and Metal implementations.
 
@@ -383,9 +390,10 @@ The architecture is not yet at the target:
   projection handle, Metal dispatch, CPU/GPU input bindings, residual/norm transition, router
   readback, state handoff, padded-vocabulary policy, and topK command as Q4. Qwen3/Qwen3-VL
   non-Q4 dense plus fixed-Q4 expert graphs resolve all nine stages; real-checkpoint correctness is
-  still pending. Qwen3.5 hybrid BF16/F16/F32 now resolves fused linear attention and stops at its
-  named non-Q4 shared-expert CMD3 implementation. Non-Q4 shared-expert and expert-slot
-  implementations remain incomplete.
+  still pending. Qwen3.5 hybrid BF16/F16/F32 now resolves all nine stages, including its resident
+  shared-expert CMD3 implementation, while retaining the same fixed-Q4 active-expert slots and
+  scheduler lifecycle. Real-checkpoint correctness and non-Q4 whole-expert slot implementations
+  remain incomplete.
 
 At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
 correctness closure. Typed implementations for additional variants and final legacy removal remain;
@@ -566,7 +574,7 @@ Completion evidence:
   recurrent state, deferred CMD3 handoff, terminal hidden state, logits, and candidates.
 - Local-Metal reference tests cover resident-Q4 and BF16/F16/F32 projection/CMD2 preparation plus
   the scheduler-owned CMD3 active/shared combine. The current full all-target suite passed with
-  653 tests and seven device-dependent tests ignored, the release build completed, and the required
+  654 tests and seven device-dependent tests ignored, the release build completed, and the required
   smoke printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
@@ -576,10 +584,11 @@ Objective: add variants as stage implementations, not runtimes.
 
 Required work:
 
-- Add typed BF16/F16 dense and expert implementations where model support requires them.
-- Add Qwen MoE attention/layout/shared-expert implementations to the same graph.
-- Create `vision.rs` and make Qwen-VL produce typed runtime inputs before the MoE graph starts.
-- Add capability and parity fixtures for every newly supported combination.
+- Add typed BF16/F16 whole-expert storage and Metal implementations where model support requires
+  them, using the existing scheduler leases and CMD3 handoff.
+- Close real-checkpoint correctness for the resolved text-only Qwen MoE and Qwen-VL Q4 graphs.
+- Extend capability and parity fixtures until every supported family/dtype/expert-layout
+  combination has direct evidence.
 
 Exit criteria:
 
@@ -596,7 +605,7 @@ Current capability matrix:
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
-| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4 slots | Fused CMD1/recurrence/CMD2 implemented; unsupported at shared CMD3 | Load-resolved ten-binding table, dtype-specific kernel compilation, and precise next-stage capability failure; full-command real-model parity pending |
+| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph through resident shared CMD3 | Load-resolved linear/shared tables, dtype-specific kernels, and Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Any supported family | BF16/F16 expert slots | Unsupported at active expert/CMD3 stage | Import/reference tests only |
 
 ### Gate 7: Legacy Removal And Benchmarking
@@ -722,16 +731,15 @@ North star:
   the benchmark lock opens.
 
 For Gate 6:
-1. Make expert layout a concrete storage-resolved input to graph resolution. Generalize fixed-Q4
-   slot validation around typed dimensions and offsets so Qwen MoE can use its own layout without
-   inheriting Qwen3.5 constants.
-2. Resolve the text-only Qwen MoE Q4 graph first. Add its full-attention, Q/K norm, routing-scale,
-   shared-expert, and K policy as typed stage metadata while keeping the scheduler/runtime/CMD
-   lifecycle unchanged. Missing tensors or kernels must name the exact unresolved stage.
-3. Continue resident BF16/F16/F32 from the completed full-attention and fused-linear projection
-   graphs into shared experts. Add BF16/F16 whole-expert slots only through the same scheduler
-   leases and CMD3 handoff. Do not revive removed dense CPU/component paths as production
+1. Preserve the completed storage-resolved fixed-Q4 layouts and the resolved Qwen3.5/Qwen/Qwen-VL
+   Q4 graphs as the baseline. Do not reopen their scheduler/runtime/CMD lifecycle while adding a
+   variant; missing tensors or kernels must name the exact unresolved stage.
+2. Treat resident BF16/F16/F32 shared-expert CMD3 as complete through the same load-resolved weight
+   table and Metal builder as Q4. Add BF16/F16 whole-expert slots only through the existing
+   scheduler leases and CMD3 handoff. Do not revive removed dense CPU/component paths as production
    continuations.
+3. Run the resolved text-only Qwen MoE Q4 graph against a real checkpoint and debug manifest,
+   routing, or math mismatches through its typed metadata and shared scheduler path.
 4. Run the resolved Qwen-VL Q4 graph against a real checkpoint and debug any manifest/math mismatch
    through its typed vision executor and shared scheduler path. Do not add request-time probing or
    an alternate decoder loop to make the smoke pass.

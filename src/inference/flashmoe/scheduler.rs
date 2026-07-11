@@ -17,7 +17,7 @@ use super::state::{
 };
 use super::weights::{
     RouterScoreBatch, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
-    ScheduledNextNormWeights, SharedExpertPhaseQ4Projections, SharedExpertPhaseShape,
+    ScheduledNextNormWeights, SharedExpertPhaseResidentProjections, SharedExpertPhaseShape,
     SharedExpertPhaseWeights,
 };
 use anyhow::{Context, Result, bail};
@@ -289,13 +289,14 @@ impl FlashMoeScheduledGraph {
                 "CMD3 expert/shared combine must be implemented as a declared Metal command",
             ));
         }
-        if stage.implementation == FlashMoeStageImplementation::MetalFixedQ4ExpertSharedCombine
+        if stage.implementation
+            == FlashMoeStageImplementation::MetalFixedQ4ExpertResidentSharedCombine
             && shared == ScheduledSharedExpertSource::DenseCpuWeights
         {
             return Err(FlashMoeUnsupportedCapability::new(
                 self.family,
                 stage.stage,
-                "the fixed-Q4 CMD3 implementation requires resident Q4 shared projections or the declared no-shared source; dense CPU shared weights are not a declared graph-stage implementation",
+                "the fixed-Q4 active-expert CMD3 implementation requires resident shared projections or the declared no-shared source; dense CPU shared weights are not a declared graph-stage implementation",
             ));
         }
         Ok(ScheduledCmd3ExpertPhase {
@@ -2000,7 +2001,7 @@ pub enum ScheduledCmd3InputSource {
 pub enum ScheduledSharedExpertSource {
     None,
     DenseCpuWeights,
-    ResidentQ4Projections,
+    ResidentProjections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2035,7 +2036,7 @@ impl ScheduledSharedExpertDescriptor {
                 "FlashMoe scheduled shared expert descriptor cannot declare a shape for source None"
             ),
             (ScheduledSharedExpertSource::DenseCpuWeights, None)
-            | (ScheduledSharedExpertSource::ResidentQ4Projections, None) => bail!(
+            | (ScheduledSharedExpertSource::ResidentProjections, None) => bail!(
                 "FlashMoe scheduled shared expert descriptor source {:?} requires a declared shape",
                 source
             ),
@@ -2393,17 +2394,17 @@ pub trait ScheduledSharedExpert {
 pub(crate) enum ScheduledSharedExpertPhaseRef<'a> {
     None,
     Dense(&'a SharedExpertPhaseWeights),
-    Q4(&'a SharedExpertPhaseQ4Projections),
+    Resident(&'a SharedExpertPhaseResidentProjections),
 }
 
 impl<'a> ScheduledSharedExpertPhaseRef<'a> {
     #[allow(dead_code)]
     pub(crate) fn from_options(
         dense: Option<&'a SharedExpertPhaseWeights>,
-        q4: Option<&'a SharedExpertPhaseQ4Projections>,
+        resident: Option<&'a SharedExpertPhaseResidentProjections>,
     ) -> Self {
-        if let Some(q4) = q4 {
-            Self::Q4(q4)
+        if let Some(resident) = resident {
+            Self::Resident(resident)
         } else if let Some(dense) = dense {
             Self::Dense(dense)
         } else {
@@ -2415,13 +2416,13 @@ impl<'a> ScheduledSharedExpertPhaseRef<'a> {
     pub(crate) fn dense(self) -> Option<&'a SharedExpertPhaseWeights> {
         match self {
             Self::Dense(shared) => Some(shared),
-            Self::None | Self::Q4(_) => None,
+            Self::None | Self::Resident(_) => None,
         }
     }
 
-    pub(crate) fn q4(self) -> Option<&'a SharedExpertPhaseQ4Projections> {
+    pub(crate) fn resident(self) -> Option<&'a SharedExpertPhaseResidentProjections> {
         match self {
-            Self::Q4(shared) => Some(shared),
+            Self::Resident(shared) => Some(shared),
             Self::None | Self::Dense(_) => None,
         }
     }
@@ -2437,8 +2438,8 @@ impl ScheduledSharedExpert for ScheduledSharedExpertPhaseRef<'_> {
                 ScheduledSharedExpertSource::DenseCpuWeights,
                 Some(ScheduledSharedExpertShape::from(shared.validated_shape()?)),
             ),
-            Self::Q4(shared) => ScheduledSharedExpertDescriptor::new(
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+            Self::Resident(shared) => ScheduledSharedExpertDescriptor::new(
+                ScheduledSharedExpertSource::ResidentProjections,
                 Some(ScheduledSharedExpertShape::from(shared.validated_shape()?)),
             ),
         }
@@ -3593,8 +3594,9 @@ mod tests {
         FlashMoeExpertPhaseApplication, FlashMoeGpuBufferDescriptor, FlashMoeTokenState,
     };
     use crate::inference::flashmoe::weights::{
-        DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, RouterScoreProjectionBinding,
-        RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+        DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, ResidentMmapMatvecProjection,
+        RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
+        SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
     };
     use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
 
@@ -3910,7 +3912,7 @@ mod tests {
         let shape = match source {
             ScheduledSharedExpertSource::None => None,
             ScheduledSharedExpertSource::DenseCpuWeights
-            | ScheduledSharedExpertSource::ResidentQ4Projections => {
+            | ScheduledSharedExpertSource::ResidentProjections => {
                 Some(ScheduledSharedExpertShape::new(8, 2, 2).unwrap())
             }
         };
@@ -4010,7 +4012,7 @@ mod tests {
             state: FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep_state),
         };
         let shared = dummy_shared_expert_with_shape(
-            ScheduledSharedExpertSource::ResidentQ4Projections,
+            ScheduledSharedExpertSource::ResidentProjections,
             Some(ScheduledSharedExpertShape::new(width, 1, width).unwrap()),
         );
         let next_norm = match next_norm_weights {
@@ -4213,7 +4215,7 @@ mod tests {
             issue_elapsed: Duration::from_millis(1),
         };
         let shared = dummy_shared_expert_with_shape(
-            ScheduledSharedExpertSource::ResidentQ4Projections,
+            ScheduledSharedExpertSource::ResidentProjections,
             Some(ScheduledSharedExpertShape::new(2, 1, 2).unwrap()),
         );
 
@@ -4351,7 +4353,7 @@ mod tests {
             state: FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep_state),
         };
         let shared = dummy_shared_expert_with_shape(
-            ScheduledSharedExpertSource::ResidentQ4Projections,
+            ScheduledSharedExpertSource::ResidentProjections,
             Some(ScheduledSharedExpertShape::new(width, 1, width).unwrap()),
         );
         let execution = pending
@@ -4748,183 +4750,246 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires a local Metal device"]
-    fn qwen35_q4_cmd3_metal_output_matches_layer_reference() {
+    fn qwen35_resident_shared_cmd3_metal_output_matches_layer_reference() {
+        #[derive(Debug, Clone, Copy)]
+        enum SharedLayout {
+            Q4,
+            Dense(&'static str),
+        }
+
         let position = 7;
         let layer = 0;
         let width = 2;
         let experts = 9;
         let active_experts = 4;
-        let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
-            ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
-        ]);
-        write_identity_fixed_q4_layer(temp.path(), layer, experts);
-
         let residual = [1.5092846, 0.6604769];
         let normed = [1.2955897, 0.5669620];
         let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
         let active = top_k(&router_scores, active_experts);
-        let scheduled = scheduler
-            .begin_layer(
-                position,
-                layer,
-                1,
-                active_experts,
-                ScheduledPreviousCmd3Handoff::initial(width),
-                true,
-            )
-            .unwrap();
-        let (_, scheduled) = scheduled
-            .resolve(
-                &scheduler,
-                ScheduledCmd1InputSource::CpuNormedHidden,
-                FlashMoeCmd1InputState::cpu_normed(layer, width),
-            )
-            .unwrap();
-        let (cmd2, scheduled) = scheduled
-            .resolve(
-                &scheduler,
-                ScheduledCmd2PhaseInputs::from_inputs(
-                    ScheduledCmd2AttentionInput::metal_values(width),
-                    ScheduledCmd2ResidualInput::metal_buffer(width),
-                ),
-            )
-            .unwrap();
-        let prep_state = FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
-        let routing = scheduler
-            .routing_from_post_attention_prep(&cmd2, prep_state, &active)
-            .unwrap();
-        let pending = scheduled
-            .resolve(&routing)
-            .unwrap()
-            .issue_cmd3(&mut scheduler, &routing)
-            .unwrap();
+        for shared_layout in [
+            SharedLayout::Q4,
+            SharedLayout::Dense("BF16"),
+            SharedLayout::Dense("F16"),
+            SharedLayout::Dense("F32"),
+        ] {
+            let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
+                ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+            ]);
+            write_identity_fixed_q4_layer(temp.path(), layer, experts);
 
-        let dense_path = temp.path().join("cmd3-parity-dense.bin");
-        let mut dense_bytes = vec![0u8; 16 * 1024];
-        let one_bf16 = 0x3f80u16.to_le_bytes();
-        let mut write_identity_q4 = |packed: usize, scales: usize, rows: usize| {
-            dense_bytes[packed] = 0x01;
-            if rows > 1 {
-                dense_bytes[packed + 1] = 0x10;
-            }
-            for row in 0..rows {
-                dense_bytes[scales + row * 2..scales + row * 2 + 2].copy_from_slice(&one_bf16);
-            }
-        };
-        write_identity_q4(0, 16, 2);
-        write_identity_q4(64, 80, 2);
-        write_identity_q4(128, 144, 2);
-        dense_bytes[208..210].copy_from_slice(&one_bf16);
-        std::fs::write(&dense_path, dense_bytes).unwrap();
-        let dense_file = std::fs::File::open(&dense_path).unwrap();
-        let dense_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&dense_file).unwrap() });
-        let metal = MetalExecutionContext::compile(
-            Arc::clone(&dense_mmap),
-            dense_mmap.len() as u64,
-            &[None],
-        )
-        .unwrap();
-        let f32_bytes = |values: &[f32]| {
-            values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>()
-        };
-        let normed_buffer = unsafe {
-            metal
-                .buffers()
-                .buffer_with_bytes(metal.runtime().device, &f32_bytes(&normed))
+            let scheduled = scheduler
+                .begin_layer(
+                    position,
+                    layer,
+                    1,
+                    active_experts,
+                    ScheduledPreviousCmd3Handoff::initial(width),
+                    true,
+                )
+                .unwrap();
+            let (_, scheduled) = scheduled
+                .resolve(
+                    &scheduler,
+                    ScheduledCmd1InputSource::CpuNormedHidden,
+                    FlashMoeCmd1InputState::cpu_normed(layer, width),
+                )
+                .unwrap();
+            let (cmd2, scheduled) = scheduled
+                .resolve(
+                    &scheduler,
+                    ScheduledCmd2PhaseInputs::from_inputs(
+                        ScheduledCmd2AttentionInput::metal_values(width),
+                        ScheduledCmd2ResidualInput::metal_buffer(width),
+                    ),
+                )
+                .unwrap();
+            let prep_state =
+                FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
+            let routing = scheduler
+                .routing_from_post_attention_prep(&cmd2, prep_state, &active)
+                .unwrap();
+            let pending = scheduled
+                .resolve(&routing)
                 .unwrap()
-        };
-        let residual_buffer = unsafe {
-            metal
-                .buffers()
-                .buffer_with_bytes(metal.runtime().device, &f32_bytes(&residual))
-                .unwrap()
-        };
-        let mut prep = MetalPostAttentionPrep::new(
-            layer,
-            width,
-            experts,
-            active.clone(),
-            residual_buffer,
-            normed_buffer,
-        )
-        .unwrap();
-        prep.attach_routing_command(routing.clone()).unwrap();
-        let q4_projection = |tensor_name: &str,
-                             packed_byte_offset,
-                             scales_byte_offset,
-                             biases_byte_offset,
-                             rows| {
-            DenseQ4MmapMatvecProjection {
-                tensor_name: tensor_name.to_string(),
-                packed_byte_offset,
-                scales_byte_offset,
-                biases_byte_offset,
-                rows,
-                cols: width,
-                output_width: rows,
-                row_packed_bytes: 1,
-                groups_per_row: 1,
-                group_size: 2,
-                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
-            }
-        };
-        let shared = SharedExpertPhaseQ4Projections {
-            gate: q4_projection("shared.gate", 0, 16, 32, 2),
-            up: q4_projection("shared.up", 64, 80, 96, 2),
-            down: q4_projection("shared.down", 128, 144, 160, 2),
-            router: q4_projection("shared.router", 192, 208, 224, 1),
-            shared_experts: 1,
-            intermediate: 2,
-            width,
-        };
-        let dense_weights = metal.dense_weights().unwrap();
-        let execution = pending
-            .finish(
-                &mut scheduler,
-                ExpertPhaseInput::MetalPostAttention(prep),
-                ScheduledSharedExpertPhaseRef::Q4(&shared),
-                ScheduledNextNormWeights::none(),
-                |command| {
-                    let output = command.resolve_output_state()?;
-                    let ScheduledCmd3Command {
-                        position,
-                        layer,
-                        experts,
-                        weights,
-                        input,
-                        shared,
-                        next_norm_weights,
-                        payloads,
-                        ..
-                    } = command;
-                    let ExpertPhaseInput::MetalPostAttention(input) = input;
-                    MetalScheduledCmd3Builder::new(
-                        metal.runtime(),
-                        dense_weights,
-                        Arc::clone(metal.buffers()),
-                    )
-                    .submit(
-                        position,
-                        layer,
-                        experts,
-                        weights,
-                        input,
-                        output,
-                        shared,
-                        next_norm_weights.values(),
-                        &payloads,
-                    )
-                },
+                .issue_cmd3(&mut scheduler, &routing)
+                .unwrap();
+
+            let dense_path = temp.path().join("cmd3-parity-dense.bin");
+            let mut dense_bytes = vec![0u8; 16 * 1024];
+            let shared = match shared_layout {
+                SharedLayout::Q4 => {
+                    let one_bf16 = 0x3f80u16.to_le_bytes();
+                    let mut write_identity_q4 = |packed: usize, scales: usize, rows: usize| {
+                        dense_bytes[packed] = 0x01;
+                        if rows > 1 {
+                            dense_bytes[packed + 1] = 0x10;
+                        }
+                        for row in 0..rows {
+                            dense_bytes[scales + row * 2..scales + row * 2 + 2]
+                                .copy_from_slice(&one_bf16);
+                        }
+                    };
+                    write_identity_q4(0, 16, 2);
+                    write_identity_q4(64, 80, 2);
+                    write_identity_q4(128, 144, 2);
+                    dense_bytes[208..210].copy_from_slice(&one_bf16);
+                    let projection = |tensor_name: &str,
+                                      packed_byte_offset,
+                                      scales_byte_offset,
+                                      biases_byte_offset,
+                                      rows| {
+                        DenseQ4MmapMatvecProjection {
+                            tensor_name: tensor_name.to_string(),
+                            packed_byte_offset,
+                            scales_byte_offset,
+                            biases_byte_offset,
+                            rows,
+                            cols: width,
+                            output_width: rows,
+                            row_packed_bytes: 1,
+                            groups_per_row: 1,
+                            group_size: 2,
+                            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+                        }
+                        .into()
+                    };
+                    SharedExpertPhaseResidentProjections {
+                        gate: projection("shared.gate", 0, 16, 32, 2),
+                        up: projection("shared.up", 64, 80, 96, 2),
+                        down: projection("shared.down", 128, 144, 160, 2),
+                        router: projection("shared.router", 192, 208, 224, 1),
+                        shared_experts: 1,
+                        intermediate: 2,
+                        width,
+                    }
+                }
+                SharedLayout::Dense(dtype) => {
+                    let scalar_bytes = |value: f32| match dtype {
+                        "BF16" => ((value.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
+                        "F16" => {
+                            let bits = if value == 0.0 { 0u16 } else { 0x3c00u16 };
+                            bits.to_le_bytes().to_vec()
+                        }
+                        "F32" => value.to_le_bytes().to_vec(),
+                        _ => unreachable!(),
+                    };
+                    for offset in [0usize, 64, 128] {
+                        let values = [1.0f32, 0.0, 0.0, 1.0];
+                        let mut cursor = offset;
+                        for value in values {
+                            let bytes = scalar_bytes(value);
+                            dense_bytes[cursor..cursor + bytes.len()].copy_from_slice(&bytes);
+                            cursor += bytes.len();
+                        }
+                    }
+                    let projection = |tensor_name: &str, byte_offset, rows| {
+                        ResidentMmapMatvecProjection::Dense(DenseMmapMatvecProjection {
+                            tensor_name: tensor_name.to_string(),
+                            byte_offset,
+                            dtype: dtype.to_string(),
+                            rows,
+                            cols: width,
+                            output_width: rows,
+                        })
+                    };
+                    SharedExpertPhaseResidentProjections {
+                        gate: projection("shared.gate", 0, 2),
+                        up: projection("shared.up", 64, 2),
+                        down: projection("shared.down", 128, 2),
+                        router: projection("shared.router", 192, 1),
+                        shared_experts: 1,
+                        intermediate: 2,
+                        width,
+                    }
+                }
+            };
+            std::fs::write(&dense_path, dense_bytes).unwrap();
+            let dense_file = std::fs::File::open(&dense_path).unwrap();
+            let dense_mmap =
+                Arc::new(unsafe { memmap2::MmapOptions::new().map(&dense_file).unwrap() });
+            let metal = MetalExecutionContext::compile(
+                Arc::clone(&dense_mmap),
+                dense_mmap.len() as u64,
+                &[None],
             )
             .unwrap();
-        let output = execution.cmd3.submission.wait().unwrap();
-        let (hidden, next_normed) = output.into_hidden_and_next_normed();
-        assert!(next_normed.is_none());
-        for (actual, expected) in hidden.iter().zip([3.3542297, 0.9476203]) {
-            assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
+            let f32_bytes = |values: &[f32]| {
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+            };
+            let normed_buffer = unsafe {
+                metal
+                    .buffers()
+                    .buffer_with_bytes(metal.runtime().device, &f32_bytes(&normed))
+                    .unwrap()
+            };
+            let residual_buffer = unsafe {
+                metal
+                    .buffers()
+                    .buffer_with_bytes(metal.runtime().device, &f32_bytes(&residual))
+                    .unwrap()
+            };
+            let mut prep = MetalPostAttentionPrep::new(
+                layer,
+                width,
+                experts,
+                active.clone(),
+                residual_buffer,
+                normed_buffer,
+            )
+            .unwrap();
+            prep.attach_routing_command(routing.clone()).unwrap();
+            let dense_weights = metal.dense_weights().unwrap();
+            let execution = pending
+                .finish(
+                    &mut scheduler,
+                    ExpertPhaseInput::MetalPostAttention(prep),
+                    ScheduledSharedExpertPhaseRef::Resident(&shared),
+                    ScheduledNextNormWeights::none(),
+                    |command| {
+                        let output = command.resolve_output_state()?;
+                        let ScheduledCmd3Command {
+                            position,
+                            layer,
+                            experts,
+                            weights,
+                            input,
+                            shared,
+                            next_norm_weights,
+                            payloads,
+                            ..
+                        } = command;
+                        let ExpertPhaseInput::MetalPostAttention(input) = input;
+                        MetalScheduledCmd3Builder::new(
+                            metal.runtime(),
+                            dense_weights,
+                            Arc::clone(metal.buffers()),
+                        )
+                        .submit(
+                            position,
+                            layer,
+                            experts,
+                            weights,
+                            input,
+                            output,
+                            shared,
+                            next_norm_weights.values(),
+                            &payloads,
+                        )
+                    },
+                )
+                .unwrap();
+            let output = execution.cmd3.submission.wait().unwrap();
+            let (hidden, next_normed) = output.into_hidden_and_next_normed();
+            assert!(next_normed.is_none());
+            for (actual, expected) in hidden.iter().zip([3.3542297, 0.9476203]) {
+                assert!(
+                    (actual - expected).abs() <= 1e-4,
+                    "{actual} != {expected} for {shared_layout:?}"
+                );
+            }
         }
     }
 
@@ -4982,12 +5047,12 @@ mod tests {
         }
     }
 
-    fn dummy_shared_q4_phase() -> SharedExpertPhaseQ4Projections {
-        SharedExpertPhaseQ4Projections {
-            gate: dummy_q4_projection("shared.gate", 16, 32),
-            up: dummy_q4_projection("shared.up", 16, 32),
-            down: dummy_q4_projection("shared.down", 32, 16),
-            router: dummy_q4_projection("shared.router", 1, 32),
+    fn dummy_shared_q4_phase() -> SharedExpertPhaseResidentProjections {
+        SharedExpertPhaseResidentProjections {
+            gate: dummy_q4_projection("shared.gate", 16, 32).into(),
+            up: dummy_q4_projection("shared.up", 16, 32).into(),
+            down: dummy_q4_projection("shared.down", 32, 16).into(),
+            router: dummy_q4_projection("shared.router", 1, 32).into(),
             shared_experts: 1,
             intermediate: 16,
             width: 32,
@@ -5004,7 +5069,7 @@ mod tests {
         assert_eq!(none_descriptor.source, ScheduledSharedExpertSource::None);
         assert_eq!(none_descriptor.shape, None);
         assert!(none.dense().is_none());
-        assert!(none.q4().is_none());
+        assert!(none.resident().is_none());
 
         let dense_ref = ScheduledSharedExpertPhaseRef::from_options(Some(&dense), None);
         let dense_descriptor = dense_ref.scheduled_shared_expert_descriptor().unwrap();
@@ -5013,7 +5078,7 @@ mod tests {
             ScheduledSharedExpertSource::DenseCpuWeights
         );
         assert!(dense_ref.dense().is_some());
-        assert!(dense_ref.q4().is_none());
+        assert!(dense_ref.resident().is_none());
         assert_eq!(
             dense_descriptor.shape,
             Some(ScheduledSharedExpertShape::new(1, 1, 2).unwrap())
@@ -5023,10 +5088,10 @@ mod tests {
         let q4_descriptor = q4_ref.scheduled_shared_expert_descriptor().unwrap();
         assert_eq!(
             q4_descriptor.source,
-            ScheduledSharedExpertSource::ResidentQ4Projections
+            ScheduledSharedExpertSource::ResidentProjections
         );
         assert!(q4_ref.dense().is_none());
-        assert!(q4_ref.q4().is_some());
+        assert!(q4_ref.resident().is_some());
         assert_eq!(
             q4_descriptor.shape,
             Some(ScheduledSharedExpertShape::new(32, 1, 16).unwrap())
@@ -5204,7 +5269,7 @@ mod tests {
                 14,
                 4,
                 ScheduledCmd3InputSource::MetalPostAttentionPrep,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -5250,7 +5315,7 @@ mod tests {
         assert_eq!(cmd3.input, ScheduledCmd3InputSource::MetalPostAttentionPrep);
         assert_eq!(
             cmd3.shared,
-            ScheduledSharedExpertSource::ResidentQ4Projections
+            ScheduledSharedExpertSource::ResidentProjections
         );
         assert_eq!(cmd3.next_norm, ScheduledNextNormSource::CpuVisibleWeights);
     }
@@ -6613,7 +6678,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -6623,7 +6688,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap();
@@ -6664,7 +6729,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -6673,7 +6738,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &next_norm,
@@ -6727,7 +6792,7 @@ mod tests {
                 19,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
                 ScheduledNextNormWeights::cpu_visible(
                     "model.layers.8.input_layernorm.weight",
                     &next_norm,
@@ -6747,7 +6812,7 @@ mod tests {
         );
         assert_eq!(
             command.cmd3.shared,
-            ScheduledSharedExpertSource::ResidentQ4Projections
+            ScheduledSharedExpertSource::ResidentProjections
         );
         assert_eq!(
             command.cmd3.next_norm,
@@ -6768,7 +6833,7 @@ mod tests {
                 19,
                 &scheduled,
                 dummy_cmd3_input_with_width(ScheduledCmd3InputSource::CpuNormedResidualUpload, 4),
-                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
                 ScheduledNextNormWeights::none(),
             )
             .unwrap_err();
@@ -6790,7 +6855,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -6799,7 +6864,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap()
@@ -6827,7 +6892,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -6836,7 +6901,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -6865,7 +6930,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -6874,7 +6939,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -6978,7 +7043,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::MetalPostAttentionPrep,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::CpuVisibleWeights,
             )
             .unwrap();
@@ -6988,7 +7053,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0],
@@ -7024,10 +7089,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
-            dummy_shared_expert_with_shape(
-                ScheduledSharedExpertSource::ResidentQ4Projections,
-                None,
-            ),
+            dummy_shared_expert_with_shape(ScheduledSharedExpertSource::ResidentProjections, None),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -7047,7 +7109,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
@@ -7063,7 +7125,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert_with_shape(
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 Some(ScheduledSharedExpertShape::new(4, 2, 2).unwrap()),
             ),
             ScheduledNextNormWeights::cpu_visible(
@@ -7086,7 +7148,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert_with_shape(
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 Some(ScheduledSharedExpertShape {
                     width: 8,
                     shared_experts: 2,
@@ -7113,7 +7175,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input_with_width(ScheduledCmd3InputSource::MetalPostAttentionPrep, 8),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 4],
@@ -7136,7 +7198,7 @@ mod tests {
                 source: ScheduledCmd3InputSource::MetalPostAttentionPrep,
                 state: FlashMoeCmd3InputState::cpu_normed_residual(7, 8, 4),
             },
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -7158,7 +7220,7 @@ mod tests {
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
         let scheduled = dummy_scheduled_experts(7, 2);
         let shared_descriptor = ScheduledSharedExpertDescriptor::new(
-            ScheduledSharedExpertSource::ResidentQ4Projections,
+            ScheduledSharedExpertSource::ResidentProjections,
             Some(ScheduledSharedExpertShape::new(8, 2, 2).unwrap()),
         )
         .unwrap();
@@ -7174,7 +7236,7 @@ mod tests {
 
         assert_eq!(
             cmd3.shared,
-            ScheduledSharedExpertSource::ResidentQ4Projections
+            ScheduledSharedExpertSource::ResidentProjections
         );
         assert_eq!(cmd3.shared_descriptor, Some(shared_descriptor));
         ScheduledCmd3Submission::new(
@@ -7182,7 +7244,7 @@ mod tests {
             cmd3,
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::cpu_visible(
                 "model.layers.8.input_layernorm.weight",
                 &[1.0; 8],
@@ -7198,7 +7260,7 @@ mod tests {
             &scheduled,
             dummy_cmd3_input(ScheduledCmd3InputSource::MetalPostAttentionPrep),
             dummy_shared_expert_with_shape(
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 Some(ScheduledSharedExpertShape::new(8, 1, 4).unwrap()),
             ),
             ScheduledNextNormWeights::cpu_visible(
@@ -7220,7 +7282,7 @@ mod tests {
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
         let shared_descriptor = ScheduledSharedExpertDescriptor::new(
-            ScheduledSharedExpertSource::ResidentQ4Projections,
+            ScheduledSharedExpertSource::ResidentProjections,
             Some(ScheduledSharedExpertShape::new(8, 1, 2).unwrap()),
         )
         .unwrap();
@@ -7266,7 +7328,7 @@ mod tests {
                 7,
                 2,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -7277,7 +7339,7 @@ mod tests {
                 cmd3,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
                 ScheduledNextNormWeights::none(),
             )
             .unwrap();
@@ -7296,7 +7358,7 @@ mod tests {
                 cmd3,
                 &scheduled,
                 dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-                dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+                dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
                 ScheduledNextNormWeights::none(),
             )
             .unwrap_err();
@@ -7316,7 +7378,7 @@ mod tests {
                 7,
                 1,
                 ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::ResidentQ4Projections,
+                ScheduledSharedExpertSource::ResidentProjections,
                 ScheduledNextNormSource::None,
             )
             .unwrap();
@@ -7338,7 +7400,7 @@ mod tests {
             cmd3,
             &wrong_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
@@ -7358,7 +7420,7 @@ mod tests {
             cmd3,
             &partial_expert,
             dummy_cmd3_input(ScheduledCmd3InputSource::CpuNormedResidualUpload),
-            dummy_shared_expert(ScheduledSharedExpertSource::ResidentQ4Projections),
+            dummy_shared_expert(ScheduledSharedExpertSource::ResidentProjections),
             ScheduledNextNormWeights::none(),
         )
         .unwrap_err();
@@ -7383,7 +7445,11 @@ mod tests {
 
             assert_eq!(err.family, graph.family());
             assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
-            assert!(err.to_string().contains("requires resident Q4"), "{err:#}");
+            assert!(
+                err.to_string()
+                    .contains("requires resident shared projections"),
+                "{err:#}"
+            );
             assert!(
                 err.to_string()
                     .contains("not a declared graph-stage implementation"),

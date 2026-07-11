@@ -710,11 +710,11 @@ impl FlashMoeEngine {
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
-            let shared_q4_phase =
-                self.resolved_shared_expert_q4_phase_projections(layer, runtime.width)?;
-            let shared_phase = match shared_q4_phase.as_deref() {
-                Some(shared) => SharedExpertPhaseRef::Q4(shared),
-                None => SharedExpertPhaseRef::None,
+            let shared_phase = match self.shared_expert_weights.layer(layer)? {
+                SharedExpertLayerWeights::Resident(shared) => {
+                    SharedExpertPhaseRef::Resident(shared)
+                }
+                SharedExpertLayerWeights::None => SharedExpertPhaseRef::None,
             };
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
             let cmd3_prepare_started = Instant::now();
@@ -1154,35 +1154,5 @@ impl FlashMoeEngine {
             buckets.attention_input_projection += started.elapsed();
         }
         Ok(prep)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn resolved_shared_expert_q4_phase_projections(
-        &self,
-        layer: usize,
-        width: usize,
-    ) -> Result<Option<Arc<SharedExpertPhaseQ4Projections>>> {
-        let shared_experts = self.config.shared_experts();
-        let intermediate = self.config.shared_expert_intermediate_size();
-        let shared = self.shared_expert_phases.q4(
-            layer,
-            width,
-            shared_experts,
-            intermediate,
-            |layer, width, shared_experts, intermediate| {
-                self.dense.required_shared_expert_q4_phase_projections(
-                    layer,
-                    width,
-                    shared_experts,
-                    intermediate,
-                )
-            },
-        )?;
-        if shared_experts > 0 && intermediate > 0 && shared.is_none() {
-            bail!(
-                "FlashMoe unsupported scheduled Qwen-family CMD3 shared-expert path at layer {layer}: the model declares {shared_experts} shared experts with intermediate width {intermediate}, but resident Q4 shared projections are unavailable"
-            );
-        }
-        Ok(shared)
     }
 }

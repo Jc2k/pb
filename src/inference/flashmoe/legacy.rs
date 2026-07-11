@@ -157,7 +157,7 @@ use super::weights::{DenseQ4Layout, ResidentMmapMatvecProjection, dense_q4_layou
 use super::weights::{
     DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef,
     FlashMoeManifest, LinearAttentionWeightTable, ResidentDenseLayout, RuntimeTensorEntry,
-    SharedExpertPhaseCache, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    SharedExpertWeightTable, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, attention_tensor_name, canonical_hf_tensor_name,
     dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
     layer_norm_tensor_name, linear_attention_scalar_tensor_name, linear_attention_tensor_name,
@@ -1169,6 +1169,14 @@ where
     )?;
     progress("linear_attention_weights", phase_started.elapsed());
     phase_started = Instant::now();
+    let shared_expert_weights = dense.resolve_shared_expert_weight_table(
+        config.num_hidden_layers,
+        config.hidden_size,
+        config.shared_experts(),
+        config.shared_expert_intermediate_size(),
+    )?;
+    progress("shared_expert_weights", phase_started.elapsed());
+    phase_started = Instant::now();
     let dense_layout = dense.registry().resolve_resident_dense_layout()?;
     if matches!(
         model_layout.family,
@@ -1233,7 +1241,7 @@ where
         routing_policy,
         runtime,
         linear_attention_weights,
-        shared_expert_phases: SharedExpertPhaseCache::default(),
+        shared_expert_weights,
         session_cache: FlashMoeSessionCache::default(),
     })
 }
@@ -1251,7 +1259,7 @@ pub struct FlashMoeEngine {
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) runtime: DenseTransformerRuntime,
     pub(super) linear_attention_weights: LinearAttentionWeightTable,
-    pub(super) shared_expert_phases: SharedExpertPhaseCache,
+    pub(super) shared_expert_weights: SharedExpertWeightTable,
     input_adapter_executor: FlashMoeInputAdapterExecutor,
     session_cache: FlashMoeSessionCache,
 }
@@ -4994,43 +5002,6 @@ fn validate_qwen_q4_graph_bindings(
             config.experts(),
             runtime.width,
         )?;
-
-        let shared_experts = config.shared_experts();
-        if shared_experts > 0 {
-            let intermediate = config.shared_expert_intermediate_size();
-            let total_intermediate = shared_experts
-                .checked_mul(intermediate)
-                .context("shared expert projection width overflow")?;
-            for projection in ["gate_proj", "up_proj"] {
-                require_resident_q4_graph_projection(
-                    family,
-                    registry,
-                    store_len,
-                    "CMD3 shared expert projection",
-                    &shared_expert_tensor_name(layer, projection),
-                    total_intermediate,
-                    runtime.width,
-                )?;
-            }
-            require_resident_q4_graph_projection(
-                family,
-                registry,
-                store_len,
-                "CMD3 shared expert down projection",
-                &shared_expert_tensor_name(layer, "down_proj"),
-                runtime.width,
-                total_intermediate,
-            )?;
-            require_resident_q4_graph_projection(
-                family,
-                registry,
-                store_len,
-                "CMD3 shared expert gate projection",
-                &shared_expert_gate_tensor_name(layer),
-                shared_experts,
-                runtime.width,
-            )?;
-        }
     }
 
     let lm_head_name = if registry.tensor("lm_head.weight").is_some() {
