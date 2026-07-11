@@ -154,23 +154,30 @@ use super::vision::{MropeAxis, MropePosition};
 use super::weights::DenseStore;
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
+use super::weights::decode_dense_tensor_f32;
 #[cfg(test)]
 use super::weights::qwen3next_norm_uses_offset;
 #[cfg(test)]
 use super::weights::qwen3next_norm_weight_needs_offset;
+use super::weights::{
+    AttentionLayerType, DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef,
+    DenseTransformerRuntime, ExpertTensorRef, FlashMoeManifest, FullAttentionLayout,
+    FullAttentionQLayout, RotaryPairing, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    attention_tensor_name, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
+    full_attention_input_projection_requests, infer_attention_layer_type,
+    infer_full_attention_layout, infer_linear_attention_layout, layer_norm_tensor_name,
+    require_tensor_shape, router_tensor_name, shared_expert_gate_tensor_name,
+    shared_expert_tensor_name,
+};
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, ResidentMmapMatvecProjection, dense_q4_layout};
-use super::weights::{
-    DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef,
-    FlashMoeManifest, RuntimeTensorEntry, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
-    attention_tensor_name, canonical_hf_tensor_name, dense_q4_layout_with_scale_bias_dtype,
-    full_attention_input_projection_requests, layer_norm_tensor_name,
-    linear_attention_scalar_tensor_name, linear_attention_tensor_name, router_tensor_name,
-    shared_expert_gate_tensor_name, shared_expert_tensor_name,
-};
-use super::weights::{decode_dense_tensor_f32, dtype_size};
 #[cfg(test)]
 use super::weights::{dense_projection_tile_rows, dense_projection_tile_rows_for_metal};
+#[cfg(test)]
+use super::weights::{
+    infer_linear_attention_key_dim, linear_attention_scalar_tensor_name,
+    linear_attention_tensor_name, require_conv1d_tensor_shape, rotary_dim_for,
+};
 const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
 const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
 #[cfg(test)]
@@ -580,258 +587,6 @@ fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize,
     Some((start?, end?, count))
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct DenseTransformerRuntime {
-    pub(super) width: usize,
-    head_dim: usize,
-    /// Config-derived default K/V width. This remains useful for legacy Metal
-    /// allocation, but full-attention execution should use per-layer layouts.
-    kv_width: usize,
-    num_q_heads: usize,
-    kv_heads: usize,
-    pub(super) full_attention: Vec<Option<FullAttentionLayout>>,
-    pub(super) linear_attention: Vec<Option<LinearAttentionLayout>>,
-}
-
-impl DenseTransformerRuntime {
-    fn new(config: &QwenModelConfig) -> Self {
-        let head_dim = config.full_attention_head_dim();
-        let kv_heads = config.kv_heads();
-        Self {
-            width: config.hidden_size,
-            head_dim,
-            kv_width: kv_heads * head_dim,
-            num_q_heads: config.num_attention_heads,
-            kv_heads,
-            full_attention: vec![None; config.num_hidden_layers],
-            linear_attention: vec![None; config.num_hidden_layers],
-        }
-    }
-
-    pub(super) fn from_registry(
-        config: &QwenModelConfig,
-        registry: &TensorRegistry,
-    ) -> Result<Self> {
-        let mut runtime = Self::new(config);
-        for layer in 0..config.num_hidden_layers {
-            match infer_attention_layer_type(registry, layer)? {
-                AttentionLayerType::Full => {
-                    runtime.full_attention[layer] =
-                        Some(infer_full_attention_layout(config, registry, layer)?);
-                }
-                AttentionLayerType::Linear => {
-                    runtime.linear_attention[layer] =
-                        Some(infer_linear_attention_layout(config, registry, layer)?);
-                }
-            }
-        }
-
-        Ok(runtime)
-    }
-
-    pub(super) fn full_attention_layout(&self, layer: usize) -> Result<FullAttentionLayout> {
-        self.full_attention
-            .get(layer)
-            .copied()
-            .flatten()
-            .with_context(|| format!("missing full-attention runtime layout for layer {layer}"))
-    }
-
-    pub(super) fn linear_attention_layout(&self, layer: usize) -> Result<LinearAttentionLayout> {
-        self.linear_attention
-            .get(layer)
-            .copied()
-            .flatten()
-            .with_context(|| format!("missing linear-attention runtime layout for layer {layer}"))
-    }
-
-    pub(super) fn is_linear_attention_layer(&self, layer: usize) -> bool {
-        self.linear_attention
-            .get(layer)
-            .and_then(|layout| *layout)
-            .is_some()
-    }
-
-    #[cfg(test)]
-    fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
-        if self.is_linear_attention_layer(layer) {
-            FlashMoeLayerKind::LinearAttention
-        } else if self
-            .full_attention
-            .get(layer)
-            .and_then(|layout| *layout)
-            .is_some()
-        {
-            FlashMoeLayerKind::FullAttention
-        } else {
-            FlashMoeLayerKind::Unknown
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionLayerType {
-    Full,
-    Linear,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FullAttentionQLayout {
-    Standard,
-    Gated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RotaryPairing {
-    Adjacent,
-    SplitHalf,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FullAttentionLayout {
-    pub(super) q_layout: FullAttentionQLayout,
-    pub(super) q_projection_width: usize,
-    pub(super) q_width: usize,
-    pub(super) kv_width: usize,
-    pub(super) head_dim: usize,
-    pub(super) rotary_dim: usize,
-    pub(super) num_q_heads: usize,
-    pub(super) kv_heads: usize,
-    pub(super) rotary_pairing: RotaryPairing,
-}
-
-fn infer_linear_attention_layout(
-    config: &QwenModelConfig,
-    registry: &TensorRegistry,
-    layer: usize,
-) -> Result<LinearAttentionLayout> {
-    let qkv_name = linear_attention_tensor_name(layer, "in_proj_qkv");
-    let z_name = linear_attention_tensor_name(layer, "in_proj_z");
-    let b_name = linear_attention_tensor_name(layer, "in_proj_b");
-    let a_name = linear_attention_tensor_name(layer, "in_proj_a");
-    let conv_name = linear_attention_tensor_name(layer, "conv1d");
-    let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
-    let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
-    let norm_name = linear_attention_tensor_name(layer, "norm");
-    let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
-
-    let (qkv_rows, qkv_cols) = require_2d_tensor_shape(registry, &qkv_name)?;
-    let (z_rows, z_cols) = require_2d_tensor_shape(registry, &z_name)?;
-    let (b_rows, b_cols) = require_2d_tensor_shape(registry, &b_name)?;
-    let (a_rows, a_cols) = require_2d_tensor_shape(registry, &a_name)?;
-    let (out_rows, out_cols) = require_2d_tensor_shape(registry, &out_proj_name)?;
-    let a_log_len = require_1d_tensor_shape(registry, &a_log_name)?;
-    let dt_bias_len = require_1d_tensor_shape(registry, &dt_bias_name)?;
-    let value_dim = require_1d_tensor_shape(registry, &norm_name)?;
-    let (conv_channels, conv_kernel_size) = require_conv1d_tensor_shape(registry, &conv_name)?;
-    if conv_kernel_size < 2 {
-        bail!(
-            "linear-attention layer {layer} conv1d kernel size {conv_kernel_size} must be at least 2"
-        );
-    }
-
-    if qkv_cols != config.hidden_size
-        || z_cols != config.hidden_size
-        || b_cols != config.hidden_size
-        || a_cols != config.hidden_size
-    {
-        bail!(
-            "linear-attention layer {layer} projection input widths are qkv={qkv_cols}, z={z_cols}, b={b_cols}, a={a_cols}; expected hidden_size {}",
-            config.hidden_size
-        );
-    }
-    if out_rows != config.hidden_size {
-        bail!(
-            "linear-attention layer {layer} out_proj output rows {out_rows}; expected hidden_size {}",
-            config.hidden_size
-        );
-    }
-    if z_rows != out_cols {
-        bail!(
-            "linear-attention layer {layer} z width {z_rows} does not match out_proj input width {out_cols}"
-        );
-    }
-    if value_dim == 0 || z_rows % value_dim != 0 {
-        bail!(
-            "linear-attention layer {layer} value width {z_rows} is not divisible by norm/value dim {value_dim}"
-        );
-    }
-    let num_value_heads = z_rows / value_dim;
-    if b_rows != num_value_heads
-        || a_rows != num_value_heads
-        || a_log_len != num_value_heads
-        || dt_bias_len != num_value_heads
-    {
-        bail!(
-            "linear-attention layer {layer} value head counts disagree: inferred={num_value_heads}, b={b_rows}, a={a_rows}, A_log={a_log_len}, dt_bias={dt_bias_len}"
-        );
-    }
-    if qkv_rows < z_rows {
-        bail!(
-            "linear-attention layer {layer} qkv width {qkv_rows} is smaller than value width {z_rows}"
-        );
-    }
-    let paired_key_width = qkv_rows - z_rows;
-    if paired_key_width % 2 != 0 {
-        bail!(
-            "linear-attention layer {layer} qkv non-value width {paired_key_width} cannot split evenly into Q and K"
-        );
-    }
-    let total_key_width = paired_key_width / 2;
-    let key_dim = infer_linear_attention_key_dim(config, total_key_width, z_rows, value_dim)
-        .with_context(|| {
-            format!(
-                "linear-attention layer {layer} cannot infer key dimension from key width {total_key_width}, value width {z_rows}, value dim {value_dim}"
-            )
-        })?;
-    let num_key_heads = total_key_width / key_dim;
-    if num_key_heads == 0 {
-        bail!("linear-attention layer {layer} inferred zero key heads");
-    }
-    if num_value_heads % num_key_heads != 0 {
-        bail!(
-            "linear-attention layer {layer} value heads {num_value_heads} must be divisible by key heads {num_key_heads}"
-        );
-    }
-    if conv_channels != qkv_rows {
-        bail!(
-            "linear-attention layer {layer} conv1d channels {conv_channels} do not match qkv width {qkv_rows}"
-        );
-    }
-
-    Ok(LinearAttentionLayout {
-        num_value_heads,
-        num_key_heads,
-        key_dim,
-        value_dim,
-        total_key_width,
-        total_value_width: z_rows,
-        conv_dim: qkv_rows,
-        conv_kernel_size,
-    })
-}
-
-fn infer_linear_attention_key_dim(
-    config: &QwenModelConfig,
-    total_key_width: usize,
-    total_value_width: usize,
-    value_dim: usize,
-) -> Result<usize> {
-    let config_head_dim = config.hidden_size / config.num_attention_heads.max(1);
-    if config_head_dim > 0 && total_key_width.is_multiple_of(config_head_dim) {
-        return Ok(config_head_dim);
-    }
-    if is_known_qwen35_linear_attention_shape(total_key_width, total_value_width, value_dim) {
-        return Ok(LINEAR_KEY_DIM);
-    }
-    if total_key_width.is_multiple_of(value_dim) {
-        return Ok(value_dim);
-    }
-    bail!(
-        "key width is not divisible by config head_dim {config_head_dim} or manifest value_dim {value_dim}"
-    )
-}
-
 fn reorder_grouped_linear_qkv_projection(
     qkv: &mut Vec<f32>,
     layout: LinearAttentionLayout,
@@ -914,132 +669,6 @@ fn normalize_linear_attention_qk_in_place(
         }
     }
     Ok(())
-}
-
-fn is_known_qwen35_linear_attention_shape(
-    total_key_width: usize,
-    total_value_width: usize,
-    value_dim: usize,
-) -> bool {
-    total_key_width == LINEAR_TOTAL_KEY
-        && total_value_width == LINEAR_TOTAL_VALUE
-        && value_dim == LINEAR_VALUE_DIM
-}
-
-fn infer_full_attention_layout(
-    config: &QwenModelConfig,
-    registry: &TensorRegistry,
-    layer: usize,
-) -> Result<FullAttentionLayout> {
-    let q_name = attention_tensor_name(layer, "q_proj");
-    let k_name = attention_tensor_name(layer, "k_proj");
-    let v_name = attention_tensor_name(layer, "v_proj");
-    let o_name = attention_tensor_name(layer, "o_proj");
-
-    let (q_rows, q_cols) = require_2d_tensor_shape(registry, &q_name)?;
-    let (k_rows, k_cols) = require_2d_tensor_shape(registry, &k_name)?;
-    let (v_rows, v_cols) = require_2d_tensor_shape(registry, &v_name)?;
-    let (o_rows, o_cols) = require_2d_tensor_shape(registry, &o_name)?;
-
-    let num_q_heads = config.num_attention_heads;
-    let kv_heads = config.kv_heads();
-
-    if q_cols != config.hidden_size || k_cols != config.hidden_size || v_cols != config.hidden_size
-    {
-        bail!(
-            "full-attention layer {layer} projection input widths are q={q_cols}, k={k_cols}, v={v_cols}; expected hidden_size {}",
-            config.hidden_size
-        );
-    }
-    if o_rows != config.hidden_size {
-        bail!(
-            "full-attention layer {layer} o_proj output rows {o_rows}; expected hidden_size {}",
-            config.hidden_size
-        );
-    }
-    if k_rows != v_rows {
-        bail!(
-            "full-attention layer {layer} k_proj rows {k_rows} do not match v_proj rows {v_rows}"
-        );
-    }
-    if k_rows == 0 || k_rows % kv_heads != 0 {
-        bail!(
-            "full-attention layer {layer} k/v width {k_rows} is not divisible by kv_heads {kv_heads}"
-        );
-    }
-
-    let head_dim = k_rows / kv_heads;
-    let q_width = num_q_heads
-        .checked_mul(head_dim)
-        .context("full-attention q_width overflow")?;
-    let gated_q_width = q_width
-        .checked_mul(2)
-        .context("gated full-attention q_width overflow")?;
-
-    if q_rows == q_width && o_cols == q_width {
-        return Ok(FullAttentionLayout {
-            q_layout: FullAttentionQLayout::Standard,
-            q_projection_width: q_width,
-            q_width,
-            kv_width: k_rows,
-            head_dim,
-            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Standard),
-            num_q_heads,
-            kv_heads,
-            rotary_pairing: RotaryPairing::SplitHalf,
-        });
-    }
-
-    if q_rows == gated_q_width && o_cols == q_width {
-        return Ok(FullAttentionLayout {
-            q_layout: FullAttentionQLayout::Gated,
-            q_projection_width: gated_q_width,
-            q_width,
-            kv_width: k_rows,
-            head_dim,
-            rotary_dim: rotary_dim_for(config, head_dim, FullAttentionQLayout::Gated),
-            num_q_heads,
-            kv_heads,
-            rotary_pairing: RotaryPairing::SplitHalf,
-        });
-    }
-
-    bail!(
-        "unsupported full-attention layer {layer} layout: q_proj rows={q_rows}, k/v rows={k_rows}, o_proj shape=[{o_rows},{o_cols}], num_q_heads={num_q_heads}, kv_heads={kv_heads}, inferred head_dim={head_dim}; expected standard q_rows={q_width}, o_cols={q_width}, or gated q_rows={gated_q_width}, o_cols={q_width}"
-    )
-}
-
-fn rotary_dim_for(
-    config: &QwenModelConfig,
-    head_dim: usize,
-    q_layout: FullAttentionQLayout,
-) -> usize {
-    let factor = config.partial_rotary_factor.unwrap_or_else(|| {
-        if q_layout == FullAttentionQLayout::Gated {
-            0.25
-        } else {
-            1.0
-        }
-    });
-
-    let mut rotary_dim = ((head_dim as f64) * factor).round() as usize;
-    rotary_dim = rotary_dim.clamp(2, head_dim);
-    rotary_dim - (rotary_dim % 2)
-}
-
-fn require_2d_tensor_shape(
-    registry: &TensorRegistry,
-    canonical_name: &str,
-) -> Result<(usize, usize)> {
-    let tensor = registry.require(canonical_name)?;
-    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
-    match tensor.shape.as_slice() {
-        [rows, cols] if *rows > 0 && *cols > 0 => Ok((*rows, *cols)),
-        shape => bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 2-D matrix",
-            shape
-        ),
-    }
 }
 
 pub(super) fn split_q_projection(
@@ -1777,91 +1406,6 @@ fn require_resident_q4_graph_projection(
     Ok(())
 }
 
-fn require_tensor_shape(
-    registry: &TensorRegistry,
-    canonical_name: &str,
-    expected_shape: &[usize],
-) -> Result<()> {
-    let tensor = registry.require(canonical_name)?;
-    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
-    if tensor.shape.as_slice() != expected_shape {
-        bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected {:?}",
-            tensor.shape,
-            expected_shape
-        );
-    }
-    Ok(())
-}
-
-fn require_1d_tensor_shape(registry: &TensorRegistry, canonical_name: &str) -> Result<usize> {
-    let tensor = registry.require(canonical_name)?;
-    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
-    match tensor.shape.as_slice() {
-        [width] if *width > 0 => Ok(*width),
-        shape => bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty 1-D vector",
-            shape
-        ),
-    }
-}
-
-fn require_conv1d_tensor_shape(
-    registry: &TensorRegistry,
-    canonical_name: &str,
-) -> Result<(usize, usize)> {
-    let tensor = registry.require(canonical_name)?;
-    ensure_runtime_tensor_storage_supported(canonical_name, tensor)?;
-    match tensor.shape.as_slice() {
-        [channels, kernel_size] if *channels > 0 && *kernel_size > 0 => {
-            Ok((*channels, *kernel_size))
-        }
-        [channels, 1, kernel_size] if *channels > 0 && *kernel_size > 0 => {
-            Ok((*channels, *kernel_size))
-        }
-        [channels, kernel_size, 1] if *channels > 0 && *kernel_size > 0 => {
-            Ok((*channels, *kernel_size))
-        }
-        shape => bail!(
-            "Flash-MoE tensor {canonical_name} has shape {:?}; expected non-empty [channels, kernel], [channels, 1, kernel], or [channels, kernel, 1]",
-            shape
-        ),
-    }
-}
-
-fn ensure_runtime_tensor_storage_supported(
-    canonical_name: &str,
-    tensor: &RuntimeTensorEntry,
-) -> Result<()> {
-    match &tensor.quantization {
-        TensorQuantization::None => {
-            if dtype_size(&tensor.dtype).is_none() {
-                bail!(
-                    "Flash-MoE tensor {canonical_name} has unsupported dtype {}",
-                    tensor.dtype
-                );
-            }
-        }
-        TensorQuantization::Q4 {
-            group_size,
-            scale_bias_dtype,
-            ..
-        } => {
-            if !tensor.dtype.eq_ignore_ascii_case("U32") {
-                bail!(
-                    "Flash-MoE q4 tensor {canonical_name} has unsupported packed dtype {}",
-                    tensor.dtype
-                );
-            }
-            dense_q4_layout_with_scale_bias_dtype(&tensor.shape, *group_size, scale_bias_dtype)
-                .with_context(|| {
-                    format!("Flash-MoE q4 tensor {canonical_name} has unsupported runtime layout")
-                })?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(super) fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
     if cfg!(test) {
@@ -1870,32 +1414,6 @@ pub(super) fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> 
         bail!(
             "Flash-MoE tensor {tensor_name} is unavailable; synthetic runtime fallback is disabled outside tests"
         )
-    }
-}
-
-fn infer_attention_layer_type(
-    registry: &TensorRegistry,
-    layer: usize,
-) -> Result<AttentionLayerType> {
-    let linear_prefix = format!("model.layers.{layer}.linear_attn.");
-    let has_linear = registry.has_tensor_with_prefix(&linear_prefix);
-    let has_full = ["q_proj", "k_proj", "v_proj", "o_proj"]
-        .iter()
-        .any(|projection| {
-            registry
-                .tensor(&attention_tensor_name(layer, projection))
-                .is_some()
-        });
-
-    match (has_linear, has_full) {
-        (true, true) => bail!(
-            "Flash-MoE tensor manifest has both linear-attention tensors ({linear_prefix}*) and full-attention self_attn projection tensors for layer {layer}"
-        ),
-        (true, false) => Ok(AttentionLayerType::Linear),
-        (false, true) => Ok(AttentionLayerType::Full),
-        (false, false) => bail!(
-            "Flash-MoE tensor manifest is missing attention tensors for layer {layer}; expected either model.layers.{layer}.linear_attn.* or model.layers.{layer}.self_attn.{{q,k,v,o}}_proj.weight"
-        ),
     }
 }
 

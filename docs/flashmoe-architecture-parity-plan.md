@@ -129,7 +129,7 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 - `capabilities`: concrete model/device/storage capability resolution and precise unsupported
   errors. It returns a fully resolved graph, not a list of family-level stage labels.
 - `weights`: resident aligned dense blob, manifest, typed tensor/projection handles, dtype/layout
-  validation, dense caches, and pull-time conversion.
+  validation, manifest-resolved attention runtime layouts, dense caches, and pull-time conversion.
 - `experts`: metadata-resolved fixed-slot layouts, validation, PBQ4 import/build compatibility and
   upgrade, layer readers, positioned reads, reusable whole-expert slots, and read metrics.
 - `scheduler`: per-token/per-layer execution state, selected implementations, CMD sequencing,
@@ -254,6 +254,11 @@ Baseline reviewed on 2026-07-11:
   parsing, candidate sampling, and generation progress diagnostics. Runtime and weights consume
   that owner directly. The duplicate hand-rolled word-level/byte-BPE test adapters were deleted
   rather than carrying `legacy.rs`'s broad dead-code allowance into the extracted module.
+- `weights.rs` now derives the dense transformer runtime layout from config plus the concrete
+  tensor registry: per-layer full-versus-linear attention, standard-versus-gated Q projection,
+  head/KV/rotary dimensions, linear-attention dimensions, and runtime tensor storage/shape
+  validation move as one load-time responsibility. Runtime consumes the resolved layouts and does
+  not infer them in the generation loop.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -407,9 +412,9 @@ Baseline reviewed on 2026-07-11:
 The architecture is not yet at the target:
 
 - The engine container, load path, and public generation/session orchestration are now in
-  `runtime.rs`, and tokenizer/sampling ownership is in `text.rs`. The dense runtime-layout builder,
-  pull-time cache assembly, expert fixture implementation, and several math helpers still remain
-  in `legacy.rs`.
+  `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
+  is in `weights.rs`. Pull-time cache assembly, expert fixture implementation, and several math
+  helpers still remain in `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
