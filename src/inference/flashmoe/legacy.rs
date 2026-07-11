@@ -74,6 +74,8 @@ use super::experts::parse_pbq4_expert_pack_generic;
 #[cfg(test)]
 use super::experts::read_expert_pack_metadata;
 #[cfg(test)]
+use super::experts::rewrite_pbq4_layer_to_fixed_q4;
+#[cfg(test)]
 use super::experts::take_reusable_expert_bytes;
 #[cfg(test)]
 use super::experts::write_all_at_positioned;
@@ -82,17 +84,16 @@ use super::experts::{
     DirectExpertTensorShape, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpectedExpertPack, ExpectedExpertPackRecord, ExpertLayerStorageFormat, ExpertMlpProjection,
     ExpertPackMetadata, ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor,
-    ExpertSlotSpec, ExpertSlotStore, ExpertStorageLayout, FixedDenseExpertRecordInput,
-    FixedDenseExpertSlotSpec, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec,
-    NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload, aggregate_expert_tensor_kind,
-    aggregate_expert_tensors, aggregate_native_q4_enabled, build_expert_pack,
-    build_fixed_dense_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
-    cleanup_stale_expert_temp_files, expected_expert_pack_from_records,
-    expected_expert_pack_record_from_source, expected_native_q4_expert_record_from_input,
-    expert_tensor_byte_range, first_missing_expert_pack_for_shape,
-    fixed_native_q4_aggregate_layout, fixed_q4_payload_from_pbq4_records,
-    native_q4_slice_byte_ranges, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
-    rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
+    ExpertSlotStore, FixedDenseExpertRecordInput, FixedDenseExpertSlotSpec, FixedQ4ExpertPayload,
+    FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload,
+    aggregate_expert_tensor_kind, aggregate_expert_tensors, aggregate_native_q4_enabled,
+    build_expert_pack, build_fixed_dense_expert_pack, build_fixed_native_q4_expert_pack,
+    build_native_q4_expert_pack, cleanup_stale_expert_temp_files,
+    expected_expert_pack_from_records, expected_expert_pack_record_from_source,
+    expected_native_q4_expert_record_from_input, expert_tensor_byte_range,
+    first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
+    fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
+    pbq4_expert_pack_wire_size, rewrite_expert_layer_pack, single_aggregate_expert_tensor,
     validate_aggregate_expert_tensor_shape, validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
@@ -1146,13 +1147,12 @@ where
         .with_scheduled_active_experts(routing_policy.active_experts)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
-    let expert_slot_spec = resolved_expert_slot_spec(plan, &model_layout)?;
-    let upgraded_expert_layers =
-        ensure_expert_execution_cache(plan, &model_layout, expert_slot_spec)?;
-    if upgraded_expert_layers > 0 {
+    let resolved_experts =
+        ExpertSlotStore::resolve_from_metadata(plan.experts_dir.clone(), &model_layout)?;
+    if resolved_experts.upgraded_pbq4_layers > 0 {
         tracing::info!(
             model = %plan.model,
-            layers = upgraded_expert_layers,
+            layers = resolved_experts.upgraded_pbq4_layers,
             "upgraded PBQ4 expert cache layers to fixed Q4 slots"
         );
     }
@@ -1209,9 +1209,8 @@ where
     let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
-    let experts = ExpertSlotStore::open_with_slot_spec(plan.experts_dir.clone(), expert_slot_spec)?;
-    let expert_storage = experts
-        .resolve_execution_descriptor(model_layout.layers, model_layout.experts_per_layer)?;
+    let experts = resolved_experts.store;
+    let expert_storage = resolved_experts.descriptor;
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
     let capability_plan = FlashMoeCapabilityPlan::resolve(
@@ -5787,40 +5786,6 @@ fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWei
     experts
         .pop()
         .with_context(|| format!("expert layer {layer} returned no expert {expert}"))
-}
-
-fn resolved_expert_storage_layout(plan: &FlashMoePlan) -> ExpertStorageLayout {
-    match plan.quantization {
-        ExpertQuantization::FourBitProduction => ExpertStorageLayout::FixedQ4,
-        ExpertQuantization::Bf16 => ExpertStorageLayout::FixedBf16,
-        ExpertQuantization::F16 => ExpertStorageLayout::FixedF16,
-    }
-}
-
-fn resolved_expert_slot_spec(
-    plan: &FlashMoePlan,
-    layout: &QwenMoeModelLayout,
-) -> Result<ExpertSlotSpec> {
-    ExpertSlotSpec::from_model_layout(layout, resolved_expert_storage_layout(plan))
-}
-
-fn ensure_expert_execution_cache(
-    plan: &FlashMoePlan,
-    layout: &QwenMoeModelLayout,
-    slot_spec: ExpertSlotSpec,
-) -> Result<usize> {
-    let Some(spec) = slot_spec.fixed_q4() else {
-        return Ok(0);
-    };
-    let mut rewritten = 0usize;
-    for layer in 0..layout.layers {
-        if rewrite_pbq4_layer_to_fixed_q4(&plan.experts_dir, layer, layout.experts_per_layer, spec)
-            .with_context(|| format!("failed to upgrade layer {layer} expert cache to fixed Q4"))?
-        {
-            rewritten += 1;
-        }
-    }
-    Ok(rewritten)
 }
 
 fn f32_to_bf16_bits(value: f32) -> u16 {

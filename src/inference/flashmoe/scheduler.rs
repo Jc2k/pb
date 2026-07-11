@@ -8062,7 +8062,7 @@ mod tests {
             slot.scheduled_cmd3_expert_phase_payload(2)
                 .unwrap_err()
                 .to_string()
-                .contains("PBQ4/component records are import compatibility only")
+                .contains("PBQ4/component import data instead of a resolved whole-expert payload")
         );
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.issued_reads, 1);
