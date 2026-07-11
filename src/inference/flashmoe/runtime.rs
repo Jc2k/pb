@@ -124,8 +124,11 @@ where
         .with_scheduled_active_experts(routing_policy.active_experts)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
-    let resolved_experts =
-        ExpertSlotStore::resolve_from_metadata(plan.experts_dir.clone(), &model_layout)?;
+    let resolved_experts = ExpertSlotStore::resolve_from_metadata(
+        plan.experts_dir.clone(),
+        &model_layout,
+        plan.quantization,
+    )?;
     if resolved_experts.upgraded_pbq4_layers > 0 {
         tracing::info!(
             model = %plan.model,

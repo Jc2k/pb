@@ -2256,6 +2256,40 @@ pub(crate) enum ExpertStorageLayout {
     FixedF16,
 }
 
+impl ExpertStorageLayout {
+    fn quantization(self) -> ExpertQuantization {
+        match self {
+            Self::FixedQ4 => ExpertQuantization::FourBitProduction,
+            Self::FixedBf16 => ExpertQuantization::Bf16,
+            Self::FixedF16 => ExpertQuantization::F16,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FixedQ4 => "fixed-Q4",
+            Self::FixedBf16 => "fixed-BF16",
+            Self::FixedF16 => "fixed-F16",
+        }
+    }
+}
+
+fn validate_requested_expert_storage(
+    root: &Path,
+    resolved_layout: ExpertStorageLayout,
+    requested_quantization: ExpertQuantization,
+) -> Result<()> {
+    if resolved_layout.quantization() != requested_quantization {
+        bail!(
+            "FlashMoe unsupported expert storage policy: requested {} but cache metadata in {} resolves {} expert slots",
+            requested_quantization.as_str(),
+            root.display(),
+            resolved_layout.as_str()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExpertStoreExecutionDescriptor {
     pub(crate) layout: ExpertStorageLayout,
@@ -2433,6 +2467,7 @@ impl ExpertSlotStore {
     pub(crate) fn resolve_from_metadata(
         root: PathBuf,
         layout: &QwenMoeModelLayout,
+        requested_quantization: ExpertQuantization,
     ) -> Result<ResolvedExpertSlotStore> {
         if !root.is_dir() {
             bail!("expert store {} does not exist", root.display());
@@ -2443,18 +2478,30 @@ impl ExpertSlotStore {
                 root.display()
             )
         })?;
-        let (slot_spec, upgraded_pbq4_layers) = match metadata.format.as_str() {
-            FIXED_Q4_EXPERT_LAYER_FORMAT_V1 => (
-                ExpertSlotSpec::from_model_layout(layout, ExpertStorageLayout::FixedQ4)?,
-                0,
-            ),
+        let resolved_layout = match metadata.format.as_str() {
+            FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+            | PBQ4_EXPERT_LAYER_FORMAT_V1
+            | PBQ4_EXPERT_LAYER_FORMAT_V2 => ExpertStorageLayout::FixedQ4,
             FIXED_DENSE_EXPERT_LAYER_FORMAT_V1 => {
-                let storage = match resolve_fixed_dense_metadata_dtype(&metadata)? {
+                match resolve_fixed_dense_metadata_dtype(&metadata)? {
                     DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
                     DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
-                };
-                (ExpertSlotSpec::from_model_layout(layout, storage)?, 0)
+                }
             }
+            format => {
+                bail!("FlashMoe unsupported expert storage format {format} in layer 0 metadata")
+            }
+        };
+        validate_requested_expert_storage(&root, resolved_layout, requested_quantization)?;
+        let (slot_spec, upgraded_pbq4_layers) = match metadata.format.as_str() {
+            FIXED_Q4_EXPERT_LAYER_FORMAT_V1 => (
+                ExpertSlotSpec::from_model_layout(layout, resolved_layout)?,
+                0,
+            ),
+            FIXED_DENSE_EXPERT_LAYER_FORMAT_V1 => (
+                ExpertSlotSpec::from_model_layout(layout, resolved_layout)?,
+                0,
+            ),
             PBQ4_EXPERT_LAYER_FORMAT_V1 | PBQ4_EXPERT_LAYER_FORMAT_V2 => {
                 let slot_spec =
                     ExpertSlotSpec::from_model_layout(layout, ExpertStorageLayout::FixedQ4)?;
@@ -2473,9 +2520,7 @@ impl ExpertSlotStore {
                 }
                 (slot_spec, upgraded)
             }
-            format => {
-                bail!("FlashMoe unsupported expert storage format {format} in layer 0 metadata")
-            }
+            _ => unreachable!("expert storage format was validated before slot resolution"),
         };
         let store = Self::open_with_slot_spec(root, slot_spec)?;
         let descriptor =
@@ -5874,11 +5919,56 @@ mod tests {
         );
         write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
 
-        let resolved =
-            ExpertSlotStore::resolve_from_metadata(temp.path().to_path_buf(), &layout).unwrap();
+        let resolved = ExpertSlotStore::resolve_from_metadata(
+            temp.path().to_path_buf(),
+            &layout,
+            ExpertQuantization::FourBitProduction,
+        )
+        .unwrap();
 
         assert_eq!(resolved.descriptor.slot_spec, ExpertSlotSpec::FixedQ4(spec));
         assert_eq!(resolved.upgraded_pbq4_layers, 0);
+
+        let error = ExpertSlotStore::resolve_from_metadata(
+            temp.path().to_path_buf(),
+            &layout,
+            ExpertQuantization::Bf16,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requested BF16 expert weights"));
+        assert!(error.to_string().contains("resolves fixed-Q4 expert slots"));
+    }
+
+    #[test]
+    fn requested_expert_storage_rejects_every_mismatched_resolved_layout() {
+        for resolved in [
+            ExpertStorageLayout::FixedQ4,
+            ExpertStorageLayout::FixedBf16,
+            ExpertStorageLayout::FixedF16,
+        ] {
+            for requested in [
+                ExpertQuantization::FourBitProduction,
+                ExpertQuantization::Bf16,
+                ExpertQuantization::F16,
+            ] {
+                let result = validate_requested_expert_storage(
+                    Path::new("/cache/packed_experts"),
+                    resolved,
+                    requested,
+                );
+                if resolved.quantization() == requested {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("unsupported expert storage policy"),
+                        "{error}"
+                    );
+                    assert!(error.contains(requested.as_str()), "{error}");
+                    assert!(error.contains(resolved.as_str()), "{error}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5964,11 +6054,40 @@ mod tests {
             );
             write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
 
-            let resolved =
-                ExpertSlotStore::resolve_from_metadata(temp.path().to_path_buf(), &layout).unwrap();
+            let quantization = match dtype {
+                DenseExpertDtype::Bf16 => ExpertQuantization::Bf16,
+                DenseExpertDtype::F16 => ExpertQuantization::F16,
+            };
+            let resolved = ExpertSlotStore::resolve_from_metadata(
+                temp.path().to_path_buf(),
+                &layout,
+                quantization,
+            )
+            .unwrap();
 
             assert_eq!(resolved.descriptor.slot_spec.fixed_dense(), Some(spec));
             assert_eq!(resolved.upgraded_pbq4_layers, 0);
+
+            let mismatched_quantization = match dtype {
+                DenseExpertDtype::Bf16 => ExpertQuantization::F16,
+                DenseExpertDtype::F16 => ExpertQuantization::Bf16,
+            };
+            let error = ExpertSlotStore::resolve_from_metadata(
+                temp.path().to_path_buf(),
+                &layout,
+                mismatched_quantization,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(mismatched_quantization.as_str()),
+                "{error:#}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(resolved.descriptor.layout.as_str()),
+                "{error:#}"
+            );
         }
     }
 
@@ -5993,8 +6112,12 @@ mod tests {
         );
         write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
 
-        let error =
-            ExpertSlotStore::resolve_from_metadata(temp.path().to_path_buf(), &layout).unwrap_err();
+        let error = ExpertSlotStore::resolve_from_metadata(
+            temp.path().to_path_buf(),
+            &layout,
+            ExpertQuantization::Bf16,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("mixes BF16 and F16"),
