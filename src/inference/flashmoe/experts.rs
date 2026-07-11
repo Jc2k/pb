@@ -2752,10 +2752,6 @@ impl ExpertLayerReader {
             slot: descriptor,
             #[cfg(test)]
             metadata: plan.metadata,
-            #[cfg(test)]
-            slot_spec: self.slot_spec,
-            #[cfg(test)]
-            recycle_pool: Some(Arc::clone(&self.buffer_pool)),
             payload,
             read_latency,
             read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
@@ -2779,10 +2775,6 @@ pub(crate) struct ExpertRawRead {
     pub(crate) slot: ExpertSlotDescriptor,
     #[cfg(test)]
     pub(crate) metadata: ExpertPackMetadata,
-    #[cfg(test)]
-    pub(crate) slot_spec: ExpertSlotSpec,
-    #[cfg(test)]
-    pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
     pub(crate) payload: ExpertRawPayload,
     pub(crate) read_latency: Duration,
     pub(crate) read_path: ExpertReadPath,
@@ -3088,7 +3080,6 @@ impl ExpertSlotSpec {
 pub(crate) struct FixedQ4ExpertPayload {
     pub(crate) spec: FixedQ4ExpertSlotSpec,
     pub(crate) bytes: Vec<u8>,
-    pub(crate) decoded: Option<FixedQ4ExpertPayloadDecoded>,
     pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
 }
 
@@ -3097,7 +3088,6 @@ impl Clone for FixedQ4ExpertPayload {
         Self {
             spec: self.spec,
             bytes: self.bytes.clone(),
-            decoded: self.decoded.clone(),
             recycle_pool: None,
         }
     }
@@ -3105,7 +3095,7 @@ impl Clone for FixedQ4ExpertPayload {
 
 impl PartialEq for FixedQ4ExpertPayload {
     fn eq(&self, other: &Self) -> bool {
-        self.spec == other.spec && self.bytes == other.bytes && self.decoded == other.decoded
+        self.spec == other.spec && self.bytes == other.bytes
     }
 }
 
@@ -3137,7 +3127,6 @@ impl FixedQ4ExpertPayload {
         Ok(Self {
             spec,
             bytes,
-            decoded: None,
             recycle_pool,
         })
     }
@@ -3244,18 +3233,11 @@ impl FixedQ4ExpertPayload {
         let groups_per_row = cols.div_ceil(self.spec.layout.group_size).max(1);
         let needed_groups = rows.checked_mul(groups_per_row)?;
         let needed_packed = rows.checked_mul(cols.div_ceil(2))?;
-        let decoded = self.decoded.as_ref();
-        let (packed, scale_bytes, bias_bytes, scales, biases, source) = match projection {
+        let (packed, scale_bytes, bias_bytes, source) = match projection {
             ExpertMlpProjection::Gate => (
                 self.component(QwenMoeExpertComponentKind::GateWeight),
                 self.component(QwenMoeExpertComponentKind::GateScale),
                 self.component(QwenMoeExpertComponentKind::GateBias),
-                decoded
-                    .map(|decoded| decoded.gate_scales.as_slice())
-                    .unwrap_or(&[]),
-                decoded
-                    .map(|decoded| decoded.gate_biases.as_slice())
-                    .unwrap_or(&[]),
                 self.component_source(
                     QwenMoeExpertComponentKind::GateWeight,
                     QwenMoeExpertComponentKind::GateScale,
@@ -3266,12 +3248,6 @@ impl FixedQ4ExpertPayload {
                 self.component(QwenMoeExpertComponentKind::UpWeight),
                 self.component(QwenMoeExpertComponentKind::UpScale),
                 self.component(QwenMoeExpertComponentKind::UpBias),
-                decoded
-                    .map(|decoded| decoded.up_scales.as_slice())
-                    .unwrap_or(&[]),
-                decoded
-                    .map(|decoded| decoded.up_biases.as_slice())
-                    .unwrap_or(&[]),
                 self.component_source(
                     QwenMoeExpertComponentKind::UpWeight,
                     QwenMoeExpertComponentKind::UpScale,
@@ -3282,12 +3258,6 @@ impl FixedQ4ExpertPayload {
                 self.component(QwenMoeExpertComponentKind::DownWeight),
                 self.component(QwenMoeExpertComponentKind::DownScale),
                 self.component(QwenMoeExpertComponentKind::DownBias),
-                decoded
-                    .map(|decoded| decoded.down_scales.as_slice())
-                    .unwrap_or(&[]),
-                decoded
-                    .map(|decoded| decoded.down_biases.as_slice())
-                    .unwrap_or(&[]),
                 self.component_source(
                     QwenMoeExpertComponentKind::DownWeight,
                     QwenMoeExpertComponentKind::DownScale,
@@ -3298,8 +3268,6 @@ impl FixedQ4ExpertPayload {
         if packed.len() < needed_packed
             || scale_bytes.len() < needed_groups * 2
             || bias_bytes.len() < needed_groups * 2
-            || (!scales.is_empty() && scales.len() < needed_groups)
-            || (!biases.is_empty() && biases.len() < needed_groups)
         {
             return None;
         }
@@ -3309,17 +3277,9 @@ impl FixedQ4ExpertPayload {
             group_size: self.spec.layout.group_size,
             packed: &packed[..needed_packed],
             #[cfg(test)]
-            scales: if scales.is_empty() {
-                &[]
-            } else {
-                &scales[..needed_groups]
-            },
+            scales: &[],
             #[cfg(test)]
-            biases: if biases.is_empty() {
-                &[]
-            } else {
-                &biases[..needed_groups]
-            },
+            biases: &[],
             scale_bias_groups: needed_groups,
             scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16,
             scale_bytes: &scale_bytes[..needed_groups * 2],
@@ -3720,69 +3680,6 @@ impl<'a> Q4MatvecSource<'a> {
     pub(crate) fn offsets_are_metal_aligned(self) -> bool {
         self.packed_offset % 4 == 0 && self.scale_offset % 4 == 0 && self.bias_offset % 4 == 0
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FixedQ4ExpertPayloadDecoded {
-    pub(crate) gate_scales: Vec<f32>,
-    pub(crate) gate_biases: Vec<f32>,
-    pub(crate) up_scales: Vec<f32>,
-    pub(crate) up_biases: Vec<f32>,
-    pub(crate) down_scales: Vec<f32>,
-    pub(crate) down_biases: Vec<f32>,
-}
-
-impl FixedQ4ExpertPayloadDecoded {
-    #[cfg(test)]
-    pub(crate) fn from_slot(
-        view: &FixedQ4ExpertSlotView<'_>,
-        spec: FixedQ4ExpertSlotSpec,
-    ) -> Result<Self> {
-        Ok(Self {
-            gate_scales: decode_fixed_q4_bf16_component(
-                view,
-                QwenMoeExpertComponentKind::GateScale,
-            )?,
-            gate_biases: decode_fixed_q4_bf16_component(
-                view,
-                QwenMoeExpertComponentKind::GateBias,
-            )?,
-            up_scales: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpScale)?,
-            up_biases: decode_fixed_q4_bf16_component(view, QwenMoeExpertComponentKind::UpBias)?,
-            down_scales: decode_fixed_q4_bf16_component(
-                view,
-                QwenMoeExpertComponentKind::DownScale,
-            )?,
-            down_biases: decode_fixed_q4_bf16_component(
-                view,
-                QwenMoeExpertComponentKind::DownBias,
-            )?,
-        })
-        .and_then(|decoded| {
-            let groups_per_gate_row = spec.hidden_size.div_ceil(spec.layout.group_size);
-            let groups_per_down_row = spec.intermediate_size.div_ceil(spec.layout.group_size);
-            let gate_groups = spec.intermediate_size * groups_per_gate_row;
-            let down_groups = spec.hidden_size * groups_per_down_row;
-            if decoded.gate_scales.len() < gate_groups
-                || decoded.gate_biases.len() < gate_groups
-                || decoded.up_scales.len() < gate_groups
-                || decoded.up_biases.len() < gate_groups
-                || decoded.down_scales.len() < down_groups
-                || decoded.down_biases.len() < down_groups
-            {
-                bail!("fixed Q4 expert scale/bias payload is shorter than model layout requires");
-            }
-            Ok(decoded)
-        })
-    }
-}
-
-#[cfg(test)]
-fn decode_fixed_q4_bf16_component(
-    view: &FixedQ4ExpertSlotView<'_>,
-    kind: QwenMoeExpertComponentKind,
-) -> Result<Vec<f32>> {
-    decode_fixed_q4_bf16_component_bytes(view.component(kind))
 }
 
 #[cfg(test)]
@@ -5019,6 +4916,54 @@ pub(super) fn sha256_hex_parts(parts: &[&[u8]]) -> String {
         write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
     }
     out
+}
+
+#[cfg(test)]
+pub(super) fn read_pbq4_expert_records(
+    root: &Path,
+    layer: usize,
+    expert: usize,
+) -> Result<Vec<PackedExpertTensor>> {
+    let store = ExpertSlotStore::open(root.to_path_buf())?;
+    let raw = store
+        .read_many_raw(layer, &[expert])?
+        .pop()
+        .with_context(|| format!("expert layer {layer} returned no expert {expert}"))?;
+    let ExpertRawPayload::Pbq4(bytes) = raw.payload else {
+        bail!(
+            "expert layer {layer} expert {expert} is fixed-slot execution storage, not PBQ4 import data"
+        );
+    };
+    parse_pbq4_expert_pack(&bytes, Some(&raw.metadata))
+}
+
+#[cfg(test)]
+pub(super) fn packed_expert_record_suffix<'a>(
+    records: &'a [PackedExpertTensor],
+    suffix: &str,
+) -> Option<&'a PackedExpertTensor> {
+    records.iter().find(|record| record.name.ends_with(suffix))
+}
+
+#[cfg(test)]
+pub(super) fn project_packed_expert_record(
+    record: &PackedExpertTensor,
+    input: &[f32],
+    output_width: usize,
+) -> Result<Vec<f32>> {
+    let payload = record
+        .matvec_payload(input, output_width)
+        .with_context(|| format!("PBQ4 record {} has no compatible Q4 payload", record.name))?;
+    q4_fma_matvec_with_group_size(
+        payload.packed,
+        &input[..payload.cols],
+        payload.scales,
+        payload.biases,
+        payload.rows,
+        payload.cols,
+        payload.group_size,
+    )
+    .with_context(|| format!("failed to project PBQ4 import record {}", record.name))
 }
 
 #[cfg(test)]

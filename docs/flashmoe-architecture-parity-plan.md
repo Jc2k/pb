@@ -279,15 +279,21 @@ Baseline reviewed on 2026-07-11:
   transaction and its safetensors/source-range helpers no longer live behind `legacy.rs`.
 - Production no longer compiles or imports `legacy.rs`. Runtime owns timing aggregation; weights
   owns required-manifest and resident-Q4 graph-binding validation plus the F32 Accelerate matvec;
-  and the unused runtime expert-store test adapter has been deleted. The former `ExpertWeights`,
-  decoded/component Q4, CPU projection, and recurrent compatibility implementations are test-only.
-  This satisfies Gate 7's no-production-owner criterion, but does not complete Gate 7 while Gate 6
-  checkpoint evidence and the post-refactor benchmark work remain open.
+  and the unused runtime expert-store adapter has been deleted. The test-only `ExpertWeights`
+  decoded/component execution adapter and CPU expert-phase substitute are also gone. PBQ4 tests
+  inspect import records through experts-owned helpers; fixed-slot execution tests use
+  `FixedQ4ExpertPayload` or scheduler-owned `ScheduledExpertSlot` directly. This satisfies Gate 7's
+  no-production-owner criterion, but does not complete Gate 7 while Gate 6 checkpoint evidence and
+  the post-refactor benchmark work remain open.
 - The test-only legacy boundary no longer suppresses dead-code warnings. Unused synthetic-runtime
   gates, decoded-expert methods, tokenizer data, and an unregistered duplicate state test were
   deleted; deterministic synthetic dense-weight hashing moved to the `weights.rs` fixture that
   consumes it. Remaining legacy helpers must compile as dependencies of registered parity or
   compatibility tests.
+- Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
+  deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
+  cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
+  scheduled Metal path continues to consume typed offsets into those same bytes.
 - Pull-time dense conversion is now weights-owned: MLX native-Q4 companion resolution, logical
   shape and quantization metadata, aligned offsets/padding, mmap source reads, post-hoc Q4
   conversion, and dense/vision store publication moved together. `safetensors.rs` owns shared,
@@ -657,7 +663,9 @@ Completion evidence:
   654 tests and seven device-dependent tests ignored, the release build completed, and the required
   smoke printed `4` on 2026-07-11. After expert packing moved to its target owner, the full suite
   passed with 678 tests and seven device-dependent tests ignored; web assets and the release binary
-  rebuilt, and the required smoke again printed `4` on 2026-07-11.
+  rebuilt, and the required smoke again printed `4` on 2026-07-11. After removing the legacy
+  decoded/component execution adapter and its duplicate fallback tests, 675 tests passed with seven
+  ignored; the release binary rebuilt and the required smoke still printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations

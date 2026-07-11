@@ -549,13 +549,6 @@ pub(super) fn add_in_place(target: &mut [f32], update: &[f32]) {
     }
 }
 
-#[cfg(test)]
-pub(super) fn add_scaled_in_place(target: &mut [f32], update: &[f32], scale: f32) {
-    for (target, update) in target.iter_mut().zip(update) {
-        *target += *update * scale;
-    }
-}
-
 pub(super) fn trace_layer_values(position: usize, layer: usize, stage: &str, values: &[f32]) {
     let _ = (position, layer, stage, values);
 }

@@ -3806,7 +3806,6 @@ mod tests {
     }
 
     fn raw_pbq4_read(layer: usize, expert: usize, payload: Vec<u8>) -> ExpertRawRead {
-        let layout = qwen35_layout();
         ExpertRawRead {
             layer,
             expert,
@@ -3823,10 +3822,6 @@ mod tests {
                 packed_bytes: payload.len() as u64,
                 records: Vec::new(),
             },
-            slot_spec: ExpertSlotSpec::FixedQ4(
-                FixedQ4ExpertSlotSpec::from_model_layout(&layout).unwrap(),
-            ),
-            recycle_pool: None,
             payload: ExpertRawPayload::Pbq4(payload),
             read_latency: Duration::from_millis(7),
             read_path: ExpertReadPath::PositionedRead,
@@ -3857,8 +3852,6 @@ mod tests {
                 packed_bytes: fixed_q4.layout.expert_bytes as u64,
                 records: Vec::new(),
             },
-            slot_spec: ExpertSlotSpec::FixedQ4(fixed_q4),
-            recycle_pool: None,
             payload: ExpertRawPayload::FixedQ4(payload),
             read_latency: Duration::from_millis(3),
             read_path: ExpertReadPath::PositionedRead,
@@ -3886,8 +3879,6 @@ mod tests {
                 packed_bytes: spec.expert_bytes as u64,
                 records: Vec::new(),
             },
-            slot_spec: ExpertSlotSpec::FixedDense(spec),
-            recycle_pool: None,
             payload: ExpertRawPayload::FixedDense(payload),
             read_latency: Duration::from_millis(3),
             read_path: ExpertReadPath::PositionedRead,
