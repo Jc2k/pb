@@ -2047,6 +2047,7 @@ pub trait ScheduledCmd3Input {
     fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState;
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScheduledCmd3CpuInput<'a> {
     #[allow(dead_code)]
@@ -2056,6 +2057,7 @@ pub(crate) struct ScheduledCmd3CpuInput<'a> {
     state: FlashMoeCmd3InputState,
 }
 
+#[cfg(test)]
 impl<'a> ScheduledCmd3CpuInput<'a> {
     #[cfg(test)]
     pub(crate) fn new(layer: usize, normed: &'a [f32], residual: &'a [f32]) -> Result<Self> {
@@ -2079,11 +2081,13 @@ impl<'a> ScheduledCmd3CpuInput<'a> {
         self.state.width()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn state(self) -> FlashMoeCmd3InputState {
         self.state
     }
 }
 
+#[cfg(test)]
 impl ScheduledCmd3Input for ScheduledCmd3CpuInput<'_> {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
         ScheduledCmd3InputSource::CpuNormedResidualUpload

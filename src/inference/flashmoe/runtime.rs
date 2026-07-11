@@ -11,7 +11,368 @@ use super::state::*;
 use super::types::*;
 use super::weights::*;
 
+use super::metal::MetalObjcId as ObjcId;
 use super::scheduler::ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef;
+
+#[derive(Debug, Clone)]
+pub(super) struct MetalExecutionFacade {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) inner: Arc<MetalExecutionContext>,
+}
+
+#[derive(Debug)]
+pub(super) enum ExpertPhaseInput {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MetalPostAttention(MetalPostAttentionPrep),
+}
+
+impl ScheduledCmd3Input for ExpertPhaseInput {
+    fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
+        match self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MetalPostAttention(_) => ScheduledCmd3InputSource::MetalPostAttentionPrep,
+        }
+    }
+
+    fn scheduled_cmd3_input_state(&self, layer: usize) -> FlashMoeCmd3InputState {
+        match self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MetalPostAttention(prep) => prep.input.scheduled_cmd3_input_state(layer),
+        }
+    }
+}
+
+type ScheduledExpertCommand<'a> =
+    ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
+
+#[derive(Debug)]
+pub(super) enum DeferredExpertPhase {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    Ready(FlashMoeExpertPhaseOutput),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    ScheduledMetal(MetalScheduledCmd3Submission),
+}
+
+impl DeferredExpertPhase {
+    pub(super) fn wait(self) -> Result<FlashMoeExpertPhaseOutput> {
+        match self {
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            Self::Ready(output) => Ok(output),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::ScheduledMetal(output) => output.wait(),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn next_normed_metal_input(&self) -> Option<DeferredMetalInput> {
+        match self {
+            Self::ScheduledMetal(output) => output
+                .next_normed_buffer()
+                .map(|(buffer, len)| DeferredMetalInput::next_layer_normed(buffer, len)),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn hidden_metal_input(&self) -> Option<DeferredMetalInput> {
+        match self {
+            Self::ScheduledMetal(output) => {
+                let (buffer, len) = output.hidden_buffer();
+                Some(DeferredMetalInput::hidden(buffer, len))
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn finish_without_readback(self) -> Result<()> {
+        match self {
+            Self::ScheduledMetal(output) => output.finish_without_readback(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DeferredMetalInput {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) buffer: ObjcId,
+    pub(super) state: FlashMoeGpuBufferDescriptor,
+}
+
+impl DeferredMetalInput {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hidden(buffer: ObjcId, len: usize) -> Self {
+        Self {
+            buffer,
+            state: FlashMoeGpuBufferDescriptor::hidden(len),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn next_layer_normed(buffer: ObjcId, len: usize) -> Self {
+        Self {
+            buffer,
+            state: FlashMoeGpuBufferDescriptor::next_layer_normed(len),
+        }
+    }
+
+    pub(super) fn len(self) -> usize {
+        self.state.len()
+    }
+
+    pub(super) fn state(self) -> FlashMoeGpuBufferDescriptor {
+        self.state
+    }
+}
+
+impl MetalExecutionFacade {
+    pub(super) fn new(
+        plan: &FlashMoePlan,
+        config: &QwenModelConfig,
+        runtime: &DenseTransformerRuntime,
+        dense: &DenseStore,
+    ) -> Result<Self> {
+        if !plan.uses_metal {
+            bail!(
+                "FlashMoe unsupported required Metal execution: the resolved graph cannot be loaded with Metal disabled"
+            );
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let inner = MetalExecutionContext::compile(
+                dense.mmap.clone(),
+                dense.len,
+                &runtime.linear_attention,
+            )?;
+            tracing::info!(
+                model = %plan.model,
+                layers = config.num_hidden_layers,
+                experts = config.experts(),
+                dense_resident = inner.has_resident_dense_weights(),
+                "Flash-MoE Metal executor initialized"
+            );
+            Ok(Self {
+                inner: Arc::new(inner),
+            })
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (config, runtime, dense);
+            bail!(
+                "FlashMoe unsupported required Metal execution: the resolved graph requires Apple Silicon Metal"
+            )
+        }
+    }
+
+    pub(super) fn runtime_capabilities(&self) -> MetalRuntimeCapabilities {
+        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+    }
+
+    pub(super) fn reset_linear_attention_state(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.reset_linear_attention_state();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_scheduled_cmd3(
+        &self,
+        position: usize,
+        layer: usize,
+        experts: Arc<[Arc<ScheduledExpertSlot>]>,
+        routing_weights: &[f32],
+        input: MetalPostAttentionPrep,
+        output: ScheduledCmd3OutputState,
+        shared: SharedExpertPhaseRef<'_>,
+        next_norm_weight: Option<&[f32]>,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+    ) -> Result<MetalScheduledCmd3Submission> {
+        let dense_weights = self.inner.dense_weights().context(
+            "FlashMoe unsupported scheduled CMD3 implementation: resident dense Metal weights are unavailable",
+        )?;
+        MetalScheduledCmd3Builder::new(
+            self.inner.runtime(),
+            dense_weights,
+            Arc::clone(self.inner.buffers()),
+        )
+        .submit(
+            position,
+            layer,
+            experts,
+            routing_weights,
+            input,
+            output,
+            shared,
+            next_norm_weight,
+            payloads,
+        )
+    }
+    pub(super) fn submit_scheduled_expert_command(
+        &self,
+        command: ScheduledExpertCommand<'_>,
+    ) -> Result<DeferredExpertPhase> {
+        let output = command.resolve_output_state()?;
+        debug_assert_eq!(output.layer, command.layer);
+        debug_assert_eq!(output.cmd3, command.cmd3);
+        debug_assert_eq!(output.input_state, command.input_state);
+        let ScheduledCmd3Command {
+            position,
+            layer,
+            experts,
+            weights,
+            input,
+            shared,
+            next_norm_weights,
+            payloads,
+            ..
+        } = command;
+        let next_norm_weight = next_norm_weights.values();
+        match input {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            ExpertPhaseInput::MetalPostAttention(prep) => {
+                debug_assert_eq!(prep.input.state(), prep.state);
+                debug_assert_eq!(prep.input.width(), prep.width);
+                let pending = self.submit_scheduled_cmd3(
+                    position,
+                    layer,
+                    experts,
+                    weights,
+                    prep,
+                    output,
+                    shared,
+                    next_norm_weight,
+                    &payloads,
+                )?;
+                Ok(DeferredExpertPhase::ScheduledMetal(pending))
+            }
+        }
+    }
+
+    pub(super) fn has_resident_dense_weights(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.has_resident_dense_weights()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn resident_q4_top_candidates(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        input: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .resident_q4_top_candidates(projection, input, top_k)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projection, input, top_k);
+            bail!("FlashMoe unsupported resident Q4 topK path: Apple Silicon Metal is required")
+        }
+    }
+
+    pub(super) fn router_score_top_candidates(
+        &self,
+        plan: &RouterScoreProjectionTopKPlan,
+        hidden: &[f32],
+    ) -> Result<Option<Vec<(usize, f32)>>> {
+        if hidden.len() != plan.hidden_width {
+            bail!(
+                "FlashMoe router topK hidden length {} does not match declared width {} for layer {}",
+                hidden.len(),
+                plan.hidden_width,
+                plan.layer
+            );
+        }
+        match &plan.source {
+            RouterScoreProjectionTopKSource::ResidentDense(projection) => bail!(
+                "FlashMoe unsupported router-score layout for layer {}: resolved Metal graph requires resident Q4, got {}",
+                plan.layer,
+                projection.dtype
+            ),
+            RouterScoreProjectionTopKSource::ResidentQ4(projection) => self
+                .resident_q4_top_candidates(projection, hidden, plan.active_experts)
+                .map(Some),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn q4_post_attention_prep_topk(
+        &self,
+        projections: &Cmd2Q4PostAttentionPrepProjections,
+        attention_output: &[f32],
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+    ) -> Result<MetalPostAttentionPrep> {
+        self.inner.q4_post_attention_prep_topk(
+            projections,
+            attention_output,
+            residual,
+            post_norm_weight,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn linear_attention_q4_post_attention_prep(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        input_projections: &[DenseQ4MmapMatvecProjection],
+        input: MetalBatchProjectionInput<'_>,
+        static_offsets: MetalLinearAttentionStaticOffsets,
+        out_proj: &DenseQ4MmapMatvecProjection,
+        router: &DenseQ4MmapMatvecProjection,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+        top_k: usize,
+    ) -> Result<MetalPostAttentionPrep> {
+        self.inner.linear_attention_q4_post_attention_prep(
+            layer,
+            layout,
+            input_projections,
+            input,
+            static_offsets,
+            out_proj,
+            router,
+            residual,
+            post_norm_weight,
+            top_k,
+        )
+    }
+
+    pub(super) fn q4_mmap_matvec_batch(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.q4_projection_batch(projections, input)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projections, input);
+            Ok(None)
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn q4_mmap_matvec_batch_with_input_buffer(
+        &self,
+        projections: &[DenseQ4MmapMatvecProjection],
+        input_buffer: ObjcId,
+        input_len: usize,
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        self.inner
+            .q4_projection_batch_with_input_buffer(projections, input_buffer, input_len)
+    }
+}
 
 impl FlashMoeEngine {
     pub(super) fn forward_hidden(
