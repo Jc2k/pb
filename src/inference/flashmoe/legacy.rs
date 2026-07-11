@@ -1216,7 +1216,11 @@ where
     let config = QwenModelConfig::from_file(&plan.model_config)?;
     progress("config", phase_started.elapsed());
     phase_started = Instant::now();
-    let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?;
+    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
+    progress("routing_policy", phase_started.elapsed());
+    phase_started = Instant::now();
+    let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?
+        .with_scheduled_active_experts(routing_policy.active_experts)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
     let upgraded_expert_layers = ensure_fixed_q4_expert_cache(plan, &model_layout)?;
@@ -1228,9 +1232,6 @@ where
         );
     }
     progress("expert_cache_format", phase_started.elapsed());
-    phase_started = Instant::now();
-    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
-    progress("routing_policy", phase_started.elapsed());
     phase_started = Instant::now();
     let dense = DenseStore::open(
         plan.non_expert_weights.clone(),
@@ -1245,8 +1246,18 @@ where
     progress("runtime_layout", phase_started.elapsed());
     phase_started = Instant::now();
     let dense_layout = dense.registry().resolve_resident_dense_layout()?;
-    if model_layout.family == QwenMoeFamily::Qwen35A17B && dense_layout == ResidentDenseLayout::Q4 {
-        validate_qwen35_q4_graph_bindings(&config, &runtime, dense.registry(), dense.len)?;
+    if matches!(
+        model_layout.family,
+        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe
+    ) && dense_layout == ResidentDenseLayout::Q4
+    {
+        validate_qwen_q4_graph_bindings(
+            model_layout.family,
+            &config,
+            &runtime,
+            dense.registry(),
+            dense.len,
+        )?;
     }
     progress("dense_graph_bindings", phase_started.elapsed());
     phase_started = Instant::now();
@@ -5122,7 +5133,8 @@ fn validate_required_tensor_manifest(
     Ok(())
 }
 
-fn validate_qwen35_q4_graph_bindings(
+fn validate_qwen_q4_graph_bindings(
+    family: QwenMoeFamily,
     config: &QwenModelConfig,
     runtime: &DenseTransformerRuntime,
     registry: &TensorRegistry,
@@ -5139,6 +5151,7 @@ fn validate_qwen35_q4_graph_bindings(
             )?;
             for request in requests.requests() {
                 require_resident_q4_graph_projection(
+                    family,
                     registry,
                     store_len,
                     "CMD1 linear-attention projection",
@@ -5148,6 +5161,7 @@ fn validate_qwen35_q4_graph_bindings(
                 )?;
             }
             require_resident_q4_graph_projection(
+                family,
                 registry,
                 store_len,
                 "CMD2 linear-attention output projection",
@@ -5156,6 +5170,7 @@ fn validate_qwen35_q4_graph_bindings(
                 layout.total_value_width,
             )?;
             require_resident_static_graph_tensor(
+                family,
                 registry,
                 store_len,
                 &linear_attention_tensor_name(layer, "conv1d"),
@@ -5163,6 +5178,7 @@ fn validate_qwen35_q4_graph_bindings(
                 &["BF16", "BFLOAT16"],
             )?;
             require_resident_static_graph_tensor(
+                family,
                 registry,
                 store_len,
                 &linear_attention_scalar_tensor_name(layer, "A_log"),
@@ -5170,6 +5186,7 @@ fn validate_qwen35_q4_graph_bindings(
                 &["F32", "FLOAT32", "FP32"],
             )?;
             require_resident_static_graph_tensor(
+                family,
                 registry,
                 store_len,
                 &linear_attention_scalar_tensor_name(layer, "dt_bias"),
@@ -5177,6 +5194,7 @@ fn validate_qwen35_q4_graph_bindings(
                 &["BF16", "BFLOAT16"],
             )?;
             require_resident_static_graph_tensor(
+                family,
                 registry,
                 store_len,
                 &linear_attention_tensor_name(layer, "norm"),
@@ -5192,6 +5210,7 @@ fn validate_qwen35_q4_graph_bindings(
             )?;
             for request in requests.requests() {
                 require_resident_q4_graph_projection(
+                    family,
                     registry,
                     store_len,
                     "CMD1 full-attention projection",
@@ -5201,6 +5220,7 @@ fn validate_qwen35_q4_graph_bindings(
                 )?;
             }
             require_resident_q4_graph_projection(
+                family,
                 registry,
                 store_len,
                 "CMD2 full-attention output projection",
@@ -5211,6 +5231,7 @@ fn validate_qwen35_q4_graph_bindings(
         }
 
         require_resident_q4_graph_projection(
+            family,
             registry,
             store_len,
             "CMD2 router projection",
@@ -5227,6 +5248,7 @@ fn validate_qwen35_q4_graph_bindings(
                 .context("shared expert projection width overflow")?;
             for projection in ["gate_proj", "up_proj"] {
                 require_resident_q4_graph_projection(
+                    family,
                     registry,
                     store_len,
                     "CMD3 shared expert projection",
@@ -5236,6 +5258,7 @@ fn validate_qwen35_q4_graph_bindings(
                 )?;
             }
             require_resident_q4_graph_projection(
+                family,
                 registry,
                 store_len,
                 "CMD3 shared expert down projection",
@@ -5244,6 +5267,7 @@ fn validate_qwen35_q4_graph_bindings(
                 total_intermediate,
             )?;
             require_resident_q4_graph_projection(
+                family,
                 registry,
                 store_len,
                 "CMD3 shared expert gate projection",
@@ -5260,6 +5284,7 @@ fn validate_qwen35_q4_graph_bindings(
         "model.embed_tokens.weight"
     };
     require_resident_q4_graph_projection(
+        family,
         registry,
         store_len,
         "LM-head sampling projection",
@@ -5271,6 +5296,7 @@ fn validate_qwen35_q4_graph_bindings(
 }
 
 fn require_resident_q4_graph_projection(
+    family: QwenMoeFamily,
     registry: &TensorRegistry,
     store_len: u64,
     stage: &str,
@@ -5288,13 +5314,14 @@ fn require_resident_q4_graph_projection(
     )?
     .with_context(|| {
         format!(
-            "FlashMoe unsupported resolved Qwen3.5 Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
+            "FlashMoe unsupported resolved {family:?} Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
         )
     })?;
     Ok(())
 }
 
 fn require_resident_static_graph_tensor(
+    family: QwenMoeFamily,
     registry: &TensorRegistry,
     store_len: u64,
     tensor_name: &str,
@@ -5311,7 +5338,7 @@ fn require_resident_static_graph_tensor(
     )?
     .with_context(|| {
         format!(
-            "FlashMoe unsupported resolved Qwen3.5 Q4 linear-attention state: tensor {tensor_name} cannot bind resident static storage"
+            "FlashMoe unsupported resolved {family:?} Q4 linear-attention state: tensor {tensor_name} cannot bind resident static storage"
         )
     })?;
     Ok(())
@@ -11185,7 +11212,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_q4_graph_binding_rejects_projection_outside_resident_store() {
+    fn qwen_q4_graph_binding_rejects_projection_outside_resident_store() {
         let shape = vec![4, 4];
         let group_size = 2;
         let layout =
@@ -11218,6 +11245,7 @@ mod tests {
         let required_len = byte_offset + layout.total_bytes as u64;
 
         require_resident_q4_graph_projection(
+            QwenMoeFamily::Qwen35A17B,
             &registry,
             required_len,
             "CMD1 full-attention projection",
@@ -11228,6 +11256,7 @@ mod tests {
         .unwrap();
 
         let err = require_resident_q4_graph_projection(
+            QwenMoeFamily::Qwen35A17B,
             &registry,
             required_len - 1,
             "CMD1 full-attention projection",
@@ -11238,7 +11267,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("unsupported resolved Qwen3.5 Q4 CMD1 full-attention projection"),
+                .contains("unsupported resolved Qwen35A17B Q4 CMD1 full-attention projection"),
             "{err:#}"
         );
     }

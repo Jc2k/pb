@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeScheduledGraph {
     family: QwenMoeFamily,
+    experts_per_layer: usize,
+    active_experts: usize,
     routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     routed_expert_scale: f32,
     stages: Vec<FlashMoeStageCapability>,
@@ -53,6 +55,8 @@ impl FlashMoeScheduledGraph {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             family: capabilities.family,
+            experts_per_layer: capabilities.experts_per_layer,
+            active_experts: capabilities.active_experts,
             routing_weight_normalization: capabilities.routing_weight_normalization,
             routed_expert_scale: capabilities.routed_expert_scale,
             stages,
@@ -61,6 +65,14 @@ impl FlashMoeScheduledGraph {
 
     pub fn family(&self) -> QwenMoeFamily {
         self.family
+    }
+
+    pub fn experts_per_layer(&self) -> usize {
+        self.experts_per_layer
+    }
+
+    pub fn active_experts(&self) -> usize {
+        self.active_experts
     }
 
     pub fn routing_weight_normalization(&self) -> QwenMoeRoutingWeightNormalization {
@@ -277,13 +289,13 @@ impl FlashMoeScheduledGraph {
                 "CMD3 expert/shared combine must be implemented as a declared Metal command",
             ));
         }
-        if self.family == QwenMoeFamily::Qwen35A17B
+        if stage.implementation == FlashMoeStageImplementation::MetalFixedQ4ExpertSharedCombine
             && shared == ScheduledSharedExpertSource::DenseCpuWeights
         {
             return Err(FlashMoeUnsupportedCapability::new(
                 self.family,
                 stage.stage,
-                "Qwen3.5 Q4 CMD3 shared experts must use resident Q4 projections; dense CPU shared weights are not a declared graph-stage implementation",
+                "the fixed-Q4 CMD3 implementation requires resident Q4 shared projections or the declared no-shared source; dense CPU shared weights are not a declared graph-stage implementation",
             ));
         }
         Ok(ScheduledCmd3ExpertPhase {
@@ -446,6 +458,32 @@ impl FlashMoeExecutionScheduler {
         })
     }
 
+    pub(crate) fn begin_resolved_layer(
+        &self,
+        position: usize,
+        layer: usize,
+        layers: usize,
+        previous: ScheduledPreviousCmd3Handoff,
+        allow_deferred_output: bool,
+    ) -> Result<ScheduledLayerCmd1> {
+        self.begin_layer(
+            position,
+            layer,
+            layers,
+            self.graph.active_experts(),
+            previous,
+            allow_deferred_output,
+        )
+    }
+
+    pub(crate) fn experts_per_layer(&self) -> usize {
+        self.graph.experts_per_layer()
+    }
+
+    pub(crate) fn active_experts(&self) -> usize {
+        self.graph.active_experts()
+    }
+
     pub(crate) fn resolve_cmd1(
         &self,
         layer: usize,
@@ -490,15 +528,13 @@ impl FlashMoeExecutionScheduler {
     pub(crate) fn resolve_router_score_projection(
         &self,
         layer: usize,
-        experts: usize,
-        active_experts: usize,
         projection: Option<RouterScoreProjectionDescriptor>,
         hidden_width: usize,
     ) -> Result<ScheduledRouterScoreProjectionCommand, FlashMoeUnsupportedCapability> {
         self.graph.build_router_score_projection(
             layer,
-            experts,
-            active_experts,
+            self.graph.experts_per_layer(),
+            self.graph.active_experts(),
             projection,
             hidden_width,
         )
@@ -3585,6 +3621,29 @@ mod tests {
         QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap()
     }
 
+    fn qwen3_moe_layout() -> QwenMoeModelLayout {
+        let config: QwenModelConfig = serde_json::from_slice(
+            br#"{
+  "model_type": "qwen3_moe",
+  "architectures": ["Qwen3MoeForCausalLM"],
+  "num_hidden_layers": 48,
+  "hidden_size": 2048,
+  "num_attention_heads": 32,
+  "head_dim": 128,
+  "num_key_value_heads": 4,
+  "vocab_size": 151936,
+  "rope_theta": 1000000.0,
+  "torch_dtype": "bfloat16",
+  "num_experts": 128,
+  "num_experts_per_tok": 8,
+  "moe_intermediate_size": 768,
+  "norm_topk_prob": true
+}"#,
+        )
+        .unwrap();
+        QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
+    }
+
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
         use QwenMoeExpertComponentKind::*;
         QwenMoeQ4ExpertLayout {
@@ -3883,6 +3942,23 @@ mod tests {
         (
             temp,
             FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
+        )
+    }
+
+    fn test_qwen3_execution_scheduler() -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen3_moe_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        (
+            temp,
+            FlashMoeExecutionScheduler::new(
+                graph,
+                store,
+                vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv; 2],
+            )
+            .unwrap(),
         )
     }
 
@@ -4336,6 +4412,178 @@ mod tests {
         }
         let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
         for (actual, expected) in next_normed.iter().zip([1.4046044, 0.08228089]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn qwen3_q4_layer_parity_follows_resolved_k8_no_shared_transaction() {
+        // Golden values follow Qwen3 MoE's selected-route normalization with
+        // scale 1.0, full attention, fixed-Q4 SwiGLU, and no shared expert.
+        let position = 7;
+        let layer = 0;
+        let experts = 9;
+        let active_experts = 8;
+        let width = 2;
+        let query = [1.0, 0.0];
+        let key_0 = [1.0, 0.0];
+        let value_0 = [2.0, 1.0];
+        let key_1 = [0.0, 1.0];
+        let value_1 = [-1.0, 3.0];
+        let attention = causal_attention(
+            &query,
+            &[(&key_0, &value_0), (&key_1, &value_1)],
+            1,
+            1,
+            width,
+        );
+        let residual = [0.5 + attention[0], -1.0 + attention[1]];
+        let normed = reference_rms_norm(&residual, &[1.0, 1.0]);
+        let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
+        let active = top_k(&router_scores, active_experts);
+        assert_eq!(
+            active,
+            vec![
+                (8, 4.0),
+                (3, 3.0),
+                (5, 2.5),
+                (1, 2.0),
+                (7, 1.5),
+                (4, 0.5),
+                (0, 0.1),
+                (6, -0.2),
+            ]
+        );
+
+        let (temp, mut scheduler) = test_qwen3_execution_scheduler();
+        assert_eq!(scheduler.graph.family(), QwenMoeFamily::Qwen3Moe);
+        assert_eq!(scheduler.experts_per_layer(), 128);
+        assert_eq!(scheduler.active_experts(), 8);
+        assert_eq!(scheduler.graph.routed_expert_scale(), 1.0);
+        write_identity_fixed_q4_layer(temp.path(), layer, experts);
+
+        let attention_math = scheduler
+            .resolve_attention_math(layer, position)
+            .unwrap()
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(
+                position, layer, width, width,
+            ))
+            .unwrap();
+        assert_eq!(
+            attention_math.implementation(),
+            ScheduledAttentionMathImplementation::CpuKvCache
+        );
+
+        let scheduled = scheduler
+            .begin_resolved_layer(
+                position,
+                layer,
+                2,
+                ScheduledPreviousCmd3Handoff::initial(width),
+                true,
+            )
+            .unwrap();
+        let (_, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd1InputSource::CpuNormedHidden,
+                FlashMoeCmd1InputState::cpu_normed(layer, width),
+            )
+            .unwrap();
+        let (cmd2, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(width),
+                    ScheduledCmd2ResidualInput::metal_buffer(width),
+                ),
+            )
+            .unwrap();
+        assert_eq!(cmd2.active_experts, active_experts);
+        let prep_state = FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
+        let routing = scheduler
+            .routing_from_post_attention_prep(&cmd2, prep_state, &active)
+            .unwrap();
+        let routed = scheduled.resolve(&routing).unwrap();
+        let pending = routed.issue_cmd3(&mut scheduler, &routing).unwrap();
+        let next_norm_weights = [1.0, 0.5];
+        let execution = pending
+            .finish(
+                &mut scheduler,
+                DummyCmd3InputState {
+                    source: ScheduledCmd3InputSource::MetalPostAttentionPrep,
+                    state: FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep_state),
+                },
+                dummy_shared_expert(ScheduledSharedExpertSource::None),
+                ScheduledNextNormWeights::cpu_visible(
+                    "model.layers.1.input_layernorm.weight",
+                    &next_norm_weights,
+                    width,
+                )
+                .unwrap(),
+                |command| {
+                    assert_eq!(command.cmd3.shared, ScheduledSharedExpertSource::None);
+                    assert_eq!(
+                        command
+                            .experts
+                            .iter()
+                            .map(|expert| expert.expert())
+                            .collect::<Vec<_>>(),
+                        vec![8, 3, 5, 1, 7, 4, 0, 6]
+                    );
+                    for (actual, expected) in command.weights.iter().zip([
+                        0.5336564,
+                        0.19632123,
+                        0.11907485,
+                        0.072222546,
+                        0.04380519,
+                        0.016115028,
+                        0.010802226,
+                        0.008002486,
+                    ]) {
+                        assert!((actual - expected).abs() <= 1e-6);
+                    }
+                    let mut expert_output = vec![0.0f32; width];
+                    for (payload, weight) in command.payloads.iter().zip(command.weights.iter()) {
+                        let output = reference_q4_swiglu(payload.q4(), &normed);
+                        for (combined, value) in expert_output.iter_mut().zip(output.iter()) {
+                            *combined += value * weight;
+                        }
+                    }
+                    let hidden: Vec<f32> = residual
+                        .iter()
+                        .zip(expert_output.iter())
+                        .map(|(residual, expert)| residual + expert)
+                        .collect();
+                    for (actual, expected) in hidden.iter().zip([2.8271027, 0.86557925]) {
+                        assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+                    }
+                    let next_normed =
+                        reference_rms_norm(&hidden, command.next_norm_weights.values().unwrap());
+                    command
+                        .resolve_output_state()?
+                        .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(
+                            hidden,
+                            Some(next_normed),
+                        ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(execution.cmd3.expert_delta.positioned_reads, 8);
+        assert_eq!(execution.cmd3.expert_delta.bytes_read, 8 * 48);
+        let mut token_state = FlashMoeTokenState::new(vec![0.0; width], 0);
+        token_state
+            .apply_declared_expert_phase(
+                execution.cmd3.submission,
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )
+            .unwrap();
+        for (actual, expected) in token_state.hidden().iter().zip([2.8271027, 0.86557925]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
+        for (actual, expected) in next_normed.iter().zip([1.3522521, 0.20701078]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
     }
@@ -7103,31 +7351,30 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_graph_rejects_dense_shared_weights_for_qwen35_q4_cmd3() {
-        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
-        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+    fn fixed_q4_graph_rejects_dense_shared_weights_for_each_text_family() {
+        for layout in [qwen35_layout(), qwen3_moe_layout()] {
+            let capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+            let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
 
-        let err = graph
-            .build_cmd3_expert_phase(
-                7,
-                2,
-                ScheduledCmd3InputSource::CpuNormedResidualUpload,
-                ScheduledSharedExpertSource::DenseCpuWeights,
-                ScheduledNextNormSource::None,
-            )
-            .unwrap_err();
+            let err = graph
+                .build_cmd3_expert_phase(
+                    7,
+                    2,
+                    ScheduledCmd3InputSource::CpuNormedResidualUpload,
+                    ScheduledSharedExpertSource::DenseCpuWeights,
+                    ScheduledNextNormSource::None,
+                )
+                .unwrap_err();
 
-        assert_eq!(err.family, graph.family());
-        assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
-        assert!(
-            err.to_string().contains("must use resident Q4 projections"),
-            "{err:#}"
-        );
-        assert!(
-            err.to_string()
-                .contains("not a declared graph-stage implementation"),
-            "{err:#}"
-        );
+            assert_eq!(err.family, graph.family());
+            assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+            assert!(err.to_string().contains("requires resident Q4"), "{err:#}");
+            assert!(
+                err.to_string()
+                    .contains("not a declared graph-stage implementation"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

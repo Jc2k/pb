@@ -307,6 +307,19 @@ Baseline reviewed on 2026-07-10:
   implementation. Models that declare shared experts must resolve every resident Q4 shared
   projection; a missing projection is an unsupported binding error and cannot collapse into the
   no-shared case.
+- Text-only Qwen MoE Q4 now resolves the same nine-stage scheduler graph as Qwen3.5 Q4. Its model
+  metadata selects full attention, configured K, routed scale 1.0, selected-route normalization,
+  dimension-derived fixed-Q4 slots, and the declared no-shared CMD3 source. Production load applies
+  the same manifest/range binding validation to both text families. Metal kernel requirements are
+  resolved from layer and shared-expert metadata: hybrid Qwen3.5 requires its linear kernels, while
+  no-shared Qwen MoE does not falsely require the shared-activation kernel.
+- Expert count and active K are concrete graph values rather than generation-loop inputs. The
+  resolved CLI/model routing policy is applied to model metadata before capability resolution, and
+  production CMD1/CMD2/router construction consumes the resulting scheduler-owned values.
+- A linked Qwen MoE Q4 fixture resolves the Qwen3 graph and follows one K=8 full-attention
+  transaction through selected-route softmax at scale 1.0, eight scheduler-owned positioned reads,
+  whole-slot typed Q4 SwiGLU payloads, declared no-shared CMD3 combine, and deferred hidden/next-norm
+  state. Its route weights and output state are checked against independent golden values.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -331,7 +344,9 @@ The architecture is not yet at the target:
   owner; runtime layout metadata and `VisionEncoder` also remain defined in `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
-- Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
+- Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
+  real-checkpoint smoke evidence. Qwen-VL has metadata and legacy code but no resolved typed input
+  adapter.
 - BF16/F16 dense and expert storage have import/reference support but no typed production graph
   implementations.
 

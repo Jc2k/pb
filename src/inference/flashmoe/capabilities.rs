@@ -7,8 +7,8 @@ use super::metal::MetalPipelineNameSet;
 use super::metal::{MetalRuntimeCapabilities, kernels};
 use super::model_family::{
     QwenMoeCommandTopology, QwenMoeExecutionArchitecture, QwenMoeExpertBufferOwnership,
-    QwenMoeExpertCachePolicy, QwenMoeExpertReadStrategy, QwenMoeFamily, QwenMoeModelLayout,
-    QwenMoeRoutingPlacement, QwenMoeRoutingWeightNormalization,
+    QwenMoeExpertCachePolicy, QwenMoeExpertReadStrategy, QwenMoeFamily, QwenMoeLayerKind,
+    QwenMoeModelLayout, QwenMoeRoutingPlacement, QwenMoeRoutingWeightNormalization,
 };
 use super::weights::ResidentDenseLayout;
 
@@ -103,14 +103,14 @@ impl FlashMoeStageImplementation {
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
             Self::MetalResidentQ4PostAttention => {
-                "Metal resident-Q4 post-attention/router/shared gate-up"
+                "Metal resident-Q4 post-attention and router projection"
             }
-            Self::CpuSoftmaxTopK => "Qwen3.5 upstream-parity CPU softmax/topK",
+            Self::CpuSoftmaxTopK => "Qwen-family CPU softmax/topK",
             Self::ParallelPositionedFixedQ4Reads => {
                 "parallel positioned reads into fixed-Q4 whole-expert slots"
             }
             Self::MetalFixedQ4ExpertSharedCombine => {
-                "Metal fixed-Q4 active experts and shared combine"
+                "Metal fixed-Q4 active experts and declared shared/no-shared combine"
             }
             Self::MetalResidentQ4LmHeadSampler => "Metal resident-Q4 LM-head and sampler",
         }
@@ -161,6 +161,8 @@ pub struct FlashMoeCapabilityPlan {
     pub(crate) expert_storage: ExpertStoreExecutionDescriptor,
     pub(crate) device: FlashMoeDeviceCapability,
     pub routing: QwenMoeRoutingPlacement,
+    pub experts_per_layer: usize,
+    pub active_experts: usize,
     pub routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     pub routed_expert_scale: f32,
     pub state_policy: FlashMoeStatePolicy,
@@ -176,16 +178,8 @@ impl FlashMoeCapabilityPlan {
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
         match layout.family {
-            QwenMoeFamily::Qwen35A17B => {
-                Self::resolve_qwen35_q4(layout, dense_layout, expert_storage, metal)
-            }
-            QwenMoeFamily::Qwen3Moe => {
-                require_selected_route_renormalization(layout)?;
-                Err(FlashMoeUnsupportedCapability::new(
-                    layout.family,
-                    FlashMoeGraphStage::Cmd1AttentionProjections,
-                    "Qwen3 MoE full-attention graph-stage implementation has not been wired into the unified scheduler",
-                ))
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe => {
+                Self::resolve_qwen_text_q4(layout, dense_layout, expert_storage, metal)
             }
             QwenMoeFamily::Qwen3VlMoe => Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
@@ -195,7 +189,7 @@ impl FlashMoeCapabilityPlan {
         }
     }
 
-    fn resolve_qwen35_q4(
+    fn resolve_qwen_text_q4(
         layout: &QwenMoeModelLayout,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
@@ -206,7 +200,7 @@ impl FlashMoeCapabilityPlan {
                 layout.family,
                 FlashMoeGraphStage::Cmd1AttentionProjections,
                 format!(
-                    "Qwen3.5 first production graph requires resident Q4 dense projections, loaded {}",
+                    "the unified Qwen-family Q4 graph requires resident Q4 dense projections, loaded {}",
                     dense_layout.as_str()
                 ),
             ));
@@ -215,7 +209,7 @@ impl FlashMoeCapabilityPlan {
             return Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
                 FlashMoeGraphStage::ActiveExpertReads,
-                "Qwen3.5 first production graph requires fixed-Q4 whole-expert storage",
+                "the unified Qwen-family Q4 graph requires fixed-Q4 whole-expert storage",
             ));
         }
         let expected_fixed_q4 =
@@ -233,14 +227,14 @@ impl FlashMoeCapabilityPlan {
             return Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
                 FlashMoeGraphStage::ActiveExpertReads,
-                "fixed-Q4 expert storage does not match the resolved Qwen3.5 model layout",
+                "fixed-Q4 expert storage does not match the resolved Qwen-family model layout",
             ));
         }
         let metal = metal.ok_or_else(|| {
             FlashMoeUnsupportedCapability::new(
                 layout.family,
                 FlashMoeGraphStage::DeferredPreviousCmd3,
-                "resolved Qwen3.5 Q4 graph requires a compiled Metal executor",
+                "the resolved Qwen-family Q4 graph requires a compiled Metal executor",
             )
         })?;
         let routing_weight_normalization = require_selected_route_renormalization(layout)?;
@@ -256,14 +250,27 @@ impl FlashMoeCapabilityPlan {
                 kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
             ],
         )?;
+        if (0..layout.layers)
+            .any(|layer| layout.layer_kind(layer) == QwenMoeLayerKind::LinearAttention)
+        {
+            require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                &[
+                    kernels::LINEAR_CONV1D_STEP,
+                    kernels::LINEAR_RMS_NORM_QK,
+                    kernels::LINEAR_COMPUTE_DECAY_BETA,
+                    kernels::LINEAR_GATED_DELTA_STEP,
+                    kernels::LINEAR_GATED_RMS_NORM,
+                ],
+            )?;
+        }
         require_stage_kernels(
             layout.family,
             &metal,
             FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
-            &[
-                kernels::RESIDUAL_ADD_RMS_NORM,
-                kernels::SHARED_EXPERT_ACTIVATION,
-            ],
+            &[kernels::RESIDUAL_ADD_RMS_NORM],
         )?;
         require_stage_kernels(
             layout.family,
@@ -277,6 +284,14 @@ impl FlashMoeCapabilityPlan {
                 kernels::FILL_ZERO,
             ],
         )?;
+        if layout.shared_experts > 0 {
+            require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
+                &[kernels::SHARED_EXPERT_ACTIVATION],
+            )?;
+        }
         require_stage_kernels(
             layout.family,
             &metal,
@@ -337,6 +352,8 @@ impl FlashMoeCapabilityPlan {
             expert_storage,
             device: FlashMoeDeviceCapability { metal },
             routing: layout.execution.routing,
+            experts_per_layer: layout.experts_per_layer,
+            active_experts: layout.scheduled_active_experts,
             routing_weight_normalization,
             routed_expert_scale: layout.routed_expert_scale,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
@@ -351,16 +368,6 @@ impl FlashMoeCapabilityPlan {
         layout: &QwenMoeModelLayout,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
-        if layout.family != QwenMoeFamily::Qwen35A17B {
-            return Self::resolve(
-                layout,
-                ResidentDenseLayout::Q4,
-                test_expert_storage(layout)?,
-                Some(MetalRuntimeCapabilities::from_pipeline_names(
-                    MetalPipelineNameSet::new(),
-                )),
-            );
-        }
         Self::resolve(
             layout,
             ResidentDenseLayout::Q4,
@@ -603,12 +610,24 @@ mod tests {
         QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
     }
 
-    fn qwen35_experts(layout: &QwenMoeModelLayout) -> ExpertStoreExecutionDescriptor {
+    fn fixed_q4_experts(layout: &QwenMoeModelLayout) -> ExpertStoreExecutionDescriptor {
         test_expert_storage(layout).unwrap()
     }
 
     fn full_metal() -> MetalRuntimeCapabilities {
         MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+    }
+
+    fn metal_without_shared_activation() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.shared_expert_activation = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
+    fn metal_without_linear_conv1d() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.linear_conv1d = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
     #[test]
@@ -617,7 +636,7 @@ mod tests {
         let plan = FlashMoeCapabilityPlan::resolve(
             &layout,
             ResidentDenseLayout::Q4,
-            qwen35_experts(&layout),
+            fixed_q4_experts(&layout),
             Some(full_metal()),
         )
         .unwrap();
@@ -627,6 +646,8 @@ mod tests {
         assert_eq!(plan.dense_layout, ResidentDenseLayout::Q4);
         assert_eq!(plan.expert_storage.layout, ExpertStorageLayout::FixedQ4);
         assert_eq!(plan.routing, QwenMoeRoutingPlacement::CpuSoftmaxTopK);
+        assert_eq!(plan.experts_per_layer, 512);
+        assert_eq!(plan.active_experts, 4);
         assert_eq!(plan.state_policy, FlashMoeStatePolicy::DeferredGpuNextLayer);
         assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
         assert_eq!(
@@ -643,7 +664,7 @@ mod tests {
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
             ResidentDenseLayout::Q4,
-            qwen35_experts(&layout),
+            fixed_q4_experts(&layout),
             None,
         )
         .unwrap_err();
@@ -662,7 +683,7 @@ mod tests {
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
             ResidentDenseLayout::Bf16,
-            qwen35_experts(&layout),
+            fixed_q4_experts(&layout),
             Some(full_metal()),
         )
         .unwrap_err();
@@ -677,7 +698,7 @@ mod tests {
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
             ResidentDenseLayout::Q4,
-            qwen35_experts(&layout),
+            fixed_q4_experts(&layout),
             Some(MetalRuntimeCapabilities::empty_for_test()),
         )
         .unwrap_err();
@@ -693,7 +714,7 @@ mod tests {
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
             ResidentDenseLayout::Q4,
-            qwen35_experts(&qwen35),
+            fixed_q4_experts(&qwen35),
             Some(full_metal()),
         )
         .unwrap_err();
@@ -721,13 +742,93 @@ mod tests {
     }
 
     #[test]
-    fn qwen_moe_capability_advances_to_the_next_missing_stage_when_routing_resolves() {
+    fn qwen_moe_q4_capability_resolves_the_unified_graph() {
         let layout = qwen3_moe_layout(Some(true));
-        let error = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap_err();
+        let plan = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
 
-        assert_eq!(error.family, QwenMoeFamily::Qwen3Moe);
-        assert_eq!(error.stage, FlashMoeGraphStage::Cmd1AttentionProjections);
-        assert!(error.reason.contains("full-attention graph-stage"));
+        plan.validate_complete().unwrap();
+        assert_eq!(plan.family, QwenMoeFamily::Qwen3Moe);
+        assert_eq!(plan.dense_layout, ResidentDenseLayout::Q4);
+        assert_eq!(plan.expert_storage.layout, ExpertStorageLayout::FixedQ4);
+        assert_eq!(plan.expert_storage.fixed_q4.layout.expert_bytes, 2_654_208);
+        assert_eq!(plan.experts_per_layer, 128);
+        assert_eq!(plan.active_experts, 8);
+        assert_eq!(
+            plan.routing_weight_normalization,
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected
+        );
+        assert_eq!(plan.routed_expert_scale, 1.0);
+        assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::AttentionMath)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::QwenFullAttentionCpuKv
+        );
+    }
+
+    #[test]
+    fn qwen_text_q4_capability_carries_resolved_active_expert_policy() {
+        let layout = qwen3_moe_layout(Some(true))
+            .with_scheduled_active_experts(6)
+            .unwrap();
+        let plan = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+
+        assert_eq!(plan.experts_per_layer, 128);
+        assert_eq!(plan.active_experts, 6);
+        let graph =
+            crate::inference::flashmoe::scheduler::FlashMoeScheduledGraph::from_capabilities(&plan)
+                .unwrap();
+        assert_eq!(graph.experts_per_layer(), 128);
+        assert_eq!(graph.active_experts(), 6);
+
+        let error = qwen3_moe_layout(Some(true))
+            .with_scheduled_active_experts(129)
+            .unwrap_err();
+        assert!(error.to_string().contains("scheduled_k=129"), "{error:#}");
+    }
+
+    #[test]
+    fn qwen_text_q4_kernel_requirements_follow_resolved_layer_metadata() {
+        let qwen3 = qwen3_moe_layout(Some(true));
+        FlashMoeCapabilityPlan::resolve(
+            &qwen3,
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&qwen3),
+            Some(metal_without_shared_activation()),
+        )
+        .expect("Qwen3 without shared experts must not require the shared activation kernel");
+
+        let qwen35 = qwen35_layout();
+        let shared_error = FlashMoeCapabilityPlan::resolve(
+            &qwen35,
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&qwen35),
+            Some(metal_without_shared_activation()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            shared_error.stage,
+            FlashMoeGraphStage::Cmd3ExpertAndSharedCombine
+        );
+        assert!(
+            shared_error
+                .reason
+                .contains(kernels::SHARED_EXPERT_ACTIVATION)
+        );
+
+        let linear_error = FlashMoeCapabilityPlan::resolve(
+            &qwen35,
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&qwen35),
+            Some(metal_without_linear_conv1d()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            linear_error.stage,
+            FlashMoeGraphStage::Cmd1AttentionProjections
+        );
+        assert!(linear_error.reason.contains(kernels::LINEAR_CONV1D_STEP));
     }
 
     #[test]
@@ -736,11 +837,13 @@ mod tests {
         let plan = FlashMoeCapabilityPlan {
             family: QwenMoeFamily::Qwen35A17B,
             dense_layout: ResidentDenseLayout::Q4,
-            expert_storage: qwen35_experts(&layout),
+            expert_storage: fixed_q4_experts(&layout),
             device: FlashMoeDeviceCapability {
                 metal: full_metal(),
             },
             routing: QwenMoeRoutingPlacement::CpuSoftmaxTopK,
+            experts_per_layer: 512,
+            active_experts: 4,
             routing_weight_normalization: QwenMoeRoutingWeightNormalization::RenormalizeSelected,
             routed_expert_scale: 0.9,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,

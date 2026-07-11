@@ -415,6 +415,12 @@ impl QwenMoeModelLayout {
         }
     }
 
+    pub fn with_scheduled_active_experts(mut self, active_experts: usize) -> Result<Self> {
+        self.scheduled_active_experts = active_experts;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.layers == 0
             || self.hidden_size == 0

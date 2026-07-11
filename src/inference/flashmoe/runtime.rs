@@ -459,11 +459,10 @@ impl FlashMoeEngine {
             } else {
                 ScheduledPreviousCmd3Handoff::cpu_visible(layer - 1, token_state.hidden().len())
             };
-            let layer_schedule = self.scheduler.begin_layer(
+            let layer_schedule = self.scheduler.begin_resolved_layer(
                 position,
                 layer,
                 self.config.num_hidden_layers,
-                self.routing_policy.active_experts,
                 previous_handoff,
                 true,
             )?;
@@ -669,7 +668,7 @@ impl FlashMoeEngine {
                 let mut prep = self.dense.post_attention_q4_prep_with_metal(
                     metal,
                     layer,
-                    self.config.experts(),
+                    self.scheduler.experts_per_layer(),
                     &out_proj_name,
                     &attention_values,
                     residual_input,
@@ -1072,16 +1071,18 @@ impl FlashMoeEngine {
     ) -> Result<ScheduledRoutingCommand> {
         let projection = self.dense.router_score_projection_descriptor(
             layer,
-            self.config.experts(),
+            self.scheduler.experts_per_layer(),
             normed.len(),
         )?;
-        let router_score_command = self.scheduler.resolve_router_score_projection(
-            layer,
-            self.config.experts(),
-            active_experts,
-            projection,
-            normed.len(),
-        )?;
+        let router_score_command =
+            self.scheduler
+                .resolve_router_score_projection(layer, projection, normed.len())?;
+        if active_experts != self.scheduler.active_experts() {
+            bail!(
+                "FlashMoe scheduled routing for layer {layer} carries K={active_experts}, but the resolved graph requires K={}",
+                self.scheduler.active_experts()
+            );
+        }
         self.dense
             .router_command_with_metal(Some(&self.metal), router_score_command, normed)
     }
@@ -1153,11 +1154,11 @@ impl FlashMoeEngine {
                 &input_specs,
                 projection_input,
                 static_offsets,
-                self.config.experts(),
+                self.scheduler.experts_per_layer(),
                 &out_proj_name,
                 residual,
                 post_norm_weight,
-                self.routing_policy.active_experts,
+                self.scheduler.active_experts(),
             )?;
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_input_projection += started.elapsed();
