@@ -1090,10 +1090,10 @@ pub struct VisionEncoding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ImagePlaceholderSpec {
-    token_count: usize,
-    grid_h: usize,
-    grid_w: usize,
+pub(super) struct ImagePlaceholderSpec {
+    pub(super) token_count: usize,
+    pub(super) grid_h: usize,
+    pub(super) grid_w: usize,
 }
 
 impl ImagePlaceholderSpec {
@@ -1122,7 +1122,7 @@ impl ImagePlaceholderSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VisualTokenSpan {
+pub(super) struct VisualTokenSpan {
     start: usize,
     end: usize,
     grid_h: usize,
@@ -1130,7 +1130,7 @@ struct VisualTokenSpan {
 }
 
 impl VisualTokenSpan {
-    fn image(start: usize, end: usize, grid_h: usize, grid_w: usize) -> Self {
+    pub(super) fn image(start: usize, end: usize, grid_h: usize, grid_w: usize) -> Self {
         Self {
             start,
             end,
@@ -1453,7 +1453,7 @@ fn multimodal_mrope_positions(
     Ok((positions, current_pos))
 }
 
-fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
+pub(super) fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
     let mut start = None;
     let mut count = 0usize;
@@ -1472,6 +1472,87 @@ fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
         runs.push((run_start, tokens.len(), count));
     }
     runs
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExpandedVisionPrompt {
+    pub(super) tokens: Vec<u32>,
+    pub(super) visual_spans: Vec<VisualTokenSpan>,
+}
+
+#[cfg(test)]
+pub(super) fn expand_multimodal_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
+    image_pad_token: u32,
+    image_specs: &[ImagePlaceholderSpec],
+) -> Result<ExpandedVisionPrompt> {
+    let (tokens, visual_spans) = expand_image_placeholders(
+        prompt_tokens,
+        vision_start_token,
+        vision_end_token,
+        image_pad_token,
+        image_specs,
+    )?;
+    Ok(ExpandedVisionPrompt {
+        tokens,
+        visual_spans,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn expand_single_image_placeholders(
+    prompt_tokens: Vec<u32>,
+    vision_start_token: u32,
+    vision_end_token: u32,
+    image_pad_token: u32,
+    visual_tokens: usize,
+) -> Result<Vec<u32>> {
+    Ok(expand_multimodal_image_placeholders(
+        prompt_tokens,
+        vision_start_token,
+        vision_end_token,
+        image_pad_token,
+        &[ImagePlaceholderSpec {
+            token_count: visual_tokens,
+            grid_h: 1,
+            grid_w: visual_tokens,
+        }],
+    )?
+    .tokens)
+}
+
+#[cfg(test)]
+pub(super) fn qwen3vl_multimodal_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    visual_spans: &[VisualTokenSpan],
+) -> Result<(Vec<MropePosition>, usize)> {
+    multimodal_mrope_positions(prompt_tokens, image_pad_token, visual_spans)
+}
+
+#[cfg(test)]
+pub(super) fn qwen3vl_single_image_mrope_positions(
+    prompt_tokens: &[u32],
+    image_pad_token: u32,
+    grid_h: usize,
+    grid_w: usize,
+) -> Result<(Vec<MropePosition>, usize)> {
+    let runs = token_run_bounds(prompt_tokens, image_pad_token);
+    if runs.len() != 1 {
+        bail!(
+            "expected exactly one contiguous image placeholder run, found {}",
+            runs.len()
+        );
+    }
+    let (run_start, run_end, _) = runs[0];
+    qwen3vl_multimodal_mrope_positions(
+        prompt_tokens,
+        image_pad_token,
+        &[VisualTokenSpan::image(run_start, run_end, grid_h, grid_w)],
+    )
 }
 
 #[cfg(test)]

@@ -417,6 +417,11 @@ Baseline reviewed on 2026-07-11:
   self-attention, ViT MLP execution, DeepStack/spatial merging, dense bias application, and
   normalization are owned by `vision.rs`. `legacy.rs` no longer defines or implements the image
   preprocessor, vision config, or vision encoder.
+- The duplicate legacy Qwen-VL placeholder expansion and multimodal position implementation has
+  been deleted. Existing single/multi-image parity fixtures now call narrow test adapters around
+  `vision.rs`'s production `expand_image_placeholders` and `multimodal_mrope_positions`, so their
+  span, grid, wrapping, and position assertions exercise the same algorithm used by typed runtime
+  inputs.
 - Load now retains exactly one `FlashMoeInputAdapterExecutor` instead of probing an
   `Option<VisionEncoder>` at request time. Qwen-VL construction requires concrete weight and
   manifest artifacts, validates required vision tensor names plus adapter dimensions/DeepStack
