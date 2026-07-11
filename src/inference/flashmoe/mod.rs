@@ -4,6 +4,7 @@
 //! `legacy`. Keep this module as the stable public surface while internals move
 //! behind smaller modules.
 
+mod cache;
 mod capabilities;
 mod experts;
 mod legacy;
@@ -19,6 +20,7 @@ mod types;
 mod vision;
 mod weights;
 
+pub use cache::{build_cache_from_hf_snapshot, expected_hf_files, expected_vl_hf_files};
 pub use capabilities::*;
 pub use experts::*;
 pub use legacy::*;
