@@ -147,7 +147,7 @@ use super::state::{
 use super::types::*;
 use super::vision::{
     ImagePreprocessor, MropeAxis, MropePosition, Qwen3VLVisionConfig, QwenVlRuntimeInputs,
-    VisionEncoding,
+    VisionEncoder, VisionEncoding, apply_vision_spatial_rotary, block_major_patch_coords,
 };
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
@@ -3337,43 +3337,6 @@ fn apply_rotary_split_half_mrope(
             let axis = mrope_axis_for_frequency(i, mrope_section);
             let inv_freq = theta.powf(-((2 * i) as f32) / rotary_dim as f32);
             let angle = (position.axis(axis) as f32) * inv_freq;
-            let (sin, cos) = angle.sin_cos();
-            let x0 = head[i];
-            let x1 = head[i + half];
-            head[i] = x0 * cos - x1 * sin;
-            head[i + half] = x0 * sin + x1 * cos;
-        }
-    }
-}
-
-fn apply_vision_spatial_rotary(
-    values: &mut [f32],
-    row: usize,
-    col: usize,
-    head_dim: usize,
-    theta: f64,
-) {
-    let theta = theta.max(1.0) as f32;
-    let head_dim = head_dim.max(2);
-    let rotary_dim = head_dim - (head_dim % 2);
-    let half = rotary_dim / 2;
-    let spatial_half = half / 2;
-    if spatial_half == 0 {
-        return;
-    }
-
-    for head in values.chunks_mut(head_dim) {
-        if head.len() < rotary_dim {
-            continue;
-        }
-        for i in 0..half {
-            let (axis_position, axis_idx) = if i < spatial_half {
-                (row, i)
-            } else {
-                (col, i - spatial_half)
-            };
-            let inv_freq = theta.powf(-((2 * axis_idx) as f32) / half as f32);
-            let angle = (axis_position as f32) * inv_freq;
             let (sin, cos) = angle.sin_cos();
             let x0 = head[i];
             let x1 = head[i + half];
@@ -7462,275 +7425,9 @@ fn test_default_tokenizer_config_json() -> &'static [u8] {
 
 // ── Vision encoder (ViT) ──────────────────────────────────────────────────────
 
-fn block_major_patch_coords(
-    grid_h: usize,
-    grid_w: usize,
-    merge_size: usize,
-) -> Vec<(usize, usize)> {
-    if merge_size == 0 || grid_h == 0 || grid_w == 0 {
-        return Vec::new();
-    }
-    let mut coords = Vec::with_capacity(grid_h.saturating_mul(grid_w));
-    for block_y in 0..grid_h / merge_size {
-        for block_x in 0..grid_w / merge_size {
-            for dy in 0..merge_size {
-                for dx in 0..merge_size {
-                    coords.push((block_y * merge_size + dy, block_x * merge_size + dx));
-                }
-            }
-        }
-    }
-    coords
-}
-
-fn perfect_square_side(entries: usize) -> Option<usize> {
-    let side = (entries as f64).sqrt() as usize;
-    if side.saturating_mul(side) == entries {
-        Some(side)
-    } else if (side + 1).saturating_mul(side + 1) == entries {
-        Some(side + 1)
-    } else {
-        None
-    }
-}
-
-fn bilinear_position_corners(
-    row: usize,
-    col: usize,
-    grid_h: usize,
-    grid_w: usize,
-    side: usize,
-) -> [(usize, f32); 4] {
-    let side = side.max(1);
-    let h_pos = if grid_h > 1 {
-        row as f32 * (side - 1) as f32 / (grid_h - 1) as f32
-    } else {
-        0.0
-    };
-    let w_pos = if grid_w > 1 {
-        col as f32 * (side - 1) as f32 / (grid_w - 1) as f32
-    } else {
-        0.0
-    };
-    let h_floor = h_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
-    let w_floor = w_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
-    let h_ceil = (h_floor + 1).min(side - 1);
-    let w_ceil = (w_floor + 1).min(side - 1);
-    let h_frac = h_pos - h_floor as f32;
-    let w_frac = w_pos - w_floor as f32;
-
-    [
-        (h_floor * side + w_floor, (1.0 - h_frac) * (1.0 - w_frac)),
-        (h_floor * side + w_ceil, (1.0 - h_frac) * w_frac),
-        (h_ceil * side + w_floor, h_frac * (1.0 - w_frac)),
-        (h_ceil * side + w_ceil, h_frac * w_frac),
-    ]
-}
-
-/// Vision Transformer encoder for Qwen3-VL MoE.
-///
-/// Implements the forward pass that converts an image into a sequence of visual
-/// token embeddings at the text model's hidden size, ready for injection into
-/// the MoE language-model prefix.
-///
-/// The ViT architecture follows the Qwen3-VL specification:
-/// - Patch embedding: linear(`in_chans × patch_h × patch_w`, `embed_dim`)
-/// - `depth` transformer blocks (LayerNorm → QKV-attention → LayerNorm → MLP)
-/// - Spatial merger: 2×2 patch groups → LayerNorm → MLP → `text_hidden_size`
-///
-/// Applies Qwen3-VL's spatial rotary embeddings to ViT Q/K states before
-/// attention, then merges patch groups into decoder visual tokens.
-#[derive(Debug, Clone)]
-pub struct VisionEncoder {
-    config: Qwen3VLVisionConfig,
-    /// Target hidden size of the language-model decoder.
-    text_hidden_size: usize,
-    dense: DenseStore,
-}
-
 impl VisionEncoder {
-    /// Try to construct a `VisionEncoder` from a Flash-MoE plan.
-    ///
-    /// Returns `Ok(None)` when the plan has no vision weights (text-only model).
-    pub fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Option<Self>> {
-        let (Some(weights), Some(manifest), Some(vc)) = (
-            plan.vision_weights.as_ref(),
-            plan.vision_manifest.as_ref(),
-            text_config.vision_config.as_ref(),
-        ) else {
-            return Ok(None);
-        };
-        if !weights.is_file() || !manifest.is_file() {
-            tracing::debug!(
-                model = %plan.model,
-                "vision weights not found on disk; VisionEncoder skipped"
-            );
-            return Ok(None);
-        }
-        let dense = DenseStore::open(weights.clone(), manifest.clone())?;
-        Ok(Some(Self {
-            config: vc.clone(),
-            text_hidden_size: text_config.hidden_size,
-            dense,
-        }))
-    }
-
-    /// Encode an image into a sequence of visual token embeddings.
-    ///
-    /// Returns visual token embeddings plus their merged spatial grid.
-    pub fn encode(
-        &self,
-        preprocessor: &ImagePreprocessor,
-        image_path: &Path,
-    ) -> Result<VisionEncoding> {
-        // 1. Preprocess → patches [N, C, temporal, pH, pW]
-        let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
-        let num_patches = grid_h * grid_w;
-        let patch_flat = self.config.patch_flat_dim();
-
-        // 2. Patch embedding → [num_patches, embed_dim]
-        let mut hidden: Vec<Vec<f32>> = (0..num_patches)
-            .map(|i| {
-                let patch = &flat_patches[i * patch_flat..(i + 1) * patch_flat];
-                self.patch_embed(patch)
-            })
-            .collect::<Result<_>>()?;
-        self.add_vision_pos_embeds(&mut hidden, grid_h, grid_w)?;
-
-        // 3. Transformer blocks, retaining configured DeepStack features.
-        let mut deepstack_features = Vec::new();
-        for layer in 0..self.config.depth {
-            self.vit_block(layer, &mut hidden, grid_h, grid_w)?;
-            if let Some(merger_idx) = self
-                .config
-                .deepstack_visual_indexes
-                .iter()
-                .position(|&idx| idx == layer)
-            {
-                deepstack_features.push(self.merge_visual_tokens_with_prefix(
-                    &format!("visual.deepstack_merger_list.{merger_idx}"),
-                    true,
-                    &hidden,
-                    grid_h,
-                    grid_w,
-                )?);
-            }
-        }
-
-        // 4. Merge 2×2 patch groups into language-model visual tokens
-        let embeddings = self.merge_visual_tokens(&hidden, grid_h, grid_w)?;
-        Ok(VisionEncoding {
-            embeddings,
-            deepstack_features,
-            merged_grid_h: grid_h / self.config.merge_size,
-            merged_grid_w: grid_w / self.config.merge_size,
-        })
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    /// Linear patch embedding: `[patch_flat] → [embed_dim]`.
-    fn patch_embed(&self, patch: &[f32]) -> Result<Vec<f32>> {
-        let name = "visual.patch_embed.proj.weight";
-        let embed_dim = self.config.embed_dim;
-        let entry = self
-            .dense
-            .registry()
-            .tensor(name)
-            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
-        if entry.shape.len() < 2 {
-            bail!(
-                "vision: {name} has shape {:?}; expected Conv3d weight",
-                entry.shape
-            );
-        }
-        let rows = entry.shape.first().copied().unwrap_or(0);
-        let cols = entry.shape[1..]
-            .iter()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
-            .context("vision: patch embedding shape overflow")?;
-        if rows != embed_dim || cols != patch.len() {
-            bail!(
-                "vision: {name} shape {:?} is incompatible with embed_dim {embed_dim} and patch len {}",
-                entry.shape,
-                patch.len()
-            );
-        }
-        let weights = self
-            .dense
-            .read_full_tensor_f32(name)?
-            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
-        let mut projected = vec![0.0f32; embed_dim];
-        for row in 0..embed_dim {
-            let start = row * cols;
-            let end = start + cols;
-            projected[row] = weights[start..end]
-                .iter()
-                .zip(patch.iter())
-                .map(|(weight, value)| weight * value)
-                .sum::<f32>();
-        }
-        // Add bias if present
-        let with_bias = self.vit_add_bias("visual.patch_embed.proj.bias", projected)?;
-        Ok(with_bias)
-    }
-
-    fn add_vision_pos_embeds(
-        &self,
-        hidden: &mut [Vec<f32>],
-        grid_h: usize,
-        grid_w: usize,
-    ) -> Result<()> {
-        let pos_embed = self
-            .dense
-            .read_full_tensor_f32("visual.pos_embed.weight")?
-            .context("vision: required tensor 'visual.pos_embed.weight' is missing")?;
-        let embed_dim = self.config.embed_dim;
-        if embed_dim == 0 || pos_embed.len() % embed_dim != 0 {
-            bail!(
-                "vision: visual.pos_embed.weight has {} values; expected a multiple of embed_dim {embed_dim}",
-                pos_embed.len()
-            );
-        }
-        let entries = pos_embed.len() / embed_dim;
-        if entries == 0 {
-            bail!("vision: visual.pos_embed.weight has no position rows");
-        }
-        let side = perfect_square_side(entries).with_context(|| {
-            format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
-        })?;
-        if let Some(config_entries) = self.config.num_position_embeddings
-            && config_entries != entries
-        {
-            bail!(
-                "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
-            );
-        }
-
-        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
-        if coords.len() != hidden.len() {
-            bail!(
-                "vision: {} patch coordinates for {} hidden patches",
-                coords.len(),
-                hidden.len()
-            );
-        }
-        for (patch, (row, col)) in hidden.iter_mut().zip(coords) {
-            for (idx, weight) in bilinear_position_corners(row, col, grid_h, grid_w, side) {
-                let start = idx * embed_dim;
-                for (value, pos) in patch
-                    .iter_mut()
-                    .zip(pos_embed[start..start + embed_dim].iter())
-                {
-                    *value += weight * *pos;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Run one ViT transformer block in-place.
-    fn vit_block(
+    pub(super) fn vit_block(
         &self,
         layer: usize,
         hidden: &mut Vec<Vec<f32>>,
@@ -7926,7 +7623,7 @@ impl VisionEncoder {
     ///
     /// Layout assumption: the `hidden` slice contains patches in block-major
     /// order, with each `merge_size × merge_size` group contiguous.
-    fn merge_visual_tokens(
+    pub(super) fn merge_visual_tokens(
         &self,
         hidden: &[Vec<f32>],
         grid_h: usize,
@@ -7935,7 +7632,7 @@ impl VisionEncoder {
         self.merge_visual_tokens_with_prefix("visual.merger", false, hidden, grid_h, grid_w)
     }
 
-    fn merge_visual_tokens_with_prefix(
+    pub(super) fn merge_visual_tokens_with_prefix(
         &self,
         prefix: &str,
         use_postshuffle_norm: bool,
@@ -8014,7 +7711,7 @@ impl VisionEncoder {
     /// Load a bias vector and add it to `values`, returning the result.
     ///
     /// Returns `values` unchanged when the bias tensor is absent.
-    fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
+    pub(super) fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
         if let Some(bias) = self.dense.read_full_tensor_f32(bias_name)? {
             for (v, b) in values.iter_mut().zip(bias.iter()) {
                 *v += b;

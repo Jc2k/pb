@@ -3,9 +3,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::legacy::{FlashMoePlan, QwenModelConfig};
 use super::types::{
     VIT_IMAGE_MEAN, VIT_IMAGE_STD, VIT_MAX_PIXELS, VIT_MERGE_SIZE, VIT_MIN_PIXELS, VIT_PATCH_SIZE,
 };
+use super::weights::DenseStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Qwen3VLVisionConfig {
@@ -222,6 +224,271 @@ fn round_up_to_stride(value: u32, stride: u32) -> u32 {
 fn round_to_stride(value: f64, stride: u32) -> u32 {
     let stride_f = stride as f64;
     ((value / stride_f).max(1.0).round() as u32).max(1) * stride
+}
+
+pub(super) fn block_major_patch_coords(
+    grid_h: usize,
+    grid_w: usize,
+    merge_size: usize,
+) -> Vec<(usize, usize)> {
+    if merge_size == 0 || grid_h == 0 || grid_w == 0 {
+        return Vec::new();
+    }
+    let mut coords = Vec::with_capacity(grid_h.saturating_mul(grid_w));
+    for block_y in 0..grid_h / merge_size {
+        for block_x in 0..grid_w / merge_size {
+            for dy in 0..merge_size {
+                for dx in 0..merge_size {
+                    coords.push((block_y * merge_size + dy, block_x * merge_size + dx));
+                }
+            }
+        }
+    }
+    coords
+}
+
+fn perfect_square_side(entries: usize) -> Option<usize> {
+    let side = (entries as f64).sqrt() as usize;
+    if side.saturating_mul(side) == entries {
+        Some(side)
+    } else if (side + 1).saturating_mul(side + 1) == entries {
+        Some(side + 1)
+    } else {
+        None
+    }
+}
+
+fn bilinear_position_corners(
+    row: usize,
+    col: usize,
+    grid_h: usize,
+    grid_w: usize,
+    side: usize,
+) -> [(usize, f32); 4] {
+    let side = side.max(1);
+    let h_pos = if grid_h > 1 {
+        row as f32 * (side - 1) as f32 / (grid_h - 1) as f32
+    } else {
+        0.0
+    };
+    let w_pos = if grid_w > 1 {
+        col as f32 * (side - 1) as f32 / (grid_w - 1) as f32
+    } else {
+        0.0
+    };
+    let h_floor = h_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let w_floor = w_pos.floor().clamp(0.0, (side - 1) as f32) as usize;
+    let h_ceil = (h_floor + 1).min(side - 1);
+    let w_ceil = (w_floor + 1).min(side - 1);
+    let h_frac = h_pos - h_floor as f32;
+    let w_frac = w_pos - w_floor as f32;
+    [
+        (h_floor * side + w_floor, (1.0 - h_frac) * (1.0 - w_frac)),
+        (h_floor * side + w_ceil, (1.0 - h_frac) * w_frac),
+        (h_ceil * side + w_floor, h_frac * (1.0 - w_frac)),
+        (h_ceil * side + w_ceil, h_frac * w_frac),
+    ]
+}
+
+pub(super) fn apply_vision_spatial_rotary(
+    values: &mut [f32],
+    row: usize,
+    col: usize,
+    head_dim: usize,
+    theta: f64,
+) {
+    let theta = theta.max(1.0) as f32;
+    let head_dim = head_dim.max(2);
+    let rotary_dim = head_dim - (head_dim % 2);
+    let half = rotary_dim / 2;
+    let spatial_half = half / 2;
+    if spatial_half == 0 {
+        return;
+    }
+
+    for head in values.chunks_mut(head_dim) {
+        if head.len() < rotary_dim {
+            continue;
+        }
+        for i in 0..half {
+            let (axis_position, axis_index) = if i < spatial_half {
+                (row, i)
+            } else {
+                (col, i - spatial_half)
+            };
+            let inv_freq = theta.powf(-((2 * axis_index) as f32) / half as f32);
+            let angle = axis_position as f32 * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[i];
+            let x1 = head[i + half];
+            head[i] = x0 * cos - x1 * sin;
+            head[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VisionEncoder {
+    pub(super) config: Qwen3VLVisionConfig,
+    pub(super) text_hidden_size: usize,
+    pub(super) dense: DenseStore,
+}
+
+impl VisionEncoder {
+    pub fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Option<Self>> {
+        let (Some(weights), Some(manifest), Some(config)) = (
+            plan.vision_weights.as_ref(),
+            plan.vision_manifest.as_ref(),
+            text_config.vision_config.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if !weights.is_file() || !manifest.is_file() {
+            tracing::debug!(
+                model = %plan.model,
+                "vision weights not found on disk; VisionEncoder skipped"
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            config: config.clone(),
+            text_hidden_size: text_config.hidden_size,
+            dense: DenseStore::open(weights.clone(), manifest.clone())?,
+        }))
+    }
+
+    pub fn encode(
+        &self,
+        preprocessor: &ImagePreprocessor,
+        image_path: &Path,
+    ) -> Result<VisionEncoding> {
+        let (grid_h, grid_w, flat_patches) = preprocessor.preprocess(image_path)?;
+        let num_patches = grid_h * grid_w;
+        let patch_flat = self.config.patch_flat_dim();
+        let mut hidden = (0..num_patches)
+            .map(|index| {
+                self.patch_embed(&flat_patches[index * patch_flat..(index + 1) * patch_flat])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.add_vision_pos_embeds(&mut hidden, grid_h, grid_w)?;
+
+        let mut deepstack_features = Vec::new();
+        for layer in 0..self.config.depth {
+            self.vit_block(layer, &mut hidden, grid_h, grid_w)?;
+            if let Some(merger_index) = self
+                .config
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&index| index == layer)
+            {
+                deepstack_features.push(self.merge_visual_tokens_with_prefix(
+                    &format!("visual.deepstack_merger_list.{merger_index}"),
+                    true,
+                    &hidden,
+                    grid_h,
+                    grid_w,
+                )?);
+            }
+        }
+        let embeddings = self.merge_visual_tokens(&hidden, grid_h, grid_w)?;
+        Ok(VisionEncoding {
+            embeddings,
+            deepstack_features,
+            merged_grid_h: grid_h / self.config.merge_size,
+            merged_grid_w: grid_w / self.config.merge_size,
+        })
+    }
+
+    fn patch_embed(&self, patch: &[f32]) -> Result<Vec<f32>> {
+        let name = "visual.patch_embed.proj.weight";
+        let embed_dim = self.config.embed_dim;
+        let entry = self
+            .dense
+            .registry()
+            .tensor(name)
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        if entry.shape.len() < 2 {
+            bail!(
+                "vision: {name} has shape {:?}; expected Conv3d weight",
+                entry.shape
+            );
+        }
+        let rows = entry.shape.first().copied().unwrap_or(0);
+        let cols = entry.shape[1..]
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .context("vision: patch embedding shape overflow")?;
+        if rows != embed_dim || cols != patch.len() {
+            bail!(
+                "vision: {name} shape {:?} is incompatible with embed_dim {embed_dim} and patch len {}",
+                entry.shape,
+                patch.len()
+            );
+        }
+        let weights = self
+            .dense
+            .read_full_tensor_f32(name)?
+            .with_context(|| format!("vision: required tensor '{name}' is missing"))?;
+        let mut projected = vec![0.0f32; embed_dim];
+        for row in 0..embed_dim {
+            projected[row] = weights[row * cols..(row + 1) * cols]
+                .iter()
+                .zip(patch.iter())
+                .map(|(weight, value)| weight * value)
+                .sum();
+        }
+        self.vit_add_bias("visual.patch_embed.proj.bias", projected)
+    }
+
+    fn add_vision_pos_embeds(
+        &self,
+        hidden: &mut [Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
+        let pos_embed = self
+            .dense
+            .read_full_tensor_f32("visual.pos_embed.weight")?
+            .context("vision: required tensor 'visual.pos_embed.weight' is missing")?;
+        let embed_dim = self.config.embed_dim;
+        if embed_dim == 0 || pos_embed.len() % embed_dim != 0 {
+            bail!(
+                "vision: visual.pos_embed.weight has {} values; expected a multiple of embed_dim {embed_dim}",
+                pos_embed.len()
+            );
+        }
+        let entries = pos_embed.len() / embed_dim;
+        let side = perfect_square_side(entries).with_context(|| {
+            format!("vision: visual.pos_embed.weight has {entries} entries, not a square table")
+        })?;
+        if let Some(config_entries) = self.config.num_position_embeddings
+            && config_entries != entries
+        {
+            bail!(
+                "vision: config num_position_embeddings={config_entries} but visual.pos_embed.weight has {entries} rows"
+            );
+        }
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != hidden.len() {
+            bail!(
+                "vision: {} patch coordinates for {} hidden patches",
+                coords.len(),
+                hidden.len()
+            );
+        }
+        for (patch, (row, col)) in hidden.iter_mut().zip(coords) {
+            for (index, weight) in bilinear_position_corners(row, col, grid_h, grid_w, side) {
+                let start = index * embed_dim;
+                for (value, position) in patch
+                    .iter_mut()
+                    .zip(pos_embed[start..start + embed_dim].iter())
+                {
+                    *value += weight * *position;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
