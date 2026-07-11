@@ -328,6 +328,10 @@ Baseline reviewed on 2026-07-11:
   already cover cache transfer, shallow CPU KV snapshots, recurrent placement rejection, and prefix
   boundaries. The five-test legacy session block and the now-dead state imports were removed rather
   than duplicating those owner contracts.
+- Model-family tests now own validated runtime dimensions and model-config routing defaults;
+  planning owns explicit K overrides and the Qwen3.5 K<4 force guard. The synthetic legacy family
+  fixture and eight overlapping config/routing tests were removed, so family selection is no longer
+  restated inside the compatibility boundary.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the

@@ -564,6 +564,31 @@ mod tests {
     }
 
     #[test]
+    fn routing_policy_resolves_explicit_override_before_graph_construction() {
+        let resolved = FlashMoeRoutingPolicy::new(Some(6), false)
+            .resolve("hf://Qwen/Qwen3-30B-A3B", &qwen_config("qwen3_moe", 2))
+            .unwrap();
+
+        assert_eq!(resolved.active_experts, 6);
+        assert_eq!(resolved.source, ActiveExpertsSource::UserOverride);
+    }
+
+    #[test]
+    fn routing_policy_rejects_qwen35_k_below_four_unless_forced() {
+        let config = qwen_config("qwen3_5_moe", 10);
+        let error = FlashMoeRoutingPolicy::new(Some(3), false)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("requires K >= 4"), "{error:#}");
+
+        let forced = FlashMoeRoutingPolicy::new(Some(3), true)
+            .resolve(QWEN35_MODEL, &config)
+            .unwrap();
+        assert_eq!(forced.active_experts, 3);
+        assert!(forced.force_active_experts);
+    }
+
+    #[test]
     fn planning_selects_typed_variant_artifacts_without_runtime_probe() {
         let temp = tempfile::tempdir().unwrap();
         let vl = plan_unchecked(QWEN3_VL_MODEL, temp.path());

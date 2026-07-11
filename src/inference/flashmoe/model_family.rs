@@ -1033,6 +1033,18 @@ mod tests {
     }
 
     #[test]
+    fn qwen_model_config_exposes_validated_runtime_dimensions() {
+        let config = config(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":151936,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
+        );
+
+        config.validate().unwrap();
+        assert_eq!(config.kv_heads(), 8);
+        assert_eq!(config.experts(), 512);
+        assert_eq!(config.config_active_experts(), 10);
+    }
+
+    #[test]
     fn qwen_family_name_detection_is_owned_by_model_family() {
         assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
         assert!(is_qwen3_moe("hf://Qwen/Qwen3-30B-A3B"));
