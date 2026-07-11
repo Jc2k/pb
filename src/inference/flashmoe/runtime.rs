@@ -9,6 +9,7 @@ use tracing::info;
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::ExpertSlotStore;
 use super::legacy::*;
+use super::math::*;
 use super::metal::*;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
 use super::planning::{FlashMoePlan, ResolvedRoutingPolicy};

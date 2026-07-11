@@ -13,12 +13,10 @@ use super::experts::{
 };
 use super::legacy::dense_f32_matvec_rows;
 #[cfg(test)]
-use super::legacy::rms_norm_with_weight_in_place;
-#[cfg(test)]
 use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
 use super::math::q4_dequantize_rows_with_group_size;
 #[cfg(test)]
-use super::math::q4_fma_matvec_with_group_size;
+use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
 use super::model_family::QwenModelConfig;
 use super::runtime::MetalExecutionFacade;

@@ -136,6 +136,8 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
   routing placement, active expert issue/finish, slot leases, and GPU -> SSD -> GPU ordering.
 - `metal`: Metal device/queue/pipelines, concrete CMD1/CMD2/CMD3 builders, LM-head builders, KV and
   recurrent-state operations, Obj-C buffer ownership, command diagnostics, and wait policy.
+- `math`: placement-independent attention preprocessing, rotary/MRoPE, normalization, vector
+  combination, sampling primitives, and CPU reference math. It selects no graph implementation.
 - `state`: hidden, residual, normed, KV, recurrent, next-layer, position, and session state with
   explicit CPU-visible and GPU-resident transitions.
 - `text`: tokenizer loading and validation, Qwen chat-template rendering, tool-call parsing,
@@ -259,6 +261,10 @@ Baseline reviewed on 2026-07-11:
   head/KV/rotary dimensions, linear-attention dimensions, and runtime tensor storage/shape
   validation move as one load-time responsibility. Runtime consumes the resolved layouts and does
   not infer them in the generation loop.
+- `math.rs` now owns full-attention Q/gate splitting, Q/K normalization, rotary and multimodal
+  rotary application, vector combination, sigmoid, and the linear-attention CPU reference helpers.
+  Runtime and weights import those operations directly; `legacy.rs` no longer owns production
+  full-attention preprocessing or normalization math.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -413,7 +419,7 @@ The architecture is not yet at the target:
 
 - The engine container, load path, and public generation/session orchestration are now in
   `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
-  is in `weights.rs`. Pull-time cache assembly, expert fixture implementation, and several math
+  is in `weights.rs`. Pull-time cache assembly, expert fixture implementation, and test/compatibility
   helpers still remain in `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
