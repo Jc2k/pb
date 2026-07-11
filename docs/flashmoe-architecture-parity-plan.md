@@ -307,8 +307,9 @@ Baseline reviewed on 2026-07-11:
   were deleted from `legacy.rs`; their registered `experts.rs` and `weights.rs` owner tests remain.
 - Planning now owns its model alias, typed cache layout, missing-artifact, stale-runtime cleanup,
   source-shard cleanup, and MLX shard-name tests. The duplicate planning/cache-policy block and its
-  stale model-family import were removed from `legacy.rs`; the partial expert-layer readiness
-  fixture remains there only until its expert-pack setup moves with the expert owner.
+  stale model-family import were removed from `legacy.rs`; partial expert-layer readiness now uses
+  expert metadata directly under the planning owner. Expert buffer recycling and stale temporary
+  file cleanup are tested beside the expert store, and all three legacy copies have been removed.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the

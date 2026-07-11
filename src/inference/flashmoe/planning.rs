@@ -523,6 +523,9 @@ fn cache_cleanup_path_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::flashmoe::experts::{
+        ExpertLayerPackMetadata, ExpertPackMetadata, expert_layer_metadata_path, expert_layer_path,
+    };
     use crate::inference::flashmoe::types::{
         BF16_CACHE_VERSION, CACHE_VERSION, F16_CACHE_VERSION, QWEN3_VL_MODEL,
     };
@@ -688,6 +691,52 @@ mod tests {
                 .any(|path| path.ends_with("model_weights.bin"))
         );
         assert_eq!(status.expert_files, 0);
+    }
+
+    #[test]
+    fn cache_status_rejects_partial_expert_layer_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, root.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+        fs::write(&plan.non_expert_weights, b"dense").unwrap();
+        fs::write(
+            &plan.tensor_manifest,
+            br#"{"model":"","cache_version":"","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &plan.model_config,
+            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
+        )
+        .unwrap();
+        fs::write(&plan.tokenizer, b"{}").unwrap();
+
+        let packs = (0..8)
+            .map(|expert| ExpertPackMetadata {
+                layer: 0,
+                expert,
+                packed_bytes: 1,
+                records: Vec::new(),
+            })
+            .collect();
+        let metadata = ExpertLayerPackMetadata::new(0, 1, 8, packs);
+        fs::write(expert_layer_path(&plan.experts_dir, 0), vec![0; 8]).unwrap();
+        fs::write(
+            expert_layer_metadata_path(&plan.experts_dir, 0),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let status = plan.cache_status().unwrap();
+
+        assert!(!status.ready);
+        assert!(
+            status
+                .missing
+                .iter()
+                .any(|path| path.ends_with("layer_01.bin"))
+        );
     }
 
     #[test]

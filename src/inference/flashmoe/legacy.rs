@@ -36,8 +36,6 @@ use std::fs;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::{Context, Result};
@@ -56,8 +54,8 @@ use super::capabilities::{
 #[cfg(test)]
 use super::experts::*;
 use super::experts::{
-    ExpertMlpProjection, ExpertRawPayload, FixedQ4ExpertPayload, PackedExpertTensor,
-    fixed_q4_payload_from_pbq4_records, parse_pbq4_expert_pack,
+    ExpertMlpProjection, ExpertRawPayload, PackedExpertTensor, fixed_q4_payload_from_pbq4_records,
+    parse_pbq4_expert_pack,
 };
 #[cfg(test)]
 use super::math::*;
@@ -1174,34 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_q4_expert_payload_recycles_whole_slot_bytes_to_pool() {
-        let spec = FixedQ4ExpertSlotSpec {
-            layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
-            hidden_size: HIDDEN_DIM,
-            intermediate_size: 1024,
-        };
-        let pool = Arc::new(Mutex::new(Vec::new()));
-        let mut bytes = Vec::with_capacity(spec.layout.expert_bytes);
-        bytes.resize(spec.layout.expert_bytes, 0);
-
-        {
-            let _payload = FixedQ4ExpertPayload {
-                spec,
-                bytes,
-                recycle_pool: Some(Arc::clone(&pool)),
-            };
-        }
-
-        assert_eq!(pool.lock().unwrap().len(), 1);
-        let returned = take_reusable_expert_bytes(&pool, spec.layout.expert_bytes).unwrap();
-        assert!(returned.capacity() >= spec.layout.expert_bytes);
-        let mut scratch = ReusableExpertBuffer::default();
-        let previous = scratch.adopt_buffer(returned);
-        assert_eq!(previous.capacity(), 0);
-        assert!(scratch.capacity() >= spec.layout.expert_bytes);
-    }
-
-    #[test]
     fn build_expert_pack_writes_bf16_scale_bias_metadata_and_stays_projectable() {
         let input_values: Vec<f32> = (0..64).map(|idx| (idx as f32 - 32.0) * 0.125).collect();
         let (pack, metadata) = build_expert_pack(
@@ -1491,64 +1461,6 @@ mod tests {
             )
             .unwrap();
         }
-    }
-
-    #[test]
-    fn cache_status_rejects_partial_expert_layer_coverage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
-        fs::create_dir_all(&plan.runtime_dir).unwrap();
-        fs::create_dir_all(&plan.experts_dir).unwrap();
-        fs::write(&plan.non_expert_weights, b"dense").unwrap();
-        fs::write(
-            &plan.tensor_manifest,
-            br#"{"model":"","cache_version":"","dense_shards":[],"expert_tensors":[],"dense_tensors":[]}"#,
-        )
-        .unwrap();
-        fs::write(
-            &plan.model_config,
-            br#"{"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],"num_hidden_layers":2,"hidden_size":8,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":300,"rope_theta":1000000.0,"torch_dtype":"bfloat16","num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16}"#,
-        )
-        .unwrap();
-        fs::write(&plan.tokenizer, test_tokenizer_json()).unwrap();
-        let packs: Vec<_> = (0..8)
-            .map(|expert| {
-                let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
-                let pack = test_expert_pack(&tensor);
-                let metadata = test_expert_pack_metadata(0, expert, &tensor, pack.len());
-                (expert, pack, metadata)
-            })
-            .collect();
-        write_test_expert_layer(&plan.experts_dir, 0, packs, 8).unwrap();
-
-        let status = plan.cache_status().unwrap();
-        assert!(!status.ready);
-        assert!(
-            status
-                .missing
-                .iter()
-                .any(|path| path.ends_with("layer_01.bin"))
-        );
-    }
-
-    #[test]
-    fn cleanup_deletes_stale_expert_temp_files_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let experts_dir = tmp.path();
-        let final_bin = experts_dir.join("layer_00.bin");
-        let temp_bin = experts_dir.join("layer_00.bin.tmp-123-ThreadId(1)");
-        let temp_json = experts_dir.join("layer_00.json.tmp-123-ThreadId(1)");
-
-        fs::write(&final_bin, b"PBQ4EXPERT ").unwrap();
-        fs::write(&temp_bin, b"partial").unwrap();
-        fs::write(&temp_json, b"partial").unwrap();
-
-        let deleted = cleanup_stale_expert_temp_files(experts_dir).unwrap();
-
-        assert_eq!(deleted, 2);
-        assert!(final_bin.is_file());
-        assert!(!temp_bin.exists());
-        assert!(!temp_json.exists());
     }
 
     #[test]

@@ -6529,6 +6529,54 @@ mod tests {
     }
 
     #[test]
+    fn fixed_q4_payload_drop_recycles_whole_slot_bytes() {
+        let spec = FixedQ4ExpertSlotSpec {
+            layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
+            hidden_size: 3584,
+            intermediate_size: 1024,
+        };
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let mut bytes = Vec::with_capacity(spec.layout.expert_bytes);
+        bytes.resize(spec.layout.expert_bytes, 0);
+
+        {
+            let _payload = FixedQ4ExpertPayload {
+                spec,
+                bytes,
+                recycle_pool: Some(Arc::clone(&pool)),
+            };
+        }
+
+        assert_eq!(pool.lock().unwrap().len(), 1);
+        let returned = take_reusable_expert_bytes(&pool, spec.layout.expert_bytes).unwrap();
+        assert!(returned.capacity() >= spec.layout.expert_bytes);
+        let mut scratch = ReusableExpertBuffer::default();
+        let previous = scratch.adopt_buffer(returned);
+        assert_eq!(previous.capacity(), 0);
+        assert!(scratch.capacity() >= spec.layout.expert_bytes);
+    }
+
+    #[test]
+    fn cleanup_stale_expert_temp_files_preserves_committed_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let experts_dir = temp.path();
+        let final_bin = experts_dir.join("layer_00.bin");
+        let temp_bin = experts_dir.join("layer_00.bin.tmp-123-ThreadId(1)");
+        let temp_json = experts_dir.join("layer_00.json.tmp-123-ThreadId(1)");
+
+        fs::write(&final_bin, b"PBQ4EXPERT ").unwrap();
+        fs::write(&temp_bin, b"partial").unwrap();
+        fs::write(&temp_json, b"partial").unwrap();
+
+        let deleted = cleanup_stale_expert_temp_files(experts_dir).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(final_bin.is_file());
+        assert!(!temp_bin.exists());
+        assert!(!temp_json.exists());
+    }
+
+    #[test]
     fn reusable_expert_byte_pool_reuses_capacity_qualified_buffers() {
         let pool: ReusableExpertBytePool = Arc::new(Mutex::new(Vec::new()));
         recycle_reusable_expert_bytes(&pool, Vec::with_capacity(64), 64);
