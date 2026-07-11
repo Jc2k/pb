@@ -283,6 +283,11 @@ Baseline reviewed on 2026-07-11:
   decoded/component Q4, CPU projection, and recurrent compatibility implementations are test-only.
   This satisfies Gate 7's no-production-owner criterion, but does not complete Gate 7 while Gate 6
   checkpoint evidence and the post-refactor benchmark work remain open.
+- The test-only legacy boundary no longer suppresses dead-code warnings. Unused synthetic-runtime
+  gates, decoded-expert methods, tokenizer data, and an unregistered duplicate state test were
+  deleted; deterministic synthetic dense-weight hashing moved to the `weights.rs` fixture that
+  consumes it. Remaining legacy helpers must compile as dependencies of registered parity or
+  compatibility tests.
 - Pull-time dense conversion is now weights-owned: MLX native-Q4 companion resolution, logical
   shape and quantization metadata, aligned offsets/padding, mmap source reads, post-hoc Q4
   conversion, and dense/vision store publication moved together. `safetensors.rs` owns shared,

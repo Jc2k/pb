@@ -14,8 +14,6 @@ use super::experts::{
     AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertSourceTensor, expert_scale_bias_dtype_size,
 };
-#[cfg(test)]
-use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
 use super::math::{q4_dequantize_rows_with_group_size, quantize_q4};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
@@ -34,6 +32,13 @@ use super::types::{
     ExpertQuantization, GROUP_SIZE, LINEAR_KEY_DIM, LINEAR_TOTAL_KEY, LINEAR_TOTAL_VALUE,
     LINEAR_VALUE_DIM,
 };
+
+#[cfg(test)]
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
 use anyhow::{Context, Result, bail};
 
 #[cfg(target_os = "macos")]
@@ -3444,7 +3449,6 @@ impl DenseStore {
         if let Some(projected) = self.matvec_tensor_prefix(&tensor_name, input, width)? {
             return Ok(projected);
         }
-        ensure_synthetic_runtime_allowed(&tensor_name)?;
         let salt = self.tensor_seed(&tensor_name, stable_hash(name) ^ ((layer as u64) << 32));
         let mut out = vec![0.0f32; width];
         for (row, slot) in out.iter_mut().enumerate() {
@@ -3766,9 +3770,6 @@ impl DenseStore {
     pub(super) fn rms_norm(&self, canonical_name: &str, input: &[f32]) -> Result<Vec<f32>> {
         let mut out = input.to_vec();
         let weight = self.norm_weight(canonical_name, input.len())?;
-        if weight.is_none() {
-            ensure_synthetic_runtime_allowed(canonical_name)?;
-        }
         rms_norm_with_weight_in_place(&mut out, weight.as_deref());
         Ok(out)
     }

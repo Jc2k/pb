@@ -7,7 +7,6 @@
 //! pretending a GGUF file is required for Qwen3.5.
 
 #![allow(
-    dead_code,
     clippy::assertions_on_constants,
     clippy::collapsible_if,
     clippy::default_constructed_unit_structs,
@@ -60,7 +59,7 @@ use super::capabilities::{
 use super::experts::*;
 use super::experts::{
     ExpertMlpProjection, ExpertRawPayload, ExpertRawRead, ExpertSlotDescriptor,
-    FixedQ4ExpertPayload, PackedExpertTensor, Q4MatvecPayload, fixed_q4_payload_from_pbq4_records,
+    FixedQ4ExpertPayload, PackedExpertTensor, fixed_q4_payload_from_pbq4_records,
     parse_pbq4_expert_pack,
 };
 #[cfg(test)]
@@ -567,24 +566,6 @@ fn compute_expert_phase_cpu<E: AsRef<ExpertWeights>>(
     Ok(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
 }
 
-#[cfg(test)]
-pub(super) fn stable_hash(value: &str) -> u64 {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-    })
-}
-
-#[cfg(test)]
-pub(super) fn ensure_synthetic_runtime_allowed(tensor_name: &str) -> Result<()> {
-    if cfg!(test) {
-        Ok(())
-    } else {
-        bail!(
-            "Flash-MoE tensor {tensor_name} is unavailable; synthetic runtime fallback is disabled outside tests"
-        )
-    }
-}
-
 fn is_full_attention_layer(layer: usize) -> bool {
     // Compatibility helper for Qwen3.5-397B-A17B's Flash-MoE schedule.
     // Runtime layer type inference must use the tensor manifest instead.
@@ -717,30 +698,6 @@ impl ExpertWeights {
         })
     }
 
-    #[cfg(test)]
-    pub fn q4_fma_matvec(
-        &self,
-        input: &[f32],
-        scales: &[f32],
-        biases: &[f32],
-        rows: usize,
-        cols: usize,
-    ) -> Result<Vec<f32>> {
-        q4_fma_matvec(&self.packed, input, scales, biases, rows, cols)
-    }
-
-    pub(super) fn project(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
-        let fixed_q4 = self.fixed_q4_required()?;
-        fixed_q4
-            .project_cpu(ExpertMlpProjection::Down, hidden, width)
-            .with_context(|| {
-                format!(
-                    "fixed Q4 expert layer {} expert {} has no compatible down projection",
-                    self.layer, self.expert
-                )
-            })
-    }
-
     fn mlp(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
         self.fixed_q4_mlp(self.fixed_q4_required()?, hidden, width)
     }
@@ -835,33 +792,6 @@ impl ExpertWeights {
             )
         })?;
         Ok(Some(projected))
-    }
-
-    fn mix_hash(&self) -> u64 {
-        let mut hash = ((self.layer as u64) << 32) ^ self.expert as u64;
-        for byte in self.packed.iter().take(4096) {
-            hash = hash.rotate_left(5) ^ u64::from(*byte);
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        hash
-    }
-
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    fn primary_matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
-        if let Some(fixed_q4) = &self.fixed_q4 {
-            return [
-                ExpertMlpProjection::Gate,
-                ExpertMlpProjection::Up,
-                ExpertMlpProjection::Down,
-            ]
-            .into_iter()
-            .filter_map(|projection| fixed_q4.matvec_payload(projection, hidden.len(), width))
-            .max_by_key(|payload| payload.rows.saturating_mul(payload.cols));
-        }
-        None
     }
 }
 
@@ -1304,15 +1234,6 @@ mod tests {
   "model_max_length": 32768,
   "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
 }"##
-    }
-
-    fn test_default_tokenizer_config_json() -> &'static [u8] {
-        br#"{
-  "eos_token": "<|im_end|>",
-  "add_bos_token": false,
-  "split_special_tokens": false,
-  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
-}"#
     }
 
     fn test_tokenizer_config_json_with_template(template: &str) -> Vec<u8> {
@@ -4010,15 +3931,6 @@ mod tests {
                 .contains("unsupported resolved Qwen35A17B Q4 CMD1 full-attention projection"),
             "{err:#}"
         );
-    }
-
-    fn session_cache_reuse_requires_entire_cached_token_prefix() {
-        assert_eq!(
-            reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
-            Some(3)
-        );
-        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2, 9]), None);
-        assert_eq!(reusable_session_prefix_len(&[1, 2, 3], &[1, 2]), None);
     }
 
     fn byte_tokens(text: &str) -> Vec<u32> {
