@@ -145,6 +145,7 @@ use super::state::{
     FlashMoePromptTokenRecord, FlashMoeSessionCache, KvCache, LinearAttentionLayout,
 };
 use super::types::*;
+use super::vision::{MropeAxis, MropePosition, QwenVlRuntimeInputs, VisionEncoding};
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
 #[cfg(test)]
@@ -1334,31 +1335,7 @@ struct SampledDecode {
     hidden: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MropePosition {
-    pub(super) temporal: usize,
-    pub(super) height: usize,
-    pub(super) width: usize,
-}
-
-impl MropePosition {
-    fn text(position: usize) -> Self {
-        Self {
-            temporal: position,
-            height: position,
-            width: position,
-        }
-    }
-
-    pub(super) fn axis(self, axis: MropeAxis) -> usize {
-        match axis {
-            MropeAxis::Temporal => self.temporal,
-            MropeAxis::Height => self.height,
-            MropeAxis::Width => self.width,
-        }
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ImagePlaceholderSpec {
     token_count: usize,
@@ -1366,6 +1343,7 @@ struct ImagePlaceholderSpec {
     grid_w: usize,
 }
 
+#[cfg(test)]
 impl ImagePlaceholderSpec {
     fn validate(self, image_index: usize) -> Result<()> {
         if self.token_count == 0 {
@@ -1391,11 +1369,13 @@ impl ImagePlaceholderSpec {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualModality {
     Image,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VisualTokenSpan {
     modality: VisualModality,
@@ -1405,6 +1385,7 @@ struct VisualTokenSpan {
     grid_w: usize,
 }
 
+#[cfg(test)]
 impl VisualTokenSpan {
     fn image(start: usize, end: usize, grid_h: usize, grid_w: usize) -> Self {
         Self {
@@ -1433,12 +1414,14 @@ impl VisualTokenSpan {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpandedVisionPrompt {
     tokens: Vec<u32>,
     visual_spans: Vec<VisualTokenSpan>,
 }
 
+#[cfg(test)]
 fn qwen3vl_multimodal_mrope_positions(
     prompt_tokens: &[u32],
     image_pad_token: u32,
@@ -1533,6 +1516,7 @@ fn qwen3vl_multimodal_mrope_positions(
     Ok((positions, current_pos))
 }
 
+#[cfg(test)]
 fn qwen3vl_single_image_mrope_positions(
     prompt_tokens: &[u32],
     image_pad_token: u32,
@@ -1553,6 +1537,7 @@ fn qwen3vl_single_image_mrope_positions(
     )
 }
 
+#[cfg(test)]
 fn expand_multimodal_image_placeholders(
     prompt_tokens: Vec<u32>,
     vision_start_token: u32,
@@ -1617,6 +1602,7 @@ fn expand_multimodal_image_placeholders(
     })
 }
 
+#[cfg(test)]
 fn expand_single_image_placeholders(
     prompt_tokens: Vec<u32>,
     vision_start_token: u32,
@@ -1638,6 +1624,7 @@ fn expand_single_image_placeholders(
     .tokens)
 }
 
+#[cfg(test)]
 fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
     let mut start = None;
@@ -1659,6 +1646,7 @@ fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
     runs
 }
 
+#[cfg(test)]
 fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize, usize)> {
     let mut start = None;
     let mut end = None;
@@ -1682,13 +1670,6 @@ fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize,
         }
     }
     Some((start?, end?, count))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MropeAxis {
-    Temporal,
-    Height,
-    Width,
 }
 
 impl FlashMoeEngine {
@@ -2166,19 +2147,15 @@ impl FlashMoeEngine {
     /// Qwen-VL remains outside the text runtime until its typed input adapter resolves.
     fn prefill_with_vision(
         &mut self,
-        prompt_tokens: &[u32],
-        visual_embeddings: &[Vec<f32>],
-        deepstack_features: &[Vec<Vec<f32>>],
-        image_pad_token: u32,
-        mrope_positions: &[MropePosition],
+        inputs: &QwenVlRuntimeInputs,
         kv_cache: &mut KvCache,
     ) -> Result<Vec<f32>> {
         let _ = (
-            prompt_tokens,
-            visual_embeddings,
-            deepstack_features,
-            image_pad_token,
-            mrope_positions,
+            inputs.prompt_tokens(),
+            inputs.visual_embeddings(),
+            inputs.deepstack_features(),
+            inputs.image_pad_token(),
+            inputs.mrope_positions(),
             kv_cache,
         );
         bail!(
@@ -2323,62 +2300,19 @@ impl FlashMoeEngine {
             &[],
             true,
         )?;
-        let mut prompt_tokens = self.tokenizer.encode(&chat_text)?;
-        let mut image_specs = Vec::with_capacity(visual_encodings.len());
-        let mut visual_embeddings = Vec::new();
-        let mut deepstack_features = None::<Vec<Vec<Vec<f32>>>>;
-        for visual in visual_encodings {
-            let VisionEncoding {
-                embeddings,
-                deepstack_features: visual_deepstack,
-                merged_grid_h,
-                merged_grid_w,
-            } = visual;
-            image_specs.push(ImagePlaceholderSpec {
-                token_count: embeddings.len(),
-                grid_h: merged_grid_h,
-                grid_w: merged_grid_w,
-            });
-            visual_embeddings.extend(embeddings);
-            if let Some(accumulated_deepstack) = deepstack_features.as_mut() {
-                if accumulated_deepstack.len() != visual_deepstack.len() {
-                    bail!(
-                        "vision images produced incompatible DeepStack feature depths: {} vs {}",
-                        accumulated_deepstack.len(),
-                        visual_deepstack.len()
-                    );
-                }
-                for (dst, mut src) in accumulated_deepstack.iter_mut().zip(visual_deepstack) {
-                    dst.append(&mut src);
-                }
-            } else {
-                deepstack_features = Some(visual_deepstack);
-            }
-        }
-        let deepstack_features = deepstack_features.unwrap_or_default();
-        let expanded = expand_multimodal_image_placeholders(
-            prompt_tokens,
+        let runtime_inputs = QwenVlRuntimeInputs::build(
+            self.tokenizer.encode(&chat_text)?,
             vs_tok,
             ve_tok,
             pad_tok,
-            &image_specs,
+            visual_encodings,
         )?;
-        prompt_tokens = expanded.tokens;
-        let (mrope_positions, next_mrope_position) =
-            qwen3vl_multimodal_mrope_positions(&prompt_tokens, pad_tok, &expanded.visual_spans)?;
 
         let mut kv_cache = KvCache::new(
             self.config.num_hidden_layers,
-            prompt_tokens.len() + max_tokens.max(0) as usize,
+            runtime_inputs.prompt_tokens().len() + max_tokens.max(0) as usize,
         );
-        let prefill_hidden = self.prefill_with_vision(
-            &prompt_tokens,
-            &visual_embeddings,
-            &deepstack_features,
-            pad_tok,
-            &mrope_positions,
-            &mut kv_cache,
-        )?;
+        let prefill_hidden = self.prefill_with_vision(&runtime_inputs, &mut kv_cache)?;
 
         let mut sampler = TokenSampler::new(temperature, top_k, seed);
         let mut generated = Vec::new();
@@ -2388,7 +2322,7 @@ impl FlashMoeEngine {
             let token = self.sample_from_hidden(
                 &mut sampler,
                 &prefill_hidden,
-                &prompt_tokens,
+                runtime_inputs.prompt_tokens(),
                 &generated,
                 false,
                 &None,
@@ -2400,14 +2334,14 @@ impl FlashMoeEngine {
             }
         }
         while !stopped && generated.len() < max_tokens {
-            let position = prompt_tokens.len() + generated.len() - 1;
+            let position = runtime_inputs.prompt_tokens().len() + generated.len() - 1;
             let sampled = self.sample_next_token(
                 &mut sampler,
-                &prompt_tokens,
+                runtime_inputs.prompt_tokens(),
                 &generated,
                 &mut kv_cache,
                 position,
-                MropePosition::text(next_mrope_position + generated.len() - 1),
+                MropePosition::text(runtime_inputs.next_mrope_position() + generated.len() - 1),
                 None,
                 false,
                 None,
@@ -7876,14 +7810,6 @@ pub struct VisionEncoder {
     /// Target hidden size of the language-model decoder.
     text_hidden_size: usize,
     dense: DenseStore,
-}
-
-#[derive(Debug, Clone)]
-pub struct VisionEncoding {
-    pub embeddings: Vec<Vec<f32>>,
-    pub deepstack_features: Vec<Vec<Vec<f32>>>,
-    pub merged_grid_h: usize,
-    pub merged_grid_w: usize,
 }
 
 impl VisionEncoder {

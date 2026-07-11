@@ -9,6 +9,7 @@ use super::metal::*;
 use super::scheduler::*;
 use super::state::*;
 use super::types::*;
+use super::vision::MropePosition;
 use super::weights::*;
 
 use super::metal::MetalObjcId as ObjcId;

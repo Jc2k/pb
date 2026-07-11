@@ -14,6 +14,7 @@ mod runtime;
 mod scheduler;
 mod state;
 mod types;
+mod vision;
 mod weights;
 
 pub use capabilities::*;
