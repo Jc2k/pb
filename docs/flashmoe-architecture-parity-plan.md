@@ -232,6 +232,11 @@ Baseline reviewed on 2026-07-10:
   diagnostics moved together. Load, runtime, and sampling use that owner directly. Synthetic
   projection, CPU dense router-topK, raw-tile, and alternate projection helpers are test-only; they
   are no longer dormant production continuations hidden by `legacy.rs`'s broad dead-code allowance.
+- `state.rs` now owns the CPU-visible `KvCache`, prompt/generated/recurrent records, full-attention
+  KV insertion and causal lookup, capacity growth, and shallow session snapshots. The pure causal
+  attention math moved to `math.rs`; `legacy.rs` retains generation/session orchestration but no KV
+  storage implementation or direct access to cache internals. Focused state tests prove shared
+  snapshot storage, independent growth, and explicit rejection of undeclared GPU recurrent state.
 - Full-attention placement is now resolved by the scheduled graph rather than supplied by the
   runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
   attention stage without a matching scheduled executor is a named unsupported capability. The
@@ -272,19 +277,20 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- The legacy engine shell still stores the weights-owned `DenseStore`; CPU KV/session caches,
-  runtime layout metadata, and `VisionEncoder` also remain defined in `legacy.rs`.
-- CPU-visible KV/session transitions and deferred runtime state have not yet moved to `state.rs`,
-  so Gate 4's single-owner buffer/storage boundary is incomplete.
+- The legacy engine shell still stores the weights-owned `DenseStore`; generation/session cache-map
+  orchestration, runtime layout metadata, and `VisionEncoder` also remain defined in `legacy.rs`.
+- CPU-visible KV records and cache storage are state-owned, but generation/session lifecycle and
+  deferred runtime state still cross legacy-owned orchestration, so Gate 4's single-owner
+  buffer/storage boundary is incomplete.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this checkpoint, Gates 1 through 3 are complete. Weights/state ownership, parity closure,
-additional variants, and final legacy removal remain, so approximately 25-35% of the architectural
-work remains.
+At this checkpoint, Gates 1 through 3 are complete. Dense and CPU-KV storage ownership have moved;
+generation/deferred state ownership, parity closure, additional variants, and final legacy removal
+remain, so approximately 20-30% of the architectural work remains.
 
 ## Completion Gates
 
@@ -592,8 +598,9 @@ For Gate 4:
 1. Move `DenseStore` as a complete owner into `weights.rs`: mmap/blob, registry, resident bindings,
    projection execution, norm/projection caches, decoded/raw tile caches, and their focused tests.
    Route load, runtime, and sampling through that owner in the same ownership slices.
-2. Move `KvCache`, generated/prompt/session state, full-attention KV transitions, and cache reuse
-   into `state.rs`. Keep recurrent GPU state in `metal.rs`; remove obsolete CPU recurrent state.
+2. Finish routing generation/session cache-map lifecycle through the state-owned `KvCache`, token
+   records, full-attention KV transitions, and cache reuse. Keep recurrent GPU state in `metal.rs`;
+   remove obsolete CPU recurrent state and legacy orchestration that reaches across the boundary.
 3. Move deferred CMD3 buffers and next-layer hidden/normed transition ownership to `state.rs` and
    `metal.rs` so `runtime.rs` carries typed state handles rather than legacy-owned adapters.
 4. Audit every CPU readback/upload in the live graph. Keep only declared graph boundaries; turn a

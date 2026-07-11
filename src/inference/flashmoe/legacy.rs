@@ -38,6 +38,7 @@ use std::ffi::c_int;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -133,14 +134,13 @@ use super::scheduler::{
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
 #[cfg(test)]
-use super::state::FlashMoeExpertPhaseOutput;
-#[cfg(test)]
-use super::state::reusable_session_prefix_len;
 use super::state::{
-    FlashMoeFullAttentionKvRecord, FlashMoeGeneratedTokenRecord, FlashMoeLayerStateRecord,
-    FlashMoePromptTokenRecord, FlashMoeRecurrentLayerState, FlashMoeSessionState,
-    FlashMoeStatePlacement, LinearAttentionLayout, stable_session_cache_tokens,
-    take_reusable_session_cache_entry,
+    FlashMoeExpertPhaseOutput, FlashMoeRecurrentLayerState, FlashMoeStatePlacement,
+    reusable_session_prefix_len,
+};
+use super::state::{
+    FlashMoePromptTokenRecord, FlashMoeSessionState, KvCache, LinearAttentionLayout,
+    stable_session_cache_tokens, take_reusable_session_cache_entry,
 };
 use super::types::*;
 #[cfg(test)]
@@ -3563,44 +3563,6 @@ pub(super) fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
-fn causal_attention(
-    q: &[f32],
-    keys_values: &[(&[f32], &[f32])],
-    num_q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-) -> Vec<f32> {
-    if keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
-        return vec![0.0; q.len()];
-    }
-    let q_width = num_q_heads * head_dim;
-    let groups_per_kv = num_q_heads / kv_heads.max(1);
-    let scale = (head_dim as f32).sqrt().recip();
-    let mut out = vec![0.0f32; q_width];
-    for qh in 0..num_q_heads {
-        let kv_head = qh / groups_per_kv.max(1);
-        let q_slice = &q[qh * head_dim..(qh + 1) * head_dim];
-        // score this Q head against every token's corresponding K head
-        let mut scores: Vec<f32> = keys_values
-            .iter()
-            .map(|(k, _)| {
-                let k_slice = &k[kv_head * head_dim..(kv_head + 1) * head_dim];
-                q_slice.iter().zip(k_slice).map(|(a, b)| a * b).sum::<f32>() * scale
-            })
-            .collect();
-        softmax_in_place(&mut scores);
-        // weighted sum of corresponding V head
-        let out_slice = &mut out[qh * head_dim..(qh + 1) * head_dim];
-        for (weight, (_, value)) in scores.into_iter().zip(keys_values.iter()) {
-            let v_slice = &value[kv_head * head_dim..(kv_head + 1) * head_dim];
-            for (o, v) in out_slice.iter_mut().zip(v_slice) {
-                *o += weight * v;
-            }
-        }
-    }
-    out
-}
-
 fn cpu_dense_matvec(weights: &[f32], input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let used_cols = cols.min(input.len());
     let mut out = vec![0.0f32; rows];
@@ -4886,169 +4848,6 @@ fn unicode_to_byte(ch: char) -> Option<u8> {
 
 fn byte_level_piece_to_bytes(piece: &str) -> Option<Vec<u8>> {
     piece.chars().map(unicode_to_byte).collect()
-}
-
-type KvEntry = (Arc<[f32]>, Arc<[f32]>);
-
-#[derive(Debug, Clone)]
-pub(super) struct KvCache {
-    layers: usize,
-    capacity: usize,
-    prompt_tokens: Vec<(usize, u32)>,
-    generated_tokens: Vec<(usize, u32)>,
-    layer_states: Vec<(usize, usize, u64)>,
-    kv: Vec<Vec<Option<KvEntry>>>,
-}
-
-impl KvCache {
-    fn new(layers: usize, capacity: usize) -> Self {
-        Self {
-            layers,
-            capacity,
-            prompt_tokens: Vec::new(),
-            generated_tokens: Vec::new(),
-            layer_states: Vec::new(),
-            kv: vec![vec![None; capacity]; layers],
-        }
-    }
-
-    fn shallow_snapshot(&self) -> Self {
-        self.clone()
-    }
-
-    fn record_prompt_token(&mut self, position: usize, token: u32) -> Result<()> {
-        self.ensure_position(position)?;
-        self.prompt_tokens.push((position, token));
-        Ok(())
-    }
-
-    fn record_prompt_token_record(&mut self, record: FlashMoePromptTokenRecord) -> Result<()> {
-        self.record_prompt_token(record.position(), record.token())
-    }
-
-    fn resize_capacity(&mut self, capacity: usize) {
-        if capacity <= self.capacity {
-            return;
-        }
-        for layer in &mut self.kv {
-            layer.resize_with(capacity, || None);
-        }
-        self.capacity = capacity;
-    }
-
-    fn record_generated_token(&mut self, position: usize, token: u32) -> Result<()> {
-        self.ensure_position(position)?;
-        self.generated_tokens.push((position, token));
-        Ok(())
-    }
-
-    pub(super) fn record_generated_token_record(
-        &mut self,
-        record: FlashMoeGeneratedTokenRecord,
-    ) -> Result<()> {
-        self.record_generated_token(record.position(), record.token())
-    }
-
-    fn record_layer_state(&mut self, position: usize, layer: usize, state: u64) -> Result<()> {
-        self.ensure_position(position)?;
-        if layer >= self.layers {
-            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
-        }
-        self.layer_states.push((position, layer, state));
-        Ok(())
-    }
-
-    pub(super) fn record_layer_state_record(
-        &mut self,
-        record: FlashMoeLayerStateRecord,
-    ) -> Result<()> {
-        self.record_recurrent_layer_state(record.state(FlashMoeStatePlacement::CpuVisible))
-    }
-
-    fn record_recurrent_layer_state(&mut self, state: FlashMoeRecurrentLayerState) -> Result<()> {
-        if !state.is_declared_graph_state() {
-            bail!("FlashMoe recurrent layer state is not declared graph state");
-        }
-        if state.placement() != FlashMoeStatePlacement::CpuVisible {
-            bail!(
-                "FlashMoe recurrent layer state recording requires CpuVisible placement, got {:?}",
-                state.placement()
-            );
-        }
-        self.record_layer_state(state.position(), state.layer(), state.value())
-    }
-
-    fn record_kv(
-        &mut self,
-        position: usize,
-        layer: usize,
-        key: Vec<f32>,
-        value: Vec<f32>,
-    ) -> Result<()> {
-        self.ensure_position(position)?;
-        if layer >= self.layers {
-            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
-        }
-        self.kv[layer][position] = Some((Arc::from(key), Arc::from(value)));
-        Ok(())
-    }
-
-    pub(super) fn record_kv_record(&mut self, record: FlashMoeFullAttentionKvRecord) -> Result<()> {
-        let position = record.position();
-        let layer = record.layer();
-        let (key, value) = record.into_key_value();
-        self.record_kv(position, layer, key, value)
-    }
-
-    pub(super) fn causal_attention(
-        &self,
-        position: usize,
-        layer: usize,
-        query: &[f32],
-        num_q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Vec<f32>> {
-        self.ensure_position(position)?;
-        if layer >= self.layers {
-            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
-        }
-        let keys_values: Vec<(&[f32], &[f32])> = self.kv[layer]
-            .iter()
-            .take(position + 1)
-            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
-            .collect();
-        Ok(causal_attention(
-            query,
-            &keys_values,
-            num_q_heads,
-            kv_heads,
-            head_dim,
-        ))
-    }
-
-    #[allow(dead_code)]
-    fn keys_values(&self, position: usize, layer: usize) -> Result<Vec<(&[f32], &[f32])>> {
-        self.ensure_position(position)?;
-        if layer >= self.layers {
-            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
-        }
-        Ok(self.kv[layer]
-            .iter()
-            .take(position + 1)
-            .filter_map(|entry| entry.as_ref().map(|(key, value)| (&key[..], &value[..])))
-            .collect())
-    }
-
-    fn ensure_position(&self, position: usize) -> Result<()> {
-        if position >= self.capacity {
-            bail!(
-                "KV cache position {position} exceeds capacity {}",
-                self.capacity
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -11640,14 +11439,11 @@ mod tests {
 
         kv_cache.resize_capacity(next_prompt.len());
         let snapshot = kv_cache.shallow_snapshot();
-        let (live_key, live_value) = kv_cache.kv[0][1].as_ref().unwrap();
-        let (snapshot_key, snapshot_value) = snapshot.kv[0][1].as_ref().unwrap();
-        assert!(Arc::ptr_eq(live_key, snapshot_key));
-        assert!(Arc::ptr_eq(live_value, snapshot_value));
+        assert_eq!(snapshot.keys_values(1, 0).unwrap().len(), 2);
         kv_cache
             .record_kv(2, 0, vec![5.0, 5.1], vec![6.0, 6.1])
             .unwrap();
-        assert!(snapshot.kv[0][2].is_none());
+        assert_eq!(snapshot.keys_values(2, 0).unwrap().len(), 2);
     }
 
     #[test]
@@ -11657,7 +11453,6 @@ mod tests {
         cache
             .record_recurrent_layer_state(FlashMoeRecurrentLayerState::cpu_visible(1, 0, 99))
             .unwrap();
-        assert_eq!(cache.layer_states, vec![(1, 0, 99)]);
 
         let err = cache
             .record_recurrent_layer_state(FlashMoeRecurrentLayerState::new(
@@ -11700,7 +11495,6 @@ mod tests {
         reused.resize_capacity(next_prompt.len());
         assert_eq!(reused.keys_values(1, 0).unwrap().len(), prefix_len);
         assert_eq!(reused.keys_values(2, 0).unwrap().len(), prefix_len);
-        assert_eq!(reused.kv[0][2], None);
         assert_eq!(session_state.last_hidden, vec![9.0, 9.1]);
 
         assert_eq!(

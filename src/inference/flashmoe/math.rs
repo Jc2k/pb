@@ -2,6 +2,44 @@ use anyhow::{Context, Result, bail};
 
 use super::types::GROUP_SIZE;
 
+pub(crate) fn causal_attention(
+    q: &[f32],
+    keys_values: &[(&[f32], &[f32])],
+    num_q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    if keys_values.is_empty() || num_q_heads == 0 || head_dim == 0 {
+        return vec![0.0; q.len()];
+    }
+    let q_width = num_q_heads * head_dim;
+    let groups_per_kv = num_q_heads / kv_heads.max(1);
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut out = vec![0.0f32; q_width];
+    for qh in 0..num_q_heads {
+        let kv_head = qh / groups_per_kv.max(1);
+        let q_slice = &q[qh * head_dim..(qh + 1) * head_dim];
+        // score this Q head against every token's corresponding K head
+        let mut scores: Vec<f32> = keys_values
+            .iter()
+            .map(|(k, _)| {
+                let k_slice = &k[kv_head * head_dim..(kv_head + 1) * head_dim];
+                q_slice.iter().zip(k_slice).map(|(a, b)| a * b).sum::<f32>() * scale
+            })
+            .collect();
+        softmax_in_place(&mut scores);
+        // weighted sum of corresponding V head
+        let out_slice = &mut out[qh * head_dim..(qh + 1) * head_dim];
+        for (weight, (_, value)) in scores.into_iter().zip(keys_values.iter()) {
+            let v_slice = &value[kv_head * head_dim..(kv_head + 1) * head_dim];
+            for (o, v) in out_slice.iter_mut().zip(v_slice) {
+                *o += weight * v;
+            }
+        }
+    }
+    out
+}
+
 /// Sort by descending score, then ascending token id for stable tie-breaking.
 pub(crate) fn compare_scored_tokens(
     left: &(usize, f32),
