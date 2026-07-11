@@ -310,12 +310,14 @@ Baseline reviewed on 2026-07-11:
 - The scheduler layer transaction now starts from an explicit initial, CPU-visible, or deferred-GPU
   previous-CMD3 handoff and consumes its phase through CMD1, CMD2, routing, pending whole-slot
   reads, CMD3 submission, and a scheduler-selected complete/defer output handoff. Per-layer full
-  CPU-KV versus fused-linear-Metal attention is resolved once at load and carried by the
-  transaction; `runtime.rs` no longer discovers it from model layout. The tiny-fixture expert-skip
-  runtime and dormant Qwen-VL layer loop were deleted. Text lookup and exact precomputed visual
-  embeddings now enter the same typed token-input boundary. Declared per-layer additions force a
-  scheduler-owned complete-here CMD3 handoff, omit stale next-norm output, and are applied before
-  the next shared layer transaction.
+  CPU-KV versus fused-linear-Metal attention is resolved once from the tensor manifest, validated
+  layer-by-layer against the model-family layout by capability resolution, stored in the concrete
+  graph, and carried by the transaction. A count or kind mismatch is a named CMD1 capability error.
+  `runtime.rs` no longer constructs a parallel scheduler table, and scheduler construction cannot
+  accept one. The tiny-fixture expert-skip runtime and dormant Qwen-VL layer loop were deleted. Text
+  lookup and exact precomputed visual embeddings enter the same typed token-input boundary.
+  Declared per-layer additions force a scheduler-owned complete-here CMD3 handoff, omit stale
+  next-norm output, and are applied before the next shared layer transaction.
 - Gate 4 has moved `DenseStore` as one owner into `weights.rs`: the mmap/blob and registry,
   resident tensor and norm caches, Q4 projection bindings, decoded/raw tile accounting, projection
   batches, CMD2/routing preparation, LM-head candidates, dtype decoding, and focused cache/read
@@ -445,10 +447,10 @@ Baseline reviewed on 2026-07-11:
   residual/hidden state, declared CMD3 output, and next-layer RMSNorm. The stale ignored test that
   mislabeled a tiny Qwen3 model as the production Qwen3.5 URI was deleted rather than preserved as
   an alternate runtime fixture.
-- A second deterministic fixture now carries the resolved graph across a fused linear-attention
-  layer and a declared CPU-KV full-attention layer. It proves deferred hidden/next-normed handoff,
-  recurrent mixing, eight scheduler-owned K=4 positioned reads, terminal hidden state, logits, and
-  top candidates without entering another runtime.
+- A second deterministic fixture carries a valid two-layer Qwen3.5 linear-attention prefix through
+  the resolved graph. It proves deferred hidden/next-normed handoff, recurrent mixing, eight
+  scheduler-owned K=4 positioned reads, terminal hidden state, logits, and top candidates without
+  inventing a full-attention layer outside the family schedule.
 - Local-Metal reference tests exercise both the resident-Q4 fused projection batch and one mixed
   BF16/F16/F32 batch, Q4 and BF16/F16/F32 fused CMD2 preparation, and scheduler-issued CMD3
   active-expert plus Q4/BF16/F16/F32 shared-expert combine against independent CPU math. Route IDs
@@ -599,8 +601,8 @@ Completion evidence:
 - Runtime no longer branches on family, dtype, Qwen-VL, optional executors, or implementation
   probes. The expert-skip fixture runtime and Qwen-VL layer-loop branch were deleted. A generic
   typed token input selects resident lookup or an exact precomputed embedding and exposes declared
-  per-layer additions without identifying the source family; Qwen-VL graph selection remains a
-  named unresolved capability until its load-time bindings are proven.
+  per-layer additions without identifying the source family; Qwen-VL graph selection requires its
+  load-time typed adapter and manifest bindings.
 - The concrete required-Metal facade and CMD3 input adapter moved with production execution into
   `runtime.rs`; deferred submission and typed GPU handoff ownership live in `metal.rs`. The
   undeclared CPU CMD3 input is test-only, and source audits show no production graph builder,
@@ -666,6 +668,9 @@ Completion evidence:
   rebuilt, and the required smoke again printed `4` on 2026-07-11. After removing the legacy
   decoded/component execution adapter and its duplicate fallback tests, 675 tests passed with seven
   ignored; the release binary rebuilt and the required smoke still printed `4` on 2026-07-11.
+  After capability resolution took ownership of the manifest-validated per-layer attention
+  schedule, 676 tests passed with seven ignored; web assets and the release binary rebuilt, and the
+  required smoke again printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations

@@ -145,6 +145,7 @@ where
     progress("manifest_validation", phase_started.elapsed());
     phase_started = Instant::now();
     let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
+    let attention_layers = runtime.resolved_attention_layers()?;
     progress("runtime_layout", phase_started.elapsed());
     phase_started = Instant::now();
     let linear_attention_weights = dense.resolve_linear_attention_weight_table(
@@ -195,19 +196,11 @@ where
         input_adapter,
         dense_layout,
         expert_storage,
+        &attention_layers,
         Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
-    let attention_layers = (0..config.num_hidden_layers)
-        .map(|layer| {
-            if runtime.is_linear_attention_layer(layer) {
-                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal
-            } else {
-                ScheduledLayerAttentionImplementation::FullAttentionCpuKv
-            }
-        })
-        .collect();
-    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts, attention_layers)?;
+    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts)?;
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;

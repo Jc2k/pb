@@ -188,6 +188,7 @@ pub struct FlashMoeCapabilityPlan {
     pub routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     pub routed_expert_scale: f32,
     pub state_policy: FlashMoeStatePolicy,
+    pub(crate) attention_layers: Box<[QwenMoeLayerKind]>,
     pub stages: Vec<FlashMoeStageCapability>,
 }
 
@@ -197,16 +198,19 @@ impl FlashMoeCapabilityPlan {
         input_adapter: FlashMoeInputAdapterCapability,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
+        manifest_attention_layers: &[QwenMoeLayerKind],
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
         let input_implementation = resolve_input_adapter(layout, input_adapter)?;
+        let attention_layers = resolve_attention_layers(layout, manifest_attention_layers)?;
         Self::resolve_qwen_graph(
             layout,
             input_adapter,
             input_implementation,
             dense_layout,
             expert_storage,
+            attention_layers,
             metal,
         )
     }
@@ -217,6 +221,7 @@ impl FlashMoeCapabilityPlan {
         input_implementation: FlashMoeStageImplementation,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
+        attention_layers: Box<[QwenMoeLayerKind]>,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         let expected_slot_spec = ExpertSlotSpec::from_model_layout(layout, expert_storage.layout)
@@ -252,8 +257,7 @@ impl FlashMoeCapabilityPlan {
         })?;
         let routing_weight_normalization = require_selected_route_renormalization(layout)?;
 
-        let has_linear_attention = (0..layout.layers)
-            .any(|layer| layout.layer_kind(layer) == QwenMoeLayerKind::LinearAttention);
+        let has_linear_attention = attention_layers.contains(&QwenMoeLayerKind::LinearAttention);
         match dense_layout {
             ResidentDenseLayout::Q4 => require_stage_kernels(
                 layout.family,
@@ -436,6 +440,7 @@ impl FlashMoeCapabilityPlan {
             routing_weight_normalization,
             routed_expert_scale: layout.routed_expert_scale,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
+            attention_layers,
             stages,
         };
         plan.validate_complete()?;
@@ -447,11 +452,15 @@ impl FlashMoeCapabilityPlan {
         layout: &QwenMoeModelLayout,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
+        let attention_layers = (0..layout.layers)
+            .map(|layer| layout.layer_kind(layer))
+            .collect::<Vec<_>>();
         Self::resolve(
             layout,
             FlashMoeInputAdapterCapability::QwenText,
             ResidentDenseLayout::Q4,
             test_expert_storage(layout)?,
+            &attention_layers,
             Some(MetalRuntimeCapabilities::from_pipeline_names(
                 MetalPipelineNameSet::new(),
             )),
@@ -476,6 +485,36 @@ impl FlashMoeCapabilityPlan {
             .iter()
             .find(|capability| capability.stage == stage)
     }
+}
+
+fn resolve_attention_layers(
+    layout: &QwenMoeModelLayout,
+    manifest_attention_layers: &[QwenMoeLayerKind],
+) -> Result<Box<[QwenMoeLayerKind]>, FlashMoeUnsupportedCapability> {
+    if manifest_attention_layers.len() != layout.layers {
+        return Err(FlashMoeUnsupportedCapability::new(
+            layout.family,
+            FlashMoeGraphStage::Cmd1AttentionProjections,
+            format!(
+                "the tensor manifest resolves {} attention layers but the model declares {}",
+                manifest_attention_layers.len(),
+                layout.layers
+            ),
+        ));
+    }
+    for (layer, actual) in manifest_attention_layers.iter().copied().enumerate() {
+        let expected = layout.layer_kind(layer);
+        if actual != expected {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                format!(
+                    "layer {layer} tensor layout resolves {actual:?} but the model family requires {expected:?}"
+                ),
+            ));
+        }
+    }
+    Ok(manifest_attention_layers.to_vec().into_boxed_slice())
 }
 
 fn resolve_input_adapter(
@@ -750,6 +789,12 @@ mod tests {
         QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
     }
 
+    fn attention_layers(layout: &QwenMoeModelLayout) -> Vec<QwenMoeLayerKind> {
+        (0..layout.layers)
+            .map(|layer| layout.layer_kind(layer))
+            .collect()
+    }
+
     fn fixed_q4_experts(layout: &QwenMoeModelLayout) -> ExpertStoreExecutionDescriptor {
         test_expert_storage(layout).unwrap()
     }
@@ -828,6 +873,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(full_metal()),
         )
         .unwrap();
@@ -840,6 +886,8 @@ mod tests {
         assert_eq!(plan.experts_per_layer, 512);
         assert_eq!(plan.active_experts, 4);
         assert_eq!(plan.state_policy, FlashMoeStatePolicy::DeferredGpuNextLayer);
+        assert_eq!(plan.attention_layers[0], QwenMoeLayerKind::LinearAttention);
+        assert_eq!(plan.attention_layers[3], QwenMoeLayerKind::FullAttention);
         assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
         assert_eq!(
             plan.stage(FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection)
@@ -856,6 +904,53 @@ mod tests {
     }
 
     #[test]
+    fn capability_resolution_rejects_manifest_attention_schedule_mismatches() {
+        let layout = qwen3_moe_layout(Some(true));
+        let mut wrong_kind = attention_layers(&layout);
+        wrong_kind[0] = QwenMoeLayerKind::LinearAttention;
+        let kind_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &wrong_kind,
+            Some(full_metal()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            kind_error.stage,
+            FlashMoeGraphStage::Cmd1AttentionProjections
+        );
+        assert!(
+            kind_error.reason.contains(
+                "layer 0 tensor layout resolves LinearAttention but the model family requires FullAttention"
+            ),
+            "{kind_error}"
+        );
+
+        let missing_layer = &attention_layers(&layout)[..layout.layers - 1];
+        let count_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            missing_layer,
+            Some(full_metal()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            count_error.stage,
+            FlashMoeGraphStage::Cmd1AttentionProjections
+        );
+        assert!(
+            count_error
+                .reason
+                .contains("resolves 47 attention layers but the model declares 48"),
+            "{count_error}"
+        );
+    }
+
+    #[test]
     fn qwen35_q4_capability_plan_rejects_missing_metal_executor() {
         let layout = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(
@@ -863,6 +958,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             None,
         )
         .unwrap_err();
@@ -888,6 +984,7 @@ mod tests {
                 text_adapter(),
                 dense_layout,
                 fixed_q4_experts(&layout),
+                &attention_layers(&layout),
                 Some(full_metal()),
             )
             .unwrap();
@@ -913,6 +1010,7 @@ mod tests {
                 text_adapter(),
                 ResidentDenseLayout::Q4,
                 fixed_dense_experts(&layout, expert_dtype),
+                &attention_layers(&layout),
                 Some(full_metal()),
             )
             .unwrap();
@@ -937,6 +1035,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_dense_experts(&layout, DenseExpertDtype::Bf16),
+            &attention_layers(&layout),
             Some(metal_without_dense_bf16()),
         )
         .unwrap_err();
@@ -964,6 +1063,7 @@ mod tests {
                 text_adapter(),
                 dense_layout,
                 fixed_q4_experts(&layout),
+                &attention_layers(&layout),
                 Some(full_metal()),
             )
             .unwrap();
@@ -982,6 +1082,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(metal_without_dense_bf16()),
         )
         .unwrap_err();
@@ -1000,6 +1101,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(metal_without_residual_rms_norm()),
         )
         .unwrap_err();
@@ -1019,6 +1121,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(metal_without_topk_vocab()),
         )
         .unwrap_err();
@@ -1037,6 +1140,7 @@ mod tests {
             qwen_vl_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&vl_layout),
+            &attention_layers(&vl_layout),
             Some(full_metal()),
         )
         .unwrap();
@@ -1059,6 +1163,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(MetalRuntimeCapabilities::empty_for_test()),
         )
         .unwrap_err();
@@ -1075,6 +1180,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(full_metal()),
         )
         .unwrap_err();
@@ -1093,6 +1199,7 @@ mod tests {
             },
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(full_metal()),
         )
         .unwrap_err();
@@ -1110,6 +1217,7 @@ mod tests {
             qwen_vl_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
+            &attention_layers(&layout),
             Some(full_metal()),
         )
         .unwrap();
@@ -1209,6 +1317,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen3),
+            &attention_layers(&qwen3),
             Some(metal_without_shared_activation()),
         )
         .expect("Qwen3 without shared experts must not require the shared activation kernel");
@@ -1219,6 +1328,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen35),
+            &attention_layers(&qwen35),
             Some(metal_without_shared_activation()),
         )
         .unwrap_err();
@@ -1237,6 +1347,7 @@ mod tests {
             text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen35),
+            &attention_layers(&qwen35),
             Some(metal_without_linear_conv1d()),
         )
         .unwrap_err();
@@ -1268,6 +1379,7 @@ mod tests {
             routing_weight_normalization: QwenMoeRoutingWeightNormalization::RenormalizeSelected,
             routed_expert_scale: 0.9,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
+            attention_layers: attention_layers(&layout).into_boxed_slice(),
             stages: vec![FlashMoeStageCapability::new(
                 FlashMoeGraphStage::TokenPositionInputPreparation,
                 FlashMoeStagePlacement::InputAdapter,

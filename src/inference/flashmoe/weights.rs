@@ -18,7 +18,7 @@ use super::math::{q4_dequantize_rows_with_group_size, quantize_q4};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
-use super::model_family::{QwenModelConfig, QwenMoeFamily};
+use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind};
 use super::runtime::MetalExecutionFacade;
 use super::safetensors::{SafetensorShard, parse_safetensors_header};
 use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand};
@@ -732,6 +732,21 @@ impl DenseTransformerRuntime {
             .get(layer)
             .and_then(|layout| *layout)
             .is_some()
+    }
+
+    pub(super) fn resolved_attention_layers(&self) -> Result<Vec<QwenMoeLayerKind>> {
+        self.full_attention
+            .iter()
+            .zip(&self.linear_attention)
+            .enumerate()
+            .map(|(layer, (full, linear))| match (full.is_some(), linear.is_some()) {
+                (true, false) => Ok(QwenMoeLayerKind::FullAttention),
+                (false, true) => Ok(QwenMoeLayerKind::LinearAttention),
+                _ => bail!(
+                    "FlashMoe dense runtime layer {layer} must resolve exactly one attention implementation"
+                ),
+            })
+            .collect()
     }
 
     #[cfg(test)]

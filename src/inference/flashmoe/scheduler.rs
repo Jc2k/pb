@@ -9,7 +9,7 @@ use super::experts::{
     Q4MatvecPayload, Q4MatvecSource,
 };
 use super::math::{softmax_in_place, top_k};
-use super::model_family::{QwenMoeFamily, QwenMoeRoutingWeightNormalization};
+use super::model_family::{QwenMoeFamily, QwenMoeLayerKind, QwenMoeRoutingWeightNormalization};
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvState,
@@ -35,6 +35,7 @@ pub struct FlashMoeScheduledGraph {
     expert_storage: ExpertStorageLayout,
     routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     routed_expert_scale: f32,
+    attention_layers: Box<[ScheduledLayerAttentionImplementation]>,
     stages: Vec<FlashMoeStageCapability>,
 }
 
@@ -62,6 +63,12 @@ impl FlashMoeScheduledGraph {
             expert_storage: capabilities.expert_storage.layout,
             routing_weight_normalization: capabilities.routing_weight_normalization,
             routed_expert_scale: capabilities.routed_expert_scale,
+            attention_layers: capabilities
+                .attention_layers
+                .iter()
+                .copied()
+                .map(ScheduledLayerAttentionImplementation::from)
+                .collect(),
             stages,
         })
     }
@@ -88,6 +95,13 @@ impl FlashMoeScheduledGraph {
 
     pub fn stages(&self) -> &[FlashMoeStageCapability] {
         &self.stages
+    }
+
+    fn attention_implementation(
+        &self,
+        layer: usize,
+    ) -> Option<ScheduledLayerAttentionImplementation> {
+        self.attention_layers.get(layer).copied()
     }
 
     pub fn stage(&self, stage: FlashMoeGraphStage) -> &FlashMoeStageCapability {
@@ -399,16 +413,14 @@ impl FlashMoeScheduledGraph {
 pub(crate) struct FlashMoeExecutionScheduler {
     graph: FlashMoeScheduledGraph,
     expert_reads: ScheduledExpertReadCoordinator,
-    attention_layers: Box<[ScheduledLayerAttentionImplementation]>,
 }
 
 impl FlashMoeExecutionScheduler {
     pub(crate) fn new(
         graph: FlashMoeScheduledGraph,
         expert_store: ExpertSlotStore,
-        attention_layers: Vec<ScheduledLayerAttentionImplementation>,
     ) -> Result<Self> {
-        if attention_layers.is_empty() {
+        if graph.attention_layers.is_empty() {
             bail!(
                 "FlashMoe execution scheduler requires a resolved attention implementation for every layer"
             );
@@ -421,7 +433,6 @@ impl FlashMoeExecutionScheduler {
         Ok(Self {
             graph,
             expert_reads,
-            attention_layers: attention_layers.into_boxed_slice(),
         })
     }
 
@@ -437,10 +448,10 @@ impl FlashMoeExecutionScheduler {
         if layers == 0 || layer >= layers {
             bail!("FlashMoe scheduled layer {layer} is outside resolved layer count {layers}");
         }
-        if layers != self.attention_layers.len() {
+        if layers != self.graph.attention_layers.len() {
             bail!(
                 "FlashMoe scheduled layer count {layers} does not match resolved attention implementation count {}",
-                self.attention_layers.len()
+                self.graph.attention_layers.len()
             );
         }
         if active_experts == 0 {
@@ -452,7 +463,10 @@ impl FlashMoeExecutionScheduler {
                 position,
                 layer,
                 active_experts,
-                attention: self.attention_layers[layer],
+                attention: self
+                    .graph
+                    .attention_implementation(layer)
+                    .expect("validated scheduled layer index"),
                 output_handoff: if allow_deferred_output && layer + 1 < layers {
                     ScheduledCmd3OutputHandoff::DeferredToNextLayer
                 } else {
@@ -721,6 +735,15 @@ struct ScheduledLayerIdentity {
 pub(crate) enum ScheduledLayerAttentionImplementation {
     FullAttentionCpuKv,
     FusedLinearAttentionMetal,
+}
+
+impl From<QwenMoeLayerKind> for ScheduledLayerAttentionImplementation {
+    fn from(value: QwenMoeLayerKind) -> Self {
+        match value {
+            QwenMoeLayerKind::FullAttention => Self::FullAttentionCpuKv,
+            QwenMoeLayerKind::LinearAttention => Self::FusedLinearAttentionMetal,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4054,8 +4077,11 @@ mod tests {
 
     fn test_execution_scheduler() -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
         test_execution_scheduler_with_attention(vec![
-            ScheduledLayerAttentionImplementation::FullAttentionCpuKv;
-            5
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
+            ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
         ])
     }
 
@@ -4065,12 +4091,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
         let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
-        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let mut layout = qwen35_layout();
+        layout.layers = attention_layers.len();
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        let resolved_attention = capabilities
+            .attention_layers
+            .iter()
+            .copied()
+            .map(ScheduledLayerAttentionImplementation::from)
+            .collect::<Vec<_>>();
+        assert_eq!(attention_layers, resolved_attention);
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        (
-            temp,
-            FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
-        )
+        (temp, FlashMoeExecutionScheduler::new(graph, store).unwrap())
     }
 
     fn test_dense_execution_scheduler_with_attention(
@@ -4081,7 +4113,8 @@ mod tests {
         let tiny_spec = FixedDenseExpertSlotSpec::new(dtype, 2, 2).unwrap();
         let store =
             ExpertSlotStore::open_with_fixed_dense(temp.path().to_path_buf(), tiny_spec).unwrap();
-        let layout = qwen35_layout();
+        let mut layout = qwen35_layout();
+        layout.layers = attention_layers.len();
         let graph_spec = FixedDenseExpertSlotSpec::from_model_layout(&layout, dtype).unwrap();
         let mut capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
         capabilities.expert_storage = ExpertStoreExecutionDescriptor {
@@ -4093,11 +4126,15 @@ mod tests {
             layers: layout.layers,
             experts_per_layer: layout.experts_per_layer,
         };
+        let resolved_attention = capabilities
+            .attention_layers
+            .iter()
+            .copied()
+            .map(ScheduledLayerAttentionImplementation::from)
+            .collect::<Vec<_>>();
+        assert_eq!(attention_layers, resolved_attention);
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        (
-            temp,
-            FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
-        )
+        (temp, FlashMoeExecutionScheduler::new(graph, store).unwrap())
     }
 
     fn write_identity_fixed_dense_layer(
@@ -4141,17 +4178,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
         let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
-        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen3_moe_layout()).unwrap();
+        let mut layout = qwen3_moe_layout();
+        layout.layers = 2;
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
-        (
-            temp,
-            FlashMoeExecutionScheduler::new(
-                graph,
-                store,
-                vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv; 2],
-            )
-            .unwrap(),
-        )
+        (temp, FlashMoeExecutionScheduler::new(graph, store).unwrap())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4796,18 +4827,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_q4_multi_layer_parity_preserves_deferred_state_and_logits() {
+    fn qwen35_q4_multi_linear_layer_parity_preserves_deferred_state_and_logits() {
         let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
             ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
-            ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+            ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
         ]);
         write_identity_fixed_q4_layer(temp.path(), 0, 9);
         write_identity_fixed_q4_layer(temp.path(), 1, 9);
         assert_eq!(
-            scheduler.attention_layers.as_ref(),
+            scheduler.graph.attention_layers.as_ref(),
             [
                 ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
-                ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
+                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal,
             ]
         );
 
@@ -4856,17 +4887,7 @@ mod tests {
         let recurrent_after_linear = token_state.recurrent_value();
         assert_ne!(recurrent_after_linear, 0);
 
-        let key_0 = [1.0, 0.0];
-        let value_0 = [1.0, 0.5];
-        let key_1 = [0.0, 1.0];
-        let value_1 = [-0.5, 1.5];
-        let attention_1 = causal_attention(
-            &next_normed_0,
-            &[(&key_0, &value_0), (&key_1, &value_1)],
-            1,
-            1,
-            2,
-        );
+        let attention_1 = [0.6036627f32, 0.7642249];
         for (actual, expected) in attention_1.iter().zip([0.6036627, 0.7642249]) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }
@@ -4973,7 +4994,7 @@ mod tests {
             ),
             (ActiveLayout::Dense(DenseExpertDtype::F16), SharedLayout::Q4),
         ] {
-            let attention = vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv];
+            let attention = vec![ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal];
             let (temp, mut scheduler) = match active_layout {
                 ActiveLayout::Q4 => test_execution_scheduler_with_attention(attention),
                 ActiveLayout::Dense(dtype) => {
