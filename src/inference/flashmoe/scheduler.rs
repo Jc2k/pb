@@ -8,7 +8,7 @@ use super::experts::{
     FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection, Q4MatvecPayload, Q4MatvecSource,
 };
 use super::math::{softmax_in_place, top_k};
-use super::model_family::QwenMoeFamily;
+use super::model_family::{QwenMoeFamily, QwenMoeRoutingWeightNormalization};
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvState,
@@ -26,9 +26,11 @@ use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeScheduledGraph {
     family: QwenMoeFamily,
+    routing_weight_normalization: QwenMoeRoutingWeightNormalization,
+    routed_expert_scale: f32,
     stages: Vec<FlashMoeStageCapability>,
 }
 
@@ -51,12 +53,22 @@ impl FlashMoeScheduledGraph {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             family: capabilities.family,
+            routing_weight_normalization: capabilities.routing_weight_normalization,
+            routed_expert_scale: capabilities.routed_expert_scale,
             stages,
         })
     }
 
     pub fn family(&self) -> QwenMoeFamily {
         self.family
+    }
+
+    pub fn routing_weight_normalization(&self) -> QwenMoeRoutingWeightNormalization {
+        self.routing_weight_normalization
+    }
+
+    pub fn routed_expert_scale(&self) -> f32 {
+        self.routed_expert_scale
     }
 
     pub fn stages(&self) -> &[FlashMoeStageCapability] {
@@ -376,7 +388,7 @@ pub(crate) struct FlashMoeExecutionScheduler {
 impl FlashMoeExecutionScheduler {
     pub(crate) fn new(
         graph: FlashMoeScheduledGraph,
-        expert_reads: ScheduledExpertReadCoordinator,
+        expert_store: ExpertSlotStore,
         attention_layers: Vec<ScheduledLayerAttentionImplementation>,
     ) -> Result<Self> {
         if attention_layers.is_empty() {
@@ -384,6 +396,11 @@ impl FlashMoeExecutionScheduler {
                 "FlashMoe execution scheduler requires a resolved attention implementation for every layer"
             );
         }
+        let expert_reads = ScheduledExpertReadCoordinator::new_with_routing_policy(
+            expert_store,
+            graph.routing_weight_normalization(),
+            graph.routed_expert_scale(),
+        );
         Ok(Self {
             graph,
             expert_reads,
@@ -2742,6 +2759,20 @@ impl ScheduledExpertRoutes {
         routes: Vec<ExpertRoute>,
         routed_expert_scale: f32,
     ) -> Result<Self> {
+        Self::from_routes_with_policy(
+            layer,
+            routes,
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected,
+            routed_expert_scale,
+        )
+    }
+
+    pub fn from_routes_with_policy(
+        layer: usize,
+        routes: Vec<ExpertRoute>,
+        normalization: QwenMoeRoutingWeightNormalization,
+        routed_expert_scale: f32,
+    ) -> Result<Self> {
         if !(routed_expert_scale.is_finite() && routed_expert_scale > 0.0) {
             bail!("routed expert scale must be positive and finite");
         }
@@ -2749,7 +2780,14 @@ impl ScheduledExpertRoutes {
             route.validate()?;
         }
         let mut weights: Vec<f32> = routes.iter().map(|route| route.score).collect();
-        softmax_in_place(&mut weights);
+        match normalization {
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected => {
+                softmax_in_place(&mut weights);
+            }
+            QwenMoeRoutingWeightNormalization::PreserveFullSoftmax => bail!(
+                "FlashMoe unsupported routing weights: preserving probabilities from the full expert softmax requires a declared scheduler implementation"
+            ),
+        }
         for weight in &mut weights {
             *weight *= routed_expert_scale;
         }
@@ -2772,12 +2810,27 @@ impl ScheduledExpertRoutes {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_routing_command(
         command: &ScheduledRoutingCommand,
         routed_expert_scale: f32,
     ) -> Result<Self> {
         command.validate_for_active_expert_issue()?;
         Self::from_scores(command.layer, &command.routes, routed_expert_scale)
+    }
+
+    pub(crate) fn from_routing_command_with_policy(
+        command: &ScheduledRoutingCommand,
+        normalization: QwenMoeRoutingWeightNormalization,
+        routed_expert_scale: f32,
+    ) -> Result<Self> {
+        command.validate_for_active_expert_issue()?;
+        Self::from_routes_with_policy(
+            command.layer,
+            ExpertRoute::from_scores(&command.routes)?,
+            normalization,
+            routed_expert_scale,
+        )
     }
 
     #[cfg(test)]
@@ -3059,11 +3112,23 @@ pub(crate) struct ActiveExpertReadScheduler {
     metrics: ExpertSchedulerMetrics,
     seen_reads: BTreeSet<ExpertReadKey>,
     next_read_id: u64,
+    routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     routed_expert_scale: f32,
 }
 
 impl ActiveExpertReadScheduler {
+    #[cfg(test)]
     pub(crate) fn new(routed_expert_scale: f32) -> Self {
+        Self::new_with_routing_policy(
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected,
+            routed_expert_scale,
+        )
+    }
+
+    pub(crate) fn new_with_routing_policy(
+        routing_weight_normalization: QwenMoeRoutingWeightNormalization,
+        routed_expert_scale: f32,
+    ) -> Self {
         assert_eq!(
             FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
             ExpertReadPath::PositionedRead,
@@ -3093,6 +3158,7 @@ impl ActiveExpertReadScheduler {
             metrics: ExpertSchedulerMetrics::default(),
             seen_reads: BTreeSet::new(),
             next_read_id: 0,
+            routing_weight_normalization,
             routed_expert_scale,
         }
     }
@@ -3164,7 +3230,11 @@ impl ActiveExpertReadScheduler {
         &self,
         command: &ScheduledRoutingCommand,
     ) -> Result<ScheduledExpertRoutes> {
-        ScheduledExpertRoutes::from_routing_command(command, self.routed_expert_scale)
+        ScheduledExpertRoutes::from_routing_command_with_policy(
+            command,
+            self.routing_weight_normalization,
+            self.routed_expert_scale,
+        )
     }
 
     pub(crate) fn issue_routed_reads(
@@ -3227,14 +3297,30 @@ impl ScheduledExpertReadCoordinator {
         Self::new_with_routed_expert_scale(store, 1.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_routed_expert_scale(
         store: ExpertSlotStore,
+        routed_expert_scale: f32,
+    ) -> Self {
+        Self::new_with_routing_policy(
+            store,
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected,
+            routed_expert_scale,
+        )
+    }
+
+    pub(crate) fn new_with_routing_policy(
+        store: ExpertSlotStore,
+        routing_weight_normalization: QwenMoeRoutingWeightNormalization,
         routed_expert_scale: f32,
     ) -> Self {
         Self {
             store,
             pool: ExpertReadWorkerPool::default(),
-            core: ActiveExpertReadScheduler::new(routed_expert_scale),
+            core: ActiveExpertReadScheduler::new_with_routing_policy(
+                routing_weight_normalization,
+                routed_expert_scale,
+            ),
         }
     }
 
@@ -3792,12 +3878,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
         let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
-        let reads = ScheduledExpertReadCoordinator::new(store);
         let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
         let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
         (
             temp,
-            FlashMoeExecutionScheduler::new(graph, reads, attention_layers).unwrap(),
+            FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
         )
     }
 
@@ -4201,7 +4286,7 @@ mod tests {
                     for (actual, expected) in command
                         .weights
                         .iter()
-                        .zip([0.57925856, 0.2130973, 0.12925005, 0.07839412])
+                        .zip([0.5213327, 0.19178757, 0.11632504, 0.07055471])
                     {
                         assert!((actual - expected).abs() <= 1e-6);
                     }
@@ -4218,7 +4303,7 @@ mod tests {
                         .zip(shared_output.iter())
                         .map(|((residual, expert), shared)| residual + expert + shared)
                         .collect();
-                    for (actual, expected) in hidden.iter().zip([3.0771027, 0.3655793]) {
+                    for (actual, expected) in hidden.iter().zip([2.9453208, 0.34506905]) {
                         assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
                     }
                     let next_normed =
@@ -4246,11 +4331,11 @@ mod tests {
                 FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
             )
             .unwrap();
-        for (actual, expected) in token_state.hidden().iter().zip([3.0771027, 0.3655793]) {
+        for (actual, expected) in token_state.hidden().iter().zip([2.9453208, 0.34506905]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
-        for (actual, expected) in next_normed.iter().zip([1.404337, 0.08342207]) {
+        for (actual, expected) in next_normed.iter().zip([1.4046044, 0.08228089]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
     }
@@ -4303,14 +4388,14 @@ mod tests {
             )
             .unwrap();
         let hidden_0 = token_state.hidden().to_vec();
-        for (actual, expected) in hidden_0.iter().zip([1.011218, -1.1477928]) {
+        for (actual, expected) in hidden_0.iter().zip([0.9850961, -1.1830133]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let next_normed_0 = token_state
             .take_next_layer_normed_as_normed()
             .unwrap()
             .into_values();
-        for (actual, expected) in next_normed_0.iter().zip([0.9348729, -0.5305683]) {
+        for (actual, expected) in next_normed_0.iter().zip([0.9049467, -0.54338086]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let recurrent_after_linear = token_state.recurrent_value();
@@ -4327,7 +4412,7 @@ mod tests {
             1,
             2,
         );
-        for (actual, expected) in attention_1.iter().zip([0.6071810, 0.7618793]) {
+        for (actual, expected) in attention_1.iter().zip([0.6036627, 0.7642249]) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }
         let residual_1 = [hidden_0[0] + attention_1[0], hidden_0[1] + attention_1[1]];
@@ -4367,8 +4452,11 @@ mod tests {
             .unwrap();
         assert_ne!(token_state.recurrent_value(), recurrent_after_linear);
         let hidden_1 = token_state.hidden().to_vec();
-        for (actual, expected) in hidden_1.iter().zip([3.379081, -0.8408583]) {
-            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        for (actual, expected) in hidden_1.iter().zip([3.1801152, -0.8707439]) {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "{actual} != {expected}; hidden={hidden_1:?}"
+            );
         }
         assert!(token_state.take_next_layer_normed_as_normed().is_none());
 
@@ -4380,15 +4468,15 @@ mod tests {
         ];
         for (actual, expected) in logits
             .iter()
-            .zip([3.379081, -0.8408583, -3.7995102, 1.475414])
+            .zip([3.1801152, -0.8707439, -3.615487, 1.4480867])
         {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let candidates = top_k(&logits, 2);
         assert_eq!(candidates[0].0, 0);
         assert_eq!(candidates[1].0, 3);
-        assert!((candidates[0].1 - 3.379081).abs() <= 1e-5);
-        assert!((candidates[1].1 - 1.475414).abs() <= 1e-5);
+        assert!((candidates[0].1 - 3.1801152).abs() <= 1e-5);
+        assert!((candidates[1].1 - 1.4480867).abs() <= 1e-5);
         let metrics = scheduler.snapshot();
         assert_eq!(metrics.positioned_reads, 8);
         assert_eq!(metrics.bytes_read, 8 * 48);
@@ -4572,7 +4660,7 @@ mod tests {
         let output = execution.cmd3.submission.wait().unwrap();
         let (hidden, next_normed) = output.into_hidden_and_next_normed();
         assert!(next_normed.is_none());
-        for (actual, expected) in hidden.iter().zip([3.4860115, 0.9681305]) {
+        for (actual, expected) in hidden.iter().zip([3.3542297, 0.9476203]) {
             assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
         }
     }
@@ -7104,6 +7192,19 @@ mod tests {
         for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn scheduled_expert_routes_reject_unimplemented_full_softmax_weights() {
+        let error = ScheduledExpertRoutes::from_routes_with_policy(
+            12,
+            ExpertRoute::from_scores(&[(7, 1.0), (3, 2.0)]).unwrap(),
+            QwenMoeRoutingWeightNormalization::PreserveFullSoftmax,
+            1.0,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("full expert softmax"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use super::metal::{MetalRuntimeCapabilities, kernels};
 use super::model_family::{
     QwenMoeCommandTopology, QwenMoeExecutionArchitecture, QwenMoeExpertBufferOwnership,
     QwenMoeExpertCachePolicy, QwenMoeExpertReadStrategy, QwenMoeFamily, QwenMoeModelLayout,
-    QwenMoeRoutingPlacement,
+    QwenMoeRoutingPlacement, QwenMoeRoutingWeightNormalization,
 };
 use super::weights::ResidentDenseLayout;
 
@@ -154,13 +154,15 @@ pub(crate) struct FlashMoeDeviceCapability {
     pub(crate) metal: MetalRuntimeCapabilities,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeCapabilityPlan {
     pub family: QwenMoeFamily,
     pub(crate) dense_layout: ResidentDenseLayout,
     pub(crate) expert_storage: ExpertStoreExecutionDescriptor,
     pub(crate) device: FlashMoeDeviceCapability,
     pub routing: QwenMoeRoutingPlacement,
+    pub routing_weight_normalization: QwenMoeRoutingWeightNormalization,
+    pub routed_expert_scale: f32,
     pub state_policy: FlashMoeStatePolicy,
     pub stages: Vec<FlashMoeStageCapability>,
 }
@@ -177,11 +179,14 @@ impl FlashMoeCapabilityPlan {
             QwenMoeFamily::Qwen35A17B => {
                 Self::resolve_qwen35_q4(layout, dense_layout, expert_storage, metal)
             }
-            QwenMoeFamily::Qwen3Moe => Err(FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::TokenPositionInputPreparation,
-                "Qwen3 MoE graph-stage implementations have not been wired into the unified scheduler",
-            )),
+            QwenMoeFamily::Qwen3Moe => {
+                require_selected_route_renormalization(layout)?;
+                Err(FlashMoeUnsupportedCapability::new(
+                    layout.family,
+                    FlashMoeGraphStage::Cmd1AttentionProjections,
+                    "Qwen3 MoE full-attention graph-stage implementation has not been wired into the unified scheduler",
+                ))
+            }
             QwenMoeFamily::Qwen3VlMoe => Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
                 FlashMoeGraphStage::TokenPositionInputPreparation,
@@ -238,6 +243,7 @@ impl FlashMoeCapabilityPlan {
                 "resolved Qwen3.5 Q4 graph requires a compiled Metal executor",
             )
         })?;
+        let routing_weight_normalization = require_selected_route_renormalization(layout)?;
 
         require_stage_kernels(
             layout.family,
@@ -331,6 +337,8 @@ impl FlashMoeCapabilityPlan {
             expert_storage,
             device: FlashMoeDeviceCapability { metal },
             routing: layout.execution.routing,
+            routing_weight_normalization,
+            routed_expert_scale: layout.routed_expert_scale,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
             stages,
         };
@@ -456,6 +464,28 @@ fn validate_upstream_execution_policy(
     Ok(())
 }
 
+fn require_selected_route_renormalization(
+    layout: &QwenMoeModelLayout,
+) -> Result<QwenMoeRoutingWeightNormalization, FlashMoeUnsupportedCapability> {
+    match layout.routing_weight_normalization {
+        Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected) => {
+            Ok(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
+        }
+        Some(QwenMoeRoutingWeightNormalization::PreserveFullSoftmax) => {
+            Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::RoutingSoftmaxTopK,
+                "the resolved scheduler implements selected-route renormalization, but norm_topk_prob=false requires preserving probabilities from the full expert softmax",
+            ))
+        }
+        None => Err(FlashMoeUnsupportedCapability::new(
+            layout.family,
+            FlashMoeGraphStage::RoutingSoftmaxTopK,
+            "the model config does not declare norm_topk_prob, so routing-weight normalization cannot be resolved",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeUnsupportedCapability {
     pub family: QwenMoeFamily,
@@ -548,6 +578,29 @@ mod tests {
 }"#,
         );
         QwenMoeModelLayout::from_config(QWEN3_VL_MODEL, &config).unwrap()
+    }
+
+    fn qwen3_moe_layout(norm_topk_prob: Option<bool>) -> QwenMoeModelLayout {
+        let mut value = serde_json::json!({
+            "model_type": "qwen3_moe",
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "num_hidden_layers": 48,
+            "hidden_size": 2048,
+            "num_attention_heads": 32,
+            "head_dim": 128,
+            "num_key_value_heads": 4,
+            "vocab_size": 151936,
+            "rope_theta": 1000000.0,
+            "torch_dtype": "bfloat16",
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 768
+        });
+        if let Some(normalize) = norm_topk_prob {
+            value["norm_topk_prob"] = serde_json::Value::Bool(normalize);
+        }
+        let config: QwenModelConfig = serde_json::from_value(value).unwrap();
+        QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
     }
 
     fn qwen35_experts(layout: &QwenMoeModelLayout) -> ExpertStoreExecutionDescriptor {
@@ -651,6 +704,33 @@ mod tests {
     }
 
     #[test]
+    fn qwen_moe_capability_requires_explicit_selected_route_normalization() {
+        let missing = qwen3_moe_layout(None);
+        let missing_error = FlashMoeCapabilityPlan::for_model_layout(&missing).unwrap_err();
+        assert_eq!(missing_error.stage, FlashMoeGraphStage::RoutingSoftmaxTopK);
+        assert!(
+            missing_error
+                .reason
+                .contains("does not declare norm_topk_prob")
+        );
+
+        let preserve = qwen3_moe_layout(Some(false));
+        let preserve_error = FlashMoeCapabilityPlan::for_model_layout(&preserve).unwrap_err();
+        assert_eq!(preserve_error.stage, FlashMoeGraphStage::RoutingSoftmaxTopK);
+        assert!(preserve_error.reason.contains("norm_topk_prob=false"));
+    }
+
+    #[test]
+    fn qwen_moe_capability_advances_to_the_next_missing_stage_when_routing_resolves() {
+        let layout = qwen3_moe_layout(Some(true));
+        let error = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap_err();
+
+        assert_eq!(error.family, QwenMoeFamily::Qwen3Moe);
+        assert_eq!(error.stage, FlashMoeGraphStage::Cmd1AttentionProjections);
+        assert!(error.reason.contains("full-attention graph-stage"));
+    }
+
+    #[test]
     fn incomplete_capability_plan_reports_the_first_missing_stage() {
         let layout = qwen35_layout();
         let plan = FlashMoeCapabilityPlan {
@@ -661,6 +741,8 @@ mod tests {
                 metal: full_metal(),
             },
             routing: QwenMoeRoutingPlacement::CpuSoftmaxTopK,
+            routing_weight_normalization: QwenMoeRoutingWeightNormalization::RenormalizeSelected,
+            routed_expert_scale: 0.9,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
             stages: vec![FlashMoeStageCapability::new(
                 FlashMoeGraphStage::TokenPositionInputPreparation,

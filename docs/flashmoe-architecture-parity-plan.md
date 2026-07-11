@@ -290,9 +290,15 @@ Baseline reviewed on 2026-07-10:
 - Fixed-Q4 offsets are no longer model-family metadata. `experts` derives a checked BF16-scale/bias
   whole-slot layout from the concrete hidden/intermediate dimensions and fixed storage group size;
   native Q4 aggregate packing, store construction, and capability validation consume that same
-  descriptor. Qwen MoE's 4096x1536 expert shape therefore resolves a 10,616,832-byte record instead
-  of inheriting Qwen3.5's 7,077,888-byte record. Shapes that cannot satisfy the runtime fixed-slot
-  contract remain PBQ4 import data rather than entering CMD3.
+  descriptor. A Qwen-family 4096x1536 expert shape therefore resolves a 10,616,832-byte record
+  instead of inheriting Qwen3.5's 7,077,888-byte record. Shapes that cannot satisfy the runtime
+  fixed-slot contract remain PBQ4 import data rather than entering CMD3.
+- Routing-weight normalization and routed-expert scaling are now resolved graph policy. The
+  scheduler constructs its expert-read coordinator from that policy, so production cannot pair a
+  graph with different route math. Qwen3.5 uses selected-route softmax with scale 0.9; Qwen MoE
+  advances only when `norm_topk_prob=true`, while a missing value or `false` reports the routing
+  stage as unsupported. Moving this ownership exposed and corrected parity fixtures that had
+  accidentally injected scale 1.0 beside a Qwen3.5 graph.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream

@@ -43,6 +43,12 @@ pub enum QwenMoeRoutingPlacement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenMoeRoutingWeightNormalization {
+    RenormalizeSelected,
+    PreserveFullSoftmax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenMoeExpertReadStrategy {
     ParallelPositionedReads,
 }
@@ -326,6 +332,7 @@ pub struct QwenMoeModelLayout {
     pub configured_active_experts: usize,
     pub scheduled_active_experts: usize,
     pub routed_expert_scale: f32,
+    pub routing_weight_normalization: Option<QwenMoeRoutingWeightNormalization>,
     pub moe_intermediate_size: usize,
     pub shared_experts: usize,
     pub shared_expert_intermediate_size: usize,
@@ -352,6 +359,20 @@ impl QwenMoeModelLayout {
             QwenMoeFamily::Qwen35A17B => 0.9,
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => 1.0,
         };
+        let routing_weight_normalization = match family {
+            QwenMoeFamily::Qwen35A17B => {
+                Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
+            }
+            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
+                config.norm_topk_prob.map(|normalize| {
+                    if normalize {
+                        QwenMoeRoutingWeightNormalization::RenormalizeSelected
+                    } else {
+                        QwenMoeRoutingWeightNormalization::PreserveFullSoftmax
+                    }
+                })
+            }
+        };
         let layout = Self {
             family,
             execution: QwenMoeExecutionPolicy::UPSTREAM_PARITY,
@@ -365,6 +386,7 @@ impl QwenMoeModelLayout {
             configured_active_experts,
             scheduled_active_experts,
             routed_expert_scale,
+            routing_weight_normalization,
             moe_intermediate_size: config
                 .moe_intermediate_size
                 .or(config.intermediate_size)
@@ -402,16 +424,6 @@ impl QwenMoeModelLayout {
             || self.vocab_size == 0
         {
             bail!("Qwen MoE layout contains zero-valued required dimensions");
-        }
-        if self.family != QwenMoeFamily::Qwen35A17B
-            && self.hidden_size != self.attention_heads * self.head_dim
-        {
-            bail!(
-                "Qwen MoE hidden size {} does not match attention_heads {} * head_dim {}",
-                self.hidden_size,
-                self.attention_heads,
-                self.head_dim
-            );
         }
         if self.experts_per_layer == 0
             || self.configured_active_experts == 0
@@ -554,6 +566,10 @@ mod tests {
         assert_eq!(layout.configured_active_experts, 10);
         assert_eq!(layout.scheduled_active_experts, 4);
         assert_eq!(layout.routed_expert_scale, 0.9);
+        assert_eq!(
+            layout.routing_weight_normalization,
+            Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
+        );
         assert_eq!(layout.experts_per_layer, 512);
         assert_eq!(layout.layers, NUM_LAYERS);
         assert_eq!(layout.hidden_size, HIDDEN_DIM);
@@ -642,25 +658,31 @@ mod tests {
             br#"{
   "model_type": "qwen3_moe",
   "architectures": ["Qwen3MoeForCausalLM"],
-  "num_hidden_layers": 2,
-  "hidden_size": 4096,
+  "num_hidden_layers": 48,
+  "hidden_size": 2048,
   "num_attention_heads": 32,
-  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "num_key_value_heads": 4,
   "vocab_size": 151936,
   "rope_theta": 1000000.0,
   "torch_dtype": "bfloat16",
-  "num_experts": 512,
-  "num_experts_per_tok": 2,
-  "moe_intermediate_size": 1536
+  "num_experts": 128,
+  "num_experts_per_tok": 8,
+  "norm_topk_prob": true,
+  "moe_intermediate_size": 768
 }"#,
         );
         let layout = QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap();
 
         assert_eq!(layout.family, QwenMoeFamily::Qwen3Moe);
         assert_eq!(layout.execution, QwenMoeExecutionPolicy::UPSTREAM_PARITY);
-        assert_eq!(layout.configured_active_experts, 2);
-        assert_eq!(layout.scheduled_active_experts, 2);
+        assert_eq!(layout.configured_active_experts, 8);
+        assert_eq!(layout.scheduled_active_experts, 8);
         assert_eq!(layout.routed_expert_scale, 1.0);
+        assert_eq!(
+            layout.routing_weight_normalization,
+            Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
+        );
         assert_eq!(layout.layer_kind(0), QwenMoeLayerKind::FullAttention);
         let expert_layout = QwenMoeQ4ExpertLayout::fixed_bf16(
             layout.hidden_size,
@@ -669,7 +691,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(expert_layout, QwenMoeQ4ExpertLayout::qwen35_a17b());
-        assert_eq!(expert_layout.expert_bytes, 10_616_832);
+        assert_eq!(expert_layout.expert_bytes, 2_654_208);
     }
 
     #[test]
@@ -687,6 +709,7 @@ mod tests {
   "torch_dtype": "bfloat16",
   "num_experts": 512,
   "num_experts_per_tok": 3,
+  "norm_topk_prob": true,
   "moe_intermediate_size": 1536,
   "vision_config": {
     "depth": 1,

@@ -126,7 +126,7 @@ use super::scheduler::ScheduledRoutingCommand;
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeExecutionScheduler, FlashMoeScheduledGraph,
-    ScheduledExpertReadCoordinator, ScheduledLayerAttentionImplementation,
+    ScheduledLayerAttentionImplementation,
 };
 #[cfg(test)]
 use super::scheduler::{
@@ -352,6 +352,7 @@ pub struct QwenModelConfig {
     pub torch_dtype: Option<String>,
     pub num_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
+    pub norm_topk_prob: Option<bool>,
     pub moe_intermediate_size: Option<usize>,
     pub intermediate_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
@@ -433,6 +434,7 @@ struct RawQwenModelConfig {
     dtype: Option<String>,
     num_experts: Option<usize>,
     num_experts_per_tok: Option<usize>,
+    norm_topk_prob: Option<bool>,
     moe_intermediate_size: Option<usize>,
     intermediate_size: Option<usize>,
     max_position_embeddings: Option<usize>,
@@ -461,6 +463,7 @@ struct RawQwenTextConfig {
     dtype: Option<String>,
     num_experts: Option<usize>,
     num_experts_per_tok: Option<usize>,
+    norm_topk_prob: Option<bool>,
     moe_intermediate_size: Option<usize>,
     intermediate_size: Option<usize>,
     max_position_embeddings: Option<usize>,
@@ -564,6 +567,7 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                 .or(text.dtype),
             num_experts: raw.num_experts.or(text.num_experts),
             num_experts_per_tok: raw.num_experts_per_tok.or(text.num_experts_per_tok),
+            norm_topk_prob: raw.norm_topk_prob.or(text.norm_topk_prob),
             moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
             intermediate_size: raw.intermediate_size.or(text.intermediate_size),
             max_position_embeddings: raw.max_position_embeddings.or(text.max_position_embeddings),
@@ -1255,10 +1259,6 @@ where
     let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
     let expert_storage = experts
         .resolve_execution_descriptor(model_layout.layers, model_layout.experts_per_layer)?;
-    let expert_reads = ScheduledExpertReadCoordinator::new_with_routed_expert_scale(
-        experts,
-        model_layout.routed_expert_scale,
-    );
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
     let capability_plan = FlashMoeCapabilityPlan::resolve(
@@ -1277,8 +1277,7 @@ where
             }
         })
         .collect();
-    let scheduler =
-        FlashMoeExecutionScheduler::new(scheduled_graph, expert_reads, attention_layers)?;
+    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts, attention_layers)?;
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
@@ -13748,6 +13747,7 @@ mod tests {
             torch_dtype: Some("float32".to_string()),
             num_experts: Some(2),
             num_experts_per_tok: Some(1),
+            norm_topk_prob: None,
             moe_intermediate_size: Some(4),
             intermediate_size: None,
             max_position_embeddings: Some(8),
@@ -14235,6 +14235,7 @@ mod tests {
             torch_dtype: Some("float32".to_string()),
             num_experts: Some(1),
             num_experts_per_tok: Some(1),
+            norm_topk_prob: None,
             moe_intermediate_size: Some(4),
             intermediate_size: None,
             max_position_embeddings: Some(4),
@@ -14397,6 +14398,7 @@ mod tests {
             torch_dtype: Some("float32".to_string()),
             num_experts: Some(experts),
             num_experts_per_tok: Some(3),
+            norm_topk_prob: None,
             moe_intermediate_size: Some(4),
             intermediate_size: None,
             max_position_embeddings: Some(4),
@@ -16581,6 +16583,7 @@ mod flashmoe_rope_tests {
             torch_dtype: Some("bfloat16".to_string()),
             num_experts: Some(512),
             num_experts_per_tok: Some(4),
+            norm_topk_prob: None,
             moe_intermediate_size: Some(1024),
             intermediate_size: None,
             max_position_embeddings: None,
