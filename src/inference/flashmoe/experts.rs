@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::math::{q4_fma_matvec_with_group_size, quantize_q4};
+#[cfg(test)]
+use super::math::q4_fma_matvec_with_group_size;
+use super::math::quantize_q4;
 use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
     QwenMoeQ4ExpertLayout,
@@ -276,7 +278,9 @@ impl PackedExpertTensor {
             cols,
             group_size: self.group_size,
             packed: &self.packed[..needed_packed],
+            #[cfg(test)]
             scales: &self.scales[..needed_groups],
+            #[cfg(test)]
             biases: &self.biases[..needed_groups],
             scale_bias_groups,
             scale_bias_dtype: &self.scale_bias_dtype,
@@ -2677,6 +2681,7 @@ impl ExpertLayerReader {
         let slot_capacity = usize::try_from(self.metadata.expert_size)
             .context("expert layer slot size does not fit usize")?;
         Ok(ExpertReadPlan {
+            #[cfg(test)]
             metadata,
             offset,
             packed_len,
@@ -2742,8 +2747,11 @@ impl ExpertLayerReader {
             layer: self.metadata.layer,
             expert,
             slot: descriptor,
+            #[cfg(test)]
             metadata: plan.metadata,
+            #[cfg(test)]
             slot_spec: self.slot_spec,
+            #[cfg(test)]
             recycle_pool: Some(Arc::clone(&self.buffer_pool)),
             payload,
             read_latency,
@@ -2754,6 +2762,7 @@ impl ExpertLayerReader {
 
 #[derive(Debug)]
 pub(crate) struct ExpertReadPlan {
+    #[cfg(test)]
     pub(crate) metadata: ExpertPackMetadata,
     pub(crate) offset: u64,
     pub(crate) packed_len: usize,
@@ -2765,8 +2774,11 @@ pub(crate) struct ExpertRawRead {
     pub(crate) layer: usize,
     pub(crate) expert: usize,
     pub(crate) slot: ExpertSlotDescriptor,
+    #[cfg(test)]
     pub(crate) metadata: ExpertPackMetadata,
+    #[cfg(test)]
     pub(crate) slot_spec: ExpertSlotSpec,
+    #[cfg(test)]
     pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
     pub(crate) payload: ExpertRawPayload,
     pub(crate) read_latency: Duration,
@@ -3151,6 +3163,7 @@ impl FixedQ4ExpertPayload {
         }
     }
 
+    #[cfg(test)]
     fn decoded_scales_biases(
         &self,
         scale_kind: QwenMoeExpertComponentKind,
@@ -3171,6 +3184,7 @@ impl FixedQ4ExpertPayload {
         Ok((scales, biases))
     }
 
+    #[cfg(test)]
     pub(crate) fn project_cpu(
         &self,
         projection: ExpertMlpProjection,
@@ -3291,11 +3305,13 @@ impl FixedQ4ExpertPayload {
             cols,
             group_size: self.spec.layout.group_size,
             packed: &packed[..needed_packed],
+            #[cfg(test)]
             scales: if scales.is_empty() {
                 &[]
             } else {
                 &scales[..needed_groups]
             },
+            #[cfg(test)]
             biases: if biases.is_empty() {
                 &[]
             } else {
@@ -3436,6 +3452,7 @@ pub(crate) enum ExpertMlpProjection {
 }
 
 impl ExpertMlpProjection {
+    #[cfg(test)]
     fn scale_bias_kinds(self) -> (QwenMoeExpertComponentKind, QwenMoeExpertComponentKind) {
         match self {
             ExpertMlpProjection::Gate => (
@@ -3454,6 +3471,7 @@ impl ExpertMlpProjection {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fixed_q4_payload_from_pbq4_records(
     layer: usize,
     expert: usize,
@@ -3658,7 +3676,9 @@ pub(crate) struct Q4MatvecPayload<'a> {
     pub(crate) cols: usize,
     pub(crate) group_size: usize,
     pub(crate) packed: &'a [u8],
+    #[cfg(test)]
     pub(crate) scales: &'a [f32],
+    #[cfg(test)]
     pub(crate) biases: &'a [f32],
     pub(crate) scale_bias_groups: usize,
     pub(crate) scale_bias_dtype: &'a str,
@@ -3762,6 +3782,7 @@ fn decode_fixed_q4_bf16_component(
     decode_fixed_q4_bf16_component_bytes(view.component(kind))
 }
 
+#[cfg(test)]
 pub(crate) fn decode_fixed_q4_bf16_component_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
     let chunks = bytes.chunks_exact(2);
     if !chunks.remainder().is_empty() {

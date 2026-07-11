@@ -8,7 +8,6 @@ use tracing::info;
 
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::ExpertSlotStore;
-use super::legacy::*;
 use super::math::*;
 use super::metal::*;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
@@ -56,6 +55,19 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
 
 type ScheduledExpertCommand<'a> =
     ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
+
+impl FlashMoeTimingBuckets {
+    pub(super) fn add_expert_scheduler_delta(&mut self, delta: ExpertSchedulerSnapshot) {
+        self.expert_queue += delta.total_queue_latency;
+        self.expert_read += delta.total_read_latency;
+        self.expert_bytes_read = self.expert_bytes_read.saturating_add(delta.bytes_read);
+        self.expert_warm_reads = self.expert_warm_reads.saturating_add(delta.warm_reads);
+        self.expert_warm_read += delta.total_warm_read_latency;
+        self.expert_warm_bytes_read = self
+            .expert_warm_bytes_read
+            .saturating_add(delta.warm_bytes_read);
+    }
+}
 
 pub(super) type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
 
@@ -2164,15 +2176,6 @@ impl FlashMoeEngine {
             None,
         );
         sampler.sample_candidates(candidates)
-    }
-
-    #[cfg(test)]
-    pub fn read_active_experts(
-        &mut self,
-        layer: usize,
-        experts: &[usize],
-    ) -> Result<Vec<ExpertWeights>> {
-        read_expert_weights_many(self.scheduler.expert_store(), layer, experts)
     }
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {

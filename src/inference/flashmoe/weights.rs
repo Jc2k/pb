@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
+use std::ffi::c_int;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,14 +13,13 @@ use super::experts::{
     AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertSourceTensor,
     expert_scale_bias_dtype_size,
 };
-use super::legacy::dense_f32_matvec_rows;
 #[cfg(test)]
 use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
 use super::math::q4_dequantize_rows_with_group_size;
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
-use super::model_family::QwenModelConfig;
+use super::model_family::{QwenModelConfig, QwenMoeFamily};
 use super::runtime::MetalExecutionFacade;
 use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand};
 use super::state::{
@@ -33,11 +34,281 @@ use super::types::{
 };
 use anyhow::{Context, Result, bail};
 
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: c_int = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: c_int = 111;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemv(
+        order: c_int,
+        trans_a: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: f32,
+        a: *const f32,
+        lda: c_int,
+        x: *const f32,
+        inc_x: c_int,
+        beta: f32,
+        y: *mut f32,
+        inc_y: c_int,
+    );
+}
+
 pub(crate) const TENSOR_ALIGNMENT: u64 = 4096;
 #[cfg(test)]
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+pub(super) fn dense_f32_matvec_rows(
+    weights: &[f32],
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Option<Vec<f32>>> {
+    let expected = rows
+        .checked_mul(cols)
+        .context("dense f32 matvec row-major weight size overflow")?;
+    if weights.len() < expected || input.len() < cols {
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(m) = c_int::try_from(rows) else {
+            return Ok(None);
+        };
+        let Ok(n) = c_int::try_from(cols) else {
+            return Ok(None);
+        };
+        let mut out = vec![0.0f32; rows];
+        unsafe {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                m,
+                n,
+                1.0,
+                weights.as_ptr(),
+                n,
+                input.as_ptr(),
+                1,
+                0.0,
+                out.as_mut_ptr(),
+                1,
+            );
+        }
+        return Ok(Some(out));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut out = vec![0.0f32; rows];
+        for row in 0..rows {
+            let start = row
+                .checked_mul(cols)
+                .context("dense f32 matvec row offset overflow")?;
+            let weights = &weights[start..start + cols];
+            out[row] = weights
+                .iter()
+                .zip(input.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f32>();
+        }
+        Ok(Some(out))
+    }
+}
+
+pub(super) fn validate_required_tensor_manifest(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+) -> Result<()> {
+    require_tensor_shape(
+        registry,
+        "model.embed_tokens.weight",
+        &[config.vocab_size, config.hidden_size],
+    )?;
+    require_tensor_shape(registry, "model.norm.weight", &[config.hidden_size])?;
+    // lm_head.weight is optional: when absent (or when tie_word_embeddings is true) the model
+    // uses tied embeddings and reuses model.embed_tokens.weight (already validated above) for
+    // the output projection.
+    if registry.tensor("lm_head.weight").is_some() {
+        require_tensor_shape(
+            registry,
+            "lm_head.weight",
+            &[config.vocab_size, config.hidden_size],
+        )?;
+    }
+    for layer in 0..config.num_hidden_layers {
+        match infer_attention_layer_type(registry, layer)? {
+            AttentionLayerType::Full => {
+                let layout = infer_full_attention_layout(config, registry, layer)?;
+                for projection in ["q_norm", "k_norm"] {
+                    require_tensor_shape(
+                        registry,
+                        &layer_norm_tensor_name(layer, &format!("self_attn.{projection}")),
+                        &[layout.head_dim],
+                    )?;
+                }
+            }
+            AttentionLayerType::Linear => {
+                let _ = infer_linear_attention_layout(config, registry, layer)?;
+            }
+        }
+        require_tensor_shape(
+            registry,
+            &layer_norm_tensor_name(layer, "input_layernorm"),
+            &[config.hidden_size],
+        )?;
+        require_tensor_shape(
+            registry,
+            &layer_norm_tensor_name(layer, "post_attention_layernorm"),
+            &[config.hidden_size],
+        )?;
+        require_tensor_shape(
+            registry,
+            &router_tensor_name(layer),
+            &[config.experts(), config.hidden_size],
+        )?;
+        let shared_experts = config.shared_experts();
+        if shared_experts > 0 {
+            let shared_inter = config.shared_expert_intermediate_size();
+            if shared_inter == 0 {
+                bail!(
+                    "Qwen config declares {shared_experts} shared expert(s) but no shared expert intermediate size"
+                );
+            }
+            let total_shared_inter = shared_experts
+                .checked_mul(shared_inter)
+                .context("shared expert intermediate size overflow")?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "gate_proj"),
+                &[total_shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "up_proj"),
+                &[total_shared_inter, config.hidden_size],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_tensor_name(layer, "down_proj"),
+                &[config.hidden_size, total_shared_inter],
+            )?;
+            require_tensor_shape(
+                registry,
+                &shared_expert_gate_tensor_name(layer),
+                &[shared_experts, config.hidden_size],
+            )?;
+        }
+        // Per-expert tensor presence is intentionally not validated here.
+        //
+        // Reasons:
+        // 1. Expert MLP correctness (gate/up/down projection shapes) is enforced per-expert at
+        //    pack time by `validate_expert_tensor_group`.
+        // 2. At runtime the packed expert files are managed by `ExpertSlotStore`; the registry
+        //    records their original source metadata but is not used for expert inference.
+        // 3. Real Qwen3 revision checkpoints may differ in expert naming (e.g. shared experts)
+        //    or use a naming scheme that doesn't match the exact pattern assumed here.
+        //    A rigid per-name loop would cause false rejections for such models.
+    }
+    Ok(())
+}
+
+pub(super) fn validate_qwen_q4_graph_bindings(
+    family: QwenMoeFamily,
+    config: &QwenModelConfig,
+    runtime: &DenseTransformerRuntime,
+    registry: &TensorRegistry,
+    store_len: u64,
+) -> Result<()> {
+    for layer in 0..config.num_hidden_layers {
+        if !runtime.is_linear_attention_layer(layer) {
+            let layout = runtime.full_attention_layout(layer)?;
+            let requests = full_attention_input_projection_requests(
+                layer,
+                layout.q_projection_width,
+                layout.kv_width,
+            )?;
+            for request in requests.requests() {
+                require_resident_q4_graph_projection(
+                    family,
+                    registry,
+                    store_len,
+                    "CMD1 full-attention projection",
+                    request.tensor_name,
+                    request.output_width,
+                    runtime.width,
+                )?;
+            }
+            require_resident_q4_graph_projection(
+                family,
+                registry,
+                store_len,
+                "CMD2 full-attention output projection",
+                &attention_tensor_name(layer, "o_proj"),
+                runtime.width,
+                layout.num_q_heads * layout.head_dim,
+            )?;
+        }
+
+        require_resident_q4_graph_projection(
+            family,
+            registry,
+            store_len,
+            "CMD2 router projection",
+            &router_tensor_name(layer),
+            config.experts(),
+            runtime.width,
+        )?;
+    }
+
+    let lm_head_name = if registry.tensor("lm_head.weight").is_some() {
+        "lm_head.weight"
+    } else {
+        "model.embed_tokens.weight"
+    };
+    require_resident_q4_graph_projection(
+        family,
+        registry,
+        store_len,
+        "LM-head sampling projection",
+        lm_head_name,
+        config.vocab_size,
+        runtime.width,
+    )?;
+    Ok(())
+}
+
+pub(super) fn require_resident_q4_graph_projection(
+    family: QwenMoeFamily,
+    registry: &TensorRegistry,
+    store_len: u64,
+    stage: &str,
+    tensor_name: &str,
+    output_width: usize,
+    input_width: usize,
+) -> Result<()> {
+    let entry = registry.require(tensor_name)?;
+    DenseQ4MmapMatvecProjection::from_entry(
+        tensor_name,
+        entry,
+        store_len,
+        output_width,
+        input_width,
+    )?
+    .with_context(|| {
+        format!(
+            "FlashMoe unsupported resolved {family:?} Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
+        )
+    })?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct DenseTransformerRuntime {
@@ -4401,6 +4672,37 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("both linear-attention tensors"));
+    }
+
+    #[test]
+    fn required_manifest_validation_resolves_complete_full_attention_layer() {
+        let entries = [
+            ("model.embed_tokens.weight".to_string(), vec![32, 8]),
+            ("model.norm.weight".to_string(), vec![8]),
+            (attention_tensor_name(0, "q_proj"), vec![8, 8]),
+            (attention_tensor_name(0, "k_proj"), vec![4, 8]),
+            (attention_tensor_name(0, "v_proj"), vec![4, 8]),
+            (attention_tensor_name(0, "o_proj"), vec![8, 8]),
+            (layer_norm_tensor_name(0, "self_attn.q_norm"), vec![4]),
+            (layer_norm_tensor_name(0, "self_attn.k_norm"), vec![4]),
+            (layer_norm_tensor_name(0, "input_layernorm"), vec![8]),
+            (
+                layer_norm_tensor_name(0, "post_attention_layernorm"),
+                vec![8],
+            ),
+            (router_tensor_name(0), vec![4, 8]),
+        ];
+        let registry = TensorRegistry {
+            tensors: entries
+                .into_iter()
+                .map(|(name, shape)| {
+                    let tensor = layout_tensor(&name, &shape);
+                    (name, tensor)
+                })
+                .collect(),
+        };
+
+        validate_required_tensor_manifest(&layout_config(), &registry).unwrap();
     }
 
     fn runtime_matrix(

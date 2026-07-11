@@ -606,11 +606,6 @@ impl FlashMoeExecutionScheduler {
     pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
         self.expert_reads.snapshot()
     }
-
-    #[cfg(test)]
-    pub(crate) fn expert_store(&self) -> &ExpertSlotStore {
-        &self.expert_reads.store
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

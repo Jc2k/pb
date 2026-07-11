@@ -1,12 +1,12 @@
 //! Flash-MoE inspired inference backend facade.
 //!
-//! The implementation is being split out of the historical monolith in
-//! `legacy`. Keep this module as the stable public surface while internals move
-//! behind smaller modules.
+//! The stable public surface is composed from capability, storage, scheduling,
+//! execution, and adapter owners. Historical `legacy` code is test-only.
 
 mod cache;
 mod capabilities;
 mod experts;
+#[cfg(test)]
 mod legacy;
 mod math;
 mod metal;
@@ -23,7 +23,6 @@ mod weights;
 pub use cache::{build_cache_from_hf_snapshot, expected_hf_files, expected_vl_hf_files};
 pub use capabilities::*;
 pub use experts::*;
-pub use legacy::*;
 pub use math::*;
 pub use metal::METAL_SHADERS;
 pub use model_family::*;

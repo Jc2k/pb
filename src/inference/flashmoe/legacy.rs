@@ -82,7 +82,6 @@ use super::model_family::{QwenModelConfig, QwenMoeFamily};
 use super::planning::*;
 #[cfg(test)]
 use super::runtime::MetalExecutionFacade;
-use super::scheduler::ExpertSchedulerSnapshot;
 #[cfg(test)]
 use super::scheduler::FlashMoeScheduledGraph;
 #[cfg(test)]
@@ -119,13 +118,6 @@ use super::vision::MropePosition;
 use super::vision::block_major_patch_coords;
 #[cfg(test)]
 use super::weights::*;
-use super::weights::{
-    AttentionLayerType, DenseQ4MmapMatvecProjection, DenseTransformerRuntime, TensorRegistry,
-    attention_tensor_name, full_attention_input_projection_requests, infer_attention_layer_type,
-    infer_full_attention_layout, infer_linear_attention_layout, layer_norm_tensor_name,
-    require_tensor_shape, router_tensor_name, shared_expert_gate_tensor_name,
-    shared_expert_tensor_name,
-};
 #[cfg(test)]
 const DENSE_Q4_GROUP_SIZE: usize = 16;
 #[cfg(target_os = "macos")]
@@ -163,19 +155,6 @@ unsafe extern "C" {
         a: *mut f32,
         lda: c_int,
     );
-}
-
-impl FlashMoeTimingBuckets {
-    pub(super) fn add_expert_scheduler_delta(&mut self, delta: ExpertSchedulerSnapshot) {
-        self.expert_queue += delta.total_queue_latency;
-        self.expert_read += delta.total_read_latency;
-        self.expert_bytes_read = self.expert_bytes_read.saturating_add(delta.bytes_read);
-        self.expert_warm_reads = self.expert_warm_reads.saturating_add(delta.warm_reads);
-        self.expert_warm_read += delta.total_warm_read_latency;
-        self.expert_warm_bytes_read = self
-            .expert_warm_bytes_read
-            .saturating_add(delta.warm_bytes_read);
-    }
 }
 
 #[cfg(test)]
@@ -593,193 +572,6 @@ pub(super) fn stable_hash(value: &str) -> u64 {
     value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
     })
-}
-
-pub(super) fn validate_required_tensor_manifest(
-    config: &QwenModelConfig,
-    registry: &TensorRegistry,
-) -> Result<()> {
-    require_tensor_shape(
-        registry,
-        "model.embed_tokens.weight",
-        &[config.vocab_size, config.hidden_size],
-    )?;
-    require_tensor_shape(registry, "model.norm.weight", &[config.hidden_size])?;
-    // lm_head.weight is optional: when absent (or when tie_word_embeddings is true) the model
-    // uses tied embeddings and reuses model.embed_tokens.weight (already validated above) for
-    // the output projection.
-    if registry.tensor("lm_head.weight").is_some() {
-        require_tensor_shape(
-            registry,
-            "lm_head.weight",
-            &[config.vocab_size, config.hidden_size],
-        )?;
-    }
-    for layer in 0..config.num_hidden_layers {
-        match infer_attention_layer_type(registry, layer)? {
-            AttentionLayerType::Full => {
-                let layout = infer_full_attention_layout(config, registry, layer)?;
-                for projection in ["q_norm", "k_norm"] {
-                    require_tensor_shape(
-                        registry,
-                        &layer_norm_tensor_name(layer, &format!("self_attn.{projection}")),
-                        &[layout.head_dim],
-                    )?;
-                }
-            }
-            AttentionLayerType::Linear => {
-                let _ = infer_linear_attention_layout(config, registry, layer)?;
-            }
-        }
-        require_tensor_shape(
-            registry,
-            &layer_norm_tensor_name(layer, "input_layernorm"),
-            &[config.hidden_size],
-        )?;
-        require_tensor_shape(
-            registry,
-            &layer_norm_tensor_name(layer, "post_attention_layernorm"),
-            &[config.hidden_size],
-        )?;
-        require_tensor_shape(
-            registry,
-            &router_tensor_name(layer),
-            &[config.experts(), config.hidden_size],
-        )?;
-        let shared_experts = config.shared_experts();
-        if shared_experts > 0 {
-            let shared_inter = config.shared_expert_intermediate_size();
-            if shared_inter == 0 {
-                bail!(
-                    "Qwen config declares {shared_experts} shared expert(s) but no shared expert intermediate size"
-                );
-            }
-            let total_shared_inter = shared_experts
-                .checked_mul(shared_inter)
-                .context("shared expert intermediate size overflow")?;
-            require_tensor_shape(
-                registry,
-                &shared_expert_tensor_name(layer, "gate_proj"),
-                &[total_shared_inter, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &shared_expert_tensor_name(layer, "up_proj"),
-                &[total_shared_inter, config.hidden_size],
-            )?;
-            require_tensor_shape(
-                registry,
-                &shared_expert_tensor_name(layer, "down_proj"),
-                &[config.hidden_size, total_shared_inter],
-            )?;
-            require_tensor_shape(
-                registry,
-                &shared_expert_gate_tensor_name(layer),
-                &[shared_experts, config.hidden_size],
-            )?;
-        }
-        // Per-expert tensor presence is intentionally not validated here.
-        //
-        // Reasons:
-        // 1. Expert MLP correctness (gate/up/down projection shapes) is enforced per-expert at
-        //    pack time by `validate_expert_tensor_group`.
-        // 2. At runtime the packed expert files are managed by `ExpertSlotStore`; the registry
-        //    records their original source metadata but is not used for expert inference.
-        // 3. Real Qwen3 revision checkpoints may differ in expert naming (e.g. shared experts)
-        //    or use a naming scheme that doesn't match the exact pattern assumed here.
-        //    A rigid per-name loop would cause false rejections for such models.
-    }
-    Ok(())
-}
-
-pub(super) fn validate_qwen_q4_graph_bindings(
-    family: QwenMoeFamily,
-    config: &QwenModelConfig,
-    runtime: &DenseTransformerRuntime,
-    registry: &TensorRegistry,
-    store_len: u64,
-) -> Result<()> {
-    for layer in 0..config.num_hidden_layers {
-        if !runtime.is_linear_attention_layer(layer) {
-            let layout = runtime.full_attention_layout(layer)?;
-            let requests = full_attention_input_projection_requests(
-                layer,
-                layout.q_projection_width,
-                layout.kv_width,
-            )?;
-            for request in requests.requests() {
-                require_resident_q4_graph_projection(
-                    family,
-                    registry,
-                    store_len,
-                    "CMD1 full-attention projection",
-                    request.tensor_name,
-                    request.output_width,
-                    runtime.width,
-                )?;
-            }
-            require_resident_q4_graph_projection(
-                family,
-                registry,
-                store_len,
-                "CMD2 full-attention output projection",
-                &attention_tensor_name(layer, "o_proj"),
-                runtime.width,
-                layout.num_q_heads * layout.head_dim,
-            )?;
-        }
-
-        require_resident_q4_graph_projection(
-            family,
-            registry,
-            store_len,
-            "CMD2 router projection",
-            &router_tensor_name(layer),
-            config.experts(),
-            runtime.width,
-        )?;
-    }
-
-    let lm_head_name = if registry.tensor("lm_head.weight").is_some() {
-        "lm_head.weight"
-    } else {
-        "model.embed_tokens.weight"
-    };
-    require_resident_q4_graph_projection(
-        family,
-        registry,
-        store_len,
-        "LM-head sampling projection",
-        lm_head_name,
-        config.vocab_size,
-        runtime.width,
-    )?;
-    Ok(())
-}
-
-fn require_resident_q4_graph_projection(
-    family: QwenMoeFamily,
-    registry: &TensorRegistry,
-    store_len: u64,
-    stage: &str,
-    tensor_name: &str,
-    output_width: usize,
-    input_width: usize,
-) -> Result<()> {
-    let entry = registry.require(tensor_name)?;
-    DenseQ4MmapMatvecProjection::from_entry(
-        tensor_name,
-        entry,
-        store_len,
-        output_width,
-        input_width,
-    )?
-    .with_context(|| {
-        format!(
-            "FlashMoe unsupported resolved {family:?} Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
-        )
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1217,65 +1009,6 @@ fn apply_gated_delta_recurrence_with_scratch(
             beta_gate,
             out,
         );
-    }
-}
-
-pub(super) fn dense_f32_matvec_rows(
-    weights: &[f32],
-    input: &[f32],
-    rows: usize,
-    cols: usize,
-) -> Result<Option<Vec<f32>>> {
-    let expected = rows
-        .checked_mul(cols)
-        .context("dense f32 matvec row-major weight size overflow")?;
-    if weights.len() < expected || input.len() < cols {
-        return Ok(None);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let Ok(m) = c_int::try_from(rows) else {
-            return Ok(None);
-        };
-        let Ok(n) = c_int::try_from(cols) else {
-            return Ok(None);
-        };
-        let mut out = vec![0.0f32; rows];
-        unsafe {
-            cblas_sgemv(
-                CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                m,
-                n,
-                1.0,
-                weights.as_ptr(),
-                n,
-                input.as_ptr(),
-                1,
-                0.0,
-                out.as_mut_ptr(),
-                1,
-            );
-        }
-        return Ok(Some(out));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut out = vec![0.0f32; rows];
-        for row in 0..rows {
-            let start = row
-                .checked_mul(cols)
-                .context("dense f32 matvec row offset overflow")?;
-            let weights = &weights[start..start + cols];
-            out[row] = weights
-                .iter()
-                .zip(input.iter())
-                .map(|(weight, value)| weight * value)
-                .sum::<f32>();
-        }
-        Ok(Some(out))
     }
 }
 
