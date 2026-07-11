@@ -303,6 +303,10 @@ Baseline reviewed on 2026-07-10:
   than a Qwen3.5 label. Full-attention manifests and runtime CMD1 execution require both per-head
   Q and K RMSNorm bindings; an absent tensor is an explicit load/runtime error instead of silently
   running unnormalized attention.
+- CMD3 treats a model configuration with zero shared experts as the declared no-shared-expert
+  implementation. Models that declare shared experts must resolve every resident Q4 shared
+  projection; a missing projection is an unsupported binding error and cannot collapse into the
+  no-shared case.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
