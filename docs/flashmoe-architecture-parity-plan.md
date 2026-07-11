@@ -427,6 +427,12 @@ Baseline reviewed on 2026-07-11:
   transaction through selected-route softmax at scale 1.0, eight scheduler-owned positioned reads,
   whole-slot typed Q4 SwiGLU payloads, declared no-shared CMD3 combine, and deferred hidden/next-norm
   state. Its route weights and output state are checked against independent golden values.
+- The production Q4 `mlx-community/Qwen3-30B-A3B-4bit` checkpoint now builds through the same cache
+  transaction: all 48 layers publish 128 fixed-Q4 whole-expert slots, load resolves the nine-stage
+  graph with K=8 and no shared expert, and real one-token inference exits successfully. Raw
+  `1+1=` emits `2` in both FlashMoe and upstream MLX-LM. Raw `2+2=` emits `5` in both engines for
+  this checkpoint, proving that result is checkpoint behavior rather than a reason to alter the
+  unified math or restore a fallback. The required default Qwen3.5 smoke remains `4`.
 - `vision.rs` now owns Qwen-VL image decoding, smart resize, normalization, block-major patch
   packing, the serialized ViT configuration contract, visual encoding output, M-RoPE positions,
   placeholder-span validation, multi-image embedding/DeepStack assembly, and the typed
@@ -487,13 +493,12 @@ The architecture is not yet at the target:
   Expert fixture implementation and test/compatibility helpers remain in test-only `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
-- Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
-  real-checkpoint smoke evidence. The intended Q4 source is
-  `hf://mlx-community/Qwen3-30B-A3B-4bit`. Qwen-VL preprocessing now emits exact typed inputs
-  consumed by the shared runtime, including scheduler-compatible DeepStack handoff policy. Its Q4
-  capability and load path resolve only from a concrete vision executor and manifest bindings, and
-  the real Q4 checkpoint URI now reaches that plan, but the checkpoint is not present locally and
-  a real Qwen-VL smoke is still required before claiming production correctness.
+- Text-only Qwen MoE Q4 now has linked parity plus real-checkpoint cache/load/output parity against
+  upstream MLX-LM. Qwen-VL preprocessing emits exact typed inputs consumed by the shared runtime,
+  including scheduler-compatible DeepStack handoff policy. Its Q4 capability and load path resolve
+  only from a concrete vision executor and manifest bindings, and the real Q4 checkpoint URI now
+  reaches that plan, but the checkpoint is not present locally and a real Qwen-VL smoke is still
+  required before claiming production correctness.
 - BF16/F16/F32 full-attention CMD1, CMD2, and LM-head sampling now use the same typed resident
   projection handle, Metal dispatch, CPU/GPU input bindings, residual/norm transition, router
   readback, state handoff, padded-vocabulary policy, and topK command as Q4. Qwen3/Qwen3-VL
@@ -712,7 +717,8 @@ Required work:
 - Keep typed BF16/F16 whole-expert storage and Metal implementations on the existing positioned
   read, scheduler-lease, and CMD3 handoff while exercising the explicit production storage policy
   against compatible checkpoints and adding checkpoint evidence.
-- Close real-checkpoint correctness for the resolved text-only Qwen MoE and Qwen-VL Q4 graphs.
+- Close real-checkpoint correctness for the remaining Qwen-VL Q4 graph while preserving the
+  completed text-only Qwen MoE Q4 evidence.
 - Extend capability and parity fixtures until every supported family/dtype/expert-layout
   combination has direct evidence.
 
@@ -728,7 +734,7 @@ Current capability matrix:
 | Family | Dense/expert layout | Graph/load status | Correctness evidence |
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
-| Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph; production evidence target is `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity; real checkpoint pending |
+| Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Supported through the unified graph with `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity, 48-layer/128-expert cache build, real load/infer, and raw-output parity with upstream MLX-LM |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Real `Qwen3-VL-30B-A3B-*` names resolve the unified graph with required typed vision executor; production target is `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability/planning parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
@@ -865,9 +871,9 @@ For Gate 6:
    Metal builder as Q4. Keep production policy explicit and emit only those declared fixed-slot
    formats from matching source dtypes. Do not revive removed dense CPU/component paths as
    production continuations.
-3. Pull and run `hf://mlx-community/Qwen3-30B-A3B-4bit` through the resolved text-only Qwen MoE Q4
-   graph. Debug manifest, routing, or math mismatches through its typed metadata and shared
-   scheduler path.
+3. Preserve the completed `hf://mlx-community/Qwen3-30B-A3B-4bit` real-checkpoint evidence through
+   the text-only Qwen MoE Q4 graph. Its raw deterministic outputs match upstream MLX-LM; do not
+   reinterpret checkpoint behavior as a reason to change the unified graph.
 4. Pull and run `hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` through the resolved Qwen-VL Q4
    graph. Debug any manifest/math mismatch through its typed vision executor and shared scheduler
    path. Do not add request-time probing or an alternate decoder loop to make the smoke pass.
