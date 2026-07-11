@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use super::math::causal_attention;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeSessionState<K> {
@@ -1566,6 +1566,155 @@ impl KvCache {
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct FlashMoeSessionCache {
+    entries: BTreeMap<String, FlashMoeSessionState<KvCache>>,
+}
+
+impl FlashMoeSessionCache {
+    pub(crate) fn begin_generation(
+        &mut self,
+        session_id: Option<&str>,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        layers: usize,
+    ) -> FlashMoeGenerationState {
+        let capacity = prompt_tokens.len() + max_tokens;
+        let cached = session_id.and_then(|id| {
+            take_reusable_session_cache_entry(&mut self.entries, id, &prompt_tokens)
+        });
+        let (kv_cache, prefill_start, cached_last_hidden) =
+            if let Some((prefix_len, state)) = cached {
+                let FlashMoeSessionState {
+                    tokens: _,
+                    mut kv_cache,
+                    last_hidden,
+                } = state;
+                kv_cache.resize_capacity(capacity);
+                let cached_last_hidden = (prefix_len == prompt_tokens.len()).then_some(last_hidden);
+                (kv_cache, prefix_len, cached_last_hidden)
+            } else {
+                (KvCache::new(layers, capacity), 0, None)
+            };
+
+        FlashMoeGenerationState {
+            session_id: session_id.map(str::to_owned),
+            prompt_tokens,
+            kv_cache,
+            prefill_start,
+            cached_last_hidden,
+            prompt_cache: None,
+            generated: Vec::new(),
+            max_tokens,
+            stopped: false,
+        }
+    }
+
+    pub(crate) fn commit_generation(
+        &mut self,
+        generation: &mut FlashMoeGenerationState,
+    ) -> Result<()> {
+        let Some(session_id) = generation.session_id.as_ref() else {
+            return Ok(());
+        };
+        let state = generation
+            .prompt_cache
+            .take()
+            .context("session cache prompt snapshot is missing")?;
+        self.entries.insert(session_id.clone(), state);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct FlashMoeGenerationState {
+    session_id: Option<String>,
+    prompt_tokens: Vec<u32>,
+    kv_cache: KvCache,
+    prefill_start: usize,
+    cached_last_hidden: Option<Vec<f32>>,
+    prompt_cache: Option<FlashMoeSessionState<KvCache>>,
+    generated: Vec<u32>,
+    max_tokens: usize,
+    stopped: bool,
+}
+
+impl FlashMoeGenerationState {
+    pub(crate) fn prompt_len(&self) -> usize {
+        self.prompt_tokens.len()
+    }
+
+    pub(crate) fn prefill_start(&self) -> usize {
+        self.prefill_start
+    }
+
+    pub(crate) fn take_cached_last_hidden(&mut self) -> Option<Vec<f32>> {
+        self.cached_last_hidden.take()
+    }
+
+    pub(crate) fn prefill_inputs(&mut self) -> (&[u32], usize, &mut KvCache) {
+        (&self.prompt_tokens, self.prefill_start, &mut self.kv_cache)
+    }
+
+    pub(crate) fn capture_prompt_cache(&mut self, last_hidden: Vec<f32>) {
+        if self.session_id.is_none() {
+            return;
+        }
+        self.prompt_cache = Some(FlashMoeSessionState::new(
+            stable_session_cache_tokens(&self.prompt_tokens),
+            self.kv_cache.shallow_snapshot(),
+            last_hidden,
+        ));
+    }
+
+    pub(crate) fn should_sample_first(&self) -> bool {
+        self.max_tokens > 0
+    }
+
+    pub(crate) fn sample_inputs(&self) -> (&[u32], &[u32]) {
+        (&self.prompt_tokens, &self.generated)
+    }
+
+    pub(crate) fn record_sampled_token(&mut self, token: u32, is_eos: bool) {
+        if is_eos {
+            self.stopped = true;
+        } else {
+            self.generated.push(token);
+        }
+    }
+
+    pub(crate) fn should_decode(&self) -> bool {
+        !self.stopped && self.generated.len() < self.max_tokens
+    }
+
+    pub(crate) fn decode_inputs(&mut self) -> Result<(&[u32], &[u32], &mut KvCache, usize)> {
+        let position = self
+            .prompt_tokens
+            .len()
+            .checked_add(self.generated.len())
+            .and_then(|position| position.checked_sub(1))
+            .context("FlashMoe decode requires a prompt or generated token")?;
+        Ok((
+            &self.prompt_tokens,
+            &self.generated,
+            &mut self.kv_cache,
+            position,
+        ))
+    }
+
+    pub(crate) fn generated_len(&self) -> usize {
+        self.generated.len()
+    }
+
+    pub(crate) fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub(crate) fn into_generated(self) -> Vec<u32> {
+        self.generated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,6 +1790,51 @@ mod tests {
             err.to_string().contains("requires CpuVisible placement"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn generation_lifecycle_commits_and_reuses_state_owned_prompt_snapshot() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(Some("chat"), vec![10, 20], 2, 1);
+        assert_eq!(generation.prefill_start(), 0);
+        {
+            let (prompt, start, kv_cache) = generation.prefill_inputs();
+            assert_eq!(prompt, &[10, 20]);
+            assert_eq!(start, 0);
+            kv_cache
+                .record_kv(0, 0, vec![1.0, 1.5], vec![2.0, 2.5])
+                .unwrap();
+            kv_cache
+                .record_kv(1, 0, vec![3.0, 3.5], vec![4.0, 4.5])
+                .unwrap();
+        }
+        generation.capture_prompt_cache(vec![9.0, 9.5]);
+        generation.record_sampled_token(30, false);
+        assert_eq!(generation.generated, vec![30]);
+        sessions.commit_generation(&mut generation).unwrap();
+
+        let mut reused = sessions.begin_generation(Some("chat"), vec![10, 20], 1, 1);
+        assert_eq!(reused.prefill_start(), 2);
+        assert_eq!(reused.take_cached_last_hidden(), Some(vec![9.0, 9.5]));
+        assert_eq!(reused.kv_cache.keys_values(1, 0).unwrap().len(), 2);
+        assert!(reused.generated.is_empty());
+    }
+
+    #[test]
+    fn generation_lifecycle_owns_decode_position_and_stop_state() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(None, vec![10, 20], 2, 1);
+        assert!(generation.should_sample_first());
+        generation.record_sampled_token(30, false);
+        assert!(generation.should_decode());
+        let (prompt, generated, _, position) = generation.decode_inputs().unwrap();
+        assert_eq!(prompt, &[10, 20]);
+        assert_eq!(generated, &[30]);
+        assert_eq!(position, 2);
+
+        generation.record_sampled_token(0, true);
+        assert!(!generation.should_decode());
+        assert_eq!(generation.into_generated(), vec![30]);
     }
 
     #[test]

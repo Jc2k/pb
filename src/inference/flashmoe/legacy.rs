@@ -135,12 +135,12 @@ use super::scheduler::{
 use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
 #[cfg(test)]
 use super::state::{
-    FlashMoeExpertPhaseOutput, FlashMoeRecurrentLayerState, FlashMoeStatePlacement,
-    reusable_session_prefix_len,
+    FlashMoeExpertPhaseOutput, FlashMoeRecurrentLayerState, FlashMoeSessionState,
+    FlashMoeStatePlacement, reusable_session_prefix_len, stable_session_cache_tokens,
+    take_reusable_session_cache_entry,
 };
 use super::state::{
-    FlashMoePromptTokenRecord, FlashMoeSessionState, KvCache, LinearAttentionLayout,
-    stable_session_cache_tokens, take_reusable_session_cache_entry,
+    FlashMoePromptTokenRecord, FlashMoeSessionCache, KvCache, LinearAttentionLayout,
 };
 use super::types::*;
 #[cfg(test)]
@@ -1294,7 +1294,7 @@ where
         routing_policy,
         runtime,
         shared_expert_phases: SharedExpertPhaseCache::default(),
-        session_cache: BTreeMap::new(),
+        session_cache: FlashMoeSessionCache::default(),
     })
 }
 
@@ -1313,7 +1313,7 @@ pub struct FlashMoeEngine {
     pub(super) shared_expert_phases: SharedExpertPhaseCache,
     /// Vision encoder, present only for Qwen3-VL plans.
     vision_encoder: Option<VisionEncoder>,
-    session_cache: BTreeMap<String, FlashMoeSessionState<KvCache>>,
+    session_cache: FlashMoeSessionCache,
 }
 
 #[derive(Debug)]
@@ -1857,45 +1857,32 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
-        let cache_capacity = prompt_tokens.len() + request.max_tokens.max(0) as usize;
-        let cached = session_id.and_then(|id| {
-            take_reusable_session_cache_entry(&mut self.session_cache, id, &prompt_tokens)
-        });
-        let (mut kv_cache, prefill_start, cached_last_hidden) =
-            if let Some((prefix_len, state)) = cached {
-                let FlashMoeSessionState {
-                    tokens: _,
-                    mut kv_cache,
-                    last_hidden,
-                } = state;
-                kv_cache.resize_capacity(cache_capacity);
-                let last_hidden = if prefix_len == prompt_tokens.len() {
-                    Some(last_hidden)
-                } else {
-                    None
-                };
-                info!(
-                    "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
-                    prefix_len,
-                    prompt_tokens.len()
-                );
-                (kv_cache, prefix_len, last_hidden)
-            } else {
-                (
-                    KvCache::new(self.config.num_hidden_layers, cache_capacity),
-                    0,
-                    None,
-                )
-            };
+        let max_tokens = request.max_tokens.max(0) as usize;
+        let mut generation = self.session_cache.begin_generation(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            self.config.num_hidden_layers,
+        );
+        let prefill_start = generation.prefill_start();
+        let prompt_len = generation.prompt_len();
+        if prefill_start > 0 {
+            info!(
+                "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
+                prefill_start, prompt_len
+            );
+        }
         if prefill_start == 0 {
             self.metal.reset_linear_attention_state();
         }
-        let prefill_hidden = if prefill_start == prompt_tokens.len() {
+        let prefill_hidden = if prefill_start == prompt_len {
             info!(
                 "flashmoe: prompt prefill fully cached tokens={}",
-                prompt_tokens.len()
+                prompt_len
             );
-            cached_last_hidden.context("session cache entry is missing the final hidden state")?
+            generation
+                .take_cached_last_hidden()
+                .context("session cache entry is missing the final hidden state")?
         } else {
             let prefill_started = Instant::now();
             report_generation_progress(
@@ -1903,56 +1890,57 @@ impl FlashMoeEngine {
                 format!(
                     "prefill begin start_token={} remaining_tokens={}",
                     prefill_start,
-                    prompt_tokens.len().saturating_sub(prefill_start)
+                    prompt_len.saturating_sub(prefill_start)
                 ),
             );
             info!(
                 "flashmoe: prefill begin start_token={} remaining_tokens={}",
                 prefill_start,
-                prompt_tokens.len().saturating_sub(prefill_start)
+                prompt_len.saturating_sub(prefill_start)
             );
-            let hidden = self.prefill_from(
-                &prompt_tokens,
-                prefill_start,
-                &mut kv_cache,
-                timing.as_deref_mut(),
-                progress.clone(),
-            )?;
+            let hidden = {
+                let (prompt_tokens, prefill_start, kv_cache) = generation.prefill_inputs();
+                self.prefill_from(
+                    prompt_tokens,
+                    prefill_start,
+                    kv_cache,
+                    timing.as_deref_mut(),
+                    progress.clone(),
+                )?
+            };
             report_generation_progress(
                 &progress,
                 format!(
                     "prefill complete tokens={} elapsed_ms={}",
-                    prompt_tokens.len().saturating_sub(prefill_start),
+                    prompt_len.saturating_sub(prefill_start),
                     prefill_started.elapsed().as_millis()
                 ),
             );
             info!(
                 "flashmoe: prefill complete tokens={} elapsed_ms={}",
-                prompt_tokens.len().saturating_sub(prefill_start),
+                prompt_len.saturating_sub(prefill_start),
                 prefill_started.elapsed().as_millis()
             );
             hidden
         };
-        let prompt_cache = session_id
-            .is_some()
-            .then(|| (kv_cache.shallow_snapshot(), prefill_hidden.clone()));
+        generation.capture_prompt_cache(prefill_hidden.clone());
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
-        let mut generated = Vec::new();
-        let max_tokens = request.max_tokens.max(0) as usize;
-        let mut stopped = false;
-        if max_tokens > 0 {
+        if generation.should_sample_first() {
             let sample_started = Instant::now();
             report_generation_progress(&progress, "first-token sampling begin".to_string());
             info!("flashmoe: first-token sampling begin");
-            let token = self.sample_from_hidden(
-                &mut sampler,
-                &prefill_hidden,
-                &prompt_tokens,
-                &generated,
-                request.trace_candidates,
-                &progress,
-            )?;
+            let token = {
+                let (prompt_tokens, generated) = generation.sample_inputs();
+                self.sample_from_hidden(
+                    &mut sampler,
+                    &prefill_hidden,
+                    prompt_tokens,
+                    generated,
+                    request.trace_candidates,
+                    &progress,
+                )?
+            };
             report_generation_progress(
                 &progress,
                 format!(
@@ -1974,47 +1962,44 @@ impl FlashMoeEngine {
                 last.buckets.total_wall += elapsed;
                 last.sampled_token = Some(token);
             }
-            if !self.tokenizer.is_eos(token) {
-                generated.push(token);
-            } else {
-                stopped = true;
-            }
+            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
         }
-        while !stopped && generated.len() < max_tokens {
-            let position = prompt_tokens.len() + generated.len() - 1;
+        while generation.should_decode() {
+            let generated_len = generation.generated_len();
+            let max_tokens = generation.max_tokens();
+            let position = generation.decode_inputs()?.3;
             report_generation_progress(
                 &progress,
                 format!(
                     "decode begin generated={}/{} position={}",
-                    generated.len(),
-                    max_tokens,
-                    position
+                    generated_len, max_tokens, position
                 ),
             );
             info!(
                 "flashmoe: decode begin generated={}/{} position={}",
-                generated.len(),
-                max_tokens,
-                position
+                generated_len, max_tokens, position
             );
             let decode_started = Instant::now();
-            let sampled = self.sample_next_token(
-                &mut sampler,
-                &prompt_tokens,
-                &generated,
-                &mut kv_cache,
-                position,
-                MropePosition::text(position),
-                timing.as_deref_mut(),
-                request.trace_candidates,
-                progress.clone(),
-            )?;
+            let sampled = {
+                let (prompt_tokens, generated, kv_cache, position) = generation.decode_inputs()?;
+                self.sample_next_token(
+                    &mut sampler,
+                    prompt_tokens,
+                    generated,
+                    kv_cache,
+                    position,
+                    MropePosition::text(position),
+                    timing.as_deref_mut(),
+                    request.trace_candidates,
+                    progress.clone(),
+                )?
+            };
             let token = sampled.token;
             report_generation_progress(
                 &progress,
                 format!(
                     "decode complete generated={}/{} token={} elapsed_ms={}",
-                    generated.len() + 1,
+                    generated_len + 1,
                     max_tokens,
                     token,
                     decode_started.elapsed().as_millis()
@@ -2022,23 +2007,17 @@ impl FlashMoeEngine {
             );
             info!(
                 "flashmoe: decode complete generated={}/{} token={} elapsed_ms={}",
-                generated.len() + 1,
+                generated_len + 1,
                 max_tokens,
                 token,
                 decode_started.elapsed().as_millis()
             );
-            if self.tokenizer.is_eos(token) {
-                break;
-            }
-            generated.push(token);
+            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
         }
 
-        if let Some(session_id) = session_id {
-            let (prompt_kv_cache, prompt_hidden) =
-                prompt_cache.context("session cache prompt snapshot is missing")?;
-            self.store_session_cache(session_id, &prompt_tokens, prompt_kv_cache, prompt_hidden);
-        }
+        self.session_cache.commit_generation(&mut generation)?;
 
+        let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
         let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
         let output = GenerationOutput {
@@ -2161,23 +2140,6 @@ impl FlashMoeEngine {
             }
         }
         last_hidden.context("cannot generate from an empty prompt")
-    }
-
-    fn store_session_cache(
-        &mut self,
-        session_id: &str,
-        prompt_tokens: &[u32],
-        kv_cache: KvCache,
-        last_hidden: Vec<f32>,
-    ) {
-        self.session_cache.insert(
-            session_id.to_string(),
-            FlashMoeSessionState::new(
-                stable_session_cache_tokens(prompt_tokens),
-                kv_cache,
-                last_hidden,
-            ),
-        );
     }
 
     /// Qwen-VL remains outside the text runtime until its typed input adapter resolves.

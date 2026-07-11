@@ -237,6 +237,11 @@ Baseline reviewed on 2026-07-10:
   attention math moved to `math.rs`; `legacy.rs` retains generation/session orchestration but no KV
   storage implementation or direct access to cache internals. Focused state tests prove shared
   snapshot storage, independent growth, and explicit rejection of undeclared GPU recurrent state.
+- `FlashMoeGenerationState` and `FlashMoeSessionCache` now own the complete CPU-visible generation
+  lifecycle: rendered prompt tokens, KV cache, reusable-prefix position, cached final hidden state,
+  prompt snapshot, generated tokens, decode position, EOS/length stop state, and session-map
+  commit. The engine generation loop borrows typed prefill/sample/decode views from that owner;
+  its raw session map, local generated/stop state, and `store_session_cache` helper were removed.
 - Full-attention placement is now resolved by the scheduled graph rather than supplied by the
   runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
   attention stage without a matching scheduled executor is a named unsupported capability. The
@@ -277,20 +282,22 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- The legacy engine shell still stores the weights-owned `DenseStore`; generation/session cache-map
-  orchestration, runtime layout metadata, and `VisionEncoder` also remain defined in `legacy.rs`.
-- CPU-visible KV records and cache storage are state-owned, but generation/session lifecycle and
-  deferred runtime state still cross legacy-owned orchestration, so Gate 4's single-owner
-  buffer/storage boundary is incomplete.
+- The legacy engine shell still stores the weights-owned `DenseStore` and state-owned session-cache
+  owner; runtime layout metadata and `VisionEncoder` also remain defined in `legacy.rs`.
+- CPU-visible generation and session lifecycle is state-owned, but a reusable prompt snapshot does
+  not yet capture/restore the Metal linear-attention recurrent buffers. That transition must become
+  an explicit state/Metal session implementation before prefix reuse is parity-safe. Deferred CMD3
+  handles also still live in `runtime.rs`, so Gate 4's single-owner GPU boundary is incomplete.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
 - Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
   yet established.
 
-At this checkpoint, Gates 1 through 3 are complete. Dense and CPU-KV storage ownership have moved;
-generation/deferred state ownership, parity closure, additional variants, and final legacy removal
-remain, so approximately 20-30% of the architectural work remains.
+At this checkpoint, Gates 1 through 3 are complete. Dense, CPU-KV, and CPU generation/session
+ownership have moved; recurrent session snapshots, deferred GPU state ownership, parity closure,
+additional variants, and final legacy removal remain, so approximately 20-30% of the architectural
+work remains.
 
 ## Completion Gates
 
@@ -598,9 +605,10 @@ For Gate 4:
 1. Move `DenseStore` as a complete owner into `weights.rs`: mmap/blob, registry, resident bindings,
    projection execution, norm/projection caches, decoded/raw tile caches, and their focused tests.
    Route load, runtime, and sampling through that owner in the same ownership slices.
-2. Finish routing generation/session cache-map lifecycle through the state-owned `KvCache`, token
-   records, full-attention KV transitions, and cache reuse. Keep recurrent GPU state in `metal.rs`;
-   remove obsolete CPU recurrent state and legacy orchestration that reaches across the boundary.
+2. Add a typed session snapshot for Metal linear-attention recurrence and capture/restore it at the
+   declared prompt boundary alongside the state-owned CPU KV snapshot. Missing recurrent snapshot
+   support must be a precise unsupported error, never partial prefix reuse. Remove obsolete CPU
+   recurrent state and any remaining legacy orchestration that reaches across this boundary.
 3. Move deferred CMD3 buffers and next-layer hidden/normed transition ownership to `state.rs` and
    `metal.rs` so `runtime.rs` carries typed state handles rather than legacy-owned adapters.
 4. Audit every CPU readback/upload in the live graph. Keep only declared graph boundaries; turn a
