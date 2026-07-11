@@ -320,6 +320,10 @@ Baseline reviewed on 2026-07-11:
   serialization, parser, and byte-level BPE parity suite in `text_parity_tests.rs`. Remaining legacy
   integration fixtures borrow those owner fixtures temporarily; the 782-line tokenizer/text block
   and a duplicate non-FlashMoe backend-selection test have left `legacy.rs`.
+- Vision now owns Qwen-VL image preprocessing, placeholder expansion, multi-image span, MRoPE,
+  config validation, and patch-order parity in `vision_parity_tests.rs`. The 741-line adapter test
+  block and its broad legacy imports were removed from `legacy.rs`; these tests remain explicitly
+  upstream of the shared decoder graph.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the

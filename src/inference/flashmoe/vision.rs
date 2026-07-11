@@ -1556,6 +1556,10 @@ pub(super) fn qwen3vl_single_image_mrope_positions(
 }
 
 #[cfg(test)]
+#[path = "vision_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::inference::flashmoe::{QWEN3_VL_MODEL, plan_unchecked};
