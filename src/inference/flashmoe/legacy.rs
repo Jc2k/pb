@@ -5048,7 +5048,14 @@ fn validate_required_tensor_manifest(
     for layer in 0..config.num_hidden_layers {
         match infer_attention_layer_type(registry, layer)? {
             AttentionLayerType::Full => {
-                let _ = infer_full_attention_layout(config, registry, layer)?;
+                let layout = infer_full_attention_layout(config, registry, layer)?;
+                for projection in ["q_norm", "k_norm"] {
+                    require_tensor_shape(
+                        registry,
+                        &layer_norm_tensor_name(layer, &format!("self_attn.{projection}")),
+                        &[layout.head_dim],
+                    )?;
+                }
             }
             AttentionLayerType::Linear => {
                 let _ = infer_linear_attention_layout(config, registry, layer)?;
@@ -10877,6 +10884,8 @@ mod tests {
             ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
             ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
             ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.q_norm.weight", vec![4]),
+            ("model.layers.0.self_attn.k_norm.weight", vec![4]),
             ("model.layers.0.input_layernorm.weight", vec![8]),
             ("model.layers.0.post_attention_layernorm.weight", vec![8]),
             ("model.layers.0.mlp.gate.weight", vec![4, 8]),
@@ -10979,6 +10988,8 @@ mod tests {
                         attention_tensor_name(layer, "o_proj"),
                         vec![config.hidden_size, config.hidden_size],
                     );
+                    push(layer_norm_tensor_name(layer, "self_attn.q_norm"), vec![4]);
+                    push(layer_norm_tensor_name(layer, "self_attn.k_norm"), vec![4]);
                 }
                 AttentionLayerType::Linear => {
                     push(
@@ -11057,6 +11068,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn full_attention_manifest_requires_qk_norm_bindings() {
+        let (config, mut manifest) = minimal_dense_manifest(true);
+        manifest
+            .dense_tensors
+            .retain(|tensor| tensor.tensor != "model.layers.0.self_attn.k_norm.weight");
+        let registry = TensorRegistry::from_manifest(&manifest);
+
+        let error = validate_required_tensor_manifest(&config, &registry).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("model.layers.0.self_attn.k_norm.weight"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -11485,6 +11513,14 @@ mod tests {
                 push(
                     attention_tensor_name(layer, "o_proj"),
                     vec![config.hidden_size, config.hidden_size],
+                );
+                push(
+                    layer_norm_tensor_name(layer, "self_attn.q_norm"),
+                    vec![head_dim],
+                );
+                push(
+                    layer_norm_tensor_name(layer, "self_attn.k_norm"),
+                    vec![head_dim],
                 );
             } else {
                 push(

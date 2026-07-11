@@ -87,7 +87,7 @@ pub enum FlashMoeStageImplementation {
     QwenTextInput,
     DeferredMetalCmd3,
     MetalResidentQ4AttentionProjections,
-    Qwen35CpuAttention,
+    QwenFullAttentionCpuKv,
     MetalResidentQ4PostAttention,
     CpuSoftmaxTopK,
     ParallelPositionedFixedQ4Reads,
@@ -101,7 +101,7 @@ impl FlashMoeStageImplementation {
             Self::QwenTextInput => "Qwen text token/position adapter",
             Self::DeferredMetalCmd3 => "deferred Metal CMD3 handoff",
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
-            Self::Qwen35CpuAttention => "Qwen3.5 upstream-parity CPU attention",
+            Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
             Self::MetalResidentQ4PostAttention => {
                 "Metal resident-Q4 post-attention/router/shared gate-up"
             }
@@ -303,7 +303,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::AttentionMath,
                 FlashMoeStagePlacement::CpuDeclared,
-                FlashMoeStageImplementation::Qwen35CpuAttention,
+                FlashMoeStageImplementation::QwenFullAttentionCpuKv,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,

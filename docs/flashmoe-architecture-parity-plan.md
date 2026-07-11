@@ -299,6 +299,10 @@ Baseline reviewed on 2026-07-10:
   advances only when `norm_topk_prob=true`, while a missing value or `false` reports the routing
   stage as unsupported. Moving this ownership exposed and corrected parity fixtures that had
   accidentally injected scale 1.0 beside a Qwen3.5 graph.
+- The declared CPU-KV attention stage is now a Qwen-family full-attention implementation rather
+  than a Qwen3.5 label. Full-attention manifests and runtime CMD1 execution require both per-head
+  Q and K RMSNorm bindings; an absent tensor is an explicit load/runtime error instead of silently
+  running unnormalized attention.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream

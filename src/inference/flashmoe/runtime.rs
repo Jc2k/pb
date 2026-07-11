@@ -969,12 +969,23 @@ impl FlashMoeEngine {
         let subphase_started = Instant::now();
         let (mut q, q_gate) = split_q_projection(q_projected, layout)?;
 
-        // Some Qwen full-attention variants apply Q/K RMSNorm before RoPE.
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
         let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
 
-        let q_norm_w = self.model_norm_weight(&q_norm_name, layout.head_dim)?;
-        let k_norm_w = self.model_norm_weight(&k_norm_name, layout.head_dim)?;
+        let q_norm_w = self
+            .model_norm_weight(&q_norm_name, layout.head_dim)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported Qwen full-attention CMD1 at layer {layer}: required Q norm tensor {q_norm_name} is unavailable"
+                )
+            })?;
+        let k_norm_w = self
+            .model_norm_weight(&k_norm_name, layout.head_dim)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported Qwen full-attention CMD1 at layer {layer}: required K norm tensor {k_norm_name} is unavailable"
+                )
+            })?;
         let theta = self.config.rope_theta.unwrap_or_else(|| {
             if layout.q_layout == FullAttentionQLayout::Gated {
                 10_000_000.0
@@ -989,8 +1000,8 @@ impl FlashMoeEngine {
             rope_position,
             theta,
             self.config.text_mrope_section(),
-            q_norm_w.as_deref(),
-            k_norm_w.as_deref(),
+            Some(&q_norm_w),
+            Some(&k_norm_w),
         )?;
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_misc += subphase_started.elapsed();

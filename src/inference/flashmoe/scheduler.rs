@@ -996,7 +996,7 @@ impl ScheduledAttentionMathImplementation {
         match (stage.placement, stage.implementation) {
             (
                 FlashMoeStagePlacement::CpuDeclared,
-                FlashMoeStageImplementation::Qwen35CpuAttention,
+                FlashMoeStageImplementation::QwenFullAttentionCpuKv,
             ) => Ok(Self::CpuKvCache),
             _ => Err(FlashMoeUnsupportedCapability::new(
                 family,
