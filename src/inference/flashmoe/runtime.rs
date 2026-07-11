@@ -276,6 +276,8 @@ impl MetalExecutionFacade {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn router_score_top_candidates(
         &self,
         plan: &RouterScoreProjectionTopKPlan,

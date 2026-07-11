@@ -226,6 +226,12 @@ Baseline reviewed on 2026-07-10:
   transaction; `runtime.rs` no longer discovers it from model layout. The tiny-fixture expert-skip
   runtime and dormant Qwen-VL embedding/DeepStack branch were deleted. Qwen-VL now reports its
   unresolved typed input adapter rather than entering a different layer loop.
+- Gate 4 has moved `DenseStore` as one owner into `weights.rs`: the mmap/blob and registry,
+  resident tensor and norm caches, Q4 projection bindings, decoded/raw tile accounting, projection
+  batches, CMD2/routing preparation, LM-head candidates, dtype decoding, and focused cache/read
+  diagnostics moved together. Load, runtime, and sampling use that owner directly. Synthetic
+  projection, CPU dense router-topK, raw-tile, and alternate projection helpers are test-only; they
+  are no longer dormant production continuations hidden by `legacy.rs`'s broad dead-code allowance.
 - Full-attention placement is now resolved by the scheduled graph rather than supplied by the
   runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
   attention stage without a matching scheduled executor is a named unsupported capability. The
@@ -266,10 +272,10 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- `DenseStore`, CPU KV/session caches, runtime layout metadata, and `VisionEncoder` remain in
-  `legacy.rs` and are exposed crate-internally to the scheduler-owned runtime during migration.
-- Dense projection/cache ownership and CPU-visible KV/session transitions have not yet moved to
-  `weights.rs` and `state.rs`, so Gate 4's single-owner buffer/storage boundary is incomplete.
+- The legacy engine shell still stores the weights-owned `DenseStore`; CPU KV/session caches,
+  runtime layout metadata, and `VisionEncoder` also remain defined in `legacy.rs`.
+- CPU-visible KV/session transitions and deferred runtime state have not yet moved to `state.rs`,
+  so Gate 4's single-owner buffer/storage boundary is incomplete.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.

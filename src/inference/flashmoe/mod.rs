@@ -25,6 +25,6 @@ pub use model_family::*;
 pub use scheduler::*;
 pub use types::*;
 pub use weights::{
-    DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef, FlashMoeManifest, RuntimeTensorEntry,
-    TensorQuantization, TensorRegistry,
+    DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
+    RuntimeTensorEntry, TensorQuantization, TensorRegistry,
 };
