@@ -568,6 +568,14 @@ mod tests {
         assert!(vl.vision_manifest.is_some());
         assert!(vl.vision_config_path.is_some());
         assert_eq!(vl.quantization, ExpertQuantization::FourBitProduction);
+
+        let qwen35 = plan_unchecked(QWEN35_MODEL, temp.path());
+        assert!(qwen35.runtime_dir.ends_with(CACHE_VERSION));
+        assert!(qwen35.non_expert_weights.ends_with("model_weights.bin"));
+        assert!(qwen35.experts_dir.ends_with("packed_experts"));
+        assert!(qwen35.uses_metal);
+        assert!(qwen35.streams_experts_from_nand);
+        assert!(qwen35.describe().contains("397B"));
     }
 
     #[test]
@@ -579,6 +587,14 @@ mod tests {
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
         assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
+        assert_eq!(
+            canonical_model("hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
+            QWEN35_MODEL
+        );
+        assert_eq!(
+            select_backend("qwen-vision.gguf"),
+            BackendSelection::LlamaCpp
+        );
 
         let vl = plan_unchecked(QWEN3_VL_MODEL, Path::new("/models"));
         assert!(vl.vision_weights.is_some());
@@ -626,6 +642,16 @@ mod tests {
             default_expert_quantization(QWEN35_BF16_MODEL),
             ExpertQuantization::Bf16
         );
+        assert_eq!(canonical_model(QWEN35_BF16_MODEL), QWEN35_BF16_MODEL);
+        assert_eq!(cache_version_for_model(QWEN35_MODEL), CACHE_VERSION);
+        assert_eq!(
+            cache_version_for_model(QWEN35_BF16_MODEL),
+            BF16_CACHE_VERSION
+        );
+
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, Path::new("/models"));
+        assert!(plan.runtime_dir.ends_with(BF16_CACHE_VERSION));
+        assert_eq!(plan.model, QWEN35_BF16_MODEL);
     }
 
     #[test]
@@ -645,5 +671,105 @@ mod tests {
                 .contains("cannot resolve expert cache coverage"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn cache_status_reports_missing_runtime_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, root.path());
+
+        let status = plan.cache_status().unwrap();
+
+        assert!(!status.ready);
+        assert!(
+            status
+                .missing
+                .iter()
+                .any(|path| path.ends_with("model_weights.bin"))
+        );
+        assert_eq!(status.expert_files, 0);
+    }
+
+    #[test]
+    fn cache_cleanup_preserves_active_runtime_during_dry_run() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, root.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v2-denseq4");
+        fs::create_dir_all(stale_runtime.join("packed_experts")).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+
+        let report = clean_cache(&plan, false, false).unwrap();
+
+        assert!(!report.deleted);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].kind,
+            FlashMoeCacheCleanupKind::StaleRuntimeDir
+        );
+        assert_eq!(report.candidates[0].path, stale_runtime);
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+        assert!(stale_runtime.is_dir());
+    }
+
+    #[test]
+    fn cache_cleanup_deletes_only_selected_runtime_and_source_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_BF16_MODEL, root.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v1");
+        let source_shard = plan
+            .model_cache_dir
+            .join("model.safetensors-00002-of-00094.safetensors");
+        let unrelated_file = plan.model_cache_dir.join("config.json");
+        fs::create_dir_all(&stale_runtime).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+        fs::write(&source_shard, b"source").unwrap();
+        fs::write(&unrelated_file, b"{}").unwrap();
+
+        let runtimes_only = clean_cache(&plan, false, true).unwrap();
+        assert_eq!(runtimes_only.candidates.len(), 1);
+        assert!(!stale_runtime.exists());
+        assert!(source_shard.is_file());
+
+        let with_sources = clean_cache(&plan, true, true).unwrap();
+        assert_eq!(with_sources.candidates.len(), 1);
+        assert_eq!(
+            with_sources.candidates[0].kind,
+            FlashMoeCacheCleanupKind::SourceShard
+        );
+        assert!(!source_shard.exists());
+        assert!(unrelated_file.is_file());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
+    }
+
+    #[test]
+    fn source_shard_cleanup_preserves_runtime_directories_and_matches_mlx_names() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, root.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        fs::write(plan.runtime_dir.join("model_weights.bin"), b"active").unwrap();
+        let stale_runtime = plan.model_cache_dir.join("flashmoe-v1");
+        fs::create_dir_all(&stale_runtime).unwrap();
+        fs::write(stale_runtime.join("model_weights.bin"), b"stale").unwrap();
+        let hf_shard = plan
+            .model_cache_dir
+            .join("model.safetensors-00001-of-00002.safetensors");
+        let mlx_shard = plan
+            .model_cache_dir
+            .join("model-00001-of-00046.safetensors");
+        fs::write(&hf_shard, b"source").unwrap();
+        fs::write(&mlx_shard, b"source").unwrap();
+
+        let report = clean_source_shards(&plan, true).unwrap();
+
+        assert!(report.deleted);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(!hf_shard.exists());
+        assert!(!mlx_shard.exists());
+        assert!(stale_runtime.is_dir());
+        assert!(plan.runtime_dir.join("model_weights.bin").is_file());
     }
 }
