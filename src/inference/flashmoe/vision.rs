@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::capabilities::FlashMoeInputAdapterCapability;
-use super::legacy::{FlashMoePlan, QwenModelConfig};
+use super::legacy::FlashMoePlan;
+use super::model_family::QwenModelConfig;
 use super::model_family::QwenMoeFamily;
 use super::types::{
     VIT_IMAGE_MEAN, VIT_IMAGE_STD, VIT_MAX_PIXELS, VIT_MERGE_SIZE, VIT_MIN_PIXELS, VIT_PATCH_SIZE,

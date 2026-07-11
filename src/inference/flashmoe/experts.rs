@@ -3951,7 +3951,7 @@ impl ReusableExpertBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::legacy::QwenModelConfig;
+    use super::super::model_family::QwenModelConfig;
     use super::*;
 
     #[derive(Debug)]

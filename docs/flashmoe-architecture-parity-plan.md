@@ -120,9 +120,9 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 
 ## Ownership Boundaries
 
-- `model_family`: model dimensions, tensor names, attention schedule, RoPE/MRoPE metadata, K policy,
-  shared-expert shape, and typed dense/expert layouts. It must not assign a Qwen3.5 Q4 layout to
-  unrelated families.
+- `model_family`: raw Qwen/Qwen-VL config parsing and validation, family-name resolution, model
+  dimensions, tensor names, attention schedule, RoPE/MRoPE metadata, K policy, shared-expert shape,
+  and typed dense/expert layouts. It must not assign a Qwen3.5 Q4 layout to unrelated families.
 - `capabilities`: concrete model/device/storage capability resolution and precise unsupported
   errors. It returns a fully resolved graph, not a list of family-level stage labels.
 - `weights`: resident aligned dense blob, manifest, typed tensor/projection handles, dtype/layout
@@ -156,8 +156,12 @@ Baseline reviewed on 2026-07-10:
   dtype across every layer before capability resolution. PBQ4 layers are upgraded there to the
   dimension-derived fixed-Q4 layout. The model-name quantization flag no longer selects runtime
   expert storage in `legacy.rs`; mixed or undeclared fixed-dense metadata is a load-time error.
-- Model-family metadata, state descriptors, resident projection descriptors, and many CMD1/CMD2/CMD3
-  input/output/layout records have been extracted.
+- `model_family.rs` now owns `QwenModelConfig`, including nested Qwen-VL text configuration, RoPE
+  metadata precedence, dimension/dtype validation, family-name detection, and derived MoE/attention
+  dimensions. `legacy.rs`, `runtime.rs`, `vision.rs`, and expert fixtures consume that one type;
+  the duplicate 400-line config and family-name implementation has been removed from `legacy.rs`.
+- State descriptors, resident projection descriptors, and many CMD1/CMD2/CMD3 input/output/layout
+  records have been extracted.
 - Several missing CMD2/CMD3 continuations now produce explicit unsupported errors.
 - The Metal shader source, pipeline surface, command diagnostics, and many buffer descriptors live
   in `metal.rs`.
