@@ -1071,6 +1071,15 @@ fn test_default_tokenizer_config_json() -> &'static [u8] {
 }
 
 #[cfg(test)]
+#[path = "text_parity_tests.rs"]
+mod parity_tests;
+#[cfg(test)]
+pub(super) use parity_tests::{
+    test_qwen3_tool_tokenizer_config_json, test_qwen3vl_tokenizer_json,
+    test_qwen3vl_tool_tokenizer_config_json, test_tokenizer_config_json, test_tokenizer_json,
+};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

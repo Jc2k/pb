@@ -316,6 +316,10 @@ Baseline reviewed on 2026-07-11:
   that proves routed order, normalization and scale, warm-read accounting, and worker failure
   metrics. Six overlapping coordinator tests and the duplicate expert-I/O guardrail test were
   removed from `legacy.rs`; the lower-level scheduler and expert policy tests retain each contract.
+- Text now owns the shared tokenizer fixtures and its sampling, chat-template, Qwen/Qwen-VL tool
+  serialization, parser, and byte-level BPE parity suite in `text_parity_tests.rs`. Remaining legacy
+  integration fixtures borrow those owner fixtures temporarily; the 782-line tokenizer/text block
+  and a duplicate non-FlashMoe backend-selection test have left `legacy.rs`.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
