@@ -328,36 +328,36 @@ impl MetalExecutionFacade {
         )
     }
 
-    pub(super) fn q4_mmap_matvec_batch(
+    pub(super) fn resident_mmap_matvec_batch(
         &self,
-        projections: &[DenseQ4MmapMatvecProjection],
+        projections: &[ResidentMmapMatvecProjection],
         input: &[f32],
     ) -> Result<(Vec<Vec<f32>>, MetalMatvecTiming, usize)> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             self.inner
-                .q4_projection_batch(projections, input)?
-                .context("FlashMoe required Q4 Metal projection batch did not resolve")
+                .resident_projection_batch(projections, input)?
+                .context("FlashMoe required resident Metal projection batch did not resolve")
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = (projections, input);
             bail!(
-                "FlashMoe unsupported required Q4 projection batch: Apple Silicon Metal is unavailable"
+                "FlashMoe unsupported required resident projection batch: Apple Silicon Metal is unavailable"
             )
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn q4_mmap_matvec_batch_with_input_buffer(
+    pub(super) fn resident_mmap_matvec_batch_with_input_buffer(
         &self,
-        projections: &[DenseQ4MmapMatvecProjection],
+        projections: &[ResidentMmapMatvecProjection],
         input_buffer: ObjcId,
         input_len: usize,
     ) -> Result<(Vec<Vec<f32>>, MetalMatvecTiming, usize)> {
         self.inner
-            .q4_projection_batch_with_input_buffer(projections, input_buffer, input_len)?
-            .context("FlashMoe required Q4 Metal projection batch did not resolve")
+            .resident_projection_batch_with_input_buffer(projections, input_buffer, input_len)?
+            .context("FlashMoe required resident Metal projection batch did not resolve")
     }
 }
 
@@ -957,7 +957,7 @@ impl FlashMoeEngine {
         let input_specs = input_requests.requests();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let mut projections = if let Some(input) = deferred_input {
-            self.dense.project_q4_tensors_from_metal_input(
+            self.dense.project_resident_tensors_from_metal_input(
                 &self.metal,
                 &input_specs,
                 input.buffer(),
@@ -965,7 +965,7 @@ impl FlashMoeEngine {
             )?
         } else {
             self.dense
-                .project_q4_tensors_from_cpu_input(&self.metal, &input_specs, normed)?
+                .project_resident_tensors_from_cpu_input(&self.metal, &input_specs, normed)?
         };
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let mut projections: Vec<Vec<f32>> = {

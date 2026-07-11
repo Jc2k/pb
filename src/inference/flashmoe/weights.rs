@@ -1471,6 +1471,91 @@ impl DenseQ4MmapMatvecProjection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidentMmapMatvecProjection {
+    Q4(DenseQ4MmapMatvecProjection),
+    Dense(DenseMmapMatvecProjection),
+}
+
+impl ResidentMmapMatvecProjection {
+    pub(crate) fn from_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        output_width: usize,
+        input_len: usize,
+    ) -> Result<Self> {
+        match &entry.quantization {
+            TensorQuantization::Q4 { .. } => {
+                let projection = DenseQ4MmapMatvecProjection::from_entry(
+                    tensor_name,
+                    entry,
+                    store_len,
+                    output_width,
+                    input_len,
+                )?
+                .with_context(|| {
+                    format!(
+                        "resident Q4 projection {tensor_name} does not match its declared shape or byte range"
+                    )
+                })?;
+                Ok(Self::Q4(projection))
+            }
+            TensorQuantization::None => {
+                let element_size = dense_dtype_size(&entry.dtype).with_context(|| {
+                    format!(
+                        "resident dense projection {tensor_name} has unsupported dtype {}",
+                        entry.dtype
+                    )
+                })?;
+                Ok(Self::Dense(DenseMmapMatvecProjection::from_entry(
+                    tensor_name,
+                    entry,
+                    store_len,
+                    output_width,
+                    input_len,
+                    element_size,
+                )?))
+            }
+        }
+    }
+
+    pub(crate) fn tensor_name(&self) -> &str {
+        match self {
+            Self::Q4(projection) => &projection.tensor_name,
+            Self::Dense(projection) => &projection.tensor_name,
+        }
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Self::Q4(projection) => projection.rows,
+            Self::Dense(projection) => projection.rows,
+        }
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        match self {
+            Self::Q4(projection) => projection.cols,
+            Self::Dense(projection) => projection.cols,
+        }
+    }
+
+    pub(crate) fn output_width(&self) -> usize {
+        match self {
+            Self::Q4(projection) => projection.output_width,
+            Self::Dense(projection) => projection.output_width,
+        }
+    }
+
+    pub(crate) fn q4(&self) -> Option<&DenseQ4MmapMatvecProjection> {
+        match self {
+            Self::Q4(projection) => Some(projection),
+            Self::Dense(_) => None,
+        }
+    }
+}
+
 pub(crate) fn build_dense_q4_mmap_projection<'a, F>(
     tensor_name: &str,
     output_width: usize,
@@ -2291,29 +2376,29 @@ impl DenseStore {
         }
         self.project(layer, name, input, width)
     }
-    pub(super) fn project_q4_tensors_from_cpu_input(
+    pub(super) fn project_resident_tensors_from_cpu_input(
         &self,
         metal: &MetalExecutionFacade,
         specs: &[DenseProjectionRequest<'_>],
         input: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
         if specs.is_empty() {
-            bail!("FlashMoe scheduled Q4 projection batch has no projections");
+            bail!("FlashMoe scheduled resident projection batch has no projections");
         }
         metal.require_resident_dense_weights()?;
         let mut projections = Vec::with_capacity(specs.len());
         for spec in specs {
             let projection = self
-                .dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input.len())?
+                .resident_mmap_projection(spec.tensor_name, spec.output_width, input.len())?
                 .with_context(|| {
                     format!(
-                        "FlashMoe unsupported scheduled Q4 projection batch: missing resident Q4 projection {}",
+                        "FlashMoe unsupported scheduled resident projection batch: missing projection {}",
                         spec.tensor_name
                     )
                 })?;
             projections.push(projection);
         }
-        let (outputs, _, _) = metal.q4_mmap_matvec_batch(&projections, input)?;
+        let (outputs, _, _) = metal.resident_mmap_matvec_batch(&projections, input)?;
         Ok(outputs)
     }
 
@@ -2455,7 +2540,7 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn project_q4_tensors_from_metal_input(
+    pub(super) fn project_resident_tensors_from_metal_input(
         &self,
         metal: &MetalExecutionFacade,
         specs: &[DenseProjectionRequest<'_>],
@@ -2463,23 +2548,26 @@ impl DenseStore {
         input_len: usize,
     ) -> Result<Vec<Vec<f32>>> {
         if specs.is_empty() {
-            bail!("FlashMoe scheduled Q4 projection batch has no projections");
+            bail!("FlashMoe scheduled resident projection batch has no projections");
         }
         metal.require_resident_dense_weights()?;
         let mut projections = Vec::with_capacity(specs.len());
         for spec in specs {
             let projection = self
-                .dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
+                .resident_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
                 .with_context(|| {
                     format!(
-                        "FlashMoe unsupported scheduled Q4 projection batch: missing resident Q4 projection {}",
+                        "FlashMoe unsupported scheduled resident projection batch: missing projection {}",
                         spec.tensor_name
                     )
                 })?;
             projections.push(projection);
         }
-        let (outputs, _, _) =
-            metal.q4_mmap_matvec_batch_with_input_buffer(&projections, input_buffer, input_len)?;
+        let (outputs, _, _) = metal.resident_mmap_matvec_batch_with_input_buffer(
+            &projections,
+            input_buffer,
+            input_len,
+        )?;
         Ok(outputs)
     }
 
@@ -2650,6 +2738,30 @@ impl DenseStore {
             cache.insert(key, projection.clone());
             Ok(Some((*projection).clone()))
         }
+    }
+
+    pub(super) fn resident_mmap_projection(
+        &self,
+        tensor_name: &str,
+        output_width: usize,
+        input_len: usize,
+    ) -> Result<Option<ResidentMmapMatvecProjection>> {
+        let Some(entry) = self.registry.tensor(tensor_name) else {
+            return Ok(None);
+        };
+        if matches!(&entry.quantization, TensorQuantization::Q4 { .. }) {
+            return self
+                .dense_q4_mmap_projection(tensor_name, output_width, input_len)
+                .map(|projection| projection.map(ResidentMmapMatvecProjection::Q4));
+        }
+        ResidentMmapMatvecProjection::from_entry(
+            tensor_name,
+            entry,
+            self.len,
+            output_width,
+            input_len,
+        )
+        .map(Some)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2974,8 +3086,9 @@ impl DenseStore {
                     "FlashMoe unsupported scheduled Q4 projection: missing resident descriptor for {canonical_name}"
                 )
             })?;
+        let projection = ResidentMmapMatvecProjection::Q4(projection);
         let (mut outputs, _, _) =
-            metal.q4_mmap_matvec_batch(std::slice::from_ref(&projection), input)?;
+            metal.resident_mmap_matvec_batch(std::slice::from_ref(&projection), input)?;
         outputs
             .pop()
             .with_context(|| format!("Metal Q4 projection {canonical_name} returned no output"))
@@ -3955,6 +4068,46 @@ mod tests {
         assert_eq!(projection.rows, 4);
         assert_eq!(projection.cols, 8);
         assert_eq!(projection.output_width, 4);
+    }
+
+    #[test]
+    fn resident_projection_binding_resolves_bf16_f16_and_f32_without_layout_probe() {
+        for (dtype, element_size) in [("BF16", 2), ("F16", 2), ("F32", 4)] {
+            let entry = RuntimeTensorEntry {
+                name: format!("model.layers.0.self_attn.{dtype}_proj.weight"),
+                dtype: dtype.to_string(),
+                shape: vec![3, 4],
+                byte_offset: 64,
+                byte_len: (12 * element_size) as u64,
+                alignment: TENSOR_ALIGNMENT,
+                quantization: TensorQuantization::None,
+            };
+
+            let projection =
+                ResidentMmapMatvecProjection::from_entry(&entry.name, &entry, 256, 3, 4).unwrap();
+            assert_eq!(projection.tensor_name(), entry.name);
+            assert_eq!(projection.rows(), 3);
+            assert_eq!(projection.cols(), 4);
+            assert_eq!(projection.output_width(), 3);
+            assert!(matches!(projection, ResidentMmapMatvecProjection::Dense(_)));
+        }
+
+        let unsupported = RuntimeTensorEntry {
+            name: "model.layers.0.self_attn.i8_proj.weight".to_string(),
+            dtype: "I8".to_string(),
+            shape: vec![3, 4],
+            byte_offset: 64,
+            byte_len: 12,
+            alignment: TENSOR_ALIGNMENT,
+            quantization: TensorQuantization::None,
+        };
+        let error =
+            ResidentMmapMatvecProjection::from_entry(&unsupported.name, &unsupported, 256, 3, 4)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported dtype I8"),
+            "{error:#}"
+        );
     }
 
     #[test]

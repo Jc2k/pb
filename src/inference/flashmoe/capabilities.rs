@@ -87,6 +87,7 @@ pub enum FlashMoeStageImplementation {
     QwenTextInput,
     QwenVlTypedInput,
     DeferredMetalCmd3,
+    MetalResidentAttentionProjections,
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
     MetalResidentQ4PostAttention,
@@ -102,6 +103,9 @@ impl FlashMoeStageImplementation {
             Self::QwenTextInput => "Qwen text token/position adapter",
             Self::QwenVlTypedInput => "Qwen-VL typed token/position/embedding/DeepStack adapter",
             Self::DeferredMetalCmd3 => "deferred Metal CMD3 handoff",
+            Self::MetalResidentAttentionProjections => {
+                "Metal resident Q4/BF16/F16/F32 attention projections"
+            }
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
             Self::MetalResidentQ4PostAttention => {
@@ -211,16 +215,6 @@ impl FlashMoeCapabilityPlan {
         expert_storage: ExpertStoreExecutionDescriptor,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
-        if dense_layout != ResidentDenseLayout::Q4 {
-            return Err(FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::Cmd1AttentionProjections,
-                format!(
-                    "the unified Qwen-family Q4 graph requires resident Q4 dense projections, loaded {}",
-                    dense_layout.as_str()
-                ),
-            ));
-        }
         if expert_storage.layout != ExpertStorageLayout::FixedQ4 {
             return Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
@@ -255,20 +249,50 @@ impl FlashMoeCapabilityPlan {
         })?;
         let routing_weight_normalization = require_selected_route_renormalization(layout)?;
 
-        require_stage_kernels(
-            layout.family,
-            &metal,
-            FlashMoeGraphStage::Cmd1AttentionProjections,
-            &[
-                kernels::Q4_MMAP_FMA_MATVEC,
-                kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
-                kernels::Q4_MMAP_FMA_MATVEC_BATCH,
-                kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
-            ],
-        )?;
-        if (0..layout.layers)
-            .any(|layer| layout.layer_kind(layer) == QwenMoeLayerKind::LinearAttention)
-        {
+        let has_linear_attention = (0..layout.layers)
+            .any(|layer| layout.layer_kind(layer) == QwenMoeLayerKind::LinearAttention);
+        match dense_layout {
+            ResidentDenseLayout::Q4 => require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                &[
+                    kernels::Q4_MMAP_FMA_MATVEC,
+                    kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
+                    kernels::Q4_MMAP_FMA_MATVEC_BATCH,
+                    kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+                ],
+            )?,
+            ResidentDenseLayout::Bf16 => require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                &[kernels::DENSE_MMAP_FMA_MATVEC_BF16],
+            )?,
+            ResidentDenseLayout::F16 => require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                &[kernels::DENSE_MMAP_FMA_MATVEC_F16],
+            )?,
+            ResidentDenseLayout::F32 => require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                &[kernels::DENSE_MMAP_FMA_MATVEC_F32],
+            )?,
+        }
+        if has_linear_attention {
+            if dense_layout != ResidentDenseLayout::Q4 {
+                return Err(FlashMoeUnsupportedCapability::new(
+                    layout.family,
+                    FlashMoeGraphStage::Cmd1AttentionProjections,
+                    format!(
+                        "the fused linear-attention CMD1 implementation does not yet consume {} projections",
+                        dense_layout.as_str()
+                    ),
+                ));
+            }
             require_stage_kernels(
                 layout.family,
                 &metal,
@@ -281,6 +305,16 @@ impl FlashMoeCapabilityPlan {
                     kernels::LINEAR_GATED_RMS_NORM,
                 ],
             )?;
+        }
+        if dense_layout != ResidentDenseLayout::Q4 {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
+                format!(
+                    "full-attention CMD1 resolves {}, but the unified CMD2 post-attention/router builder does not yet consume that layout",
+                    dense_layout.as_str()
+                ),
+            ));
         }
         require_stage_kernels(
             layout.family,
@@ -329,7 +363,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd1AttentionProjections,
                 FlashMoeStagePlacement::Metal,
-                FlashMoeStageImplementation::MetalResidentQ4AttentionProjections,
+                FlashMoeStageImplementation::MetalResidentAttentionProjections,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::AttentionMath,
@@ -720,6 +754,12 @@ mod tests {
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
+    fn metal_without_dense_bf16() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.dense_mmap_bf16 = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
     #[test]
     fn qwen35_q4_capability_plan_resolves_concrete_storage_and_device() {
         let mut layout = qwen35_layout();
@@ -785,7 +825,50 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.stage, FlashMoeGraphStage::Cmd1AttentionProjections);
-        assert!(err.to_string().contains("loaded resident BF16"), "{err}");
+        assert!(err.to_string().contains("fused linear-attention"), "{err}");
+        assert!(err.to_string().contains("resident BF16"), "{err}");
+    }
+
+    #[test]
+    fn qwen_full_attention_non_q4_dense_resolves_cmd1_then_fails_at_cmd2() {
+        let layout = qwen3_moe_layout(Some(true));
+        for dense_layout in [
+            ResidentDenseLayout::Bf16,
+            ResidentDenseLayout::F16,
+            ResidentDenseLayout::F32,
+        ] {
+            let error = FlashMoeCapabilityPlan::resolve(
+                &layout,
+                text_adapter(),
+                dense_layout,
+                fixed_q4_experts(&layout),
+                Some(full_metal()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.stage,
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
+            );
+            assert!(error.reason.contains(dense_layout.as_str()), "{error}");
+        }
+
+        let kernel_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Bf16,
+            fixed_q4_experts(&layout),
+            Some(metal_without_dense_bf16()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            kernel_error.stage,
+            FlashMoeGraphStage::Cmd1AttentionProjections
+        );
+        assert!(
+            kernel_error
+                .reason
+                .contains(kernels::DENSE_MMAP_FMA_MATVEC_BF16)
+        );
     }
 
     #[test]

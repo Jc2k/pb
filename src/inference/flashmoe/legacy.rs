@@ -156,7 +156,7 @@ use super::weights::SharedExpertPhaseWeights;
 #[cfg(test)]
 use super::weights::qwen3next_norm_weight_needs_offset;
 #[cfg(test)]
-use super::weights::{DenseQ4Layout, dense_q4_layout};
+use super::weights::{DenseQ4Layout, ResidentMmapMatvecProjection, dense_q4_layout};
 use super::weights::{
     DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef,
     FlashMoeManifest, ResidentDenseLayout, ResidentStaticTensorRef, RuntimeTensorEntry,
@@ -13343,8 +13343,13 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let (actual, _timing, dispatches) =
-            metal.q4_mmap_matvec_batch(&projections, &input).unwrap();
+        let projections = projections
+            .into_iter()
+            .map(ResidentMmapMatvecProjection::Q4)
+            .collect::<Vec<_>>();
+        let (actual, _timing, dispatches) = metal
+            .resident_mmap_matvec_batch(&projections, &input)
+            .unwrap();
 
         assert_eq!(dispatches, 1);
         assert_eq!(actual.len(), tensors.len());
@@ -13363,6 +13368,165 @@ mod tests {
                 assert!(
                     (*actual - *expected).abs() < 1e-4,
                     "projection {projection_idx} row {row}: Metal q4 batch mmap {actual} diverged from CPU reference {expected}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_resident_dense_mmap_batch_matches_cpu_reference() {
+        fn f16_bits(value: f32) -> u16 {
+            match value.to_bits() {
+                bits if bits == 0.0f32.to_bits() => 0x0000,
+                bits if bits == 0.25f32.to_bits() => 0x3400,
+                bits if bits == 0.5f32.to_bits() => 0x3800,
+                bits if bits == 1.0f32.to_bits() => 0x3c00,
+                bits if bits == 2.0f32.to_bits() => 0x4000,
+                bits if bits == (-0.5f32).to_bits() => 0xb800,
+                bits if bits == (-1.0f32).to_bits() => 0xbc00,
+                bits if bits == (-2.0f32).to_bits() => 0xc000,
+                _ => panic!("test value {value} is not in the exact F16 fixture"),
+            }
+        }
+
+        fn append_dense_tensor(
+            bytes: &mut Vec<u8>,
+            name: &str,
+            dtype: &str,
+            values: &[f32],
+            rows: usize,
+            cols: usize,
+        ) -> DenseTensorRef {
+            while !bytes.len().is_multiple_of(TENSOR_ALIGNMENT as usize) {
+                bytes.push(0);
+            }
+            let runtime_offset = bytes.len() as u64;
+            match dtype {
+                "BF16" => {
+                    for value in values {
+                        bytes.extend_from_slice(&f32_to_bf16_bits(*value).to_le_bytes());
+                    }
+                }
+                "F16" => {
+                    for value in values {
+                        bytes.extend_from_slice(&f16_bits(*value).to_le_bytes());
+                    }
+                }
+                "F32" => {
+                    for value in values {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let byte_len = bytes.len() as u64 - runtime_offset;
+            DenseTensorRef {
+                tensor: name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: dtype.to_string(),
+                shape: vec![rows, cols],
+                source_offsets: [0, byte_len],
+                runtime_offset,
+                byte_len,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, temp.path());
+        fs::create_dir_all(&plan.runtime_dir).unwrap();
+        let rows = 3;
+        let cols = 4;
+        let values = [
+            1.0, -0.5, 0.25, 2.0, -1.0, 0.5, 2.0, -2.0, 0.0, 1.0, -1.0, 0.5,
+        ];
+        let mut bytes = Vec::new();
+        let tensors = [
+            append_dense_tensor(&mut bytes, "dense_bf16", "BF16", &values, rows, cols),
+            append_dense_tensor(&mut bytes, "dense_f16", "F16", &values, rows, cols),
+            append_dense_tensor(&mut bytes, "dense_f32", "F32", &values, rows, cols),
+        ];
+        let tensor_names = tensors
+            .iter()
+            .map(|tensor| tensor.tensor.clone())
+            .collect::<Vec<_>>();
+        fs::write(&plan.non_expert_weights, &bytes).unwrap();
+        fs::write(
+            &plan.tensor_manifest,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: QWEN35_MODEL.to_string(),
+                cache_version: CACHE_VERSION.to_string(),
+                dense_shards: vec!["dense.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: tensors.into_iter().collect(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(
+            plan.non_expert_weights.clone(),
+            plan.tensor_manifest.clone(),
+        )
+        .unwrap();
+        let config = QwenModelConfig {
+            model_type: Some("qwen".to_string()),
+            architectures: None,
+            num_hidden_layers: 1,
+            hidden_size: cols,
+            num_attention_heads: 1,
+            head_dim: None,
+            num_key_value_heads: Some(1),
+            vocab_size: 32,
+            rope_theta: None,
+            partial_rotary_factor: None,
+            torch_dtype: Some("bfloat16".to_string()),
+            num_experts: Some(1),
+            num_experts_per_tok: Some(1),
+            norm_topk_prob: None,
+            moe_intermediate_size: Some(4),
+            intermediate_size: None,
+            max_position_embeddings: Some(4),
+            mrope_section: None,
+            tie_word_embeddings: None,
+            num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            vision_config: None,
+        };
+        let runtime = DenseTransformerRuntime::new(&config);
+        let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
+        let input = [0.5, -1.0, 2.0, 0.25];
+        let projections = tensor_names
+            .iter()
+            .map(|tensor_name| {
+                store
+                    .resident_mmap_projection(tensor_name, rows, cols)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (actual, _, dispatches) = metal
+            .resident_mmap_matvec_batch(&projections, &input)
+            .unwrap();
+
+        let expected = values
+            .chunks_exact(cols)
+            .map(|weights| {
+                weights
+                    .iter()
+                    .zip(input.iter())
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dispatches, 3);
+        for (dtype, output) in ["BF16", "F16", "F32"].iter().zip(actual.iter()) {
+            for (row, (actual, expected)) in output.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "{dtype} row {row}: Metal {actual} != CPU {expected}"
                 );
             }
         }
