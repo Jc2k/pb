@@ -31,13 +31,11 @@
     clippy::useless_vec
 )]
 
-use std::cell::RefCell;
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
@@ -120,9 +118,9 @@ use super::model_family::QwenMoeQ4ExpertLayout;
 use super::model_family::is_qwen35_or_legacy_alias;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
 use super::planning::*;
-use super::runtime::FlashMoeEngine;
 #[cfg(test)]
 use super::runtime::MetalExecutionFacade;
+use super::runtime::{FlashMoeEngine, GenerationProgress};
 use super::scheduler::ExpertSchedulerSnapshot;
 #[cfg(test)]
 use super::scheduler::FlashMoeScheduledGraph;
@@ -175,8 +173,6 @@ use super::weights::{decode_dense_tensor_f32, dtype_size};
 #[cfg(test)]
 use super::weights::{dense_projection_tile_rows, dense_projection_tile_rows_for_metal};
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
-
-pub(super) type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
 
 const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
 const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
@@ -248,11 +244,6 @@ struct SafetensorTensorInfo {
     dtype: String,
     shape: Vec<usize>,
     data_offsets: [u64; 2],
-}
-
-struct SampledDecode {
-    token: u32,
-    hidden: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -592,875 +583,6 @@ fn single_token_run_bounds(tokens: &[u32], needle: u32) -> Option<(usize, usize,
     Some((start?, end?, count))
 }
 
-impl FlashMoeEngine {
-    pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
-        let request = StructuredGenerationRequest::from_prompt(request);
-        self.generate_structured(&request)
-    }
-
-    pub fn generate_raw(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
-        let mut request = StructuredGenerationRequest::from_prompt(request);
-        request.raw_prompt = true;
-        request.add_generation_prompt = false;
-        self.generate_structured(&request)
-    }
-
-    pub fn generate_structured(
-        &mut self,
-        request: &StructuredGenerationRequest,
-    ) -> Result<GenerationOutput> {
-        Ok(self.generate_structured_inner(request, None)?.output)
-    }
-
-    pub fn generate_in_session(
-        &mut self,
-        session_id: &str,
-        request: &GenerationRequest,
-    ) -> Result<GenerationOutput> {
-        if session_id.is_empty() {
-            return self.generate(request);
-        }
-        let request = StructuredGenerationRequest::from_prompt(request);
-        self.generate_structured_in_session(session_id, &request)
-    }
-
-    pub fn generate_structured_in_session(
-        &mut self,
-        session_id: &str,
-        request: &StructuredGenerationRequest,
-    ) -> Result<GenerationOutput> {
-        if session_id.is_empty() {
-            return self.generate_structured(request);
-        }
-        Ok(self
-            .generate_structured_inner_with_session(request, Some(session_id), None)?
-            .output)
-    }
-
-    pub fn generate_timed(&mut self, request: &GenerationRequest) -> Result<TimedGenerationOutput> {
-        let request = StructuredGenerationRequest::from_prompt(request);
-        self.generate_structured_timed(&request)
-    }
-
-    pub fn generate_timed_with_progress<F>(
-        &mut self,
-        request: &GenerationRequest,
-        mut progress: F,
-    ) -> Result<TimedGenerationOutput>
-    where
-        F: FnMut(String),
-    {
-        let request = StructuredGenerationRequest::from_prompt(request);
-        self.generate_structured_timed_with_progress(&request, &mut progress)
-    }
-
-    pub fn generate_raw_timed_with_progress<F>(
-        &mut self,
-        request: &GenerationRequest,
-        mut progress: F,
-    ) -> Result<TimedGenerationOutput>
-    where
-        F: FnMut(String),
-    {
-        let mut request = StructuredGenerationRequest::from_prompt(request);
-        request.raw_prompt = true;
-        request.add_generation_prompt = false;
-        self.generate_structured_timed_with_progress(&request, &mut progress)
-    }
-
-    pub fn generate_structured_timed(
-        &mut self,
-        request: &StructuredGenerationRequest,
-    ) -> Result<TimedGenerationOutput> {
-        let mut timing = FlashMoeGenerationTiming {
-            model: self.plan.model.clone(),
-            dimensions: self.model_dimensions(),
-            tokens: Vec::new(),
-            total_wall: Duration::ZERO,
-        };
-        self.generate_structured_inner_with_session(request, None, Some(&mut timing))
-    }
-
-    pub fn generate_structured_timed_with_progress(
-        &mut self,
-        request: &StructuredGenerationRequest,
-        progress: &mut dyn FnMut(String),
-    ) -> Result<TimedGenerationOutput> {
-        let mut timing = FlashMoeGenerationTiming {
-            model: self.plan.model.clone(),
-            dimensions: self.model_dimensions(),
-            tokens: Vec::new(),
-            total_wall: Duration::ZERO,
-        };
-        let progress = Some(Rc::new(RefCell::new(progress)));
-        self.generate_structured_inner_with_session_progress(
-            request,
-            None,
-            Some(&mut timing),
-            progress,
-        )
-    }
-
-    fn generate_structured_inner(
-        &mut self,
-        request: &StructuredGenerationRequest,
-        timing: Option<&mut FlashMoeGenerationTiming>,
-    ) -> Result<TimedGenerationOutput> {
-        self.generate_structured_inner_with_session_progress(request, None, timing, None)
-    }
-
-    fn generate_structured_inner_with_session(
-        &mut self,
-        request: &StructuredGenerationRequest,
-        session_id: Option<&str>,
-        timing: Option<&mut FlashMoeGenerationTiming>,
-    ) -> Result<TimedGenerationOutput> {
-        self.generate_structured_inner_with_session_progress(request, session_id, timing, None)
-    }
-
-    fn generate_structured_inner_with_session_progress(
-        &mut self,
-        request: &StructuredGenerationRequest,
-        session_id: Option<&str>,
-        mut timing: Option<&mut FlashMoeGenerationTiming>,
-        progress: GenerationProgress<'_>,
-    ) -> Result<TimedGenerationOutput> {
-        let generation_started = Instant::now();
-        let render_started = Instant::now();
-        let prompt = if request.raw_prompt {
-            if !request.tools.is_empty() {
-                bail!("raw Flash-MoE generation does not support tools");
-            }
-            match request.messages.as_slice() {
-                [
-                    ChatMessage {
-                        content: ChatMessageContent::Text(prompt),
-                        ..
-                    },
-                ] => prompt.clone(),
-                _ => bail!("raw Flash-MoE generation requires exactly one text prompt"),
-            }
-        } else {
-            self.tokenizer.apply_chat_template_to_messages(
-                &request.messages,
-                &request.tools,
-                request.add_generation_prompt,
-            )?
-        };
-        let render_elapsed = render_started.elapsed();
-        let encode_started = Instant::now();
-        let prompt_tokens = self.tokenizer.encode(&prompt)?;
-        let encode_elapsed = encode_started.elapsed();
-        report_generation_progress(
-            &progress,
-            format!(
-                "rendered prompt chars={} tokens={} render_ms={} encode_ms={}",
-                prompt.len(),
-                prompt_tokens.len(),
-                render_elapsed.as_millis(),
-                encode_elapsed.as_millis()
-            ),
-        );
-        info!(
-            "flashmoe: rendered prompt chars={} tokens={} render_ms={} encode_ms={} tools={} session={}",
-            prompt.len(),
-            prompt_tokens.len(),
-            render_elapsed.as_millis(),
-            encode_elapsed.as_millis(),
-            request.tools.len(),
-            session_id.unwrap_or("<none>")
-        );
-        let max_tokens = request.max_tokens.max(0) as usize;
-        let mut generation = self.session_cache.begin_generation(
-            session_id,
-            prompt_tokens,
-            max_tokens,
-            self.config.num_hidden_layers,
-        );
-        let prefill_start = generation.prefill_start();
-        let prompt_len = generation.prompt_len();
-        if prefill_start > 0 {
-            info!(
-                "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
-                prefill_start, prompt_len
-            );
-        }
-        if prefill_start == 0 {
-            self.metal.reset_linear_attention_state()?;
-        } else {
-            let recurrent = generation
-                .take_cached_recurrent()
-                .context("session cache entry is missing the Metal recurrent-state snapshot")?;
-            self.metal
-                .restore_linear_attention_session_state(&recurrent)?;
-        }
-        let prefill_hidden = if prefill_start == prompt_len {
-            info!(
-                "flashmoe: prompt prefill fully cached tokens={}",
-                prompt_len
-            );
-            generation
-                .take_cached_last_hidden()
-                .context("session cache entry is missing the final hidden state")?
-        } else {
-            let prefill_started = Instant::now();
-            report_generation_progress(
-                &progress,
-                format!(
-                    "prefill begin start_token={} remaining_tokens={}",
-                    prefill_start,
-                    prompt_len.saturating_sub(prefill_start)
-                ),
-            );
-            info!(
-                "flashmoe: prefill begin start_token={} remaining_tokens={}",
-                prefill_start,
-                prompt_len.saturating_sub(prefill_start)
-            );
-            let hidden = {
-                let (prompt_tokens, prefill_start, kv_cache) = generation.prefill_inputs();
-                self.prefill_from(
-                    prompt_tokens,
-                    prefill_start,
-                    kv_cache,
-                    timing.as_deref_mut(),
-                    progress.clone(),
-                )?
-            };
-            report_generation_progress(
-                &progress,
-                format!(
-                    "prefill complete tokens={} elapsed_ms={}",
-                    prompt_len.saturating_sub(prefill_start),
-                    prefill_started.elapsed().as_millis()
-                ),
-            );
-            info!(
-                "flashmoe: prefill complete tokens={} elapsed_ms={}",
-                prompt_len.saturating_sub(prefill_start),
-                prefill_started.elapsed().as_millis()
-            );
-            hidden
-        };
-        if generation.requires_prompt_snapshot() {
-            let recurrent = self.metal.capture_linear_attention_session_state()?;
-            generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
-        }
-
-        let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
-        if generation.should_sample_first() {
-            let sample_started = Instant::now();
-            report_generation_progress(&progress, "first-token sampling begin".to_string());
-            info!("flashmoe: first-token sampling begin");
-            let token = {
-                let (prompt_tokens, generated) = generation.sample_inputs();
-                self.sample_from_hidden(
-                    &mut sampler,
-                    &prefill_hidden,
-                    prompt_tokens,
-                    generated,
-                    request.trace_candidates,
-                    &progress,
-                )?
-            };
-            report_generation_progress(
-                &progress,
-                format!(
-                    "first-token sampling complete token={} elapsed_ms={}",
-                    token,
-                    sample_started.elapsed().as_millis()
-                ),
-            );
-            info!(
-                "flashmoe: first-token sampling complete token={} elapsed_ms={}",
-                token,
-                sample_started.elapsed().as_millis()
-            );
-            if let Some(timing) = timing.as_deref_mut()
-                && let Some(last) = timing.tokens.last_mut()
-            {
-                let elapsed = sample_started.elapsed();
-                last.buckets.sampling += elapsed;
-                last.buckets.total_wall += elapsed;
-                last.sampled_token = Some(token);
-            }
-            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
-        }
-        while generation.should_decode() {
-            let generated_len = generation.generated_len();
-            let max_tokens = generation.max_tokens();
-            let position = generation.decode_inputs()?.3;
-            report_generation_progress(
-                &progress,
-                format!(
-                    "decode begin generated={}/{} position={}",
-                    generated_len, max_tokens, position
-                ),
-            );
-            info!(
-                "flashmoe: decode begin generated={}/{} position={}",
-                generated_len, max_tokens, position
-            );
-            let decode_started = Instant::now();
-            let sampled = {
-                let (prompt_tokens, generated, kv_cache, position) = generation.decode_inputs()?;
-                self.sample_next_token(
-                    &mut sampler,
-                    prompt_tokens,
-                    generated,
-                    kv_cache,
-                    position,
-                    MropePosition::text(position),
-                    timing.as_deref_mut(),
-                    request.trace_candidates,
-                    progress.clone(),
-                )?
-            };
-            let token = sampled.token;
-            report_generation_progress(
-                &progress,
-                format!(
-                    "decode complete generated={}/{} token={} elapsed_ms={}",
-                    generated_len + 1,
-                    max_tokens,
-                    token,
-                    decode_started.elapsed().as_millis()
-                ),
-            );
-            info!(
-                "flashmoe: decode complete generated={}/{} token={} elapsed_ms={}",
-                generated_len + 1,
-                max_tokens,
-                token,
-                decode_started.elapsed().as_millis()
-            );
-            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
-        }
-
-        self.session_cache.commit_generation(&mut generation)?;
-
-        let generated = generation.into_generated();
-        let decoded = self.tokenizer.decode(&generated)?;
-        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
-        let output = GenerationOutput {
-            content,
-            tool_calls,
-            generated_tokens: generated.len(),
-        };
-        let total_wall = generation_started.elapsed();
-        info!(
-            "flashmoe: generation complete generated_tokens={} total_ms={}",
-            generated.len(),
-            total_wall.as_millis()
-        );
-        if let Some(timing) = timing {
-            timing.total_wall = total_wall;
-            return Ok(TimedGenerationOutput {
-                output,
-                timing: timing.clone(),
-            });
-        }
-        Ok(TimedGenerationOutput {
-            output,
-            timing: FlashMoeGenerationTiming {
-                model: self.plan.model.clone(),
-                dimensions: self.model_dimensions(),
-                tokens: Vec::new(),
-                total_wall,
-            },
-        })
-    }
-
-    fn prefill(
-        &mut self,
-        prompt_tokens: &[u32],
-        kv_cache: &mut KvCache,
-        timing: Option<&mut FlashMoeGenerationTiming>,
-    ) -> Result<Vec<f32>> {
-        self.prefill_from(prompt_tokens, 0, kv_cache, timing, None)
-    }
-
-    fn prefill_from(
-        &mut self,
-        prompt_tokens: &[u32],
-        start_position: usize,
-        kv_cache: &mut KvCache,
-        mut timing: Option<&mut FlashMoeGenerationTiming>,
-        progress: GenerationProgress<'_>,
-    ) -> Result<Vec<f32>> {
-        if start_position > prompt_tokens.len() {
-            bail!(
-                "prefill start position {start_position} exceeds prompt length {}",
-                prompt_tokens.len()
-            );
-        }
-        let mut last_hidden = None;
-        let progress_started = Instant::now();
-        let mut last_progress = Instant::now();
-        for (position, token) in prompt_tokens
-            .iter()
-            .copied()
-            .enumerate()
-            .skip(start_position)
-        {
-            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
-            let mut token_timing =
-                FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
-            report_generation_progress(
-                &progress,
-                format!(
-                    "prefill token begin processed={} remaining={} position={}",
-                    position.saturating_sub(start_position) + 1,
-                    prompt_tokens.len().saturating_sub(position + 1),
-                    position
-                ),
-            );
-            // Populate the causal KV cache with the prompt tokens so decode can
-            // attend to the full rendered prompt rather than only the latest
-            // generated token.
-            last_hidden = Some(self.forward_token_input(
-                FlashMoeTokenInput::text(token, position),
-                kv_cache,
-                position,
-                false,
-                if timing.is_some() {
-                    Some(&mut token_timing)
-                } else {
-                    None
-                },
-                progress.clone(),
-            )?);
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.tokens.push(token_timing);
-            }
-            let processed = position.saturating_sub(start_position) + 1;
-            let remaining = prompt_tokens.len().saturating_sub(position + 1);
-            let should_report = processed == 1
-                || remaining == 0
-                || processed % 16 == 0
-                || last_progress.elapsed() >= Duration::from_secs(10);
-            if should_report {
-                report_generation_progress(
-                    &progress,
-                    format!(
-                        "prefill progress processed={} remaining={} position={} elapsed_ms={}",
-                        processed,
-                        remaining,
-                        position,
-                        progress_started.elapsed().as_millis()
-                    ),
-                );
-                info!(
-                    "flashmoe: prefill progress processed={} remaining={} position={} elapsed_ms={}",
-                    processed,
-                    remaining,
-                    position,
-                    progress_started.elapsed().as_millis()
-                );
-                last_progress = Instant::now();
-            }
-        }
-        last_hidden.context("cannot generate from an empty prompt")
-    }
-
-    fn prefill_with_vision(
-        &mut self,
-        inputs: &QwenVlRuntimeInputs,
-        kv_cache: &mut KvCache,
-    ) -> Result<Vec<f32>> {
-        let mut cursor = inputs.token_inputs()?;
-        let mut last_hidden = None;
-        while let Some((position, input)) = cursor.next_input()? {
-            let token = input.token();
-            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
-            last_hidden =
-                Some(self.forward_token_input(input, kv_cache, position, false, None, None)?);
-        }
-        last_hidden.context("cannot generate from empty Qwen-VL runtime inputs")
-    }
-
-    /// Generate text from ordered text and image content using the Qwen3-VL vision encoder.
-    ///
-    /// Returns an error when the engine was not loaded from a Qwen3-VL plan
-    /// (i.e. `plan.vision_weights` is `None`).
-    pub fn generate_multimodal(
-        &mut self,
-        request: &MultimodalGenerationRequest,
-    ) -> Result<GenerationOutput> {
-        let image_count = request
-            .content
-            .iter()
-            .filter(|part| matches!(part, MultimodalContent::Image { .. }))
-            .count();
-        if image_count == 0 {
-            bail!("generate_multimodal requires at least one image block");
-        }
-
-        let vision_config = self
-            .config
-            .vision_config
-            .as_ref()
-            .context("generate_multimodal requires a Qwen3-VL plan with a vision_config")?;
-        let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
-        let (parts, visual_encodings) = {
-            let encoder = self.input_adapter_executor.vision_encoder()?;
-            let mut parts = Vec::with_capacity(request.content.len());
-            let mut visual_encodings = Vec::with_capacity(image_count);
-            for part in &request.content {
-                match part {
-                    MultimodalContent::Text { text } => {
-                        parts.push(ChatContentPart::Text { text: text.clone() });
-                    }
-                    MultimodalContent::Image { image_path } => {
-                        let visual = encoder.encode(&preprocessor, image_path)?;
-                        let num_visual_tokens = visual.embeddings.len();
-                        parts.push(ChatContentPart::Image {
-                            image: Some(image_path.display().to_string()),
-                            placeholder_tokens: Some(num_visual_tokens),
-                        });
-                        visual_encodings.push(visual);
-                    }
-                }
-            }
-            (parts, visual_encodings)
-        };
-
-        self.generate_with_encoded_visual_prompt(
-            ChatMessageContent::Parts(parts),
-            visual_encodings,
-            request.max_tokens,
-            request.temperature,
-            request.top_k,
-            request.seed,
-        )
-    }
-
-    /// Generate text from an image + text prompt using the Qwen3-VL vision encoder.
-    ///
-    /// Compatibility wrapper around the structured multimodal path.
-    pub fn generate_with_image(
-        &mut self,
-        request: &VisionGenerationRequest,
-    ) -> Result<GenerationOutput> {
-        if request.prompt.contains("<|image_pad|>") {
-            let vision_config = self
-                .config
-                .vision_config
-                .as_ref()
-                .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
-            let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
-            let visual = {
-                let encoder = self.input_adapter_executor.vision_encoder()?;
-                encoder.encode(&preprocessor, &request.image_path)?
-            };
-            return self.generate_with_encoded_visual_prompt(
-                ChatMessageContent::Text(request.prompt.clone()),
-                vec![visual],
-                request.max_tokens,
-                request.temperature,
-                request.top_k,
-                request.seed,
-            );
-        }
-
-        self.generate_multimodal(&MultimodalGenerationRequest {
-            content: vec![
-                MultimodalContent::Image {
-                    image_path: request.image_path.clone(),
-                },
-                MultimodalContent::Text {
-                    text: request.prompt.clone(),
-                },
-            ],
-            max_tokens: request.max_tokens,
-            temperature: request.temperature,
-            top_k: request.top_k,
-            seed: request.seed,
-        })
-    }
-
-    fn generate_with_encoded_visual_prompt(
-        &mut self,
-        content: ChatMessageContent,
-        visual_encodings: Vec<VisionEncoding>,
-        max_tokens: i32,
-        temperature: f32,
-        top_k: i32,
-        seed: u32,
-    ) -> Result<GenerationOutput> {
-        // Qwen3-VL chat template: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
-        let vision_start = self.tokenizer.token_id("<|vision_start|>");
-        let vision_end = self.tokenizer.token_id("<|vision_end|>");
-        let image_pad = self.tokenizer.token_id("<|image_pad|>");
-        let (vs_tok, ve_tok, pad_tok) = match (vision_start, vision_end, image_pad) {
-            (Some(vs), Some(ve), Some(pad)) => (vs, ve, pad),
-            _ => bail!(
-                "Qwen3-VL tokenizer is missing required vision special tokens \
-                 (<|vision_start|>, <|vision_end|>, <|image_pad|>); \
-                 ensure the tokenizer.json is from a VL checkpoint"
-            ),
-        };
-
-        let chat_text = self.tokenizer.apply_chat_template_to_messages(
-            &[ChatMessage {
-                role: ChatRole::User,
-                content,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: None,
-            }],
-            &[],
-            true,
-        )?;
-        let runtime_inputs = QwenVlRuntimeInputs::build(
-            self.tokenizer.encode(&chat_text)?,
-            vs_tok,
-            ve_tok,
-            pad_tok,
-            visual_encodings,
-        )?;
-
-        let mut kv_cache = KvCache::new(
-            self.config.num_hidden_layers,
-            runtime_inputs.prompt_tokens().len() + max_tokens.max(0) as usize,
-        );
-        let prefill_hidden = self.prefill_with_vision(&runtime_inputs, &mut kv_cache)?;
-
-        let mut sampler = TokenSampler::new(temperature, top_k, seed);
-        let mut generated = Vec::new();
-        let max_tokens = max_tokens.max(0) as usize;
-        let mut stopped = false;
-        if max_tokens > 0 {
-            let token = self.sample_from_hidden(
-                &mut sampler,
-                &prefill_hidden,
-                runtime_inputs.prompt_tokens(),
-                &generated,
-                false,
-                &None,
-            )?;
-            if !self.tokenizer.is_eos(token) {
-                generated.push(token);
-            } else {
-                stopped = true;
-            }
-        }
-        while !stopped && generated.len() < max_tokens {
-            let position = runtime_inputs.prompt_tokens().len() + generated.len() - 1;
-            let sampled = self.sample_next_token(
-                &mut sampler,
-                runtime_inputs.prompt_tokens(),
-                &generated,
-                &mut kv_cache,
-                position,
-                MropePosition::text(runtime_inputs.next_mrope_position() + generated.len() - 1),
-                None,
-                false,
-                None,
-            )?;
-            let token = sampled.token;
-            if self.tokenizer.is_eos(token) {
-                break;
-            }
-            generated.push(token);
-        }
-
-        let decoded = self.tokenizer.decode(&generated)?;
-        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
-        Ok(GenerationOutput {
-            content,
-            tool_calls,
-            generated_tokens: generated.len(),
-        })
-    }
-
-    pub(super) fn model_norm_weight(
-        &self,
-        canonical_name: &str,
-        width: usize,
-    ) -> Result<Option<Vec<f32>>> {
-        let Some(mut weight) = self.dense.norm_weight(canonical_name, width)? else {
-            return Ok(None);
-        };
-        apply_qwen3next_norm_offset_if_needed(
-            self.config.uses_qwen3next_norm_offsets(),
-            canonical_name,
-            &mut weight,
-        );
-        Ok(Some(weight))
-    }
-
-    pub(super) fn rms_norm_with_model_weight(
-        &self,
-        canonical_name: &str,
-        input: &[f32],
-    ) -> Result<Vec<f32>> {
-        let weight = self.model_norm_weight(canonical_name, input.len())?;
-        let mut out = input.to_vec();
-        rms_norm_with_weight_in_place(&mut out, weight.as_deref());
-        Ok(out)
-    }
-
-    fn uses_qwen3next_offset_norm(&self, canonical_name: &str) -> bool {
-        qwen3next_norm_uses_offset(self.config.uses_qwen3next_norm_offsets(), canonical_name)
-    }
-
-    fn sample_next_token(
-        &mut self,
-        sampler: &mut TokenSampler,
-        prompt_tokens: &[u32],
-        generated: &[u32],
-        kv_cache: &mut KvCache,
-        position: usize,
-        rope_position: MropePosition,
-        timing: Option<&mut FlashMoeGenerationTiming>,
-        trace_candidates: bool,
-        progress: GenerationProgress<'_>,
-    ) -> Result<SampledDecode> {
-        let previous = generated
-            .last()
-            .copied()
-            .or_else(|| prompt_tokens.last().copied())
-            .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        let mut token_timing = FlashMoeTokenTiming::new(
-            prompt_tokens.len() + generated.len(),
-            position,
-            FlashMoeTokenPhase::Decode,
-            previous,
-        );
-        let hidden = self.forward_token_input(
-            FlashMoeTokenInput::resident(previous, rope_position),
-            kv_cache,
-            position,
-            true,
-            if timing.is_some() {
-                Some(&mut token_timing)
-            } else {
-                None
-            },
-            progress.clone(),
-        )?;
-        let sample_started = Instant::now();
-        let token = self.sample_from_hidden(
-            sampler,
-            &hidden,
-            prompt_tokens,
-            generated,
-            trace_candidates,
-            &progress,
-        )?;
-        let elapsed = sample_started.elapsed();
-        token_timing.buckets.sampling += elapsed;
-        token_timing.buckets.total_wall += elapsed;
-        token_timing.sampled_token = Some(token);
-        if let Some(timing) = timing {
-            timing.tokens.push(token_timing);
-        }
-        Ok(SampledDecode { token, hidden })
-    }
-
-    fn sample_from_hidden(
-        &self,
-        sampler: &mut TokenSampler,
-        hidden: &[f32],
-        prompt_tokens: &[u32],
-        generated: &[u32],
-        trace_candidates: bool,
-        progress: &GenerationProgress<'_>,
-    ) -> Result<u32> {
-        if trace_candidates {
-            let logits = self.dense.lm_head_logits_with_metal(
-                Some(&self.metal),
-                0,
-                hidden,
-                &self.tokenizer,
-            )?;
-            let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
-            trace_sampling_candidates(
-                progress,
-                &self.tokenizer,
-                prompt_tokens.len(),
-                generated,
-                &candidates,
-                Some((hidden, &logits)),
-            );
-            return sampler.sample_candidates(candidates);
-        }
-        let candidates = self.dense.lm_head_top_candidates_with_metal(
-            &self.metal,
-            hidden,
-            &self.tokenizer,
-            sampler,
-            prompt_tokens,
-            generated,
-        )?;
-        trace_sampling_candidates(
-            progress,
-            &self.tokenizer,
-            prompt_tokens.len(),
-            generated,
-            &candidates,
-            None,
-        );
-        sampler.sample_candidates(candidates)
-    }
-
-    #[cfg(test)]
-    pub fn read_active_experts(
-        &mut self,
-        layer: usize,
-        experts: &[usize],
-    ) -> Result<Vec<ExpertWeights>> {
-        read_expert_weights_many(self.scheduler.expert_store(), layer, experts)
-    }
-
-    pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {
-        self.scheduler.snapshot()
-    }
-
-    fn model_dimensions(&self) -> FlashMoeModelDimensions {
-        FlashMoeModelDimensions {
-            layers: self.model_layout.layers,
-            hidden_size: self.model_layout.hidden_size,
-            attention_heads: self.model_layout.attention_heads,
-            kv_heads: self.model_layout.kv_heads,
-            vocab_size: self.model_layout.vocab_size,
-            experts_per_layer: Some(self.model_layout.experts_per_layer),
-            active_experts_per_token: Some(self.routing_policy.active_experts),
-            moe_intermediate_size: nonzero_usize(self.model_layout.moe_intermediate_size),
-            shared_experts: nonzero_usize(self.model_layout.shared_experts),
-        }
-    }
-
-    pub(super) fn layer_dimensions(&self, layer: usize) -> FlashMoeLayerDimensions {
-        let full_layout = self
-            .runtime
-            .full_attention
-            .get(layer)
-            .and_then(|layout| *layout);
-        let linear_layout = self
-            .runtime
-            .linear_attention
-            .get(layer)
-            .and_then(|layout| *layout);
-        FlashMoeLayerDimensions {
-            hidden_size: self.model_layout.hidden_size,
-            q_width: full_layout
-                .map(|layout| layout.q_width)
-                .or_else(|| linear_layout.map(|layout| layout.total_key_width)),
-            kv_width: full_layout
-                .map(|layout| layout.kv_width)
-                .or_else(|| linear_layout.map(|layout| layout.total_value_width)),
-            head_dim: full_layout
-                .map(|layout| layout.head_dim)
-                .or_else(|| linear_layout.map(|layout| layout.key_dim)),
-            experts_per_layer: Some(self.model_layout.experts_per_layer),
-            active_experts_per_token: Some(self.routing_policy.active_experts),
-            shared_experts: nonzero_usize(self.model_layout.shared_experts),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct DenseTransformerRuntime {
     pub(super) width: usize,
@@ -1470,7 +592,7 @@ pub(super) struct DenseTransformerRuntime {
     kv_width: usize,
     num_q_heads: usize,
     kv_heads: usize,
-    full_attention: Vec<Option<FullAttentionLayout>>,
+    pub(super) full_attention: Vec<Option<FullAttentionLayout>>,
     pub(super) linear_attention: Vec<Option<LinearAttentionLayout>>,
 }
 
@@ -2387,11 +1509,7 @@ fn add_scaled_in_place(target: &mut [f32], update: &[f32], scale: f32) {
     }
 }
 
-fn nonzero_usize(value: usize) -> Option<usize> {
-    (value > 0).then_some(value)
-}
-
-fn trace_sampling_candidates(
+pub(super) fn trace_sampling_candidates(
     progress: &GenerationProgress<'_>,
     tokenizer: &QwenTokenizer,
     prompt_len: usize,
@@ -2818,7 +1936,7 @@ impl QwenTokenizer {
         }
     }
 
-    fn apply_chat_template_to_messages(
+    pub(super) fn apply_chat_template_to_messages(
         &self,
         messages: &[ChatMessage],
         tools: &[ChatTool],
@@ -2847,7 +1965,7 @@ impl QwenTokenizer {
         )
     }
 
-    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+    pub(super) fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -2867,7 +1985,7 @@ impl QwenTokenizer {
         Ok(ids)
     }
 
-    fn decode(&self, tokens: &[u32]) -> Result<String> {
+    pub(super) fn decode(&self, tokens: &[u32]) -> Result<String> {
         let tokens: Vec<u32> = tokens
             .iter()
             .copied()
@@ -2879,16 +1997,16 @@ impl QwenTokenizer {
             .context("failed to decode tokens with tokenizer.json")
     }
 
-    fn is_eos(&self, token: u32) -> bool {
+    pub(super) fn is_eos(&self, token: u32) -> bool {
         self.eos_tokens.contains(&token)
     }
 
-    fn eos_token_id(&self) -> u32 {
+    pub(super) fn eos_token_id(&self) -> u32 {
         self.primary_eos_token
     }
 
     /// Look up a token string and return its ID, or `None` if not present.
-    fn token_id(&self, token: &str) -> Option<u32> {
+    pub(super) fn token_id(&self, token: &str) -> Option<u32> {
         self.tokenizer.token_to_id(token)
     }
 
@@ -3483,7 +2601,7 @@ fn render_qwen_tool_call_json(tool_call: &ChatToolCall) -> Result<String> {
     Ok(format!("{{\"name\": {name}, \"arguments\": {arguments}}}"))
 }
 
-fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCall>)> {
+pub(super) fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCall>)> {
     let mut remaining = content;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -3654,7 +2772,7 @@ pub(super) struct TokenSampler {
 }
 
 impl TokenSampler {
-    fn new(temperature: f32, top_k: i32, seed: u32) -> Self {
+    pub(super) fn new(temperature: f32, top_k: i32, seed: u32) -> Self {
         let deterministic = temperature <= 0.0 || top_k <= 1;
         Self {
             temperature,
@@ -3673,7 +2791,7 @@ impl TokenSampler {
         self.sample_candidates(candidates)
     }
 
-    fn sample_candidates(&mut self, mut candidates: Vec<(usize, f32)>) -> Result<u32> {
+    pub(super) fn sample_candidates(&mut self, mut candidates: Vec<(usize, f32)>) -> Result<u32> {
         if candidates.is_empty() {
             bail!("no logits candidates available");
         }
@@ -3700,7 +2818,7 @@ impl TokenSampler {
         u32::try_from(fallback).context("sampled token id does not fit u32")
     }
 
-    fn top_candidates(
+    pub(super) fn top_candidates(
         &self,
         logits: &[f32],
         prompt: &[u32],
@@ -4437,7 +3555,7 @@ impl ExpertWeights {
 }
 
 #[cfg(test)]
-fn read_expert_weights_many(
+pub(super) fn read_expert_weights_many(
     store: &ExpertSlotStore,
     layer: usize,
     experts: &[usize],
