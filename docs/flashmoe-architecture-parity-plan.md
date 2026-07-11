@@ -160,8 +160,11 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 
 Baseline reviewed on 2026-07-11:
 
-- `experts.rs` substantially owns fixed-slot metadata, cache compatibility, layer readers,
-  positioned reads, reusable whole-expert buffers, raw payloads, and the worker pool.
+- `experts.rs` owns fixed-slot metadata, pull-time direct/aggregate expert grouping and validation,
+  PBQ4/native-Q4/fixed-dense import conversion, source-range fingerprints, atomic layer
+  publication, cache compatibility, layer readers, positioned reads, reusable whole-expert
+  buffers, raw payloads, and the worker pool. Pull-time packing receives an explicit model,
+  expert-directory, and quantization policy instead of depending on the runtime plan.
 - The scheduler owns routed expert read issue/finish, read metrics, normalized routes, pending read
   sets, and whole-slot handoff into CMD3.
 - Q4 fixed-slot execution rejects PBQ4/component records at the scheduler boundary.
@@ -283,7 +286,10 @@ Baseline reviewed on 2026-07-11:
 - Pull-time dense conversion is now weights-owned: MLX native-Q4 companion resolution, logical
   shape and quantization metadata, aligned offsets/padding, mmap source reads, post-hoc Q4
   conversion, and dense/vision store publication moved together. `safetensors.rs` owns shared,
-  bounds-checked source-header parsing. `cache.rs` only coordinates those owners.
+  bounds-checked source-header parsing. Pull-time expert conversion is likewise experts-owned:
+  direct and aggregate layer splitting, fixed-slot selection, PBQ4/native-Q4/fixed-dense record
+  construction, source hashing and range reads, reuse validation, and atomic layer publication
+  moved together. `cache.rs` only coordinates those owners.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -438,9 +444,9 @@ The architecture is not yet at the target:
 
 - The engine container, load path, and public generation/session orchestration are now in
   `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
-  is in `weights.rs`. The extracted `cache.rs` transaction still contains format-specific expert
-  packing helpers that must move to `experts.rs`. Expert fixture implementation and
-  test/compatibility helpers remain in test-only `legacy.rs`.
+  is in `weights.rs`. The extracted `cache.rs` transaction delegates dense conversion to
+  `weights.rs`, expert packing to `experts.rs`, and source-header parsing to `safetensors.rs`.
+  Expert fixture implementation and test/compatibility helpers remain in test-only `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
@@ -639,7 +645,9 @@ Completion evidence:
 - Local-Metal reference tests cover resident-Q4 and BF16/F16/F32 projection/CMD2 preparation plus
   the scheduler-owned CMD3 active/shared combine. The current full all-target suite passed with
   654 tests and seven device-dependent tests ignored, the release build completed, and the required
-  smoke printed `4` on 2026-07-11.
+  smoke printed `4` on 2026-07-11. After expert packing moved to its target owner, the full suite
+  passed with 678 tests and seven device-dependent tests ignored; web assets and the release binary
+  rebuilt, and the required smoke again printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations

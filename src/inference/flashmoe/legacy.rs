@@ -5933,7 +5933,13 @@ mod tests {
             },
         ];
 
-        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        pack_expert_tensors(
+            &snapshot,
+            ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+            &tensors,
+            Some(&config),
+        )
+        .unwrap();
 
         let layer_path = expert_layer_path(&plan.experts_dir, 1);
         let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
@@ -6075,7 +6081,13 @@ mod tests {
             },
         ];
 
-        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        pack_expert_tensors(
+            &snapshot,
+            ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+            &tensors,
+            Some(&config),
+        )
+        .unwrap();
 
         let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
             .unwrap()
@@ -6247,7 +6259,13 @@ mod tests {
             br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":8,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":8}"#,
         )
         .unwrap();
-        pack_expert_tensors(&snapshot, &plan, &manifest.expert_tensors, Some(&config)).unwrap();
+        pack_expert_tensors(
+            &snapshot,
+            ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+            &manifest.expert_tensors,
+            Some(&config),
+        )
+        .unwrap();
 
         let expert0 = read_one_expert(&plan.experts_dir, 1, 0).unwrap();
         let gate0 = expert0.record_suffix("gate_proj.weight").unwrap();
@@ -6433,7 +6451,13 @@ mod tests {
         };
 
         write_expert_shard((0u8..16).collect(), (16u8..24).collect());
-        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        pack_expert_tensors(
+            &snapshot,
+            ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+            &tensors,
+            Some(&config),
+        )
+        .unwrap();
         let before = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
             .unwrap()
             .unwrap()
@@ -6443,7 +6467,13 @@ mod tests {
             .unwrap();
 
         write_expert_shard((100u8..116).collect(), (200u8..208).collect());
-        pack_expert_tensors(&snapshot, &plan, &tensors, Some(&config)).unwrap();
+        pack_expert_tensors(
+            &snapshot,
+            ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+            &tensors,
+            Some(&config),
+        )
+        .unwrap();
         let after = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
             .unwrap()
             .unwrap()
