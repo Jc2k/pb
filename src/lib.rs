@@ -3205,6 +3205,44 @@ mod tests {
     }
 
     #[test]
+    fn flashmoe_cli_selects_expert_storage_for_pull_and_infer() {
+        let pull = Cli::try_parse_from([
+            "pb",
+            "pull",
+            "hf://Qwen/Qwen3-30B-A3B",
+            "--flashmoe-expert-storage",
+            "f16",
+        ])
+        .unwrap();
+        let Commands::Pull(pull) = pull.command else {
+            panic!("expected pull command");
+        };
+        assert_eq!(
+            pull.flashmoe_expert_storage,
+            Some(FlashMoeExpertStorageArg::F16)
+        );
+
+        let infer = Cli::try_parse_from([
+            "pb",
+            "flashmoe",
+            "infer",
+            "2+2=",
+            "--model",
+            "hf://Qwen/Qwen3-VL-MoE-Instruct",
+            "--expert-storage",
+            "bf16",
+        ])
+        .unwrap();
+        let Commands::FlashMoe {
+            command: FlashMoeCommand::Infer(infer),
+        } = infer.command
+        else {
+            panic!("expected flashmoe infer command");
+        };
+        assert_eq!(infer.expert_storage, Some(FlashMoeExpertStorageArg::Bf16));
+    }
+
+    #[test]
     fn flashmoe_timing_tsv_rows_match_header_columns() {
         let timed = crate::inference::flashmoe::TimedGenerationOutput {
             output: crate::inference::flashmoe::GenerationOutput {

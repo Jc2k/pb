@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use super::experts::first_missing_expert_pack_for_shape;
 use super::model_family::{QwenModelConfig, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias};
 use super::types::{
-    ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CACHE_VERSION, CacheStatus, EXPECTED_EXPERT_BYTES,
+    ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CacheStatus, EXPECTED_EXPERT_BYTES,
     ExpertQuantization, HIDDEN_DIM, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS, NUM_LAYERS,
     QWEN35_BF16_MODEL, QWEN35_MODEL,
 };
@@ -318,7 +318,7 @@ impl FlashMoePlan {
     pub fn describe(&self) -> String {
         format!(
             "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
-            CACHE_VERSION,
+            self.quantization.cache_version(),
             self.model,
             NUM_LAYERS,
             NUM_EXPERTS,
@@ -523,7 +523,9 @@ fn cache_cleanup_path_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::flashmoe::types::QWEN3_VL_MODEL;
+    use crate::inference::flashmoe::types::{
+        BF16_CACHE_VERSION, CACHE_VERSION, F16_CACHE_VERSION, QWEN3_VL_MODEL,
+    };
 
     fn qwen_config(model_type: &str, active_experts: usize) -> QwenModelConfig {
         serde_json::from_value(serde_json::json!({
@@ -566,6 +568,48 @@ mod tests {
         assert!(vl.vision_manifest.is_some());
         assert!(vl.vision_config_path.is_some());
         assert_eq!(vl.quantization, ExpertQuantization::FourBitProduction);
+    }
+
+    #[test]
+    fn explicit_storage_policy_selects_distinct_qwen_family_cache_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        for model in ["hf://Qwen/Qwen3-30B-A3B", QWEN3_VL_MODEL] {
+            let q4 = plan_unchecked_with_quantization(
+                model,
+                temp.path(),
+                ExpertQuantization::FourBitProduction,
+            );
+            let bf16 =
+                plan_unchecked_with_quantization(model, temp.path(), ExpertQuantization::Bf16);
+            let f16 = plan_unchecked_with_quantization(model, temp.path(), ExpertQuantization::F16);
+
+            assert_eq!(q4.model_cache_dir, bf16.model_cache_dir);
+            assert_eq!(q4.model_cache_dir, f16.model_cache_dir);
+            assert!(q4.runtime_dir.ends_with(CACHE_VERSION));
+            assert!(bf16.runtime_dir.ends_with(BF16_CACHE_VERSION));
+            assert!(f16.runtime_dir.ends_with(F16_CACHE_VERSION));
+            assert_eq!(q4.quantization, ExpertQuantization::FourBitProduction);
+            assert_eq!(bf16.quantization, ExpertQuantization::Bf16);
+            assert_eq!(f16.quantization, ExpertQuantization::F16);
+            assert!(bf16.describe().contains(BF16_CACHE_VERSION));
+            assert!(f16.describe().contains(F16_CACHE_VERSION));
+        }
+    }
+
+    #[test]
+    fn default_storage_policy_preserves_q4_and_official_bf16_compatibility() {
+        assert_eq!(
+            default_expert_quantization("hf://Qwen/Qwen3-30B-A3B"),
+            ExpertQuantization::FourBitProduction
+        );
+        assert_eq!(
+            default_expert_quantization(QWEN3_VL_MODEL),
+            ExpertQuantization::FourBitProduction
+        );
+        assert_eq!(
+            default_expert_quantization(QWEN35_BF16_MODEL),
+            ExpertQuantization::Bf16
+        );
     }
 
     #[test]

@@ -277,6 +277,12 @@ Baseline reviewed on 2026-07-11:
   through config/tokenizer validation, manifest construction, aligned dense-store publication,
   expert-layer publication, and final cache plan. CLI callers use that owner directly; the
   transaction and its safetensors/source-range helpers no longer live behind `legacy.rs`.
+- Pull, infer, bench, and cache-clean now carry one explicit `q4`/`bf16`/`f16` expert-storage
+  policy into planning and cache construction for every Qwen family. Each layout has a distinct
+  cache namespace, and fixed-BF16/F16 cache import rejects a source tensor whose declared dtype
+  does not exactly match the selected layout. Q4 remains the default production policy; the
+  official Qwen3.5 BF16 model URI retains its compatibility default without imposing that choice
+  on other Qwen-family models.
 - Production no longer compiles or imports `legacy.rs`. Runtime owns timing aggregation; weights
   owns required-manifest and resident-Q4 graph-binding validation plus the F32 Accelerate matvec;
   and the unused runtime expert-store adapter has been deleted. The test-only `ExpertWeights`
@@ -483,9 +489,10 @@ The architecture is not yet at the target:
   still pending. Qwen3.5 hybrid BF16/F16/F32 now resolves all nine stages, including its resident
   shared-expert CMD3 implementation. Typed fixed-BF16 and fixed-F16 active-expert slots use the
   same positioned reads, scheduler leases, CMD3 handoff, and Metal builder as fixed-Q4 slots. The
-  explicit Qwen3.5 BF16 cache builder emits fixed-BF16 metadata, which production load resolves
-  without a model-name branch; F16 slot execution is capability resolved but is not yet emitted by
-  a production model policy. Real-checkpoint correctness remains incomplete.
+  explicit expert-storage cache policy emits fixed-BF16 or fixed-F16 metadata for compatible
+  source checkpoints, which production load resolves without a model-name branch. Source dtype
+  mismatches are cache-build errors rather than conversion or runtime fallback. Real-checkpoint
+  correctness remains incomplete.
 
 At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
 correctness closure. Typed implementations for additional variants and final legacy removal remain;
@@ -676,7 +683,9 @@ Completion evidence:
   schedule, 676 tests passed with seven ignored; web assets and the release binary rebuilt, and the
   required smoke again printed `4` on 2026-07-11. The subsequent Qwen3/Qwen3-VL typed dense-expert
   matrix raised the suite to 677 passing tests with seven ignored without changing production
-  execution.
+  execution. After explicit Q4/BF16/F16 production storage selection was generalized across Qwen
+  families and its Qwen3 text/VL namespace policy was covered, 680 tests passed with seven ignored;
+  web assets and the release binary rebuilt, and the required smoke printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations
@@ -686,8 +695,8 @@ Objective: add variants as stage implementations, not runtimes.
 Required work:
 
 - Keep typed BF16/F16 whole-expert storage and Metal implementations on the existing positioned
-  read, scheduler-lease, and CMD3 handoff while adding production model policies and checkpoint
-  evidence.
+  read, scheduler-lease, and CMD3 handoff while exercising the explicit production storage policy
+  against compatible checkpoints and adding checkpoint evidence.
 - Close real-checkpoint correctness for the resolved text-only Qwen MoE and Qwen-VL Q4 graphs.
 - Extend capability and parity fixtures until every supported family/dtype/expert-layout
   combination has direct evidence.
@@ -707,8 +716,8 @@ Current capability matrix:
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
-| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit BF16 cache emits fixed-BF16 slots | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
-| Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Capability-resolved only when exact model layout, fixed slot metadata, typed adapter, and required Metal kernels are present; no production cache policy currently selects them | Cross-family 12-combination graph matrix plus storage, scheduler, and local-Metal fixtures; real checkpoint pending |
+| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
+| Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; capability resolution still requires exact model layout, slot metadata, typed adapter, and required Metal kernels | Cross-family 12-combination graph matrix, CLI/planning storage-selection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
 
 ### Gate 7: Legacy Removal And Benchmarking
 
@@ -838,8 +847,9 @@ For Gate 6:
    variant; missing tensors or kernels must name the exact unresolved stage.
 2. Preserve completed resident BF16/F16/F32 shared-expert CMD3 and metadata-resolved typed
    BF16/F16 whole-expert execution through the same positioned-read slots, scheduler leases, and
-   Metal builder as Q4. Add new model policies only by emitting one of those declared fixed-slot
-   formats. Do not revive removed dense CPU/component paths as production continuations.
+   Metal builder as Q4. Keep production policy explicit and emit only those declared fixed-slot
+   formats from matching source dtypes. Do not revive removed dense CPU/component paths as
+   production continuations.
 3. Run the resolved text-only Qwen MoE Q4 graph against a real checkpoint and debug manifest,
    routing, or math mismatches through its typed metadata and shared scheduler path.
 4. Run the resolved Qwen-VL Q4 graph against a real checkpoint and debug any manifest/math mismatch

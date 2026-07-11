@@ -1743,12 +1743,12 @@ mod tests {
         );
         assert_eq!(
             cache_version_for_model(QWEN35_BF16_MODEL),
-            QWEN35_BF16_CACHE_VERSION,
+            BF16_CACHE_VERSION,
             "explicit BF16 source model should use the existing BF16 cache"
         );
 
         let plan = plan_unchecked(QWEN35_BF16_MODEL, Path::new("/models"));
-        assert!(plan.runtime_dir.ends_with(QWEN35_BF16_CACHE_VERSION));
+        assert!(plan.runtime_dir.ends_with(BF16_CACHE_VERSION));
         assert_eq!(plan.model, QWEN35_BF16_MODEL);
     }
 
