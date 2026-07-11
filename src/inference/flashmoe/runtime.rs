@@ -284,14 +284,14 @@ impl MetalExecutionFacade {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn q4_post_attention_prep_topk(
+    pub(super) fn resident_post_attention_prep_topk(
         &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
+        projections: &Cmd2ResidentPostAttentionPrepProjections,
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
     ) -> Result<MetalPostAttentionPrep> {
-        self.inner.q4_post_attention_prep_topk(
+        self.inner.resident_post_attention_prep_topk(
             projections,
             attention_output,
             residual,
@@ -669,10 +669,10 @@ impl FlashMoeEngine {
                     .model_norm_weight(post_norm_name.as_str(), runtime.width)?
                     .with_context(|| {
                         format!(
-                            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing norm tensor {post_norm_name}"
+                            "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: missing norm tensor {post_norm_name}"
                         )
                     })?;
-                let mut prep = self.dense.post_attention_q4_prep_with_metal(
+                let mut prep = self.dense.post_attention_prep_with_metal(
                     metal,
                     layer,
                     self.scheduler.experts_per_layer(),

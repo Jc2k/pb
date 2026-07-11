@@ -90,7 +90,7 @@ pub enum FlashMoeStageImplementation {
     MetalResidentAttentionProjections,
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
-    MetalResidentQ4PostAttention,
+    MetalResidentPostAttention,
     CpuSoftmaxTopK,
     ParallelPositionedFixedQ4Reads,
     MetalFixedQ4ExpertSharedCombine,
@@ -108,8 +108,8 @@ impl FlashMoeStageImplementation {
             }
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
-            Self::MetalResidentQ4PostAttention => {
-                "Metal resident-Q4 post-attention and router projection"
+            Self::MetalResidentPostAttention => {
+                "Metal resident Q4/BF16/F16/F32 post-attention and router projection"
             }
             Self::CpuSoftmaxTopK => "Qwen-family CPU softmax/topK",
             Self::ParallelPositionedFixedQ4Reads => {
@@ -306,21 +306,17 @@ impl FlashMoeCapabilityPlan {
                 ],
             )?;
         }
-        if dense_layout != ResidentDenseLayout::Q4 {
-            return Err(FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
-                format!(
-                    "full-attention CMD1 resolves {}, but the unified CMD2 post-attention/router builder does not yet consume that layout",
-                    dense_layout.as_str()
-                ),
-            ));
-        }
+        let cmd2_projection_kernel = match dense_layout {
+            ResidentDenseLayout::Q4 => kernels::Q4_MMAP_FMA_MATVEC,
+            ResidentDenseLayout::Bf16 => kernels::DENSE_MMAP_FMA_MATVEC_BF16,
+            ResidentDenseLayout::F16 => kernels::DENSE_MMAP_FMA_MATVEC_F16,
+            ResidentDenseLayout::F32 => kernels::DENSE_MMAP_FMA_MATVEC_F32,
+        };
         require_stage_kernels(
             layout.family,
             &metal,
             FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
-            &[kernels::RESIDUAL_ADD_RMS_NORM],
+            &[cmd2_projection_kernel, kernels::RESIDUAL_ADD_RMS_NORM],
         )?;
         require_stage_kernels(
             layout.family,
@@ -341,6 +337,30 @@ impl FlashMoeCapabilityPlan {
                 FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
                 &[kernels::SHARED_EXPERT_ACTIVATION],
             )?;
+        }
+        if dense_layout != ResidentDenseLayout::Q4 {
+            let (stage, reason) = if layout.shared_experts > 0 {
+                (
+                    FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
+                    format!(
+                        "CMD2 resolves {}, but the unified CMD3 shared-expert builder does not yet consume that layout",
+                        dense_layout.as_str()
+                    ),
+                )
+            } else {
+                (
+                    FlashMoeGraphStage::LmHeadAndSampling,
+                    format!(
+                        "CMD1/CMD2 resolve {}, but the unified LM-head sampler does not yet consume that layout",
+                        dense_layout.as_str()
+                    ),
+                )
+            };
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                stage,
+                reason,
+            ));
         }
         require_stage_kernels(
             layout.family,
@@ -373,7 +393,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
                 FlashMoeStagePlacement::Metal,
-                FlashMoeStageImplementation::MetalResidentQ4PostAttention,
+                FlashMoeStageImplementation::MetalResidentPostAttention,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::RoutingSoftmaxTopK,
@@ -760,6 +780,12 @@ mod tests {
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
+    fn metal_without_residual_rms_norm() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.residual_rms_norm = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
     #[test]
     fn qwen35_q4_capability_plan_resolves_concrete_storage_and_device() {
         let mut layout = qwen35_layout();
@@ -784,6 +810,12 @@ mod tests {
         assert_eq!(plan.active_experts, 4);
         assert_eq!(plan.state_policy, FlashMoeStatePolicy::DeferredGpuNextLayer);
         assert_eq!(plan.stages.len(), FlashMoeGraphStage::ALL.len());
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::MetalResidentPostAttention
+        );
         assert_eq!(
             plan.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
                 .unwrap()
@@ -830,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_full_attention_non_q4_dense_resolves_cmd1_then_fails_at_cmd2() {
+    fn qwen_full_attention_non_q4_dense_resolves_cmd2_then_fails_at_next_missing_stage() {
         let layout = qwen3_moe_layout(Some(true));
         for dense_layout in [
             ResidentDenseLayout::Bf16,
@@ -845,11 +877,9 @@ mod tests {
                 Some(full_metal()),
             )
             .unwrap_err();
-            assert_eq!(
-                error.stage,
-                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
-            );
+            assert_eq!(error.stage, FlashMoeGraphStage::LmHeadAndSampling);
             assert!(error.reason.contains(dense_layout.as_str()), "{error}");
+            assert!(error.reason.contains("CMD1/CMD2 resolve"), "{error}");
         }
 
         let kernel_error = FlashMoeCapabilityPlan::resolve(
@@ -869,6 +899,37 @@ mod tests {
                 .reason
                 .contains(kernels::DENSE_MMAP_FMA_MATVEC_BF16)
         );
+
+        let cmd2_kernel_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Bf16,
+            fixed_q4_experts(&layout),
+            Some(metal_without_residual_rms_norm()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            cmd2_kernel_error.stage,
+            FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection
+        );
+        assert!(
+            cmd2_kernel_error
+                .reason
+                .contains(kernels::RESIDUAL_ADD_RMS_NORM),
+            "{cmd2_kernel_error}"
+        );
+
+        let vl_layout = qwen3_vl_layout();
+        let vl_error = FlashMoeCapabilityPlan::resolve(
+            &vl_layout,
+            qwen_vl_adapter(),
+            ResidentDenseLayout::Bf16,
+            fixed_q4_experts(&vl_layout),
+            Some(full_metal()),
+        )
+        .unwrap_err();
+        assert_eq!(vl_error.stage, FlashMoeGraphStage::LmHeadAndSampling);
+        assert!(vl_error.reason.contains("CMD1/CMD2 resolve"), "{vl_error}");
     }
 
     #[test]

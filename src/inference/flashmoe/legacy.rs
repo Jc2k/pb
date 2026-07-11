@@ -121,17 +121,14 @@ use super::scheduler::ScheduledExpertReadCoordinator as ExpertScheduler;
 #[cfg(test)]
 use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(test)]
+use super::scheduler::ScheduledRoutingCandidateSource;
+#[cfg(test)]
 use super::scheduler::ScheduledRoutingCommand;
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
     ExpertSchedulerSnapshot, FlashMoeExecutionScheduler, FlashMoeScheduledGraph,
     ScheduledLayerAttentionImplementation,
-};
-#[cfg(test)]
-use super::scheduler::{
-    ScheduledCmd2AttentionSource, ScheduledCmd2PhaseInputs, ScheduledCmd2ResidualSource,
-    ScheduledRoutingCandidateSource,
 };
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
@@ -13535,7 +13532,213 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires a local Metal device"]
-    fn arm_macos_post_attention_q4_prep_matches_cpu_reference() {
+    fn arm_macos_post_attention_dense_prep_matches_cpu_reference() {
+        fn f16_bits(value: f32) -> u16 {
+            match value.to_bits() {
+                bits if bits == 0.0f32.to_bits() => 0x0000,
+                bits if bits == 0.25f32.to_bits() => 0x3400,
+                bits if bits == 0.5f32.to_bits() => 0x3800,
+                bits if bits == 1.0f32.to_bits() => 0x3c00,
+                bits if bits == 2.0f32.to_bits() => 0x4000,
+                bits if bits == (-0.5f32).to_bits() => 0xb800,
+                bits if bits == (-1.0f32).to_bits() => 0xbc00,
+                bits if bits == (-2.0f32).to_bits() => 0xc000,
+                _ => panic!("test value {value} is not in the exact F16 fixture"),
+            }
+        }
+
+        fn append_dense_tensor(
+            bytes: &mut Vec<u8>,
+            name: &str,
+            dtype: &str,
+            values: &[f32],
+            rows: usize,
+            cols: usize,
+        ) -> DenseTensorRef {
+            while !bytes.len().is_multiple_of(TENSOR_ALIGNMENT as usize) {
+                bytes.push(0);
+            }
+            let runtime_offset = bytes.len() as u64;
+            match dtype {
+                "BF16" => {
+                    for value in values {
+                        bytes.extend_from_slice(&f32_to_bf16_bits(*value).to_le_bytes());
+                    }
+                }
+                "F16" => {
+                    for value in values {
+                        bytes.extend_from_slice(&f16_bits(*value).to_le_bytes());
+                    }
+                }
+                "F32" => {
+                    for value in values {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            DenseTensorRef {
+                tensor: name.to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: dtype.to_string(),
+                shape: vec![rows, cols],
+                source_offsets: [0, (values.len() * std::mem::size_of::<f32>()) as u64],
+                runtime_offset,
+                byte_len: bytes.len() as u64 - runtime_offset,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }
+        }
+
+        fn matvec(weights: &[f32], input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+            assert_eq!(weights.len(), rows * cols);
+            weights
+                .chunks_exact(cols)
+                .map(|row| {
+                    row.iter()
+                        .zip(input)
+                        .map(|(weight, value)| weight * value)
+                        .sum()
+                })
+                .collect()
+        }
+
+        let layer = 0;
+        let width = 4;
+        let attention_width = 4;
+        let experts = 3;
+        let out_proj_name = attention_tensor_name(layer, "o_proj");
+        let router_name = router_tensor_name(layer);
+        let out_values = [
+            1.0, -0.5, 0.25, 2.0, -1.0, 0.5, 2.0, -2.0, 0.0, 1.0, -1.0, 0.5, 0.25, -2.0, 1.0, 0.5,
+        ];
+        let router_values = [
+            1.0, -0.5, 0.25, 2.0, -1.0, 0.5, 2.0, -2.0, 0.25, -2.0, 1.0, 0.5,
+        ];
+        let attention_output = [0.5, -1.0, 2.0, 0.25];
+        let residual = [0.25, -0.5, 1.0, 2.0];
+        let post_norm_weight = [1.0, 0.5, 2.0, 0.25];
+
+        let expected_projected = matvec(&out_values, &attention_output, width, attention_width);
+        let mut expected_residual = residual.to_vec();
+        add_in_place(&mut expected_residual, &expected_projected);
+        let mut expected_normed = expected_residual.clone();
+        rms_norm_with_weight_in_place(&mut expected_normed, Some(&post_norm_weight));
+        let expected_active = top_k(&matvec(&router_values, &expected_normed, experts, width), 2);
+
+        for dtype in ["BF16", "F16", "F32"] {
+            let temp = tempfile::tempdir().unwrap();
+            let plan = plan_unchecked(QWEN35_MODEL, temp.path());
+            fs::create_dir_all(&plan.runtime_dir).unwrap();
+            let mut bytes = Vec::new();
+            let out_tensor = append_dense_tensor(
+                &mut bytes,
+                &out_proj_name,
+                dtype,
+                &out_values,
+                width,
+                attention_width,
+            );
+            let router_tensor = append_dense_tensor(
+                &mut bytes,
+                &router_name,
+                dtype,
+                &router_values,
+                experts,
+                width,
+            );
+            fs::write(&plan.non_expert_weights, &bytes).unwrap();
+            fs::write(
+                &plan.tensor_manifest,
+                serde_json::to_vec(&FlashMoeManifest {
+                    model: QWEN35_MODEL.to_string(),
+                    cache_version: CACHE_VERSION.to_string(),
+                    dense_shards: vec!["dense.safetensors".to_string()],
+                    expert_tensors: Vec::new(),
+                    dense_tensors: vec![out_tensor, router_tensor],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let store = DenseStore::open(
+                plan.non_expert_weights.clone(),
+                plan.tensor_manifest.clone(),
+            )
+            .unwrap();
+            let config = QwenModelConfig {
+                model_type: Some("qwen3_moe".to_string()),
+                architectures: None,
+                num_hidden_layers: 1,
+                hidden_size: width,
+                num_attention_heads: 1,
+                head_dim: None,
+                num_key_value_heads: Some(1),
+                vocab_size: 32,
+                rope_theta: None,
+                partial_rotary_factor: None,
+                torch_dtype: Some(dtype.to_ascii_lowercase()),
+                num_experts: Some(experts),
+                num_experts_per_tok: Some(2),
+                norm_topk_prob: None,
+                moe_intermediate_size: Some(4),
+                intermediate_size: None,
+                max_position_embeddings: Some(4),
+                mrope_section: None,
+                tie_word_embeddings: None,
+                num_shared_experts: None,
+                shared_expert_intermediate_size: None,
+                vision_config: None,
+            };
+            let runtime = DenseTransformerRuntime::new(&config);
+            let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
+            let prep = store
+                .post_attention_prep_with_metal(
+                    &metal,
+                    layer,
+                    experts,
+                    &out_proj_name,
+                    &attention_output,
+                    MetalBatchProjectionInput::Cpu(&residual),
+                    &post_norm_weight,
+                    2,
+                )
+                .unwrap();
+
+            assert_eq!(prep.active.len(), expected_active.len());
+            for ((actual_id, actual_score), (expected_id, expected_score)) in
+                prep.active.iter().zip(&expected_active)
+            {
+                assert_eq!(actual_id, expected_id, "{dtype} route id diverged");
+                assert!(
+                    (actual_score - expected_score).abs() <= 1e-4,
+                    "{dtype} route score {actual_score} != {expected_score}"
+                );
+            }
+            let actual_residual = metal
+                .inner
+                .read_and_recycle_f32(prep.residual_buffer, width);
+            let actual_normed = metal.inner.read_and_recycle_f32(prep.normed_buffer, width);
+            for index in 0..width {
+                assert!(
+                    (actual_residual[index] - expected_residual[index]).abs() <= 1e-4,
+                    "{dtype} residual[{index}] {} != {}",
+                    actual_residual[index],
+                    expected_residual[index]
+                );
+                assert!(
+                    (actual_normed[index] - expected_normed[index]).abs() <= 1e-4,
+                    "{dtype} normed[{index}] {} != {}",
+                    actual_normed[index],
+                    expected_normed[index]
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn arm_macos_post_attention_resident_q4_prep_matches_cpu_reference() {
         fn q4_bytes(
             values: &[f32],
             shape: &[usize],
@@ -13695,8 +13898,8 @@ mod tests {
         .unwrap();
         let expected_active = top_k(&expected_router, 3);
 
-        let mut prep = store
-            .post_attention_q4_prep_with_metal(
+        let prep = store
+            .post_attention_prep_with_metal(
                 &metal,
                 layer,
                 experts,
@@ -13722,53 +13925,6 @@ mod tests {
             );
         }
         assert!(prep.routing_command().is_none());
-        let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config).unwrap();
-        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
-        let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
-        let scheduled_cmd2 = scheduled_graph
-            .build_cmd2_post_attention(
-                layer,
-                3,
-                ScheduledCmd2AttentionSource::CpuAttentionValues,
-                ScheduledCmd2ResidualSource::CpuHidden,
-            )
-            .unwrap();
-        let scheduled_cmd2 = scheduled_graph
-            .build_cmd2_submission(
-                scheduled_cmd2,
-                ScheduledCmd2PhaseInputs::new(
-                    ScheduledCmd2AttentionSource::CpuAttentionValues,
-                    ScheduledCmd2ResidualSource::CpuHidden,
-                    attention_width,
-                    width,
-                ),
-            )
-            .unwrap()
-            .into_cmd2_command();
-        let routing_command = scheduled_cmd2
-            .command_from_post_attention_prep_routes(&scheduled_graph, prep.state, &prep.active)
-            .unwrap();
-        assert_eq!(
-            routing_command.source,
-            ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
-        );
-        for (slot, ((actual_id, actual_score), (expected_id, expected_score))) in routing_command
-            .routes
-            .iter()
-            .zip(expected_active.iter())
-            .enumerate()
-        {
-            assert_eq!(actual_id, expected_id, "route id at slot {slot} diverged");
-            assert!(
-                (*actual_score - *expected_score).abs() <= 1e-4,
-                "route score at slot {slot} diverged: actual={actual_score}, expected={expected_score}"
-            );
-        }
-        let attached = prep
-            .attach_routing_command(routing_command.clone())
-            .unwrap();
-        assert_eq!(attached, routing_command);
-        assert_eq!(prep.routing_command(), Some(&routing_command));
 
         let actual_residual = metal
             .inner

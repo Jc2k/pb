@@ -727,21 +727,21 @@ impl RouterScoreBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Cmd2Q4PostAttentionPrepProjections {
+pub(crate) struct Cmd2ResidentPostAttentionPrepProjections {
     pub(crate) layer: usize,
-    pub(crate) out_proj: DenseQ4MmapMatvecProjection,
-    pub(crate) router: DenseQ4MmapMatvecProjection,
+    pub(crate) out_proj: ResidentMmapMatvecProjection,
+    pub(crate) router: ResidentMmapMatvecProjection,
     pub(crate) experts: usize,
     pub(crate) residual_width: usize,
     pub(crate) attention_width: usize,
     pub(crate) active_experts: usize,
 }
 
-impl Cmd2Q4PostAttentionPrepProjections {
+impl Cmd2ResidentPostAttentionPrepProjections {
     pub(crate) fn new(
         layer: usize,
-        out_proj: DenseQ4MmapMatvecProjection,
-        router: DenseQ4MmapMatvecProjection,
+        out_proj: ResidentMmapMatvecProjection,
+        router: ResidentMmapMatvecProjection,
         experts: usize,
         residual_width: usize,
         attention_width: usize,
@@ -749,23 +749,23 @@ impl Cmd2Q4PostAttentionPrepProjections {
     ) -> Result<Self> {
         if residual_width == 0 || attention_width == 0 || experts == 0 {
             bail!(
-                "FlashMoe CMD2 Q4 post-attention prep requires non-zero experts, residual width, and attention width"
+                "FlashMoe CMD2 resident post-attention prep requires non-zero experts, residual width, and attention width"
             );
         }
-        if out_proj.output_width != residual_width || out_proj.cols != attention_width {
+        if out_proj.output_width() != residual_width || out_proj.cols() != attention_width {
             bail!(
-                "FlashMoe CMD2 Q4 post-attention output projection shape is invalid: output_width={} cols={} expected output_width={} cols={}",
-                out_proj.output_width,
-                out_proj.cols,
+                "FlashMoe CMD2 resident post-attention output projection shape is invalid: output_width={} cols={} expected output_width={} cols={}",
+                out_proj.output_width(),
+                out_proj.cols(),
                 residual_width,
                 attention_width
             );
         }
-        if router.output_width != experts || router.cols != residual_width {
+        if router.output_width() != experts || router.cols() != residual_width {
             bail!(
-                "FlashMoe CMD2 Q4 post-attention router projection shape is invalid: output_width={} cols={} expected output_width={} cols={}",
-                router.output_width,
-                router.cols,
+                "FlashMoe CMD2 resident post-attention router projection shape is invalid: output_width={} cols={} expected output_width={} cols={}",
+                router.output_width(),
+                router.cols(),
                 experts,
                 residual_width
             );
@@ -783,7 +783,7 @@ impl Cmd2Q4PostAttentionPrepProjections {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Cmd2Q4PostAttentionPrepResidentPlan {
+pub(crate) struct Cmd2ResidentPostAttentionPrepPlan {
     pub(crate) layer: usize,
     pub(crate) width: usize,
     pub(crate) attention_width: usize,
@@ -791,108 +791,58 @@ pub(crate) struct Cmd2Q4PostAttentionPrepResidentPlan {
     pub(crate) active_count: usize,
 }
 
-impl Cmd2Q4PostAttentionPrepProjections {
+impl Cmd2ResidentPostAttentionPrepProjections {
     pub(crate) fn resident_plan(
         &self,
-        dense_store_len: usize,
         attention_width: usize,
         residual_width: usize,
         post_norm_weight_len: usize,
-    ) -> Result<Cmd2Q4PostAttentionPrepResidentPlan> {
+    ) -> Result<Cmd2ResidentPostAttentionPrepPlan> {
         if self.active_experts == 0 {
             bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: active expert count is zero"
+                "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: active expert count is zero"
             );
         }
         if attention_width == 0 || residual_width == 0 {
             bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: attention width {attention_width} and residual width {residual_width} must be non-zero"
+                "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: attention width {attention_width} and residual width {residual_width} must be non-zero"
             );
         }
         if residual_width != post_norm_weight_len {
             bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: post-attention norm weight length {post_norm_weight_len} does not match residual width {residual_width}"
+                "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: post-attention norm weight length {post_norm_weight_len} does not match residual width {residual_width}"
             );
         }
-        if self.out_proj.output_width != residual_width
-            || self.out_proj.rows != residual_width
-            || self.out_proj.cols != attention_width
-            || self.router.cols != residual_width
-            || self.router.output_width != self.router.rows
+        if self.out_proj.output_width() != residual_width
+            || self.out_proj.rows() != residual_width
+            || self.out_proj.cols() != attention_width
+            || self.router.cols() != residual_width
+            || self.router.output_width() != self.router.rows()
         {
             bail!(
-                "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: projection shapes out={}x{} rows={} router={}x{} rows={} do not match attention width {} and residual width {}",
-                self.out_proj.output_width,
-                self.out_proj.cols,
-                self.out_proj.rows,
-                self.router.output_width,
-                self.router.cols,
-                self.router.rows,
+                "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: projection shapes out={}x{} rows={} router={}x{} rows={} do not match attention width {} and residual width {}",
+                self.out_proj.output_width(),
+                self.out_proj.cols(),
+                self.out_proj.rows(),
+                self.router.output_width(),
+                self.router.cols(),
+                self.router.rows(),
                 attention_width,
                 residual_width
             );
         }
-        for projection in [&self.out_proj, &self.router] {
-            validate_cmd2_q4_projection_resident_bounds(projection, dense_store_len)?;
-        }
-        Ok(Cmd2Q4PostAttentionPrepResidentPlan {
+        Ok(Cmd2ResidentPostAttentionPrepPlan {
             layer: self.layer,
             width: residual_width,
             attention_width,
-            experts: self.router.rows,
-            active_count: self.active_experts.min(self.router.rows).max(1),
+            experts: self.router.rows(),
+            active_count: self.active_experts.min(self.router.rows()).max(1),
         })
     }
 }
 
-fn validate_cmd2_q4_projection_resident_bounds(
-    projection: &DenseQ4MmapMatvecProjection,
-    dense_store_len: usize,
-) -> Result<()> {
-    let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-    if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-        || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-    {
-        bail!(
-            "FlashMoe CMD2 Q4 projection {} has unaligned scale/bias offsets for dtype {}",
-            projection.tensor_name,
-            projection.scale_bias_dtype
-        );
-    }
-    let packed_len = projection
-        .rows
-        .checked_mul(projection.row_packed_bytes)
-        .context("CMD2 post-attention q4 packed byte length overflow")?;
-    let groups_len = projection
-        .rows
-        .checked_mul(projection.groups_per_row)
-        .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-        .context("CMD2 post-attention q4 group byte length overflow")?;
-    for (offset, len) in [
-        (projection.packed_byte_offset, packed_len),
-        (projection.scales_byte_offset, groups_len),
-        (projection.biases_byte_offset, groups_len),
-    ] {
-        let offset =
-            usize::try_from(offset).context("CMD2 post-attention q4 offset does not fit usize")?;
-        if offset
-            .checked_add(len)
-            .map_or(true, |end| end > dense_store_len)
-        {
-            bail!(
-                "FlashMoe CMD2 Q4 projection {} byte range {}..{} exceeds resident dense store length {}",
-                projection.tensor_name,
-                offset,
-                offset.saturating_add(len),
-                dense_store_len
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-fn build_cmd2_q4_post_attention_prep_projections<F>(
+fn build_cmd2_resident_post_attention_prep_projections<F>(
     layer: usize,
     experts: usize,
     out_proj_name: &str,
@@ -900,9 +850,9 @@ fn build_cmd2_q4_post_attention_prep_projections<F>(
     residual_width: usize,
     active_experts: usize,
     mut projection: F,
-) -> Result<Option<Cmd2Q4PostAttentionPrepProjections>>
+) -> Result<Option<Cmd2ResidentPostAttentionPrepProjections>>
 where
-    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+    F: FnMut(&str, usize, usize) -> Result<Option<ResidentMmapMatvecProjection>>,
 {
     if experts == 0 || attention_width == 0 || residual_width == 0 {
         return Ok(None);
@@ -914,7 +864,7 @@ where
     let Some(router) = projection(&router_name, experts, residual_width)? else {
         return Ok(None);
     };
-    Cmd2Q4PostAttentionPrepProjections::new(
+    Cmd2ResidentPostAttentionPrepProjections::new(
         layer,
         out_proj,
         router,
@@ -926,7 +876,7 @@ where
     .map(Some)
 }
 
-pub(crate) fn build_required_cmd2_q4_post_attention_prep_projections<F>(
+pub(crate) fn build_required_cmd2_resident_post_attention_prep_projections<F>(
     layer: usize,
     experts: usize,
     out_proj_name: &str,
@@ -934,27 +884,27 @@ pub(crate) fn build_required_cmd2_q4_post_attention_prep_projections<F>(
     residual_width: usize,
     active_experts: usize,
     mut projection: F,
-) -> Result<Cmd2Q4PostAttentionPrepProjections>
+) -> Result<Cmd2ResidentPostAttentionPrepProjections>
 where
-    F: FnMut(&str, usize, usize) -> Result<Option<DenseQ4MmapMatvecProjection>>,
+    F: FnMut(&str, usize, usize) -> Result<Option<ResidentMmapMatvecProjection>>,
 {
     if experts == 0 || attention_width == 0 || residual_width == 0 {
         bail!(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: experts {experts}, attention width {attention_width}, and residual width {residual_width} must be non-zero"
+            "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: experts {experts}, attention width {attention_width}, and residual width {residual_width} must be non-zero"
         );
     }
     let out_proj = projection(out_proj_name, residual_width, attention_width)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing resident output projection {out_proj_name}"
+            "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: missing output projection {out_proj_name}"
         )
     })?;
     let router_name = router_tensor_name(layer);
     let router = projection(&router_name, experts, residual_width)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: missing resident router projection {router_name}"
+            "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: missing router projection {router_name}"
         )
     })?;
-    Cmd2Q4PostAttentionPrepProjections::new(
+    Cmd2ResidentPostAttentionPrepProjections::new(
         layer,
         out_proj,
         router,
@@ -2784,7 +2734,7 @@ impl DenseStore {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn post_attention_q4_prep_with_metal(
+    pub(super) fn post_attention_prep_with_metal(
         &self,
         metal: &MetalExecutionFacade,
         layer: usize,
@@ -2797,7 +2747,7 @@ impl DenseStore {
     ) -> Result<MetalPostAttentionPrep> {
         metal.require_resident_dense_weights()?;
         let residual_len = residual.len();
-        let projections = build_required_cmd2_q4_post_attention_prep_projections(
+        let projections = build_required_cmd2_resident_post_attention_prep_projections(
             layer,
             experts,
             out_proj_name,
@@ -2805,10 +2755,10 @@ impl DenseStore {
             residual_len,
             active_experts,
             |tensor_name, output_width, input_len| {
-                self.dense_q4_mmap_projection(tensor_name, output_width, input_len)
+                self.resident_mmap_projection(tensor_name, output_width, input_len)
             },
         )?;
-        metal.q4_post_attention_prep_topk(
+        metal.resident_post_attention_prep_topk(
             &projections,
             attention_output,
             residual,
@@ -4392,8 +4342,8 @@ mod tests {
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_projection_bundle_resolves_bindings() {
-        let projections = build_cmd2_q4_post_attention_prep_projections(
+    fn cmd2_resident_post_attention_prep_projection_bundle_resolves_bindings() {
+        let projections = build_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4401,19 +4351,21 @@ mod tests {
             32,
             4,
             |name, output_width, input_len| {
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap()
@@ -4425,22 +4377,22 @@ mod tests {
         assert_eq!(projections.attention_width, 24);
         assert_eq!(projections.active_experts, 4);
         assert_eq!(
-            projections.out_proj.tensor_name,
+            projections.out_proj.tensor_name(),
             "model.layers.7.self_attn.o_proj.weight"
         );
         assert_eq!(
-            projections.router.tensor_name,
+            projections.router.tensor_name(),
             "model.layers.7.mlp.gate.weight"
         );
-        assert_eq!(projections.out_proj.output_width, 32);
-        assert_eq!(projections.out_proj.cols, 24);
-        assert_eq!(projections.router.output_width, 16);
-        assert_eq!(projections.router.cols, 32);
+        assert_eq!(projections.out_proj.output_width(), 32);
+        assert_eq!(projections.out_proj.cols(), 24);
+        assert_eq!(projections.router.output_width(), 16);
+        assert_eq!(projections.router.cols(), 32);
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_resident_plan_declares_executable_shape() {
-        let projections = build_cmd2_q4_post_attention_prep_projections(
+    fn cmd2_resident_post_attention_prep_plan_declares_executable_shape() {
+        let projections = build_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4448,29 +4400,31 @@ mod tests {
             32,
             20,
             |name, output_width, input_len| {
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap()
         .unwrap();
 
-        let plan = projections.resident_plan(1024, 24, 32, 32).unwrap();
+        let plan = projections.resident_plan(24, 32, 32).unwrap();
 
         assert_eq!(
             plan,
-            Cmd2Q4PostAttentionPrepResidentPlan {
+            Cmd2ResidentPostAttentionPrepPlan {
                 layer: 7,
                 width: 32,
                 attention_width: 24,
@@ -4481,8 +4435,8 @@ mod tests {
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_resident_plan_rejects_undeclared_inputs() {
-        let projections = build_cmd2_q4_post_attention_prep_projections(
+    fn cmd2_resident_post_attention_prep_plan_rejects_undeclared_inputs() {
+        let projections = build_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4490,45 +4444,40 @@ mod tests {
             32,
             4,
             |name, output_width, input_len| {
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap()
         .unwrap();
 
-        let norm_err = projections.resident_plan(1024, 24, 32, 31).unwrap_err();
+        let norm_err = projections.resident_plan(24, 32, 31).unwrap_err();
         assert!(
             norm_err
                 .to_string()
                 .contains("norm weight length 31 does not match residual width 32"),
             "{norm_err:#}"
         );
-
-        let err = projections.resident_plan(520, 24, 32, 32).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("exceeds resident dense store length"),
-            "{err:#}"
-        );
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_resident_plan_errors_on_undeclared_shape() {
-        let projections = Cmd2Q4PostAttentionPrepProjections {
+    fn cmd2_resident_post_attention_prep_plan_errors_on_undeclared_shape() {
+        let projections = Cmd2ResidentPostAttentionPrepProjections {
             layer: 7,
-            out_proj: DenseQ4MmapMatvecProjection {
+            out_proj: ResidentMmapMatvecProjection::Q4(DenseQ4MmapMatvecProjection {
                 tensor_name: "model.layers.7.self_attn.o_proj.weight".to_string(),
                 packed_byte_offset: 128,
                 scales_byte_offset: 256,
@@ -4540,8 +4489,8 @@ mod tests {
                 groups_per_row: 2,
                 group_size: 16,
                 scale_bias_dtype: "BF16".to_string(),
-            },
-            router: DenseQ4MmapMatvecProjection {
+            }),
+            router: ResidentMmapMatvecProjection::Q4(DenseQ4MmapMatvecProjection {
                 tensor_name: "model.layers.7.mlp.gate.weight".to_string(),
                 packed_byte_offset: 128,
                 scales_byte_offset: 256,
@@ -4553,14 +4502,14 @@ mod tests {
                 groups_per_row: 2,
                 group_size: 16,
                 scale_bias_dtype: "BF16".to_string(),
-            },
+            }),
             experts: 16,
             residual_width: 32,
             attention_width: 24,
             active_experts: 4,
         };
 
-        let err = projections.resident_plan(1024, 24, 32, 32).unwrap_err();
+        let err = projections.resident_plan(24, 32, 32).unwrap_err();
         assert!(
             err.to_string()
                 .contains("projection shapes out=32x25 rows=32 router=16x32 rows=16"),
@@ -4569,8 +4518,8 @@ mod tests {
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_projection_bundle_skips_missing_bindings() {
-        let missing_out = build_cmd2_q4_post_attention_prep_projections(
+    fn cmd2_resident_post_attention_prep_projection_bundle_skips_missing_bindings() {
+        let missing_out = build_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4581,35 +4530,42 @@ mod tests {
                 if name.ends_with("o_proj.weight") {
                     return Ok(None);
                 }
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap();
         assert!(missing_out.is_none());
 
-        let disabled =
-            build_cmd2_q4_post_attention_prep_projections(7, 0, "out", 24, 32, 4, |_, _, _| {
-                panic!("disabled CMD2 Q4 prep must not request projections")
-            })
-            .unwrap();
+        let disabled = build_cmd2_resident_post_attention_prep_projections(
+            7,
+            0,
+            "out",
+            24,
+            32,
+            4,
+            |_, _, _| panic!("disabled CMD2 prep must not request projections"),
+        )
+        .unwrap();
         assert!(disabled.is_none());
     }
 
     #[test]
-    fn required_cmd2_q4_post_attention_prep_projection_errors_on_missing_bindings() {
-        let missing_out = build_required_cmd2_q4_post_attention_prep_projections(
+    fn required_cmd2_resident_post_attention_prep_projection_errors_on_missing_bindings() {
+        let missing_out = build_required_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4620,30 +4576,32 @@ mod tests {
                 if name.ends_with("o_proj.weight") {
                     return Ok(None);
                 }
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap_err();
         assert!(
             missing_out
                 .to_string()
-                .contains("missing resident output projection"),
+                .contains("missing output projection"),
             "{missing_out:#}"
         );
 
-        let missing_router = build_required_cmd2_q4_post_attention_prep_projections(
+        let missing_router = build_required_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4654,33 +4612,35 @@ mod tests {
                 if name.ends_with("mlp.gate.weight") {
                     return Ok(None);
                 }
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len,
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len,
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap_err();
         assert!(
             missing_router
                 .to_string()
-                .contains("missing resident router projection model.layers.7.mlp.gate.weight"),
+                .contains("missing router projection model.layers.7.mlp.gate.weight"),
             "{missing_router:#}"
         );
     }
 
     #[test]
-    fn cmd2_q4_post_attention_prep_projection_bundle_rejects_mismatched_shape() {
-        let err = build_cmd2_q4_post_attention_prep_projections(
+    fn cmd2_resident_post_attention_prep_projection_bundle_rejects_mismatched_shape() {
+        let err = build_cmd2_resident_post_attention_prep_projections(
             7,
             16,
             "model.layers.7.self_attn.o_proj.weight",
@@ -4688,26 +4648,28 @@ mod tests {
             32,
             4,
             |name, output_width, input_len| {
-                Ok(Some(DenseQ4MmapMatvecProjection {
-                    tensor_name: name.to_string(),
-                    packed_byte_offset: 128,
-                    scales_byte_offset: 256,
-                    biases_byte_offset: 512,
-                    rows: output_width,
-                    cols: input_len + usize::from(name.ends_with("o_proj.weight")),
-                    output_width,
-                    row_packed_bytes: input_len.div_ceil(2),
-                    groups_per_row: input_len.div_ceil(16),
-                    group_size: 16,
-                    scale_bias_dtype: "BF16".to_string(),
-                }))
+                Ok(Some(ResidentMmapMatvecProjection::Q4(
+                    DenseQ4MmapMatvecProjection {
+                        tensor_name: name.to_string(),
+                        packed_byte_offset: 128,
+                        scales_byte_offset: 256,
+                        biases_byte_offset: 512,
+                        rows: output_width,
+                        cols: input_len + usize::from(name.ends_with("o_proj.weight")),
+                        output_width,
+                        row_packed_bytes: input_len.div_ceil(2),
+                        groups_per_row: input_len.div_ceil(16),
+                        group_size: 16,
+                        scale_bias_dtype: "BF16".to_string(),
+                    },
+                )))
             },
         )
         .unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("CMD2 Q4 post-attention output projection shape is invalid")
+                .contains("CMD2 resident post-attention output projection shape is invalid")
         );
     }
 

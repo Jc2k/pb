@@ -36,8 +36,8 @@ use super::state::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
-    Cmd2Q4PostAttentionPrepProjections, DenseQ4MmapMatvecProjection, ResidentMmapMatvecProjection,
-    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    Cmd2ResidentPostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
+    ResidentMmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -991,17 +991,17 @@ impl MetalExecutionContext {
         .execute(projection, input, top_k)
     }
 
-    pub(crate) fn q4_post_attention_prep_topk(
+    pub(crate) fn resident_post_attention_prep_topk(
         &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
+        projections: &Cmd2ResidentPostAttentionPrepProjections,
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
     ) -> anyhow::Result<MetalPostAttentionPrep> {
         let dense_weights = self.dense_weights.as_ref().context(
-            "FlashMoe unsupported scheduled CMD2 Q4 post-attention prep path: resident dense Metal weights are unavailable",
+            "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: resident dense Metal weights are unavailable",
         )?;
-        MetalQ4PostAttentionPrepBuilder::new(
+        MetalResidentPostAttentionPrepBuilder::new(
             self.runtime.device,
             self.runtime.command_queue,
             &self.runtime.pipelines,
@@ -1418,30 +1418,28 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) struct MetalQ4PostAttentionPrepBuilder<'a> {
+pub(crate) struct MetalResidentPostAttentionPrepBuilder<'a> {
     device: MetalObjcId,
     command_queue: MetalObjcId,
-    q4_pipeline: MetalObjcId,
-    q4_bf16_scale_bias_pipeline: MetalObjcId,
+    pipelines: &'a MetalPipelineSet<MetalObjcId>,
     residual_rms_norm_pipeline: MetalObjcId,
     dense_weights: &'a MetalDenseWeights,
     buffers: &'a MetalBufferPool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
+impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
     pub(crate) fn new(
         device: MetalObjcId,
         command_queue: MetalObjcId,
-        pipelines: &MetalPipelineSet<MetalObjcId>,
+        pipelines: &'a MetalPipelineSet<MetalObjcId>,
         dense_weights: &'a MetalDenseWeights,
         buffers: &'a MetalBufferPool,
     ) -> Self {
         Self {
             device,
             command_queue,
-            q4_pipeline: pipelines.q4_mmap_pipeline,
-            q4_bf16_scale_bias_pipeline: pipelines.q4_mmap_bf16_scale_bias_pipeline,
+            pipelines,
             residual_rms_norm_pipeline: pipelines.residual_rms_norm_pipeline,
             dense_weights,
             buffers,
@@ -1450,22 +1448,24 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
 
     pub(crate) fn execute(
         &self,
-        projections: &Cmd2Q4PostAttentionPrepProjections,
+        projections: &Cmd2ResidentPostAttentionPrepProjections,
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
     ) -> anyhow::Result<MetalPostAttentionPrep> {
         let plan = projections.resident_plan(
-            self.dense_weights.len,
             attention_output.len(),
             residual.len(),
             post_norm_weight.len(),
         )?;
+        validate_resident_projection(
+            &projections.out_proj,
+            attention_output.len(),
+            self.dense_weights.len,
+        )?;
+        validate_resident_projection(&projections.router, residual.len(), self.dense_weights.len)?;
         let width_u32 =
             u32::try_from(plan.width).context("FlashMoe Metal CMD2 residual width exceeds u32")?;
-        let out_constants = Self::projection_constants(&projections.out_proj)?;
-        let router_constants = Self::projection_constants(&projections.router)?;
-
         unsafe {
             let mut owned = Vec::with_capacity(7);
             let attention_buffer = self.buffers.tracked_buffer_with_bytes(
@@ -1506,7 +1506,7 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
             )?;
             let router_logits_buffer = self.buffers.tracked_buffer_with_len(
                 self.device,
-                projections.router.rows * std::mem::size_of::<f32>(),
+                projections.router.rows() * std::mem::size_of::<f32>(),
                 &mut owned,
             )?;
 
@@ -1522,43 +1522,55 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
                 anyhow::bail!("failed to create Flash-MoE CMD2 post-attention compute encoder");
             }
 
-            self.encode_q4_projection(
-                encoder,
-                &projections.out_proj,
-                out_constants,
-                attention_buffer,
-                projected_buffer,
-            );
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.residual_rms_norm_pipeline,
-            );
-            set_buffer(encoder, projected_buffer, 0);
-            set_buffer(encoder, residual_input_buffer, 1);
-            set_buffer(encoder, norm_weight_buffer, 2);
-            set_buffer(encoder, residual_buffer, 3);
-            set_buffer(encoder, normed_buffer, 4);
-            set_bytes(encoder, u32_as_bytes(&width_u32), 5);
-            dispatch_single_threadgroup(encoder, 256);
-            self.encode_q4_projection(
-                encoder,
-                &projections.router,
-                router_constants,
-                normed_buffer,
-                router_logits_buffer,
-            );
+            let encode_result = (|| -> Result<()> {
+                encode_resident_projection(
+                    self.pipelines,
+                    encoder,
+                    self.dense_weights,
+                    &projections.out_proj,
+                    attention_buffer,
+                    projected_buffer,
+                    0,
+                )?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.residual_rms_norm_pipeline,
+                );
+                set_buffer(encoder, projected_buffer, 0);
+                set_buffer(encoder, residual_input_buffer, 1);
+                set_buffer(encoder, norm_weight_buffer, 2);
+                set_buffer(encoder, residual_buffer, 3);
+                set_buffer(encoder, normed_buffer, 4);
+                set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                dispatch_single_threadgroup(encoder, 256);
+                encode_resident_projection(
+                    self.pipelines,
+                    encoder,
+                    self.dense_weights,
+                    &projections.router,
+                    normed_buffer,
+                    router_logits_buffer,
+                    0,
+                )
+            })();
+            if let Err(error) = encode_result {
+                release(encoder);
+                release(command_buffer);
+                self.buffers.recycle_or_release(&owned, true);
+                return Err(error);
+            }
             msg_send_void0(encoder, sel("endEncoding"));
 
-            let context = MetalCommandContext::new("cmd2_q4_post_attention")
+            let context = MetalCommandContext::new("cmd2_resident_post_attention")
                 .with("layer", plan.layer)
                 .with("width", plan.width)
                 .with("attention_width", plan.attention_width)
                 .with("experts", plan.experts)
                 .with("top_k", plan.active_count)
                 .with("routing_topk", "cpu")
-                .with("out_proj", &projections.out_proj.tensor_name)
-                .with("router", &projections.router.tensor_name);
+                .with("out_proj", projections.out_proj.tensor_name())
+                .with("router", projections.router.tensor_name());
             if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
                 release(encoder);
                 release(command_buffer);
@@ -1570,7 +1582,7 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
             let router_logits_ptr =
                 msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
             let router_scores =
-                std::slice::from_raw_parts(router_logits_ptr, projections.router.rows).to_vec();
+                std::slice::from_raw_parts(router_logits_ptr, projections.router.rows()).to_vec();
             let active = top_k(&router_scores, plan.active_count);
             let output = MetalPostAttentionPrep::new(
                 plan.layer,
@@ -1594,67 +1606,6 @@ impl<'a> MetalQ4PostAttentionPrepBuilder<'a> {
             debug_assert_eq!(transient.len(), if owned_residual_input { 5 } else { 4 });
             self.buffers.recycle_or_release(&transient, false);
             output
-        }
-    }
-
-    fn projection_constants(
-        projection: &DenseQ4MmapMatvecProjection,
-    ) -> anyhow::Result<(u32, u32, u32, u32)> {
-        Ok((
-            u32::try_from(projection.rows).with_context(|| {
-                format!(
-                    "FlashMoe Metal CMD2 rows exceed u32 for {}",
-                    projection.tensor_name
-                )
-            })?,
-            u32::try_from(projection.cols).with_context(|| {
-                format!(
-                    "FlashMoe Metal CMD2 cols exceed u32 for {}",
-                    projection.tensor_name
-                )
-            })?,
-            u32::try_from(projection.groups_per_row).with_context(|| {
-                format!(
-                    "FlashMoe Metal CMD2 groups per row exceed u32 for {}",
-                    projection.tensor_name
-                )
-            })?,
-            u32::try_from(projection.group_size).with_context(|| {
-                format!(
-                    "FlashMoe Metal CMD2 group size exceeds u32 for {}",
-                    projection.tensor_name
-                )
-            })?,
-        ))
-    }
-
-    unsafe fn encode_q4_projection(
-        &self,
-        encoder: MetalObjcId,
-        projection: &DenseQ4MmapMatvecProjection,
-        (rows, cols, groups, group_size): (u32, u32, u32, u32),
-        input_buffer: MetalObjcId,
-        output_buffer: MetalObjcId,
-    ) {
-        unsafe {
-            let pipeline = if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
-                self.q4_bf16_scale_bias_pipeline
-            } else {
-                debug_assert_eq!(projection.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_F32);
-                self.q4_pipeline
-            };
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
-            set_buffer(encoder, self.dense_weights.buffer, 0);
-            set_buffer(encoder, input_buffer, 1);
-            set_buffer(encoder, output_buffer, 2);
-            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-            set_bytes(encoder, u32_as_bytes(&rows), 6);
-            set_bytes(encoder, u32_as_bytes(&cols), 7);
-            set_bytes(encoder, u32_as_bytes(&groups), 8);
-            set_bytes(encoder, u32_as_bytes(&group_size), 9);
-            dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
         }
     }
 }
@@ -8408,7 +8359,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn cmd2_q4_builder_rejects_state_width_mismatch_before_encoding() {
+    fn cmd2_resident_builder_rejects_state_width_mismatch_before_encoding() {
         let mmap = Arc::new(
             memmap2::MmapMut::map_anon(4096)
                 .unwrap()
@@ -8418,19 +8369,48 @@ mod tests {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
         let dense = MetalDenseWeights::new(id, mmap, 4096);
         let buffers = MetalBufferPool::default();
-        let builder = MetalQ4PostAttentionPrepBuilder {
-            device: id,
-            command_queue: id,
+        let pipelines = MetalPipelineSet {
             q4_pipeline: id,
             q4_bf16_scale_bias_pipeline: id,
+            q4_swiglu_pipeline: id,
+            q4_swiglu_bf16_scale_bias_pipeline: id,
+            q4_mmap_pipeline: id,
+            q4_mmap_bf16_scale_bias_pipeline: id,
+            q4_mmap_batch_pipeline: id,
+            q4_mmap_batch_bf16_scale_bias_pipeline: id,
+            dense_mmap_bf16_pipeline: id,
+            dense_mmap_f16_pipeline: id,
+            dense_mmap_f32_pipeline: id,
+            rms_norm_reduced_pipeline: id,
             residual_rms_norm_pipeline: id,
-            dense_weights: &dense,
-            buffers: &buffers,
+            attention_pipeline: id,
+            expert_mlp_pipeline: id,
+            silu_product_pipeline: id,
+            shared_expert_activation_pipeline: id,
+            combine_expert_phase_pipeline: id,
+            fill_zero_pipeline: id,
+            lm_head_pipeline: id,
+            topk_vocab_pipeline: id,
+            linear_conv1d_pipeline: id,
+            linear_rms_norm_qk_pipeline: id,
+            linear_decay_beta_pipeline: id,
+            linear_delta_step_pipeline: id,
+            linear_gated_rms_norm_pipeline: id,
         };
-        let projections = Cmd2Q4PostAttentionPrepProjections::new(
+        let builder =
+            MetalResidentPostAttentionPrepBuilder::new(id, id, &pipelines, &dense, &buffers);
+        let projections = Cmd2ResidentPostAttentionPrepProjections::new(
             7,
-            test_q4_projection("model.layers.7.self_attn.o_proj.weight", 4, 16),
-            test_q4_projection("model.layers.7.mlp.gate.weight", 8, 4),
+            ResidentMmapMatvecProjection::Q4(test_q4_projection(
+                "model.layers.7.self_attn.o_proj.weight",
+                4,
+                16,
+            )),
+            ResidentMmapMatvecProjection::Q4(test_q4_projection(
+                "model.layers.7.mlp.gate.weight",
+                8,
+                4,
+            )),
             8,
             4,
             16,

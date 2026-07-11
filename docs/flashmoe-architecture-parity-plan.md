@@ -167,10 +167,11 @@ Baseline reviewed on 2026-07-10:
   builder: typed projection/range validation, allocation, Q4 logits encoding, vocabulary top-k,
   submission, readback, and cleanup. Router-score and LM-head callers share that builder, and the
   resolved LM-head path returns a concrete result instead of probing `Option` availability.
-- The fused Q4 CMD2 post-attention builder is also Metal-owned end to end: it validates typed
-  projection/state widths, encodes output projection, residual-add/RMS norm, and router projection
-  in one command, performs declared CPU top-k readback, and returns GPU-resident residual/normed
-  state. `legacy.rs` now only invokes this concrete builder for that stage.
+- The fused resident CMD2 post-attention builder is also Metal-owned end to end. One
+  `Cmd2ResidentPostAttentionPrepProjections` binding resolves Q4/BF16/F16/F32 output and router
+  projections from manifest metadata, encodes both through the shared resident projection
+  dispatcher around residual-add/RMS norm, performs declared CPU top-k readback, and returns
+  GPU-resident residual/normed state. `legacy.rs` does not own production behavior for that stage.
 - `MetalRuntime` owns device discovery, shader-library compilation, the command queue, every
   required pipeline, partial-construction cleanup, and final release. `MetalExecutionContext`
   owns that runtime together with resident dense and recurrent state; `legacy.rs` no longer
@@ -358,10 +359,10 @@ Baseline reviewed on 2026-07-10:
   recurrent mixing, eight scheduler-owned K=4 positioned reads, terminal hidden state, logits, and
   top candidates without entering another runtime.
 - Local-Metal reference tests exercise both the resident-Q4 fused projection batch and one mixed
-  BF16/F16/F32 batch, fused CMD2 preparation, and scheduler-issued CMD3 active-expert plus
-  shared-expert combine against independent CPU math. Route IDs are exact and floating-point route
-  scores use an explicit numerical tolerance rather than bitwise equality across CPU and Metal
-  implementations.
+  BF16/F16/F32 batch, Q4 and BF16/F16/F32 fused CMD2 preparation, and scheduler-issued CMD3
+  active-expert plus shared-expert combine against independent CPU math. Route IDs are exact and
+  floating-point route scores use an explicit numerical tolerance rather than bitwise equality
+  across CPU and Metal implementations.
 
 The architecture is not yet at the target:
 
@@ -374,10 +375,12 @@ The architecture is not yet at the target:
   the shared runtime, including scheduler-compatible DeepStack handoff policy. Its Q4 capability
   and load path resolve only from a concrete vision executor and manifest bindings, but a real
   Qwen-VL checkpoint smoke is still required before claiming production correctness.
-- BF16/F16/F32 full-attention CMD1 now uses the same typed resident projection handle, Metal batch
-  builder, CPU/GPU input bindings, and state handoff as Q4. Full-attention non-Q4 graphs stop at the
-  named CMD2 stage; Qwen3.5 hybrid non-Q4 graphs stop at fused linear-attention CMD1. Non-Q4 CMD2,
-  shared expert, LM-head, and expert-slot implementations remain incomplete.
+- BF16/F16/F32 full-attention CMD1 and CMD2 now use the same typed resident projection handle,
+  Metal dispatch, CPU/GPU input bindings, residual/norm transition, router readback, and state
+  handoff as Q4. Qwen3/Qwen3-VL non-Q4 graphs now stop at the named LM-head stage; a family with
+  resident non-Q4 shared experts would stop at CMD3. Qwen3.5 hybrid non-Q4 graphs still stop at
+  fused linear-attention CMD1. Non-Q4 fused-linear, shared-expert, LM-head, and expert-slot
+  implementations remain incomplete.
 
 At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
 correctness closure. Typed implementations for additional variants and final legacy removal remain;
@@ -556,10 +559,10 @@ Completion evidence:
 - Independent single-layer and multi-layer fixtures cover attention math, router scores, K=4
   routes/weights, whole-slot expert reads, active/shared expert output, residual/norm transitions,
   recurrent state, deferred CMD3 handoff, terminal hidden state, logits, and candidates.
-- Local-Metal reference tests cover resident-Q4 CMD1 projection batches, CMD2 preparation, and the
-  scheduler-owned CMD3 active/shared combine. The full all-target suite passed with 635 tests and
-  five device-dependent tests ignored, the release build completed, and the required smoke printed
-  `4` on 2026-07-11.
+- Local-Metal reference tests cover resident-Q4 and BF16/F16/F32 projection/CMD2 preparation plus
+  the scheduler-owned CMD3 active/shared combine. The current full all-target suite passed with
+  653 tests and seven device-dependent tests ignored, the release build completed, and the required
+  smoke printed `4` on 2026-07-11.
 - No FlashMoe benchmark or tok/s experiment was run during Gates 1-5.
 
 ### Gate 6: Unified Variant Implementations
@@ -587,7 +590,7 @@ Current capability matrix:
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
-| Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | CMD1 implemented; unsupported at CMD2 | Descriptor and local-Metal mixed-batch parity |
+| Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | CMD1/CMD2 implemented; unsupported at LM-head | Descriptor, mixed CMD1 batch, and per-layout CMD2 local-Metal parity |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4 slots | Unsupported at fused linear-attention CMD1 | Precise capability failure |
 | Any supported family | BF16/F16 expert slots | Unsupported at active expert/CMD3 stage | Import/reference tests only |
 
@@ -720,7 +723,7 @@ For Gate 6:
 2. Resolve the text-only Qwen MoE Q4 graph first. Add its full-attention, Q/K norm, routing-scale,
    shared-expert, and K policy as typed stage metadata while keeping the scheduler/runtime/CMD
    lifecycle unchanged. Missing tensors or kernels must name the exact unresolved stage.
-3. Continue resident BF16/F16/F32 from the completed shared full-attention CMD1 binding into CMD2,
+3. Continue resident BF16/F16/F32 from the completed shared full-attention CMD1/CMD2 binding into
    fused linear attention, shared experts, and LM-head. Add BF16/F16 whole-expert slots only through
    the same scheduler leases and CMD3 handoff. Do not revive removed dense CPU/component paths as
    production continuations.
