@@ -327,10 +327,11 @@ Baseline reviewed on 2026-07-10:
   constructs that one typed input object before calling the prefill boundary. Because the shared
   graph cannot consume it yet, prefill remains a precise unsupported input-adapter error rather
   than branching inside the layer loop.
-- `VisionEncoder` construction and its image-to-patch entry, patch projection, learned position
-  interpolation, block-major coordinate policy, and spatial rotary math are also owned by
-  `vision.rs`. The remaining transformer-block, MLP, and merger methods are temporary explicit
-  legacy impl shims to be moved as the next ownership slice; they are not an alternate encoder.
+- `VisionEncoder` construction, image-to-patch entry, patch projection, learned position
+  interpolation, block-major coordinate policy, spatial rotary math, transformer residual blocks,
+  self-attention, ViT MLP execution, DeepStack/spatial merging, dense bias application, and
+  normalization are owned by `vision.rs`. `legacy.rs` no longer defines or implements the image
+  preprocessor, vision config, or vision encoder.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -357,8 +358,8 @@ The architecture is not yet at the target:
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
   real-checkpoint smoke evidence. Qwen-VL now has typed preprocessing and a pre-MoE input adapter,
-  while the remaining ViT block/merger helpers and graph consumption are unresolved; capability
-  resolution still reports the input-adapter stage as unsupported.
+  while graph consumption is unresolved; capability resolution still reports the input-adapter
+  stage as unsupported.
 - BF16/F16 dense and expert storage have import/reference support but no typed production graph
   implementations.
 

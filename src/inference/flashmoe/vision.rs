@@ -489,6 +489,303 @@ impl VisionEncoder {
         }
         Ok(())
     }
+
+    fn vit_block(
+        &self,
+        layer: usize,
+        hidden: &mut Vec<Vec<f32>>,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<()> {
+        let norm1_weight = format!("visual.blocks.{layer}.norm1.weight");
+        let norm1_bias = format!("visual.blocks.{layer}.norm1.bias");
+        let normed = hidden
+            .iter()
+            .map(|value| self.layer_norm_named(value, &norm1_weight, &norm1_bias))
+            .collect::<Result<Vec<_>>>()?;
+        let attention =
+            self.vit_attention(layer, &normed, self.config.embed_dim, grid_h, grid_w)?;
+        for (value, delta) in hidden.iter_mut().zip(attention.iter()) {
+            for (value, delta) in value.iter_mut().zip(delta.iter()) {
+                *value += delta;
+            }
+        }
+
+        let norm2_weight = format!("visual.blocks.{layer}.norm2.weight");
+        let norm2_bias = format!("visual.blocks.{layer}.norm2.bias");
+        let normed = hidden
+            .iter()
+            .map(|value| self.layer_norm_named(value, &norm2_weight, &norm2_bias))
+            .collect::<Result<Vec<_>>>()?;
+        let mlp = normed
+            .iter()
+            .map(|value| self.vit_mlp(layer, value))
+            .collect::<Result<Vec<_>>>()?;
+        for (value, delta) in hidden.iter_mut().zip(mlp.iter()) {
+            for (value, delta) in value.iter_mut().zip(delta.iter()) {
+                *value += delta;
+            }
+        }
+        Ok(())
+    }
+
+    fn vit_attention(
+        &self,
+        layer: usize,
+        hidden: &[Vec<f32>],
+        embed_dim: usize,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let num_heads = self.config.num_heads;
+        let head_dim = embed_dim / num_heads;
+        let num_tokens = hidden.len();
+        let qkv_name = format!("visual.blocks.{layer}.attn.qkv.weight");
+        let qkv_bias = format!("visual.blocks.{layer}.attn.qkv.bias");
+        let projection_name = format!("visual.blocks.{layer}.attn.proj.weight");
+        let projection_bias = format!("visual.blocks.{layer}.attn.proj.bias");
+        let qkv_width = 3 * embed_dim;
+        let mut all_qkv = hidden
+            .iter()
+            .map(|value| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&qkv_name, value, qkv_width)?
+                    .with_context(|| format!("vision: required tensor '{qkv_name}' is missing"))?;
+                self.vit_add_bias(&qkv_bias, projected)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut queries = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut keys = vec![vec![0.0f32; embed_dim]; num_tokens];
+        let mut values = vec![vec![0.0f32; embed_dim]; num_tokens];
+        for (token, qkv) in all_qkv.iter_mut().enumerate() {
+            queries[token].copy_from_slice(&qkv[..embed_dim]);
+            keys[token].copy_from_slice(&qkv[embed_dim..2 * embed_dim]);
+            values[token].copy_from_slice(&qkv[2 * embed_dim..]);
+        }
+
+        let coords = block_major_patch_coords(grid_h, grid_w, self.config.merge_size);
+        if coords.len() != num_tokens {
+            bail!(
+                "vision: {} rotary coordinates for {num_tokens} attention tokens",
+                coords.len()
+            );
+        }
+        for (token, (row, col)) in coords.into_iter().enumerate() {
+            apply_vision_spatial_rotary(&mut queries[token], row, col, head_dim, 10_000.0);
+            apply_vision_spatial_rotary(&mut keys[token], row, col, head_dim, 10_000.0);
+        }
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attention_output = vec![vec![0.0f32; embed_dim]; num_tokens];
+        for head in 0..num_heads {
+            let head_start = head * head_dim;
+            let head_end = head_start + head_dim;
+            let mut scores = vec![0.0f32; num_tokens * num_tokens];
+            for query in 0..num_tokens {
+                for key in 0..num_tokens {
+                    scores[query * num_tokens + key] = queries[query][head_start..head_end]
+                        .iter()
+                        .zip(keys[key][head_start..head_end].iter())
+                        .map(|(query, key)| query * key)
+                        .sum::<f32>()
+                        * scale;
+                }
+                let row = &mut scores[query * num_tokens..(query + 1) * num_tokens];
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                for score in row.iter_mut() {
+                    *score = (*score - max).exp();
+                }
+                let sum = row.iter().sum::<f32>();
+                if sum > 0.0 {
+                    for score in row.iter_mut() {
+                        *score /= sum;
+                    }
+                }
+            }
+            for query in 0..num_tokens {
+                for key in 0..num_tokens {
+                    let weight = scores[query * num_tokens + key];
+                    for (output, value) in attention_output[query][head_start..head_end]
+                        .iter_mut()
+                        .zip(values[key][head_start..head_end].iter())
+                    {
+                        *output += weight * value;
+                    }
+                }
+            }
+        }
+
+        attention_output
+            .into_iter()
+            .map(|value| {
+                let projected = self
+                    .dense
+                    .matvec_tensor_prefix(&projection_name, &value, embed_dim)?
+                    .with_context(|| {
+                        format!("vision: required tensor '{projection_name}' is missing")
+                    })?;
+                self.vit_add_bias(&projection_bias, projected)
+            })
+            .collect()
+    }
+
+    fn vit_mlp(&self, layer: usize, hidden: &[f32]) -> Result<Vec<f32>> {
+        let embed_dim = self.config.embed_dim;
+        let mlp_hidden = self.config.mlp_hidden_size();
+        let fc1_name = format!("visual.blocks.{layer}.mlp.fc1.weight");
+        let fc1_bias = format!("visual.blocks.{layer}.mlp.fc1.bias");
+        let fc2_name = format!("visual.blocks.{layer}.mlp.fc2.weight");
+        let fc2_bias = format!("visual.blocks.{layer}.mlp.fc2.bias");
+        let mut middle = self
+            .dense
+            .matvec_tensor_prefix(&fc1_name, hidden, mlp_hidden)?
+            .with_context(|| format!("vision: required tensor '{fc1_name}' is missing"))?;
+        middle = self.vit_add_bias(&fc1_bias, middle)?;
+        for value in middle.iter_mut() {
+            *value = gelu_approx(*value);
+        }
+        let output = self
+            .dense
+            .matvec_tensor_prefix(&fc2_name, &middle, embed_dim)?
+            .with_context(|| format!("vision: required tensor '{fc2_name}' is missing"))?;
+        self.vit_add_bias(&fc2_bias, output)
+    }
+
+    fn merge_visual_tokens(
+        &self,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.merge_visual_tokens_with_prefix("visual.merger", false, hidden, grid_h, grid_w)
+    }
+
+    fn merge_visual_tokens_with_prefix(
+        &self,
+        prefix: &str,
+        use_postshuffle_norm: bool,
+        hidden: &[Vec<f32>],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let embed_dim = self.config.embed_dim;
+        let merge_size = self.config.merge_size;
+        let merged_h = grid_h / merge_size;
+        let merged_w = grid_w / merge_size;
+        let group_size = merge_size * merge_size;
+        let concat_dim = group_size * embed_dim;
+        let output_dim = self.config.out_hidden_size.unwrap_or(self.text_hidden_size);
+        let qwen3_norm_weight = format!("{prefix}.norm.weight");
+        let has_qwen3_names = self.dense.registry().tensor(&qwen3_norm_weight).is_some();
+        let (norm_weight, norm_bias, fc1_weight, fc1_bias, fc2_weight, fc2_bias) =
+            if has_qwen3_names {
+                (
+                    qwen3_norm_weight,
+                    format!("{prefix}.norm.bias"),
+                    format!("{prefix}.linear_fc1.weight"),
+                    format!("{prefix}.linear_fc1.bias"),
+                    format!("{prefix}.linear_fc2.weight"),
+                    format!("{prefix}.linear_fc2.bias"),
+                )
+            } else {
+                (
+                    format!("{prefix}.ln_q.weight"),
+                    format!("{prefix}.ln_q.bias"),
+                    format!("{prefix}.mlp.0.weight"),
+                    format!("{prefix}.mlp.0.bias"),
+                    format!("{prefix}.mlp.2.weight"),
+                    format!("{prefix}.mlp.2.bias"),
+                )
+            };
+
+        let mut merged = Vec::with_capacity(merged_h * merged_w);
+        for group in 0..merged_h * merged_w {
+            let mut concatenated = Vec::with_capacity(concat_dim);
+            if use_postshuffle_norm {
+                for offset in 0..group_size {
+                    concatenated.extend_from_slice(&hidden[group * group_size + offset]);
+                }
+                concatenated = self.layer_norm_named(&concatenated, &norm_weight, &norm_bias)?;
+            } else {
+                for offset in 0..group_size {
+                    let normalized = self.layer_norm_named(
+                        &hidden[group * group_size + offset],
+                        &norm_weight,
+                        &norm_bias,
+                    )?;
+                    concatenated.extend_from_slice(&normalized);
+                }
+            }
+            let mut middle = self
+                .dense
+                .matvec_tensor_prefix(&fc1_weight, &concatenated, concat_dim)?
+                .with_context(|| format!("vision: required tensor '{fc1_weight}' is missing"))?;
+            middle = self.vit_add_bias(&fc1_bias, middle)?;
+            for value in middle.iter_mut() {
+                *value = gelu_approx(*value);
+            }
+            let output = self
+                .dense
+                .matvec_tensor_prefix(&fc2_weight, &middle, output_dim)?
+                .with_context(|| format!("vision: required tensor '{fc2_weight}' is missing"))?;
+            merged.push(self.vit_add_bias(&fc2_bias, output)?);
+        }
+        Ok(merged)
+    }
+
+    fn vit_add_bias(&self, bias_name: &str, mut values: Vec<f32>) -> Result<Vec<f32>> {
+        if let Some(bias) = self.dense.read_full_tensor_f32(bias_name)? {
+            for (value, bias) in values.iter_mut().zip(bias.iter()) {
+                *value += bias;
+            }
+        }
+        Ok(values)
+    }
+
+    fn layer_norm_named(
+        &self,
+        input: &[f32],
+        weight_name: &str,
+        bias_name: &str,
+    ) -> Result<Vec<f32>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mean = input.iter().sum::<f32>() / input.len() as f32;
+        let variance = input
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f32>()
+            / input.len() as f32;
+        let inverse_std = 1.0 / (variance + 1e-6).sqrt();
+        let weight = self.dense.read_full_tensor_f32(weight_name)?;
+        let bias = self.dense.read_full_tensor_f32(bias_name)?;
+        Ok(input
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let normalized = (value - mean) * inverse_std;
+                let weight = weight
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied()
+                    .unwrap_or(1.0);
+                let bias = bias
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied()
+                    .unwrap_or(0.0);
+                normalized * weight + bias
+            })
+            .collect())
+    }
+}
+
+fn gelu_approx(value: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    0.5 * value * (1.0 + (SQRT_2_OVER_PI * (value + 0.044_715 * value * value * value)).tanh())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
