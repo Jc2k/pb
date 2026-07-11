@@ -129,6 +129,8 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 - `cache`: the pull-time artifact transaction: validate source artifacts, invoke dense conversion
   and expert packing, and atomically publish one runtime cache. Format-specific conversion and
   packing implementations belong to `weights` and `experts`, not to runtime or `legacy`.
+- `safetensors`: validated source-header parsing and absolute source-range metadata shared by
+  cache importers. It owns no runtime storage or execution policy.
 - `capabilities`: concrete model/device/storage capability resolution and precise unsupported
   errors. It returns a fully resolved graph, not a list of family-level stage labels.
 - `weights`: resident aligned dense blob, manifest, typed tensor/projection handles, dtype/layout
@@ -278,6 +280,10 @@ Baseline reviewed on 2026-07-11:
   decoded/component Q4, CPU projection, and recurrent compatibility implementations are test-only.
   This satisfies Gate 7's no-production-owner criterion, but does not complete Gate 7 while Gate 6
   checkpoint evidence and the post-refactor benchmark work remain open.
+- Pull-time dense conversion is now weights-owned: MLX native-Q4 companion resolution, logical
+  shape and quantization metadata, aligned offsets/padding, mmap source reads, post-hoc Q4
+  conversion, and dense/vision store publication moved together. `safetensors.rs` owns shared,
+  bounds-checked source-header parsing. `cache.rs` only coordinates those owners.
 - `FlashMoeExecutionScheduler` now owns the resolved graph and the sole production expert-read
   coordinator. `runtime.rs` resolves CMD1, attention placement, CMD2, and routing through that
   owner; it no longer calls graph builders or expert issue/finish APIs directly. CMD3 uses a typed
@@ -432,9 +438,9 @@ The architecture is not yet at the target:
 
 - The engine container, load path, and public generation/session orchestration are now in
   `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
-  is in `weights.rs`. The extracted `cache.rs` transaction still contains format-specific dense
-  conversion and expert packing helpers that must move to `weights.rs` and `experts.rs`. Expert
-  fixture implementation and test/compatibility helpers remain in test-only `legacy.rs`.
+  is in `weights.rs`. The extracted `cache.rs` transaction still contains format-specific expert
+  packing helpers that must move to `experts.rs`. Expert fixture implementation and
+  test/compatibility helpers remain in test-only `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs

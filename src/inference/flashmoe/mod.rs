@@ -13,6 +13,7 @@ mod metal;
 mod model_family;
 mod planning;
 mod runtime;
+mod safetensors;
 mod scheduler;
 mod state;
 mod text;

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -10,17 +11,18 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::experts::{
-    AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertSourceTensor,
-    expert_scale_bias_dtype_size,
+    AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
+    ExpertSourceTensor, expert_scale_bias_dtype_size,
 };
 #[cfg(test)]
 use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
-use super::math::q4_dequantize_rows_with_group_size;
+use super::math::{q4_dequantize_rows_with_group_size, quantize_q4};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
 use super::model_family::{QwenModelConfig, QwenMoeFamily};
 use super::runtime::MetalExecutionFacade;
+use super::safetensors::{SafetensorShard, parse_safetensors_header};
 use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand};
 use super::state::{
     FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, LinearAttentionLayout,
@@ -63,6 +65,347 @@ pub(crate) const TENSOR_ALIGNMENT: u64 = 4096;
 const DENSE_PROJECTION_TILE_BYTES: usize = 64 * 1024 * 1024;
 const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+pub(super) const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
+
+pub(super) fn skip_flashmoe_runtime_tensor(canonical_tensor: &str) -> bool {
+    canonical_tensor.starts_with("mtp.")
+}
+
+pub(super) fn is_q4_aux_tensor_name(canonical_tensor: &str) -> bool {
+    canonical_tensor.ends_with(".scales") || canonical_tensor.ends_with(".biases")
+}
+
+pub(super) fn q4_weight_name_for_aux(tensor: &str) -> String {
+    tensor
+        .strip_suffix(".scales")
+        .or_else(|| tensor.strip_suffix(".biases"))
+        .map(|base| format!("{base}.weight"))
+        .unwrap_or_else(|| tensor.to_string())
+}
+
+pub(super) fn q4_aux_tensor_name(weight: &str, suffix: &str) -> String {
+    weight
+        .strip_suffix(".weight")
+        .map(|base| format!("{base}.{suffix}"))
+        .unwrap_or_else(|| format!("{weight}.{suffix}"))
+}
+
+pub(super) fn logical_shape_for_mlx_q4(shape: &[usize]) -> Result<Vec<usize>> {
+    let Some((last, prefix)) = shape.split_last() else {
+        bail!("native dense q4 tensor has empty shape");
+    };
+    let cols = last
+        .checked_mul(8)
+        .context("native dense q4 logical column count overflow")?;
+    let mut logical = prefix.to_vec();
+    logical.push(cols);
+    Ok(logical)
+}
+
+pub(super) fn dense_native_q4_sources(
+    snapshot_dir: &Path,
+    weight_map: &BTreeMap<String, String>,
+    shard_cache: &mut BTreeMap<String, SafetensorShard>,
+    tensor: &str,
+) -> Result<Option<DenseQ4SourceRefs>> {
+    let canonical_tensor = canonical_hf_tensor_name(tensor);
+    if !canonical_tensor.ends_with(".weight") {
+        return Ok(None);
+    }
+    let Some(weight_shard) = weight_map.get(tensor) else {
+        return Ok(None);
+    };
+    if !shard_cache.contains_key(weight_shard) {
+        let path = snapshot_dir.join(weight_shard);
+        shard_cache.insert(weight_shard.clone(), parse_safetensors_header(&path)?);
+    }
+    let (weight_shape, weight_offsets) = {
+        let weight_info = shard_cache
+            .get(weight_shard)
+            .and_then(|shard| shard.tensors.get(tensor))
+            .with_context(|| format!("tensor {tensor} missing from safetensors header"))?;
+        if !weight_info.dtype.eq_ignore_ascii_case("U32") {
+            return Ok(None);
+        }
+        (weight_info.shape.clone(), weight_info.data_offsets)
+    };
+
+    let scales_name = q4_aux_tensor_name(tensor, "scales");
+    let biases_name = q4_aux_tensor_name(tensor, "biases");
+    let (Some(scales_shard), Some(biases_shard)) =
+        (weight_map.get(&scales_name), weight_map.get(&biases_name))
+    else {
+        return Ok(None);
+    };
+    for shard in [scales_shard, biases_shard] {
+        if !shard_cache.contains_key(shard) {
+            let path = snapshot_dir.join(shard);
+            shard_cache.insert(shard.clone(), parse_safetensors_header(&path)?);
+        }
+    }
+    let scales_info = shard_cache
+        .get(scales_shard)
+        .and_then(|shard| shard.tensors.get(&scales_name))
+        .with_context(|| format!("tensor {scales_name} missing from safetensors header"))?;
+    let biases_info = shard_cache
+        .get(biases_shard)
+        .and_then(|shard| shard.tensors.get(&biases_name))
+        .with_context(|| format!("tensor {biases_name} missing from safetensors header"))?;
+    if !scales_info
+        .dtype
+        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        || !biases_info
+            .dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+    {
+        bail!(
+            "native dense q4 tensor {tensor} expects BF16 scales/biases, found {}/{}",
+            scales_info.dtype,
+            biases_info.dtype
+        );
+    }
+    let logical_shape = logical_shape_for_mlx_q4(&weight_shape)?;
+    let layout = dense_q4_layout_with_scale_bias_dtype(
+        &logical_shape,
+        GROUP_SIZE,
+        EXPERT_SCALE_BIAS_DTYPE_BF16,
+    )?;
+    let weight_bytes = weight_offsets[1].saturating_sub(weight_offsets[0]);
+    let scales_bytes = scales_info.data_offsets[1].saturating_sub(scales_info.data_offsets[0]);
+    let biases_bytes = biases_info.data_offsets[1].saturating_sub(biases_info.data_offsets[0]);
+    if weight_bytes != layout.packed_bytes as u64
+        || scales_bytes != layout.scales_bytes as u64
+        || biases_bytes != layout.scales_bytes as u64
+    {
+        bail!(
+            "native dense q4 tensor {tensor} layout mismatch: weight/scales/biases bytes {weight_bytes}/{scales_bytes}/{biases_bytes}, expected {}/{}/{}",
+            layout.packed_bytes,
+            layout.scales_bytes,
+            layout.scales_bytes
+        );
+    }
+    Ok(Some(DenseQ4SourceRefs {
+        scales_shard: scales_shard.clone(),
+        scales_offsets: scales_info.data_offsets,
+        biases_shard: biases_shard.clone(),
+        biases_offsets: biases_info.data_offsets,
+        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+    }))
+}
+
+pub(super) fn dense_tensor_quantization(
+    canonical_tensor: &str,
+    tensor_dtype: &str,
+    native_q4: &Option<DenseQ4SourceRefs>,
+) -> TensorQuantization {
+    let _ = (canonical_tensor, tensor_dtype);
+    if let Some(native_q4) = native_q4 {
+        TensorQuantization::Q4 {
+            group_size: GROUP_SIZE,
+            format: DENSE_Q4_MLX_FORMAT.to_string(),
+            scale_bias_dtype: native_q4.scale_bias_dtype.clone(),
+        }
+    } else {
+        TensorQuantization::None
+    }
+}
+
+pub(super) fn align_to(value: u64, alignment: u64) -> u64 {
+    if alignment == 0 {
+        return value;
+    }
+    value.div_ceil(alignment) * alignment
+}
+
+pub(super) fn write_dense_tensor_store(
+    snapshot_dir: &Path,
+    destination: &Path,
+    dense_tensors: &[DenseTensorRef],
+) -> Result<()> {
+    let mut out = fs::File::create(destination).with_context(|| {
+        format!(
+            "failed to create dense tensor store {}",
+            destination.display()
+        )
+    })?;
+    let mut current = 0u64;
+    let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
+    for tensor in dense_tensors {
+        if !shard_cache.contains_key(&tensor.shard) {
+            let path = snapshot_dir.join(&tensor.shard);
+            let file = fs::File::open(&path)
+                .with_context(|| format!("failed to open shard {}", path.display()))?;
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .map(&file)
+                    .with_context(|| format!("failed to memory-map {}", path.display()))?
+            };
+            shard_cache.insert(
+                tensor.shard.clone(),
+                (mmap, parse_safetensors_header(&path)?),
+            );
+        }
+        if current < tensor.runtime_offset {
+            write_padding(&mut out, tensor.runtime_offset - current)?;
+            current = tensor.runtime_offset;
+        }
+        if let Some(q4_sources) = &tensor.q4_sources {
+            for shard in [&q4_sources.scales_shard, &q4_sources.biases_shard] {
+                if !shard_cache.contains_key(shard) {
+                    let path = snapshot_dir.join(shard);
+                    let file = fs::File::open(&path)
+                        .with_context(|| format!("failed to open shard {}", path.display()))?;
+                    let mmap = unsafe {
+                        memmap2::MmapOptions::new()
+                            .map(&file)
+                            .with_context(|| format!("failed to memory-map {}", path.display()))?
+                    };
+                    shard_cache.insert(shard.clone(), (mmap, parse_safetensors_header(&path)?));
+                }
+            }
+        }
+        let (bytes, shard) = shard_cache.get(&tensor.shard).expect("inserted above");
+        let start = shard.data_start + tensor.source_offsets[0];
+        let end = shard.data_start + tensor.source_offsets[1];
+        let raw = &bytes[start as usize..end as usize];
+        match &tensor.quantization {
+            TensorQuantization::None => {
+                out.write_all(raw)
+                    .with_context(|| format!("failed to write dense tensor {}", tensor.tensor))?;
+            }
+            TensorQuantization::Q4 {
+                group_size,
+                scale_bias_dtype,
+                ..
+            } => {
+                let layout = dense_q4_layout_with_scale_bias_dtype(
+                    &tensor.shape,
+                    *group_size,
+                    scale_bias_dtype,
+                )?;
+                if let Some(q4_sources) = &tensor.q4_sources {
+                    if raw.len() != layout.packed_bytes {
+                        bail!(
+                            "native dense q4 packed byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            raw.len(),
+                            layout.packed_bytes
+                        );
+                    }
+                    out.write_all(raw).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 packed values for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    let (scale_bytes, scale_shard) = shard_cache
+                        .get(&q4_sources.scales_shard)
+                        .expect("inserted above");
+                    let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                    let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                    let scales = &scale_bytes[scale_start as usize..scale_end as usize];
+                    if scales.len() != layout.scales_bytes {
+                        bail!(
+                            "native dense q4 scale byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            scales.len(),
+                            layout.scales_bytes
+                        );
+                    }
+                    out.write_all(scales).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 scales for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    let (bias_bytes, bias_shard) = shard_cache
+                        .get(&q4_sources.biases_shard)
+                        .expect("inserted above");
+                    let bias_start = bias_shard.data_start + q4_sources.biases_offsets[0];
+                    let bias_end = bias_shard.data_start + q4_sources.biases_offsets[1];
+                    let biases = &bias_bytes[bias_start as usize..bias_end as usize];
+                    if biases.len() != layout.scales_bytes {
+                        bail!(
+                            "native dense q4 bias byte length mismatch for {}: raw={} expected={}",
+                            tensor.tensor,
+                            biases.len(),
+                            layout.scales_bytes
+                        );
+                    }
+                    out.write_all(biases).with_context(|| {
+                        format!(
+                            "failed to write native dense q4 biases for {}",
+                            tensor.tensor
+                        )
+                    })?;
+                    current = current.saturating_add(tensor.byte_len);
+                    continue;
+                }
+                if !scale_bias_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_F32) {
+                    bail!(
+                        "post-hoc dense q4 quantization for {} only supports F32 scale/bias output, requested {}",
+                        tensor.tensor,
+                        scale_bias_dtype
+                    );
+                }
+                let values = decode_dense_tensor_f32(&tensor.dtype, raw).with_context(|| {
+                    format!(
+                        "failed to decode dense tensor {} as {} before q4 quantization",
+                        tensor.tensor, tensor.dtype
+                    )
+                })?;
+                let packed =
+                    quantize_q4(&values, &tensor.shape, *group_size).with_context(|| {
+                        format!(
+                            "failed to quantize dense tensor {} into q4 groups",
+                            tensor.tensor
+                        )
+                    })?;
+                if packed.values.len() != layout.packed_bytes
+                    || packed.scales.len() != layout.scales_bytes / std::mem::size_of::<f32>()
+                    || packed.biases.len() != layout.scales_bytes / std::mem::size_of::<f32>()
+                    || tensor.byte_len as usize != layout.total_bytes
+                {
+                    bail!(
+                        "dense q4 layout mismatch for {}: packed={} scales={} biases={} manifest_bytes={} computed_bytes={}",
+                        tensor.tensor,
+                        packed.values.len(),
+                        packed.scales.len(),
+                        packed.biases.len(),
+                        tensor.byte_len,
+                        layout.total_bytes
+                    );
+                }
+                out.write_all(&packed.values).with_context(|| {
+                    format!(
+                        "failed to write dense q4 packed values for {}",
+                        tensor.tensor
+                    )
+                })?;
+                for scale in &packed.scales {
+                    out.write_all(&scale.to_le_bytes())?;
+                }
+                for bias in &packed.biases {
+                    out.write_all(&bias.to_le_bytes())?;
+                }
+            }
+        }
+        current = current.saturating_add(tensor.byte_len);
+    }
+    Ok(())
+}
+
+pub(super) fn write_padding(out: &mut fs::File, mut bytes: u64) -> Result<()> {
+    const ZEROES: [u8; 4096] = [0; 4096];
+    while bytes > 0 {
+        let n = usize::try_from(bytes.min(ZEROES.len() as u64)).unwrap_or(ZEROES.len());
+        out.write_all(&ZEROES[..n])
+            .context("failed to write tensor alignment padding")?;
+        bytes -= n as u64;
+    }
+    Ok(())
+}
 
 pub(super) fn dense_f32_matvec_rows(
     weights: &[f32],
@@ -4703,6 +5046,31 @@ mod tests {
         };
 
         validate_required_tensor_manifest(&layout_config(), &registry).unwrap();
+    }
+
+    #[test]
+    fn dense_cache_conversion_resolves_native_mlx_q4_layout() {
+        assert_eq!(logical_shape_for_mlx_q4(&[3, 4]).unwrap(), vec![3, 32]);
+        let native = DenseQ4SourceRefs {
+            scales_shard: "scales.safetensors".to_string(),
+            scales_offsets: [0, 8],
+            biases_shard: "biases.safetensors".to_string(),
+            biases_offsets: [0, 8],
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        };
+
+        assert_eq!(
+            dense_tensor_quantization(
+                "model.layers.0.self_attn.q_proj.weight",
+                "U32",
+                &Some(native)
+            ),
+            TensorQuantization::Q4 {
+                group_size: GROUP_SIZE,
+                format: DENSE_Q4_MLX_FORMAT.to_string(),
+                scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            }
+        );
     }
 
     fn runtime_matrix(
