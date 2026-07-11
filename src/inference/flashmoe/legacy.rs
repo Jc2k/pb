@@ -78,21 +78,22 @@ use super::experts::take_reusable_expert_bytes;
 #[cfg(test)]
 use super::experts::write_all_at_positioned;
 use super::experts::{
-    AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors,
+    AggregateExpertLayout, AggregateExpertTensorKind, AggregateExpertTensors, DenseExpertDtype,
     DirectExpertTensorShape, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
-    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertPackMetadata, ExpertRawPayload,
-    ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor, ExpertSlotStore, FixedQ4ExpertPayload,
-    FixedQ4ExpertProjection, FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor,
-    Q4MatvecPayload, aggregate_expert_tensor_kind, aggregate_expert_tensors,
-    aggregate_native_q4_enabled, build_expert_pack, build_fixed_native_q4_expert_pack,
-    build_native_q4_expert_pack, cleanup_stale_expert_temp_files,
-    expected_expert_pack_from_records, expected_expert_pack_record_from_source,
-    expected_native_q4_expert_record_from_input, expert_tensor_byte_range,
-    first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
-    fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
-    pbq4_expert_pack_wire_size, rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4,
-    single_aggregate_expert_tensor, validate_aggregate_expert_tensor_shape,
-    validate_direct_expert_tensor_group,
+    ExpectedExpertPack, ExpectedExpertPackRecord, ExpertLayerStorageFormat, ExpertMlpProjection,
+    ExpertPackMetadata, ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor,
+    ExpertSlotSpec, ExpertSlotStore, ExpertStorageLayout, FixedDenseExpertRecordInput,
+    FixedDenseExpertSlotSpec, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec,
+    NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload, aggregate_expert_tensor_kind,
+    aggregate_expert_tensors, aggregate_native_q4_enabled, build_expert_pack,
+    build_fixed_dense_expert_pack, build_fixed_native_q4_expert_pack, build_native_q4_expert_pack,
+    cleanup_stale_expert_temp_files, expected_expert_pack_from_records,
+    expected_expert_pack_record_from_source, expected_native_q4_expert_record_from_input,
+    expert_tensor_byte_range, first_missing_expert_pack_for_shape,
+    fixed_native_q4_aggregate_layout, fixed_q4_payload_from_pbq4_records,
+    native_q4_slice_byte_ranges, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
+    rewrite_expert_layer_pack, rewrite_pbq4_layer_to_fixed_q4, single_aggregate_expert_tensor,
+    validate_aggregate_expert_tensor_shape, validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
 use super::experts::{
@@ -853,6 +854,11 @@ pub fn plan_unchecked_with_cache_version(
     let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
     let runtime_dir = model_cache_dir.join(cache_version);
     let vl = is_qwen3_vl(&model);
+    let quantization = if model == QWEN35_BF16_MODEL {
+        ExpertQuantization::Bf16
+    } else {
+        ExpertQuantization::FourBitProduction
+    };
     FlashMoePlan {
         vision_weights: vl.then(|| runtime_dir.join("vision_weights.bin")),
         vision_manifest: vl.then(|| runtime_dir.join("vision_weights.json")),
@@ -868,7 +874,7 @@ pub fn plan_unchecked_with_cache_version(
         model_cache_dir,
         uses_metal: true,
         streams_experts_from_nand: true,
-        quantization: ExpertQuantization::FourBitProduction,
+        quantization,
         routing_policy,
     }
 }
@@ -1140,7 +1146,9 @@ where
         .with_scheduled_active_experts(routing_policy.active_experts)?;
     progress("model_layout", phase_started.elapsed());
     phase_started = Instant::now();
-    let upgraded_expert_layers = ensure_fixed_q4_expert_cache(plan, &model_layout)?;
+    let expert_slot_spec = resolved_expert_slot_spec(plan, &model_layout)?;
+    let upgraded_expert_layers =
+        ensure_expert_execution_cache(plan, &model_layout, expert_slot_spec)?;
     if upgraded_expert_layers > 0 {
         tracing::info!(
             model = %plan.model,
@@ -1201,7 +1209,7 @@ where
     let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
-    let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
+    let experts = ExpertSlotStore::open_with_slot_spec(plan.experts_dir.clone(), expert_slot_spec)?;
     let expert_storage = experts
         .resolve_execution_descriptor(model_layout.layers, model_layout.experts_per_layer)?;
     progress("expert_store", phase_started.elapsed());
@@ -5216,12 +5224,12 @@ impl ScheduledCmd3ExpertPayload for ExpertWeights {
     ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
         let fixed_q4 = self.fixed_q4_required()?;
         let gate = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Gate,
+            ExpertMlpProjection::Gate,
             width,
             fixed_q4.spec.intermediate_size,
         );
         let up = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Up,
+            ExpertMlpProjection::Up,
             width,
             fixed_q4.spec.intermediate_size,
         );
@@ -5232,7 +5240,7 @@ impl ScheduledCmd3ExpertPayload for ExpertWeights {
                 self.expert
             );
         };
-        let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
+        let Some(down) = fixed_q4.matvec_payload(ExpertMlpProjection::Down, gate.rows, width)
         else {
             bail!(
                 "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {} expert {} does not provide down payload for width {width}",
@@ -5250,6 +5258,12 @@ impl ExpertWeights {
     fn from_raw_read(raw: ExpertRawRead) -> Result<Self> {
         let (records, fixed_q4, packed_prefix) = match raw.payload {
             ExpertRawPayload::Pbq4(bytes) => {
+                let fixed_q4_spec = raw.slot_spec.fixed_q4().with_context(|| {
+                    format!(
+                        "PBQ4 import payload at layer {} expert {} cannot populate non-Q4 execution storage",
+                        raw.layer, raw.expert
+                    )
+                })?;
                 let records =
                     parse_pbq4_expert_pack(&bytes, Some(&raw.metadata)).with_context(|| {
                         format!(
@@ -5260,7 +5274,7 @@ impl ExpertWeights {
                 match fixed_q4_payload_from_pbq4_records(
                     raw.layer,
                     raw.expert,
-                    raw.fixed_q4,
+                    fixed_q4_spec,
                     &records,
                     raw.recycle_pool,
                 ) {
@@ -5277,6 +5291,12 @@ impl ExpertWeights {
                 }
             }
             ExpertRawPayload::FixedQ4(fixed_q4) => (Vec::new(), Some(fixed_q4), Vec::new()),
+            ExpertRawPayload::FixedDense(fixed_dense) => {
+                bail!(
+                    "legacy ExpertWeights adapter does not implement fixed {} expert payloads",
+                    fixed_dense.spec.dtype.as_str()
+                )
+            }
         };
         Ok(Self {
             layer: raw.layer,
@@ -5303,7 +5323,7 @@ impl ExpertWeights {
     pub(super) fn project(&self, hidden: &[f32], width: usize) -> Result<Vec<f32>> {
         let fixed_q4 = self.fixed_q4_required()?;
         fixed_q4
-            .project_cpu(FixedQ4ExpertProjection::Down, hidden, width)
+            .project_cpu(ExpertMlpProjection::Down, hidden, width)
             .with_context(|| {
                 format!(
                     "fixed Q4 expert layer {} expert {} has no compatible down projection",
@@ -5333,7 +5353,7 @@ impl ExpertWeights {
     ) -> Result<Vec<f32>> {
         let gate = fixed_q4
             .project_cpu(
-                FixedQ4ExpertProjection::Gate,
+                ExpertMlpProjection::Gate,
                 hidden,
                 fixed_q4.spec.intermediate_size,
             )
@@ -5345,7 +5365,7 @@ impl ExpertWeights {
             })?;
         let up = fixed_q4
             .project_cpu(
-                FixedQ4ExpertProjection::Up,
+                ExpertMlpProjection::Up,
                 hidden,
                 fixed_q4.spec.intermediate_size,
             )
@@ -5361,7 +5381,7 @@ impl ExpertWeights {
             .map(|(gate, up)| silu(*gate) * up)
             .collect();
         fixed_q4
-            .project_cpu(FixedQ4ExpertProjection::Down, &intermediate, width)
+            .project_cpu(ExpertMlpProjection::Down, &intermediate, width)
             .with_context(|| {
                 format!(
                     "fixed Q4 expert layer {} expert {} has no compatible down projection",
@@ -5424,9 +5444,9 @@ impl ExpertWeights {
     fn primary_matvec_payload(&self, hidden: &[f32], width: usize) -> Option<Q4MatvecPayload<'_>> {
         if let Some(fixed_q4) = &self.fixed_q4 {
             return [
-                FixedQ4ExpertProjection::Gate,
-                FixedQ4ExpertProjection::Up,
-                FixedQ4ExpertProjection::Down,
+                ExpertMlpProjection::Gate,
+                ExpertMlpProjection::Up,
+                ExpertMlpProjection::Down,
             ]
             .into_iter()
             .filter_map(|projection| fixed_q4.matvec_payload(projection, hidden.len(), width))
@@ -5769,8 +5789,29 @@ fn read_one_expert(root: &Path, layer: usize, expert: usize) -> Result<ExpertWei
         .with_context(|| format!("expert layer {layer} returned no expert {expert}"))
 }
 
-fn ensure_fixed_q4_expert_cache(plan: &FlashMoePlan, layout: &QwenMoeModelLayout) -> Result<usize> {
-    let spec = FixedQ4ExpertSlotSpec::from_model_layout(layout)?;
+fn resolved_expert_storage_layout(plan: &FlashMoePlan) -> ExpertStorageLayout {
+    match plan.quantization {
+        ExpertQuantization::FourBitProduction => ExpertStorageLayout::FixedQ4,
+        ExpertQuantization::Bf16 => ExpertStorageLayout::FixedBf16,
+        ExpertQuantization::F16 => ExpertStorageLayout::FixedF16,
+    }
+}
+
+fn resolved_expert_slot_spec(
+    plan: &FlashMoePlan,
+    layout: &QwenMoeModelLayout,
+) -> Result<ExpertSlotSpec> {
+    ExpertSlotSpec::from_model_layout(layout, resolved_expert_storage_layout(plan))
+}
+
+fn ensure_expert_execution_cache(
+    plan: &FlashMoePlan,
+    layout: &QwenMoeModelLayout,
+    slot_spec: ExpertSlotSpec,
+) -> Result<usize> {
+    let Some(spec) = slot_spec.fixed_q4() else {
+        return Ok(0);
+    };
     let mut rewritten = 0usize;
     for layer in 0..layout.layers {
         if rewrite_pbq4_layer_to_fixed_q4(&plan.experts_dir, layer, layout.experts_per_layer, spec)
@@ -6585,6 +6626,20 @@ fn pack_expert_tensors(
     Ok(())
 }
 
+fn fixed_dense_expert_slot_spec_for_pack(
+    plan: &FlashMoePlan,
+    config: Option<&QwenModelConfig>,
+) -> Result<Option<FixedDenseExpertSlotSpec>> {
+    let dtype = match plan.quantization {
+        ExpertQuantization::FourBitProduction => return Ok(None),
+        ExpertQuantization::Bf16 => DenseExpertDtype::Bf16,
+        ExpertQuantization::F16 => DenseExpertDtype::F16,
+    };
+    let config = config.context("Qwen config is required for fixed dense expert packing")?;
+    let layout = QwenMoeModelLayout::from_config(&plan.model, config)?;
+    FixedDenseExpertSlotSpec::from_model_layout(&layout, dtype).map(Some)
+}
+
 fn pack_direct_expert_layer(
     snapshot_dir: &Path,
     plan: &FlashMoePlan,
@@ -6593,27 +6648,44 @@ fn pack_direct_expert_layer(
     config: Option<&QwenModelConfig>,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
 ) -> Result<()> {
+    let fixed_dense = fixed_dense_expert_slot_spec_for_pack(plan, config)?;
     let mut expected = Vec::with_capacity(experts.len());
     for (expert, tensors) in &experts {
         validate_expert_tensor_group(layer, *expert, tensors, config)?;
-        expected.push(expected_expert_pack(
-            snapshot_dir,
-            shard_cache,
-            *expert,
-            tensors,
-        )?);
+        expected.push(match fixed_dense {
+            Some(spec) => expected_fixed_dense_expert_pack(
+                snapshot_dir,
+                shard_cache,
+                layer,
+                *expert,
+                tensors,
+                spec,
+            )?,
+            None => expected_expert_pack(snapshot_dir, shard_cache, *expert, tensors)?,
+        });
     }
     let expert_count = layer_expert_count(config, &experts);
     rewrite_expert_layer_pack(
         &plan.experts_dir,
         layer,
         expert_count,
+        match fixed_dense {
+            Some(spec) => ExpertLayerStorageFormat::FixedDense(spec),
+            None => ExpertLayerStorageFormat::Pbq4Import,
+        },
         &expected,
         |expert| {
             let tensors = experts
                 .get(&expert)
                 .with_context(|| format!("missing expert {expert} tensors for layer {layer}"))?;
-            build_direct_expert_pack(snapshot_dir, shard_cache, layer, expert, tensors)
+            build_direct_expert_pack(
+                snapshot_dir,
+                shard_cache,
+                layer,
+                expert,
+                tensors,
+                fixed_dense,
+            )
         },
     )?;
     Ok(())
@@ -6638,7 +6710,25 @@ fn build_direct_expert_pack(
     layer: usize,
     expert: usize,
     tensors: &[&ExpertTensorRef],
+    fixed_dense: Option<FixedDenseExpertSlotSpec>,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    if let Some(spec) = fixed_dense {
+        let inputs = tensors
+            .iter()
+            .map(|tensor| {
+                fixed_dense_expert_record_input(
+                    snapshot_dir,
+                    shard_cache,
+                    tensor,
+                    tensor.tensor.clone(),
+                    tensor.shape.clone(),
+                    0,
+                    tensor.shape.iter().product(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return build_fixed_dense_expert_pack(layer, expert, spec, inputs);
+    }
     let mut inputs = Vec::with_capacity(tensors.len());
     for tensor in tensors {
         let dtype = tensor.dtype.as_deref().unwrap_or("unknown");
@@ -6689,36 +6779,13 @@ fn pack_aggregate_expert_layer(
         "packing aggregate experts for layer {layer} ({layer_index}/{layer_total}): {} experts",
         layout.experts
     );
+    let fixed_dense = fixed_dense_expert_slot_spec_for_pack(plan, Some(config))?;
     let fixed_native_q4 = fixed_native_q4_aggregate_layout(&aggregate_tensors, down, layout)?;
     let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
     let mut expected = Vec::with_capacity(layout.experts);
     for expert in 0..layout.experts {
-        let records = expected_aggregate_expert_records(
-            snapshot_dir,
-            &mut shard_cache,
-            layer,
-            expert,
-            &aggregate_tensors,
-            down,
-            layout,
-        )?;
-        let packed_bytes = match fixed_native_q4 {
-            Some(fixed) => fixed.expert_bytes as u64,
-            None => pbq4_expert_pack_wire_size(&records)?,
-        };
-        expected.push(ExpectedExpertPack {
-            expert,
-            packed_bytes,
-            records,
-        });
-    }
-    let skipped = rewrite_expert_layer_pack(
-        &plan.experts_dir,
-        layer,
-        layout.experts,
-        &expected,
-        |expert| {
-            build_aggregate_expert_pack(
+        let records = match fixed_dense {
+            Some(spec) => expected_fixed_dense_aggregate_expert_records(
                 snapshot_dir,
                 &mut shard_cache,
                 layer,
@@ -6726,9 +6793,67 @@ fn pack_aggregate_expert_layer(
                 &aggregate_tensors,
                 down,
                 layout,
-            )
-        },
-    )?;
+                spec,
+            )?,
+            None => expected_aggregate_expert_records(
+                snapshot_dir,
+                &mut shard_cache,
+                layer,
+                expert,
+                &aggregate_tensors,
+                down,
+                layout,
+            )?,
+        };
+        let packed_bytes = match (fixed_dense, fixed_native_q4) {
+            (Some(spec), _) => spec.expert_bytes as u64,
+            (None, Some(fixed)) => fixed.expert_bytes as u64,
+            (None, None) => pbq4_expert_pack_wire_size(&records)?,
+        };
+        expected.push(ExpectedExpertPack {
+            expert,
+            packed_bytes,
+            records,
+        });
+    }
+    let skipped =
+        rewrite_expert_layer_pack(
+            &plan.experts_dir,
+            layer,
+            layout.experts,
+            match (fixed_dense, fixed_native_q4) {
+                (Some(spec), _) => ExpertLayerStorageFormat::FixedDense(spec),
+                (None, Some(fixed)) => ExpertLayerStorageFormat::FixedQ4(
+                    FixedQ4ExpertSlotSpec::new(fixed, layout.hidden, layout.intermediate)?,
+                ),
+                (None, None) => ExpertLayerStorageFormat::Pbq4Import,
+            },
+            &expected,
+            |expert| {
+                if let Some(spec) = fixed_dense {
+                    build_fixed_dense_aggregate_expert_pack(
+                        snapshot_dir,
+                        &mut shard_cache,
+                        layer,
+                        expert,
+                        &aggregate_tensors,
+                        down,
+                        layout,
+                        spec,
+                    )
+                } else {
+                    build_aggregate_expert_pack(
+                        snapshot_dir,
+                        &mut shard_cache,
+                        layer,
+                        expert,
+                        &aggregate_tensors,
+                        down,
+                        layout,
+                    )
+                }
+            },
+        )?;
     eprintln!(
         "prepared aggregate experts for layer {layer} ({layer_index}/{layer_total}): {}/{} ({skipped} reused)",
         layout.experts, layout.experts,
@@ -6819,6 +6944,114 @@ fn build_aggregate_expert_pack(
         values: down_values,
     });
     build_expert_pack(layer, expert, inputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_fixed_dense_aggregate_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+    spec: FixedDenseExpertSlotSpec,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let inputs = vec![
+        fixed_dense_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.gate.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.gate.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        fixed_dense_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            aggregate_tensors.up.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.up.start(expert)?,
+            layout.single_projection_values,
+        )?,
+        fixed_dense_expert_record_input(
+            snapshot_dir,
+            shard_cache,
+            down,
+            format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            vec![layout.hidden, layout.intermediate],
+            expert
+                .checked_mul(layout.down_expert_values)
+                .context("aggregate down expert offset overflow")?,
+            layout.down_expert_values,
+        )?,
+    ];
+    build_fixed_dense_expert_pack(layer, expert, spec, inputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_fixed_dense_aggregate_expert_records(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
+    down: &ExpertTensorRef,
+    layout: AggregateExpertLayout,
+    spec: FixedDenseExpertSlotSpec,
+) -> Result<Vec<ExpectedExpertPackRecord>> {
+    let sources = [
+        (
+            aggregate_tensors.gate.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.gate.start(expert)?,
+            layout.single_projection_values,
+            ExpertMlpProjection::Gate,
+        ),
+        (
+            aggregate_tensors.up.tensor,
+            format!("model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            aggregate_tensors.up.start(expert)?,
+            layout.single_projection_values,
+            ExpertMlpProjection::Up,
+        ),
+        (
+            down,
+            format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            vec![layout.hidden, layout.intermediate],
+            expert
+                .checked_mul(layout.down_expert_values)
+                .context("aggregate down expert offset overflow")?,
+            layout.down_expert_values,
+            ExpertMlpProjection::Down,
+        ),
+    ];
+    sources
+        .into_iter()
+        .map(|(source, tensor, shape, offset, count, projection)| {
+            let (source_offsets, source_hash) =
+                expert_tensor_source_fingerprint(snapshot_dir, shard_cache, source, offset, count)?;
+            let component = spec.projection(projection);
+            Ok(ExpectedExpertPackRecord {
+                tensor,
+                dtype: source
+                    .dtype
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                shape,
+                source_offsets,
+                source_hash,
+                packed_bytes: component.bytes as u64,
+                groups: 0,
+                group_size: 0,
+                scale_bias_dtype: spec.dtype.as_str().to_string(),
+            })
+        })
+        .collect()
 }
 
 fn expected_aggregate_expert_records(
@@ -7035,6 +7268,69 @@ fn expected_expert_pack(
     expected_expert_pack_from_records(expert, records)
 }
 
+fn expected_fixed_dense_expert_pack(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    layer: usize,
+    expert: usize,
+    tensors: &[&ExpertTensorRef],
+    spec: FixedDenseExpertSlotSpec,
+) -> Result<ExpectedExpertPack> {
+    let mut records = Vec::with_capacity(tensors.len());
+    for tensor in tensors {
+        let projection = if tensor.tensor.ends_with("gate_proj.weight") {
+            ExpertMlpProjection::Gate
+        } else if tensor.tensor.ends_with("up_proj.weight") {
+            ExpertMlpProjection::Up
+        } else if tensor.tensor.ends_with("down_proj.weight") {
+            ExpertMlpProjection::Down
+        } else {
+            bail!(
+                "fixed {} expert pack layer {layer} expert {expert} has unknown tensor {}",
+                spec.dtype.as_str(),
+                tensor.tensor
+            );
+        };
+        let component = spec.projection(projection);
+        if tensor.shape != [component.rows, component.cols] {
+            bail!(
+                "fixed {} expert tensor {} has shape {:?}, expected [{}, {}]",
+                spec.dtype.as_str(),
+                tensor.tensor,
+                tensor.shape,
+                component.rows,
+                component.cols
+            );
+        }
+        let (source_offsets, source_hash) = expert_tensor_source_fingerprint(
+            snapshot_dir,
+            shard_cache,
+            tensor,
+            0,
+            tensor.shape.iter().product(),
+        )?;
+        records.push(ExpectedExpertPackRecord {
+            tensor: tensor.tensor.clone(),
+            dtype: tensor
+                .dtype
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            shape: tensor.shape.clone(),
+            source_offsets,
+            source_hash,
+            packed_bytes: component.bytes as u64,
+            groups: 0,
+            group_size: 0,
+            scale_bias_dtype: spec.dtype.as_str().to_string(),
+        });
+    }
+    Ok(ExpectedExpertPack {
+        expert,
+        packed_bytes: spec.expert_bytes as u64,
+        records,
+    })
+}
+
 fn decode_expert_tensor_range(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
@@ -7056,6 +7352,35 @@ fn decode_expert_tensor_range(
                 )
             })?;
             Ok((values, source_offsets, sha256_hex(raw)))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_dense_expert_record_input(
+    snapshot_dir: &Path,
+    shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
+    source: &ExpertTensorRef,
+    tensor: String,
+    shape: Vec<usize>,
+    element_offset: usize,
+    element_count: usize,
+) -> Result<FixedDenseExpertRecordInput> {
+    with_expert_tensor_raw_range(
+        snapshot_dir,
+        shard_cache,
+        source,
+        element_offset,
+        element_count,
+        |raw, source_offsets, dtype| {
+            Ok(FixedDenseExpertRecordInput {
+                tensor,
+                dtype: dtype.to_string(),
+                shape,
+                source_offsets,
+                source_hash: Some(sha256_hex(raw)),
+                bytes: raw.to_vec(),
+            })
         },
     )
 }
@@ -14690,6 +15015,7 @@ mod tests {
             expert_layer_slot_is_reusable(
                 &expert_layer_path(temp.path(), 0),
                 &layer_metadata,
+                ExpertLayerStorageFormat::Pbq4Import,
                 &expected
             )
             .unwrap()

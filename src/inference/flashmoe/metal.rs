@@ -24,9 +24,10 @@ use super::experts::{
 use super::math::top_k;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
-    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload,
-    ScheduledExpertSlot, ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource,
-    ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef,
+    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
+    ScheduledDenseExpertPhaseMlpPayload, ScheduledExpertPhaseMlpPayload, ScheduledExpertSlot,
+    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledSharedExpertPhaseRef,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
@@ -108,28 +109,28 @@ impl MetalBatchProjectionInput<'_> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MetalQ4SourceBufferKey {
+struct MetalExpertSourceBufferKey {
     ptr: usize,
     len: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy)]
-struct MetalQ4SourceBufferEntry {
-    key: MetalQ4SourceBufferKey,
+struct MetalExpertSourceBufferEntry {
+    key: MetalExpertSourceBufferKey,
     buffer: MetalObjcId,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
-pub(crate) struct MetalQ4SourceBufferCache {
-    entries: Vec<MetalQ4SourceBufferEntry>,
+pub(crate) struct MetalExpertSourceBufferCache {
+    entries: Vec<MetalExpertSourceBufferEntry>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalQ4SourceBufferCache {
-    fn key_for(bytes: &[u8]) -> MetalQ4SourceBufferKey {
-        MetalQ4SourceBufferKey {
+impl MetalExpertSourceBufferCache {
+    fn key_for(bytes: &[u8]) -> MetalExpertSourceBufferKey {
+        MetalExpertSourceBufferKey {
             ptr: bytes.as_ptr() as usize,
             len: bytes.len(),
         }
@@ -147,7 +148,8 @@ impl MetalQ4SourceBufferCache {
         if self.entries.iter().any(|entry| entry.key == key) {
             return;
         }
-        self.entries.push(MetalQ4SourceBufferEntry { key, buffer });
+        self.entries
+            .push(MetalExpertSourceBufferEntry { key, buffer });
     }
 }
 
@@ -1810,7 +1812,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             }
 
             let encode_result = (|| -> anyhow::Result<()> {
-                let mut source_buffers = MetalQ4SourceBufferCache::default();
+                let mut source_buffers = MetalExpertSourceBufferCache::default();
                 self.encode_shared(
                     encoder,
                     &command_plan,
@@ -1828,25 +1830,37 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         &output_buffers,
                         active_work,
                     )?;
-                    let payload = payload.q4();
-                    self.encode_q4_swiglu(
-                        encoder,
-                        payload,
-                        active_stage.normed,
-                        active_stage.activated,
-                        &mut phase_buffers,
-                        &mut source_buffers,
-                    )?;
-                    self.encode_q4_matvec(
-                        encoder,
-                        &payload.down,
-                        payload.down_source(),
-                        active_stage.activated,
-                        active_stage.expert_outputs,
-                        active_stage.output_offset,
-                        &mut phase_buffers,
-                        &mut source_buffers,
-                    )?;
+                    match payload {
+                        ScheduledExpertPhaseMlpPayload::Q4(payload) => {
+                            self.encode_q4_swiglu(
+                                encoder,
+                                payload,
+                                active_stage.normed,
+                                active_stage.activated,
+                                &mut phase_buffers,
+                                &mut source_buffers,
+                            )?;
+                            self.encode_q4_matvec(
+                                encoder,
+                                &payload.down,
+                                payload.down_source(),
+                                active_stage.activated,
+                                active_stage.expert_outputs,
+                                active_stage.output_offset,
+                                &mut phase_buffers,
+                                &mut source_buffers,
+                            )?;
+                        }
+                        ScheduledExpertPhaseMlpPayload::Dense(payload) => {
+                            self.encode_dense_swiglu(
+                                encoder,
+                                payload,
+                                active_stage,
+                                &mut phase_buffers,
+                                &mut source_buffers,
+                            )?;
+                        }
+                    }
                 }
                 self.encode_combine(
                     encoder,
@@ -1989,8 +2003,17 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         buffers: &mut Vec<MetalPhaseBuffer>,
     ) -> anyhow::Result<MetalCmd3ActiveExpertWorkBuffers> {
         unsafe {
-            let activated = self.phase_buffer(plan.buffer_layout()?.activation_bytes, buffers)?;
-            MetalCmd3ActiveExpertWorkBuffers::new(plan, activated)
+            let layout = plan.buffer_layout()?;
+            let gate_out = layout
+                .projection_output_bytes
+                .map(|bytes| self.phase_buffer(bytes, buffers))
+                .transpose()?;
+            let up_out = layout
+                .projection_output_bytes
+                .map(|bytes| self.phase_buffer(bytes, buffers))
+                .transpose()?;
+            let activated = self.phase_buffer(layout.activation_bytes, buffers)?;
+            MetalCmd3ActiveExpertWorkBuffers::new(plan, gate_out, up_out, activated)
         }
     }
 
@@ -2145,6 +2168,104 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         }
     }
 
+    unsafe fn encode_dense_swiglu(
+        &self,
+        encoder: MetalObjcId,
+        payload: &ScheduledDenseExpertPhaseMlpPayload<'_>,
+        stage: MetalCmd3ActiveExpertStageBuffers,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalExpertSourceBufferCache,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let gate_out = stage
+                .work
+                .gate_out
+                .context("Metal dense expert stage has no gate projection buffer")?;
+            let up_out = stage
+                .work
+                .up_out
+                .context("Metal dense expert stage has no up projection buffer")?;
+            self.encode_dense_expert_matvec(
+                encoder,
+                &payload.gate,
+                stage.normed,
+                gate_out,
+                0,
+                buffers,
+                source_buffers,
+            )?;
+            self.encode_dense_expert_matvec(
+                encoder,
+                &payload.up,
+                stage.normed,
+                up_out,
+                0,
+                buffers,
+                source_buffers,
+            )?;
+            let intermediate = stage.plan.intermediate_u32()?;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime.pipelines.silu_product_pipeline,
+            );
+            set_buffer(encoder, gate_out, 0);
+            set_buffer(encoder, up_out, 1);
+            set_buffer(encoder, stage.activated, 2);
+            set_bytes(encoder, u32_as_bytes(&intermediate), 3);
+            dispatch_threads(encoder, stage.plan.intermediate as u64);
+            self.encode_dense_expert_matvec(
+                encoder,
+                &payload.down,
+                stage.activated,
+                stage.expert_outputs,
+                stage.output_offset,
+                buffers,
+                source_buffers,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_dense_expert_matvec(
+        &self,
+        encoder: MetalObjcId,
+        payload: &super::experts::DenseMatvecPayload<'_>,
+        input: MetalObjcId,
+        output: MetalObjcId,
+        output_offset: u64,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalExpertSourceBufferCache,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let source = payload.source;
+            let buffer = self.expert_source_buffer(source.bytes, buffers, source_buffers)?;
+            let rows =
+                u32::try_from(payload.rows).context("Metal CMD3 dense expert rows exceed u32")?;
+            let cols =
+                u32::try_from(payload.cols).context("Metal CMD3 dense expert cols exceed u32")?;
+            let byte_offset = u64::try_from(source.byte_offset)
+                .context("Metal CMD3 dense expert byte offset exceeds u64")?;
+            let pipeline = match payload.dtype {
+                super::experts::DenseExpertDtype::Bf16 => {
+                    self.runtime.pipelines.dense_mmap_bf16_pipeline
+                }
+                super::experts::DenseExpertDtype::F16 => {
+                    self.runtime.pipelines.dense_mmap_f16_pipeline
+                }
+            };
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+            set_buffer(encoder, buffer, 0);
+            set_buffer(encoder, input, 1);
+            set_buffer_with_offset(encoder, output, output_offset, 2);
+            set_bytes(encoder, u64_as_bytes(&byte_offset), 3);
+            set_bytes(encoder, u32_as_bytes(&rows), 4);
+            set_bytes(encoder, u32_as_bytes(&cols), 5);
+            dispatch_threads(encoder, payload.rows as u64);
+            Ok(())
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn encode_q4_matvec(
         &self,
@@ -2155,10 +2276,10 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         output: MetalObjcId,
         output_offset: u64,
         buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalQ4SourceBufferCache,
+        source_buffers: &mut MetalExpertSourceBufferCache,
     ) -> anyhow::Result<()> {
         unsafe {
-            let buffer = self.q4_source_buffer(source, buffers, source_buffers)?;
+            let buffer = self.expert_source_buffer(source.bytes, buffers, source_buffers)?;
             let rows = u32::try_from(payload.rows).context("Metal CMD3 expert rows exceed u32")?;
             let cols = u32::try_from(payload.cols).context("Metal CMD3 expert cols exceed u32")?;
             let groups = u32::try_from(payload.cols.div_ceil(payload.group_size).max(1))
@@ -2191,13 +2312,13 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         input: MetalObjcId,
         output: MetalObjcId,
         buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalQ4SourceBufferCache,
+        source_buffers: &mut MetalExpertSourceBufferCache,
     ) -> anyhow::Result<()> {
         unsafe {
             let gate = &payload.gate;
             let gate_source = payload.gate_source();
             let up_source = payload.up_source();
-            let buffer = self.q4_source_buffer(gate_source, buffers, source_buffers)?;
+            let buffer = self.expert_source_buffer(gate_source.bytes, buffers, source_buffers)?;
             let rows = u32::try_from(gate.rows).context("Metal CMD3 SwiGLU rows exceed u32")?;
             let cols = u32::try_from(gate.cols).context("Metal CMD3 SwiGLU cols exceed u32")?;
             let groups = u32::try_from(gate.cols.div_ceil(gate.group_size).max(1))
@@ -2226,19 +2347,19 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         }
     }
 
-    unsafe fn q4_source_buffer(
+    unsafe fn expert_source_buffer(
         &self,
-        source: super::experts::Q4MatvecSource<'_>,
+        bytes: &[u8],
         buffers: &mut Vec<MetalPhaseBuffer>,
-        cache: &mut MetalQ4SourceBufferCache,
+        cache: &mut MetalExpertSourceBufferCache,
     ) -> anyhow::Result<MetalObjcId> {
-        if let Some(buffer) = cache.get(source.bytes) {
+        if let Some(buffer) = cache.get(bytes) {
             return Ok(buffer);
         }
-        let phase = unsafe { self.borrowed_or_copied_buffer(source.bytes, 16)? };
+        let phase = unsafe { self.borrowed_or_copied_buffer(bytes, 16)? };
         let buffer = phase.id;
         buffers.push(phase);
-        cache.insert(source.bytes, buffer);
+        cache.insert(bytes, buffer);
         Ok(buffer)
     }
 
@@ -4158,8 +4279,16 @@ impl MetalCmd3SharedPhasePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalCmd3ActiveExpertPlan {
     pub(crate) index: usize,
+    pub(crate) source: MetalCmd3ActiveExpertSource,
     pub(crate) intermediate: usize,
     pub(crate) output_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetalCmd3ActiveExpertSource {
+    Q4,
+    Dense,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4167,12 +4296,14 @@ pub(crate) struct MetalCmd3ActiveExpertPlan {
 pub(crate) struct MetalCmd3ActiveExpertBufferLayout {
     pub(crate) intermediate_u32: u32,
     pub(crate) activation_bytes: usize,
-    pub(crate) projection_output_bytes: usize,
+    pub(crate) projection_output_bytes: Option<usize>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalCmd3ActiveExpertWorkBuffers {
+    pub(crate) gate_out: Option<MetalObjcId>,
+    pub(crate) up_out: Option<MetalObjcId>,
     pub(crate) activated: MetalObjcId,
     pub(crate) layout: MetalCmd3ActiveExpertBufferLayout,
 }
@@ -4214,9 +4345,21 @@ impl MetalCmd3ActiveExpertStageBuffers {
 impl MetalCmd3ActiveExpertWorkBuffers {
     pub(crate) fn new(
         plan: MetalCmd3ActiveExpertPlan,
+        gate_out: Option<MetalObjcId>,
+        up_out: Option<MetalObjcId>,
         activated: MetalObjcId,
     ) -> anyhow::Result<Self> {
+        let requires_projection_outputs = plan.source == MetalCmd3ActiveExpertSource::Dense;
+        if gate_out.is_some() != requires_projection_outputs
+            || up_out.is_some() != requires_projection_outputs
+        {
+            anyhow::bail!(
+                "FlashMoe Metal CMD3 active expert work buffers do not match the declared payload source"
+            );
+        }
         Ok(Self {
+            gate_out,
+            up_out,
             activated,
             layout: plan.buffer_layout()?,
         })
@@ -4228,35 +4371,50 @@ impl MetalCmd3ActiveExpertPlan {
     pub(crate) fn new(
         phase: MetalCmd3PhasePlan,
         index: usize,
-        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
+        payload: &ScheduledExpertPhaseMlpPayload<'_>,
     ) -> anyhow::Result<Self> {
-        if payload.gate.rows == 0 {
+        let (source, gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols) = match payload {
+            ScheduledExpertPhaseMlpPayload::Q4(payload) => (
+                MetalCmd3ActiveExpertSource::Q4,
+                payload.gate.rows,
+                payload.gate.cols,
+                payload.up.rows,
+                payload.up.cols,
+                payload.down.rows,
+                payload.down.cols,
+            ),
+            ScheduledExpertPhaseMlpPayload::Dense(payload) => (
+                MetalCmd3ActiveExpertSource::Dense,
+                payload.gate.rows,
+                payload.gate.cols,
+                payload.up.rows,
+                payload.up.cols,
+                payload.down.rows,
+                payload.down.cols,
+            ),
+        };
+        if gate_rows == 0 {
             anyhow::bail!("FlashMoe Metal CMD3 active expert requires non-zero intermediate width");
         }
-        if payload.gate.rows != payload.up.rows || payload.down.cols != payload.gate.rows {
+        if gate_rows != up_rows || down_cols != gate_rows {
             anyhow::bail!(
-                "FlashMoe Metal CMD3 active expert payload has mismatched intermediate widths: gate={} up={} down_cols={}",
-                payload.gate.rows,
-                payload.up.rows,
-                payload.down.cols
+                "FlashMoe Metal CMD3 active expert payload has mismatched intermediate widths: gate={gate_rows} up={up_rows} down_cols={down_cols}"
             );
         }
-        if payload.gate.cols != phase.width
-            || payload.up.cols != phase.width
-            || payload.down.rows != phase.width
-        {
+        if gate_cols != phase.width || up_cols != phase.width || down_rows != phase.width {
             anyhow::bail!(
                 "FlashMoe Metal CMD3 active expert payload width does not match phase width {}: gate={} up={} down_rows={}",
                 phase.width,
-                payload.gate.cols,
-                payload.up.cols,
-                payload.down.rows
+                gate_cols,
+                up_cols,
+                down_rows
             );
         }
-        Self::usize_to_u32("intermediate width", payload.gate.rows)?;
+        Self::usize_to_u32("intermediate width", gate_rows)?;
         Ok(Self {
             index,
-            intermediate: payload.gate.rows,
+            source,
+            intermediate: gate_rows,
             output_offset: phase.expert_output_offset(index)?,
         })
     }
@@ -4277,7 +4435,9 @@ impl MetalCmd3ActiveExpertPlan {
         Ok(MetalCmd3ActiveExpertBufferLayout {
             intermediate_u32: self.intermediate_u32()?,
             activation_bytes: self.activation_bytes()?,
-            projection_output_bytes: self.projection_output_bytes()?,
+            projection_output_bytes: (self.source == MetalCmd3ActiveExpertSource::Dense)
+                .then(|| self.projection_output_bytes())
+                .transpose()?,
         })
     }
 
@@ -4391,7 +4551,7 @@ impl MetalCmd3ExecutionPlan {
         let active_experts = payloads
             .iter()
             .enumerate()
-            .map(|(idx, payload)| MetalCmd3ActiveExpertPlan::new(phase, idx, payload.q4()))
+            .map(|(idx, payload)| MetalCmd3ActiveExpertPlan::new(phase, idx, payload))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let combine = MetalCmd3CombinePlan::new(phase);
         Ok(Self {
@@ -7642,16 +7802,17 @@ mod tests {
     fn cmd3_active_expert_work_buffers_carry_fused_layout() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
         let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
-        let payload = test_q4_expert_payload(6, 4);
+        let payload = ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(6, 4));
         let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
 
         let fused =
-            MetalCmd3ActiveExpertWorkBuffers::new(plan, 0x1000usize as MetalObjcId).unwrap();
+            MetalCmd3ActiveExpertWorkBuffers::new(plan, None, None, 0x1000usize as MetalObjcId)
+                .unwrap();
 
         assert_eq!(fused.activated, 0x1000usize as MetalObjcId);
         assert_eq!(fused.layout.intermediate_u32, 6);
         assert_eq!(fused.layout.activation_bytes, 6 * 4);
-        assert_eq!(fused.layout.projection_output_bytes, 6 * 4);
+        assert_eq!(fused.layout.projection_output_bytes, None);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7689,8 +7850,13 @@ mod tests {
         )
         .unwrap();
         let active_plan = execution.active_experts[1];
-        let work =
-            MetalCmd3ActiveExpertWorkBuffers::new(active_plan, 0x6000usize as MetalObjcId).unwrap();
+        let work = MetalCmd3ActiveExpertWorkBuffers::new(
+            active_plan,
+            None,
+            None,
+            0x6000usize as MetalObjcId,
+        )
+        .unwrap();
 
         let stage =
             MetalCmd3ActiveExpertStageBuffers::new(active_plan, inputs, &outputs, work).unwrap();
@@ -7866,11 +8032,12 @@ mod tests {
     fn cmd3_active_expert_plan_declares_payload_layout() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
         let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
-        let payload = test_q4_expert_payload(6, 4);
+        let payload = ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(6, 4));
 
         let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
 
         assert_eq!(plan.index, 1);
+        assert_eq!(plan.source, MetalCmd3ActiveExpertSource::Q4);
         assert_eq!(plan.intermediate, 6);
         assert_eq!(plan.intermediate_u32().unwrap(), 6);
         assert_eq!(plan.activation_bytes().unwrap(), 6 * 4);
@@ -7881,7 +8048,7 @@ mod tests {
             MetalCmd3ActiveExpertBufferLayout {
                 intermediate_u32: 6,
                 activation_bytes: 6 * 4,
-                projection_output_bytes: 6 * 4,
+                projection_output_bytes: None,
             }
         );
     }
@@ -7891,7 +8058,7 @@ mod tests {
     fn cmd3_active_expert_plan_rejects_mismatched_payload() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
         let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
-        let payload = test_q4_expert_payload(6, 5);
+        let payload = ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(6, 5));
 
         let err = MetalCmd3ActiveExpertPlan::new(phase, 0, &payload).unwrap_err();
 
@@ -8480,11 +8647,11 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn metal_q4_source_buffer_cache_reuses_same_fixed_payload_key() {
+    fn metal_expert_source_buffer_cache_reuses_same_fixed_payload_key() {
         let first = [1u8; 16];
         let second = [2u8; 16];
         let buffer = 0x1000usize as MetalObjcId;
-        let mut cache = MetalQ4SourceBufferCache::default();
+        let mut cache = MetalExpertSourceBufferCache::default();
 
         cache.insert(&first, buffer);
 

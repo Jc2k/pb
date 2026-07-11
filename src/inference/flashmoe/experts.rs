@@ -28,6 +28,8 @@ pub(crate) const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
 pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
 pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
 pub(crate) const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
+pub(crate) const FIXED_DENSE_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_DENSE_EXPERT_LAYER_V1";
+const EXPERT_COMPONENT_ALIGNMENT: usize = 4096;
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
 pub(crate) const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
@@ -106,6 +108,21 @@ impl ExpertLayerPackMetadata {
         }
     }
 
+    pub(crate) fn new_fixed_dense(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: FIXED_DENSE_EXPERT_LAYER_FORMAT_V1.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
     pub(crate) fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
         self.packs.iter().find(|metadata| metadata.expert == expert)
     }
@@ -114,6 +131,7 @@ impl ExpertLayerPackMetadata {
         if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1
             && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
             && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+            && self.format != FIXED_DENSE_EXPERT_LAYER_FORMAT_V1
         {
             bail!(
                 "expert metadata {} has unsupported format {}",
@@ -718,6 +736,57 @@ pub(crate) struct ExpectedExpertPack {
     pub(crate) records: Vec<ExpectedExpertPackRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertLayerStorageFormat {
+    Pbq4Import,
+    FixedQ4(FixedQ4ExpertSlotSpec),
+    FixedDense(FixedDenseExpertSlotSpec),
+}
+
+impl ExpertLayerStorageFormat {
+    fn slot_size(self, expected: &[ExpectedExpertPack]) -> u64 {
+        match self {
+            Self::Pbq4Import => expected
+                .iter()
+                .map(|pack| pack.packed_bytes)
+                .max()
+                .unwrap_or(0)
+                .max(1),
+            Self::FixedQ4(spec) => spec.layout.expert_bytes as u64,
+            Self::FixedDense(spec) => spec.expert_bytes as u64,
+        }
+    }
+
+    fn metadata_matches(self, metadata: &ExpertLayerPackMetadata) -> bool {
+        match self {
+            Self::Pbq4Import => matches!(
+                metadata.format.as_str(),
+                PBQ4_EXPERT_LAYER_FORMAT_V1 | PBQ4_EXPERT_LAYER_FORMAT_V2
+            ),
+            Self::FixedQ4(_) => metadata.format == FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+            Self::FixedDense(_) => metadata.format == FIXED_DENSE_EXPERT_LAYER_FORMAT_V1,
+        }
+    }
+
+    fn layer_metadata(
+        self,
+        layer: usize,
+        slot_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> ExpertLayerPackMetadata {
+        match self {
+            Self::Pbq4Import => ExpertLayerPackMetadata::new(layer, slot_size, experts, packs),
+            Self::FixedQ4(_) => {
+                ExpertLayerPackMetadata::new_fixed_q4(layer, slot_size, experts, packs)
+            }
+            Self::FixedDense(_) => {
+                ExpertLayerPackMetadata::new_fixed_dense(layer, slot_size, experts, packs)
+            }
+        }
+    }
+}
+
 pub(crate) fn expected_expert_pack_record_from_source(
     tensor: String,
     dtype: String,
@@ -1290,6 +1359,15 @@ pub(crate) struct ExpertRecordInput {
     pub(crate) values: Vec<f32>,
 }
 
+pub(crate) struct FixedDenseExpertRecordInput {
+    pub(crate) tensor: String,
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) source_offsets: [u64; 2],
+    pub(crate) source_hash: Option<String>,
+    pub(crate) bytes: Vec<u8>,
+}
+
 pub(crate) struct NativeQ4ExpertRecordInput {
     pub(crate) tensor: String,
     pub(crate) dtype: String,
@@ -1323,6 +1401,98 @@ pub(crate) fn build_expert_pack(
         records,
     };
     Ok((packed, metadata))
+}
+
+pub(crate) fn build_fixed_dense_expert_pack(
+    layer: usize,
+    expert: usize,
+    spec: FixedDenseExpertSlotSpec,
+    inputs: Vec<FixedDenseExpertRecordInput>,
+) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    if inputs.len() != 3 {
+        bail!(
+            "fixed {} expert pack requires gate, up, and down inputs",
+            spec.dtype.as_str()
+        );
+    }
+    let mut out = vec![0u8; spec.expert_bytes];
+    let mut records = Vec::with_capacity(3);
+    for projection in [
+        ExpertMlpProjection::Gate,
+        ExpertMlpProjection::Up,
+        ExpertMlpProjection::Down,
+    ] {
+        let suffix = match projection {
+            ExpertMlpProjection::Gate => "gate_proj.weight",
+            ExpertMlpProjection::Up => "up_proj.weight",
+            ExpertMlpProjection::Down => "down_proj.weight",
+        };
+        let index = inputs
+            .iter()
+            .position(|input| input.tensor.ends_with(suffix))
+            .with_context(|| {
+                format!(
+                    "fixed {} expert pack layer {layer} expert {expert} is missing {suffix}",
+                    spec.dtype.as_str()
+                )
+            })?;
+        let input = &inputs[index];
+        let component = spec.projection(projection);
+        if input.shape != [component.rows, component.cols] {
+            bail!(
+                "fixed {} expert tensor {} has shape {:?}, expected [{}, {}]",
+                spec.dtype.as_str(),
+                input.tensor,
+                input.shape,
+                component.rows,
+                component.cols
+            );
+        }
+        let dtype_matches = match spec.dtype {
+            DenseExpertDtype::Bf16 => {
+                matches!(
+                    input.dtype.to_ascii_uppercase().as_str(),
+                    "BF16" | "BFLOAT16"
+                )
+            }
+            DenseExpertDtype::F16 => matches!(
+                input.dtype.to_ascii_uppercase().as_str(),
+                "F16" | "FLOAT16" | "FP16"
+            ),
+        };
+        if !dtype_matches || input.bytes.len() != component.bytes {
+            bail!(
+                "fixed {} expert tensor {} has dtype {} and {} bytes, expected {} bytes",
+                spec.dtype.as_str(),
+                input.tensor,
+                input.dtype,
+                input.bytes.len(),
+                component.bytes
+            );
+        }
+        out[component.offset..component.offset + component.bytes].copy_from_slice(&input.bytes);
+        records.push(ExpertPackRecord {
+            tensor: input.tensor.clone(),
+            dtype: input.dtype.clone(),
+            shape: input.shape.clone(),
+            source_offsets: input.source_offsets,
+            source_hash: input.source_hash.clone(),
+            record_offset: component.offset as u64,
+            packed_bytes: component.bytes as u64,
+            groups: 0,
+            group_size: 0,
+            scale_bias_dtype: spec.dtype.as_str().to_string(),
+        });
+    }
+    Ok((
+        out,
+        ExpertPackMetadata {
+            layer,
+            expert,
+            packed_bytes: spec.expert_bytes as u64,
+            records,
+        },
+    ))
 }
 
 pub(crate) fn build_native_q4_expert_pack(
@@ -1590,24 +1760,21 @@ pub(crate) fn rewrite_expert_layer_pack(
     root: &Path,
     layer: usize,
     experts: usize,
+    storage_format: ExpertLayerStorageFormat,
     expected: &[ExpectedExpertPack],
     mut build: impl FnMut(usize) -> Result<(Vec<u8>, ExpertPackMetadata)>,
 ) -> Result<usize> {
     if expected.is_empty() {
         return Ok(0);
     }
-    let slot_size = expected
-        .iter()
-        .map(|pack| pack.packed_bytes)
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let slot_size = storage_format.slot_size(expected);
     let old_metadata = read_expert_layer_pack_metadata(root, layer)?;
     let layer_path = expert_layer_path(root, layer);
     let all_reusable = old_metadata.as_ref().is_some_and(|metadata| {
-        expected
-            .iter()
-            .all(|pack| expert_layer_slot_is_reusable(&layer_path, metadata, pack).unwrap_or(false))
+        expected.iter().all(|pack| {
+            expert_layer_slot_is_reusable(&layer_path, metadata, storage_format, pack)
+                .unwrap_or(false)
+        })
     });
     if all_reusable {
         return Ok(expected.len());
@@ -1631,7 +1798,7 @@ pub(crate) fn rewrite_expert_layer_pack(
     for pack in expected {
         let offset = expert_slot_offset(pack.expert, slot_size)?;
         let (packed, metadata) = if let Some(old_metadata) = old_metadata.as_ref()
-            && expert_layer_slot_is_reusable(&layer_path, old_metadata, pack)?
+            && expert_layer_slot_is_reusable(&layer_path, old_metadata, storage_format, pack)?
         {
             reused += 1;
             let metadata = old_metadata
@@ -1664,7 +1831,7 @@ pub(crate) fn rewrite_expert_layer_pack(
     }
 
     finish_expert_pack_atomically(out, &temp_path, &layer_path)?;
-    let metadata = ExpertLayerPackMetadata::new(layer, slot_size, experts, packs);
+    let metadata = storage_format.layer_metadata(layer, slot_size, experts, packs);
     write_expert_metadata_atomically(root, layer, &metadata)?;
     Ok(reused)
 }
@@ -1672,8 +1839,15 @@ pub(crate) fn rewrite_expert_layer_pack(
 pub(crate) fn expert_layer_slot_is_reusable(
     layer_path: &Path,
     layer_metadata: &ExpertLayerPackMetadata,
+    storage_format: ExpertLayerStorageFormat,
     expected: &ExpectedExpertPack,
 ) -> Result<bool> {
+    if !storage_format.metadata_matches(layer_metadata)
+        || layer_metadata.expert_size != storage_format.slot_size(std::slice::from_ref(expected))
+            && !matches!(storage_format, ExpertLayerStorageFormat::Pbq4Import)
+    {
+        return Ok(false);
+    }
     let Some(metadata) = layer_metadata.pack_for(expected.expert) else {
         return Ok(false);
     };
@@ -1705,12 +1879,15 @@ pub(crate) fn expert_layer_slot_is_reusable(
     if file_len < end {
         return Ok(false);
     }
-    let offset = expert_slot_offset(expected.expert, layer_metadata.expert_size)?;
-    let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
-    if read_exact_at_positioned(&file, &mut magic, offset).is_err() {
-        return Ok(false);
+    if matches!(storage_format, ExpertLayerStorageFormat::Pbq4Import) {
+        let offset = expert_slot_offset(expected.expert, layer_metadata.expert_size)?;
+        let mut magic = vec![0u8; PBQ4_EXPERT_MAGIC.len()];
+        if read_exact_at_positioned(&file, &mut magic, offset).is_err() {
+            return Ok(false);
+        }
+        return Ok(magic == PBQ4_EXPERT_MAGIC);
     }
-    Ok(magic == PBQ4_EXPERT_MAGIC)
+    Ok(metadata.packed_bytes == layer_metadata.expert_size)
 }
 
 pub(crate) fn read_layer_slot_bytes(
@@ -2053,27 +2230,29 @@ pub(crate) struct ExpertLayerReader {
     path: PathBuf,
     file: fs::File,
     metadata: ExpertLayerPackMetadata,
-    fixed_q4: FixedQ4ExpertSlotSpec,
-    fixed_q4_buffer_pool: ReusableExpertBytePool,
+    slot_spec: ExpertSlotSpec,
+    buffer_pool: ReusableExpertBytePool,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExpertSlotStore {
     root: PathBuf,
-    fixed_q4: FixedQ4ExpertSlotSpec,
-    fixed_q4_buffer_pool: ReusableExpertBytePool,
+    slot_spec: ExpertSlotSpec,
+    buffer_pool: ReusableExpertBytePool,
     layers: Arc<Mutex<BTreeMap<usize, Arc<ExpertLayerReader>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertStorageLayout {
     FixedQ4,
+    FixedBf16,
+    FixedF16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExpertStoreExecutionDescriptor {
     pub(crate) layout: ExpertStorageLayout,
-    pub(crate) fixed_q4: FixedQ4ExpertSlotSpec,
+    pub(crate) slot_spec: ExpertSlotSpec,
     pub(crate) layers: usize,
     pub(crate) experts_per_layer: usize,
 }
@@ -2210,20 +2389,36 @@ impl ExpertSlotStore {
         root: PathBuf,
         layout: &QwenMoeModelLayout,
     ) -> Result<Self> {
-        Self::open_with_fixed_q4(root, FixedQ4ExpertSlotSpec::from_model_layout(layout)?)
+        Self::open_with_slot_spec(
+            root,
+            ExpertSlotSpec::from_model_layout(layout, ExpertStorageLayout::FixedQ4)?,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_fixed_q4(
         root: PathBuf,
         fixed_q4: FixedQ4ExpertSlotSpec,
     ) -> Result<Self> {
+        Self::open_with_slot_spec(root, ExpertSlotSpec::FixedQ4(fixed_q4))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_fixed_dense(
+        root: PathBuf,
+        fixed_dense: FixedDenseExpertSlotSpec,
+    ) -> Result<Self> {
+        Self::open_with_slot_spec(root, ExpertSlotSpec::FixedDense(fixed_dense))
+    }
+
+    pub(crate) fn open_with_slot_spec(root: PathBuf, slot_spec: ExpertSlotSpec) -> Result<Self> {
         if !root.is_dir() {
             bail!("expert store {} does not exist", root.display());
         }
         Ok(Self {
             root,
-            fixed_q4,
-            fixed_q4_buffer_pool: Arc::new(Mutex::new(Vec::new())),
+            slot_spec,
+            buffer_pool: Arc::new(Mutex::new(Vec::new())),
             layers: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -2238,32 +2433,35 @@ impl ExpertSlotStore {
                 "FlashMoe expert storage resolution requires non-zero layers and experts, layers={layers}, experts_per_layer={experts_per_layer}"
             );
         }
-        let expected_layer_bytes = (self.fixed_q4.layout.expert_bytes as u64)
+        let slot_bytes = self.slot_spec.expert_bytes();
+        let storage_layout = self.slot_spec.storage_layout();
+        let expected_format = self.slot_spec.metadata_format();
+        let expected_layer_bytes = (slot_bytes as u64)
             .checked_mul(experts_per_layer as u64)
-            .context("fixed-Q4 expert layer byte length overflow")?;
+            .context("fixed expert layer byte length overflow")?;
         for layer in 0..layers {
             let metadata = read_expert_layer_pack_metadata(&self.root, layer)?.with_context(|| {
                 format!(
-                    "FlashMoe unsupported fixed-Q4 expert storage: layer {layer} metadata is missing"
+                    "FlashMoe unsupported {storage_layout:?} expert storage: layer {layer} metadata is missing"
                 )
             })?;
-            if metadata.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1 {
+            if metadata.format != expected_format {
                 bail!(
                     "FlashMoe unsupported expert storage at layer {layer}: format {} is import compatibility only; expected {}",
                     metadata.format,
-                    FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+                    expected_format
                 );
             }
-            if metadata.expert_size != self.fixed_q4.layout.expert_bytes as u64 {
+            if metadata.expert_size != slot_bytes as u64 {
                 bail!(
-                    "FlashMoe fixed-Q4 expert storage layer {layer} has slot size {}, expected {}",
+                    "FlashMoe {storage_layout:?} expert storage layer {layer} has slot size {}, expected {}",
                     metadata.expert_size,
-                    self.fixed_q4.layout.expert_bytes
+                    slot_bytes
                 );
             }
             if metadata.experts != experts_per_layer || metadata.packs.len() != experts_per_layer {
                 bail!(
-                    "FlashMoe fixed-Q4 expert storage layer {layer} declares {} experts and {} records, expected {experts_per_layer}",
+                    "FlashMoe {storage_layout:?} expert storage layer {layer} declares {} experts and {} records, expected {experts_per_layer}",
                     metadata.experts,
                     metadata.packs.len()
                 );
@@ -2271,12 +2469,12 @@ impl ExpertSlotStore {
             for expert in 0..experts_per_layer {
                 let pack = metadata.pack_for(expert).with_context(|| {
                     format!(
-                        "FlashMoe fixed-Q4 expert storage layer {layer} is missing expert {expert}"
+                        "FlashMoe {storage_layout:?} expert storage layer {layer} is missing expert {expert}"
                     )
                 })?;
                 if pack.packed_bytes != metadata.expert_size {
                     bail!(
-                        "FlashMoe fixed-Q4 expert storage layer {layer} expert {expert} has {} bytes, expected whole-slot payload {}",
+                        "FlashMoe {storage_layout:?} expert storage layer {layer} expert {expert} has {} bytes, expected whole-slot payload {}",
                         pack.packed_bytes,
                         metadata.expert_size
                     );
@@ -2288,13 +2486,13 @@ impl ExpertSlotStore {
                 .len();
             if actual_layer_bytes != expected_layer_bytes {
                 bail!(
-                    "FlashMoe fixed-Q4 expert storage layer {layer} has file size {actual_layer_bytes}, expected {expected_layer_bytes}"
+                    "FlashMoe {storage_layout:?} expert storage layer {layer} has file size {actual_layer_bytes}, expected {expected_layer_bytes}"
                 );
             }
         }
         Ok(ExpertStoreExecutionDescriptor {
-            layout: ExpertStorageLayout::FixedQ4,
-            fixed_q4: self.fixed_q4,
+            layout: storage_layout,
+            slot_spec: self.slot_spec,
             layers,
             experts_per_layer,
         })
@@ -2330,8 +2528,8 @@ impl ExpertSlotStore {
         let reader = Arc::new(ExpertLayerReader::open(
             &self.root,
             layer,
-            self.fixed_q4,
-            Arc::clone(&self.fixed_q4_buffer_pool),
+            self.slot_spec,
+            Arc::clone(&self.buffer_pool),
         )?);
         let mut layers = self.layers.lock().expect("expert layer cache poisoned");
         Ok(layers.entry(layer).or_insert_with(|| reader).clone())
@@ -2342,8 +2540,8 @@ impl ExpertLayerReader {
     pub(crate) fn open(
         root: &Path,
         layer: usize,
-        fixed_q4: FixedQ4ExpertSlotSpec,
-        fixed_q4_buffer_pool: ReusableExpertBytePool,
+        slot_spec: ExpertSlotSpec,
+        buffer_pool: ReusableExpertBytePool,
     ) -> Result<Self> {
         let path = expert_layer_path(root, layer);
         let metadata = read_expert_layer_pack_metadata(root, layer)?.with_context(|| {
@@ -2358,8 +2556,8 @@ impl ExpertLayerReader {
             path,
             file,
             metadata,
-            fixed_q4,
-            fixed_q4_buffer_pool,
+            slot_spec,
+            buffer_pool,
         })
     }
 
@@ -2398,14 +2596,13 @@ impl ExpertLayerReader {
         scratch: &mut ReusableExpertBuffer,
     ) -> Result<ExpertRawRead> {
         if scratch.capacity() < plan.slot_capacity
-            && let Some(bytes) =
-                take_reusable_expert_bytes(&self.fixed_q4_buffer_pool, plan.slot_capacity)
+            && let Some(bytes) = take_reusable_expert_bytes(&self.buffer_pool, plan.slot_capacity)
         {
             let previous = scratch.adopt_buffer(bytes);
             recycle_reusable_expert_bytes(
-                &self.fixed_q4_buffer_pool,
+                &self.buffer_pool,
                 previous,
-                self.fixed_q4.layout.expert_bytes,
+                self.slot_spec.expert_bytes(),
             );
         }
         let payload = scratch.prepare_payload(plan.slot_capacity, plan.packed_len)?;
@@ -2423,25 +2620,36 @@ impl ExpertLayerReader {
         let payload = if slot.payload().starts_with(PBQ4_EXPERT_MAGIC) {
             ExpertRawPayload::Pbq4(scratch.take_payload())
         } else {
-            FixedQ4ExpertSlotView::new(slot, self.fixed_q4.layout).with_context(|| {
-                format!(
-                    "expert {} is neither a PBQ4 pack nor a fixed Q4 slot matching the model layout",
-                    self.path.display()
-                )
-            })?;
-            ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_whole_slot(
-                self.fixed_q4,
-                scratch.take_payload(),
-                Some(Arc::clone(&self.fixed_q4_buffer_pool)),
-            )?)
+            match self.slot_spec {
+                ExpertSlotSpec::FixedQ4(spec) => {
+                    FixedQ4ExpertSlotView::new(slot, spec.layout).with_context(|| {
+                        format!(
+                            "expert {} is neither a PBQ4 pack nor a fixed Q4 slot matching the model layout",
+                            self.path.display()
+                        )
+                    })?;
+                    ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_whole_slot(
+                        spec,
+                        scratch.take_payload(),
+                        Some(Arc::clone(&self.buffer_pool)),
+                    )?)
+                }
+                ExpertSlotSpec::FixedDense(spec) => {
+                    ExpertRawPayload::FixedDense(FixedDenseExpertPayload::from_whole_slot(
+                        spec,
+                        scratch.take_payload(),
+                        Some(Arc::clone(&self.buffer_pool)),
+                    )?)
+                }
+            }
         };
         Ok(ExpertRawRead {
             layer: self.metadata.layer,
             expert,
             slot: descriptor,
             metadata: plan.metadata,
-            fixed_q4: self.fixed_q4,
-            recycle_pool: Some(Arc::clone(&self.fixed_q4_buffer_pool)),
+            slot_spec: self.slot_spec,
+            recycle_pool: Some(Arc::clone(&self.buffer_pool)),
             payload,
             read_latency,
             read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
@@ -2463,7 +2671,7 @@ pub(crate) struct ExpertRawRead {
     pub(crate) expert: usize,
     pub(crate) slot: ExpertSlotDescriptor,
     pub(crate) metadata: ExpertPackMetadata,
-    pub(crate) fixed_q4: FixedQ4ExpertSlotSpec,
+    pub(crate) slot_spec: ExpertSlotSpec,
     pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
     pub(crate) payload: ExpertRawPayload,
     pub(crate) read_latency: Duration,
@@ -2474,6 +2682,7 @@ pub(crate) struct ExpertRawRead {
 pub(crate) enum ExpertRawPayload {
     Pbq4(Vec<u8>),
     FixedQ4(FixedQ4ExpertPayload),
+    FixedDense(FixedDenseExpertPayload),
 }
 
 pub(crate) fn expert_slot_offset(expert: usize, expert_size: u64) -> Result<u64> {
@@ -2559,6 +2768,202 @@ impl FixedQ4ExpertSlotSpec {
             )
         })?;
         Self::new(q4_layout, layout.hidden_size, layout.moe_intermediate_size)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseExpertDtype {
+    Bf16,
+    F16,
+}
+
+impl DenseExpertDtype {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::F16 => "F16",
+        }
+    }
+
+    pub(crate) const fn element_size(self) -> usize {
+        2
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenseExpertProjectionSpec {
+    pub(crate) offset: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FixedDenseExpertSlotSpec {
+    pub(crate) dtype: DenseExpertDtype,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) gate: DenseExpertProjectionSpec,
+    pub(crate) up: DenseExpertProjectionSpec,
+    pub(crate) down: DenseExpertProjectionSpec,
+    pub(crate) expert_bytes: usize,
+}
+
+impl FixedDenseExpertSlotSpec {
+    pub(crate) fn new(
+        dtype: DenseExpertDtype,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        if hidden_size == 0 || intermediate_size == 0 {
+            bail!(
+                "fixed {} expert slot spec requires non-zero dimensions, hidden_size={hidden_size}, intermediate_size={intermediate_size}",
+                dtype.as_str()
+            );
+        }
+        let projection_bytes = |rows: usize, cols: usize| {
+            rows.checked_mul(cols)
+                .and_then(|values| values.checked_mul(dtype.element_size()))
+                .context("fixed dense expert projection byte length overflow")
+        };
+        let aligned = |value: usize| {
+            value
+                .checked_add(EXPERT_COMPONENT_ALIGNMENT - 1)
+                .map(|value| value / EXPERT_COMPONENT_ALIGNMENT * EXPERT_COMPONENT_ALIGNMENT)
+                .context("fixed dense expert component alignment overflow")
+        };
+        let gate_bytes = projection_bytes(intermediate_size, hidden_size)?;
+        let down_bytes = projection_bytes(hidden_size, intermediate_size)?;
+        let gate = DenseExpertProjectionSpec {
+            offset: 0,
+            rows: intermediate_size,
+            cols: hidden_size,
+            bytes: gate_bytes,
+        };
+        let up = DenseExpertProjectionSpec {
+            offset: aligned(
+                gate.offset
+                    .checked_add(gate.bytes)
+                    .context("fixed dense expert gate component end overflow")?,
+            )?,
+            rows: intermediate_size,
+            cols: hidden_size,
+            bytes: gate_bytes,
+        };
+        let down = DenseExpertProjectionSpec {
+            offset: aligned(
+                up.offset
+                    .checked_add(up.bytes)
+                    .context("fixed dense expert up component end overflow")?,
+            )?,
+            rows: hidden_size,
+            cols: intermediate_size,
+            bytes: down_bytes,
+        };
+        let expert_bytes = aligned(
+            down.offset
+                .checked_add(down.bytes)
+                .context("fixed dense expert down component end overflow")?,
+        )?;
+        Ok(Self {
+            dtype,
+            hidden_size,
+            intermediate_size,
+            gate,
+            up,
+            down,
+            expert_bytes,
+        })
+    }
+
+    pub(crate) fn from_model_layout(
+        layout: &QwenMoeModelLayout,
+        dtype: DenseExpertDtype,
+    ) -> Result<Self> {
+        Self::new(dtype, layout.hidden_size, layout.moe_intermediate_size).with_context(|| {
+            format!(
+                "FlashMoe unsupported {:?} fixed-{} expert storage dimensions",
+                layout.family,
+                dtype.as_str()
+            )
+        })
+    }
+
+    pub(crate) const fn projection(
+        self,
+        projection: ExpertMlpProjection,
+    ) -> DenseExpertProjectionSpec {
+        match projection {
+            ExpertMlpProjection::Gate => self.gate,
+            ExpertMlpProjection::Up => self.up,
+            ExpertMlpProjection::Down => self.down,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertSlotSpec {
+    FixedQ4(FixedQ4ExpertSlotSpec),
+    FixedDense(FixedDenseExpertSlotSpec),
+}
+
+impl ExpertSlotSpec {
+    pub(crate) fn from_model_layout(
+        layout: &QwenMoeModelLayout,
+        storage: ExpertStorageLayout,
+    ) -> Result<Self> {
+        match storage {
+            ExpertStorageLayout::FixedQ4 => {
+                FixedQ4ExpertSlotSpec::from_model_layout(layout).map(Self::FixedQ4)
+            }
+            ExpertStorageLayout::FixedBf16 => {
+                FixedDenseExpertSlotSpec::from_model_layout(layout, DenseExpertDtype::Bf16)
+                    .map(Self::FixedDense)
+            }
+            ExpertStorageLayout::FixedF16 => {
+                FixedDenseExpertSlotSpec::from_model_layout(layout, DenseExpertDtype::F16)
+                    .map(Self::FixedDense)
+            }
+        }
+    }
+
+    pub(crate) const fn storage_layout(self) -> ExpertStorageLayout {
+        match self {
+            Self::FixedQ4(_) => ExpertStorageLayout::FixedQ4,
+            Self::FixedDense(spec) => match spec.dtype {
+                DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
+                DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
+            },
+        }
+    }
+
+    pub(crate) const fn expert_bytes(self) -> usize {
+        match self {
+            Self::FixedQ4(spec) => spec.layout.expert_bytes,
+            Self::FixedDense(spec) => spec.expert_bytes,
+        }
+    }
+
+    pub(crate) const fn metadata_format(self) -> &'static str {
+        match self {
+            Self::FixedQ4(_) => FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+            Self::FixedDense(_) => FIXED_DENSE_EXPERT_LAYER_FORMAT_V1,
+        }
+    }
+
+    pub(crate) const fn fixed_q4(self) -> Option<FixedQ4ExpertSlotSpec> {
+        match self {
+            Self::FixedQ4(spec) => Some(spec),
+            Self::FixedDense(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fixed_dense(self) -> Option<FixedDenseExpertSlotSpec> {
+        match self {
+            Self::FixedDense(spec) => Some(spec),
+            Self::FixedQ4(_) => None,
+        }
     }
 }
 
@@ -2666,7 +3071,7 @@ impl FixedQ4ExpertPayload {
 
     pub(crate) fn project_cpu(
         &self,
-        projection: FixedQ4ExpertProjection,
+        projection: ExpertMlpProjection,
         input: &[f32],
         output_width: usize,
     ) -> Result<Vec<f32>> {
@@ -2700,7 +3105,7 @@ impl FixedQ4ExpertPayload {
 
     pub(crate) fn matvec_payload(
         &self,
-        projection: FixedQ4ExpertProjection,
+        projection: ExpertMlpProjection,
         input_len: usize,
         output_width: usize,
     ) -> Option<Q4MatvecPayload<'_>> {
@@ -2708,11 +3113,11 @@ impl FixedQ4ExpertPayload {
             return None;
         }
         let (rows, cols) = match projection {
-            FixedQ4ExpertProjection::Gate | FixedQ4ExpertProjection::Up => (
+            ExpertMlpProjection::Gate | ExpertMlpProjection::Up => (
                 self.spec.intermediate_size.min(output_width).max(1),
                 self.spec.hidden_size.min(input_len).max(1),
             ),
-            FixedQ4ExpertProjection::Down => (
+            ExpertMlpProjection::Down => (
                 self.spec.hidden_size.min(output_width).max(1),
                 self.spec.intermediate_size.min(input_len).max(1),
             ),
@@ -2722,7 +3127,7 @@ impl FixedQ4ExpertPayload {
         let needed_packed = rows.checked_mul(cols.div_ceil(2))?;
         let decoded = self.decoded.as_ref();
         let (packed, scale_bytes, bias_bytes, scales, biases, source) = match projection {
-            FixedQ4ExpertProjection::Gate => (
+            ExpertMlpProjection::Gate => (
                 self.component(QwenMoeExpertComponentKind::GateWeight),
                 self.component(QwenMoeExpertComponentKind::GateScale),
                 self.component(QwenMoeExpertComponentKind::GateBias),
@@ -2738,7 +3143,7 @@ impl FixedQ4ExpertPayload {
                     QwenMoeExpertComponentKind::GateBias,
                 ),
             ),
-            FixedQ4ExpertProjection::Up => (
+            ExpertMlpProjection::Up => (
                 self.component(QwenMoeExpertComponentKind::UpWeight),
                 self.component(QwenMoeExpertComponentKind::UpScale),
                 self.component(QwenMoeExpertComponentKind::UpBias),
@@ -2754,7 +3159,7 @@ impl FixedQ4ExpertPayload {
                     QwenMoeExpertComponentKind::UpBias,
                 ),
             ),
-            FixedQ4ExpertProjection::Down => (
+            ExpertMlpProjection::Down => (
                 self.component(QwenMoeExpertComponentKind::DownWeight),
                 self.component(QwenMoeExpertComponentKind::DownScale),
                 self.component(QwenMoeExpertComponentKind::DownBias),
@@ -2804,24 +3209,142 @@ impl FixedQ4ExpertPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FixedQ4ExpertProjection {
+pub(crate) struct DenseMatvecSource<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) byte_offset: usize,
+}
+
+impl DenseMatvecSource<'_> {
+    pub(crate) fn same_buffer(self, other: Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenseMatvecPayload<'a> {
+    pub(crate) dtype: DenseExpertDtype,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) source: DenseMatvecSource<'a>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FixedDenseExpertPayload {
+    pub(crate) spec: FixedDenseExpertSlotSpec,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
+}
+
+impl Clone for FixedDenseExpertPayload {
+    fn clone(&self) -> Self {
+        Self {
+            spec: self.spec,
+            bytes: self.bytes.clone(),
+            recycle_pool: None,
+        }
+    }
+}
+
+impl PartialEq for FixedDenseExpertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && self.bytes == other.bytes
+    }
+}
+
+impl Eq for FixedDenseExpertPayload {}
+
+impl Drop for FixedDenseExpertPayload {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.recycle_pool {
+            recycle_reusable_expert_bytes(
+                pool,
+                std::mem::take(&mut self.bytes),
+                self.spec.expert_bytes,
+            );
+        }
+    }
+}
+
+impl FixedDenseExpertPayload {
+    pub(crate) fn from_whole_slot(
+        spec: FixedDenseExpertSlotSpec,
+        bytes: Vec<u8>,
+        recycle_pool: Option<ReusableExpertBytePool>,
+    ) -> Result<Self> {
+        if bytes.len() < spec.expert_bytes {
+            bail!(
+                "fixed {} expert whole-slot payload length {} is shorter than layout size {}",
+                spec.dtype.as_str(),
+                bytes.len(),
+                spec.expert_bytes
+            );
+        }
+        Ok(Self {
+            spec,
+            bytes,
+            recycle_pool,
+        })
+    }
+
+    pub(crate) fn matvec_payload(
+        &self,
+        projection: ExpertMlpProjection,
+        input_len: usize,
+        output_width: usize,
+    ) -> Result<DenseMatvecPayload<'_>> {
+        let component = self.spec.projection(projection);
+        if input_len != component.cols || output_width != component.rows {
+            bail!(
+                "fixed {} expert {projection:?} projection requires input/output {}/{}, got {input_len}/{output_width}",
+                self.spec.dtype.as_str(),
+                component.cols,
+                component.rows
+            );
+        }
+        let end = component
+            .offset
+            .checked_add(component.bytes)
+            .context("fixed dense expert component end overflow")?;
+        if end > self.bytes.len() {
+            bail!(
+                "fixed {} expert {projection:?} component range {}..{} exceeds whole-slot payload {}",
+                self.spec.dtype.as_str(),
+                component.offset,
+                end,
+                self.bytes.len()
+            );
+        }
+        Ok(DenseMatvecPayload {
+            dtype: self.spec.dtype,
+            rows: component.rows,
+            cols: component.cols,
+            source: DenseMatvecSource {
+                bytes: &self.bytes,
+                byte_offset: component.offset,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertMlpProjection {
     Gate,
     Up,
     Down,
 }
 
-impl FixedQ4ExpertProjection {
+impl ExpertMlpProjection {
     fn scale_bias_kinds(self) -> (QwenMoeExpertComponentKind, QwenMoeExpertComponentKind) {
         match self {
-            FixedQ4ExpertProjection::Gate => (
+            ExpertMlpProjection::Gate => (
                 QwenMoeExpertComponentKind::GateScale,
                 QwenMoeExpertComponentKind::GateBias,
             ),
-            FixedQ4ExpertProjection::Up => (
+            ExpertMlpProjection::Up => (
                 QwenMoeExpertComponentKind::UpScale,
                 QwenMoeExpertComponentKind::UpBias,
             ),
-            FixedQ4ExpertProjection::Down => (
+            ExpertMlpProjection::Down => (
                 QwenMoeExpertComponentKind::DownScale,
                 QwenMoeExpertComponentKind::DownBias,
             ),
@@ -4141,9 +4664,71 @@ mod tests {
         let descriptor = store.resolve_execution_descriptor(1, experts).unwrap();
 
         assert_eq!(descriptor.layout, ExpertStorageLayout::FixedQ4);
-        assert_eq!(descriptor.fixed_q4, spec);
+        assert_eq!(descriptor.slot_spec, ExpertSlotSpec::FixedQ4(spec));
         assert_eq!(descriptor.layers, 1);
         assert_eq!(descriptor.experts_per_layer, experts);
+    }
+
+    #[test]
+    fn fixed_dense_expert_slots_resolve_offsets_reads_and_typed_payloads() {
+        for (dtype, expected_layout) in [
+            (DenseExpertDtype::Bf16, ExpertStorageLayout::FixedBf16),
+            (DenseExpertDtype::F16, ExpertStorageLayout::FixedF16),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let spec = FixedDenseExpertSlotSpec::new(dtype, 2, 3).unwrap();
+            assert_eq!(spec.gate.offset, 0);
+            assert_eq!(spec.gate.rows, 3);
+            assert_eq!(spec.gate.cols, 2);
+            assert_eq!(spec.up.offset, EXPERT_COMPONENT_ALIGNMENT);
+            assert_eq!(spec.down.offset, EXPERT_COMPONENT_ALIGNMENT * 2);
+            assert_eq!(spec.expert_bytes, EXPERT_COMPONENT_ALIGNMENT * 3);
+
+            let experts = 2;
+            let mut bytes = vec![0u8; spec.expert_bytes * experts];
+            bytes[spec.gate.offset] = 11;
+            bytes[spec.up.offset] = 22;
+            bytes[spec.down.offset] = 33;
+            fs::write(expert_layer_path(temp.path(), 0), bytes).unwrap();
+            let metadata = ExpertLayerPackMetadata::new_fixed_dense(
+                0,
+                spec.expert_bytes as u64,
+                experts,
+                (0..experts)
+                    .map(|expert| tiny_pack_metadata(0, expert, spec.expert_bytes as u64))
+                    .collect(),
+            );
+            write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
+            let store =
+                ExpertSlotStore::open_with_fixed_dense(temp.path().to_path_buf(), spec).unwrap();
+
+            let descriptor = store.resolve_execution_descriptor(1, experts).unwrap();
+            assert_eq!(descriptor.layout, expected_layout);
+            assert_eq!(descriptor.slot_spec.fixed_dense(), Some(spec));
+
+            let mut reads = store.read_many_raw(0, &[0]).unwrap();
+            let raw = reads.pop().unwrap();
+            assert_eq!(raw.slot.slot_capacity, spec.expert_bytes);
+            let ExpertRawPayload::FixedDense(payload) = raw.payload else {
+                panic!("fixed dense slot did not resolve a fixed dense payload");
+            };
+            let gate = payload
+                .matvec_payload(ExpertMlpProjection::Gate, 2, 3)
+                .unwrap();
+            let up = payload
+                .matvec_payload(ExpertMlpProjection::Up, 2, 3)
+                .unwrap();
+            let down = payload
+                .matvec_payload(ExpertMlpProjection::Down, 3, 2)
+                .unwrap();
+            assert_eq!(gate.dtype, dtype);
+            assert_eq!(gate.source.byte_offset, spec.gate.offset);
+            assert_eq!(up.source.byte_offset, spec.up.offset);
+            assert_eq!(down.source.byte_offset, spec.down.offset);
+            assert_eq!(gate.source.bytes[gate.source.byte_offset], 11);
+            assert_eq!(up.source.bytes[up.source.byte_offset], 22);
+            assert_eq!(down.source.bytes[down.source.byte_offset], 33);
+        }
     }
 
     #[test]
@@ -4175,7 +4760,7 @@ mod tests {
         let payload = FixedQ4ExpertPayload::from_whole_slot(spec, (0..45).collect(), None).unwrap();
 
         let gate = payload
-            .matvec_payload(FixedQ4ExpertProjection::Gate, 2, 2)
+            .matvec_payload(ExpertMlpProjection::Gate, 2, 2)
             .unwrap();
         assert_eq!(gate.rows, 2);
         assert_eq!(gate.cols, 2);
@@ -4195,7 +4780,7 @@ mod tests {
         assert!(source.offsets_are_metal_aligned());
 
         let up = payload
-            .matvec_payload(FixedQ4ExpertProjection::Up, 2, 2)
+            .matvec_payload(ExpertMlpProjection::Up, 2, 2)
             .unwrap();
         let up_source = up.source.unwrap();
         assert!(source.same_buffer(up_source));
@@ -4211,7 +4796,7 @@ mod tests {
 
         assert!(
             payload
-                .matvec_payload(FixedQ4ExpertProjection::Down, 2, 2)
+                .matvec_payload(ExpertMlpProjection::Down, 2, 2)
                 .is_none()
         );
     }
@@ -4302,8 +4887,13 @@ mod tests {
         )
         .unwrap();
 
-        let reader =
-            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        let reader = ExpertLayerReader::open(
+            tmp.path(),
+            0,
+            ExpertSlotSpec::FixedQ4(spec),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .unwrap();
         let plan = reader.prepare_read(0).unwrap();
         let mut scratch = ReusableExpertBuffer::default();
         let raw = reader.read_prepared_into(0, plan, &mut scratch).unwrap();
@@ -4319,6 +4909,7 @@ mod tests {
                 );
             }
             ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
+            ExpertRawPayload::FixedDense(_) => panic!("Q4 slot classified as fixed dense"),
         }
     }
 
@@ -4342,8 +4933,13 @@ mod tests {
         )
         .unwrap();
 
-        let reader =
-            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap();
+        let reader = ExpertLayerReader::open(
+            tmp.path(),
+            0,
+            ExpertSlotSpec::FixedQ4(spec),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .unwrap();
         let plan = reader.prepare_read(0).unwrap();
         let mut scratch = ReusableExpertBuffer::default();
         let raw = reader.read_prepared_into(0, plan, &mut scratch).unwrap();
@@ -4351,6 +4947,7 @@ mod tests {
         match raw.payload {
             ExpertRawPayload::Pbq4(bytes) => assert_eq!(bytes, payload),
             ExpertRawPayload::FixedQ4(_) => panic!("PBQ4 slot classified as fixed Q4"),
+            ExpertRawPayload::FixedDense(_) => panic!("PBQ4 slot classified as fixed dense"),
         }
     }
 
@@ -4373,7 +4970,13 @@ mod tests {
         )
         .unwrap();
         let reader = Arc::new(
-            ExpertLayerReader::open(tmp.path(), 0, spec, Arc::new(Mutex::new(Vec::new()))).unwrap(),
+            ExpertLayerReader::open(
+                tmp.path(),
+                0,
+                ExpertSlotSpec::FixedQ4(spec),
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .unwrap(),
         );
         let plan = reader.prepare_read(0).unwrap();
         let mut pool = ExpertReadWorkerPool::default();
@@ -4399,6 +5002,7 @@ mod tests {
                 );
             }
             ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
+            ExpertRawPayload::FixedDense(_) => panic!("Q4 slot classified as fixed dense"),
         }
     }
 

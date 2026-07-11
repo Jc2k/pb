@@ -3,9 +3,10 @@ use super::capabilities::{
     FlashMoeStageImplementation, FlashMoeStagePlacement, FlashMoeUnsupportedCapability,
 };
 use super::experts::{
-    EXPERT_SCALE_BIAS_DTYPE_BF16, ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse,
-    ExpertReadPath, ExpertReadWorkerPool, ExpertSlotDescriptor, ExpertSlotStore,
-    FLASHMOE_EXPERT_IO_POLICY, FixedQ4ExpertProjection, Q4MatvecPayload, Q4MatvecSource,
+    DenseMatvecPayload, EXPERT_SCALE_BIAS_DTYPE_BF16, ExpertMlpProjection, ExpertRawPayload,
+    ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertReadWorkerPool,
+    ExpertSlotDescriptor, ExpertSlotStore, ExpertStorageLayout, FLASHMOE_EXPERT_IO_POLICY,
+    Q4MatvecPayload, Q4MatvecSource,
 };
 use super::math::{softmax_in_place, top_k};
 use super::model_family::{QwenMoeFamily, QwenMoeRoutingWeightNormalization};
@@ -31,6 +32,7 @@ pub struct FlashMoeScheduledGraph {
     family: QwenMoeFamily,
     experts_per_layer: usize,
     active_experts: usize,
+    expert_storage: ExpertStorageLayout,
     routing_weight_normalization: QwenMoeRoutingWeightNormalization,
     routed_expert_scale: f32,
     stages: Vec<FlashMoeStageCapability>,
@@ -57,6 +59,7 @@ impl FlashMoeScheduledGraph {
             family: capabilities.family,
             experts_per_layer: capabilities.experts_per_layer,
             active_experts: capabilities.active_experts,
+            expert_storage: capabilities.expert_storage.layout,
             routing_weight_normalization: capabilities.routing_weight_normalization,
             routed_expert_scale: capabilities.routed_expert_scale,
             stages,
@@ -290,19 +293,20 @@ impl FlashMoeScheduledGraph {
             ));
         }
         if stage.implementation
-            == FlashMoeStageImplementation::MetalFixedQ4ExpertResidentSharedCombine
+            == FlashMoeStageImplementation::MetalTypedExpertResidentSharedCombine
             && shared == ScheduledSharedExpertSource::DenseCpuWeights
         {
             return Err(FlashMoeUnsupportedCapability::new(
                 self.family,
                 stage.stage,
-                "the fixed-Q4 active-expert CMD3 implementation requires resident shared projections or the declared no-shared source; dense CPU shared weights are not a declared graph-stage implementation",
+                "the typed active-expert CMD3 implementation requires resident shared projections or the declared no-shared source; dense CPU shared weights are not a declared graph-stage implementation",
             ));
         }
         Ok(ScheduledCmd3ExpertPhase {
             stage,
             layer,
             expert_count,
+            expert_storage: self.expert_storage,
             input,
             shared,
             shared_descriptor: None,
@@ -2090,6 +2094,7 @@ pub struct ScheduledCmd3ExpertPhase {
     pub stage: FlashMoeStageCapability,
     pub layer: usize,
     pub expert_count: usize,
+    pub(crate) expert_storage: ExpertStorageLayout,
     pub input: ScheduledCmd3InputSource,
     pub shared: ScheduledSharedExpertSource,
     pub shared_descriptor: Option<ScheduledSharedExpertDescriptor>,
@@ -2226,13 +2231,78 @@ where
 #[derive(Debug, Clone)]
 pub enum ScheduledExpertPhaseMlpPayload<'a> {
     Q4(ScheduledQ4ExpertPhaseMlpPayload<'a>),
+    Dense(ScheduledDenseExpertPhaseMlpPayload<'a>),
 }
 
 impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
+    #[cfg(test)]
     pub(crate) fn q4(&self) -> &ScheduledQ4ExpertPhaseMlpPayload<'a> {
         match self {
             Self::Q4(payload) => payload,
+            Self::Dense(_) => panic!("scheduled expert payload is dense, not Q4"),
         }
+    }
+
+    pub(crate) fn storage_layout(&self) -> ExpertStorageLayout {
+        match self {
+            Self::Q4(_) => ExpertStorageLayout::FixedQ4,
+            Self::Dense(payload) => match payload.gate.dtype {
+                super::experts::DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
+                super::experts::DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledDenseExpertPhaseMlpPayload<'a> {
+    pub(crate) gate: DenseMatvecPayload<'a>,
+    pub(crate) up: DenseMatvecPayload<'a>,
+    pub(crate) down: DenseMatvecPayload<'a>,
+}
+
+impl<'a> ScheduledDenseExpertPhaseMlpPayload<'a> {
+    pub(crate) fn new(
+        layer: usize,
+        expert: usize,
+        width: usize,
+        gate: DenseMatvecPayload<'a>,
+        up: DenseMatvecPayload<'a>,
+        down: DenseMatvecPayload<'a>,
+    ) -> Result<Self> {
+        if gate.dtype != up.dtype || gate.dtype != down.dtype {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed dense expert layer {layer} expert {expert} has mismatched projection dtypes"
+            );
+        }
+        if gate.rows == 0
+            || gate.rows != up.rows
+            || down.cols != gate.rows
+            || gate.cols != width
+            || up.cols != width
+            || down.rows != width
+        {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed {} expert layer {} expert {} has payload shape gate={}x{}, up={}x{}, down={}x{} for width {width}",
+                gate.dtype.as_str(),
+                layer,
+                expert,
+                gate.rows,
+                gate.cols,
+                up.rows,
+                up.cols,
+                down.rows,
+                down.cols
+            );
+        }
+        let source = gate.source;
+        if !source.same_buffer(up.source) || !source.same_buffer(down.source) {
+            bail!(
+                "FlashMoe unsupported active expert CMD3 path: fixed {} expert layer {layer} expert {expert} projections do not share one scheduler-owned whole-expert slot",
+                gate.dtype.as_str()
+            );
+        }
+        Ok(Self { gate, up, down })
     }
 }
 
@@ -2733,6 +2803,17 @@ where
     ) -> Result<ScheduledCmd3Command<'a, TExpert, TInput, TShared>> {
         let input_width = self.input_state.width();
         let payloads = self.scheduled.cmd3_expert_phase_payloads(input_width)?;
+        if let Some((index, payload)) = payloads
+            .iter()
+            .enumerate()
+            .find(|(_, payload)| payload.storage_layout() != self.cmd3.expert_storage)
+        {
+            bail!(
+                "FlashMoe scheduled CMD3 expert payload {index} resolves {:?} storage, but the graph requires {:?}",
+                payload.storage_layout(),
+                self.cmd3.expert_storage
+            );
+        }
         Ok(ScheduledCmd3Command {
             cmd3: self.cmd3,
             position: self.position,
@@ -3071,6 +3152,7 @@ impl ScheduledExpertSlot {
         let prefix = match &self.raw.payload {
             ExpertRawPayload::Pbq4(bytes) => bytes.as_slice(),
             ExpertRawPayload::FixedQ4(fixed_q4) => fixed_q4.bytes.as_slice(),
+            ExpertRawPayload::FixedDense(fixed_dense) => fixed_dense.bytes.as_slice(),
         };
         for byte in prefix.iter().take(4096) {
             hash = hash.rotate_left(5) ^ u64::from(*byte);
@@ -3099,48 +3181,72 @@ impl ScheduledCmd3ExpertPayload for ScheduledExpertSlot {
         &self,
         width: usize,
     ) -> Result<ScheduledExpertPhaseMlpPayload<'_>> {
-        let ExpertRawPayload::FixedQ4(fixed_q4) = &self.raw.payload else {
-            bail!(
-                "FlashMoe unsupported active expert CMD3 path: scheduler-owned layer {} expert {} slot is not a fixed-Q4 whole-expert payload; PBQ4/component records are import compatibility only",
-                self.layer(),
-                self.expert()
-            );
-        };
-        let gate = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Gate,
-            width,
-            fixed_q4.spec.intermediate_size,
-        );
-        let up = fixed_q4.matvec_payload(
-            FixedQ4ExpertProjection::Up,
-            width,
-            fixed_q4.spec.intermediate_size,
-        );
-        let Some((gate, up)) = gate.zip(up) else {
-            bail!(
-                "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide gate/up payloads for width {width}",
-                self.layer(),
-                self.expert()
-            );
-        };
-        let Some(down) = fixed_q4.matvec_payload(FixedQ4ExpertProjection::Down, gate.rows, width)
-        else {
-            bail!(
-                "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide down payload for width {width}",
-                self.layer(),
-                self.expert()
-            );
-        };
-        Ok(ScheduledExpertPhaseMlpPayload::Q4(
-            ScheduledQ4ExpertPhaseMlpPayload::new(
-                self.layer(),
-                self.expert(),
-                width,
-                gate,
-                up,
-                down,
-            )?,
-        ))
+        match &self.raw.payload {
+            ExpertRawPayload::FixedQ4(fixed_q4) => {
+                let gate = fixed_q4.matvec_payload(
+                    ExpertMlpProjection::Gate,
+                    width,
+                    fixed_q4.spec.intermediate_size,
+                );
+                let up = fixed_q4.matvec_payload(
+                    ExpertMlpProjection::Up,
+                    width,
+                    fixed_q4.spec.intermediate_size,
+                );
+                let Some((gate, up)) = gate.zip(up) else {
+                    bail!(
+                        "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide gate/up payloads for width {width}",
+                        self.layer(),
+                        self.expert()
+                    );
+                };
+                let Some(down) =
+                    fixed_q4.matvec_payload(ExpertMlpProjection::Down, gate.rows, width)
+                else {
+                    bail!(
+                        "FlashMoe unsupported active expert CMD3 path: scheduler-owned fixed-Q4 slot layer {} expert {} does not provide down payload for width {width}",
+                        self.layer(),
+                        self.expert()
+                    );
+                };
+                Ok(ScheduledExpertPhaseMlpPayload::Q4(
+                    ScheduledQ4ExpertPhaseMlpPayload::new(
+                        self.layer(),
+                        self.expert(),
+                        width,
+                        gate,
+                        up,
+                        down,
+                    )?,
+                ))
+            }
+            ExpertRawPayload::FixedDense(fixed_dense) => {
+                let intermediate = fixed_dense.spec.intermediate_size;
+                let gate =
+                    fixed_dense.matvec_payload(ExpertMlpProjection::Gate, width, intermediate)?;
+                let up =
+                    fixed_dense.matvec_payload(ExpertMlpProjection::Up, width, intermediate)?;
+                let down =
+                    fixed_dense.matvec_payload(ExpertMlpProjection::Down, intermediate, width)?;
+                Ok(ScheduledExpertPhaseMlpPayload::Dense(
+                    ScheduledDenseExpertPhaseMlpPayload::new(
+                        self.layer(),
+                        self.expert(),
+                        width,
+                        gate,
+                        up,
+                        down,
+                    )?,
+                ))
+            }
+            ExpertRawPayload::Pbq4(_) => {
+                bail!(
+                    "FlashMoe unsupported active expert CMD3 path: scheduler-owned layer {} expert {} slot contains PBQ4/component import data instead of a resolved whole-expert payload",
+                    self.layer(),
+                    self.expert()
+                )
+            }
+        }
     }
 }
 
@@ -3577,8 +3683,10 @@ impl ExpertSchedulerSnapshot {
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{
-        ExpertLayerPackMetadata, ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertPayload,
-        FixedQ4ExpertSlotSpec, expert_layer_path, write_expert_metadata_atomically,
+        DenseExpertDtype, ExpertLayerPackMetadata, ExpertPackMetadata, ExpertRawPayload,
+        ExpertSlotSpec, ExpertStoreExecutionDescriptor, FixedDenseExpertPayload,
+        FixedDenseExpertSlotSpec, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, expert_layer_path,
+        write_expert_metadata_atomically,
     };
     use crate::inference::flashmoe::math::causal_attention;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3599,6 +3707,7 @@ mod tests {
         SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
     };
     use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
+    use std::{fs, path::Path};
 
     fn qwen35_layout() -> QwenMoeModelLayout {
         let config: QwenModelConfig = serde_json::from_slice(
@@ -3719,7 +3828,9 @@ mod tests {
                 packed_bytes: payload.len() as u64,
                 records: Vec::new(),
             },
-            fixed_q4: FixedQ4ExpertSlotSpec::from_model_layout(&layout).unwrap(),
+            slot_spec: ExpertSlotSpec::FixedQ4(
+                FixedQ4ExpertSlotSpec::from_model_layout(&layout).unwrap(),
+            ),
             recycle_pool: None,
             payload: ExpertRawPayload::Pbq4(payload),
             read_latency: Duration::from_millis(7),
@@ -3751,9 +3862,38 @@ mod tests {
                 packed_bytes: fixed_q4.layout.expert_bytes as u64,
                 records: Vec::new(),
             },
-            fixed_q4,
+            slot_spec: ExpertSlotSpec::FixedQ4(fixed_q4),
             recycle_pool: None,
             payload: ExpertRawPayload::FixedQ4(payload),
+            read_latency: Duration::from_millis(3),
+            read_path: ExpertReadPath::PositionedRead,
+        }
+    }
+
+    fn raw_fixed_dense_read(layer: usize, expert: usize, dtype: DenseExpertDtype) -> ExpertRawRead {
+        let spec = FixedDenseExpertSlotSpec::new(dtype, 2, 2).unwrap();
+        let payload =
+            FixedDenseExpertPayload::from_whole_slot(spec, vec![0; spec.expert_bytes], None)
+                .unwrap();
+        ExpertRawRead {
+            layer,
+            expert,
+            slot: ExpertSlotDescriptor {
+                layer,
+                expert,
+                slot_offset: 512,
+                slot_capacity: spec.expert_bytes,
+                payload_len: spec.expert_bytes,
+            },
+            metadata: ExpertPackMetadata {
+                layer,
+                expert,
+                packed_bytes: spec.expert_bytes as u64,
+                records: Vec::new(),
+            },
+            slot_spec: ExpertSlotSpec::FixedDense(spec),
+            recycle_pool: None,
+            payload: ExpertRawPayload::FixedDense(payload),
             read_latency: Duration::from_millis(3),
             read_path: ExpertReadPath::PositionedRead,
         }
@@ -3945,6 +4085,70 @@ mod tests {
             temp,
             FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
         )
+    }
+
+    fn test_dense_execution_scheduler_with_attention(
+        dtype: DenseExpertDtype,
+        attention_layers: Vec<ScheduledLayerAttentionImplementation>,
+    ) -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
+        let temp = tempfile::tempdir().unwrap();
+        let tiny_spec = FixedDenseExpertSlotSpec::new(dtype, 2, 2).unwrap();
+        let store =
+            ExpertSlotStore::open_with_fixed_dense(temp.path().to_path_buf(), tiny_spec).unwrap();
+        let layout = qwen35_layout();
+        let graph_spec = FixedDenseExpertSlotSpec::from_model_layout(&layout, dtype).unwrap();
+        let mut capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        capabilities.expert_storage = ExpertStoreExecutionDescriptor {
+            layout: match dtype {
+                DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
+                DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
+            },
+            slot_spec: ExpertSlotSpec::FixedDense(graph_spec),
+            layers: layout.layers,
+            experts_per_layer: layout.experts_per_layer,
+        };
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        (
+            temp,
+            FlashMoeExecutionScheduler::new(graph, store, attention_layers).unwrap(),
+        )
+    }
+
+    fn write_identity_fixed_dense_layer(
+        root: &Path,
+        layer: usize,
+        experts: usize,
+        dtype: DenseExpertDtype,
+    ) {
+        let spec = FixedDenseExpertSlotSpec::new(dtype, 2, 2).unwrap();
+        let one = match dtype {
+            DenseExpertDtype::Bf16 => 0x3f80u16.to_le_bytes(),
+            DenseExpertDtype::F16 => 0x3c00u16.to_le_bytes(),
+        };
+        let mut bytes = vec![0u8; spec.expert_bytes * experts];
+        for expert in 0..experts {
+            let slot = expert * spec.expert_bytes;
+            for projection in [spec.gate, spec.up, spec.down] {
+                let start = slot + projection.offset;
+                bytes[start..start + 2].copy_from_slice(&one);
+                bytes[start + 6..start + 8].copy_from_slice(&one);
+            }
+        }
+        fs::write(expert_layer_path(root, layer), bytes).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_dense(
+            layer,
+            spec.expert_bytes as u64,
+            experts,
+            (0..experts)
+                .map(|expert| ExpertPackMetadata {
+                    layer,
+                    expert,
+                    packed_bytes: spec.expert_bytes as u64,
+                    records: Vec::new(),
+                })
+                .collect(),
+        );
+        write_expert_metadata_atomically(root, layer, &metadata).unwrap();
     }
 
     fn test_qwen3_execution_scheduler() -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
@@ -4752,6 +4956,12 @@ mod tests {
     #[ignore = "requires a local Metal device"]
     fn qwen35_resident_shared_cmd3_metal_output_matches_layer_reference() {
         #[derive(Debug, Clone, Copy)]
+        enum ActiveLayout {
+            Q4,
+            Dense(DenseExpertDtype),
+        }
+
+        #[derive(Debug, Clone, Copy)]
         enum SharedLayout {
             Q4,
             Dense(&'static str),
@@ -4766,16 +4976,30 @@ mod tests {
         let normed = [1.2955897, 0.5669620];
         let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
         let active = top_k(&router_scores, active_experts);
-        for shared_layout in [
-            SharedLayout::Q4,
-            SharedLayout::Dense("BF16"),
-            SharedLayout::Dense("F16"),
-            SharedLayout::Dense("F32"),
+        for (active_layout, shared_layout) in [
+            (ActiveLayout::Q4, SharedLayout::Q4),
+            (ActiveLayout::Q4, SharedLayout::Dense("BF16")),
+            (ActiveLayout::Q4, SharedLayout::Dense("F16")),
+            (ActiveLayout::Q4, SharedLayout::Dense("F32")),
+            (
+                ActiveLayout::Dense(DenseExpertDtype::Bf16),
+                SharedLayout::Q4,
+            ),
+            (ActiveLayout::Dense(DenseExpertDtype::F16), SharedLayout::Q4),
         ] {
-            let (temp, mut scheduler) = test_execution_scheduler_with_attention(vec![
-                ScheduledLayerAttentionImplementation::FullAttentionCpuKv,
-            ]);
-            write_identity_fixed_q4_layer(temp.path(), layer, experts);
+            let attention = vec![ScheduledLayerAttentionImplementation::FullAttentionCpuKv];
+            let (temp, mut scheduler) = match active_layout {
+                ActiveLayout::Q4 => test_execution_scheduler_with_attention(attention),
+                ActiveLayout::Dense(dtype) => {
+                    test_dense_execution_scheduler_with_attention(dtype, attention)
+                }
+            };
+            match active_layout {
+                ActiveLayout::Q4 => write_identity_fixed_q4_layer(temp.path(), layer, experts),
+                ActiveLayout::Dense(dtype) => {
+                    write_identity_fixed_dense_layer(temp.path(), layer, experts, dtype)
+                }
+            }
 
             let scheduled = scheduler
                 .begin_layer(
@@ -4987,7 +5211,7 @@ mod tests {
             for (actual, expected) in hidden.iter().zip([3.3542297, 0.9476203]) {
                 assert!(
                     (actual - expected).abs() <= 1e-4,
-                    "{actual} != {expected} for {shared_layout:?}"
+                    "{actual} != {expected} for active={active_layout:?} shared={shared_layout:?}"
                 );
             }
         }
@@ -7660,14 +7884,39 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_expert_slot_resolves_typed_dense_payload_from_same_lease() {
+        for dtype in [DenseExpertDtype::Bf16, DenseExpertDtype::F16] {
+            let spec = FixedDenseExpertSlotSpec::new(dtype, 2, 2).unwrap();
+            let slot = ScheduledExpertSlot::from_raw(raw_fixed_dense_read(3, 8, dtype));
+            let payload = slot.scheduled_cmd3_expert_phase_payload(2).unwrap();
+            let ScheduledExpertPhaseMlpPayload::Dense(dense) = payload else {
+                panic!("fixed dense slot resolved a Q4 payload");
+            };
+            assert_eq!(dense.gate.dtype, dtype);
+            assert_eq!(dense.gate.rows, 2);
+            assert_eq!(dense.gate.cols, 2);
+            assert_eq!(
+                dense.up.source.bytes.as_ptr(),
+                dense.gate.source.bytes.as_ptr()
+            );
+            assert_eq!(
+                dense.down.source.bytes.as_ptr(),
+                dense.gate.source.bytes.as_ptr()
+            );
+            assert_eq!(dense.gate.source.byte_offset, 0);
+            assert_eq!(dense.up.source.byte_offset, spec.up.offset);
+            assert_eq!(dense.down.source.byte_offset, spec.down.offset);
+        }
+    }
+
+    #[test]
     fn scheduled_expert_slot_rejects_pbq4_component_payload_for_cmd3() {
         let slot = ScheduledExpertSlot::from_raw(raw_pbq4_read(3, 8, vec![1, 2, 3]));
 
         let err = slot.scheduled_cmd3_expert_phase_payload(2).unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("PBQ4/component records are import compatibility only"),
+            err.to_string().contains("PBQ4/component import data"),
             "{err:#}"
         );
     }
