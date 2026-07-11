@@ -25,6 +25,7 @@ pub use math::*;
 pub use metal::METAL_SHADERS;
 pub use model_family::*;
 pub use planning::*;
+pub use runtime::{FlashMoeEngine, load, load_with_progress};
 pub use scheduler::*;
 pub use types::*;
 pub use vision::{ImagePreprocessor, Qwen3VLVisionConfig, VisionEncoder, VisionEncoding};

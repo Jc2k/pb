@@ -138,8 +138,9 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
   recurrent-state operations, Obj-C buffer ownership, command diagnostics, and wait policy.
 - `state`: hidden, residual, normed, KV, recurrent, next-layer, position, and session state with
   explicit CPU-visible and GPU-resident transitions.
-- `runtime`: model-family-agnostic generation loop that asks the scheduler to execute resolved
-  graph stages. It does not inspect storage formats or probe optional implementations.
+- `runtime`: engine state, the load transaction, and the model-family-agnostic generation loop that
+  asks the scheduler to execute resolved graph stages. It does not inspect storage formats or probe
+  optional implementations.
 - `vision`: Qwen-VL preprocessing, embeddings, MRoPE, and multimodal position adaptation. It emits
   typed token/position inputs to `runtime` and never branches through the MoE layer loop.
 - `legacy`: temporary facade and compatibility shims only. It is not an owner in the target
@@ -167,6 +168,11 @@ Baseline reviewed on 2026-07-10:
   canonical cache paths, readiness checks, and cleanup. Runtime and vision import the plan directly
   from that owner. Cache readiness no longer substitutes Qwen3.5's 60x512 expert shape when config
   parsing fails; malformed model metadata is an explicit planning error before graph construction.
+- `runtime.rs` now owns `FlashMoeEngine` and the complete ordered load transaction from cache status
+  through config/layout, metadata-resolved expert storage, dense bindings, typed input adapter,
+  required Metal executor, capability graph, scheduler, and tokenizer. The stored capability plan
+  was removed once it had produced the scheduler graph. `legacy.rs` no longer constructs the engine
+  or selects load-time implementations.
 - State descriptors, resident projection descriptors, and many CMD1/CMD2/CMD3 input/output/layout
   records have been extracted.
 - Several missing CMD2/CMD3 continuations now produce explicit unsupported errors.
@@ -393,8 +399,9 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- The legacy engine shell still stores the weights-owned `DenseStore`, state-owned session-cache
-  owner, and runtime layout metadata even though their implementations live in focused modules.
+- The engine container and load path are now in `runtime.rs`, but the public generation/session
+  methods, tokenizer implementation, dense runtime-layout builder, and several math helpers remain
+  as sibling implementations in `legacy.rs`.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs

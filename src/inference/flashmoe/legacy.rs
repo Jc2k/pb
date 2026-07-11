@@ -36,7 +36,7 @@ use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
@@ -54,15 +54,17 @@ use std::io::Write;
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::capabilities::FlashMoeCapabilityPlan;
 #[cfg(test)]
 use super::capabilities::FlashMoeGraphStage;
 #[cfg(test)]
 use super::capabilities::{
-    FlashMoeStageCapability, FlashMoeStageImplementation, FlashMoeStagePlacement,
+    FlashMoeCapabilityPlan, FlashMoeStageCapability, FlashMoeStageImplementation,
+    FlashMoeStagePlacement,
 };
 #[cfg(test)]
 use super::experts::ExpertReadPath;
+#[cfg(test)]
+use super::experts::ExpertSlotStore;
 #[cfg(test)]
 use super::experts::FLASHMOE_EXPERT_IO_POLICY;
 #[cfg(test)]
@@ -84,7 +86,7 @@ use super::experts::{
     DirectExpertTensorShape, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpectedExpertPack, ExpectedExpertPackRecord, ExpertLayerStorageFormat, ExpertMlpProjection,
     ExpertPackMetadata, ExpertRawPayload, ExpertRawRead, ExpertRecordInput, ExpertSlotDescriptor,
-    ExpertSlotStore, FixedDenseExpertRecordInput, FixedDenseExpertSlotSpec, FixedQ4ExpertPayload,
+    FixedDenseExpertRecordInput, FixedDenseExpertSlotSpec, FixedQ4ExpertPayload,
     FixedQ4ExpertSlotSpec, NativeQ4ExpertRecordInput, PackedExpertTensor, Q4MatvecPayload,
     aggregate_expert_tensor_kind, aggregate_expert_tensors, aggregate_native_q4_enabled,
     build_expert_pack, build_fixed_dense_expert_pack, build_fixed_native_q4_expert_pack,
@@ -118,7 +120,12 @@ use super::model_family::QwenMoeQ4ExpertLayout;
 use super::model_family::is_qwen35_or_legacy_alias;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
 use super::planning::*;
+use super::runtime::FlashMoeEngine;
+#[cfg(test)]
 use super::runtime::MetalExecutionFacade;
+use super::scheduler::ExpertSchedulerSnapshot;
+#[cfg(test)]
+use super::scheduler::FlashMoeScheduledGraph;
 #[cfg(test)]
 use super::scheduler::ScheduledExpertPhaseMlpPayload;
 #[cfg(test)]
@@ -131,10 +138,6 @@ use super::scheduler::ScheduledRoutingCandidateSource;
 use super::scheduler::ScheduledRoutingCommand;
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
-use super::scheduler::{
-    ExpertSchedulerSnapshot, FlashMoeExecutionScheduler, FlashMoeScheduledGraph,
-    ScheduledLayerAttentionImplementation,
-};
 #[cfg(test)]
 use super::scheduler::{ScheduledCmd3Expert, ScheduledCmd3ExpertPayload};
 #[cfg(test)]
@@ -143,16 +146,16 @@ use super::state::{
     FlashMoeStatePlacement, reusable_session_prefix_len, stable_session_cache_tokens,
     take_reusable_session_cache_entry,
 };
-use super::state::{
-    FlashMoePromptTokenRecord, FlashMoeSessionCache, KvCache, LinearAttentionLayout,
-};
+use super::state::{FlashMoePromptTokenRecord, KvCache, LinearAttentionLayout};
 use super::types::*;
 #[cfg(test)]
 use super::vision::block_major_patch_coords;
 use super::vision::{
-    FlashMoeInputAdapterExecutor, FlashMoeTokenInput, ImagePreprocessor, MropeAxis, MropePosition,
-    QwenVlRuntimeInputs, VisionEncoding,
+    FlashMoeTokenInput, ImagePreprocessor, MropeAxis, MropePosition, QwenVlRuntimeInputs,
+    VisionEncoding,
 };
+#[cfg(test)]
+use super::weights::DenseStore;
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
 #[cfg(test)]
@@ -160,9 +163,8 @@ use super::weights::qwen3next_norm_weight_needs_offset;
 #[cfg(test)]
 use super::weights::{DenseQ4Layout, ResidentMmapMatvecProjection, dense_q4_layout};
 use super::weights::{
-    DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef,
-    FlashMoeManifest, LinearAttentionWeightTable, ResidentDenseLayout, RuntimeTensorEntry,
-    SharedExpertWeightTable, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
+    DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseTensorRef, ExpertTensorRef,
+    FlashMoeManifest, RuntimeTensorEntry, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, attention_tensor_name, canonical_hf_tensor_name,
     dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
     layer_norm_tensor_name, linear_attention_scalar_tensor_name, linear_attention_tensor_name,
@@ -248,163 +250,6 @@ struct SafetensorTensorInfo {
     data_offsets: [u64; 2],
 }
 
-pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
-    load_with_progress(plan, |_, _| {})
-}
-
-pub fn load_with_progress<F>(plan: &FlashMoePlan, mut progress: F) -> Result<FlashMoeEngine>
-where
-    F: FnMut(&'static str, Duration),
-{
-    let mut phase_started = Instant::now();
-    let status = plan.cache_status()?;
-    progress("cache_status", phase_started.elapsed());
-    if !status.ready {
-        bail!(
-            "Flash-MoE cache is not ready for {}. Missing: {}. Found {} expert files totaling {} bytes. Run `pb pull {}` on ARM macOS to download and prepare the Qwen3.5 cache.",
-            plan.model,
-            format_missing(&status.missing),
-            status.expert_files,
-            status.expert_bytes,
-            plan.model
-        );
-    }
-    phase_started = Instant::now();
-    let config = QwenModelConfig::from_file(&plan.model_config)?;
-    progress("config", phase_started.elapsed());
-    phase_started = Instant::now();
-    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
-    progress("routing_policy", phase_started.elapsed());
-    phase_started = Instant::now();
-    let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?
-        .with_scheduled_active_experts(routing_policy.active_experts)?;
-    progress("model_layout", phase_started.elapsed());
-    phase_started = Instant::now();
-    let resolved_experts =
-        ExpertSlotStore::resolve_from_metadata(plan.experts_dir.clone(), &model_layout)?;
-    if resolved_experts.upgraded_pbq4_layers > 0 {
-        tracing::info!(
-            model = %plan.model,
-            layers = resolved_experts.upgraded_pbq4_layers,
-            "upgraded PBQ4 expert cache layers to fixed Q4 slots"
-        );
-    }
-    progress("expert_cache_format", phase_started.elapsed());
-    phase_started = Instant::now();
-    let dense = DenseStore::open(
-        plan.non_expert_weights.clone(),
-        plan.tensor_manifest.clone(),
-    )?;
-    progress("dense_store", phase_started.elapsed());
-    phase_started = Instant::now();
-    validate_required_tensor_manifest(&config, dense.registry())?;
-    progress("manifest_validation", phase_started.elapsed());
-    phase_started = Instant::now();
-    let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
-    progress("runtime_layout", phase_started.elapsed());
-    phase_started = Instant::now();
-    let linear_attention_weights = dense.resolve_linear_attention_weight_table(
-        &runtime.linear_attention,
-        config.hidden_size,
-        model_layout.experts_per_layer,
-    )?;
-    progress("linear_attention_weights", phase_started.elapsed());
-    phase_started = Instant::now();
-    let shared_expert_weights = dense.resolve_shared_expert_weight_table(
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.shared_experts(),
-        config.shared_expert_intermediate_size(),
-    )?;
-    progress("shared_expert_weights", phase_started.elapsed());
-    phase_started = Instant::now();
-    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
-    if matches!(
-        model_layout.family,
-        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe
-    ) && dense_layout == ResidentDenseLayout::Q4
-    {
-        validate_qwen_q4_graph_bindings(
-            model_layout.family,
-            &config,
-            &runtime,
-            dense.registry(),
-            dense.len,
-        )?;
-    }
-    progress("dense_graph_bindings", phase_started.elapsed());
-    phase_started = Instant::now();
-    let input_adapter_executor =
-        FlashMoeInputAdapterExecutor::from_plan(model_layout.family, plan, &config)?;
-    let input_adapter = input_adapter_executor.capability()?;
-    progress("vision_encoder", phase_started.elapsed());
-    phase_started = Instant::now();
-    let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
-    progress("metal_executor", phase_started.elapsed());
-    phase_started = Instant::now();
-    let experts = resolved_experts.store;
-    let expert_storage = resolved_experts.descriptor;
-    progress("expert_store", phase_started.elapsed());
-    phase_started = Instant::now();
-    let capability_plan = FlashMoeCapabilityPlan::resolve(
-        &model_layout,
-        input_adapter,
-        dense_layout,
-        expert_storage,
-        Some(metal.runtime_capabilities()),
-    )?;
-    let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
-    let attention_layers = (0..config.num_hidden_layers)
-        .map(|layer| {
-            if runtime.is_linear_attention_layer(layer) {
-                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal
-            } else {
-                ScheduledLayerAttentionImplementation::FullAttentionCpuKv
-            }
-        })
-        .collect();
-    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts, attention_layers)?;
-    progress("capability_graph", phase_started.elapsed());
-    phase_started = Instant::now();
-    let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
-    progress("tokenizer", phase_started.elapsed());
-    Ok(FlashMoeEngine {
-        plan: plan.clone(),
-        scheduler,
-        dense,
-        tokenizer,
-        metal,
-        input_adapter_executor,
-        config,
-        model_layout,
-        capability_plan,
-        routing_policy,
-        runtime,
-        linear_attention_weights,
-        shared_expert_weights,
-        session_cache: FlashMoeSessionCache::default(),
-    })
-}
-
-#[derive(Debug)]
-pub struct FlashMoeEngine {
-    pub(super) plan: FlashMoePlan,
-    pub(super) scheduler: FlashMoeExecutionScheduler,
-    pub(super) dense: DenseStore,
-    tokenizer: QwenTokenizer,
-    pub(super) metal: MetalExecutionFacade,
-    pub(super) config: QwenModelConfig,
-    model_layout: QwenMoeModelLayout,
-    capability_plan: FlashMoeCapabilityPlan,
-    pub(super) routing_policy: ResolvedRoutingPolicy,
-    pub(super) runtime: DenseTransformerRuntime,
-    pub(super) linear_attention_weights: LinearAttentionWeightTable,
-    pub(super) shared_expert_weights: SharedExpertWeightTable,
-    input_adapter_executor: FlashMoeInputAdapterExecutor,
-    session_cache: FlashMoeSessionCache,
-}
-
-#[derive(Debug)]
 struct SampledDecode {
     token: u32,
     hidden: Vec<f32>,
@@ -1644,7 +1489,10 @@ impl DenseTransformerRuntime {
         }
     }
 
-    fn from_registry(config: &QwenModelConfig, registry: &TensorRegistry) -> Result<Self> {
+    pub(super) fn from_registry(
+        config: &QwenModelConfig,
+        registry: &TensorRegistry,
+    ) -> Result<Self> {
         let mut runtime = Self::new(config);
         for layer in 0..config.num_hidden_layers {
             match infer_attention_layer_type(registry, layer)? {
@@ -2757,7 +2605,7 @@ impl QwenTokenizer {
         Self::from_files(path, &config_path)
     }
 
-    fn from_files(tokenizer_path: &Path, config_path: &Path) -> Result<Self> {
+    pub(super) fn from_files(tokenizer_path: &Path, config_path: &Path) -> Result<Self> {
         if !config_path.is_file() {
             bail!(
                 "Flash-MoE tokenizer config is required for chat generation: missing {}",
@@ -3999,7 +3847,7 @@ pub(super) fn report_generation_progress(progress: &GenerationProgress<'_>, mess
     }
 }
 
-fn validate_required_tensor_manifest(
+pub(super) fn validate_required_tensor_manifest(
     config: &QwenModelConfig,
     registry: &TensorRegistry,
 ) -> Result<()> {
@@ -4096,7 +3944,7 @@ fn validate_required_tensor_manifest(
     Ok(())
 }
 
-fn validate_qwen_q4_graph_bindings(
+pub(super) fn validate_qwen_q4_graph_bindings(
     family: QwenMoeFamily,
     config: &QwenModelConfig,
     runtime: &DenseTransformerRuntime,
@@ -4925,18 +4773,6 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
     ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
-}
-
-fn format_missing(paths: &[PathBuf]) -> String {
-    if paths.is_empty() {
-        "none".to_string()
-    } else {
-        paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 pub fn expected_hf_files() -> Vec<OsString> {

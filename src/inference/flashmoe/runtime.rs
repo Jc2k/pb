@@ -1,17 +1,19 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
+use super::capabilities::FlashMoeCapabilityPlan;
+use super::experts::ExpertSlotStore;
 use super::legacy::*;
 use super::metal::*;
-use super::model_family::QwenModelConfig;
-use super::planning::FlashMoePlan;
+use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
+use super::planning::{FlashMoePlan, ResolvedRoutingPolicy};
 use super::scheduler::*;
 use super::state::*;
 use super::types::*;
-use super::vision::{FlashMoeTokenInput, MropePosition};
+use super::vision::{FlashMoeInputAdapterExecutor, FlashMoeTokenInput, MropePosition};
 use super::weights::*;
 
 use super::metal::MetalObjcId as ObjcId;
@@ -47,6 +49,195 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
 
 type ScheduledExpertCommand<'a> =
     ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
+
+#[derive(Debug)]
+pub struct FlashMoeEngine {
+    pub(super) plan: FlashMoePlan,
+    pub(super) scheduler: FlashMoeExecutionScheduler,
+    pub(super) dense: DenseStore,
+    pub(super) tokenizer: QwenTokenizer,
+    pub(super) metal: MetalExecutionFacade,
+    pub(super) config: QwenModelConfig,
+    pub(super) model_layout: QwenMoeModelLayout,
+    pub(super) routing_policy: ResolvedRoutingPolicy,
+    pub(super) runtime: DenseTransformerRuntime,
+    pub(super) linear_attention_weights: LinearAttentionWeightTable,
+    pub(super) shared_expert_weights: SharedExpertWeightTable,
+    pub(super) input_adapter_executor: FlashMoeInputAdapterExecutor,
+    pub(super) session_cache: FlashMoeSessionCache,
+}
+
+pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
+    load_with_progress(plan, |_, _| {})
+}
+
+pub fn load_with_progress<F>(plan: &FlashMoePlan, mut progress: F) -> Result<FlashMoeEngine>
+where
+    F: FnMut(&'static str, Duration),
+{
+    let mut phase_started = Instant::now();
+    let status = plan.cache_status()?;
+    progress("cache_status", phase_started.elapsed());
+    if !status.ready {
+        bail!(
+            "Flash-MoE cache is not ready for {}. Missing: {}. Found {} expert files totaling {} bytes. Run `pb pull {}` on ARM macOS to download and prepare the Qwen3.5 cache.",
+            plan.model,
+            format_missing(&status.missing),
+            status.expert_files,
+            status.expert_bytes,
+            plan.model
+        );
+    }
+    phase_started = Instant::now();
+    let config = QwenModelConfig::from_file(&plan.model_config)?;
+    progress("config", phase_started.elapsed());
+    phase_started = Instant::now();
+    let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
+    progress("routing_policy", phase_started.elapsed());
+    phase_started = Instant::now();
+    let model_layout = QwenMoeModelLayout::from_config(&plan.model, &config)?
+        .with_scheduled_active_experts(routing_policy.active_experts)?;
+    progress("model_layout", phase_started.elapsed());
+    phase_started = Instant::now();
+    let resolved_experts =
+        ExpertSlotStore::resolve_from_metadata(plan.experts_dir.clone(), &model_layout)?;
+    if resolved_experts.upgraded_pbq4_layers > 0 {
+        tracing::info!(
+            model = %plan.model,
+            layers = resolved_experts.upgraded_pbq4_layers,
+            "upgraded PBQ4 expert cache layers to fixed Q4 slots"
+        );
+    }
+    progress("expert_cache_format", phase_started.elapsed());
+    phase_started = Instant::now();
+    let dense = DenseStore::open(
+        plan.non_expert_weights.clone(),
+        plan.tensor_manifest.clone(),
+    )?;
+    progress("dense_store", phase_started.elapsed());
+    phase_started = Instant::now();
+    validate_required_tensor_manifest(&config, dense.registry())?;
+    progress("manifest_validation", phase_started.elapsed());
+    phase_started = Instant::now();
+    let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
+    progress("runtime_layout", phase_started.elapsed());
+    phase_started = Instant::now();
+    let linear_attention_weights = dense.resolve_linear_attention_weight_table(
+        &runtime.linear_attention,
+        config.hidden_size,
+        model_layout.experts_per_layer,
+    )?;
+    progress("linear_attention_weights", phase_started.elapsed());
+    phase_started = Instant::now();
+    let shared_expert_weights = dense.resolve_shared_expert_weight_table(
+        config.num_hidden_layers,
+        config.hidden_size,
+        config.shared_experts(),
+        config.shared_expert_intermediate_size(),
+    )?;
+    progress("shared_expert_weights", phase_started.elapsed());
+    phase_started = Instant::now();
+    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
+    if matches!(
+        model_layout.family,
+        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe
+    ) && dense_layout == ResidentDenseLayout::Q4
+    {
+        validate_qwen_q4_graph_bindings(
+            model_layout.family,
+            &config,
+            &runtime,
+            dense.registry(),
+            dense.len,
+        )?;
+    }
+    progress("dense_graph_bindings", phase_started.elapsed());
+    phase_started = Instant::now();
+    let input_adapter_executor =
+        FlashMoeInputAdapterExecutor::from_plan(model_layout.family, plan, &config)?;
+    let input_adapter = input_adapter_executor.capability()?;
+    progress("vision_encoder", phase_started.elapsed());
+    phase_started = Instant::now();
+    let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
+    progress("metal_executor", phase_started.elapsed());
+    phase_started = Instant::now();
+    let experts = resolved_experts.store;
+    let expert_storage = resolved_experts.descriptor;
+    progress("expert_store", phase_started.elapsed());
+    phase_started = Instant::now();
+    let capability_plan = FlashMoeCapabilityPlan::resolve(
+        &model_layout,
+        input_adapter,
+        dense_layout,
+        expert_storage,
+        Some(metal.runtime_capabilities()),
+    )?;
+    let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
+    let attention_layers = (0..config.num_hidden_layers)
+        .map(|layer| {
+            if runtime.is_linear_attention_layer(layer) {
+                ScheduledLayerAttentionImplementation::FusedLinearAttentionMetal
+            } else {
+                ScheduledLayerAttentionImplementation::FullAttentionCpuKv
+            }
+        })
+        .collect();
+    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts, attention_layers)?;
+    progress("capability_graph", phase_started.elapsed());
+    phase_started = Instant::now();
+    let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
+    progress("tokenizer", phase_started.elapsed());
+    Ok(FlashMoeEngine {
+        plan: plan.clone(),
+        scheduler,
+        dense,
+        tokenizer,
+        metal,
+        input_adapter_executor,
+        config,
+        model_layout,
+        routing_policy,
+        runtime,
+        linear_attention_weights,
+        shared_expert_weights,
+        session_cache: FlashMoeSessionCache::default(),
+    })
+}
+
+fn format_missing(paths: &[std::path::PathBuf]) -> String {
+    if paths.is_empty() {
+        "none".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::inference::flashmoe::planning::plan_unchecked;
+    use crate::inference::flashmoe::types::QWEN35_MODEL;
+
+    #[test]
+    fn runtime_load_rejects_missing_cache_before_executor_construction() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(QWEN35_MODEL, root.path());
+        let mut phases = Vec::new();
+
+        let error = load_with_progress(&plan, |phase, _| phases.push(phase)).unwrap_err();
+
+        assert_eq!(phases, ["cache_status"]);
+        assert!(
+            error.to_string().contains("cache is not ready"),
+            "{error:#}"
+        );
+        assert!(!error.to_string().contains("Metal executor"), "{error:#}");
+    }
+}
 
 impl MetalExecutionFacade {
     pub(super) fn new(
