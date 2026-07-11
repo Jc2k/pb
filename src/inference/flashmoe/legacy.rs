@@ -30,8 +30,6 @@
     clippy::useless_vec
 )]
 
-#[cfg(target_os = "macos")]
-use std::ffi::c_int;
 #[cfg(test)]
 use std::fs;
 #[cfg(test)]
@@ -114,42 +112,6 @@ use super::vision::{
 use super::weights::*;
 #[cfg(test)]
 const DENSE_Q4_GROUP_SIZE: usize = 16;
-#[cfg(target_os = "macos")]
-const CBLAS_ROW_MAJOR: c_int = 101;
-#[cfg(target_os = "macos")]
-const CBLAS_NO_TRANS: c_int = 111;
-
-#[cfg(target_os = "macos")]
-#[link(name = "Accelerate", kind = "framework")]
-unsafe extern "C" {
-    fn cblas_sscal(n: c_int, alpha: f32, x: *mut f32, inc_x: c_int);
-    fn cblas_sgemv(
-        order: c_int,
-        trans_a: c_int,
-        m: c_int,
-        n: c_int,
-        alpha: f32,
-        a: *const f32,
-        lda: c_int,
-        x: *const f32,
-        inc_x: c_int,
-        beta: f32,
-        y: *mut f32,
-        inc_y: c_int,
-    );
-    fn cblas_sger(
-        order: c_int,
-        m: c_int,
-        n: c_int,
-        alpha: f32,
-        x: *const f32,
-        inc_x: c_int,
-        y: *const f32,
-        inc_y: c_int,
-        a: *mut f32,
-        lda: c_int,
-    );
-}
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
@@ -201,38 +163,6 @@ fn apply_gated_delta_recurrence(
     dt_bias: &[f32],
     out_values: &mut [f32],
 ) {
-    let mut kv_mem = vec![0.0f32; layout.value_dim];
-    let mut delta = vec![0.0f32; layout.value_dim];
-    apply_gated_delta_recurrence_with_scratch(
-        layout,
-        ssm_state,
-        lin_q,
-        lin_k,
-        lin_v,
-        alpha,
-        beta,
-        a_log,
-        dt_bias,
-        &mut kv_mem,
-        &mut delta,
-        out_values,
-    );
-}
-
-fn apply_gated_delta_recurrence_with_scratch(
-    layout: LinearAttentionLayout,
-    ssm_state: &mut [f32],
-    lin_q: &[f32],
-    lin_k: &[f32],
-    lin_v: &[f32],
-    alpha: &[f32],
-    beta: &[f32],
-    a_log: &[f32],
-    dt_bias: &[f32],
-    kv_mem: &mut [f32],
-    delta: &mut [f32],
-    out_values: &mut [f32],
-) {
     let heads_per_key = layout.value_heads_per_key_head();
     let matrix_len = layout.value_dim * layout.key_dim;
     for vh in 0..layout.num_value_heads {
@@ -254,23 +184,6 @@ fn apply_gated_delta_recurrence_with_scratch(
         let query = &lin_q[q_base..q_base + layout.key_dim];
         let out = &mut out_values[v_base..v_base + layout.value_dim];
 
-        #[cfg(target_os = "macos")]
-        if gated_delta_head_step_accelerate(
-            layout.value_dim,
-            layout.key_dim,
-            state,
-            key,
-            query,
-            value,
-            decay,
-            beta_gate,
-            kv_mem,
-            delta,
-            out,
-        ) {
-            continue;
-        }
-
         gated_delta_head_step_scalar(
             layout.value_dim,
             layout.key_dim,
@@ -283,91 +196,6 @@ fn apply_gated_delta_recurrence_with_scratch(
             out,
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn gated_delta_head_step_accelerate(
-    value_dim: usize,
-    key_dim: usize,
-    state: &mut [f32],
-    key: &[f32],
-    query: &[f32],
-    value: &[f32],
-    decay: f32,
-    beta_gate: f32,
-    kv_mem: &mut [f32],
-    delta: &mut [f32],
-    out: &mut [f32],
-) -> bool {
-    let Ok(m) = c_int::try_from(value_dim) else {
-        return false;
-    };
-    let Ok(n) = c_int::try_from(key_dim) else {
-        return false;
-    };
-    let Ok(items) = c_int::try_from(value_dim.saturating_mul(key_dim)) else {
-        return false;
-    };
-    if state.len() != value_dim * key_dim
-        || key.len() != key_dim
-        || query.len() != key_dim
-        || value.len() != value_dim
-        || kv_mem.len() != value_dim
-        || delta.len() != value_dim
-        || out.len() != value_dim
-    {
-        return false;
-    }
-
-    unsafe {
-        cblas_sscal(items, decay, state.as_mut_ptr(), 1);
-        cblas_sgemv(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            m,
-            n,
-            1.0,
-            state.as_ptr(),
-            n,
-            key.as_ptr(),
-            1,
-            0.0,
-            kv_mem.as_mut_ptr(),
-            1,
-        );
-    }
-    for vi in 0..value_dim {
-        delta[vi] = (value[vi] - kv_mem[vi]) * beta_gate;
-    }
-    unsafe {
-        cblas_sger(
-            CBLAS_ROW_MAJOR,
-            m,
-            n,
-            1.0,
-            delta.as_ptr(),
-            1,
-            key.as_ptr(),
-            1,
-            state.as_mut_ptr(),
-            n,
-        );
-        cblas_sgemv(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            m,
-            n,
-            1.0,
-            state.as_ptr(),
-            n,
-            query.as_ptr(),
-            1,
-            0.0,
-            out.as_mut_ptr(),
-            1,
-        );
-    }
-    true
 }
 
 fn gated_delta_head_step_scalar(
