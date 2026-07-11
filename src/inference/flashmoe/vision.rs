@@ -1,4 +1,161 @@
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+use super::legacy::Qwen3VLVisionConfig;
+use super::types::{
+    VIT_IMAGE_MEAN, VIT_IMAGE_STD, VIT_MAX_PIXELS, VIT_MERGE_SIZE, VIT_MIN_PIXELS, VIT_PATCH_SIZE,
+};
+
+#[derive(Debug, Clone)]
+pub struct ImagePreprocessor {
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub max_pixels: usize,
+    pub min_pixels: usize,
+}
+
+impl ImagePreprocessor {
+    pub fn from_vision_config(config: &Qwen3VLVisionConfig) -> Self {
+        Self {
+            patch_size: config.patch_size,
+            merge_size: config.merge_size,
+            temporal_patch_size: config.temporal_patch_size,
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    pub fn default_qwen3_vl() -> Self {
+        Self {
+            patch_size: VIT_PATCH_SIZE,
+            merge_size: VIT_MERGE_SIZE,
+            temporal_patch_size: 2,
+            image_mean: VIT_IMAGE_MEAN,
+            image_std: VIT_IMAGE_STD,
+            max_pixels: VIT_MAX_PIXELS,
+            min_pixels: VIT_MIN_PIXELS,
+        }
+    }
+
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    pub fn patch_flat_dim(&self) -> usize {
+        3 * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    pub fn smart_resize(&self, orig_h: u32, orig_w: u32) -> (u32, u32) {
+        let stride = self.token_stride() as u32;
+        let mut h = round_up_to_stride(orig_h.max(stride), stride);
+        let mut w = round_up_to_stride(orig_w.max(stride), stride);
+        let pixels = (h as usize) * (w as usize);
+        if pixels > self.max_pixels {
+            let scale = ((self.max_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
+        } else if pixels < self.min_pixels {
+            let scale = ((self.min_pixels as f64) / (pixels as f64)).sqrt();
+            h = round_to_stride((orig_h as f64) * scale, stride);
+            w = round_to_stride((orig_w as f64) * scale, stride);
+        }
+        while (h as usize) * (w as usize) > self.max_pixels && (h > stride || w > stride) {
+            if h >= w && h > stride {
+                h -= stride;
+            } else if w > stride {
+                w -= stride;
+            } else {
+                break;
+            }
+        }
+        while (h as usize) * (w as usize) < self.min_pixels {
+            if h <= w {
+                h = h.saturating_add(stride);
+            } else {
+                w = w.saturating_add(stride);
+            }
+        }
+        (h.max(stride), w.max(stride))
+    }
+
+    pub fn preprocess(&self, path: &Path) -> Result<(usize, usize, Vec<f32>)> {
+        let image = image::ImageReader::open(path)
+            .with_context(|| format!("vision: failed to open image {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("vision: failed to guess format for {}", path.display()))?
+            .decode()
+            .with_context(|| format!("vision: failed to decode image {}", path.display()))?
+            .to_rgb8();
+        let (orig_w, orig_h) = image.dimensions();
+        let (target_h, target_w) = self.smart_resize(orig_h, orig_w);
+        let image = if (orig_h, orig_w) != (target_h, target_w) {
+            image::imageops::resize(
+                &image,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            image
+        };
+
+        let grid_h = target_h as usize / self.patch_size;
+        let grid_w = target_w as usize / self.patch_size;
+        let patch_pixels = self.patch_size * self.patch_size;
+        let patch_flat = self.patch_flat_dim();
+        let mut patches = vec![0.0f32; grid_h * grid_w * patch_flat];
+        let pixels = image.as_raw();
+        let mut patch_index = 0usize;
+        for block_y in 0..grid_h / self.merge_size {
+            for block_x in 0..grid_w / self.merge_size {
+                for dy in 0..self.merge_size {
+                    for dx in 0..self.merge_size {
+                        let patch_y = block_y * self.merge_size + dy;
+                        let patch_x = block_x * self.merge_size + dx;
+                        for channel in 0..3usize {
+                            for temporal in 0..self.temporal_patch_size {
+                                for y in 0..self.patch_size {
+                                    for x in 0..self.patch_size {
+                                        let source_y = patch_y * self.patch_size + y;
+                                        let source_x = patch_x * self.patch_size + x;
+                                        let pixel_index =
+                                            (source_y * target_w as usize + source_x) * 3 + channel;
+                                        let value = pixels[pixel_index] as f32 / 255.0;
+                                        let normalized = (value - self.image_mean[channel])
+                                            / self.image_std[channel];
+                                        let target_index = patch_index * patch_flat
+                                            + channel * self.temporal_patch_size * patch_pixels
+                                            + temporal * patch_pixels
+                                            + y * self.patch_size
+                                            + x;
+                                        patches[target_index] = normalized;
+                                    }
+                                }
+                            }
+                        }
+                        patch_index += 1;
+                    }
+                }
+            }
+        }
+        Ok((grid_h, grid_w, patches))
+    }
+}
+
+fn round_up_to_stride(value: u32, stride: u32) -> u32 {
+    value.div_ceil(stride) * stride
+}
+
+fn round_to_stride(value: f64, stride: u32) -> u32 {
+    let stride_f = stride as f64;
+    ((value / stride_f).max(1.0).round() as u32).max(1) * stride
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MropePosition {

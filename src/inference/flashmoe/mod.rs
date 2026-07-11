@@ -25,6 +25,7 @@ pub use metal::METAL_SHADERS;
 pub use model_family::*;
 pub use scheduler::*;
 pub use types::*;
+pub use vision::{ImagePreprocessor, VisionEncoding};
 pub use weights::{
     DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
     RuntimeTensorEntry, TensorQuantization, TensorRegistry,

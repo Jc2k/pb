@@ -320,12 +320,12 @@ Baseline reviewed on 2026-07-10:
   transaction through selected-route softmax at scale 1.0, eight scheduler-owned positioned reads,
   whole-slot typed Q4 SwiGLU payloads, declared no-shared CMD3 combine, and deferred hidden/next-norm
   state. Its route weights and output state are checked against independent golden values.
-- `vision.rs` now owns Qwen-VL visual encoding output, M-RoPE positions, placeholder-span
-  validation, multi-image embedding/DeepStack assembly, and the typed `QwenVlRuntimeInputs` emitted
-  before decoder execution. The multimodal generation entry point constructs that one typed input
-  object before calling the prefill boundary. Because the shared graph cannot consume it yet,
-  prefill remains a precise unsupported input-adapter error rather than branching inside the layer
-  loop.
+- `vision.rs` now owns Qwen-VL image decoding, smart resize, normalization, block-major patch
+  packing, visual encoding output, M-RoPE positions, placeholder-span validation, multi-image
+  embedding/DeepStack assembly, and the typed `QwenVlRuntimeInputs` emitted before decoder
+  execution. The multimodal generation entry point constructs that one typed input object before
+  calling the prefill boundary. Because the shared graph cannot consume it yet, prefill remains a
+  precise unsupported input-adapter error rather than branching inside the layer loop.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -351,9 +351,9 @@ The architecture is not yet at the target:
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
-  real-checkpoint smoke evidence. Qwen-VL now has a typed pre-MoE input adapter, while image
-  preprocessing/ViT ownership and graph consumption remain unresolved; capability resolution still
-  reports the input-adapter stage as unsupported.
+  real-checkpoint smoke evidence. Qwen-VL now has typed preprocessing and a pre-MoE input adapter,
+  while ViT ownership and graph consumption remain unresolved; capability resolution still reports
+  the input-adapter stage as unsupported.
 - BF16/F16 dense and expert storage have import/reference support but no typed production graph
   implementations.
 
