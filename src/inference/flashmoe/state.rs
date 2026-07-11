@@ -37,6 +37,7 @@ pub(crate) fn reusable_session_prefix_len(
     (prefix_len == cached_tokens.len()).then_some(prefix_len)
 }
 
+#[cfg(test)]
 pub(crate) fn take_reusable_session_cache_entry<K>(
     session_cache: &mut BTreeMap<String, FlashMoeSessionState<K>>,
     session_id: &str,
@@ -912,7 +913,6 @@ impl FlashMoeLinearAttentionCacheState {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn cpu_visible(
         layer: usize,
         conv_state_len: usize,
@@ -1018,6 +1018,88 @@ impl LinearAttentionLayout {
 
     pub(crate) fn value_heads_per_key_head(self) -> usize {
         (self.num_value_heads / self.num_key_heads).max(1)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeLinearAttentionLayerSnapshot {
+    state: FlashMoeLinearAttentionCacheState,
+    conv_state: Vec<f32>,
+    ssm_state: Vec<f32>,
+}
+
+impl FlashMoeLinearAttentionLayerSnapshot {
+    pub(crate) fn new(
+        layer: usize,
+        conv_state: Vec<f32>,
+        ssm_state: Vec<f32>,
+        conv_output_len: usize,
+        output_len: usize,
+    ) -> Result<Self> {
+        let state = FlashMoeLinearAttentionCacheState::cpu_visible(
+            layer,
+            conv_state.len(),
+            ssm_state.len(),
+            conv_output_len,
+            output_len,
+        );
+        if !state.is_declared_graph_state() {
+            bail!(
+                "FlashMoe linear-attention session snapshot for layer {layer} is not declared CPU-visible graph state"
+            );
+        }
+        Ok(Self {
+            state,
+            conv_state,
+            ssm_state,
+        })
+    }
+
+    pub(crate) fn state(&self) -> FlashMoeLinearAttentionCacheState {
+        self.state
+    }
+
+    pub(crate) fn conv_state(&self) -> &[f32] {
+        &self.conv_state
+    }
+
+    pub(crate) fn ssm_state(&self) -> &[f32] {
+        &self.ssm_state
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FlashMoeLinearAttentionSessionSnapshot {
+    layers: Box<[Option<FlashMoeLinearAttentionLayerSnapshot>]>,
+}
+
+impl FlashMoeLinearAttentionSessionSnapshot {
+    pub(crate) fn new(layers: Vec<Option<FlashMoeLinearAttentionLayerSnapshot>>) -> Result<Self> {
+        if layers.is_empty() {
+            bail!("FlashMoe linear-attention session snapshot requires resolved model layers");
+        }
+        for (layer, snapshot) in layers.iter().enumerate() {
+            if let Some(snapshot) = snapshot
+                && (snapshot.state().layer() != layer
+                    || snapshot.state().placement() != FlashMoeStatePlacement::CpuVisible
+                    || !snapshot.state().is_declared_graph_state())
+            {
+                bail!(
+                    "FlashMoe linear-attention session snapshot layer {layer} does not match its declared CPU-visible state"
+                );
+            }
+        }
+        Ok(Self {
+            layers: layers.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn layer(&self, layer: usize) -> Option<&FlashMoeLinearAttentionLayerSnapshot> {
+        self.layers.get(layer).and_then(Option::as_ref)
     }
 }
 
@@ -1568,7 +1650,13 @@ impl KvCache {
 
 #[derive(Debug, Default)]
 pub(super) struct FlashMoeSessionCache {
-    entries: BTreeMap<String, FlashMoeSessionState<KvCache>>,
+    entries: BTreeMap<String, FlashMoeCachedSessionState>,
+}
+
+#[derive(Debug, Clone)]
+struct FlashMoeCachedSessionState {
+    cpu: FlashMoeSessionState<KvCache>,
+    recurrent: FlashMoeLinearAttentionSessionSnapshot,
 }
 
 impl FlashMoeSessionCache {
@@ -1581,20 +1669,29 @@ impl FlashMoeSessionCache {
     ) -> FlashMoeGenerationState {
         let capacity = prompt_tokens.len() + max_tokens;
         let cached = session_id.and_then(|id| {
-            take_reusable_session_cache_entry(&mut self.entries, id, &prompt_tokens)
+            let prefix_len = self
+                .entries
+                .get(id)
+                .and_then(|state| reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens))?;
+            self.entries.remove(id).map(|state| (prefix_len, state))
         });
-        let (kv_cache, prefill_start, cached_last_hidden) =
+        let (kv_cache, prefill_start, cached_last_hidden, cached_recurrent) =
             if let Some((prefix_len, state)) = cached {
                 let FlashMoeSessionState {
                     tokens: _,
                     mut kv_cache,
                     last_hidden,
-                } = state;
+                } = state.cpu;
                 kv_cache.resize_capacity(capacity);
                 let cached_last_hidden = (prefix_len == prompt_tokens.len()).then_some(last_hidden);
-                (kv_cache, prefix_len, cached_last_hidden)
+                (
+                    kv_cache,
+                    prefix_len,
+                    cached_last_hidden,
+                    Some(state.recurrent),
+                )
             } else {
-                (KvCache::new(layers, capacity), 0, None)
+                (KvCache::new(layers, capacity), 0, None, None)
             };
 
         FlashMoeGenerationState {
@@ -1604,6 +1701,8 @@ impl FlashMoeSessionCache {
             prefill_start,
             cached_last_hidden,
             prompt_cache: None,
+            cached_recurrent,
+            prompt_recurrent: None,
             generated: Vec::new(),
             max_tokens,
             stopped: false,
@@ -1617,11 +1716,18 @@ impl FlashMoeSessionCache {
         let Some(session_id) = generation.session_id.as_ref() else {
             return Ok(());
         };
-        let state = generation
+        let cpu = generation
             .prompt_cache
             .take()
             .context("session cache prompt snapshot is missing")?;
-        self.entries.insert(session_id.clone(), state);
+        let recurrent = generation
+            .prompt_recurrent
+            .take()
+            .context("session cache recurrent snapshot is missing")?;
+        self.entries.insert(
+            session_id.clone(),
+            FlashMoeCachedSessionState { cpu, recurrent },
+        );
         Ok(())
     }
 }
@@ -1634,6 +1740,8 @@ pub(super) struct FlashMoeGenerationState {
     prefill_start: usize,
     cached_last_hidden: Option<Vec<f32>>,
     prompt_cache: Option<FlashMoeSessionState<KvCache>>,
+    cached_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
+    prompt_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
     generated: Vec<u32>,
     max_tokens: usize,
     stopped: bool,
@@ -1652,11 +1760,25 @@ impl FlashMoeGenerationState {
         self.cached_last_hidden.take()
     }
 
+    pub(crate) fn take_cached_recurrent(
+        &mut self,
+    ) -> Option<FlashMoeLinearAttentionSessionSnapshot> {
+        self.cached_recurrent.take()
+    }
+
     pub(crate) fn prefill_inputs(&mut self) -> (&[u32], usize, &mut KvCache) {
         (&self.prompt_tokens, self.prefill_start, &mut self.kv_cache)
     }
 
-    pub(crate) fn capture_prompt_cache(&mut self, last_hidden: Vec<f32>) {
+    pub(crate) fn requires_prompt_snapshot(&self) -> bool {
+        self.session_id.is_some()
+    }
+
+    pub(crate) fn capture_prompt_cache(
+        &mut self,
+        last_hidden: Vec<f32>,
+        recurrent: FlashMoeLinearAttentionSessionSnapshot,
+    ) {
         if self.session_id.is_none() {
             return;
         }
@@ -1665,6 +1787,7 @@ impl FlashMoeGenerationState {
             self.kv_cache.shallow_snapshot(),
             last_hidden,
         ));
+        self.prompt_recurrent = Some(recurrent);
     }
 
     pub(crate) fn should_sample_first(&self) -> bool {
@@ -1718,6 +1841,14 @@ impl FlashMoeGenerationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recurrent_session_snapshot() -> FlashMoeLinearAttentionSessionSnapshot {
+        FlashMoeLinearAttentionSessionSnapshot::new(vec![Some(
+            FlashMoeLinearAttentionLayerSnapshot::new(0, vec![1.0, 2.0], vec![3.0, 4.0, 5.0], 2, 2)
+                .unwrap(),
+        )])
+        .unwrap()
+    }
 
     #[test]
     fn reusable_session_prefix_requires_complete_cached_prefix() {
@@ -1808,7 +1939,7 @@ mod tests {
                 .record_kv(1, 0, vec![3.0, 3.5], vec![4.0, 4.5])
                 .unwrap();
         }
-        generation.capture_prompt_cache(vec![9.0, 9.5]);
+        generation.capture_prompt_cache(vec![9.0, 9.5], recurrent_session_snapshot());
         generation.record_sampled_token(30, false);
         assert_eq!(generation.generated, vec![30]);
         sessions.commit_generation(&mut generation).unwrap();
@@ -1816,6 +1947,10 @@ mod tests {
         let mut reused = sessions.begin_generation(Some("chat"), vec![10, 20], 1, 1);
         assert_eq!(reused.prefill_start(), 2);
         assert_eq!(reused.take_cached_last_hidden(), Some(vec![9.0, 9.5]));
+        assert_eq!(
+            reused.take_cached_recurrent(),
+            Some(recurrent_session_snapshot())
+        );
         assert_eq!(reused.kv_cache.keys_values(1, 0).unwrap().len(), 2);
         assert!(reused.generated.is_empty());
     }
@@ -1835,6 +1970,39 @@ mod tests {
         generation.record_sampled_token(0, true);
         assert!(!generation.should_decode());
         assert_eq!(generation.into_generated(), vec![30]);
+    }
+
+    #[test]
+    fn recurrent_session_snapshot_requires_declared_layer_shape_and_order() {
+        let snapshot = recurrent_session_snapshot();
+        let layer = snapshot.layer(0).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(layer.state().layer(), 0);
+        assert_eq!(
+            layer.state().placement(),
+            FlashMoeStatePlacement::CpuVisible
+        );
+        assert_eq!(layer.conv_state(), &[1.0, 2.0]);
+        assert_eq!(layer.ssm_state(), &[3.0, 4.0, 5.0]);
+
+        let empty =
+            FlashMoeLinearAttentionLayerSnapshot::new(0, Vec::new(), vec![1.0], 1, 1).unwrap_err();
+        assert!(
+            empty
+                .to_string()
+                .contains("not declared CPU-visible graph state"),
+            "{empty:#}"
+        );
+
+        let misplaced = FlashMoeLinearAttentionSessionSnapshot::new(vec![
+            None,
+            Some(FlashMoeLinearAttentionLayerSnapshot::new(0, vec![1.0], vec![2.0], 1, 1).unwrap()),
+        ])
+        .unwrap_err();
+        assert!(
+            misplaced.to_string().contains("layer 1 does not match"),
+            "{misplaced:#}"
+        );
     }
 
     #[test]

@@ -1873,7 +1873,13 @@ impl FlashMoeEngine {
             );
         }
         if prefill_start == 0 {
-            self.metal.reset_linear_attention_state();
+            self.metal.reset_linear_attention_state()?;
+        } else {
+            let recurrent = generation
+                .take_cached_recurrent()
+                .context("session cache entry is missing the Metal recurrent-state snapshot")?;
+            self.metal
+                .restore_linear_attention_session_state(&recurrent)?;
         }
         let prefill_hidden = if prefill_start == prompt_len {
             info!(
@@ -1923,7 +1929,10 @@ impl FlashMoeEngine {
             );
             hidden
         };
-        generation.capture_prompt_cache(prefill_hidden.clone());
+        if generation.requires_prompt_snapshot() {
+            let recurrent = self.metal.capture_linear_attention_session_state()?;
+            generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
+        }
 
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         if generation.should_sample_first() {

@@ -166,10 +166,48 @@ impl MetalExecutionFacade {
         MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
     }
 
-    pub(super) fn reset_linear_attention_state(&self) {
+    pub(super) fn reset_linear_attention_state(&self) -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            self.inner.reset_linear_attention_state();
+            self.inner.reset_linear_attention_state()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "FlashMoe unsupported recurrent-state reset: the resolved graph requires Apple Silicon Metal"
+            )
+        }
+    }
+
+    pub(super) fn capture_linear_attention_session_state(
+        &self,
+    ) -> Result<FlashMoeLinearAttentionSessionSnapshot> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.capture_linear_attention_session_state()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "FlashMoe unsupported recurrent session capture: the resolved graph requires Apple Silicon Metal"
+            )
+        }
+    }
+
+    pub(super) fn restore_linear_attention_session_state(
+        &self,
+        snapshot: &FlashMoeLinearAttentionSessionSnapshot,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.restore_linear_attention_session_state(snapshot)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = snapshot;
+            bail!(
+                "FlashMoe unsupported recurrent session restore: the resolved graph requires Apple Silicon Metal"
+            )
         }
     }
 

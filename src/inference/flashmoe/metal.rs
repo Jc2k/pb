@@ -29,6 +29,7 @@ use super::scheduler::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeLinearAttentionCacheState,
+    FlashMoeLinearAttentionLayerSnapshot, FlashMoeLinearAttentionSessionSnapshot,
     FlashMoePostAttentionPrepState, LinearAttentionLayout,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -870,10 +871,10 @@ impl MetalExecutionContext {
         self.dense_weights.is_some()
     }
 
-    pub(crate) fn reset_linear_attention_state(&self) {
-        let Ok(state) = self.linear_attention_state.lock() else {
-            return;
-        };
+    pub(crate) fn reset_linear_attention_state(&self) -> anyhow::Result<()> {
+        let state = self.linear_attention_state.lock().map_err(|_| {
+            anyhow::anyhow!("FlashMoe Metal linear-attention state lock is poisoned during reset")
+        })?;
         unsafe {
             for layer in state.layers.iter().flatten() {
                 zero_buffer(layer.conv_state, layer.conv_state_len);
@@ -884,6 +885,30 @@ impl MetalExecutionContext {
                 zero_buffer(layer.beta_gate, layer.num_value_heads);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn capture_linear_attention_session_state(
+        &self,
+    ) -> anyhow::Result<FlashMoeLinearAttentionSessionSnapshot> {
+        let state = self.linear_attention_state.lock().map_err(|_| {
+            anyhow::anyhow!(
+                "FlashMoe Metal linear-attention state lock is poisoned during session capture"
+            )
+        })?;
+        capture_linear_attention_session_snapshot(&state)
+    }
+
+    pub(crate) fn restore_linear_attention_session_state(
+        &self,
+        snapshot: &FlashMoeLinearAttentionSessionSnapshot,
+    ) -> anyhow::Result<()> {
+        let state = self.linear_attention_state.lock().map_err(|_| {
+            anyhow::anyhow!(
+                "FlashMoe Metal linear-attention state lock is poisoned during session restore"
+            )
+        })?;
+        restore_linear_attention_session_snapshot(&state, snapshot)
     }
 
     pub(crate) fn resident_q4_top_candidates(
@@ -994,6 +1019,96 @@ impl MetalExecutionContext {
             values
         }
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn validate_linear_attention_session_snapshot(
+    resident: &MetalLinearAttentionStateCache,
+    snapshot: &FlashMoeLinearAttentionSessionSnapshot,
+) -> anyhow::Result<()> {
+    if snapshot.len() != resident.layers.len() {
+        anyhow::bail!(
+            "FlashMoe Metal recurrent session snapshot has {} layers, expected {}",
+            snapshot.len(),
+            resident.layers.len()
+        );
+    }
+    for (layer, resident) in resident.layers.iter().enumerate() {
+        match (resident, snapshot.layer(layer)) {
+            (None, None) => {}
+            (Some(resident), Some(snapshot)) => {
+                let declared = snapshot.state();
+                if declared.layer() != layer
+                    || declared.conv_state_len() != resident.conv_state_len
+                    || declared.ssm_state_len() != resident.ssm_state_len
+                    || declared.conv_output_len() != resident.conv_dim
+                    || declared.output_len() != resident.total_value_width
+                {
+                    anyhow::bail!(
+                        "FlashMoe Metal recurrent session snapshot for layer {layer} does not match the resolved resident state"
+                    );
+                }
+            }
+            (Some(_), None) => {
+                anyhow::bail!(
+                    "FlashMoe Metal recurrent session snapshot is missing resolved linear-attention layer {layer}"
+                );
+            }
+            (None, Some(_)) => {
+                anyhow::bail!(
+                    "FlashMoe Metal recurrent session snapshot unexpectedly contains full-attention layer {layer}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn capture_linear_attention_session_snapshot(
+    resident: &MetalLinearAttentionStateCache,
+) -> anyhow::Result<FlashMoeLinearAttentionSessionSnapshot> {
+    let layers = resident
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(layer, state)| {
+            state
+                .as_ref()
+                .map(|state| unsafe {
+                    FlashMoeLinearAttentionLayerSnapshot::new(
+                        layer,
+                        read_f32_buffer(state.conv_state, state.conv_state_len),
+                        read_f32_buffer(state.ssm_state, state.ssm_state_len),
+                        state.conv_dim,
+                        state.total_value_width,
+                    )
+                })
+                .transpose()
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    FlashMoeLinearAttentionSessionSnapshot::new(layers)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn restore_linear_attention_session_snapshot(
+    resident: &MetalLinearAttentionStateCache,
+    snapshot: &FlashMoeLinearAttentionSessionSnapshot,
+) -> anyhow::Result<()> {
+    validate_linear_attention_session_snapshot(resident, snapshot)?;
+    for (layer, resident) in resident.layers.iter().enumerate() {
+        if let (Some(resident), Some(snapshot)) = (resident, snapshot.layer(layer)) {
+            unsafe {
+                write_f32_buffer(resident.conv_state, snapshot.conv_state());
+                write_f32_buffer(resident.ssm_state, snapshot.ssm_state());
+                zero_buffer(resident.conv_output, resident.conv_dim);
+                zero_buffer(resident.delta_output, resident.total_value_width);
+                zero_buffer(resident.g_decay, resident.num_value_heads);
+                zero_buffer(resident.beta_gate, resident.num_value_heads);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4689,6 +4804,14 @@ pub(crate) unsafe fn read_f32_buffer(buffer: MetalObjcId, len: usize) -> Vec<f32
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn write_f32_buffer(buffer: MetalObjcId, values: &[f32]) {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents"));
+        ptr::copy_nonoverlapping(values.as_ptr(), contents.cast::<f32>(), values.len());
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn dispatch_threads(encoder: MetalObjcId, threads: u64) {
     unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::threads(threads)) }
 }
@@ -7856,6 +7979,109 @@ mod tests {
         assert_eq!(layer.conv_dim, 4);
         assert_eq!(layer.total_value_width, 8);
         assert_eq!(layer.num_value_heads, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn recurrent_session_snapshot_validates_complete_resident_layer_table() {
+        let base = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
+        let resident = MetalLinearAttentionStateCache::new(vec![
+            None,
+            Some(MetalLinearAttentionLayerState::new(
+                base, base, base, base, base, base, 2, 3, 4, 5, 2,
+            )),
+        ]);
+        let matching = FlashMoeLinearAttentionSessionSnapshot::new(vec![
+            None,
+            Some(
+                FlashMoeLinearAttentionLayerSnapshot::new(1, vec![1.0; 2], vec![2.0; 3], 4, 5)
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        validate_linear_attention_session_snapshot(&resident, &matching).unwrap();
+
+        let missing = FlashMoeLinearAttentionSessionSnapshot::new(vec![None, None]).unwrap();
+        let missing_err =
+            validate_linear_attention_session_snapshot(&resident, &missing).unwrap_err();
+        assert!(
+            missing_err
+                .to_string()
+                .contains("missing resolved linear-attention layer 1"),
+            "{missing_err:#}"
+        );
+
+        let wrong_shape = FlashMoeLinearAttentionSessionSnapshot::new(vec![
+            None,
+            Some(
+                FlashMoeLinearAttentionLayerSnapshot::new(1, vec![1.0; 2], vec![2.0; 4], 4, 5)
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let shape_err =
+            validate_linear_attention_session_snapshot(&resident, &wrong_shape).unwrap_err();
+        assert!(
+            shape_err
+                .to_string()
+                .contains("does not match the resolved resident state"),
+            "{shape_err:#}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn recurrent_session_snapshot_round_trips_metal_recurrent_buffers() {
+        let device = unsafe { OwnedMetalObject::new(metal_default_device()).unwrap() };
+        let allocate = |len: usize, label: &str| {
+            OwnedMetalObject::new(allocate_zeroed_buffer(device.id(), len * 4, label).unwrap())
+                .unwrap()
+        };
+        let conv_state = allocate(2, "test recurrent conv state");
+        let ssm_state = allocate(3, "test recurrent SSM state");
+        let conv_output = allocate(4, "test recurrent conv output");
+        let delta_output = allocate(5, "test recurrent delta output");
+        let g_decay = allocate(2, "test recurrent decay");
+        let beta_gate = allocate(2, "test recurrent beta");
+        let resident =
+            MetalLinearAttentionStateCache::new(vec![Some(MetalLinearAttentionLayerState::new(
+                conv_state.id(),
+                ssm_state.id(),
+                conv_output.id(),
+                delta_output.id(),
+                g_decay.id(),
+                beta_gate.id(),
+                2,
+                3,
+                4,
+                5,
+                2,
+            ))]);
+        unsafe {
+            write_f32_buffer(conv_state.id(), &[1.0, 2.0]);
+            write_f32_buffer(ssm_state.id(), &[3.0, 4.0, 5.0]);
+            write_f32_buffer(conv_output.id(), &[6.0; 4]);
+            write_f32_buffer(delta_output.id(), &[7.0; 5]);
+            write_f32_buffer(g_decay.id(), &[8.0; 2]);
+            write_f32_buffer(beta_gate.id(), &[9.0; 2]);
+        }
+
+        let snapshot = capture_linear_attention_session_snapshot(&resident).unwrap();
+        unsafe {
+            write_f32_buffer(conv_state.id(), &[10.0; 2]);
+            write_f32_buffer(ssm_state.id(), &[11.0; 3]);
+        }
+        restore_linear_attention_session_snapshot(&resident, &snapshot).unwrap();
+
+        unsafe {
+            assert_eq!(read_f32_buffer(conv_state.id(), 2), vec![1.0, 2.0]);
+            assert_eq!(read_f32_buffer(ssm_state.id(), 3), vec![3.0, 4.0, 5.0]);
+            assert_eq!(read_f32_buffer(conv_output.id(), 4), vec![0.0; 4]);
+            assert_eq!(read_f32_buffer(delta_output.id(), 5), vec![0.0; 5]);
+            assert_eq!(read_f32_buffer(g_decay.id(), 2), vec![0.0; 2]);
+            assert_eq!(read_f32_buffer(beta_gate.id(), 2), vec![0.0; 2]);
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
