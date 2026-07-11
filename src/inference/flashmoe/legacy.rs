@@ -112,13 +112,15 @@ use super::metal::{
 use super::model_family::QwenMoeExpertComponentKind;
 use super::model_family::{QwenMoeFamily, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
 #[cfg(test)]
+use super::scheduler::ScheduledExpertReadCoordinator as ExpertScheduler;
+#[cfg(test)]
 use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(test)]
 use super::scheduler::ScheduledRoutingTopK;
 use super::scheduler::{
-    ExpertSchedulerSnapshot, FlashMoeScheduledGraph, ScheduledCmd3Command, ScheduledCmd3CpuInput,
-    ScheduledCmd3Input, ScheduledCmd3InputSource, ScheduledCmd3OutputState,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator as ExpertScheduler,
+    ExpertSchedulerSnapshot, FlashMoeExecutionScheduler, FlashMoeScheduledGraph,
+    ScheduledCmd3Command, ScheduledCmd3CpuInput, ScheduledCmd3Input, ScheduledCmd3InputSource,
+    ScheduledCmd3OutputState, ScheduledExpertPhaseMlpPayload, ScheduledExpertReadCoordinator,
     ScheduledExpertSlot, ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand,
     ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef,
 };
@@ -1255,8 +1257,8 @@ where
     let experts = ExpertSlotStore::open_with_model_layout(plan.experts_dir.clone(), &model_layout)?;
     let expert_storage = experts
         .resolve_execution_descriptor(model_layout.layers, model_layout.experts_per_layer)?;
-    let scheduler = ExpertScheduler::new_with_routed_expert_scale(
-        experts.clone(),
+    let expert_reads = ScheduledExpertReadCoordinator::new_with_routed_expert_scale(
+        experts,
         model_layout.routed_expert_scale,
     );
     progress("expert_store", phase_started.elapsed());
@@ -1268,13 +1270,13 @@ where
         Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
+    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, expert_reads);
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
     progress("tokenizer", phase_started.elapsed());
     Ok(FlashMoeEngine {
         plan: plan.clone(),
-        experts,
         scheduler,
         dense,
         tokenizer,
@@ -1283,7 +1285,6 @@ where
         config,
         model_layout,
         capability_plan,
-        scheduled_graph,
         routing_policy,
         runtime,
         shared_expert_phases: SharedExpertPhaseCache::default(),
@@ -1294,15 +1295,13 @@ where
 #[derive(Debug)]
 pub struct FlashMoeEngine {
     pub(super) plan: FlashMoePlan,
-    pub(super) experts: ExpertSlotStore,
-    pub(super) scheduler: ExpertScheduler,
+    pub(super) scheduler: FlashMoeExecutionScheduler,
     pub(super) dense: DenseStore,
     tokenizer: QwenTokenizer,
     pub(super) metal: MetalExecutionFacade,
     pub(super) config: QwenModelConfig,
     model_layout: QwenMoeModelLayout,
     capability_plan: FlashMoeCapabilityPlan,
-    pub(super) scheduled_graph: FlashMoeScheduledGraph,
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) runtime: DenseTransformerRuntime,
     pub(super) shared_expert_phases: SharedExpertPhaseCache,
@@ -3100,7 +3099,7 @@ impl FlashMoeEngine {
         layer: usize,
         experts: &[usize],
     ) -> Result<Vec<ExpertWeights>> {
-        read_expert_weights_many(&self.experts, layer, experts)
+        read_expert_weights_many(self.scheduler.expert_store(), layer, experts)
     }
 
     pub fn expert_scheduler_metrics(&self) -> ExpertSchedulerSnapshot {

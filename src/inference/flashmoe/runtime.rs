@@ -138,21 +138,14 @@ impl FlashMoeEngine {
             } else {
                 ScheduledCmd1InputSource::CpuNormedHidden
             };
-            let scheduled_cmd1 = self
-                .scheduled_graph
-                .build_cmd1_attention_projections(layer, cmd1_input)?;
-            let scheduled_cmd1 = self
-                .scheduled_graph
-                .build_cmd1_submission(scheduled_cmd1, cmd1_input)?
-                .into_cmd1_command();
-            debug_assert_eq!(scheduled_cmd1.layer, layer);
-            debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
             let cmd1_input_state = if let Some(input) = deferred_attention_input {
                 FlashMoeCmd1InputState::gpu_next_layer_normed(layer, input.state())
             } else {
                 FlashMoeCmd1InputState::cpu_normed(layer, normed.len())
             };
-            let scheduled_cmd1 = scheduled_cmd1.into_resolved_command(cmd1_input_state)?;
+            let scheduled_cmd1 =
+                self.scheduler
+                    .resolve_cmd1(layer, cmd1_input, cmd1_input_state)?;
             debug_assert_eq!(scheduled_cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.cmd1.layer, layer);
             debug_assert_eq!(scheduled_cmd1.input, cmd1_input);
@@ -313,7 +306,7 @@ impl FlashMoeEngine {
             } else {
                 ScheduledCmd2ResidualInput::cpu_hidden(cmd2_residual_len)
             };
-            let scheduled_cmd2 = self.scheduled_graph.build_cmd2_command(
+            let scheduled_cmd2 = self.scheduler.resolve_cmd2(
                 layer,
                 self.routing_policy.active_experts,
                 ScheduledCmd2PhaseInputs::from_inputs(cmd2_attention_input, cmd2_residual_input),
@@ -331,8 +324,8 @@ impl FlashMoeEngine {
             let mut precomputed_active: Option<ScheduledRoutingCommand> = None;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if let Some(prep) = metal_post_attention_prep.as_mut() {
-                let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
-                    &self.scheduled_graph,
+                let routing_command = self.scheduler.routing_from_post_attention_prep(
+                    &scheduled_cmd2,
                     prep.state,
                     &prep.active,
                 )?;
@@ -379,8 +372,8 @@ impl FlashMoeEngine {
                     {
                         pending.finish_without_readback()?;
                     }
-                    let routing_command = scheduled_cmd2.command_from_post_attention_prep_routes(
-                        &self.scheduled_graph,
+                    let routing_command = self.scheduler.routing_from_post_attention_prep(
+                        &scheduled_cmd2,
                         prep.state,
                         &prep.active,
                     )?;
@@ -423,10 +416,7 @@ impl FlashMoeEngine {
                 }
                 continue;
             }
-            let expert_metrics_before = self.scheduler.snapshot();
-            let expert_io_started = Instant::now();
-            let pending_experts = self.scheduler.issue_routing_command(&active)?;
-            layer_timing.buckets.expert_io += expert_io_started.elapsed();
+            let pending_cmd3 = self.scheduler.issue_cmd3(&active)?;
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
             let shared_compute_started = Instant::now();
@@ -438,26 +428,7 @@ impl FlashMoeEngine {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let shared_phase = SharedExpertPhaseRef::None;
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
-            let expert_io_started = Instant::now();
-            let scheduled_experts = self.scheduler.finish_routes(pending_experts)?;
-            layer_timing.buckets.expert_io += expert_io_started.elapsed();
-            let expert_metrics_after = self.scheduler.snapshot();
-            let expert_delta = expert_metrics_after.saturating_delta(expert_metrics_before);
-            layer_timing
-                .buckets
-                .add_expert_scheduler_delta(expert_delta);
-            let expert_compute_started = Instant::now();
-            debug_assert_eq!(scheduled_experts.layer, layer);
-            debug_assert_eq!(scheduled_experts.len(), scheduled_experts.routes.len());
-            debug_assert_eq!(scheduled_experts.len(), scheduled_experts.weights.len());
-            debug_assert_eq!(scheduled_experts.is_empty(), active.routes.is_empty());
-            for (expert, weight) in scheduled_experts
-                .experts
-                .iter()
-                .zip(scheduled_experts.weights.iter().copied())
-            {
-                token_state.mix_active_expert(expert.mix_hash(), weight);
-            }
+            let cmd3_prepare_started = Instant::now();
             let prepared_next_norm_weights = prepare_scheduled_next_norm_weights(
                 layer,
                 self.config.num_hidden_layers,
@@ -466,6 +437,7 @@ impl FlashMoeEngine {
                 |name, width| self.model_norm_weight(name, width),
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
+            layer_timing.buckets.expert_compute += cmd3_prepare_started.elapsed();
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let prep = metal_post_attention_prep.take().with_context(|| {
                 format!(
@@ -477,15 +449,26 @@ impl FlashMoeEngine {
                 "FlashMoe unsupported scheduled Qwen3.5 CMD3 path at layer {layer}: the resolved implementation requires Apple Silicon Metal"
             );
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                let command = self.scheduled_graph.build_cmd3_command_from_descriptors(
+            let expert_delta = {
+                let metal = &self.metal;
+                let cmd3_execution = self.scheduler.finish_cmd3(
+                    pending_cmd3,
                     position,
-                    &scheduled_experts,
                     ExpertPhaseInput::MetalPostAttention(prep),
                     shared_phase,
                     next_norm_weights,
+                    |command| metal.submit_scheduled_expert_command(command),
                 )?;
-                let pending = self.metal.submit_scheduled_expert_command(command)?;
+                let expert_delta = cmd3_execution.expert_delta;
+                layer_timing.buckets.expert_io += cmd3_execution.expert_io_elapsed;
+                layer_timing
+                    .buckets
+                    .add_expert_scheduler_delta(expert_delta);
+                for (mix_hash, weight) in cmd3_execution.expert_mixes {
+                    token_state.mix_active_expert(mix_hash, weight);
+                }
+                layer_timing.buckets.expert_compute += cmd3_execution.submit_elapsed;
+                let pending = cmd3_execution.submission;
                 if deepstack.is_none() && layer + 1 < self.config.num_hidden_layers {
                     deferred_expert_phase = Some(pending);
                 } else {
@@ -495,9 +478,11 @@ impl FlashMoeEngine {
                         FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
                     )?;
                 }
-            }
+                expert_delta
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let expert_delta = ExpertSchedulerSnapshot::default();
             trace_layer_values(position, layer, "moe", token_state.hidden());
-            layer_timing.buckets.expert_compute += expert_compute_started.elapsed();
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
                 kv_cache
@@ -750,7 +735,7 @@ impl FlashMoeEngine {
         _layout: FullAttentionLayout,
         kv_record: &FlashMoeFullAttentionKvRecord,
     ) -> Result<ScheduledAttentionMathOutput> {
-        let scheduled_attention = self.scheduled_graph.build_attention_math(layer, position)?;
+        let scheduled_attention = self.scheduler.resolve_attention_math(layer, position)?;
         scheduled_attention.resolve_kv_state(kv_record.state(FlashMoeStatePlacement::CpuVisible))
     }
 
@@ -824,7 +809,7 @@ impl FlashMoeEngine {
             self.config.experts(),
             normed.len(),
         )?;
-        let router_score_command = self.scheduled_graph.build_router_score_projection(
+        let router_score_command = self.scheduler.resolve_router_score_projection(
             layer,
             self.config.experts(),
             active_experts,

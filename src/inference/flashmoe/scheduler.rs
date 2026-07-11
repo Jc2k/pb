@@ -366,6 +366,168 @@ impl FlashMoeScheduledGraph {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FlashMoeExecutionScheduler {
+    graph: FlashMoeScheduledGraph,
+    expert_reads: ScheduledExpertReadCoordinator,
+}
+
+impl FlashMoeExecutionScheduler {
+    pub(crate) fn new(
+        graph: FlashMoeScheduledGraph,
+        expert_reads: ScheduledExpertReadCoordinator,
+    ) -> Self {
+        Self {
+            graph,
+            expert_reads,
+        }
+    }
+
+    pub(crate) fn resolve_cmd1(
+        &self,
+        layer: usize,
+        input: ScheduledCmd1InputSource,
+        input_state: FlashMoeCmd1InputState,
+    ) -> Result<ScheduledCmd1ResolvedCommand<ScheduledCmd1InputSource>> {
+        self.graph
+            .build_cmd1_submission(
+                self.graph.build_cmd1_attention_projections(layer, input)?,
+                input,
+            )?
+            .into_cmd1_command()
+            .into_resolved_command(input_state)
+    }
+
+    pub(crate) fn resolve_attention_math(
+        &self,
+        layer: usize,
+        position: usize,
+    ) -> Result<ScheduledAttentionMath, FlashMoeUnsupportedCapability> {
+        self.graph.build_attention_math(layer, position)
+    }
+
+    pub(crate) fn resolve_cmd2(
+        &self,
+        layer: usize,
+        active_experts: usize,
+        inputs: ScheduledCmd2PhaseInputs,
+    ) -> Result<ScheduledCmd2Command<ScheduledCmd2PhaseInputs>> {
+        self.graph.build_cmd2_command(layer, active_experts, inputs)
+    }
+
+    pub(crate) fn routing_from_post_attention_prep(
+        &self,
+        cmd2: &ScheduledCmd2Command<ScheduledCmd2PhaseInputs>,
+        state: FlashMoePostAttentionPrepState,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledRoutingCommand> {
+        cmd2.command_from_post_attention_prep_routes(&self.graph, state, routes)
+    }
+
+    pub(crate) fn resolve_router_score_projection(
+        &self,
+        layer: usize,
+        experts: usize,
+        active_experts: usize,
+        projection: Option<RouterScoreProjectionDescriptor>,
+        hidden_width: usize,
+    ) -> Result<ScheduledRouterScoreProjectionCommand, FlashMoeUnsupportedCapability> {
+        self.graph.build_router_score_projection(
+            layer,
+            experts,
+            active_experts,
+            projection,
+            hidden_width,
+        )
+    }
+
+    pub(crate) fn issue_cmd3(
+        &mut self,
+        routing: &ScheduledRoutingCommand,
+    ) -> Result<PendingScheduledCmd3> {
+        let before = self.expert_reads.snapshot();
+        let issue_started = Instant::now();
+        let pending = self.expert_reads.issue_routing_command(routing)?;
+        Ok(PendingScheduledCmd3 {
+            before,
+            pending,
+            issue_elapsed: issue_started.elapsed(),
+        })
+    }
+
+    pub(crate) fn finish_cmd3<TInput, TShared, TSubmission>(
+        &mut self,
+        pending: PendingScheduledCmd3,
+        position: usize,
+        input: TInput,
+        shared: TShared,
+        next_norm_weights: ScheduledNextNormWeights<'_>,
+        submit: impl FnOnce(
+            ScheduledCmd3Command<'_, Arc<ScheduledExpertSlot>, TInput, TShared>,
+        ) -> Result<TSubmission>,
+    ) -> Result<ScheduledCmd3Execution<TSubmission>>
+    where
+        TInput: ScheduledCmd3Input,
+        TShared: ScheduledSharedExpert,
+    {
+        let finish_started = Instant::now();
+        let scheduled = self.expert_reads.finish_routes(pending.pending)?;
+        let expert_io_elapsed = pending.issue_elapsed + finish_started.elapsed();
+        let expert_delta = self
+            .expert_reads
+            .snapshot()
+            .saturating_delta(pending.before);
+        let expert_mixes = scheduled
+            .experts
+            .iter()
+            .zip(scheduled.weights.iter().copied())
+            .map(|(expert, weight)| (expert.mix_hash(), weight))
+            .collect();
+        let submit_started = Instant::now();
+        let command = self.graph.build_cmd3_command_from_descriptors(
+            position,
+            &scheduled,
+            input,
+            shared,
+            next_norm_weights,
+        )?;
+        let submission = submit(command)?;
+        let submit_elapsed = submit_started.elapsed();
+        Ok(ScheduledCmd3Execution {
+            submission,
+            expert_delta,
+            expert_mixes,
+            expert_io_elapsed,
+            submit_elapsed,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        self.expert_reads.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expert_store(&self) -> &ExpertSlotStore {
+        &self.expert_reads.store
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingScheduledCmd3 {
+    before: ExpertSchedulerSnapshot,
+    pending: PendingScheduledExpertSet<ExpertRawReadResponse>,
+    issue_elapsed: Duration,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScheduledCmd3Execution<TSubmission> {
+    pub(crate) submission: TSubmission,
+    pub(crate) expert_delta: ExpertSchedulerSnapshot,
+    pub(crate) expert_mixes: Vec<(u64, f32)>,
+    pub(crate) expert_io_elapsed: Duration,
+    pub(crate) submit_elapsed: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledCmd1InputSource {
     CpuNormedHidden,
@@ -3208,6 +3370,110 @@ mod tests {
         shape: Option<ScheduledSharedExpertShape>,
     ) -> DummySharedExpert {
         DummySharedExpert { source, shape }
+    }
+
+    fn test_execution_scheduler() -> (tempfile::TempDir, FlashMoeExecutionScheduler) {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+        let reads = ScheduledExpertReadCoordinator::new(store);
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        (temp, FlashMoeExecutionScheduler::new(graph, reads))
+    }
+
+    #[test]
+    fn execution_scheduler_resolves_cmd1_cmd2_and_routing_with_one_graph_owner() {
+        let (_temp, scheduler) = test_execution_scheduler();
+        let cmd1 = scheduler
+            .resolve_cmd1(
+                3,
+                ScheduledCmd1InputSource::CpuNormedHidden,
+                FlashMoeCmd1InputState::cpu_normed(3, 8),
+            )
+            .unwrap();
+        assert_eq!(cmd1.layer, 3);
+        assert_eq!(cmd1.input_state.layer(), 3);
+
+        let cmd2 = scheduler
+            .resolve_cmd2(
+                3,
+                2,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(8),
+                    ScheduledCmd2ResidualInput::metal_buffer(8),
+                ),
+            )
+            .unwrap();
+        let state = FlashMoePostAttentionPrepState::new(3, 8, 5, 2);
+        let routing = scheduler
+            .routing_from_post_attention_prep(&cmd2, state, &[(4, 3.0), (1, 2.0)])
+            .unwrap();
+
+        assert_eq!(routing.layer, 3);
+        assert_eq!(routing.active_experts, 2);
+        assert_eq!(routing.routes, vec![(4, 3.0), (1, 2.0)]);
+    }
+
+    #[test]
+    fn execution_scheduler_finishes_whole_slot_reads_and_submits_cmd3_transaction() {
+        let (_temp, mut scheduler) = test_execution_scheduler();
+        let routes = ScheduledExpertRoutes::from_routes(
+            3,
+            vec![ExpertRoute {
+                expert: 8,
+                score: 1.0,
+            }],
+            1.0,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let pending =
+            PendingScheduledExpertSet::new(routes, vec![PendingScheduledRead::new(77, rx)]);
+        tx.send(ExpertRawReadResponse {
+            id: 77,
+            queue_latency: Duration::from_millis(1),
+            read_path: ExpertReadPath::PositionedRead,
+            read_latency: Duration::from_millis(2),
+            bytes_read: tiny_fixed_q4_layout().expert_bytes as u64,
+            warm: false,
+            result: Ok(raw_fixed_q4_read(3, 8)),
+        })
+        .unwrap();
+        let transaction = PendingScheduledCmd3 {
+            before: scheduler.snapshot(),
+            pending,
+            issue_elapsed: Duration::from_millis(1),
+        };
+        let shared = dummy_shared_expert_with_shape(
+            ScheduledSharedExpertSource::ResidentQ4Projections,
+            Some(ScheduledSharedExpertShape::new(2, 1, 2).unwrap()),
+        );
+
+        let execution = scheduler
+            .finish_cmd3(
+                transaction,
+                19,
+                dummy_cmd3_input_with_width(ScheduledCmd3InputSource::CpuNormedResidualUpload, 2),
+                shared,
+                ScheduledNextNormWeights::none(),
+                |command| {
+                    assert_eq!(command.layer, 3);
+                    assert_eq!(command.experts.len(), 1);
+                    Ok(command.layer)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(execution.submission, 3);
+        assert_eq!(execution.expert_delta.positioned_reads, 1);
+        assert_eq!(
+            execution.expert_delta.bytes_read,
+            tiny_fixed_q4_layout().expert_bytes as u64
+        );
+        assert_eq!(execution.expert_mixes.len(), 1);
+        assert_eq!(execution.expert_mixes[0].1, 1.0);
+        assert!(execution.expert_io_elapsed >= Duration::from_millis(1));
     }
 
     fn dummy_shared_dense_phase() -> SharedExpertPhaseWeights {
