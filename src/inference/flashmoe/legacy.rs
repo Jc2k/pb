@@ -9828,30 +9828,6 @@ mod tests {
     mod arm_macos_integration {
         use super::*;
 
-        fn tiny_snapshot() -> tempfile::TempDir {
-            let tmp = tempfile::tempdir().unwrap();
-            let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
-            std::fs::create_dir_all(&snapshot).unwrap();
-            std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
-            write_test_config(&snapshot);
-            std::fs::write(
-                snapshot.join("dense.safetensors"),
-                make_safetensors(&[("model.layers.0.self_attn.q_proj.weight", b"dense")]),
-            )
-            .unwrap();
-            std::fs::write(
-                snapshot.join("expert.safetensors"),
-                make_typed_safetensors(&typed_fixture_refs(&test_expert_triplet(0, 0))),
-            )
-            .unwrap();
-            std::fs::write(
-                snapshot.join("model.safetensors.index.json"),
-                expert_triplet_weight_map(0, 0),
-            )
-            .unwrap();
-            tmp
-        }
-
         fn tiny_dense_store(root: &Path) -> DenseStore {
             let dense_path = root.join("model_weights.bin");
             let manifest_path = root.join("model_weights.json");
@@ -9887,27 +9863,6 @@ mod tests {
                 &runtime.linear_attention,
             )
             .unwrap();
-        }
-
-        #[test]
-        #[ignore = "requires Apple Silicon Metal; run on ARM macOS with `cargo test --all-targets -- --ignored`"]
-        fn arm_macos_tiny_flashmoe_cache_builds_loads_and_generates() {
-            let tmp = tiny_snapshot();
-            let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
-            let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
-            assert!(plan.cache_status().unwrap().ready);
-
-            let mut engine = load(&plan).unwrap();
-            let output = engine
-                .generate(&GenerationRequest {
-                    prompt: "hello".to_string(),
-                    max_tokens: 1,
-                    temperature: 0.0,
-                    top_k: 1,
-                    seed: 1,
-                })
-                .unwrap();
-            assert_eq!(output.generated_tokens, 1);
         }
     }
 

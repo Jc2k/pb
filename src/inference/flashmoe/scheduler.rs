@@ -3454,12 +3454,16 @@ impl ExpertSchedulerSnapshot {
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{
-        ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec,
+        ExpertLayerPackMetadata, ExpertPackMetadata, ExpertRawPayload, FixedQ4ExpertPayload,
+        FixedQ4ExpertSlotSpec, expert_layer_path, write_expert_metadata_atomically,
     };
+    use crate::inference::flashmoe::math::causal_attention;
     use crate::inference::flashmoe::model_family::{
         QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeQ4ExpertLayout,
     };
-    use crate::inference::flashmoe::state::FlashMoeGpuBufferDescriptor;
+    use crate::inference::flashmoe::state::{
+        FlashMoeExpertPhaseApplication, FlashMoeGpuBufferDescriptor, FlashMoeTokenState,
+    };
     use crate::inference::flashmoe::weights::{
         DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, RouterScoreProjectionBinding,
         RouterScoreProjectionDescriptor, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
@@ -3605,6 +3609,90 @@ mod tests {
             read_latency: Duration::from_millis(3),
             read_path: ExpertReadPath::PositionedRead,
         }
+    }
+
+    fn identity_fixed_q4_slot_bytes() -> Vec<u8> {
+        let layout = tiny_fixed_q4_layout();
+        let mut bytes = vec![0u8; layout.expert_bytes];
+        let one_bf16 = 0x3f80u16.to_le_bytes();
+        for (weight_offset, scale_offset) in [(0, 8), (16, 24), (32, 40)] {
+            // Row-major 2x2 identity, low nibble first. Remaining component
+            // bytes are fixed-slot padding and must stay addressable.
+            bytes[weight_offset] = 0x01;
+            bytes[weight_offset + 1] = 0x10;
+            bytes[scale_offset..scale_offset + 2].copy_from_slice(&one_bf16);
+            bytes[scale_offset + 2..scale_offset + 4].copy_from_slice(&one_bf16);
+        }
+        bytes
+    }
+
+    fn write_identity_fixed_q4_layer(root: &std::path::Path, layer: usize, experts: usize) {
+        let slot = identity_fixed_q4_slot_bytes();
+        let bytes = slot.repeat(experts);
+        std::fs::write(expert_layer_path(root, layer), bytes).unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_q4(
+            layer,
+            slot.len() as u64,
+            experts,
+            (0..experts)
+                .map(|expert| ExpertPackMetadata {
+                    layer,
+                    expert,
+                    packed_bytes: slot.len() as u64,
+                    records: Vec::new(),
+                })
+                .collect(),
+        );
+        write_expert_metadata_atomically(root, layer, &metadata).unwrap();
+    }
+
+    fn reference_bf16(bytes: &[u8], group: usize) -> f32 {
+        let offset = group * 2;
+        f32::from_bits((u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as u32) << 16)
+    }
+
+    fn reference_q4_matvec(payload: &Q4MatvecPayload<'_>, input: &[f32]) -> Vec<f32> {
+        let row_bytes = payload.cols.div_ceil(2);
+        let groups_per_row = payload.cols.div_ceil(payload.group_size);
+        (0..payload.rows)
+            .map(|row| {
+                (0..payload.cols)
+                    .map(|col| {
+                        let byte = payload.packed[row * row_bytes + col / 2];
+                        let quantized = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                        let group = row * groups_per_row + col / payload.group_size;
+                        let scale = reference_bf16(payload.scale_bytes, group);
+                        let bias = reference_bf16(payload.bias_bytes, group);
+                        (quantized as f32 * scale + bias) * input[col]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn reference_q4_swiglu(
+        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let gate = reference_q4_matvec(&payload.gate, input);
+        let up = reference_q4_matvec(&payload.up, input);
+        let intermediate: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+            .collect();
+        reference_q4_matvec(&payload.down, &intermediate)
+    }
+
+    fn reference_rms_norm(values: &[f32], weights: &[f32]) -> Vec<f32> {
+        let mean_square =
+            values.iter().map(|value| value * value).sum::<f32>() / values.len().max(1) as f32;
+        let scale = (mean_square + 1e-6).sqrt().recip();
+        values
+            .iter()
+            .zip(weights.iter())
+            .map(|(value, weight)| value * scale * weight)
+            .collect()
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -3887,6 +3975,186 @@ mod tests {
         assert_eq!(cmd3.expert_mixes.len(), 1);
         assert_eq!(cmd3.expert_mixes[0].1, 1.0);
         assert!(cmd3.expert_io_elapsed >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn qwen35_q4_layer_parity_fixture_follows_resolved_k4_transaction() {
+        // Golden values are independently derived from the Qwen3.5/Qwen3Next
+        // equations: scaled dot-product attention, residual RMSNorm, router
+        // topK then selected-score softmax, Q4 SwiGLU, shared addition, RMSNorm.
+        let position = 7;
+        let layer = 3;
+        let experts = 9;
+        let active_experts = 4;
+        let width = 2;
+        let query = [1.0, 0.0];
+        let key_0 = [1.0, 0.0];
+        let value_0 = [2.0, 1.0];
+        let key_1 = [0.0, 1.0];
+        let value_1 = [-1.0, 3.0];
+        let attention = causal_attention(
+            &query,
+            &[(&key_0, &value_0), (&key_1, &value_1)],
+            1,
+            1,
+            width,
+        );
+        for (actual, expected) in attention.iter().zip([1.0092846, 1.6604769]) {
+            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
+        let residual_input = [0.5, -1.0];
+        let residual = [
+            residual_input[0] + attention[0],
+            residual_input[1] + attention[1],
+        ];
+        let normed = reference_rms_norm(&residual, &[1.0, 1.0]);
+        for (actual, expected) in normed.iter().zip([1.2955897, 0.5669620]) {
+            assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+        }
+
+        let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
+        let active = top_k(&router_scores, active_experts);
+        assert_eq!(active, vec![(8, 4.0), (3, 3.0), (5, 2.5), (1, 2.0)]);
+
+        let (temp, mut scheduler) = test_execution_scheduler();
+        write_identity_fixed_q4_layer(temp.path(), layer, experts);
+        let attention_math = scheduler
+            .graph
+            .build_attention_math(layer, position)
+            .unwrap()
+            .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(
+                position, layer, width, width,
+            ))
+            .unwrap();
+        assert_eq!(
+            attention_math.implementation(),
+            ScheduledAttentionMathImplementation::CpuKvCache
+        );
+
+        let scheduled = scheduler
+            .begin_layer(
+                position,
+                layer,
+                5,
+                active_experts,
+                ScheduledPreviousCmd3Handoff::deferred_gpu(
+                    layer - 1,
+                    FlashMoeGpuBufferDescriptor::hidden(width),
+                    FlashMoeGpuBufferDescriptor::next_layer_normed(width),
+                ),
+                true,
+            )
+            .unwrap();
+        let (_, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd1InputSource::DeferredMetalNextNormed,
+                FlashMoeCmd1InputState::gpu_next_layer_normed(
+                    layer,
+                    FlashMoeGpuBufferDescriptor::next_layer_normed(width),
+                ),
+            )
+            .unwrap();
+        let (cmd2, scheduled) = scheduled
+            .resolve(
+                &scheduler,
+                ScheduledCmd2PhaseInputs::from_inputs(
+                    ScheduledCmd2AttentionInput::metal_values(width),
+                    ScheduledCmd2ResidualInput::metal_buffer(width),
+                ),
+            )
+            .unwrap();
+        let prep_state = FlashMoePostAttentionPrepState::new(layer, width, experts, active_experts);
+        let routing = scheduler
+            .routing_from_post_attention_prep(&cmd2, prep_state, &active)
+            .unwrap();
+        let routed = scheduled.resolve(&routing).unwrap();
+        let pending = routed.issue_cmd3(&mut scheduler, &routing).unwrap();
+        let next_norm_weights = [1.0, 0.5];
+        let shared_output = [0.25, -0.5];
+        let input = DummyCmd3InputState {
+            source: ScheduledCmd3InputSource::MetalPostAttentionPrep,
+            state: FlashMoeCmd3InputState::metal_post_attention_prep(layer, prep_state),
+        };
+        let shared = dummy_shared_expert_with_shape(
+            ScheduledSharedExpertSource::ResidentQ4Projections,
+            Some(ScheduledSharedExpertShape::new(width, 1, width).unwrap()),
+        );
+        let execution = pending
+            .finish(
+                &mut scheduler,
+                input,
+                shared,
+                ScheduledNextNormWeights::cpu_visible(
+                    "model.layers.4.input_layernorm.weight",
+                    &next_norm_weights,
+                    width,
+                )
+                .unwrap(),
+                |command| {
+                    assert_eq!(
+                        command
+                            .experts
+                            .iter()
+                            .map(|expert| expert.expert())
+                            .collect::<Vec<_>>(),
+                        vec![8, 3, 5, 1]
+                    );
+                    for (actual, expected) in command
+                        .weights
+                        .iter()
+                        .zip([0.57925856, 0.2130973, 0.12925005, 0.07839412])
+                    {
+                        assert!((actual - expected).abs() <= 1e-6);
+                    }
+                    let mut expert_output = vec![0.0f32; width];
+                    for (payload, weight) in command.payloads.iter().zip(command.weights.iter()) {
+                        let output = reference_q4_swiglu(payload.q4(), &normed);
+                        for (combined, value) in expert_output.iter_mut().zip(output.iter()) {
+                            *combined += value * weight;
+                        }
+                    }
+                    let hidden: Vec<f32> = residual
+                        .iter()
+                        .zip(expert_output.iter())
+                        .zip(shared_output.iter())
+                        .map(|((residual, expert), shared)| residual + expert + shared)
+                        .collect();
+                    for (actual, expected) in hidden.iter().zip([3.0771027, 0.3655793]) {
+                        assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+                    }
+                    let next_normed =
+                        reference_rms_norm(&hidden, command.next_norm_weights.values().unwrap());
+                    command
+                        .resolve_output_state()?
+                        .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(
+                            hidden,
+                            Some(next_normed),
+                        ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.output_handoff,
+            ScheduledCmd3OutputHandoff::DeferredToNextLayer
+        );
+        assert_eq!(execution.cmd3.expert_delta.positioned_reads, 4);
+        assert_eq!(execution.cmd3.expert_delta.bytes_read, 4 * 48);
+        let mut token_state = FlashMoeTokenState::new(vec![0.0; width], 0);
+        token_state
+            .apply_declared_expert_phase(
+                execution.cmd3.submission,
+                FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+            )
+            .unwrap();
+        for (actual, expected) in token_state.hidden().iter().zip([3.0771027, 0.3655793]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+        let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
+        for (actual, expected) in next_normed.iter().zip([1.404337, 0.08342207]) {
+            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
     }
 
     fn dummy_shared_dense_phase() -> SharedExpertPhaseWeights {

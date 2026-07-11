@@ -291,6 +291,13 @@ Baseline reviewed on 2026-07-10:
   no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
+- Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
+  equations. It follows CPU-KV scaled-dot-product attention, deferred CMD1 state, Metal-placed CMD2
+  descriptors, fixed router scores, K=4 IDs/weights, four real scheduler-owned positioned reads of
+  whole fixed-Q4 slots, typed gate/up/down offsets, SwiGLU expert output, shared output,
+  residual/hidden state, declared CMD3 output, and next-layer RMSNorm. The stale ignored test that
+  mislabeled a tiny Qwen3 model as the production Qwen3.5 URI was deleted rather than preserved as
+  an alternate runtime fixture.
 
 The architecture is not yet at the target:
 
@@ -299,8 +306,8 @@ The architecture is not yet at the target:
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
-- Contract tests are numerous, but full per-layer/logit parity through the resolved K=4 graph is not
-  yet established.
+- One complete K=4 layer golden is established, but multi-layer deferred/recurrent state and final
+  logit-candidate parity through the resolved graph are not yet established.
 
 At this checkpoint, Gates 1 through 4 are complete. Dense, CPU-KV, CPU generation/session,
 recurrent-session, and deferred GPU ownership have moved; Qwen3.5 Q4 parity closure, additional
