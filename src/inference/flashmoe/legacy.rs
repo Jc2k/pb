@@ -1714,15 +1714,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_hf_repos_are_flashmoe_pull_candidates() {
-        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-30B-A3B"));
-        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-235B-A22B-Instruct"));
-        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-MoE-Instruct"));
-        assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
-        assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
-    }
-
-    #[test]
     fn plan_uses_flashmoe_cache_layout() {
         let plan = plan_unchecked(QWEN35_MODEL, Path::new("/models"));
         assert!(plan.runtime_dir.ends_with(CACHE_VERSION));

@@ -571,6 +571,22 @@ mod tests {
     }
 
     #[test]
+    fn qwen_moe_repositories_resolve_their_typed_pull_family() {
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-30B-A3B"));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-235B-A22B-Instruct"));
+        assert!(is_flashmoe_hf_model(QWEN3_VL_MODEL));
+        assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-30B-A3B-Instruct"));
+        assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
+        assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
+        assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
+
+        let vl = plan_unchecked(QWEN3_VL_MODEL, Path::new("/models"));
+        assert!(vl.vision_weights.is_some());
+        assert!(vl.vision_manifest.is_some());
+        assert!(vl.vision_config_path.is_some());
+    }
+
+    #[test]
     fn explicit_storage_policy_selects_distinct_qwen_family_cache_namespaces() {
         let temp = tempfile::tempdir().unwrap();
         for model in ["hf://Qwen/Qwen3-30B-A3B", QWEN3_VL_MODEL] {

@@ -21,7 +21,9 @@ pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
 }
 
 pub fn is_qwen3_vl(model: &str) -> bool {
-    model.to_ascii_lowercase().contains(QWEN3_VL_MODEL_MARKER)
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains(QWEN3_VL_MODEL_MARKER)
+        && (normalized.contains("moe") || contains_active_parameter_marker(&normalized))
 }
 
 pub fn is_qwen3_moe(model: &str) -> bool {
@@ -1034,7 +1036,11 @@ mod tests {
     fn qwen_family_name_detection_is_owned_by_model_family() {
         assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
         assert!(is_qwen3_moe("hf://Qwen/Qwen3-30B-A3B"));
+        assert!(is_qwen3_vl(QWEN3_VL_MODEL));
+        assert!(is_qwen3_vl("hf://Qwen/Qwen3-VL-30B-A3B-Instruct"));
+        assert!(is_qwen3_vl("hf://Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"));
         assert!(is_qwen3_vl("hf://Qwen/Qwen3-VL-MoE-Instruct"));
+        assert!(!is_qwen3_vl("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_qwen3_moe("qwen3-dense-8b"));
     }
 

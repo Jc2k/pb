@@ -452,6 +452,12 @@ Baseline reviewed on 2026-07-11:
   Qwen3.5 config cannot redirect its text graph into Qwen-VL.
   A text adapter bound to Qwen-VL, a VL adapter bound to text, absent artifacts, invalid metadata,
   or missing required vision tensors is a token-input-stage error before inference.
+- Qwen3-VL planning now recognizes real MoE repository names such as
+  `Qwen3-VL-30B-A3B-*`, while dense names such as `Qwen3-VL-8B-*` remain outside FlashMoe. The
+  production Q4 evidence target is
+  `hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit`; the former placeholder
+  `Qwen3-VL-MoE-Instruct` name no longer determines whether vision artifacts are planned. Pull
+  classification coverage moved from `legacy.rs` to the planning owner.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -482,10 +488,12 @@ The architecture is not yet at the target:
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
-  real-checkpoint smoke evidence. Qwen-VL preprocessing now emits exact typed inputs consumed by
-  the shared runtime, including scheduler-compatible DeepStack handoff policy. Its Q4 capability
-  and load path resolve only from a concrete vision executor and manifest bindings, but a real
-  Qwen-VL checkpoint smoke is still required before claiming production correctness.
+  real-checkpoint smoke evidence. The intended Q4 source is
+  `hf://mlx-community/Qwen3-30B-A3B-4bit`. Qwen-VL preprocessing now emits exact typed inputs
+  consumed by the shared runtime, including scheduler-compatible DeepStack handoff policy. Its Q4
+  capability and load path resolve only from a concrete vision executor and manifest bindings, and
+  the real Q4 checkpoint URI now reaches that plan, but the checkpoint is not present locally and
+  a real Qwen-VL smoke is still required before claiming production correctness.
 - BF16/F16/F32 full-attention CMD1, CMD2, and LM-head sampling now use the same typed resident
   projection handle, Metal dispatch, CPU/GPU input bindings, residual/norm transition, router
   readback, state handoff, padded-vocabulary policy, and topK command as Q4. Qwen3/Qwen3-VL
@@ -720,8 +728,8 @@ Current capability matrix:
 | Family | Dense/expert layout | Graph/load status | Correctness evidence |
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
-| Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
-| Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
+| Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph; production evidence target is `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity; real checkpoint pending |
+| Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Real `Qwen3-VL-30B-A3B-*` names resolve the unified graph with required typed vision executor; production target is `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability/planning parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
@@ -857,11 +865,12 @@ For Gate 6:
    Metal builder as Q4. Keep production policy explicit and emit only those declared fixed-slot
    formats from matching source dtypes. Do not revive removed dense CPU/component paths as
    production continuations.
-3. Run the resolved text-only Qwen MoE Q4 graph against a real checkpoint and debug manifest,
-   routing, or math mismatches through its typed metadata and shared scheduler path.
-4. Run the resolved Qwen-VL Q4 graph against a real checkpoint and debug any manifest/math mismatch
-   through its typed vision executor and shared scheduler path. Do not add request-time probing or
-   an alternate decoder loop to make the smoke pass.
+3. Pull and run `hf://mlx-community/Qwen3-30B-A3B-4bit` through the resolved text-only Qwen MoE Q4
+   graph. Debug manifest, routing, or math mismatches through its typed metadata and shared
+   scheduler path.
+4. Pull and run `hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` through the resolved Qwen-VL Q4
+   graph. Debug any manifest/math mismatch through its typed vision executor and shared scheduler
+   path. Do not add request-time probing or an alternate decoder loop to make the smoke pass.
 5. Add a capability matrix and focused parity fixture for each supported family/dtype/layout. Keep
    every not-yet-implemented combination as a precise load-time unsupported-stage error while the
    matrix is filled in.

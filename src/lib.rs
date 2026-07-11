@@ -3228,7 +3228,7 @@ mod tests {
             "infer",
             "2+2=",
             "--model",
-            "hf://Qwen/Qwen3-VL-MoE-Instruct",
+            "hf://mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
             "--expert-storage",
             "bf16",
         ])
