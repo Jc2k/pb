@@ -37,7 +37,8 @@ use super::state::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
     Cmd2ResidentPostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
-    ResidentMmapMatvecProjection, SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
+    LinearAttentionResidentBindings, ResidentMmapMatvecProjection, ResidentStaticDtype,
+    SharedExpertPhaseQ4Projections, SharedExpertPhaseWeights,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -86,32 +87,6 @@ pub(crate) struct MetalMatvecTiming {
     pub(crate) buffer_upload: Duration,
     pub(crate) dispatch: Duration,
     pub(crate) readback: Duration,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MetalLinearAttentionStaticOffsets {
-    pub(crate) conv_weight_byte_offset: u64,
-    pub(crate) a_log_byte_offset: u64,
-    pub(crate) dt_bias_byte_offset: u64,
-    pub(crate) norm_weight_byte_offset: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalLinearAttentionStaticOffsets {
-    pub(crate) fn new(
-        conv_weight_byte_offset: u64,
-        a_log_byte_offset: u64,
-        dt_bias_byte_offset: u64,
-        norm_weight_byte_offset: u64,
-    ) -> Self {
-        Self {
-            conv_weight_byte_offset,
-            a_log_byte_offset,
-            dt_bias_byte_offset,
-            norm_weight_byte_offset,
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -505,11 +480,17 @@ pub(crate) mod kernels {
     pub(crate) const COMBINE_EXPERT_PHASE: &str = "combine_expert_phase";
     pub(crate) const FILL_ZERO: &str = "fill_zero";
     pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
-    pub(crate) const LINEAR_CONV1D_STEP: &str = "linear_conv1d_step";
+    pub(crate) const LINEAR_CONV1D_STEP_BF16: &str = "linear_conv1d_step_bf16";
+    pub(crate) const LINEAR_CONV1D_STEP_F16: &str = "linear_conv1d_step_f16";
+    pub(crate) const LINEAR_CONV1D_STEP_F32: &str = "linear_conv1d_step_f32";
     pub(crate) const LINEAR_RMS_NORM_QK: &str = "linear_rms_norm_qk";
-    pub(crate) const LINEAR_COMPUTE_DECAY_BETA: &str = "linear_compute_decay_beta";
+    pub(crate) const LINEAR_COMPUTE_DECAY_BETA_BF16: &str = "linear_compute_decay_beta_bf16";
+    pub(crate) const LINEAR_COMPUTE_DECAY_BETA_F16: &str = "linear_compute_decay_beta_f16";
+    pub(crate) const LINEAR_COMPUTE_DECAY_BETA_F32: &str = "linear_compute_decay_beta_f32";
     pub(crate) const LINEAR_GATED_DELTA_STEP: &str = "linear_gated_delta_step";
-    pub(crate) const LINEAR_GATED_RMS_NORM: &str = "linear_gated_rms_norm";
+    pub(crate) const LINEAR_GATED_RMS_NORM_BF16: &str = "linear_gated_rms_norm_bf16";
+    pub(crate) const LINEAR_GATED_RMS_NORM_F16: &str = "linear_gated_rms_norm_f16";
+    pub(crate) const LINEAR_GATED_RMS_NORM_F32: &str = "linear_gated_rms_norm_f32";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,11 +551,17 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::COMBINE_EXPERT_PHASE,
     kernels::FILL_ZERO,
     kernels::TOPK_VOCAB,
-    kernels::LINEAR_CONV1D_STEP,
+    kernels::LINEAR_CONV1D_STEP_BF16,
+    kernels::LINEAR_CONV1D_STEP_F16,
+    kernels::LINEAR_CONV1D_STEP_F32,
     kernels::LINEAR_RMS_NORM_QK,
-    kernels::LINEAR_COMPUTE_DECAY_BETA,
+    kernels::LINEAR_COMPUTE_DECAY_BETA_BF16,
+    kernels::LINEAR_COMPUTE_DECAY_BETA_F16,
+    kernels::LINEAR_COMPUTE_DECAY_BETA_F32,
     kernels::LINEAR_GATED_DELTA_STEP,
-    kernels::LINEAR_GATED_RMS_NORM,
+    kernels::LINEAR_GATED_RMS_NORM_BF16,
+    kernels::LINEAR_GATED_RMS_NORM_F16,
+    kernels::LINEAR_GATED_RMS_NORM_F32,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,11 +586,17 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) combine_expert_phase: &'static str,
     pub(crate) fill_zero: &'static str,
     pub(crate) topk_vocab: &'static str,
-    pub(crate) linear_conv1d: &'static str,
+    pub(crate) linear_conv1d_bf16: &'static str,
+    pub(crate) linear_conv1d_f16: &'static str,
+    pub(crate) linear_conv1d_f32: &'static str,
     pub(crate) linear_rms_norm_qk: &'static str,
-    pub(crate) linear_decay_beta: &'static str,
+    pub(crate) linear_decay_beta_bf16: &'static str,
+    pub(crate) linear_decay_beta_f16: &'static str,
+    pub(crate) linear_decay_beta_f32: &'static str,
     pub(crate) linear_delta_step: &'static str,
-    pub(crate) linear_gated_rms_norm: &'static str,
+    pub(crate) linear_gated_rms_norm_bf16: &'static str,
+    pub(crate) linear_gated_rms_norm_f16: &'static str,
+    pub(crate) linear_gated_rms_norm_f32: &'static str,
 }
 
 impl MetalPipelineNameSet {
@@ -629,11 +622,17 @@ impl MetalPipelineNameSet {
             combine_expert_phase: kernels::COMBINE_EXPERT_PHASE,
             fill_zero: kernels::FILL_ZERO,
             topk_vocab: kernels::TOPK_VOCAB,
-            linear_conv1d: kernels::LINEAR_CONV1D_STEP,
+            linear_conv1d_bf16: kernels::LINEAR_CONV1D_STEP_BF16,
+            linear_conv1d_f16: kernels::LINEAR_CONV1D_STEP_F16,
+            linear_conv1d_f32: kernels::LINEAR_CONV1D_STEP_F32,
             linear_rms_norm_qk: kernels::LINEAR_RMS_NORM_QK,
-            linear_decay_beta: kernels::LINEAR_COMPUTE_DECAY_BETA,
+            linear_decay_beta_bf16: kernels::LINEAR_COMPUTE_DECAY_BETA_BF16,
+            linear_decay_beta_f16: kernels::LINEAR_COMPUTE_DECAY_BETA_F16,
+            linear_decay_beta_f32: kernels::LINEAR_COMPUTE_DECAY_BETA_F32,
             linear_delta_step: kernels::LINEAR_GATED_DELTA_STEP,
-            linear_gated_rms_norm: kernels::LINEAR_GATED_RMS_NORM,
+            linear_gated_rms_norm_bf16: kernels::LINEAR_GATED_RMS_NORM_BF16,
+            linear_gated_rms_norm_f16: kernels::LINEAR_GATED_RMS_NORM_F16,
+            linear_gated_rms_norm_f32: kernels::LINEAR_GATED_RMS_NORM_F32,
         }
     }
 
@@ -659,11 +658,17 @@ impl MetalPipelineNameSet {
             self.combine_expert_phase,
             self.fill_zero,
             self.topk_vocab,
-            self.linear_conv1d,
+            self.linear_conv1d_bf16,
+            self.linear_conv1d_f16,
+            self.linear_conv1d_f32,
             self.linear_rms_norm_qk,
-            self.linear_decay_beta,
+            self.linear_decay_beta_bf16,
+            self.linear_decay_beta_f16,
+            self.linear_decay_beta_f32,
             self.linear_delta_step,
-            self.linear_gated_rms_norm,
+            self.linear_gated_rms_norm_bf16,
+            self.linear_gated_rms_norm_f16,
+            self.linear_gated_rms_norm_f32,
         ]
     }
 }
@@ -690,11 +695,17 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) combine_expert_phase_pipeline: T,
     pub(crate) fill_zero_pipeline: T,
     pub(crate) topk_vocab_pipeline: T,
-    pub(crate) linear_conv1d_pipeline: T,
+    pub(crate) linear_conv1d_bf16_pipeline: T,
+    pub(crate) linear_conv1d_f16_pipeline: T,
+    pub(crate) linear_conv1d_f32_pipeline: T,
     pub(crate) linear_rms_norm_qk_pipeline: T,
-    pub(crate) linear_decay_beta_pipeline: T,
+    pub(crate) linear_decay_beta_bf16_pipeline: T,
+    pub(crate) linear_decay_beta_f16_pipeline: T,
+    pub(crate) linear_decay_beta_f32_pipeline: T,
     pub(crate) linear_delta_step_pipeline: T,
-    pub(crate) linear_gated_rms_norm_pipeline: T,
+    pub(crate) linear_gated_rms_norm_bf16_pipeline: T,
+    pub(crate) linear_gated_rms_norm_f16_pipeline: T,
+    pub(crate) linear_gated_rms_norm_f32_pipeline: T,
 }
 
 impl<T: Copy> MetalPipelineSet<T> {
@@ -719,11 +730,17 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.combine_expert_phase_pipeline);
         release(self.fill_zero_pipeline);
         release(self.topk_vocab_pipeline);
-        release(self.linear_conv1d_pipeline);
+        release(self.linear_conv1d_bf16_pipeline);
+        release(self.linear_conv1d_f16_pipeline);
+        release(self.linear_conv1d_f32_pipeline);
         release(self.linear_rms_norm_qk_pipeline);
-        release(self.linear_decay_beta_pipeline);
+        release(self.linear_decay_beta_bf16_pipeline);
+        release(self.linear_decay_beta_f16_pipeline);
+        release(self.linear_decay_beta_f32_pipeline);
         release(self.linear_delta_step_pipeline);
-        release(self.linear_gated_rms_norm_pipeline);
+        release(self.linear_gated_rms_norm_bf16_pipeline);
+        release(self.linear_gated_rms_norm_f16_pipeline);
+        release(self.linear_gated_rms_norm_f32_pipeline);
     }
 }
 
@@ -833,11 +850,19 @@ impl MetalRuntime {
                 combine_expert_phase_pipeline: take_pipeline(names.combine_expert_phase),
                 fill_zero_pipeline: take_pipeline(names.fill_zero),
                 topk_vocab_pipeline: take_pipeline(names.topk_vocab),
-                linear_conv1d_pipeline: take_pipeline(names.linear_conv1d),
+                linear_conv1d_bf16_pipeline: take_pipeline(names.linear_conv1d_bf16),
+                linear_conv1d_f16_pipeline: take_pipeline(names.linear_conv1d_f16),
+                linear_conv1d_f32_pipeline: take_pipeline(names.linear_conv1d_f32),
                 linear_rms_norm_qk_pipeline: take_pipeline(names.linear_rms_norm_qk),
-                linear_decay_beta_pipeline: take_pipeline(names.linear_decay_beta),
+                linear_decay_beta_bf16_pipeline: take_pipeline(names.linear_decay_beta_bf16),
+                linear_decay_beta_f16_pipeline: take_pipeline(names.linear_decay_beta_f16),
+                linear_decay_beta_f32_pipeline: take_pipeline(names.linear_decay_beta_f32),
                 linear_delta_step_pipeline: take_pipeline(names.linear_delta_step),
-                linear_gated_rms_norm_pipeline: take_pipeline(names.linear_gated_rms_norm),
+                linear_gated_rms_norm_bf16_pipeline: take_pipeline(
+                    names.linear_gated_rms_norm_bf16,
+                ),
+                linear_gated_rms_norm_f16_pipeline: take_pipeline(names.linear_gated_rms_norm_f16),
+                linear_gated_rms_norm_f32_pipeline: take_pipeline(names.linear_gated_rms_norm_f32),
             };
             debug_assert!(compiled.is_empty());
             Ok(Self {
@@ -1005,15 +1030,11 @@ impl MetalExecutionContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn linear_attention_q4_post_attention_prep(
+    pub(crate) fn linear_attention_post_attention_prep(
         &self,
-        layer: usize,
         layout: LinearAttentionLayout,
-        projections: &[DenseQ4MmapMatvecProjection],
+        bindings: &LinearAttentionResidentBindings,
         input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
@@ -1024,18 +1045,7 @@ impl MetalExecutionContext {
             &self.linear_attention_state,
             &self.buffers,
         )
-        .execute(
-            layer,
-            layout,
-            projections,
-            input,
-            static_offsets,
-            out_proj,
-            router,
-            residual,
-            post_norm_weight,
-            top_k,
-        )
+        .execute(layout, bindings, input, residual, post_norm_weight, top_k)
     }
 
     pub(crate) fn resident_projection_batch(
@@ -2595,34 +2605,53 @@ impl std::ops::Deref for MetalFusedLinearAttentionBuilder<'_> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn select_static_dtype_pipeline(
+    dtype: &ResidentStaticDtype,
+    bf16: MetalObjcId,
+    f16: MetalObjcId,
+    f32: MetalObjcId,
+) -> MetalObjcId {
+    match dtype {
+        ResidentStaticDtype::Bf16 => bf16,
+        ResidentStaticDtype::F16 => f16,
+        ResidentStaticDtype::F32 => f32,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalFusedLinearAttentionBuilder<'_> {
     pub(crate) fn execute(
         &self,
-        layer: usize,
         layout: LinearAttentionLayout,
-        projections: &[DenseQ4MmapMatvecProjection],
+        bindings: &LinearAttentionResidentBindings,
         input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
     ) -> Result<MetalPostAttentionPrep> {
+        let layer = bindings.layer;
+        let projections = &bindings.input_projections;
+        let out_proj = &bindings.out_proj;
+        let router = &bindings.router;
+        let static_tensors = &bindings.static_tensors;
         let residual_len = residual.len();
         if top_k == 0
             || residual_len == 0
             || residual_len != post_norm_weight.len()
-            || projections.len() != 4
-            || projections[0].output_width != layout.conv_dim
-            || projections[1].output_width != layout.total_value_width
-            || projections[2].output_width != layout.num_value_heads
-            || projections[3].output_width != layout.num_value_heads
-            || out_proj.output_width != residual_len
-            || out_proj.rows != residual_len
-            || out_proj.cols != layout.total_value_width
-            || router.cols != residual_len
-            || router.output_width != router.rows
+            || projections[0].output_width() != layout.conv_dim
+            || projections[1].output_width() != layout.total_value_width
+            || projections[2].output_width() != layout.num_value_heads
+            || projections[3].output_width() != layout.num_value_heads
+            || out_proj.output_width() != residual_len
+            || out_proj.rows() != residual_len
+            || out_proj.cols() != layout.total_value_width
+            || router.cols() != residual_len
+            || router.output_width() != router.rows()
+            || static_tensors.conv_weight.values != layout.conv_dim * layout.conv_kernel_size
+            || static_tensors.a_log.values != layout.num_value_heads
+            || static_tensors.dt_bias.values != layout.num_value_heads
+            || static_tensors.norm_weight.values != layout.value_dim
+            || static_tensors.a_log.dtype != ResidentStaticDtype::F32
             || layout.key_dim == 0
             || layout.value_dim == 0
             || layout.key_dim > 256
@@ -2644,77 +2673,46 @@ impl MetalFusedLinearAttentionBuilder<'_> {
         let mut total_rows = 0usize;
         let mut output_offsets = Vec::with_capacity(projections.len());
         for projection in projections {
-            if projection.rows == 0
-                || projection.cols == 0
-                || projection.cols != input_len
-                || projection.output_width != projection.rows
-                || projection.row_packed_bytes != projection.cols.div_ceil(2)
-            {
-                bail!(
-                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: projection {} does not match resolved input width {input_len}",
-                    projection.tensor_name
-                );
-            }
+            validate_resident_projection(projection, input_len, dense_weights.len).with_context(
+                || {
+                    format!(
+                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: projection {} is incompatible",
+                        projection.tensor_name()
+                    )
+                },
+            )?;
             output_offsets.push(total_rows);
             total_rows = total_rows
-                .checked_add(projection.rows)
-                .context("linear-attention q4 projection output row overflow")?;
+                .checked_add(projection.rows())
+                .context("linear-attention projection output row overflow")?;
         }
-        for projection in projections.iter().chain([out_proj, router]) {
-            let scale_bias_bytes = expert_scale_bias_dtype_size(&projection.scale_bias_dtype)?;
-            if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-                || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-            {
-                bail!(
-                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} has unaligned scale/bias offsets for {}",
-                    projection.tensor_name,
-                    projection.scale_bias_dtype
-                );
-            }
-            let packed_len = projection
-                .rows
-                .checked_mul(projection.row_packed_bytes)
-                .context("linear fused q4 packed byte length overflow")?;
-            let group_bytes = projection
-                .rows
-                .checked_mul(projection.groups_per_row)
-                .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-                .context("linear fused q4 group byte length overflow")?;
-            for (offset, len) in [
-                (projection.packed_byte_offset, packed_len),
-                (projection.scales_byte_offset, group_bytes),
-                (projection.biases_byte_offset, group_bytes),
-            ] {
-                let offset = usize::try_from(offset).context("linear fused q4 offset overflow")?;
-                if offset
-                    .checked_add(len)
-                    .map_or(true, |end| end > dense_weights.len)
-                {
-                    bail!(
-                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: projection {} exceeds resident dense store length {}",
-                        projection.tensor_name,
-                        dense_weights.len
-                    );
-                }
-            }
-        }
+        validate_resident_projection(out_proj, layout.total_value_width, dense_weights.len)
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: output projection {} is incompatible",
+                    out_proj.tensor_name()
+                )
+            })?;
+        validate_resident_projection(router, residual_len, dense_weights.len).with_context(|| {
+            format!(
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: router projection {} is incompatible",
+                router.tensor_name()
+            )
+        })?;
 
-        let qkv_offset = output_offsets[0]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention qkv projection offset overflow")?
-            as u64;
-        let z_offset = output_offsets[1]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention z projection offset overflow")?
-            as u64;
-        let beta_offset = output_offsets[2]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention beta projection offset overflow")?
-            as u64;
-        let alpha_offset = output_offsets[3]
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("linear-attention alpha projection offset overflow")?
-            as u64;
+        let output_byte_offsets = output_offsets
+            .iter()
+            .map(|offset| {
+                offset
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .map(|offset| offset as u64)
+                    .context("linear-attention projection byte offset overflow")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let qkv_offset = output_byte_offsets[0];
+        let z_offset = output_byte_offsets[1];
+        let beta_offset = output_byte_offsets[2];
+        let alpha_offset = output_byte_offsets[3];
 
         let mut state_guard = self
             .linear_attention_state
@@ -2766,7 +2764,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
             let normed_buffer = self.buffer_with_len(residual_len * std::mem::size_of::<f32>())?;
             let router_logits_buffer =
-                self.buffer_with_len(router.rows * std::mem::size_of::<f32>())?;
+                self.buffer_with_len(router.rows() * std::mem::size_of::<f32>())?;
             let mut owned_buffers = vec![
                 projection_buffer,
                 attention_output_buffer,
@@ -2786,7 +2784,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 }
                 self.recycle_or_release_buffers(&owned_buffers, true);
                 drop(state_guard);
-                bail!("failed to create Flash-MoE fused linear q4 command buffer");
+                bail!("failed to create Flash-MoE fused linear-attention command buffer");
             }
             let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
@@ -2796,41 +2794,28 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 }
                 self.recycle_or_release_buffers(&owned_buffers, true);
                 drop(state_guard);
-                bail!("failed to create Flash-MoE fused linear q4 compute encoder");
+                bail!("failed to create Flash-MoE fused linear-attention compute encoder");
             }
 
             for (idx, projection) in projections.iter().enumerate() {
-                let output_offset = output_offsets[idx]
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .context("linear fused q4 output byte offset overflow")?
-                    as u64;
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let groups_u32 = projection.groups_per_row as u32;
-                let group_size_u32 = projection.group_size as u32;
-                msg_send_void1_id(
+                if let Err(error) = encode_resident_projection(
+                    &self.pipelines,
                     encoder,
-                    sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.pipelines.q4_mmap_pipeline
-                    },
-                );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer_with_offset(encoder, projection_buffer, output_offset, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                    dense_weights,
+                    projection,
+                    input_buffer,
+                    projection_buffer,
+                    output_byte_offsets[idx],
+                ) {
+                    release(encoder);
+                    release(command_buffer);
+                    if let Some(buffer) = owned_input_buffer {
+                        self.recycle_or_release_buffers(&[buffer], true);
+                    }
+                    self.recycle_or_release_buffers(&owned_buffers, true);
+                    drop(state_guard);
+                    return Err(error);
+                }
             }
 
             let conv_dim_u32 = layout.conv_dim as u32;
@@ -2845,14 +2830,19 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.pipelines.linear_conv1d_pipeline,
+                select_static_dtype_pipeline(
+                    &static_tensors.conv_weight.dtype,
+                    self.pipelines.linear_conv1d_bf16_pipeline,
+                    self.pipelines.linear_conv1d_f16_pipeline,
+                    self.pipelines.linear_conv1d_f32_pipeline,
+                ),
             );
             set_buffer(encoder, state.conv_state, 0);
             set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
             set_buffer_with_offset(
                 encoder,
                 dense_weights.buffer,
-                static_offsets.conv_weight_byte_offset,
+                static_tensors.conv_weight.byte_offset,
                 2,
             );
             set_buffer(encoder, state.conv_output, 3);
@@ -2892,20 +2882,25 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.pipelines.linear_decay_beta_pipeline,
+                select_static_dtype_pipeline(
+                    &static_tensors.dt_bias.dtype,
+                    self.pipelines.linear_decay_beta_bf16_pipeline,
+                    self.pipelines.linear_decay_beta_f16_pipeline,
+                    self.pipelines.linear_decay_beta_f32_pipeline,
+                ),
             );
             set_buffer_with_offset(encoder, projection_buffer, alpha_offset, 0);
             set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
             set_buffer_with_offset(
                 encoder,
                 dense_weights.buffer,
-                static_offsets.a_log_byte_offset,
+                static_tensors.a_log.byte_offset,
                 2,
             );
             set_buffer_with_offset(
                 encoder,
                 dense_weights.buffer,
-                static_offsets.dt_bias_byte_offset,
+                static_tensors.dt_bias.byte_offset,
                 3,
             );
             set_buffer(encoder, state.g_decay, 4);
@@ -2956,14 +2951,19 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.pipelines.linear_gated_rms_norm_pipeline,
+                select_static_dtype_pipeline(
+                    &static_tensors.norm_weight.dtype,
+                    self.pipelines.linear_gated_rms_norm_bf16_pipeline,
+                    self.pipelines.linear_gated_rms_norm_f16_pipeline,
+                    self.pipelines.linear_gated_rms_norm_f32_pipeline,
+                ),
             );
             set_buffer(encoder, state.delta_output, 0);
             set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
             set_buffer_with_offset(
                 encoder,
                 dense_weights.buffer,
-                static_offsets.norm_weight_byte_offset,
+                static_tensors.norm_weight.byte_offset,
                 2,
             );
             set_buffer(encoder, attention_output_buffer, 3);
@@ -2983,64 +2983,60 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                     depth: 1,
                 },
             );
-            for (projection, input_buffer, output_buffer) in [
-                (out_proj, attention_output_buffer, projected_buffer),
-                (router, normed_buffer, router_logits_buffer),
-            ] {
-                let rows_u32 = projection.rows as u32;
-                let cols_u32 = projection.cols as u32;
-                let groups_u32 = projection.groups_per_row as u32;
-                let group_size_u32 = projection.group_size as u32;
+            let post_projection_result = (|| -> Result<()> {
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    out_proj,
+                    attention_output_buffer,
+                    projected_buffer,
+                    0,
+                )?;
+                let width_u32 = u32::try_from(residual_len)
+                    .context("linear-attention residual width exceeds u32")?;
                 msg_send_void1_id(
                     encoder,
                     sel("setComputePipelineState:"),
-                    if projection
-                        .scale_bias_dtype
-                        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-                    {
-                        self.pipelines.q4_mmap_bf16_scale_bias_pipeline
-                    } else {
-                        self.pipelines.q4_mmap_pipeline
-                    },
+                    self.pipelines.residual_rms_norm_pipeline,
                 );
-                set_buffer(encoder, dense_weights.buffer, 0);
-                set_buffer(encoder, input_buffer, 1);
-                set_buffer(encoder, output_buffer, 2);
-                set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-                set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-                set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-                set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-                set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-                set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-                set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
-
-                if std::ptr::eq(projection, out_proj) {
-                    let width_u32 = residual_len as u32;
-                    msg_send_void1_id(
-                        encoder,
-                        sel("setComputePipelineState:"),
-                        self.pipelines.residual_rms_norm_pipeline,
-                    );
-                    set_buffer(encoder, projected_buffer, 0);
-                    set_buffer(encoder, residual_input_buffer, 1);
-                    set_buffer(encoder, norm_weight_buffer, 2);
-                    set_buffer(encoder, residual_buffer, 3);
-                    set_buffer(encoder, normed_buffer, 4);
-                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
-                    dispatch_single_threadgroup(encoder, 256);
+                set_buffer(encoder, projected_buffer, 0);
+                set_buffer(encoder, residual_input_buffer, 1);
+                set_buffer(encoder, norm_weight_buffer, 2);
+                set_buffer(encoder, residual_buffer, 3);
+                set_buffer(encoder, normed_buffer, 4);
+                set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                dispatch_single_threadgroup(encoder, 256);
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    router,
+                    normed_buffer,
+                    router_logits_buffer,
+                    0,
+                )
+            })();
+            if let Err(error) = post_projection_result {
+                release(encoder);
+                release(command_buffer);
+                if let Some(buffer) = owned_input_buffer {
+                    self.recycle_or_release_buffers(&[buffer], true);
                 }
+                self.recycle_or_release_buffers(&owned_buffers, true);
+                drop(state_guard);
+                return Err(error);
             }
 
             msg_send_void0(encoder, sel("endEncoding"));
 
-            let active_count = top_k.min(router.rows).max(1);
-            let context = MetalCommandContext::new("linear_attention_q4_fused_post")
+            let active_count = top_k.min(router.rows()).max(1);
+            let context = MetalCommandContext::new("linear_attention_fused_post")
                 .with("layer", layer)
                 .with("projections", projections.len())
                 .with("rows", total_rows)
                 .with("input_len", input_len)
-                .with("experts", router.rows)
+                .with("experts", router.rows())
                 .with("top_k", active_count);
             if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
                 release(encoder);
@@ -3055,7 +3051,8 @@ impl MetalFusedLinearAttentionBuilder<'_> {
 
             let router_logits_ptr =
                 msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
-            let router_scores = std::slice::from_raw_parts(router_logits_ptr, router.rows).to_vec();
+            let router_scores =
+                std::slice::from_raw_parts(router_logits_ptr, router.rows()).to_vec();
             let active = super::math::top_k(&router_scores, active_count);
 
             release(encoder);
@@ -3079,7 +3076,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             Ok(MetalPostAttentionPrep::new(
                 layer,
                 residual_len,
-                router.rows,
+                router.rows(),
                 active,
                 residual_buffer,
                 normed_buffer,
@@ -6319,7 +6316,7 @@ kernel void topk_vocab(
     }
 }
 
-kernel void linear_conv1d_step(
+kernel void linear_conv1d_step_bf16(
     device float* conv_state [[buffer(0)]],
     device const float* input [[buffer(1)]],
     device const ushort* weights [[buffer(2)]],
@@ -6337,6 +6334,60 @@ kernel void linear_conv1d_step(
     }
     float inp = input[idx];
     acc = fma(inp, bf16_to_float(weights[w_base + kernel_size - 1]), acc);
+    output[idx] = acc / (1.0f + exp(-acc));
+    for (uint k = 0; k + 2 < kernel_size; ++k) {
+        conv_state[k * conv_dim + idx] = conv_state[(k + 1) * conv_dim + idx];
+    }
+    if (kernel_size > 1) {
+        conv_state[(kernel_size - 2) * conv_dim + idx] = inp;
+    }
+}
+
+kernel void linear_conv1d_step_f16(
+    device float* conv_state [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const half* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& kernel_size [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= conv_dim || kernel_size == 0) {
+        return;
+    }
+    float acc = 0.0f;
+    uint w_base = idx * kernel_size;
+    for (uint k = 0; k + 1 < kernel_size; ++k) {
+        acc = fma(conv_state[k * conv_dim + idx], float(weights[w_base + k]), acc);
+    }
+    float inp = input[idx];
+    acc = fma(inp, float(weights[w_base + kernel_size - 1]), acc);
+    output[idx] = acc / (1.0f + exp(-acc));
+    for (uint k = 0; k + 2 < kernel_size; ++k) {
+        conv_state[k * conv_dim + idx] = conv_state[(k + 1) * conv_dim + idx];
+    }
+    if (kernel_size > 1) {
+        conv_state[(kernel_size - 2) * conv_dim + idx] = inp;
+    }
+}
+
+kernel void linear_conv1d_step_f32(
+    device float* conv_state [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& kernel_size [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= conv_dim || kernel_size == 0) {
+        return;
+    }
+    float acc = 0.0f;
+    uint w_base = idx * kernel_size;
+    for (uint k = 0; k + 1 < kernel_size; ++k) {
+        acc = fma(conv_state[k * conv_dim + idx], weights[w_base + k], acc);
+    }
+    float inp = input[idx];
+    acc = fma(inp, weights[w_base + kernel_size - 1], acc);
     output[idx] = acc / (1.0f + exp(-acc));
     for (uint k = 0; k + 2 < kernel_size; ++k) {
         conv_state[k * conv_dim + idx] = conv_state[(k + 1) * conv_dim + idx];
@@ -6386,7 +6437,7 @@ kernel void linear_rms_norm_qk(
     }
 }
 
-kernel void linear_compute_decay_beta(
+kernel void linear_compute_decay_beta_bf16(
     device const float* alpha [[buffer(0)]],
     device const float* beta [[buffer(1)]],
     device const float* a_log [[buffer(2)]],
@@ -6399,6 +6450,40 @@ kernel void linear_compute_decay_beta(
         return;
     }
     float softplus_value = log(1.0f + exp(alpha[idx] + bf16_to_float(dt_bias[idx])));
+    g_decay[idx] = exp(-exp(a_log[idx]) * softplus_value);
+    beta_gate[idx] = 1.0f / (1.0f + exp(-beta[idx]));
+}
+
+kernel void linear_compute_decay_beta_f16(
+    device const float* alpha [[buffer(0)]],
+    device const float* beta [[buffer(1)]],
+    device const float* a_log [[buffer(2)]],
+    device const half* dt_bias [[buffer(3)]],
+    device float* g_decay [[buffer(4)]],
+    device float* beta_gate [[buffer(5)]],
+    constant uint& heads [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= heads) {
+        return;
+    }
+    float softplus_value = log(1.0f + exp(alpha[idx] + float(dt_bias[idx])));
+    g_decay[idx] = exp(-exp(a_log[idx]) * softplus_value);
+    beta_gate[idx] = 1.0f / (1.0f + exp(-beta[idx]));
+}
+
+kernel void linear_compute_decay_beta_f32(
+    device const float* alpha [[buffer(0)]],
+    device const float* beta [[buffer(1)]],
+    device const float* a_log [[buffer(2)]],
+    device const float* dt_bias [[buffer(3)]],
+    device float* g_decay [[buffer(4)]],
+    device float* beta_gate [[buffer(5)]],
+    constant uint& heads [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= heads) {
+        return;
+    }
+    float softplus_value = log(1.0f + exp(alpha[idx] + dt_bias[idx]));
     g_decay[idx] = exp(-exp(a_log[idx]) * softplus_value);
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta[idx]));
 }
@@ -6442,7 +6527,7 @@ kernel void linear_gated_delta_step(
     output[value_base + vi] = out_value;
 }
 
-kernel void linear_gated_rms_norm(
+kernel void linear_gated_rms_norm_bf16(
     device const float* values [[buffer(0)]],
     device const float* z [[buffer(1)]],
     device const ushort* weight [[buffer(2)]],
@@ -6468,6 +6553,64 @@ kernel void linear_gated_rms_norm(
         float zval = z[base + tid];
         float gate = zval / (1.0f + exp(-zval));
         output[base + tid] = value * partial[0] * gate * bf16_to_float(weight[tid]);
+    }
+}
+
+kernel void linear_gated_rms_norm_f16(
+    device const float* values [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const half* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& value_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    uint base = head * value_dim;
+    threadgroup float partial[256];
+    float value = (tid < value_dim) ? values[base + tid] : 0.0f;
+    partial[tid] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < value_dim; ++i) {
+            sum += partial[i];
+        }
+        partial[0] = rsqrt(sum / float(max(value_dim, 1u)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < value_dim) {
+        float zval = z[base + tid];
+        float gate = zval / (1.0f + exp(-zval));
+        output[base + tid] = value * partial[0] * gate * float(weight[tid]);
+    }
+}
+
+kernel void linear_gated_rms_norm_f32(
+    device const float* values [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& value_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    uint base = head * value_dim;
+    threadgroup float partial[256];
+    float value = (tid < value_dim) ? values[base + tid] : 0.0f;
+    partial[tid] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < value_dim; ++i) {
+            sum += partial[i];
+        }
+        partial[0] = rsqrt(sum / float(max(value_dim, 1u)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < value_dim) {
+        float zval = z[base + tid];
+        float gate = zval / (1.0f + exp(-zval));
+        output[base + tid] = value * partial[0] * gate * weight[tid];
     }
 }
 "#;
@@ -6898,7 +7041,7 @@ mod tests {
                 (1..=8).collect::<Vec<_>>(),
                 vec![24, 25, 26],
                 (9..=16).collect::<Vec<_>>(),
-                (18..=23).collect::<Vec<_>>(),
+                vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
             ]
             .concat()
         );
@@ -6926,11 +7069,17 @@ mod tests {
             combine_expert_phase_pipeline: 15,
             fill_zero_pipeline: 16,
             topk_vocab_pipeline: 18,
-            linear_conv1d_pipeline: 19,
+            linear_conv1d_bf16_pipeline: 19,
+            linear_conv1d_f16_pipeline: 27,
+            linear_conv1d_f32_pipeline: 28,
             linear_rms_norm_qk_pipeline: 20,
-            linear_decay_beta_pipeline: 21,
+            linear_decay_beta_bf16_pipeline: 21,
+            linear_decay_beta_f16_pipeline: 29,
+            linear_decay_beta_f32_pipeline: 30,
             linear_delta_step_pipeline: 22,
-            linear_gated_rms_norm_pipeline: 23,
+            linear_gated_rms_norm_bf16_pipeline: 23,
+            linear_gated_rms_norm_f16_pipeline: 31,
+            linear_gated_rms_norm_f32_pipeline: 32,
         }
     }
 
@@ -6957,23 +7106,18 @@ mod tests {
             combine_expert_phase_pipeline: id,
             fill_zero_pipeline: id,
             topk_vocab_pipeline: id,
-            linear_conv1d_pipeline: id,
+            linear_conv1d_bf16_pipeline: id,
+            linear_conv1d_f16_pipeline: id,
+            linear_conv1d_f32_pipeline: id,
             linear_rms_norm_qk_pipeline: id,
-            linear_decay_beta_pipeline: id,
+            linear_decay_beta_bf16_pipeline: id,
+            linear_decay_beta_f16_pipeline: id,
+            linear_decay_beta_f32_pipeline: id,
             linear_delta_step_pipeline: id,
-            linear_gated_rms_norm_pipeline: id,
+            linear_gated_rms_norm_bf16_pipeline: id,
+            linear_gated_rms_norm_f16_pipeline: id,
+            linear_gated_rms_norm_f32_pipeline: id,
         }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn linear_attention_static_offsets_preserve_resident_weight_bindings() {
-        let offsets = MetalLinearAttentionStaticOffsets::new(16, 32, 48, 64);
-
-        assert_eq!(offsets.conv_weight_byte_offset, 16);
-        assert_eq!(offsets.a_log_byte_offset, 32);
-        assert_eq!(offsets.dt_bias_byte_offset, 48);
-        assert_eq!(offsets.norm_weight_byte_offset, 64);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

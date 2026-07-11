@@ -302,27 +302,19 @@ impl MetalExecutionFacade {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn linear_attention_q4_post_attention_prep(
+    pub(super) fn linear_attention_post_attention_prep(
         &self,
-        layer: usize,
         layout: LinearAttentionLayout,
-        input_projections: &[DenseQ4MmapMatvecProjection],
+        bindings: &LinearAttentionResidentBindings,
         input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-        out_proj: &DenseQ4MmapMatvecProjection,
-        router: &DenseQ4MmapMatvecProjection,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         top_k: usize,
     ) -> Result<MetalPostAttentionPrep> {
-        self.inner.linear_attention_q4_post_attention_prep(
-            layer,
+        self.inner.linear_attention_post_attention_prep(
             layout,
-            input_projections,
+            bindings,
             input,
-            static_offsets,
-            out_proj,
-            router,
             residual,
             post_norm_weight,
             top_k,
@@ -1127,14 +1119,7 @@ impl FlashMoeEngine {
                 "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: the resolved implementation does not support QKV projection reorder"
             );
         }
-        let static_offsets = self
-            .dense
-            .linear_attention_static_offsets_for_metal(layer, layout)?
-            .with_context(|| {
-                format!(
-                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention state path at layer {layer}: resident static tensor offsets are unavailable"
-                )
-            })?;
+        let bindings = self.linear_attention_weights.require(layer)?;
         let residual_len = residual.len();
         if residual_len != runtime.width || residual_len != post_norm_weight.len() {
             bail!(
@@ -1143,14 +1128,6 @@ impl FlashMoeEngine {
                 post_norm_weight.len()
             );
         }
-        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
-        let input_requests = linear_attention_input_projection_requests(
-            layer,
-            layout.conv_dim,
-            layout.total_value_width,
-            layout.num_value_heads,
-        )?;
-        let input_specs = input_requests.requests();
         let projection_input = if let Some(input) = deferred_input {
             MetalBatchProjectionInput::Buffer {
                 buffer: input.buffer(),
@@ -1164,21 +1141,15 @@ impl FlashMoeEngine {
             );
         };
         let started = Instant::now();
-        let prep = self
-            .dense
-            .linear_attention_q4_post_attention_prep_with_metal(
-                metal,
-                layer,
-                layout,
-                &input_specs,
-                projection_input,
-                static_offsets,
-                self.scheduler.experts_per_layer(),
-                &out_proj_name,
-                residual,
-                post_norm_weight,
-                self.scheduler.active_experts(),
-            )?;
+        let prep = self.dense.linear_attention_post_attention_prep_with_metal(
+            metal,
+            layout,
+            bindings,
+            projection_input,
+            residual,
+            post_norm_weight,
+            self.scheduler.active_experts(),
+        )?;
         if let Some(buckets) = attention_buckets.as_deref_mut() {
             buckets.attention_input_projection += started.elapsed();
         }

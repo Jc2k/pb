@@ -19,10 +19,7 @@ use super::legacy::{ensure_synthetic_runtime_allowed, stable_hash};
 use super::math::q4_dequantize_rows_with_group_size;
 #[cfg(test)]
 use super::math::q4_fma_matvec_with_group_size;
-use super::metal::{
-    MetalBatchProjectionInput, MetalLinearAttentionStaticOffsets, MetalObjcId as ObjcId,
-    MetalPostAttentionPrep,
-};
+use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
 use super::runtime::MetalExecutionFacade;
 use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand};
 use super::state::{
@@ -1214,10 +1211,43 @@ pub(crate) fn apply_qwen3next_norm_offset_if_needed(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidentStaticDtype {
+    Bf16,
+    F16,
+    F32,
+}
+
+impl ResidentStaticDtype {
+    fn from_declared(dtype: &str) -> Option<Self> {
+        match dtype.to_ascii_uppercase().as_str() {
+            "BF16" | "BFLOAT16" => Some(Self::Bf16),
+            "F16" | "FLOAT16" | "FP16" => Some(Self::F16),
+            "F32" | "FLOAT32" | "FP32" => Some(Self::F32),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::F16 => "F16",
+            Self::F32 => "F32",
+        }
+    }
+
+    const fn element_size(&self) -> usize {
+        match self {
+            Self::Bf16 | Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentStaticTensorRef {
     pub(crate) tensor_name: String,
     pub(crate) byte_offset: u64,
-    pub(crate) dtype: String,
+    pub(crate) dtype: ResidentStaticDtype,
     pub(crate) values: usize,
     pub(crate) element_size: usize,
 }
@@ -1228,20 +1258,18 @@ impl ResidentStaticTensorRef {
         entry: &RuntimeTensorEntry,
         store_len: u64,
         expected_values: usize,
-        allowed_dtypes: &[&str],
+        allowed_dtypes: &[ResidentStaticDtype],
     ) -> Result<Option<Self>> {
         if entry.quantization != TensorQuantization::None {
             return Ok(None);
         }
-        if !allowed_dtypes
-            .iter()
-            .any(|allowed| entry.dtype.eq_ignore_ascii_case(allowed))
-        {
-            return Ok(None);
-        }
-        let Some(element_size) = dense_dtype_size(&entry.dtype) else {
+        let Some(dtype) = ResidentStaticDtype::from_declared(&entry.dtype) else {
             return Ok(None);
         };
+        if !allowed_dtypes.contains(&dtype) {
+            return Ok(None);
+        }
+        let element_size = dtype.element_size();
         let expected_bytes = expected_values
             .checked_mul(element_size)
             .context("resident static tensor byte length overflow")?;
@@ -1261,7 +1289,7 @@ impl ResidentStaticTensorRef {
         Ok(Some(Self {
             tensor_name: tensor_name.to_string(),
             byte_offset: entry.byte_offset,
-            dtype: entry.dtype.clone(),
+            dtype,
             values: expected_values,
             element_size,
         }))
@@ -1503,6 +1531,46 @@ impl ResidentMmapMatvecProjection {
             Self::Q4(projection) => Some(projection),
             Self::Dense(_) => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinearAttentionStaticBindings {
+    pub(crate) conv_weight: ResidentStaticTensorRef,
+    pub(crate) a_log: ResidentStaticTensorRef,
+    pub(crate) dt_bias: ResidentStaticTensorRef,
+    pub(crate) norm_weight: ResidentStaticTensorRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinearAttentionResidentBindings {
+    pub(crate) layer: usize,
+    pub(crate) input_projections: [ResidentMmapMatvecProjection; 4],
+    pub(crate) static_tensors: LinearAttentionStaticBindings,
+    pub(crate) out_proj: ResidentMmapMatvecProjection,
+    pub(crate) router: ResidentMmapMatvecProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinearAttentionWeightTable {
+    layers: Vec<Option<LinearAttentionResidentBindings>>,
+}
+
+impl LinearAttentionWeightTable {
+    pub(crate) fn require(&self, layer: usize) -> Result<&LinearAttentionResidentBindings> {
+        self.layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled linear-attention weight path: layer {layer} has no resolved resident bindings"
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layer(&self, layer: usize) -> Option<&LinearAttentionResidentBindings> {
+        self.layers.get(layer).and_then(Option::as_ref)
     }
 }
 
@@ -2352,137 +2420,188 @@ impl DenseStore {
         Ok(outputs)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn linear_attention_static_offsets_for_metal(
+    fn required_resident_static_tensor(
         &self,
         layer: usize,
-        layout: LinearAttentionLayout,
-    ) -> Result<Option<MetalLinearAttentionStaticOffsets>> {
-        let conv_name = linear_attention_tensor_name(layer, "conv1d");
-        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
-        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
-        let norm_name = linear_attention_tensor_name(layer, "norm");
-        let Some(conv_weight_byte_offset) = self.resident_static_tensor_offset(
-            &conv_name,
-            layout.conv_dim * layout.conv_kernel_size,
-            &["BF16", "BFLOAT16"],
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(a_log_byte_offset) = self.resident_static_tensor_offset(
-            &a_log_name,
-            layout.num_value_heads,
-            &["F32", "FLOAT32", "FP32"],
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(dt_bias_byte_offset) = self.resident_static_tensor_offset(
-            &dt_bias_name,
-            layout.num_value_heads,
-            &["BF16", "BFLOAT16"],
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(norm_weight_byte_offset) = self.resident_static_tensor_offset(
-            &norm_name,
-            layout.value_dim,
-            &["BF16", "BFLOAT16"],
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(MetalLinearAttentionStaticOffsets::new(
-            conv_weight_byte_offset,
-            a_log_byte_offset,
-            dt_bias_byte_offset,
-            norm_weight_byte_offset,
-        )))
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn resident_static_tensor_offset(
-        &self,
         tensor_name: &str,
         expected_values: usize,
-        allowed_dtypes: &[&str],
-    ) -> Result<Option<u64>> {
-        let Some(entry) = self.registry.tensor(tensor_name) else {
-            return Ok(None);
-        };
-        Ok(ResidentStaticTensorRef::from_entry(
+        allowed_dtypes: &[ResidentStaticDtype],
+    ) -> Result<ResidentStaticTensorRef> {
+        let entry = self.registry.require(tensor_name).with_context(|| {
+            format!(
+                "FlashMoe unsupported scheduled linear-attention static-weight path at layer {layer}: missing tensor {tensor_name}"
+            )
+        })?;
+        ResidentStaticTensorRef::from_entry(
             tensor_name,
             entry,
             self.len,
             expected_values,
             allowed_dtypes,
         )?
-        .map(|resident| resident.byte_offset))
+        .with_context(|| {
+            format!(
+                "FlashMoe unsupported scheduled linear-attention static-weight path at layer {layer}: tensor {tensor_name} does not resolve {} values as {}",
+                expected_values,
+                allowed_dtypes
+                    .iter()
+                    .map(ResidentStaticDtype::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )
+        })
+    }
+
+    fn required_linear_attention_resident_bindings(
+        &self,
+        layer: usize,
+        layout: LinearAttentionLayout,
+        hidden_width: usize,
+        experts: usize,
+    ) -> Result<LinearAttentionResidentBindings> {
+        let input_requests = linear_attention_input_projection_requests(
+            layer,
+            layout.conv_dim,
+            layout.total_value_width,
+            layout.num_value_heads,
+        )?;
+        let mut input_projections = Vec::with_capacity(4);
+        for spec in input_requests.requests() {
+            input_projections.push(
+                self.resident_mmap_projection(spec.tensor_name, spec.output_width, hidden_width)?
+                    .with_context(|| {
+                        format!(
+                            "FlashMoe unsupported scheduled linear-attention CMD1 path at layer {layer}: missing resident projection {}",
+                            spec.tensor_name
+                        )
+                    })?,
+            );
+        }
+        let input_projections = input_projections.try_into().map_err(|values: Vec<_>| {
+            anyhow::anyhow!(
+                "FlashMoe unsupported scheduled linear-attention CMD1 path at layer {layer}: expected 4 resident projections, resolved {}",
+                values.len()
+            )
+        })?;
+
+        let conv_name = linear_attention_tensor_name(layer, "conv1d");
+        let a_log_name = linear_attention_scalar_tensor_name(layer, "A_log");
+        let dt_bias_name = linear_attention_scalar_tensor_name(layer, "dt_bias");
+        let norm_name = linear_attention_tensor_name(layer, "norm");
+        let static_tensors = LinearAttentionStaticBindings {
+            conv_weight: self.required_resident_static_tensor(
+                layer,
+                &conv_name,
+                layout.conv_dim * layout.conv_kernel_size,
+                &[
+                    ResidentStaticDtype::Bf16,
+                    ResidentStaticDtype::F16,
+                    ResidentStaticDtype::F32,
+                ],
+            )?,
+            a_log: self.required_resident_static_tensor(
+                layer,
+                &a_log_name,
+                layout.num_value_heads,
+                &[ResidentStaticDtype::F32],
+            )?,
+            dt_bias: self.required_resident_static_tensor(
+                layer,
+                &dt_bias_name,
+                layout.num_value_heads,
+                &[
+                    ResidentStaticDtype::Bf16,
+                    ResidentStaticDtype::F16,
+                    ResidentStaticDtype::F32,
+                ],
+            )?,
+            norm_weight: self.required_resident_static_tensor(
+                layer,
+                &norm_name,
+                layout.value_dim,
+                &[
+                    ResidentStaticDtype::Bf16,
+                    ResidentStaticDtype::F16,
+                    ResidentStaticDtype::F32,
+                ],
+            )?,
+        };
+        let out_proj_name = linear_attention_tensor_name(layer, "out_proj");
+        let out_proj = self
+            .resident_mmap_projection(&out_proj_name, hidden_width, layout.total_value_width)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled linear-attention CMD2 path at layer {layer}: missing resident output projection {out_proj_name}"
+                )
+            })?;
+        let router_name = router_tensor_name(layer);
+        let router = self
+            .resident_mmap_projection(&router_name, experts, hidden_width)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported scheduled linear-attention CMD2 path at layer {layer}: missing resident router projection {router_name}"
+                )
+            })?;
+        Ok(LinearAttentionResidentBindings {
+            layer,
+            input_projections,
+            static_tensors,
+            out_proj,
+            router,
+        })
+    }
+
+    pub(super) fn resolve_linear_attention_weight_table(
+        &self,
+        layouts: &[Option<LinearAttentionLayout>],
+        hidden_width: usize,
+        experts: usize,
+    ) -> Result<LinearAttentionWeightTable> {
+        let layers = layouts
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(layer, layout)| {
+                layout
+                    .map(|layout| {
+                        self.required_linear_attention_resident_bindings(
+                            layer,
+                            layout,
+                            hidden_width,
+                            experts,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LinearAttentionWeightTable { layers })
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn linear_attention_q4_post_attention_prep_with_metal(
+    pub(super) fn linear_attention_post_attention_prep_with_metal(
         &self,
         metal: &MetalExecutionFacade,
-        layer: usize,
         layout: LinearAttentionLayout,
-        input_specs: &[DenseProjectionRequest<'_>],
+        bindings: &LinearAttentionResidentBindings,
         input: MetalBatchProjectionInput<'_>,
-        static_offsets: MetalLinearAttentionStaticOffsets,
-        experts: usize,
-        out_proj_name: &str,
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
     ) -> Result<MetalPostAttentionPrep> {
+        let layer = bindings.layer;
         let residual_len = residual.len();
         metal.require_resident_dense_weights()?;
-        if input_specs.len() != 4 || residual_len != post_norm_weight.len() {
+        if residual_len != post_norm_weight.len() {
             bail!(
-                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: expected 4 input projections and equal residual/norm widths, got {} projections and widths {residual_len}/{}",
-                input_specs.len(),
+                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1/CMD2 path at layer {layer}: residual/norm widths {residual_len}/{} do not match",
                 post_norm_weight.len()
             );
         }
-        let input_len = input.len();
-        let mut input_projections = Vec::with_capacity(input_specs.len());
-        for spec in input_specs {
-            let projection = self
-                .dense_q4_mmap_projection(spec.tensor_name, spec.output_width, input_len)?
-                .with_context(|| {
-                    format!(
-                        "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: missing resident Q4 projection {}",
-                        spec.tensor_name
-                    )
-                })?;
-            input_projections.push(projection);
-        }
-        let router_name = router_tensor_name(layer);
-        let out_proj = self
-            .dense_q4_mmap_projection(out_proj_name, residual_len, layout.total_value_width)?
-            .with_context(|| {
-                format!(
-                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: missing resident output projection {out_proj_name}"
-                )
-            })?;
-        let router = self
-            .dense_q4_mmap_projection(&router_name, experts, residual_len)?
-            .with_context(|| {
-                format!(
-                    "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD2 path at layer {layer}: missing resident router projection {router_name}"
-                )
-            })?;
-        metal.linear_attention_q4_post_attention_prep(
-            layer,
+        metal.linear_attention_post_attention_prep(
             layout,
-            &input_projections,
+            bindings,
             input,
-            static_offsets,
-            &out_proj,
-            &router,
             residual,
             post_norm_weight,
             active_experts,
@@ -4698,13 +4817,19 @@ mod tests {
             quantization: TensorQuantization::None,
         };
 
-        let resident =
-            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 64, 8, &["BF16", "BFLOAT16"])
-                .unwrap()
-                .unwrap();
+        let resident = ResidentStaticTensorRef::from_entry(
+            &entry.name,
+            &entry,
+            64,
+            8,
+            &[ResidentStaticDtype::Bf16],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(resident.tensor_name, entry.name);
         assert_eq!(resident.byte_offset, 16);
+        assert_eq!(resident.dtype, ResidentStaticDtype::Bf16);
         assert_eq!(resident.values, 8);
         assert_eq!(resident.element_size, 2);
     }
@@ -4722,16 +4847,28 @@ mod tests {
         };
 
         assert!(
-            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
-                .unwrap()
-                .is_some()
+            ResidentStaticTensorRef::from_entry(
+                &entry.name,
+                &entry,
+                32,
+                4,
+                &[ResidentStaticDtype::F32],
+            )
+            .unwrap()
+            .is_some()
         );
 
         entry.byte_len = 12;
         assert!(
-            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
-                .unwrap()
-                .is_none()
+            ResidentStaticTensorRef::from_entry(
+                &entry.name,
+                &entry,
+                32,
+                4,
+                &[ResidentStaticDtype::F32],
+            )
+            .unwrap()
+            .is_none()
         );
 
         entry.byte_len = 16;
@@ -4741,10 +4878,192 @@ mod tests {
             scale_bias_dtype: "F32".to_string(),
         };
         assert!(
-            ResidentStaticTensorRef::from_entry(&entry.name, &entry, 32, 4, &["F32"])
-                .unwrap()
-                .is_none()
+            ResidentStaticTensorRef::from_entry(
+                &entry.name,
+                &entry,
+                32,
+                4,
+                &[ResidentStaticDtype::F32],
+            )
+            .unwrap()
+            .is_none()
         );
+    }
+
+    #[test]
+    fn linear_attention_weight_table_resolves_all_resident_dense_layouts_at_load() {
+        fn append_tensor(
+            bytes: &mut Vec<u8>,
+            tensors: &mut Vec<DenseTensorRef>,
+            name: String,
+            dtype: &str,
+            shape: Vec<usize>,
+        ) {
+            while !(bytes.len() as u64).is_multiple_of(TENSOR_ALIGNMENT) {
+                bytes.push(0);
+            }
+            let runtime_offset = bytes.len() as u64;
+            let element_size = dense_dtype_size(dtype).unwrap();
+            let byte_len = shape.iter().product::<usize>() * element_size;
+            bytes.resize(bytes.len() + byte_len, 0);
+            tensors.push(DenseTensorRef {
+                tensor: name,
+                shard: "fixture.safetensors".to_string(),
+                dtype: dtype.to_string(),
+                shape,
+                source_offsets: [0, byte_len as u64],
+                runtime_offset,
+                byte_len: byte_len as u64,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            });
+        }
+
+        fn fixture(dtype: &str, omit_norm: bool) -> (tempfile::TempDir, DenseStore) {
+            let hidden = 4;
+            let experts = 3;
+            let layout = LinearAttentionLayout {
+                num_value_heads: 2,
+                num_key_heads: 1,
+                key_dim: 2,
+                value_dim: 2,
+                total_key_width: 2,
+                total_value_width: 4,
+                conv_dim: 8,
+                conv_kernel_size: 2,
+            };
+            let mut bytes = Vec::new();
+            let mut tensors = Vec::new();
+            for request in linear_attention_input_projection_requests(
+                0,
+                layout.conv_dim,
+                layout.total_value_width,
+                layout.num_value_heads,
+            )
+            .unwrap()
+            .requests()
+            {
+                append_tensor(
+                    &mut bytes,
+                    &mut tensors,
+                    request.tensor_name.to_string(),
+                    dtype,
+                    vec![request.output_width, hidden],
+                );
+            }
+            append_tensor(
+                &mut bytes,
+                &mut tensors,
+                linear_attention_tensor_name(0, "conv1d"),
+                dtype,
+                vec![layout.conv_dim, layout.conv_kernel_size],
+            );
+            append_tensor(
+                &mut bytes,
+                &mut tensors,
+                linear_attention_scalar_tensor_name(0, "A_log"),
+                "F32",
+                vec![layout.num_value_heads],
+            );
+            append_tensor(
+                &mut bytes,
+                &mut tensors,
+                linear_attention_scalar_tensor_name(0, "dt_bias"),
+                dtype,
+                vec![layout.num_value_heads],
+            );
+            if !omit_norm {
+                append_tensor(
+                    &mut bytes,
+                    &mut tensors,
+                    linear_attention_tensor_name(0, "norm"),
+                    dtype,
+                    vec![layout.value_dim],
+                );
+            }
+            append_tensor(
+                &mut bytes,
+                &mut tensors,
+                linear_attention_tensor_name(0, "out_proj"),
+                dtype,
+                vec![hidden, layout.total_value_width],
+            );
+            append_tensor(
+                &mut bytes,
+                &mut tensors,
+                router_tensor_name(0),
+                dtype,
+                vec![experts, hidden],
+            );
+
+            let temp = tempfile::tempdir().unwrap();
+            let dense_path = temp.path().join("non-expert.bin");
+            let manifest_path = temp.path().join("manifest.json");
+            fs::write(&dense_path, bytes).unwrap();
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&FlashMoeManifest {
+                    model: "fixture".to_string(),
+                    cache_version: "test".to_string(),
+                    dense_shards: vec!["fixture.safetensors".to_string()],
+                    expert_tensors: Vec::new(),
+                    dense_tensors: tensors,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let store = DenseStore::open(dense_path, manifest_path).unwrap();
+            (temp, store)
+        }
+
+        let layout = LinearAttentionLayout {
+            num_value_heads: 2,
+            num_key_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 4,
+            conv_dim: 8,
+            conv_kernel_size: 2,
+        };
+        for (dtype, expected_static_dtype) in [
+            ("BF16", ResidentStaticDtype::Bf16),
+            ("F16", ResidentStaticDtype::F16),
+            ("F32", ResidentStaticDtype::F32),
+        ] {
+            let (_temp, store) = fixture(dtype, false);
+            let table = store
+                .resolve_linear_attention_weight_table(&[Some(layout)], 4, 3)
+                .unwrap();
+            let bindings = table.layer(0).unwrap();
+            assert_eq!(bindings.layer, 0);
+            assert_eq!(bindings.input_projections.len(), 4);
+            assert_eq!(
+                bindings.static_tensors.conv_weight.dtype,
+                expected_static_dtype
+            );
+            assert_eq!(bindings.static_tensors.dt_bias.dtype, expected_static_dtype);
+            assert_eq!(
+                bindings.static_tensors.norm_weight.dtype,
+                expected_static_dtype
+            );
+            assert_eq!(
+                bindings.static_tensors.a_log.dtype,
+                ResidentStaticDtype::F32
+            );
+            assert_eq!(bindings.out_proj.rows(), 4);
+            assert_eq!(bindings.router.rows(), 3);
+        }
+
+        let (_temp, store) = fixture("BF16", true);
+        let error = store
+            .resolve_linear_attention_weight_table(&[Some(layout)], 4, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("static-weight path"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("linear_attn.norm"), "{error:#}");
     }
 
     #[test]

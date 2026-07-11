@@ -156,13 +156,13 @@ use super::weights::qwen3next_norm_weight_needs_offset;
 use super::weights::{DenseQ4Layout, ResidentMmapMatvecProjection, dense_q4_layout};
 use super::weights::{
     DenseQ4MmapMatvecProjection, DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef,
-    FlashMoeManifest, ResidentDenseLayout, ResidentStaticTensorRef, RuntimeTensorEntry,
+    FlashMoeManifest, LinearAttentionWeightTable, ResidentDenseLayout, RuntimeTensorEntry,
     SharedExpertPhaseCache, TENSOR_ALIGNMENT, TensorQuantization, TensorRegistry,
     apply_qwen3next_norm_offset_if_needed, attention_tensor_name, canonical_hf_tensor_name,
     dense_q4_layout_with_scale_bias_dtype, full_attention_input_projection_requests,
-    layer_norm_tensor_name, linear_attention_input_projection_requests,
-    linear_attention_scalar_tensor_name, linear_attention_tensor_name, qwen3next_norm_uses_offset,
-    router_tensor_name, shared_expert_gate_tensor_name, shared_expert_tensor_name,
+    layer_norm_tensor_name, linear_attention_scalar_tensor_name, linear_attention_tensor_name,
+    qwen3next_norm_uses_offset, router_tensor_name, shared_expert_gate_tensor_name,
+    shared_expert_tensor_name,
 };
 use super::weights::{decode_dense_tensor_f32, dtype_size};
 #[cfg(test)]
@@ -1162,6 +1162,13 @@ where
     let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
     progress("runtime_layout", phase_started.elapsed());
     phase_started = Instant::now();
+    let linear_attention_weights = dense.resolve_linear_attention_weight_table(
+        &runtime.linear_attention,
+        config.hidden_size,
+        model_layout.experts_per_layer,
+    )?;
+    progress("linear_attention_weights", phase_started.elapsed());
+    phase_started = Instant::now();
     let dense_layout = dense.registry().resolve_resident_dense_layout()?;
     if matches!(
         model_layout.family,
@@ -1225,6 +1232,7 @@ where
         capability_plan,
         routing_policy,
         runtime,
+        linear_attention_weights,
         shared_expert_phases: SharedExpertPhaseCache::default(),
         session_cache: FlashMoeSessionCache::default(),
     })
@@ -1242,6 +1250,7 @@ pub struct FlashMoeEngine {
     capability_plan: FlashMoeCapabilityPlan,
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) runtime: DenseTransformerRuntime,
+    pub(super) linear_attention_weights: LinearAttentionWeightTable,
     pub(super) shared_expert_phases: SharedExpertPhaseCache,
     input_adapter_executor: FlashMoeInputAdapterExecutor,
     session_cache: FlashMoeSessionCache,
@@ -4947,67 +4956,7 @@ fn validate_qwen_q4_graph_bindings(
     store_len: u64,
 ) -> Result<()> {
     for layer in 0..config.num_hidden_layers {
-        if runtime.is_linear_attention_layer(layer) {
-            let layout = runtime.linear_attention_layout(layer)?;
-            let requests = linear_attention_input_projection_requests(
-                layer,
-                layout.conv_dim,
-                layout.total_value_width,
-                layout.num_value_heads,
-            )?;
-            for request in requests.requests() {
-                require_resident_q4_graph_projection(
-                    family,
-                    registry,
-                    store_len,
-                    "CMD1 linear-attention projection",
-                    request.tensor_name,
-                    request.output_width,
-                    runtime.width,
-                )?;
-            }
-            require_resident_q4_graph_projection(
-                family,
-                registry,
-                store_len,
-                "CMD2 linear-attention output projection",
-                &linear_attention_tensor_name(layer, "out_proj"),
-                runtime.width,
-                layout.total_value_width,
-            )?;
-            require_resident_static_graph_tensor(
-                family,
-                registry,
-                store_len,
-                &linear_attention_tensor_name(layer, "conv1d"),
-                layout.conv_dim * layout.conv_kernel_size,
-                &["BF16", "BFLOAT16"],
-            )?;
-            require_resident_static_graph_tensor(
-                family,
-                registry,
-                store_len,
-                &linear_attention_scalar_tensor_name(layer, "A_log"),
-                layout.num_value_heads,
-                &["F32", "FLOAT32", "FP32"],
-            )?;
-            require_resident_static_graph_tensor(
-                family,
-                registry,
-                store_len,
-                &linear_attention_scalar_tensor_name(layer, "dt_bias"),
-                layout.num_value_heads,
-                &["BF16", "BFLOAT16"],
-            )?;
-            require_resident_static_graph_tensor(
-                family,
-                registry,
-                store_len,
-                &linear_attention_tensor_name(layer, "norm"),
-                layout.value_dim,
-                &["BF16", "BFLOAT16"],
-            )?;
-        } else {
+        if !runtime.is_linear_attention_layer(layer) {
             let layout = runtime.full_attention_layout(layer)?;
             let requests = full_attention_input_projection_requests(
                 layer,
@@ -5121,30 +5070,6 @@ fn require_resident_q4_graph_projection(
     .with_context(|| {
         format!(
             "FlashMoe unsupported resolved {family:?} Q4 {stage}: tensor {tensor_name} cannot bind the resident projection for shape {output_width}x{input_width}"
-        )
-    })?;
-    Ok(())
-}
-
-fn require_resident_static_graph_tensor(
-    family: QwenMoeFamily,
-    registry: &TensorRegistry,
-    store_len: u64,
-    tensor_name: &str,
-    expected_values: usize,
-    allowed_dtypes: &[&str],
-) -> Result<()> {
-    let entry = registry.require(tensor_name)?;
-    ResidentStaticTensorRef::from_entry(
-        tensor_name,
-        entry,
-        store_len,
-        expected_values,
-        allowed_dtypes,
-    )?
-    .with_context(|| {
-        format!(
-            "FlashMoe unsupported resolved {family:?} Q4 linear-attention state: tensor {tensor_name} cannot bind resident static storage"
         )
     })?;
     Ok(())

@@ -187,16 +187,17 @@ Baseline reviewed on 2026-07-10:
   real-model smoke cover the production command.
 - `LinearAttentionLayout` now lives with recurrent-state contracts in `state.rs`. The active
   Qwen3.5 fused linear-attention CMD1/CMD2 command is owned by
-  `MetalFusedLinearAttentionBuilder`: resident Q4 input projections, convolution and recurrent
-  state mutation, gated normalization, output projection, residual/RMS norm, router projection,
-  CPU top-k readback, and GPU-resident CMD3 handoff move together. `legacy.rs` retains only the
-  model-weight lookup and one builder invocation for this resolved stage.
+  `MetalFusedLinearAttentionBuilder`: resident Q4/BF16/F16/F32 input/output/router projections,
+  typed resident convolution/decay/norm static tensors, recurrent state mutation, gated
+  normalization, residual/RMS norm, CPU top-k readback, and GPU-resident CMD3 handoff move
+  together. `weights.rs` resolves all ten per-layer bindings once during load; the token loop only
+  obtains the already-resolved layer binding and invokes the builder.
 - The previous split linear-attention runtime has been deleted: intermediate projection buffers,
   separate recurrence encoders, CPU recurrence and static-weight caches, CPU recurrent session
   state, and `Ok(None)` retries no longer sit beside the fused implementation. Qwen-VL deepstack
   and diagnostic expert skipping now fail as undeclared graph behavior at the layer boundary.
-  Deferred full-attention CMD1 likewise requires resident Q4 projections and cannot select the
-  removed dense BF16/F32 encoder through runtime probing.
+  Deferred full-attention CMD1 and fused linear attention both use the shared typed resident
+  projection dispatcher and cannot select an alternate encoder through runtime probing.
 - Single Q4 projections now use the same resident `MetalResidentProjectionBatchBuilder` as projection
   batches. The packed/component upload retry, direct single-mmap encoder, and their tests have been
   removed. The unused application-owned F32 LM-head buffer cache, command, and stale dedicated
@@ -269,8 +270,8 @@ Baseline reviewed on 2026-07-10:
 - Qwen3.5 full-attention Q/K normalization and rotary preprocessing now match that declared CPU
   placement directly. The dead optional Metal RoPE/RMS probes, unary dispatcher, shaders,
   pipelines, and false CMD1 kernel requirements have been removed. The same ownership cleanup
-  deleted F32/BF16 dense Metal matvec, mmap, batch, and router-topK encoders; the resolved graph
-  requires resident Q4 projections and reports non-Q4 dense or router layouts as unsupported.
+  deleted standalone F32/BF16 dense Metal matvec, mmap, batch, and router-topK encoders; their
+  supported layouts now enter the same resident projection and topK builders as Q4.
 - Qwen3.5 Q4 capability planning now consumes one resident dense layout resolved by `weights`, a
   fixed-Q4 execution descriptor validated against every expert layer's metadata and file size, and
   the kernel surface from a successfully compiled Metal executor. The live load path builds the
@@ -286,10 +287,11 @@ Baseline reviewed on 2026-07-10:
 - Q4 CMD2 post-attention projection, residual/norm, and routing prep now return one required Metal
   result for both CPU-visible and Metal-resident attention values. Missing resident weights,
   projections, norm weights, or buffers are named errors instead of `Ok(None)` continuations.
-- Normal Qwen3.5 linear-attention layers now require one fused resident-Q4 CMD1/recurrence/CMD2
-  implementation. Missing projections, static offsets, recurrent state, norm weights, or compatible
-  dimensions are named errors; the live graph no longer retries through an intermediate
-  Metal-values path or CPU recurrence.
+- Normal Qwen3.5 linear-attention layers now require one fused resident CMD1/recurrence/CMD2
+  implementation. A weights-owned table resolves four input projections, convolution/A-log/delta
+  bias/norm static tensors, output projection, and router before capability resolution. Missing or
+  incompatible bindings are named load errors; the live graph no longer performs per-token tensor
+  lookup or retries through an intermediate Metal-values path or CPU recurrence.
 - Load now binds every Qwen3.5 Q4 CMD1, CMD2, shared-CMD3, linear static-state, and LM-head
   projection against the actual manifest and resident byte ranges before capability resolution.
   Deferred next-layer state, CPU full-attention placement, resident projection batches, and
@@ -381,9 +383,9 @@ The architecture is not yet at the target:
   projection handle, Metal dispatch, CPU/GPU input bindings, residual/norm transition, router
   readback, state handoff, padded-vocabulary policy, and topK command as Q4. Qwen3/Qwen3-VL
   non-Q4 dense plus fixed-Q4 expert graphs resolve all nine stages; real-checkpoint correctness is
-  still pending. A family with resident non-Q4 shared experts would stop at CMD3. Qwen3.5 hybrid
-  non-Q4 graphs still stop at fused linear-attention CMD1. Non-Q4 fused-linear, shared-expert, and
-  expert-slot implementations remain incomplete.
+  still pending. Qwen3.5 hybrid BF16/F16/F32 now resolves fused linear attention and stops at its
+  named non-Q4 shared-expert CMD3 implementation. Non-Q4 shared-expert and expert-slot
+  implementations remain incomplete.
 
 At this checkpoint, Gates 1 through 5 are complete. Qwen3.5 Q4 has a resolved production graph and
 correctness closure. Typed implementations for additional variants and final legacy removal remain;
@@ -594,7 +596,7 @@ Current capability matrix:
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
-| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4 slots | Unsupported at fused linear-attention CMD1 | Precise capability failure |
+| Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4 slots | Fused CMD1/recurrence/CMD2 implemented; unsupported at shared CMD3 | Load-resolved ten-binding table, dtype-specific kernel compilation, and precise next-stage capability failure; full-command real-model parity pending |
 | Any supported family | BF16/F16 expert slots | Unsupported at active expert/CMD3 stage | Import/reference tests only |
 
 ### Gate 7: Legacy Removal And Benchmarking
@@ -726,10 +728,10 @@ For Gate 6:
 2. Resolve the text-only Qwen MoE Q4 graph first. Add its full-attention, Q/K norm, routing-scale,
    shared-expert, and K policy as typed stage metadata while keeping the scheduler/runtime/CMD
    lifecycle unchanged. Missing tensors or kernels must name the exact unresolved stage.
-3. Continue resident BF16/F16/F32 from the completed shared full-attention CMD1/CMD2/LM-head graph
-   into fused linear attention and shared experts. Add BF16/F16 whole-expert slots only through the
-   same scheduler leases and CMD3 handoff. Do not revive removed dense CPU/component paths as
-   production continuations.
+3. Continue resident BF16/F16/F32 from the completed full-attention and fused-linear projection
+   graphs into shared experts. Add BF16/F16 whole-expert slots only through the same scheduler
+   leases and CMD3 handoff. Do not revive removed dense CPU/component paths as production
+   continuations.
 4. Run the resolved Qwen-VL Q4 graph against a real checkpoint and debug any manifest/math mismatch
    through its typed vision executor and shared scheduler path. Do not add request-time probing or
    an alternate decoder loop to make the smoke pass.

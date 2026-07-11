@@ -285,26 +285,33 @@ impl FlashMoeCapabilityPlan {
             )?,
         }
         if has_linear_attention {
-            if dense_layout != ResidentDenseLayout::Q4 {
-                return Err(FlashMoeUnsupportedCapability::new(
-                    layout.family,
-                    FlashMoeGraphStage::Cmd1AttentionProjections,
-                    format!(
-                        "the fused linear-attention CMD1 implementation does not yet consume {} projections",
-                        dense_layout.as_str()
-                    ),
-                ));
-            }
+            let (conv_kernel, decay_kernel, gated_norm_kernel) = match dense_layout {
+                ResidentDenseLayout::Q4 | ResidentDenseLayout::Bf16 => (
+                    kernels::LINEAR_CONV1D_STEP_BF16,
+                    kernels::LINEAR_COMPUTE_DECAY_BETA_BF16,
+                    kernels::LINEAR_GATED_RMS_NORM_BF16,
+                ),
+                ResidentDenseLayout::F16 => (
+                    kernels::LINEAR_CONV1D_STEP_F16,
+                    kernels::LINEAR_COMPUTE_DECAY_BETA_F16,
+                    kernels::LINEAR_GATED_RMS_NORM_F16,
+                ),
+                ResidentDenseLayout::F32 => (
+                    kernels::LINEAR_CONV1D_STEP_F32,
+                    kernels::LINEAR_COMPUTE_DECAY_BETA_F32,
+                    kernels::LINEAR_GATED_RMS_NORM_F32,
+                ),
+            };
             require_stage_kernels(
                 layout.family,
                 &metal,
                 FlashMoeGraphStage::Cmd1AttentionProjections,
                 &[
-                    kernels::LINEAR_CONV1D_STEP,
+                    conv_kernel,
                     kernels::LINEAR_RMS_NORM_QK,
-                    kernels::LINEAR_COMPUTE_DECAY_BETA,
+                    decay_kernel,
                     kernels::LINEAR_GATED_DELTA_STEP,
-                    kernels::LINEAR_GATED_RMS_NORM,
+                    gated_norm_kernel,
                 ],
             )?;
         }
@@ -764,7 +771,7 @@ mod tests {
 
     fn metal_without_linear_conv1d() -> MetalRuntimeCapabilities {
         let mut names = MetalPipelineNameSet::new();
-        names.linear_conv1d = kernels::FILL_ZERO;
+        names.linear_conv1d_bf16 = kernels::FILL_ZERO;
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
@@ -845,20 +852,26 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_q4_capability_plan_rejects_non_q4_dense_storage() {
+    fn qwen35_non_q4_dense_resolves_fused_linear_then_fails_at_shared_cmd3() {
         let layout = qwen35_layout();
-        let err = FlashMoeCapabilityPlan::resolve(
-            &layout,
-            text_adapter(),
+        for dense_layout in [
             ResidentDenseLayout::Bf16,
-            fixed_q4_experts(&layout),
-            Some(full_metal()),
-        )
-        .unwrap_err();
+            ResidentDenseLayout::F16,
+            ResidentDenseLayout::F32,
+        ] {
+            let err = FlashMoeCapabilityPlan::resolve(
+                &layout,
+                text_adapter(),
+                dense_layout,
+                fixed_q4_experts(&layout),
+                Some(full_metal()),
+            )
+            .unwrap_err();
 
-        assert_eq!(err.stage, FlashMoeGraphStage::Cmd1AttentionProjections);
-        assert!(err.to_string().contains("fused linear-attention"), "{err}");
-        assert!(err.to_string().contains("resident BF16"), "{err}");
+            assert_eq!(err.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+            assert!(err.reason.contains("CMD2 resolves"), "{err}");
+            assert!(err.reason.contains(dense_layout.as_str()), "{err}");
+        }
     }
 
     #[test]
@@ -1146,7 +1159,11 @@ mod tests {
             linear_error.stage,
             FlashMoeGraphStage::Cmd1AttentionProjections
         );
-        assert!(linear_error.reason.contains(kernels::LINEAR_CONV1D_STEP));
+        assert!(
+            linear_error
+                .reason
+                .contains(kernels::LINEAR_CONV1D_STEP_BF16)
+        );
     }
 
     #[test]
