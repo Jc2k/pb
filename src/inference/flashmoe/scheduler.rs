@@ -3572,12 +3572,7 @@ mod tests {
                 packed_bytes: payload.len() as u64,
                 records: Vec::new(),
             },
-            fixed_q4: FixedQ4ExpertSlotSpec::new(
-                layout.q4_expert_layout.unwrap(),
-                layout.hidden_size,
-                layout.moe_intermediate_size,
-            )
-            .unwrap(),
+            fixed_q4: FixedQ4ExpertSlotSpec::from_model_layout(&layout).unwrap(),
             recycle_pool: None,
             payload: ExpertRawPayload::Pbq4(payload),
             read_latency: Duration::from_millis(7),

@@ -213,19 +213,15 @@ impl FlashMoeCapabilityPlan {
                 "Qwen3.5 first production graph requires fixed-Q4 whole-expert storage",
             ));
         }
-        let expected_q4 = layout.q4_expert_layout.ok_or_else(|| {
-            FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::ActiveExpertReads,
-                "Qwen3.5 model layout has no fixed-Q4 expert offsets",
-            )
-        })?;
-        if expert_storage.fixed_q4
-            != (FixedQ4ExpertSlotSpec {
-                layout: expected_q4,
-                hidden_size: layout.hidden_size,
-                intermediate_size: layout.moe_intermediate_size,
-            })
+        let expected_fixed_q4 =
+            FixedQ4ExpertSlotSpec::from_model_layout(layout).map_err(|error| {
+                FlashMoeUnsupportedCapability::new(
+                    layout.family,
+                    FlashMoeGraphStage::ActiveExpertReads,
+                    format!("fixed-Q4 expert layout cannot be resolved: {error}"),
+                )
+            })?;
+        if expert_storage.fixed_q4 != expected_fixed_q4
             || expert_storage.layers != layout.layers
             || expert_storage.experts_per_layer != layout.experts_per_layer
         {
@@ -391,20 +387,16 @@ impl FlashMoeCapabilityPlan {
 fn test_expert_storage(
     layout: &QwenMoeModelLayout,
 ) -> Result<ExpertStoreExecutionDescriptor, FlashMoeUnsupportedCapability> {
-    let q4 = layout.q4_expert_layout.ok_or_else(|| {
+    let fixed_q4 = FixedQ4ExpertSlotSpec::from_model_layout(layout).map_err(|error| {
         FlashMoeUnsupportedCapability::new(
             layout.family,
             FlashMoeGraphStage::ActiveExpertReads,
-            "model family has no fixed-Q4 test layout",
+            format!("model family has no fixed-Q4 test layout: {error}"),
         )
     })?;
     Ok(ExpertStoreExecutionDescriptor {
         layout: ExpertStorageLayout::FixedQ4,
-        fixed_q4: FixedQ4ExpertSlotSpec {
-            layout: q4,
-            hidden_size: layout.hidden_size,
-            intermediate_size: layout.moe_intermediate_size,
-        },
+        fixed_q4,
         layers: layout.layers,
         experts_per_layer: layout.experts_per_layer,
     })

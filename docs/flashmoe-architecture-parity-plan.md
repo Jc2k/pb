@@ -287,8 +287,12 @@ Baseline reviewed on 2026-07-10:
   projection against the actual manifest and resident byte ranges before capability resolution.
   Deferred next-layer state, CPU full-attention placement, resident projection batches, and
   resident Q4 LM-head sampling are fixed graph policy rather than runtime probes.
-- Model-family metadata now carries Qwen3.5 fixed-Q4 offsets only for Qwen3.5. Qwen MoE and Qwen-VL
-  no longer inherit those offsets and fail fixed-Q4 store construction explicitly.
+- Fixed-Q4 offsets are no longer model-family metadata. `experts` derives a checked BF16-scale/bias
+  whole-slot layout from the concrete hidden/intermediate dimensions and fixed storage group size;
+  native Q4 aggregate packing, store construction, and capability validation consume that same
+  descriptor. Qwen MoE's 4096x1536 expert shape therefore resolves a 10,616,832-byte record instead
+  of inheriting Qwen3.5's 7,077,888-byte record. Shapes that cannot satisfy the runtime fixed-slot
+  contract remain PBQ4 import data rather than entering CMD3.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream

@@ -110,7 +110,9 @@ use super::metal::MetalBatchProjectionInput;
 use super::metal::MetalExecutionContext;
 #[cfg(test)]
 use super::model_family::QwenMoeExpertComponentKind;
-use super::model_family::{QwenMoeFamily, QwenMoeModelLayout, QwenMoeQ4ExpertLayout};
+#[cfg(test)]
+use super::model_family::QwenMoeQ4ExpertLayout;
+use super::model_family::{QwenMoeFamily, QwenMoeModelLayout};
 use super::runtime::MetalExecutionFacade;
 #[cfg(test)]
 use super::scheduler::ScheduledExpertPhaseMlpPayload;
@@ -6952,6 +6954,7 @@ fn pack_aggregate_expert_layer(
         "packing aggregate experts for layer {layer} ({layer_index}/{layer_total}): {} experts",
         layout.experts
     );
+    let fixed_native_q4 = fixed_native_q4_aggregate_layout(&aggregate_tensors, down, layout)?;
     let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
     let mut expected = Vec::with_capacity(layout.experts);
     for expert in 0..layout.experts {
@@ -6964,12 +6967,10 @@ fn pack_aggregate_expert_layer(
             down,
             layout,
         )?;
-        let packed_bytes =
-            if fixed_native_q4_aggregate_layout(&aggregate_tensors, down, layout)?.is_some() {
-                QwenMoeQ4ExpertLayout::qwen35_a17b().expert_bytes as u64
-            } else {
-                pbq4_expert_pack_wire_size(&records)?
-            };
+        let packed_bytes = match fixed_native_q4 {
+            Some(fixed) => fixed.expert_bytes as u64,
+            None => pbq4_expert_pack_wire_size(&records)?,
+        };
         expected.push(ExpectedExpertPack {
             expert,
             packed_bytes,
@@ -13756,8 +13757,10 @@ mod tests {
             shared_expert_intermediate_size: None,
             vision_config: None,
         };
-        let model_layout = QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap();
-        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&model_layout).unwrap();
+        let mut graph_layout = QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap();
+        graph_layout.hidden_size = GROUP_SIZE;
+        graph_layout.moe_intermediate_size = GROUP_SIZE;
+        let capability_plan = FlashMoeCapabilityPlan::for_model_layout(&graph_layout).unwrap();
         let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan).unwrap();
         let scheduled_routing = scheduled_graph
             .build_routing_topk(0, 2, 1, ScheduledRoutingCandidateSource::CpuRouterScores)

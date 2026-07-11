@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::legacy::{QwenModelConfig, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias};
 use super::types::{
@@ -111,6 +111,122 @@ pub struct QwenMoeQ4ExpertLayout {
 }
 
 impl QwenMoeQ4ExpertLayout {
+    pub fn fixed_bf16(
+        hidden_size: usize,
+        intermediate_size: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        if hidden_size == 0 || intermediate_size == 0 || group_size == 0 {
+            bail!(
+                "fixed-Q4 expert layout requires non-zero hidden, intermediate, and group dimensions"
+            );
+        }
+        if !hidden_size.is_multiple_of(group_size) || !intermediate_size.is_multiple_of(group_size)
+        {
+            bail!(
+                "fixed-Q4 expert dimensions hidden={hidden_size} intermediate={intermediate_size} must be divisible by group_size={group_size}"
+            );
+        }
+
+        fn projection_bytes(rows: usize, cols: usize, group_size: usize) -> Result<(usize, usize)> {
+            let values = rows
+                .checked_mul(cols)
+                .context("fixed-Q4 projection element count overflow")?;
+            if !values.is_multiple_of(2) {
+                bail!("fixed-Q4 projection element count {values} must be even");
+            }
+            let packed = values / 2;
+            let scale_bias = rows
+                .checked_mul(cols / group_size)
+                .and_then(|groups| groups.checked_mul(2))
+                .context("fixed-Q4 BF16 scale/bias byte count overflow")?;
+            Ok((packed, scale_bias))
+        }
+
+        let (gate_weight_bytes, gate_scale_bias_bytes) =
+            projection_bytes(intermediate_size, hidden_size, group_size)?;
+        let (down_weight_bytes, down_scale_bias_bytes) =
+            projection_bytes(hidden_size, intermediate_size, group_size)?;
+        let gate_scale_offset = gate_weight_bytes;
+        let gate_bias_offset = gate_scale_offset
+            .checked_add(gate_scale_bias_bytes)
+            .context("fixed-Q4 gate bias offset overflow")?;
+        let up_weight_offset = gate_bias_offset
+            .checked_add(gate_scale_bias_bytes)
+            .context("fixed-Q4 up weight offset overflow")?;
+        let up_scale_offset = up_weight_offset
+            .checked_add(gate_weight_bytes)
+            .context("fixed-Q4 up scale offset overflow")?;
+        let up_bias_offset = up_scale_offset
+            .checked_add(gate_scale_bias_bytes)
+            .context("fixed-Q4 up bias offset overflow")?;
+        let down_weight_offset = up_bias_offset
+            .checked_add(gate_scale_bias_bytes)
+            .context("fixed-Q4 down weight offset overflow")?;
+        let down_scale_offset = down_weight_offset
+            .checked_add(down_weight_bytes)
+            .context("fixed-Q4 down scale offset overflow")?;
+        let down_bias_offset = down_scale_offset
+            .checked_add(down_scale_bias_bytes)
+            .context("fixed-Q4 down bias offset overflow")?;
+        let expert_bytes = down_bias_offset
+            .checked_add(down_scale_bias_bytes)
+            .context("fixed-Q4 expert byte count overflow")?;
+        let layout = Self {
+            expert_bytes,
+            group_size,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateWeight,
+                    offset: 0,
+                    bytes: gate_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateScale,
+                    offset: gate_scale_offset,
+                    bytes: gate_scale_bias_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateBias,
+                    offset: gate_bias_offset,
+                    bytes: gate_scale_bias_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpWeight,
+                    offset: up_weight_offset,
+                    bytes: gate_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpScale,
+                    offset: up_scale_offset,
+                    bytes: gate_scale_bias_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpBias,
+                    offset: up_bias_offset,
+                    bytes: gate_scale_bias_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownWeight,
+                    offset: down_weight_offset,
+                    bytes: down_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownScale,
+                    offset: down_scale_offset,
+                    bytes: down_scale_bias_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownBias,
+                    offset: down_bias_offset,
+                    bytes: down_scale_bias_bytes,
+                },
+            ],
+        };
+        layout.validate()?;
+        Ok(layout)
+    }
+
     pub const fn qwen35_a17b() -> Self {
         Self {
             expert_bytes: FOUR_BIT_EXPERT_SIZE as usize,
@@ -217,7 +333,6 @@ pub struct QwenMoeModelLayout {
     pub partial_rotary_factor: Option<f64>,
     pub mrope_section: Option<[usize; 3]>,
     pub has_vision: bool,
-    pub q4_expert_layout: Option<QwenMoeQ4ExpertLayout>,
 }
 
 impl QwenMoeModelLayout {
@@ -260,10 +375,6 @@ impl QwenMoeModelLayout {
             partial_rotary_factor: config.partial_rotary_factor,
             mrope_section: config.text_mrope_section(),
             has_vision: config.vision_config.is_some(),
-            q4_expert_layout: match family {
-                QwenMoeFamily::Qwen35A17B => Some(QwenMoeQ4ExpertLayout::qwen35_a17b()),
-                QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => None,
-            },
         };
         layout.validate()?;
         Ok(layout)
@@ -316,19 +427,6 @@ impl QwenMoeModelLayout {
                 self.scheduled_active_experts,
                 self.routed_expert_scale
             );
-        }
-        match (self.family, self.q4_expert_layout) {
-            (QwenMoeFamily::Qwen35A17B, Some(layout)) => layout.validate()?,
-            (QwenMoeFamily::Qwen35A17B, None) => {
-                bail!("Qwen3.5-A17B model layout is missing its fixed-Q4 expert layout")
-            }
-            (QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe, Some(_)) => {
-                bail!(
-                    "Qwen MoE family {:?} must resolve its expert layout from concrete model storage instead of inheriting Qwen3.5 fixed-Q4 offsets",
-                    self.family
-                )
-            }
-            (QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe, None) => {}
         }
         Ok(())
     }
@@ -464,10 +562,6 @@ mod tests {
         assert_eq!(layout.shared_experts, 1);
         assert_eq!(layout.shared_expert_intermediate_size, 1024);
         assert!(!layout.has_vision);
-        assert_eq!(
-            layout.q4_expert_layout,
-            Some(QwenMoeQ4ExpertLayout::qwen35_a17b())
-        );
     }
 
     #[test]
@@ -509,6 +603,10 @@ mod tests {
     #[test]
     fn qwen35_q4_expert_offsets_match_upstream_repack_layout() {
         let expert_layout = QwenMoeQ4ExpertLayout::qwen35_a17b();
+        assert_eq!(
+            QwenMoeQ4ExpertLayout::fixed_bf16(4096, 1024, GROUP_SIZE).unwrap(),
+            expert_layout
+        );
 
         assert_eq!(expert_layout.expert_bytes, 7_077_888);
         assert_eq!(
@@ -564,7 +662,14 @@ mod tests {
         assert_eq!(layout.scheduled_active_experts, 2);
         assert_eq!(layout.routed_expert_scale, 1.0);
         assert_eq!(layout.layer_kind(0), QwenMoeLayerKind::FullAttention);
-        assert_eq!(layout.q4_expert_layout, None);
+        let expert_layout = QwenMoeQ4ExpertLayout::fixed_bf16(
+            layout.hidden_size,
+            layout.moe_intermediate_size,
+            GROUP_SIZE,
+        )
+        .unwrap();
+        assert_ne!(expert_layout, QwenMoeQ4ExpertLayout::qwen35_a17b());
+        assert_eq!(expert_layout.expert_bytes, 10_616_832);
     }
 
     #[test]
@@ -602,6 +707,5 @@ mod tests {
         assert_eq!(layout.routed_expert_scale, 1.0);
         assert!(layout.has_vision);
         assert_eq!(layout.mrope_section, Some(DEFAULT_MROPE_SECTION));
-        assert_eq!(layout.q4_expert_layout, None);
     }
 }

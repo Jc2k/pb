@@ -17,7 +17,9 @@ use super::model_family::{
     QwenMoeExpertComponentKind, QwenMoeExpertComponentLayout, QwenMoeModelLayout,
     QwenMoeQ4ExpertLayout,
 };
-use super::types::{ACTIVE_EXPERTS_PER_TOKEN, GROUP_SIZE, HIDDEN_DIM};
+#[cfg(test)]
+use super::types::HIDDEN_DIM;
+use super::types::{ACTIVE_EXPERTS_PER_TOKEN, GROUP_SIZE};
 
 pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
 
@@ -965,14 +967,11 @@ pub(crate) fn fixed_native_q4_aggregate_layout<T: AggregateExpertTensor>(
     if !aggregate_native_q4_enabled(aggregate_tensors, down)? {
         return Ok(None);
     }
-    let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
-    fixed.validate()?;
-    if layout.hidden == HIDDEN_DIM && layout.intermediate == 1024 && fixed.group_size == GROUP_SIZE
+    if !layout.hidden.is_multiple_of(GROUP_SIZE) || !layout.intermediate.is_multiple_of(GROUP_SIZE)
     {
-        Ok(Some(fixed))
-    } else {
-        Ok(None)
+        return Ok(None);
     }
+    QwenMoeQ4ExpertLayout::fixed_bf16(layout.hidden, layout.intermediate, GROUP_SIZE).map(Some)
 }
 
 pub(crate) fn validate_aggregate_expert_tensor_shape<T: AggregateExpertTensor>(
@@ -2548,9 +2547,14 @@ impl FixedQ4ExpertSlotSpec {
     }
 
     pub(crate) fn from_model_layout(layout: &QwenMoeModelLayout) -> Result<Self> {
-        let q4_layout = layout.q4_expert_layout.with_context(|| {
+        let q4_layout = QwenMoeQ4ExpertLayout::fixed_bf16(
+            layout.hidden_size,
+            layout.moe_intermediate_size,
+            GROUP_SIZE,
+        )
+        .with_context(|| {
             format!(
-                "FlashMoe unsupported {:?} expert storage: fixed-Q4 expert layout is not resolved for this model family",
+                "FlashMoe unsupported {:?} fixed-Q4 expert storage dimensions",
                 layout.family
             )
         })?;
@@ -3435,6 +3439,61 @@ mod tests {
         assert_eq!(tensors.gate.start(1).unwrap(), 6);
         assert_eq!(tensors.up.start(1).unwrap(), 6);
         assert!(aggregate_native_q4_enabled(&tensors, &down).unwrap());
+    }
+
+    #[test]
+    fn native_q4_layout_resolves_from_qwen_moe_dimensions() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            shape: vec![512, 1536, 4096],
+            native_q4: true,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.up_proj.weight",
+            shape: vec![512, 1536, 4096],
+            native_q4: true,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.down_proj.weight",
+            shape: vec![512, 4096, 1536],
+            native_q4: true,
+        };
+        let aggregate = AggregateExpertLayout::new(512, 4096, 1536).unwrap();
+        let tensors = aggregate_expert_tensors(&[&gate, &up, &down], 1, aggregate).unwrap();
+        let fixed = fixed_native_q4_aggregate_layout(&tensors, &down, aggregate)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fixed.group_size, GROUP_SIZE);
+        assert_eq!(fixed.expert_bytes, 10_616_832);
+        assert_ne!(fixed, QwenMoeQ4ExpertLayout::qwen35_a17b());
+    }
+
+    #[test]
+    fn native_q4_layout_keeps_non_runtime_fixture_as_import_format() {
+        let gate = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: true,
+        };
+        let up = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.up_proj.weight",
+            shape: vec![2, 2, 3],
+            native_q4: true,
+        };
+        let down = TestAggregateTensor {
+            name: "model.layers.1.mlp.switch_mlp.down_proj.weight",
+            shape: vec![2, 3, 2],
+            native_q4: true,
+        };
+        let aggregate = AggregateExpertLayout::new(2, 3, 2).unwrap();
+        let tensors = aggregate_expert_tensors(&[&gate, &up, &down], 1, aggregate).unwrap();
+
+        assert!(
+            fixed_native_q4_aggregate_layout(&tensors, &down, aggregate)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
