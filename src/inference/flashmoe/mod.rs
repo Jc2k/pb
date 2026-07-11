@@ -16,6 +16,8 @@ mod runtime;
 mod safetensors;
 mod scheduler;
 mod state;
+#[cfg(test)]
+mod test_fixtures;
 mod text;
 mod types;
 mod vision;

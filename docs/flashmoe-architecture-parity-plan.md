@@ -332,6 +332,10 @@ Baseline reviewed on 2026-07-11:
   planning owns explicit K overrides and the Qwen3.5 K<4 force guard. The synthetic legacy family
   fixture and eight overlapping config/routing tests were removed, so family selection is no longer
   restated inside the compatibility boundary.
+- Shared safetensors byte builders, typed tensor fixtures, expert triplets, and numeric assertions
+  now live in the explicit `cfg(test)` `test_fixtures` module. Cache, expert, and weights tests can
+  move independently without importing helper ownership from `legacy.rs`; the duplicate helper
+  block has been removed there.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
