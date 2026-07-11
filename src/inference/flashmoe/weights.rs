@@ -1500,6 +1500,7 @@ pub(crate) struct SharedExpertPhaseWeights {
 }
 
 impl SharedExpertPhaseWeights {
+    #[cfg(test)]
     pub(crate) fn new(
         gate: Arc<Vec<f32>>,
         up: Arc<Vec<f32>>,
@@ -1553,6 +1554,7 @@ impl SharedExpertPhaseWeights {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_shared_expert_phase_weights<F>(
     layer: usize,
     width: usize,
@@ -1730,12 +1732,14 @@ where
 
 #[derive(Debug, Default)]
 pub(crate) struct SharedExpertPhaseCache {
+    #[cfg(test)]
     dense: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseWeights>>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     q4: Mutex<BTreeMap<usize, Arc<SharedExpertPhaseQ4Projections>>>,
 }
 
 impl SharedExpertPhaseCache {
+    #[cfg(test)]
     pub(crate) fn dense<F>(
         &self,
         layer: usize,
@@ -1770,6 +1774,7 @@ impl SharedExpertPhaseCache {
         }
     }
 
+    #[cfg(test)]
     fn cached_dense(
         &self,
         layer: usize,

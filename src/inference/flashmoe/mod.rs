@@ -10,6 +10,7 @@ mod legacy;
 mod math;
 mod metal;
 mod model_family;
+mod runtime;
 mod scheduler;
 mod state;
 mod types;

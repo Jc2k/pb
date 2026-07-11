@@ -208,6 +208,11 @@ Baseline reviewed on 2026-07-10:
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
   cleanup are one implementation. The three duplicate encoders and fused-batch helper have been
   removed from `legacy.rs`.
+- `runtime.rs` now owns `forward_hidden`, the production token/layer loop, deferred CMD3 handoff,
+  attention execution, CMD2/routing composition, active expert issue/finish, CMD3 submission, and
+  final norm/state recording. Generation, prefill, tokenizer, and sampling entry points remain
+  outside that hot loop. The dead CPU dense shared-expert runtime branch was removed; supported
+  CMD3 preparation requires the resolved resident-Q4 shared projections.
 - Full-attention placement is now resolved by the scheduled graph rather than supplied by the
   runtime call site. Qwen3.5 selects its declared upstream-parity CPU KV implementation; an
   attention stage without a matching scheduled executor is a named unsupported capability. The
@@ -248,12 +253,15 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- `legacy.rs` remains the production center of gravity for generation and the layer loop.
-- `FlashMoeScheduledGraph` validates stage descriptors but does not own the complete per-layer
+- `runtime.rs` owns the production layer loop, but it still composes individual scheduled-graph,
+  attention, routing, expert-read, and Metal submission calls instead of invoking one
+  scheduler-owned per-layer execution API.
+- `FlashMoeScheduledGraph` validates stage descriptors but does not yet own the complete per-layer
   execution lifecycle.
-- `forward_hidden`, `DenseStore`, CPU KV/session caches, and `VisionEncoder` remain in `legacy.rs`.
-- The legacy Metal facade still appears at production call sites; Gate 3 must move layer sequencing
-  into a scheduler-owned runtime that consumes only typed stage APIs.
+- `DenseStore`, CPU KV/session caches, runtime layout metadata, and `VisionEncoder` remain in
+  `legacy.rs` and are exposed crate-internally to the new runtime during migration.
+- The legacy Metal facade still appears at the runtime call site; Gate 3 must move layer sequencing
+  behind a scheduler-owned API that consumes only typed stage implementations.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Qwen MoE and Qwen-VL have metadata and legacy code but no resolved unified graph implementation.
