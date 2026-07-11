@@ -321,11 +321,12 @@ Baseline reviewed on 2026-07-10:
   whole-slot typed Q4 SwiGLU payloads, declared no-shared CMD3 combine, and deferred hidden/next-norm
   state. Its route weights and output state are checked against independent golden values.
 - `vision.rs` now owns Qwen-VL image decoding, smart resize, normalization, block-major patch
-  packing, visual encoding output, M-RoPE positions, placeholder-span validation, multi-image
-  embedding/DeepStack assembly, and the typed `QwenVlRuntimeInputs` emitted before decoder
-  execution. The multimodal generation entry point constructs that one typed input object before
-  calling the prefill boundary. Because the shared graph cannot consume it yet, prefill remains a
-  precise unsupported input-adapter error rather than branching inside the layer loop.
+  packing, the serialized ViT configuration contract, visual encoding output, M-RoPE positions,
+  placeholder-span validation, multi-image embedding/DeepStack assembly, and the typed
+  `QwenVlRuntimeInputs` emitted before decoder execution. The multimodal generation entry point
+  constructs that one typed input object before calling the prefill boundary. Because the shared
+  graph cannot consume it yet, prefill remains a precise unsupported input-adapter error rather
+  than branching inside the layer loop.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream

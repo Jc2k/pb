@@ -1,11 +1,78 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
-use super::legacy::Qwen3VLVisionConfig;
 use super::types::{
     VIT_IMAGE_MEAN, VIT_IMAGE_STD, VIT_MAX_PIXELS, VIT_MERGE_SIZE, VIT_MIN_PIXELS, VIT_PATCH_SIZE,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Qwen3VLVisionConfig {
+    pub depth: usize,
+    #[serde(alias = "hidden_size")]
+    pub embed_dim: usize,
+    pub num_heads: usize,
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
+    #[serde(default = "default_vit_mlp_ratio")]
+    pub mlp_ratio: f64,
+    #[serde(default = "default_vit_patch_size")]
+    pub patch_size: usize,
+    #[serde(alias = "spatial_merge_size")]
+    #[serde(default = "default_vit_merge_size")]
+    pub merge_size: usize,
+    #[serde(default = "default_vit_temporal_patch_size")]
+    pub temporal_patch_size: usize,
+    #[serde(default)]
+    pub num_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+    #[serde(default)]
+    pub out_hidden_size: Option<usize>,
+    #[serde(alias = "in_channels")]
+    #[serde(default = "default_vit_in_chans")]
+    pub in_chans: usize,
+}
+
+fn default_vit_mlp_ratio() -> f64 {
+    4.0
+}
+
+fn default_vit_patch_size() -> usize {
+    VIT_PATCH_SIZE
+}
+
+fn default_vit_merge_size() -> usize {
+    VIT_MERGE_SIZE
+}
+
+fn default_vit_temporal_patch_size() -> usize {
+    2
+}
+
+fn default_vit_in_chans() -> usize {
+    3
+}
+
+impl Qwen3VLVisionConfig {
+    pub fn token_stride(&self) -> usize {
+        self.patch_size * self.merge_size
+    }
+
+    pub fn patches_per_token(&self) -> usize {
+        self.merge_size * self.merge_size
+    }
+
+    pub fn patch_flat_dim(&self) -> usize {
+        self.in_chans * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    pub fn mlp_hidden_size(&self) -> usize {
+        self.intermediate_size
+            .unwrap_or_else(|| (self.embed_dim as f64 * self.mlp_ratio).round() as usize)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ImagePreprocessor {

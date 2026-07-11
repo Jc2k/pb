@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize, de};
+use serde::{Deserialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,7 +146,8 @@ use super::state::{
 };
 use super::types::*;
 use super::vision::{
-    ImagePreprocessor, MropeAxis, MropePosition, QwenVlRuntimeInputs, VisionEncoding,
+    ImagePreprocessor, MropeAxis, MropePosition, Qwen3VLVisionConfig, QwenVlRuntimeInputs,
+    VisionEncoding,
 };
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
@@ -374,53 +375,6 @@ pub struct QwenModelConfig {
     pub vision_config: Option<Qwen3VLVisionConfig>,
 }
 
-/// Vision-encoder (ViT) configuration for Qwen3-VL MoE models.
-///
-/// Mirrors the `vision_config` sub-object found in the HuggingFace `config.json`
-/// for `Qwen/Qwen3-VL-MoE-Instruct` and related checkpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Qwen3VLVisionConfig {
-    /// Number of transformer layers in the ViT encoder.
-    pub depth: usize,
-    /// Hidden dimension of the ViT (equals `hidden_size` in the HF config).
-    #[serde(alias = "hidden_size")]
-    pub embed_dim: usize,
-    /// Number of attention heads.
-    pub num_heads: usize,
-    /// Explicit ViT MLP hidden size used by Qwen3.5 vision configs.
-    #[serde(default)]
-    pub intermediate_size: Option<usize>,
-    /// FFN hidden-size ratio (defaults to 4.0).
-    #[serde(default = "default_vit_mlp_ratio")]
-    pub mlp_ratio: f64,
-    /// Pixel edge-length of each square patch (defaults to 14).
-    #[serde(default = "default_vit_patch_size")]
-    pub patch_size: usize,
-    /// How many patches are spatially merged into one language-model token
-    /// along each axis (defaults to 2, giving 2×2 = 4 patches per token).
-    #[serde(alias = "spatial_merge_size")]
-    #[serde(default = "default_vit_merge_size")]
-    pub merge_size: usize,
-    /// Temporal frames folded into each Conv3d patch (2 for Qwen3-VL images,
-    /// where the still image is duplicated across the temporal window).
-    #[serde(default = "default_vit_temporal_patch_size")]
-    pub temporal_patch_size: usize,
-    /// Size of the learned square absolute-position table used by the ViT.
-    #[serde(default)]
-    pub num_position_embeddings: Option<usize>,
-    /// Vision layers whose merged features are injected into early decoder layers.
-    #[serde(default)]
-    pub deepstack_visual_indexes: Vec<usize>,
-    /// Output hidden size of the vision merger.  Defaults to the text hidden size
-    /// when omitted by older configs.
-    #[serde(default)]
-    pub out_hidden_size: Option<usize>,
-    /// Input channels (defaults to 3 for RGB).
-    #[serde(alias = "in_channels")]
-    #[serde(default = "default_vit_in_chans")]
-    pub in_chans: usize,
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct RawQwenModelConfig {
     model_type: Option<String>,
@@ -600,45 +554,6 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                 .or(text.shared_expert_intermediate_size),
             vision_config: raw.vision_config,
         })
-    }
-}
-
-fn default_vit_mlp_ratio() -> f64 {
-    4.0
-}
-fn default_vit_patch_size() -> usize {
-    VIT_PATCH_SIZE
-}
-fn default_vit_merge_size() -> usize {
-    VIT_MERGE_SIZE
-}
-fn default_vit_temporal_patch_size() -> usize {
-    2
-}
-fn default_vit_in_chans() -> usize {
-    3
-}
-
-impl Qwen3VLVisionConfig {
-    /// Pixel stride per merged visual token (`patch_size * merge_size`).
-    pub fn token_stride(&self) -> usize {
-        self.patch_size * self.merge_size
-    }
-
-    /// Number of patches that form one merged visual token (`merge_size ^ 2`).
-    pub fn patches_per_token(&self) -> usize {
-        self.merge_size * self.merge_size
-    }
-
-    /// Flattened input dimension for the patch-embedding linear layer.
-    pub fn patch_flat_dim(&self) -> usize {
-        self.in_chans * self.temporal_patch_size * self.patch_size * self.patch_size
-    }
-
-    /// Intermediate size of each ViT MLP layer.
-    pub fn mlp_hidden_size(&self) -> usize {
-        self.intermediate_size
-            .unwrap_or_else(|| (self.embed_dim as f64 * self.mlp_ratio).round() as usize)
     }
 }
 
