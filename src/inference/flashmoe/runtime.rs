@@ -7,6 +7,7 @@ use tracing::info;
 use super::legacy::*;
 use super::metal::*;
 use super::model_family::QwenModelConfig;
+use super::planning::FlashMoePlan;
 use super::scheduler::*;
 use super::state::*;
 use super::types::*;

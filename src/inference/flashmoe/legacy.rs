@@ -91,9 +91,9 @@ use super::experts::{
     build_native_q4_expert_pack, cleanup_stale_expert_temp_files,
     expected_expert_pack_from_records, expected_expert_pack_record_from_source,
     expected_native_q4_expert_record_from_input, expert_tensor_byte_range,
-    first_missing_expert_pack_for_shape, fixed_native_q4_aggregate_layout,
-    fixed_q4_payload_from_pbq4_records, native_q4_slice_byte_ranges, parse_pbq4_expert_pack,
-    pbq4_expert_pack_wire_size, rewrite_expert_layer_pack, single_aggregate_expert_tensor,
+    fixed_native_q4_aggregate_layout, fixed_q4_payload_from_pbq4_records,
+    native_q4_slice_byte_ranges, parse_pbq4_expert_pack, pbq4_expert_pack_wire_size,
+    rewrite_expert_layer_pack, single_aggregate_expert_tensor,
     validate_aggregate_expert_tensor_shape, validate_direct_expert_tensor_group,
 };
 #[cfg(test)]
@@ -114,10 +114,10 @@ use super::metal::MetalExecutionContext;
 use super::model_family::QwenMoeExpertComponentKind;
 #[cfg(test)]
 use super::model_family::QwenMoeQ4ExpertLayout;
-use super::model_family::{
-    QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout, is_qwen3_moe, is_qwen3_vl,
-    is_qwen35_or_legacy_alias,
-};
+#[cfg(test)]
+use super::model_family::is_qwen35_or_legacy_alias;
+use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
+use super::planning::*;
 use super::runtime::MetalExecutionFacade;
 #[cfg(test)]
 use super::scheduler::ScheduledExpertPhaseMlpPayload;
@@ -178,7 +178,6 @@ pub(super) type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(Str
 
 const DENSE_Q4_FORMAT: &str = "dense-q4-affine-mse-v3";
 const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
-const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
 #[cfg(test)]
 const DENSE_Q4_GROUP_SIZE: usize = 16;
 #[cfg(target_os = "macos")]
@@ -218,100 +217,6 @@ unsafe extern "C" {
     );
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FlashMoeRoutingPolicy {
-    pub active_experts_override: Option<usize>,
-    pub force_active_experts: bool,
-}
-
-impl FlashMoeRoutingPolicy {
-    pub fn new(active_experts_override: Option<usize>, force_active_experts: bool) -> Self {
-        Self {
-            active_experts_override,
-            force_active_experts,
-        }
-    }
-
-    fn resolve(&self, model: &str, config: &QwenModelConfig) -> Result<ResolvedRoutingPolicy> {
-        let qwen35_profile = is_qwen35_or_legacy_alias(model);
-        let (source, active_experts) = if let Some(active_experts) = self.active_experts_override {
-            (ActiveExpertsSource::UserOverride, active_experts)
-        } else if qwen35_profile {
-            (
-                ActiveExpertsSource::Qwen35FlashMoeProfile,
-                ACTIVE_EXPERTS_PER_TOKEN,
-            )
-        } else {
-            (
-                ActiveExpertsSource::ModelConfig,
-                config.config_active_experts(),
-            )
-        };
-        let experts = config.experts();
-        if experts == 0 || active_experts == 0 || active_experts > experts {
-            bail!(
-                "invalid MoE routing policy: num_experts={experts}, active_experts={active_experts}"
-            );
-        }
-        if qwen35_profile && active_experts < QWEN35_MIN_ACTIVE_EXPERTS {
-            if self.force_active_experts {
-                tracing::warn!(
-                    model,
-                    active_experts,
-                    minimum = QWEN35_MIN_ACTIVE_EXPERTS,
-                    "forcing Qwen3.5 Flash-MoE active-expert count below the quality guard"
-                );
-            } else {
-                bail!(
-                    "Qwen3.5 Flash-MoE routing requires K >= {QWEN35_MIN_ACTIVE_EXPERTS}; got K={active_experts}. Set model.flashmoe_force_active_experts=true or pass --flashmoe-force-active-experts to force this experimental routing."
-                );
-            }
-        }
-        Ok(ResolvedRoutingPolicy {
-            active_experts,
-            source,
-            force_active_experts: self.force_active_experts,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveExpertsSource {
-    ModelConfig,
-    Qwen35FlashMoeProfile,
-    UserOverride,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResolvedRoutingPolicy {
-    pub(super) active_experts: usize,
-    source: ActiveExpertsSource,
-    force_active_experts: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct FlashMoePlan {
-    pub model: String,
-    pub model_cache_dir: PathBuf,
-    pub runtime_dir: PathBuf,
-    pub non_expert_weights: PathBuf,
-    pub tensor_manifest: PathBuf,
-    pub model_config: PathBuf,
-    pub tokenizer: PathBuf,
-    pub tokenizer_config: PathBuf,
-    pub experts_dir: PathBuf,
-    pub uses_metal: bool,
-    pub streams_experts_from_nand: bool,
-    pub quantization: ExpertQuantization,
-    pub routing_policy: FlashMoeRoutingPolicy,
-    /// Packed vision-encoder weights (present only for Qwen3-VL MoE plans).
-    pub vision_weights: Option<PathBuf>,
-    /// Vision-encoder tensor manifest JSON (present only for Qwen3-VL MoE plans).
-    pub vision_manifest: Option<PathBuf>,
-    /// Persisted vision-encoder config JSON (present only for Qwen3-VL MoE plans).
-    pub vision_config_path: Option<PathBuf>,
-}
-
 impl FlashMoeTimingBuckets {
     pub(super) fn add_expert_scheduler_delta(&mut self, delta: ExpertSchedulerSnapshot) {
         self.expert_queue += delta.total_queue_latency;
@@ -341,349 +246,6 @@ struct SafetensorTensorInfo {
     dtype: String,
     shape: Vec<usize>,
     data_offsets: [u64; 2],
-}
-
-pub fn select_backend(model: &str) -> BackendSelection {
-    if supports_flashmoe(model) {
-        BackendSelection::FlashMoePreferred
-    } else {
-        BackendSelection::LlamaCpp
-    }
-}
-
-pub fn supports_flashmoe(model: &str) -> bool {
-    is_arm_macos() && is_flashmoe_model_name(model)
-}
-
-pub fn is_arm_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
-fn is_flashmoe_model_name(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("gguf") {
-        return false;
-    }
-    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model)
-}
-
-pub fn canonical_model(model: &str) -> String {
-    if model
-        .to_ascii_lowercase()
-        .contains(LEGACY_QWEN_CODER_MARKER)
-    {
-        QWEN35_MODEL.to_string()
-    } else {
-        model.to_string()
-    }
-}
-
-pub fn cache_version_for_model(model: &str) -> &'static str {
-    if canonical_model(model) == QWEN35_BF16_MODEL {
-        QWEN35_BF16_CACHE_VERSION
-    } else {
-        CACHE_VERSION
-    }
-}
-
-pub fn plan(model: &str, models_root: &Path) -> Option<FlashMoePlan> {
-    plan_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
-}
-
-pub fn plan_unchecked(model: &str, models_root: &Path) -> FlashMoePlan {
-    plan_unchecked_with_routing(model, models_root, FlashMoeRoutingPolicy::default())
-}
-
-pub fn plan_with_routing(
-    model: &str,
-    models_root: &Path,
-    routing_policy: FlashMoeRoutingPolicy,
-) -> Option<FlashMoePlan> {
-    supports_flashmoe(model)
-        .then(|| plan_unchecked_with_routing(model, models_root, routing_policy))
-}
-
-pub fn plan_unchecked_with_routing(
-    model: &str,
-    models_root: &Path,
-    routing_policy: FlashMoeRoutingPolicy,
-) -> FlashMoePlan {
-    plan_unchecked_with_cache_version(
-        model,
-        models_root,
-        routing_policy,
-        cache_version_for_model(model),
-    )
-}
-
-pub fn plan_unchecked_with_cache_version(
-    model: &str,
-    models_root: &Path,
-    routing_policy: FlashMoeRoutingPolicy,
-    cache_version: &str,
-) -> FlashMoePlan {
-    let model = canonical_model(model);
-    let model_cache_dir = models_root.join(crate::cache_dir_name(&model));
-    let runtime_dir = model_cache_dir.join(cache_version);
-    let vl = is_qwen3_vl(&model);
-    let quantization = if model == QWEN35_BF16_MODEL {
-        ExpertQuantization::Bf16
-    } else {
-        ExpertQuantization::FourBitProduction
-    };
-    FlashMoePlan {
-        vision_weights: vl.then(|| runtime_dir.join("vision_weights.bin")),
-        vision_manifest: vl.then(|| runtime_dir.join("vision_weights.json")),
-        vision_config_path: vl.then(|| runtime_dir.join("vision_config.json")),
-        non_expert_weights: runtime_dir.join("model_weights.bin"),
-        tensor_manifest: runtime_dir.join("model_weights.json"),
-        model_config: runtime_dir.join("config.json"),
-        tokenizer: model_cache_dir.join("tokenizer.json"),
-        tokenizer_config: model_cache_dir.join("tokenizer_config.json"),
-        experts_dir: runtime_dir.join("packed_experts"),
-        runtime_dir,
-        model,
-        model_cache_dir,
-        uses_metal: true,
-        streams_experts_from_nand: true,
-        quantization,
-        routing_policy,
-    }
-}
-
-impl FlashMoePlan {
-    pub fn cache_status(&self) -> Result<CacheStatus> {
-        let mut required = vec![
-            self.non_expert_weights.clone(),
-            self.tensor_manifest.clone(),
-            self.model_config.clone(),
-            self.tokenizer.clone(),
-        ];
-        if is_qwen3_vl(&self.model) {
-            required.extend(
-                [
-                    self.vision_weights.clone(),
-                    self.vision_manifest.clone(),
-                    self.vision_config_path.clone(),
-                ]
-                .into_iter()
-                .flatten(),
-            );
-        }
-        let mut missing: Vec<PathBuf> = required
-            .into_iter()
-            .filter(|path| !path.is_file())
-            .collect();
-        if !self.experts_dir.is_dir() {
-            missing.push(self.experts_dir.clone());
-        }
-
-        let (expert_files, expert_bytes) = expert_store_size(&self.experts_dir)?;
-        if self.experts_dir.is_dir()
-            && let Some(missing_expert) =
-                first_missing_expert_pack(&self.experts_dir, &self.model_config)?
-        {
-            missing.push(missing_expert);
-        }
-        let ready = missing.is_empty() && expert_bytes > 0;
-
-        Ok(CacheStatus {
-            ready,
-            missing,
-            expert_files,
-            expert_bytes,
-        })
-    }
-
-    pub fn describe(&self) -> String {
-        format!(
-            "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
-            CACHE_VERSION,
-            self.model,
-            NUM_LAYERS,
-            NUM_EXPERTS,
-            ACTIVE_EXPERTS_PER_TOKEN,
-            HIDDEN_DIM,
-            self.runtime_dir.display(),
-            self.experts_dir.display(),
-            EXPECTED_EXPERT_BYTES / (1024 * 1024 * 1024)
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlashMoeCacheCleanupKind {
-    StaleRuntimeDir,
-    SourceShard,
-}
-
-impl FlashMoeCacheCleanupKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::StaleRuntimeDir => "stale-runtime-dir",
-            Self::SourceShard => "source-shard",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlashMoeCacheCleanupCandidate {
-    pub path: PathBuf,
-    pub kind: FlashMoeCacheCleanupKind,
-    pub bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlashMoeCacheCleanupReport {
-    pub model: String,
-    pub model_cache_dir: PathBuf,
-    pub active_runtime_dir: PathBuf,
-    pub include_source_shards: bool,
-    pub deleted: bool,
-    pub candidates: Vec<FlashMoeCacheCleanupCandidate>,
-}
-
-impl FlashMoeCacheCleanupReport {
-    pub fn total_bytes(&self) -> u64 {
-        self.candidates
-            .iter()
-            .map(|candidate| candidate.bytes)
-            .sum()
-    }
-}
-
-pub fn plan_cache_cleanup(
-    plan: &FlashMoePlan,
-    include_source_shards: bool,
-) -> Result<FlashMoeCacheCleanupReport> {
-    let mut candidates = Vec::new();
-    if plan.model_cache_dir.is_dir() {
-        for entry in fs::read_dir(&plan.model_cache_dir)
-            .with_context(|| format!("failed to read {}", plan.model_cache_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            let file_type = entry.file_type()?;
-
-            if file_type.is_dir() && file_name.starts_with("flashmoe-") && path != plan.runtime_dir
-            {
-                candidates.push(FlashMoeCacheCleanupCandidate {
-                    bytes: cache_cleanup_path_size(&path)?,
-                    kind: FlashMoeCacheCleanupKind::StaleRuntimeDir,
-                    path,
-                });
-                continue;
-            }
-
-            if include_source_shards
-                && file_type.is_file()
-                && is_flashmoe_source_shard_name(&file_name)
-            {
-                candidates.push(FlashMoeCacheCleanupCandidate {
-                    bytes: entry.metadata()?.len(),
-                    kind: FlashMoeCacheCleanupKind::SourceShard,
-                    path,
-                });
-            }
-        }
-    }
-
-    candidates.sort_by(|left, right| left.path.cmp(&right.path));
-
-    Ok(FlashMoeCacheCleanupReport {
-        model: plan.model.clone(),
-        model_cache_dir: plan.model_cache_dir.clone(),
-        active_runtime_dir: plan.runtime_dir.clone(),
-        include_source_shards,
-        deleted: false,
-        candidates,
-    })
-}
-
-pub fn clean_cache(
-    plan: &FlashMoePlan,
-    include_source_shards: bool,
-    delete: bool,
-) -> Result<FlashMoeCacheCleanupReport> {
-    let mut report = plan_cache_cleanup(plan, include_source_shards)?;
-    if delete {
-        for candidate in &report.candidates {
-            ensure_cache_cleanup_candidate_is_safe(&report.model_cache_dir, candidate)?;
-            delete_cache_cleanup_candidate(candidate)?;
-        }
-        report.deleted = true;
-    }
-    Ok(report)
-}
-
-pub fn clean_source_shards(
-    plan: &FlashMoePlan,
-    delete: bool,
-) -> Result<FlashMoeCacheCleanupReport> {
-    let mut report = plan_cache_cleanup(plan, true)?;
-    report
-        .candidates
-        .retain(|candidate| candidate.kind == FlashMoeCacheCleanupKind::SourceShard);
-    if delete {
-        for candidate in &report.candidates {
-            ensure_cache_cleanup_candidate_is_safe(&report.model_cache_dir, candidate)?;
-            delete_cache_cleanup_candidate(candidate)?;
-        }
-        report.deleted = true;
-    }
-    Ok(report)
-}
-
-fn is_flashmoe_source_shard_name(file_name: &str) -> bool {
-    (file_name.starts_with("model.safetensors-") || file_name.starts_with("model-"))
-        && file_name.contains("-of-")
-        && file_name.ends_with(".safetensors")
-}
-
-fn ensure_cache_cleanup_candidate_is_safe(
-    model_cache_dir: &Path,
-    candidate: &FlashMoeCacheCleanupCandidate,
-) -> Result<()> {
-    if candidate.path.parent() != Some(model_cache_dir) {
-        bail!(
-            "refusing to clean cache path outside model cache root: {}",
-            candidate.path.display()
-        );
-    }
-    Ok(())
-}
-
-fn delete_cache_cleanup_candidate(candidate: &FlashMoeCacheCleanupCandidate) -> Result<()> {
-    let metadata = fs::symlink_metadata(&candidate.path)
-        .with_context(|| format!("failed to inspect {}", candidate.path.display()))?;
-    if metadata.is_dir() {
-        fs::remove_dir_all(&candidate.path)
-            .with_context(|| format!("failed to delete {}", candidate.path.display()))?;
-    } else {
-        fs::remove_file(&candidate.path)
-            .with_context(|| format!("failed to delete {}", candidate.path.display()))?;
-    }
-    Ok(())
-}
-
-fn cache_cleanup_path_size(path: &Path) -> Result<u64> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-
-    let mut bytes = 0u64;
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        bytes = bytes.saturating_add(cache_cleanup_path_size(&entry.path())?);
-    }
-    Ok(bytes)
 }
 
 pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
@@ -5365,25 +4927,6 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
 }
 
-fn expert_store_size(path: &Path) -> Result<(usize, u64)> {
-    if !path.is_dir() {
-        return Ok((0, 0));
-    }
-    let mut files = 0usize;
-    let mut bytes = 0u64;
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file()
-            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("bin")
-        {
-            files += 1;
-            bytes = bytes.saturating_add(metadata.len());
-        }
-    }
-    Ok((files, bytes))
-}
-
 fn format_missing(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         "none".to_string()
@@ -7129,14 +6672,6 @@ fn sha256_hex_parts(parts: &[&[u8]]) -> String {
     out
 }
 
-fn first_missing_expert_pack(experts_dir: &Path, model_config: &Path) -> Result<Option<PathBuf>> {
-    let (layers, experts) = match QwenModelConfig::from_file(model_config) {
-        Ok(config) => (config.num_hidden_layers, config.experts()),
-        Err(_) => (NUM_LAYERS, NUM_EXPERTS),
-    };
-    first_missing_expert_pack_for_shape(experts_dir, layers, experts)
-}
-
 fn is_expert_tensor_name(name: &str) -> bool {
     name.starts_with("model.layers.")
         && (name.contains(".experts.")
@@ -7156,10 +6691,6 @@ fn parse_layer_expert(name: &str) -> (Option<usize>, Option<usize>) {
         }
     }
     (layer, expert)
-}
-
-pub fn is_flashmoe_hf_model(model: &str) -> bool {
-    model.starts_with("hf://") && is_flashmoe_model_name(model)
 }
 
 #[cfg(test)]

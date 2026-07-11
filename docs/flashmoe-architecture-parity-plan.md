@@ -123,6 +123,9 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 - `model_family`: raw Qwen/Qwen-VL config parsing and validation, family-name resolution, model
   dimensions, tensor names, attention schedule, RoPE/MRoPE metadata, K policy, shared-expert shape,
   and typed dense/expert layouts. It must not assign a Qwen3.5 Q4 layout to unrelated families.
+- `planning`: backend/model selection, canonical model identity, artifact paths, requested routing
+  policy, cache readiness, and cache cleanup. It chooses no runtime implementation; concrete graph
+  stages remain the responsibility of `capabilities`.
 - `capabilities`: concrete model/device/storage capability resolution and precise unsupported
   errors. It returns a fully resolved graph, not a list of family-level stage labels.
 - `weights`: resident aligned dense blob, manifest, typed tensor/projection handles, dtype/layout
@@ -160,6 +163,10 @@ Baseline reviewed on 2026-07-10:
   metadata precedence, dimension/dtype validation, family-name detection, and derived MoE/attention
   dimensions. `legacy.rs`, `runtime.rs`, `vision.rs`, and expert fixtures consume that one type;
   the duplicate 400-line config and family-name implementation has been removed from `legacy.rs`.
+- `planning.rs` now owns `FlashMoePlan`, family-aware routing requests, backend/model selection,
+  canonical cache paths, readiness checks, and cleanup. Runtime and vision import the plan directly
+  from that owner. Cache readiness no longer substitutes Qwen3.5's 60x512 expert shape when config
+  parsing fails; malformed model metadata is an explicit planning error before graph construction.
 - State descriptors, resident projection descriptors, and many CMD1/CMD2/CMD3 input/output/layout
   records have been extracted.
 - Several missing CMD2/CMD3 continuations now produce explicit unsupported errors.
