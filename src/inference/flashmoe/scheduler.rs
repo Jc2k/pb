@@ -4096,6 +4096,21 @@ mod tests {
             routed.identity.output_handoff,
             ScheduledCmd3OutputHandoff::DeferredToNextLayer
         );
+
+        let complete_here = scheduler
+            .begin_layer(
+                17,
+                3,
+                5,
+                2,
+                ScheduledPreviousCmd3Handoff::cpu_visible(2, 8),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            complete_here.identity.output_handoff,
+            ScheduledCmd3OutputHandoff::CompleteHere
+        );
     }
 
     #[test]

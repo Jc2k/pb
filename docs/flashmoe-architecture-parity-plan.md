@@ -208,7 +208,7 @@ Baseline reviewed on 2026-07-10:
   per-projection dispatch otherwise, packed GPU output handoff, optional readback, timing, and
   cleanup are one implementation. The three duplicate encoders and fused-batch helper have been
   removed from `legacy.rs`.
-- `runtime.rs` now owns `forward_hidden`, the production token/layer loop, deferred CMD3 handoff,
+- `runtime.rs` now owns `forward_token_input`, the production token/layer loop, deferred CMD3 handoff,
   attention execution, CMD2/routing composition, active expert issue/finish, CMD3 submission, and
   final norm/state recording. Generation, prefill, tokenizer, and sampling entry points remain
   outside that hot loop. The dead CPU dense shared-expert runtime branch was removed; supported
@@ -224,8 +224,10 @@ Baseline reviewed on 2026-07-10:
   reads, CMD3 submission, and a scheduler-selected complete/defer output handoff. Per-layer full
   CPU-KV versus fused-linear-Metal attention is resolved once at load and carried by the
   transaction; `runtime.rs` no longer discovers it from model layout. The tiny-fixture expert-skip
-  runtime and dormant Qwen-VL embedding/DeepStack branch were deleted. Qwen-VL now reports its
-  unresolved typed input adapter rather than entering a different layer loop.
+  runtime and dormant Qwen-VL layer loop were deleted. Text lookup and exact precomputed visual
+  embeddings now enter the same typed token-input boundary. Declared per-layer additions force a
+  scheduler-owned complete-here CMD3 handoff, omit stale next-norm output, and are applied before
+  the next shared layer transaction.
 - Gate 4 has moved `DenseStore` as one owner into `weights.rs`: the mmap/blob and registry,
   resident tensor and norm caches, Q4 projection bindings, decoded/raw tile accounting, projection
   batches, CMD2/routing preparation, LM-head candidates, dtype decoding, and focused cache/read
@@ -323,10 +325,10 @@ Baseline reviewed on 2026-07-10:
 - `vision.rs` now owns Qwen-VL image decoding, smart resize, normalization, block-major patch
   packing, the serialized ViT configuration contract, visual encoding output, M-RoPE positions,
   placeholder-span validation, multi-image embedding/DeepStack assembly, and the typed
-  `QwenVlRuntimeInputs` emitted before decoder execution. The multimodal generation entry point
-  constructs that one typed input object before calling the prefill boundary. Because the shared
-  graph cannot consume it yet, prefill remains a precise unsupported input-adapter error rather
-  than branching inside the layer loop.
+  `QwenVlRuntimeInputs` emitted before decoder execution. Its cursor validates exact placeholder,
+  embedding, M-RoPE, and DeepStack cardinality and emits resident-text or precomputed-visual
+  `FlashMoeTokenInput` values. The multimodal prefill facade feeds those values through the same
+  scheduler/CMD runtime as text; there is no Qwen-VL decoder loop or embedding fallback.
 - `VisionEncoder` construction, image-to-patch entry, patch projection, learned position
   interpolation, block-major coordinate policy, spatial rotary math, transformer residual blocks,
   self-attention, ViT MLP execution, DeepStack/spatial merging, dense bias application, and
@@ -352,14 +354,15 @@ Baseline reviewed on 2026-07-10:
 
 The architecture is not yet at the target:
 
-- The legacy engine shell still stores the weights-owned `DenseStore` and state-owned session-cache
-  owner; runtime layout metadata and `VisionEncoder` also remain defined in `legacy.rs`.
+- The legacy engine shell still stores the weights-owned `DenseStore`, state-owned session-cache
+  owner, and runtime layout metadata even though their implementations live in focused modules.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
-  real-checkpoint smoke evidence. Qwen-VL now has typed preprocessing and a pre-MoE input adapter,
-  while graph consumption is unresolved; capability resolution still reports the input-adapter
-  stage as unsupported.
+  real-checkpoint smoke evidence. Qwen-VL preprocessing now emits exact typed inputs consumed by
+  the shared runtime, including scheduler-compatible DeepStack handoff policy. Qwen-VL capability
+  resolution and load binding still report the input-adapter stage as unsupported until the whole
+  family graph and a real checkpoint are proven together.
 - BF16/F16 dense and expert storage have import/reference support but no typed production graph
   implementations.
 
@@ -465,22 +468,24 @@ Required work:
 
 Exit criteria:
 
-- `forward_hidden` and the layer loop no longer live in `legacy.rs`.
+- `forward_token_input` and the layer loop no longer live in `legacy.rs`.
 - Runtime does not branch on Q4/BF16/F16, Qwen3.5/Qwen/Qwen-VL, or optional Metal helpers.
 - The scheduler is the only production caller that sequences CMD1/CMD2/routing/reads/CMD3.
 - Direct legacy execution paths are deleted or test-only.
 
 Completion evidence:
 
-- `runtime.rs` owns `forward_hidden` and the sole production token/layer loop; generation,
-  tokenizer, rendering, sampling, and unresolved model input adapters stay outside it.
+- `runtime.rs` owns `forward_token_input` and the sole production token/layer loop; generation,
+  tokenizer, rendering, sampling, and typed model input adaptation stay outside it.
 - `FlashMoeExecutionScheduler` owns the resolved graph, per-layer attention implementation table,
   sole expert store/read coordinator, and an allocation-free phase transaction from explicit
   previous-CMD3 handoff through CMD1, CMD2, routing, whole-slot reads, CMD3 submission, and
   complete/deferred output handoff.
 - Runtime no longer branches on family, dtype, Qwen-VL, optional executors, or implementation
-  probes. The expert-skip fixture runtime and Qwen-VL embedding/DeepStack layer-loop branch were
-  deleted; Qwen-VL remains a named unresolved input adapter.
+  probes. The expert-skip fixture runtime and Qwen-VL layer-loop branch were deleted. A generic
+  typed token input selects resident lookup or an exact precomputed embedding and exposes declared
+  per-layer additions without identifying the source family; Qwen-VL graph selection remains a
+  named unresolved capability until its load-time bindings are proven.
 - The concrete required-Metal facade and CMD3 input adapter moved with production execution into
   `runtime.rs`; deferred submission and typed GPU handoff ownership live in `metal.rs`. The
   undeclared CPU CMD3 input is test-only, and source audits show no production graph builder,
@@ -694,9 +699,10 @@ For Gate 6:
 3. Add resident BF16/F16 dense projection and whole-expert slot implementations through the same
    weight handles, scheduler leases, CMD builders, and state handoffs. Do not revive removed dense
    CPU/component paths as production continuations.
-4. Create `vision.rs` and move Qwen-VL preprocessing, embeddings, DeepStack, and MRoPE ownership
-   there. The adapter must emit typed token/position/embedding inputs before the shared MoE runtime;
-   it must not branch inside the layer loop.
+4. Resolve the Qwen-VL input adapter at load time now that `vision.rs` owns preprocessing,
+   embeddings, DeepStack, MRoPE, and exact typed token inputs consumed by the shared runtime. Prove
+   required vision/model bindings and a real checkpoint before changing its current precise
+   unsupported capability into a supported graph.
 5. Add a capability matrix and focused parity fixture for each supported family/dtype/layout. Keep
    every not-yet-implemented combination as a precise load-time unsupported-stage error while the
    matrix is filled in.

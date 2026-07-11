@@ -9,7 +9,7 @@ use super::metal::*;
 use super::scheduler::*;
 use super::state::*;
 use super::types::*;
-use super::vision::MropePosition;
+use super::vision::{FlashMoeTokenInput, MropePosition};
 use super::weights::*;
 
 use super::metal::MetalObjcId as ObjcId;
@@ -363,19 +363,23 @@ impl MetalExecutionFacade {
 
 impl FlashMoeEngine {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn forward_hidden(
+    pub(super) fn forward_token_input(
         &mut self,
-        previous: u32,
+        input: FlashMoeTokenInput<'_>,
         kv_cache: &mut KvCache,
         position: usize,
-        rope_position: MropePosition,
         record_generated: bool,
         mut timing: Option<&mut FlashMoeTokenTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
         let token_started = Instant::now();
-        let hidden_values = self.dense.embedding(previous, runtime.width)?;
+        let previous = input.token();
+        let rope_position = input.rope_position();
+        let hidden_values = match input.precomputed_embedding(runtime.width)? {
+            Some(values) => values.to_vec(),
+            None => self.dense.embedding(previous, runtime.width)?,
+        };
         let mut token_state = FlashMoeTokenState::new(
             hidden_values,
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
@@ -384,6 +388,8 @@ impl FlashMoeEngine {
         let mut deferred_expert_phase: Option<MetalScheduledCmd3Submission> = None;
 
         for layer in 0..self.config.num_hidden_layers {
+            let layer_addition = input.layer_addition(layer, runtime.width)?;
+            let allow_deferred_output = layer_addition.is_none();
             let report_layer_progress = progress.is_some()
                 || layer == 0
                 || layer + 1 == self.config.num_hidden_layers
@@ -465,7 +471,7 @@ impl FlashMoeEngine {
                 layer,
                 self.config.num_hidden_layers,
                 previous_handoff,
-                true,
+                allow_deferred_output,
             )?;
             let attention_implementation = layer_schedule.attention_implementation();
             let layer_started = Instant::now();
@@ -723,7 +729,7 @@ impl FlashMoeEngine {
                 layer,
                 self.config.num_hidden_layers,
                 runtime.width,
-                true,
+                allow_deferred_output,
                 |name, width| self.model_norm_weight(name, width),
             )?;
             let next_norm_weights = prepared_next_norm_weights.scheduled()?;
@@ -761,12 +767,25 @@ impl FlashMoeEngine {
                         let output = pending.wait()?;
                         token_state.apply_declared_expert_phase(
                             output,
-                            FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
+                            if layer_addition.is_some() {
+                                FlashMoeExpertPhaseApplication::HiddenOnly
+                            } else {
+                                FlashMoeExpertPhaseApplication::HiddenAndNextNormed
+                            },
                         )?;
                     }
                 }
                 expert_delta
             };
+            if let Some(addition) = layer_addition {
+                if deferred_expert_phase.is_some() {
+                    bail!(
+                        "FlashMoe scheduled layer {layer} deferred CMD3 despite a declared layer addition"
+                    );
+                }
+                add_in_place(token_state.hidden_mut(), addition);
+                token_state.clear_next_layer_normed();
+            }
             trace_layer_values(position, layer, "moe", token_state.hidden());
             let combine_started = Instant::now();
             if deferred_expert_phase.is_some() {
@@ -895,21 +914,19 @@ impl FlashMoeEngine {
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub(super) fn forward_hidden(
+    pub(super) fn forward_token_input(
         &mut self,
-        previous: u32,
+        input: FlashMoeTokenInput<'_>,
         kv_cache: &mut KvCache,
         position: usize,
-        rope_position: MropePosition,
         record_generated: bool,
         timing: Option<&mut FlashMoeTokenTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
         let _ = (
-            previous,
+            input,
             kv_cache,
             position,
-            rope_position,
             record_generated,
             timing,
             progress,

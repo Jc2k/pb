@@ -148,8 +148,8 @@ use super::types::*;
 #[cfg(test)]
 use super::vision::block_major_patch_coords;
 use super::vision::{
-    ImagePreprocessor, MropeAxis, MropePosition, Qwen3VLVisionConfig, QwenVlRuntimeInputs,
-    VisionEncoder, VisionEncoding,
+    FlashMoeTokenInput, ImagePreprocessor, MropeAxis, MropePosition, Qwen3VLVisionConfig,
+    QwenVlRuntimeInputs, VisionEncoder, VisionEncoding,
 };
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
@@ -2017,11 +2017,10 @@ impl FlashMoeEngine {
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
-            last_hidden = Some(self.forward_hidden(
-                token,
+            last_hidden = Some(self.forward_token_input(
+                FlashMoeTokenInput::text(token, position),
                 kv_cache,
                 position,
-                MropePosition::text(position),
                 false,
                 if timing.is_some() {
                     Some(&mut token_timing)
@@ -2063,23 +2062,20 @@ impl FlashMoeEngine {
         last_hidden.context("cannot generate from an empty prompt")
     }
 
-    /// Qwen-VL remains outside the text runtime until its typed input adapter resolves.
     fn prefill_with_vision(
         &mut self,
         inputs: &QwenVlRuntimeInputs,
         kv_cache: &mut KvCache,
     ) -> Result<Vec<f32>> {
-        let _ = (
-            inputs.prompt_tokens(),
-            inputs.visual_embeddings(),
-            inputs.deepstack_features(),
-            inputs.image_pad_token(),
-            inputs.mrope_positions(),
-            kv_cache,
-        );
-        bail!(
-            "FlashMoe unsupported Qwen-VL input adapter: vision embeddings, DeepStack features, and M-RoPE inputs are not resolved into the shared runtime graph"
-        )
+        let mut cursor = inputs.token_inputs()?;
+        let mut last_hidden = None;
+        while let Some((position, input)) = cursor.next_input()? {
+            let token = input.token();
+            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
+            last_hidden =
+                Some(self.forward_token_input(input, kv_cache, position, false, None, None)?);
+        }
+        last_hidden.context("cannot generate from empty Qwen-VL runtime inputs")
     }
 
     /// Generate text from ordered text and image content using the Qwen3-VL vision encoder.
@@ -2335,11 +2331,10 @@ impl FlashMoeEngine {
             FlashMoeTokenPhase::Decode,
             previous,
         );
-        let hidden = self.forward_hidden(
-            previous,
+        let hidden = self.forward_token_input(
+            FlashMoeTokenInput::resident(previous, rope_position),
             kv_cache,
             position,
-            rope_position,
             true,
             if timing.is_some() {
                 Some(&mut token_timing)

@@ -820,6 +820,119 @@ pub(super) enum MropeAxis {
     Width,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum FlashMoeEmbeddingInput<'a> {
+    ResidentToken,
+    Precomputed(&'a [f32]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct FlashMoeLayerAdditions<'a> {
+    features: &'a [Vec<Vec<f32>>],
+    visual_index: usize,
+}
+
+impl<'a> FlashMoeLayerAdditions<'a> {
+    fn for_visual_token(
+        features: &[Vec<Vec<f32>>],
+        visual_index: usize,
+    ) -> FlashMoeLayerAdditions<'_> {
+        FlashMoeLayerAdditions {
+            features,
+            visual_index,
+        }
+    }
+
+    pub(super) fn layer_feature(self, layer: usize, width: usize) -> Result<Option<&'a [f32]>> {
+        let Some(features_for_layer) = self.features.get(layer) else {
+            return Ok(None);
+        };
+        let feature = features_for_layer.get(self.visual_index).with_context(|| {
+            format!(
+                "FlashMoe token input is missing DeepStack feature for layer {layer}, visual token {}",
+                self.visual_index
+            )
+        })?;
+        if feature.len() != width {
+            bail!(
+                "FlashMoe DeepStack feature for layer {layer}, visual token {} has width {}, expected {width}",
+                self.visual_index,
+                feature.len()
+            );
+        }
+        Ok(Some(feature))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct FlashMoeTokenInput<'a> {
+    token: u32,
+    rope_position: MropePosition,
+    embedding: FlashMoeEmbeddingInput<'a>,
+    layer_additions: Option<FlashMoeLayerAdditions<'a>>,
+}
+
+impl<'a> FlashMoeTokenInput<'a> {
+    pub(super) fn text(token: u32, position: usize) -> Self {
+        Self::resident(token, MropePosition::text(position))
+    }
+
+    pub(super) fn resident(token: u32, rope_position: MropePosition) -> Self {
+        Self {
+            token,
+            rope_position,
+            embedding: FlashMoeEmbeddingInput::ResidentToken,
+            layer_additions: None,
+        }
+    }
+
+    fn visual(
+        token: u32,
+        rope_position: MropePosition,
+        embedding: &'a [f32],
+        deepstack_features: &'a [Vec<Vec<f32>>],
+        visual_index: usize,
+    ) -> Self {
+        Self {
+            token,
+            rope_position,
+            embedding: FlashMoeEmbeddingInput::Precomputed(embedding),
+            layer_additions: Some(FlashMoeLayerAdditions::for_visual_token(
+                deepstack_features,
+                visual_index,
+            )),
+        }
+    }
+
+    pub(super) fn token(self) -> u32 {
+        self.token
+    }
+
+    pub(super) fn rope_position(self) -> MropePosition {
+        self.rope_position
+    }
+
+    pub(super) fn precomputed_embedding(self, width: usize) -> Result<Option<&'a [f32]>> {
+        let FlashMoeEmbeddingInput::Precomputed(values) = self.embedding else {
+            return Ok(None);
+        };
+        if values.len() != width {
+            bail!(
+                "FlashMoe precomputed token embedding has width {}, expected {width}",
+                values.len()
+            );
+        }
+        Ok(Some(values))
+    }
+
+    pub(super) fn layer_addition(self, layer: usize, width: usize) -> Result<Option<&'a [f32]>> {
+        self.layer_additions
+            .map(|additions| additions.layer_feature(layer, width))
+            .transpose()
+            .map(Option::flatten)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VisionEncoding {
     pub embeddings: Vec<Vec<f32>>,
@@ -970,24 +1083,93 @@ impl QwenVlRuntimeInputs {
         &self.prompt_tokens
     }
 
-    pub(super) fn visual_embeddings(&self) -> &[Vec<f32>] {
-        &self.visual_embeddings
-    }
-
-    pub(super) fn deepstack_features(&self) -> &[Vec<Vec<f32>>] {
-        &self.deepstack_features
-    }
-
-    pub(super) fn image_pad_token(&self) -> u32 {
-        self.image_pad_token
-    }
-
-    pub(super) fn mrope_positions(&self) -> &[MropePosition] {
-        &self.mrope_positions
-    }
-
     pub(super) fn next_mrope_position(&self) -> usize {
         self.next_mrope_position
+    }
+
+    pub(super) fn token_inputs(&self) -> Result<QwenVlTokenInputCursor<'_>> {
+        if self.mrope_positions.len() != self.prompt_tokens.len() {
+            bail!(
+                "Qwen-VL input adapter has {} tokens but {} M-RoPE positions",
+                self.prompt_tokens.len(),
+                self.mrope_positions.len()
+            );
+        }
+        let placeholder_count = self
+            .prompt_tokens
+            .iter()
+            .filter(|&&token| token == self.image_pad_token)
+            .count();
+        if placeholder_count != self.visual_embeddings.len() {
+            bail!(
+                "Qwen-VL input adapter has {placeholder_count} visual token placeholders but {} embeddings",
+                self.visual_embeddings.len()
+            );
+        }
+        for (layer, features) in self.deepstack_features.iter().enumerate() {
+            if features.len() != self.visual_embeddings.len() {
+                bail!(
+                    "Qwen-VL input adapter DeepStack layer {layer} has {} features for {} visual embeddings",
+                    features.len(),
+                    self.visual_embeddings.len()
+                );
+            }
+        }
+        Ok(QwenVlTokenInputCursor {
+            inputs: self,
+            position: 0,
+            visual_index: 0,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct QwenVlTokenInputCursor<'a> {
+    inputs: &'a QwenVlRuntimeInputs,
+    position: usize,
+    visual_index: usize,
+}
+
+impl<'a> QwenVlTokenInputCursor<'a> {
+    pub(super) fn next_input(&mut self) -> Result<Option<(usize, FlashMoeTokenInput<'a>)>> {
+        let Some(&token) = self.inputs.prompt_tokens.get(self.position) else {
+            if self.visual_index != self.inputs.visual_embeddings.len() {
+                bail!(
+                    "Qwen-VL input adapter consumed {} of {} visual embeddings",
+                    self.visual_index,
+                    self.inputs.visual_embeddings.len()
+                );
+            }
+            return Ok(None);
+        };
+        let position = self.position;
+        let rope_position = *self.inputs.mrope_positions.get(position).with_context(|| {
+            format!("Qwen-VL input adapter is missing M-RoPE position {position}")
+        })?;
+        let input = if token == self.inputs.image_pad_token {
+            let visual_index = self.visual_index;
+            let embedding = self
+                .inputs
+                .visual_embeddings
+                .get(visual_index)
+                .with_context(|| {
+                    format!(
+                        "Qwen-VL input adapter is missing embedding for visual token {visual_index}"
+                    )
+                })?;
+            self.visual_index += 1;
+            FlashMoeTokenInput::visual(
+                token,
+                rope_position,
+                embedding,
+                &self.inputs.deepstack_features,
+                visual_index,
+            )
+        } else {
+            FlashMoeTokenInput::resident(token, rope_position)
+        };
+        self.position += 1;
+        Ok(Some((position, input)))
     }
 }
 
@@ -1179,14 +1361,14 @@ mod tests {
             inputs.prompt_tokens(),
             [10, 97, 99, 99, 98, 11, 97, 99, 99, 98, 12]
         );
-        assert_eq!(inputs.visual_embeddings().len(), 4);
-        assert_eq!(inputs.deepstack_features().len(), 2);
-        assert_eq!(inputs.deepstack_features()[0].len(), 4);
-        assert_eq!(inputs.image_pad_token(), 99);
-        assert_eq!(inputs.mrope_positions().len(), inputs.prompt_tokens().len());
+        assert_eq!(inputs.visual_embeddings.len(), 4);
+        assert_eq!(inputs.deepstack_features.len(), 2);
+        assert_eq!(inputs.deepstack_features[0].len(), 4);
+        assert_eq!(inputs.image_pad_token, 99);
+        assert_eq!(inputs.mrope_positions.len(), inputs.prompt_tokens().len());
         assert_eq!(inputs.next_mrope_position(), 11);
         assert_eq!(
-            inputs.mrope_positions()[3],
+            inputs.mrope_positions[3],
             MropePosition {
                 temporal: 2,
                 height: 2,
@@ -1207,5 +1389,80 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("incompatible DeepStack"));
+    }
+
+    #[test]
+    fn qwen_vl_token_cursor_emits_typed_text_and_visual_inputs_in_order() {
+        let inputs =
+            QwenVlRuntimeInputs::build(vec![10, 99, 11], 97, 98, 99, vec![encoding(1, 1, 2)])
+                .unwrap();
+        let mut cursor = inputs.token_inputs().unwrap();
+
+        let (position, text_start) = cursor.next_input().unwrap().unwrap();
+        assert_eq!(position, 0);
+        assert_eq!(text_start.token(), 10);
+        assert_eq!(text_start.precomputed_embedding(1).unwrap(), None);
+        assert_eq!(text_start.layer_addition(0, 1).unwrap(), None);
+
+        let (position, vision_start) = cursor.next_input().unwrap().unwrap();
+        assert_eq!(position, 1);
+        assert_eq!(vision_start.token(), 97);
+
+        let (position, visual) = cursor.next_input().unwrap().unwrap();
+        assert_eq!(position, 2);
+        assert_eq!(visual.token(), 99);
+        assert_eq!(visual.precomputed_embedding(1).unwrap(), Some(&[0.0][..]));
+        assert_eq!(visual.layer_addition(0, 1).unwrap(), Some(&[0.0][..]));
+        assert_eq!(visual.layer_addition(1, 1).unwrap(), Some(&[100.0][..]));
+        assert_eq!(visual.layer_addition(2, 1).unwrap(), None);
+
+        let (position, vision_end) = cursor.next_input().unwrap().unwrap();
+        assert_eq!(position, 3);
+        assert_eq!(vision_end.token(), 98);
+
+        let (position, text_end) = cursor.next_input().unwrap().unwrap();
+        assert_eq!(position, 4);
+        assert_eq!(text_end.token(), 11);
+        assert_eq!(cursor.next_input().unwrap(), None);
+    }
+
+    #[test]
+    fn typed_visual_input_rejects_embedding_and_deepstack_width_mismatches() {
+        let embedding = [1.0, 2.0];
+        let deepstack = vec![vec![vec![3.0]]];
+        let input =
+            FlashMoeTokenInput::visual(99, MropePosition::text(0), &embedding, &deepstack, 0);
+
+        let embedding_error = input.precomputed_embedding(3).unwrap_err();
+        assert!(
+            embedding_error
+                .to_string()
+                .contains("embedding has width 2, expected 3")
+        );
+        let deepstack_error = input.layer_addition(0, 2).unwrap_err();
+        assert!(
+            deepstack_error
+                .to_string()
+                .contains("DeepStack feature for layer 0, visual token 0 has width 1, expected 2")
+        );
+    }
+
+    #[test]
+    fn qwen_vl_token_cursor_rejects_incomplete_deepstack_layers() {
+        let inputs = QwenVlRuntimeInputs {
+            prompt_tokens: vec![99, 99],
+            visual_embeddings: vec![vec![1.0], vec![2.0]],
+            deepstack_features: vec![vec![vec![3.0]]],
+            image_pad_token: 99,
+            mrope_positions: vec![MropePosition::text(0), MropePosition::text(1)],
+            next_mrope_position: 2,
+        };
+
+        let error = inputs.token_inputs().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DeepStack layer 0 has 1 features for 2 visual embeddings")
+        );
     }
 }
