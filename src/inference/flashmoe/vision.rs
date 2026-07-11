@@ -3,7 +3,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::capabilities::FlashMoeInputAdapterCapability;
 use super::legacy::{FlashMoePlan, QwenModelConfig};
+use super::model_family::QwenMoeFamily;
 use super::types::{
     VIT_IMAGE_MEAN, VIT_IMAGE_STD, VIT_MAX_PIXELS, VIT_MERGE_SIZE, VIT_MIN_PIXELS, VIT_PATCH_SIZE,
 };
@@ -334,27 +336,172 @@ pub struct VisionEncoder {
     pub(super) dense: DenseStore,
 }
 
-impl VisionEncoder {
-    pub fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Option<Self>> {
-        let (Some(weights), Some(manifest), Some(config)) = (
-            plan.vision_weights.as_ref(),
-            plan.vision_manifest.as_ref(),
-            text_config.vision_config.as_ref(),
-        ) else {
-            return Ok(None);
-        };
-        if !weights.is_file() || !manifest.is_file() {
-            tracing::debug!(
-                model = %plan.model,
-                "vision weights not found on disk; VisionEncoder skipped"
-            );
-            return Ok(None);
+#[derive(Debug, Clone)]
+pub(super) enum FlashMoeInputAdapterExecutor {
+    QwenText,
+    QwenVl(VisionEncoder),
+}
+
+impl FlashMoeInputAdapterExecutor {
+    pub(super) fn from_plan(
+        family: QwenMoeFamily,
+        plan: &FlashMoePlan,
+        text_config: &QwenModelConfig,
+    ) -> Result<Self> {
+        match family {
+            QwenMoeFamily::Qwen3VlMoe => {
+                Ok(Self::QwenVl(VisionEncoder::from_plan(plan, text_config)?))
+            }
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe => Ok(Self::QwenText),
         }
-        Ok(Some(Self {
+    }
+
+    pub(super) fn capability(&self) -> Result<FlashMoeInputAdapterCapability> {
+        match self {
+            Self::QwenText => Ok(FlashMoeInputAdapterCapability::QwenText),
+            Self::QwenVl(encoder) => encoder.resolved_input_adapter(),
+        }
+    }
+
+    pub(super) fn vision_encoder(&self) -> Result<&VisionEncoder> {
+        match self {
+            Self::QwenVl(encoder) => Ok(encoder),
+            Self::QwenText => bail!(
+                "FlashMoe unsupported Qwen text path: token/position input preparation has no Qwen-VL vision encoder"
+            ),
+        }
+    }
+}
+
+impl VisionEncoder {
+    fn from_plan(plan: &FlashMoePlan, text_config: &QwenModelConfig) -> Result<Self> {
+        let config = text_config.vision_config.as_ref().context(
+            "FlashMoe unsupported Qwen text path: token/position input preparation has no vision config",
+        )?;
+        let weights = plan.vision_weights.as_ref().with_context(|| {
+            format!(
+                "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation requires a vision weights artifact for {}",
+                plan.model
+            )
+        })?;
+        let manifest = plan.vision_manifest.as_ref().with_context(|| {
+            format!(
+                "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation requires a vision tensor manifest for {}",
+                plan.model
+            )
+        })?;
+        if !weights.is_file() {
+            bail!(
+                "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation vision weights artifact is missing: {}",
+                weights.display()
+            );
+        }
+        if !manifest.is_file() {
+            bail!(
+                "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation vision manifest is missing: {}",
+                manifest.display()
+            );
+        }
+        let encoder = Self {
             config: config.clone(),
             text_hidden_size: text_config.hidden_size,
             dense: DenseStore::open(weights.clone(), manifest.clone())?,
-        }))
+        };
+        encoder.resolved_input_adapter()?;
+        Ok(encoder)
+    }
+
+    pub(crate) fn resolved_input_adapter(&self) -> Result<FlashMoeInputAdapterCapability> {
+        let output_hidden_size = self.config.out_hidden_size.unwrap_or(self.text_hidden_size);
+        if output_hidden_size != self.text_hidden_size {
+            bail!(
+                "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation emits width {output_hidden_size}, expected text hidden width {}",
+                self.text_hidden_size
+            );
+        }
+        for (index, &layer) in self.config.deepstack_visual_indexes.iter().enumerate() {
+            if layer >= self.config.depth {
+                bail!(
+                    "FlashMoe unsupported Qwen3VlMoe path: DeepStack index {layer} is outside vision depth {}",
+                    self.config.depth
+                );
+            }
+            if self.config.deepstack_visual_indexes[..index].contains(&layer) {
+                bail!(
+                    "FlashMoe unsupported Qwen3VlMoe path: duplicate DeepStack vision layer {layer}"
+                );
+            }
+        }
+        self.validate_required_manifest_bindings()?;
+        Ok(FlashMoeInputAdapterCapability::QwenVl {
+            text_hidden_size: self.text_hidden_size,
+            vision_embed_dim: self.config.embed_dim,
+            vision_depth: self.config.depth,
+            deepstack_layers: self.config.deepstack_visual_indexes.len(),
+        })
+    }
+
+    fn validate_required_manifest_bindings(&self) -> Result<()> {
+        let registry = self.dense.registry();
+        let require = |name: &str| -> Result<()> {
+            let entry = registry.tensor(name).with_context(|| {
+                format!(
+                    "FlashMoe unsupported Qwen3VlMoe path: token/position input preparation is missing vision tensor {name}"
+                )
+            })?;
+            if entry.shape.is_empty() || entry.shape.contains(&0) {
+                bail!(
+                    "FlashMoe unsupported Qwen3VlMoe path: vision tensor {name} has invalid shape {:?}",
+                    entry.shape
+                );
+            }
+            Ok(())
+        };
+
+        require("visual.patch_embed.proj.weight")?;
+        require("visual.pos_embed.weight")?;
+        for layer in 0..self.config.depth {
+            for suffix in [
+                "norm1.weight",
+                "attn.qkv.weight",
+                "attn.proj.weight",
+                "norm2.weight",
+                "mlp.fc1.weight",
+                "mlp.fc2.weight",
+            ] {
+                require(&format!("visual.blocks.{layer}.{suffix}"))?;
+            }
+        }
+        self.validate_merger_manifest_bindings("visual.merger", &require)?;
+        for merger in 0..self.config.deepstack_visual_indexes.len() {
+            self.validate_merger_manifest_bindings(
+                &format!("visual.deepstack_merger_list.{merger}"),
+                &require,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_merger_manifest_bindings(
+        &self,
+        prefix: &str,
+        require: &impl Fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        if self
+            .dense
+            .registry()
+            .tensor(&format!("{prefix}.norm.weight"))
+            .is_some()
+        {
+            require(&format!("{prefix}.norm.weight"))?;
+            require(&format!("{prefix}.linear_fc1.weight"))?;
+            require(&format!("{prefix}.linear_fc2.weight"))?;
+        } else {
+            require(&format!("{prefix}.ln_q.weight"))?;
+            require(&format!("{prefix}.mlp.0.weight"))?;
+            require(&format!("{prefix}.mlp.2.weight"))?;
+        }
+        Ok(())
     }
 
     pub fn encode(
@@ -1329,6 +1476,7 @@ fn token_run_bounds(tokens: &[u32], needle: u32) -> Vec<(usize, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::flashmoe::{QWEN3_VL_MODEL, plan_unchecked};
 
     fn encoding(grid_h: usize, grid_w: usize, deepstack_depth: usize) -> VisionEncoding {
         let tokens = grid_h * grid_w;
@@ -1344,6 +1492,32 @@ mod tests {
             merged_grid_h: grid_h,
             merged_grid_w: grid_w,
         }
+    }
+
+    fn qwen_vl_text_config() -> QwenModelConfig {
+        serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_vl_moe",
+            "architectures": ["Qwen3VLMoeForConditionalGeneration"],
+            "num_hidden_layers": 2,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 248320,
+            "num_experts": 512,
+            "num_experts_per_tok": 3,
+            "norm_topk_prob": true,
+            "moe_intermediate_size": 1536,
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 64,
+                "num_heads": 4,
+                "patch_size": 14,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "out_hidden_size": 4096
+            }
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -1375,6 +1549,48 @@ mod tests {
                 width: 3,
             }
         );
+    }
+
+    #[test]
+    fn qwen_vl_encoder_requires_declared_vision_artifacts_at_load_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = plan_unchecked(QWEN3_VL_MODEL, temp.path());
+        plan.vision_weights = None;
+
+        let error = VisionEncoder::from_plan(&plan, &qwen_vl_text_config()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a vision weights artifact"),
+            "{error:#}"
+        );
+
+        plan.vision_weights = Some(temp.path().join("missing-vision.bin"));
+        let error = VisionEncoder::from_plan(&plan, &qwen_vl_text_config()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("vision weights artifact is missing"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn input_adapter_executor_uses_resolved_family_not_incidental_vision_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked("hf://Qwen/Qwen3-30B-A3B", temp.path());
+        let config = qwen_vl_text_config();
+
+        let adapter =
+            FlashMoeInputAdapterExecutor::from_plan(QwenMoeFamily::Qwen35A17B, &plan, &config)
+                .unwrap();
+        assert!(matches!(adapter, FlashMoeInputAdapterExecutor::QwenText));
+        assert_eq!(
+            adapter.capability().unwrap(),
+            FlashMoeInputAdapterCapability::QwenText
+        );
+        let error = adapter.vision_encoder().unwrap_err();
+        assert!(error.to_string().contains("has no Qwen-VL vision encoder"));
     }
 
     #[test]

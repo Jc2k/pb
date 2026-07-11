@@ -148,8 +148,8 @@ use super::types::*;
 #[cfg(test)]
 use super::vision::block_major_patch_coords;
 use super::vision::{
-    FlashMoeTokenInput, ImagePreprocessor, MropeAxis, MropePosition, Qwen3VLVisionConfig,
-    QwenVlRuntimeInputs, VisionEncoder, VisionEncoding,
+    FlashMoeInputAdapterExecutor, FlashMoeTokenInput, ImagePreprocessor, MropeAxis, MropePosition,
+    Qwen3VLVisionConfig, QwenVlRuntimeInputs, VisionEncoding,
 };
 #[cfg(test)]
 use super::weights::SharedExpertPhaseWeights;
@@ -1168,7 +1168,7 @@ where
     let dense_layout = dense.registry().resolve_resident_dense_layout()?;
     if matches!(
         model_layout.family,
-        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe
+        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe
     ) && dense_layout == ResidentDenseLayout::Q4
     {
         validate_qwen_q4_graph_bindings(
@@ -1181,7 +1181,9 @@ where
     }
     progress("dense_graph_bindings", phase_started.elapsed());
     phase_started = Instant::now();
-    let vision_encoder = VisionEncoder::from_plan(plan, &config)?;
+    let input_adapter_executor =
+        FlashMoeInputAdapterExecutor::from_plan(model_layout.family, plan, &config)?;
+    let input_adapter = input_adapter_executor.capability()?;
     progress("vision_encoder", phase_started.elapsed());
     phase_started = Instant::now();
     let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
@@ -1194,6 +1196,7 @@ where
     phase_started = Instant::now();
     let capability_plan = FlashMoeCapabilityPlan::resolve(
         &model_layout,
+        input_adapter,
         dense_layout,
         expert_storage,
         Some(metal.runtime_capabilities()),
@@ -1219,7 +1222,7 @@ where
         dense,
         tokenizer,
         metal,
-        vision_encoder,
+        input_adapter_executor,
         config,
         model_layout,
         capability_plan,
@@ -1243,8 +1246,7 @@ pub struct FlashMoeEngine {
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) runtime: DenseTransformerRuntime,
     pub(super) shared_expert_phases: SharedExpertPhaseCache,
-    /// Vision encoder, present only for Qwen3-VL plans.
-    vision_encoder: Option<VisionEncoder>,
+    input_adapter_executor: FlashMoeInputAdapterExecutor,
     session_cache: FlashMoeSessionCache,
 }
 
@@ -2102,9 +2104,7 @@ impl FlashMoeEngine {
             .context("generate_multimodal requires a Qwen3-VL plan with a vision_config")?;
         let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
         let (parts, visual_encodings) = {
-            let encoder = self.vision_encoder.as_ref().context(
-                "generate_multimodal requires a loaded VisionEncoder; this plan has no vision weights",
-            )?;
+            let encoder = self.input_adapter_executor.vision_encoder()?;
             let mut parts = Vec::with_capacity(request.content.len());
             let mut visual_encodings = Vec::with_capacity(image_count);
             for part in &request.content {
@@ -2151,9 +2151,7 @@ impl FlashMoeEngine {
                 .context("generate_with_image requires a Qwen3-VL plan with a vision_config")?;
             let preprocessor = ImagePreprocessor::from_vision_config(vision_config);
             let visual = {
-                let encoder = self.vision_encoder.as_ref().context(
-                    "generate_with_image requires a loaded VisionEncoder; this plan has no vision weights",
-                )?;
+                let encoder = self.input_adapter_executor.vision_encoder()?;
                 encoder.encode(&preprocessor, &request.image_path)?
             };
             return self.generate_with_encoded_visual_prompt(

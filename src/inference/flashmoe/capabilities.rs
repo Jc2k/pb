@@ -85,6 +85,7 @@ impl FlashMoeStagePlacement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMoeStageImplementation {
     QwenTextInput,
+    QwenVlTypedInput,
     DeferredMetalCmd3,
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
@@ -99,6 +100,7 @@ impl FlashMoeStageImplementation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QwenTextInput => "Qwen text token/position adapter",
+            Self::QwenVlTypedInput => "Qwen-VL typed token/position/embedding/DeepStack adapter",
             Self::DeferredMetalCmd3 => "deferred Metal CMD3 handoff",
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
@@ -149,6 +151,17 @@ pub enum FlashMoeStatePolicy {
     DeferredGpuNextLayer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeInputAdapterCapability {
+    QwenText,
+    QwenVl {
+        text_hidden_size: usize,
+        vision_embed_dim: usize,
+        vision_depth: usize,
+        deepstack_layers: usize,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FlashMoeDeviceCapability {
     pub(crate) metal: MetalRuntimeCapabilities,
@@ -157,6 +170,7 @@ pub(crate) struct FlashMoeDeviceCapability {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeCapabilityPlan {
     pub family: QwenMoeFamily,
+    pub(crate) input_adapter: FlashMoeInputAdapterCapability,
     pub(crate) dense_layout: ResidentDenseLayout,
     pub(crate) expert_storage: ExpertStoreExecutionDescriptor,
     pub(crate) device: FlashMoeDeviceCapability,
@@ -172,25 +186,27 @@ pub struct FlashMoeCapabilityPlan {
 impl FlashMoeCapabilityPlan {
     pub(crate) fn resolve(
         layout: &QwenMoeModelLayout,
+        input_adapter: FlashMoeInputAdapterCapability,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
-        match layout.family {
-            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe => {
-                Self::resolve_qwen_text_q4(layout, dense_layout, expert_storage, metal)
-            }
-            QwenMoeFamily::Qwen3VlMoe => Err(FlashMoeUnsupportedCapability::new(
-                layout.family,
-                FlashMoeGraphStage::TokenPositionInputPreparation,
-                "Qwen3-VL vision adapter has not been wired into the unified scheduler",
-            )),
-        }
+        let input_implementation = resolve_input_adapter(layout, input_adapter)?;
+        Self::resolve_qwen_q4(
+            layout,
+            input_adapter,
+            input_implementation,
+            dense_layout,
+            expert_storage,
+            metal,
+        )
     }
 
-    fn resolve_qwen_text_q4(
+    fn resolve_qwen_q4(
         layout: &QwenMoeModelLayout,
+        input_adapter: FlashMoeInputAdapterCapability,
+        input_implementation: FlashMoeStageImplementation,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
         metal: Option<MetalRuntimeCapabilities>,
@@ -303,7 +319,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::TokenPositionInputPreparation,
                 FlashMoeStagePlacement::InputAdapter,
-                FlashMoeStageImplementation::QwenTextInput,
+                input_implementation,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::DeferredPreviousCmd3,
@@ -348,6 +364,7 @@ impl FlashMoeCapabilityPlan {
         ];
         let plan = Self {
             family: layout.family,
+            input_adapter,
             dense_layout,
             expert_storage,
             device: FlashMoeDeviceCapability { metal },
@@ -370,6 +387,7 @@ impl FlashMoeCapabilityPlan {
         validate_upstream_execution_policy(layout)?;
         Self::resolve(
             layout,
+            FlashMoeInputAdapterCapability::QwenText,
             ResidentDenseLayout::Q4,
             test_expert_storage(layout)?,
             Some(MetalRuntimeCapabilities::from_pipeline_names(
@@ -395,6 +413,64 @@ impl FlashMoeCapabilityPlan {
         self.stages
             .iter()
             .find(|capability| capability.stage == stage)
+    }
+}
+
+fn resolve_input_adapter(
+    layout: &QwenMoeModelLayout,
+    input_adapter: FlashMoeInputAdapterCapability,
+) -> Result<FlashMoeStageImplementation, FlashMoeUnsupportedCapability> {
+    match (layout.family, input_adapter) {
+        (
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe,
+            FlashMoeInputAdapterCapability::QwenText,
+        ) => Ok(FlashMoeStageImplementation::QwenTextInput),
+        (
+            QwenMoeFamily::Qwen3VlMoe,
+            FlashMoeInputAdapterCapability::QwenVl {
+                text_hidden_size,
+                vision_embed_dim,
+                vision_depth,
+                deepstack_layers,
+            },
+        ) if layout.has_vision
+            && text_hidden_size == layout.hidden_size
+            && vision_embed_dim > 0
+            && vision_depth > 0
+            && deepstack_layers <= vision_depth =>
+        {
+            Ok(FlashMoeStageImplementation::QwenVlTypedInput)
+        }
+        (QwenMoeFamily::Qwen3VlMoe, FlashMoeInputAdapterCapability::QwenText) => {
+            Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::TokenPositionInputPreparation,
+                "the resolved resources do not include a Qwen-VL vision encoder and typed input adapter",
+            ))
+        }
+        (
+            QwenMoeFamily::Qwen3VlMoe,
+            FlashMoeInputAdapterCapability::QwenVl {
+                text_hidden_size,
+                vision_embed_dim,
+                vision_depth,
+                deepstack_layers,
+            },
+        ) => Err(FlashMoeUnsupportedCapability::new(
+            layout.family,
+            FlashMoeGraphStage::TokenPositionInputPreparation,
+            format!(
+                "Qwen-VL adapter metadata does not match the model: has_vision={}, text_hidden_size={text_hidden_size} expected={}, vision_embed_dim={vision_embed_dim}, vision_depth={vision_depth}, deepstack_layers={deepstack_layers}",
+                layout.has_vision, layout.hidden_size
+            ),
+        )),
+        (_, FlashMoeInputAdapterCapability::QwenVl { .. }) => {
+            Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::TokenPositionInputPreparation,
+                "a Qwen-VL input adapter cannot be bound to a text-only Qwen graph",
+            ))
+        }
     }
 }
 
@@ -572,6 +648,7 @@ mod tests {
   "torch_dtype": "bfloat16",
   "num_experts": 512,
   "num_experts_per_tok": 3,
+  "norm_topk_prob": true,
   "moe_intermediate_size": 1536,
   "vision_config": {
     "depth": 1,
@@ -618,6 +695,19 @@ mod tests {
         MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
     }
 
+    fn text_adapter() -> FlashMoeInputAdapterCapability {
+        FlashMoeInputAdapterCapability::QwenText
+    }
+
+    fn qwen_vl_adapter() -> FlashMoeInputAdapterCapability {
+        FlashMoeInputAdapterCapability::QwenVl {
+            text_hidden_size: 4096,
+            vision_embed_dim: 64,
+            vision_depth: 1,
+            deepstack_layers: 0,
+        }
+    }
+
     fn metal_without_shared_activation() -> MetalRuntimeCapabilities {
         let mut names = MetalPipelineNameSet::new();
         names.shared_expert_activation = kernels::FILL_ZERO;
@@ -632,9 +722,13 @@ mod tests {
 
     #[test]
     fn qwen35_q4_capability_plan_resolves_concrete_storage_and_device() {
-        let layout = qwen35_layout();
+        let mut layout = qwen35_layout();
+        // Some Qwen3.5 checkpoints retain incidental vision metadata even
+        // though family resolution selects the text-only Qwen3.5 graph.
+        layout.has_vision = true;
         let plan = FlashMoeCapabilityPlan::resolve(
             &layout,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
             Some(full_metal()),
@@ -663,6 +757,7 @@ mod tests {
         let layout = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
             None,
@@ -682,6 +777,7 @@ mod tests {
         let layout = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
+            text_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&layout),
             Some(full_metal()),
@@ -697,6 +793,7 @@ mod tests {
         let layout = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
             Some(MetalRuntimeCapabilities::empty_for_test()),
@@ -708,20 +805,65 @@ mod tests {
     }
 
     #[test]
-    fn qwen_vl_capability_plan_fails_with_a_named_missing_stage() {
+    fn qwen_vl_capability_plan_requires_and_resolves_the_typed_adapter() {
         let layout = qwen3_vl_layout();
-        let qwen35 = qwen35_layout();
         let err = FlashMoeCapabilityPlan::resolve(
             &layout,
+            text_adapter(),
             ResidentDenseLayout::Q4,
-            fixed_q4_experts(&qwen35),
+            fixed_q4_experts(&layout),
             Some(full_metal()),
         )
         .unwrap_err();
 
         assert_eq!(err.family, QwenMoeFamily::Qwen3VlMoe);
         assert_eq!(err.stage, FlashMoeGraphStage::TokenPositionInputPreparation);
-        assert!(err.to_string().contains("Qwen3-VL vision adapter"), "{err}");
+        assert!(err.to_string().contains("Qwen-VL vision encoder"), "{err}");
+
+        let metadata_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            FlashMoeInputAdapterCapability::QwenVl {
+                text_hidden_size: 2048,
+                vision_embed_dim: 64,
+                vision_depth: 1,
+                deepstack_layers: 0,
+            },
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            Some(full_metal()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            metadata_error.stage,
+            FlashMoeGraphStage::TokenPositionInputPreparation
+        );
+        assert!(
+            metadata_error.reason.contains("text_hidden_size=2048"),
+            "{metadata_error}"
+        );
+
+        let plan = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            qwen_vl_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            Some(full_metal()),
+        )
+        .unwrap();
+        assert_eq!(plan.family, QwenMoeFamily::Qwen3VlMoe);
+        assert_eq!(plan.input_adapter, qwen_vl_adapter());
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::TokenPositionInputPreparation)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::QwenVlTypedInput
+        );
+        plan.validate_complete().unwrap();
+        let graph =
+            crate::inference::flashmoe::scheduler::FlashMoeScheduledGraph::from_capabilities(&plan)
+                .unwrap();
+        assert_eq!(graph.family(), QwenMoeFamily::Qwen3VlMoe);
+        assert_eq!(graph.active_experts(), 3);
     }
 
     #[test]
@@ -793,6 +935,7 @@ mod tests {
         let qwen3 = qwen3_moe_layout(Some(true));
         FlashMoeCapabilityPlan::resolve(
             &qwen3,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen3),
             Some(metal_without_shared_activation()),
@@ -802,6 +945,7 @@ mod tests {
         let qwen35 = qwen35_layout();
         let shared_error = FlashMoeCapabilityPlan::resolve(
             &qwen35,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen35),
             Some(metal_without_shared_activation()),
@@ -819,6 +963,7 @@ mod tests {
 
         let linear_error = FlashMoeCapabilityPlan::resolve(
             &qwen35,
+            text_adapter(),
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&qwen35),
             Some(metal_without_linear_conv1d()),
@@ -836,6 +981,7 @@ mod tests {
         let layout = qwen35_layout();
         let plan = FlashMoeCapabilityPlan {
             family: QwenMoeFamily::Qwen35A17B,
+            input_adapter: text_adapter(),
             dense_layout: ResidentDenseLayout::Q4,
             expert_storage: fixed_q4_experts(&layout),
             device: FlashMoeDeviceCapability {

@@ -108,7 +108,8 @@ loops. Candidate layout families include:
   contracts.
 - `AttentionImplementation` and `RoutingImplementation` values that include placement rather than
   allowing helpers to discover placement at runtime.
-- `VisionAdapter::None` or a typed Qwen-VL adapter that emits the same runtime inputs as text.
+- `FlashMoeInputAdapterExecutor::{QwenText, QwenVl}` with a retained concrete capability descriptor;
+  the Qwen-VL implementation emits the same typed runtime inputs as text.
 
 Loading fails before allocating runtime state if any selected stage cannot be resolved. Errors name
 the family, concrete layout/device, stage, and missing implementation, for example:
@@ -334,6 +335,14 @@ Baseline reviewed on 2026-07-10:
   self-attention, ViT MLP execution, DeepStack/spatial merging, dense bias application, and
   normalization are owned by `vision.rs`. `legacy.rs` no longer defines or implements the image
   preprocessor, vision config, or vision encoder.
+- Load now retains exactly one `FlashMoeInputAdapterExecutor` instead of probing an
+  `Option<VisionEncoder>` at request time. Qwen-VL construction requires concrete weight and
+  manifest artifacts, validates required vision tensor names plus adapter dimensions/DeepStack
+  metadata, and contributes a `QwenVlTypedInput` implementation to the same nine-stage Q4 graph.
+  The already resolved model family selects the executor; incidental vision metadata in a
+  Qwen3.5 config cannot redirect its text graph into Qwen-VL.
+  A text adapter bound to Qwen-VL, a VL adapter bound to text, absent artifacts, invalid metadata,
+  or missing required vision tensors is a token-input-stage error before inference.
 - Focused parity/reference tests cover expert layout and math, routing contracts, attention and
   recurrence primitives, state descriptors, and Metal buffer-plan contracts.
 - Gate 5 now has a linked Qwen3.5 Q4 per-layer golden derived independently from the upstream
@@ -360,9 +369,9 @@ The architecture is not yet at the target:
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 has a resolved unified graph and linked parity fixture but still needs
   real-checkpoint smoke evidence. Qwen-VL preprocessing now emits exact typed inputs consumed by
-  the shared runtime, including scheduler-compatible DeepStack handoff policy. Qwen-VL capability
-  resolution and load binding still report the input-adapter stage as unsupported until the whole
-  family graph and a real checkpoint are proven together.
+  the shared runtime, including scheduler-compatible DeepStack handoff policy. Its Q4 capability
+  and load path resolve only from a concrete vision executor and manifest bindings, but a real
+  Qwen-VL checkpoint smoke is still required before claiming production correctness.
 - BF16/F16 dense and expert storage have import/reference support but no typed production graph
   implementations.
 
@@ -567,6 +576,15 @@ Exit criteria:
   implementations.
 - Unsupported combinations fail at graph resolution with precise missing-stage errors.
 
+Current capability matrix:
+
+| Family | Dense/expert layout | Graph/load status | Correctness evidence |
+| --- | --- | --- | --- |
+| Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
+| Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Resolved unified graph | Linked K=8 parity; real checkpoint pending |
+| Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Resolved unified graph with required typed vision executor | Adapter/capability parity; real checkpoint pending |
+| Any supported family | Resident BF16/F16 dense or experts | Unsupported at named dense/expert stage | Import/reference tests only |
+
 ### Gate 7: Legacy Removal And Benchmarking
 
 Objective: finish the migration and only then evaluate sustained decode performance.
@@ -699,10 +717,9 @@ For Gate 6:
 3. Add resident BF16/F16 dense projection and whole-expert slot implementations through the same
    weight handles, scheduler leases, CMD builders, and state handoffs. Do not revive removed dense
    CPU/component paths as production continuations.
-4. Resolve the Qwen-VL input adapter at load time now that `vision.rs` owns preprocessing,
-   embeddings, DeepStack, MRoPE, and exact typed token inputs consumed by the shared runtime. Prove
-   required vision/model bindings and a real checkpoint before changing its current precise
-   unsupported capability into a supported graph.
+4. Run the resolved Qwen-VL Q4 graph against a real checkpoint and debug any manifest/math mismatch
+   through its typed vision executor and shared scheduler path. Do not add request-time probing or
+   an alternate decoder loop to make the smoke pass.
 5. Add a capability matrix and focused parity fixture for each supported family/dtype/layout. Keep
    every not-yet-implemented combination as a precise load-time unsupported-stage error while the
    matrix is filled in.
