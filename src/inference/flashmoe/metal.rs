@@ -504,7 +504,6 @@ pub(crate) mod kernels {
     pub(crate) const SHARED_EXPERT_ACTIVATION: &str = "shared_expert_activation";
     pub(crate) const COMBINE_EXPERT_PHASE: &str = "combine_expert_phase";
     pub(crate) const FILL_ZERO: &str = "fill_zero";
-    pub(crate) const LM_HEAD_LOGITS: &str = "lm_head_logits";
     pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
     pub(crate) const LINEAR_CONV1D_STEP: &str = "linear_conv1d_step";
     pub(crate) const LINEAR_RMS_NORM_QK: &str = "linear_rms_norm_qk";
@@ -570,7 +569,6 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::SHARED_EXPERT_ACTIVATION,
     kernels::COMBINE_EXPERT_PHASE,
     kernels::FILL_ZERO,
-    kernels::LM_HEAD_LOGITS,
     kernels::TOPK_VOCAB,
     kernels::LINEAR_CONV1D_STEP,
     kernels::LINEAR_RMS_NORM_QK,
@@ -600,7 +598,6 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) shared_expert_activation: &'static str,
     pub(crate) combine_expert_phase: &'static str,
     pub(crate) fill_zero: &'static str,
-    pub(crate) lm_head: &'static str,
     pub(crate) topk_vocab: &'static str,
     pub(crate) linear_conv1d: &'static str,
     pub(crate) linear_rms_norm_qk: &'static str,
@@ -631,7 +628,6 @@ impl MetalPipelineNameSet {
             shared_expert_activation: kernels::SHARED_EXPERT_ACTIVATION,
             combine_expert_phase: kernels::COMBINE_EXPERT_PHASE,
             fill_zero: kernels::FILL_ZERO,
-            lm_head: kernels::LM_HEAD_LOGITS,
             topk_vocab: kernels::TOPK_VOCAB,
             linear_conv1d: kernels::LINEAR_CONV1D_STEP,
             linear_rms_norm_qk: kernels::LINEAR_RMS_NORM_QK,
@@ -662,7 +658,6 @@ impl MetalPipelineNameSet {
             self.shared_expert_activation,
             self.combine_expert_phase,
             self.fill_zero,
-            self.lm_head,
             self.topk_vocab,
             self.linear_conv1d,
             self.linear_rms_norm_qk,
@@ -694,7 +689,6 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) shared_expert_activation_pipeline: T,
     pub(crate) combine_expert_phase_pipeline: T,
     pub(crate) fill_zero_pipeline: T,
-    pub(crate) lm_head_pipeline: T,
     pub(crate) topk_vocab_pipeline: T,
     pub(crate) linear_conv1d_pipeline: T,
     pub(crate) linear_rms_norm_qk_pipeline: T,
@@ -724,7 +718,6 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.shared_expert_activation_pipeline);
         release(self.combine_expert_phase_pipeline);
         release(self.fill_zero_pipeline);
-        release(self.lm_head_pipeline);
         release(self.topk_vocab_pipeline);
         release(self.linear_conv1d_pipeline);
         release(self.linear_rms_norm_qk_pipeline);
@@ -839,7 +832,6 @@ impl MetalRuntime {
                 shared_expert_activation_pipeline: take_pipeline(names.shared_expert_activation),
                 combine_expert_phase_pipeline: take_pipeline(names.combine_expert_phase),
                 fill_zero_pipeline: take_pipeline(names.fill_zero),
-                lm_head_pipeline: take_pipeline(names.lm_head),
                 topk_vocab_pipeline: take_pipeline(names.topk_vocab),
                 linear_conv1d_pipeline: take_pipeline(names.linear_conv1d),
                 linear_rms_norm_qk_pipeline: take_pipeline(names.linear_rms_norm_qk),
@@ -972,23 +964,24 @@ impl MetalExecutionContext {
         restore_linear_attention_session_snapshot(&state, snapshot)
     }
 
-    pub(crate) fn resident_q4_top_candidates(
+    pub(crate) fn resident_top_candidates(
         &self,
-        projection: &DenseQ4MmapMatvecProjection,
+        projection: &ResidentMmapMatvecProjection,
         input: &[f32],
+        output_rows: usize,
         top_k: usize,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         let dense_weights = self.dense_weights.as_ref().context(
-            "FlashMoe unsupported resident Q4 topK path: resident dense Metal weights are unavailable",
+            "FlashMoe unsupported resident topK path: resident dense Metal weights are unavailable",
         )?;
-        MetalResidentQ4TopKBuilder::new(
+        MetalResidentTopKBuilder::new(
             self.runtime.device,
             self.runtime.command_queue,
             &self.runtime.pipelines,
             dense_weights,
             &self.buffers,
         )
-        .execute(projection, input, top_k)
+        .execute(projection, input, output_rows, top_k)
     }
 
     pub(crate) fn resident_post_attention_prep_topk(
@@ -1173,30 +1166,28 @@ fn restore_linear_attention_session_snapshot(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) struct MetalResidentQ4TopKBuilder<'a> {
+pub(crate) struct MetalResidentTopKBuilder<'a> {
     device: MetalObjcId,
     command_queue: MetalObjcId,
-    q4_pipeline: MetalObjcId,
-    q4_bf16_scale_bias_pipeline: MetalObjcId,
+    pipelines: &'a MetalPipelineSet<MetalObjcId>,
     topk_pipeline: MetalObjcId,
     dense_weights: &'a MetalDenseWeights,
     buffers: &'a MetalBufferPool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> MetalResidentQ4TopKBuilder<'a> {
+impl<'a> MetalResidentTopKBuilder<'a> {
     pub(crate) fn new(
         device: MetalObjcId,
         command_queue: MetalObjcId,
-        pipelines: &MetalPipelineSet<MetalObjcId>,
+        pipelines: &'a MetalPipelineSet<MetalObjcId>,
         dense_weights: &'a MetalDenseWeights,
         buffers: &'a MetalBufferPool,
     ) -> Self {
         Self {
             device,
             command_queue,
-            q4_pipeline: pipelines.q4_mmap_pipeline,
-            q4_bf16_scale_bias_pipeline: pipelines.q4_mmap_bf16_scale_bias_pipeline,
+            pipelines,
             topk_pipeline: pipelines.topk_vocab_pipeline,
             dense_weights,
             buffers,
@@ -1205,87 +1196,26 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
 
     pub(crate) fn execute(
         &self,
-        projection: &DenseQ4MmapMatvecProjection,
+        projection: &ResidentMmapMatvecProjection,
         input: &[f32],
+        output_rows: usize,
         top_k: usize,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
-        let rows = projection.output_width;
-        if rows == 0 || top_k == 0 {
+        if output_rows == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
-        if rows > projection.rows {
+        if output_rows > projection.rows() {
             anyhow::bail!(
-                "Metal resident Q4 topK output width {} exceeds tensor rows {} for {}",
-                rows,
-                projection.rows,
-                projection.tensor_name
+                "Metal resident topK output width {} exceeds tensor rows {} for {}",
+                output_rows,
+                projection.rows(),
+                projection.tensor_name()
             );
         }
-        if input.len() != projection.cols {
-            anyhow::bail!(
-                "Metal resident Q4 topK input length {} does not match cols {} for {}",
-                input.len(),
-                projection.cols,
-                projection.tensor_name
-            );
-        }
-        if projection.group_size == 0
-            || projection.groups_per_row == 0
-            || projection.row_packed_bytes == 0
-        {
-            anyhow::bail!(
-                "Metal resident Q4 topK projection {} has an invalid zero-sized Q4 layout",
-                projection.tensor_name
-            );
-        }
-        let (scale_bias_bytes, q4_pipeline) =
-            if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_BF16 {
-                (std::mem::size_of::<u16>(), self.q4_bf16_scale_bias_pipeline)
-            } else if projection.scale_bias_dtype == EXPERT_SCALE_BIAS_DTYPE_F32 {
-                (std::mem::size_of::<f32>(), self.q4_pipeline)
-            } else {
-                anyhow::bail!(
-                    "Metal resident Q4 topK projection {} has unsupported scale/bias dtype {}",
-                    projection.tensor_name,
-                    projection.scale_bias_dtype
-                );
-            };
-        if projection.scales_byte_offset % scale_bias_bytes as u64 != 0
-            || projection.biases_byte_offset % scale_bias_bytes as u64 != 0
-        {
-            anyhow::bail!(
-                "Metal resident Q4 topK projection {} has unaligned scale/bias offsets",
-                projection.tensor_name
-            );
-        }
-        let packed_len = rows
-            .checked_mul(projection.row_packed_bytes)
-            .context("Metal resident Q4 topK packed byte length overflow")?;
-        let groups_len = rows
-            .checked_mul(projection.groups_per_row)
-            .and_then(|groups| groups.checked_mul(scale_bias_bytes))
-            .context("Metal resident Q4 topK group byte length overflow")?;
-        for (label, offset, len) in [
-            ("packed", projection.packed_byte_offset, packed_len),
-            ("scales", projection.scales_byte_offset, groups_len),
-            ("biases", projection.biases_byte_offset, groups_len),
-        ] {
-            let offset = usize::try_from(offset).with_context(|| {
-                format!("Metal resident Q4 topK {label} offset does not fit usize")
-            })?;
-            if offset
-                .checked_add(len)
-                .map_or(true, |end| end > self.dense_weights.len)
-            {
-                anyhow::bail!(
-                    "Metal resident Q4 topK {label} range for {} exceeds resident dense weights",
-                    projection.tensor_name
-                );
-            }
-        }
+        validate_resident_projection(projection, input.len(), self.dense_weights.len)?;
 
-        let top_k = top_k.min(rows).max(1);
-        unsafe { self.encode_and_read(projection, input, rows, top_k, q4_pipeline) }
+        let top_k = top_k.min(output_rows).max(1);
+        unsafe { self.encode_and_read(projection, input, output_rows, top_k) }
     }
 
     unsafe fn transient_buffer(
@@ -1310,11 +1240,10 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
 
     unsafe fn encode_and_read(
         &self,
-        projection: &DenseQ4MmapMatvecProjection,
+        projection: &ResidentMmapMatvecProjection,
         input: &[f32],
         rows: usize,
         top_k: usize,
-        q4_pipeline: MetalObjcId,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         unsafe {
             let mut transient = Vec::with_capacity(4);
@@ -1335,16 +1264,11 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
 
             let constants = (|| -> anyhow::Result<_> {
                 Ok((
-                    u32::try_from(rows).context("resident Q4 topK rows exceed u32")?,
-                    u32::try_from(projection.cols).context("resident Q4 topK cols exceed u32")?,
-                    u32::try_from(projection.groups_per_row)
-                        .context("resident Q4 topK groups per row exceed u32")?,
-                    u32::try_from(projection.group_size)
-                        .context("resident Q4 topK group size exceeds u32")?,
-                    u32::try_from(top_k).context("resident Q4 topK count exceeds u32")?,
+                    u32::try_from(rows).context("resident topK rows exceed u32")?,
+                    u32::try_from(top_k).context("resident topK count exceeds u32")?,
                 ))
             })();
-            let (rows_u32, cols_u32, groups_u32, group_size_u32, top_k_u32) = match constants {
+            let (rows_u32, top_k_u32) = match constants {
                 Ok(constants) => constants,
                 Err(error) => {
                     self.buffers.recycle_or_release(&transient, true);
@@ -1355,27 +1279,30 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
             let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
             if command_buffer.is_null() {
                 self.buffers.recycle_or_release(&transient, true);
-                anyhow::bail!("failed to create Flash-MoE resident Q4 topK command buffer");
+                anyhow::bail!("failed to create Flash-MoE resident topK command buffer");
             }
             let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
             if encoder.is_null() {
                 release(command_buffer);
                 self.buffers.recycle_or_release(&transient, true);
-                anyhow::bail!("failed to create Flash-MoE resident Q4 topK compute encoder");
+                anyhow::bail!("failed to create Flash-MoE resident topK compute encoder");
             }
 
-            msg_send_void1_id(encoder, sel("setComputePipelineState:"), q4_pipeline);
-            set_buffer(encoder, self.dense_weights.buffer, 0);
-            set_buffer(encoder, input_buffer, 1);
-            set_buffer(encoder, logits_buffer, 2);
-            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
+            if let Err(error) = encode_resident_projection_rows(
+                self.pipelines,
+                encoder,
+                self.dense_weights,
+                projection,
+                rows,
+                input_buffer,
+                logits_buffer,
+                0,
+            ) {
+                release(encoder);
+                release(command_buffer);
+                self.buffers.recycle_or_release(&transient, true);
+                return Err(error);
+            }
 
             msg_send_void1_id(encoder, sel("setComputePipelineState:"), self.topk_pipeline);
             set_buffer(encoder, logits_buffer, 0);
@@ -1386,15 +1313,12 @@ impl<'a> MetalResidentQ4TopKBuilder<'a> {
             dispatch_threads(encoder, 1);
             msg_send_void0(encoder, sel("endEncoding"));
 
-            let context = MetalCommandContext::new("resident_q4_topk")
-                .with("tensor", &projection.tensor_name)
+            let context = MetalCommandContext::new("resident_topk")
+                .with("tensor", projection.tensor_name())
                 .with("rows", rows)
-                .with("cols", projection.cols)
-                .with("groups_per_row", projection.groups_per_row)
-                .with("group_size", projection.group_size)
-                .with("scale_bias_dtype", &projection.scale_bias_dtype)
-                .with("top_k", top_k)
-                .with("packed_offset", projection.packed_byte_offset);
+                .with("physical_rows", projection.rows())
+                .with("cols", projection.cols())
+                .with("top_k", top_k);
             if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
                 release(encoder);
                 release(command_buffer);
@@ -2568,13 +2492,46 @@ unsafe fn encode_resident_projection(
     output_offset: u64,
 ) -> Result<()> {
     unsafe {
+        encode_resident_projection_rows(
+            pipelines,
+            encoder,
+            dense_weights,
+            projection,
+            projection.rows(),
+            input_buffer,
+            output_buffer,
+            output_offset,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_resident_projection_rows(
+    pipelines: &MetalPipelineSet<MetalObjcId>,
+    encoder: MetalObjcId,
+    dense_weights: &MetalDenseWeights,
+    projection: &ResidentMmapMatvecProjection,
+    output_rows: usize,
+    input_buffer: MetalObjcId,
+    output_buffer: MetalObjcId,
+    output_offset: u64,
+) -> Result<()> {
+    if output_rows == 0 || output_rows > projection.rows() {
+        bail!(
+            "resident projection {} requested {} output rows from {} physical rows",
+            projection.tensor_name(),
+            output_rows,
+            projection.rows()
+        );
+    }
+    unsafe {
         set_buffer(encoder, dense_weights.buffer, 0);
         set_buffer(encoder, input_buffer, 1);
         set_buffer_with_offset(encoder, output_buffer, output_offset, 2);
         match projection {
             ResidentMmapMatvecProjection::Q4(projection) => {
-                let rows =
-                    u32::try_from(projection.rows).context("resident Q4 rows do not fit u32")?;
+                let rows = u32::try_from(output_rows).context("resident Q4 rows do not fit u32")?;
                 let cols =
                     u32::try_from(projection.cols).context("resident Q4 cols do not fit u32")?;
                 let groups = u32::try_from(projection.groups_per_row)
@@ -2600,7 +2557,7 @@ unsafe fn encode_resident_projection(
                 set_bytes(encoder, u32_as_bytes(&cols), 7);
                 set_bytes(encoder, u32_as_bytes(&groups), 8);
                 set_bytes(encoder, u32_as_bytes(&group_size), 9);
-                dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+                dispatch_q4_mmap_threadgroups(encoder, output_rows as u64);
             }
             ResidentMmapMatvecProjection::Dense(projection) => {
                 let pipeline = match projection.dtype.to_ascii_uppercase().as_str() {
@@ -2614,14 +2571,14 @@ unsafe fn encode_resident_projection(
                     ),
                 };
                 let rows =
-                    u32::try_from(projection.rows).context("resident dense rows do not fit u32")?;
+                    u32::try_from(output_rows).context("resident dense rows do not fit u32")?;
                 let cols =
                     u32::try_from(projection.cols).context("resident dense cols do not fit u32")?;
                 msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
                 set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
                 set_bytes(encoder, u32_as_bytes(&rows), 4);
                 set_bytes(encoder, u32_as_bytes(&cols), 5);
-                dispatch_threads(encoder, projection.rows as u64);
+                dispatch_threads(encoder, output_rows as u64);
             }
         }
         Ok(())
@@ -6331,42 +6288,6 @@ kernel void fill_zero(
     output[idx] = 0.0f;
 }
 
-kernel void lm_head_logits(
-    device const float* lm_head [[buffer(0)]],
-    device const float* hidden [[buffer(1)]],
-    device float* logits [[buffer(2)]],
-    constant uint& hidden_width [[buffer(3)]],
-    constant uint& vocab [[buffer(4)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    const uint rows_per_threadgroup = 8;
-    const uint hidden_cache_len = 4096;
-    uint token = tile * rows_per_threadgroup + simd_group;
-    bool use_hidden_cache = hidden_width <= hidden_cache_len;
-    threadgroup float hidden_cache[4096];
-    if (use_hidden_cache) {
-        for (uint i = lid; i < hidden_width; i += 256) {
-            hidden_cache[i] = hidden[i];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (token >= vocab) {
-        return;
-    }
-
-    float acc = 0.0f;
-    for (uint i = simd_lane; i < hidden_width; i += 32) {
-        float h = use_hidden_cache ? hidden_cache[i] : hidden[i];
-        acc = fma(lm_head[token * hidden_width + i], h, acc);
-    }
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        logits[token] = sum;
-    }
-}
-
 kernel void topk_vocab(
     device const float* logits [[buffer(0)]],
     device uint* indices [[buffer(1)]],
@@ -6976,7 +6897,8 @@ mod tests {
             [
                 (1..=8).collect::<Vec<_>>(),
                 vec![24, 25, 26],
-                (9..=23).collect::<Vec<_>>(),
+                (9..=16).collect::<Vec<_>>(),
+                (18..=23).collect::<Vec<_>>(),
             ]
             .concat()
         );
@@ -7003,13 +6925,43 @@ mod tests {
             shared_expert_activation_pipeline: 14,
             combine_expert_phase_pipeline: 15,
             fill_zero_pipeline: 16,
-            lm_head_pipeline: 17,
             topk_vocab_pipeline: 18,
             linear_conv1d_pipeline: 19,
             linear_rms_norm_qk_pipeline: 20,
             linear_decay_beta_pipeline: 21,
             linear_delta_step_pipeline: 22,
             linear_gated_rms_norm_pipeline: 23,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_objc_pipeline_set(id: MetalObjcId) -> MetalPipelineSet<MetalObjcId> {
+        MetalPipelineSet {
+            q4_pipeline: id,
+            q4_bf16_scale_bias_pipeline: id,
+            q4_swiglu_pipeline: id,
+            q4_swiglu_bf16_scale_bias_pipeline: id,
+            q4_mmap_pipeline: id,
+            q4_mmap_bf16_scale_bias_pipeline: id,
+            q4_mmap_batch_pipeline: id,
+            q4_mmap_batch_bf16_scale_bias_pipeline: id,
+            dense_mmap_bf16_pipeline: id,
+            dense_mmap_f16_pipeline: id,
+            dense_mmap_f32_pipeline: id,
+            rms_norm_reduced_pipeline: id,
+            residual_rms_norm_pipeline: id,
+            attention_pipeline: id,
+            expert_mlp_pipeline: id,
+            silu_product_pipeline: id,
+            shared_expert_activation_pipeline: id,
+            combine_expert_phase_pipeline: id,
+            fill_zero_pipeline: id,
+            topk_vocab_pipeline: id,
+            linear_conv1d_pipeline: id,
+            linear_rms_norm_qk_pipeline: id,
+            linear_decay_beta_pipeline: id,
+            linear_delta_step_pipeline: id,
+            linear_gated_rms_norm_pipeline: id,
         }
     }
 
@@ -8063,8 +8015,8 @@ mod tests {
             rows: output_width,
             cols: input_width,
             output_width,
-            row_packed_bytes: 16,
-            groups_per_row: 1,
+            row_packed_bytes: input_width.div_ceil(2),
+            groups_per_row: input_width.div_ceil(16),
             group_size: 16,
             scale_bias_dtype: "F32".to_string(),
         }
@@ -8307,7 +8259,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn resident_q4_topk_builder_rejects_invalid_bindings_before_encoding() {
+    fn resident_topk_builder_rejects_invalid_bindings_before_encoding() {
         let mmap = Arc::new(
             memmap2::MmapMut::map_anon(128)
                 .unwrap()
@@ -8317,38 +8269,42 @@ mod tests {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
         let dense = MetalDenseWeights::new(id, mmap, 128);
         let buffers = MetalBufferPool::default();
-        let builder = MetalResidentQ4TopKBuilder {
-            device: id,
-            command_queue: id,
-            q4_pipeline: id,
-            q4_bf16_scale_bias_pipeline: id,
-            topk_pipeline: id,
-            dense_weights: &dense,
-            buffers: &buffers,
-        };
+        let pipelines = test_objc_pipeline_set(id);
+        let builder = MetalResidentTopKBuilder::new(id, id, &pipelines, &dense, &buffers);
 
-        let projection = test_q4_projection("lm_head.weight", 4, 16);
-        let input_error = builder.execute(&projection, &[0.0; 15], 2).unwrap_err();
+        let projection =
+            ResidentMmapMatvecProjection::Q4(test_q4_projection("lm_head.weight", 4, 16));
+        let input_error = builder.execute(&projection, &[0.0; 15], 4, 2).unwrap_err();
         assert!(
-            input_error.to_string().contains("input length 15"),
+            input_error.to_string().contains("input len 15"),
             "{input_error:#}"
         );
 
-        let mut unsupported_dtype = projection.clone();
+        let mut unsupported_dtype = test_q4_projection("lm_head.weight", 4, 16);
         unsupported_dtype.scale_bias_dtype = "F16".to_string();
         let dtype_error = builder
-            .execute(&unsupported_dtype, &[0.0; 16], 2)
+            .execute(
+                &ResidentMmapMatvecProjection::Q4(unsupported_dtype),
+                &[0.0; 16],
+                4,
+                2,
+            )
             .unwrap_err();
         assert!(
-            dtype_error
-                .to_string()
-                .contains("unsupported scale/bias dtype F16"),
+            dtype_error.to_string().contains("scale/bias dtype F16"),
             "{dtype_error:#}"
         );
 
-        let mut out_of_range = projection;
+        let mut out_of_range = test_q4_projection("lm_head.weight", 4, 16);
         out_of_range.biases_byte_offset = 124;
-        let range_error = builder.execute(&out_of_range, &[0.0; 16], 2).unwrap_err();
+        let range_error = builder
+            .execute(
+                &ResidentMmapMatvecProjection::Q4(out_of_range),
+                &[0.0; 16],
+                4,
+                2,
+            )
+            .unwrap_err();
         assert!(
             range_error
                 .to_string()
@@ -8369,34 +8325,7 @@ mod tests {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
         let dense = MetalDenseWeights::new(id, mmap, 4096);
         let buffers = MetalBufferPool::default();
-        let pipelines = MetalPipelineSet {
-            q4_pipeline: id,
-            q4_bf16_scale_bias_pipeline: id,
-            q4_swiglu_pipeline: id,
-            q4_swiglu_bf16_scale_bias_pipeline: id,
-            q4_mmap_pipeline: id,
-            q4_mmap_bf16_scale_bias_pipeline: id,
-            q4_mmap_batch_pipeline: id,
-            q4_mmap_batch_bf16_scale_bias_pipeline: id,
-            dense_mmap_bf16_pipeline: id,
-            dense_mmap_f16_pipeline: id,
-            dense_mmap_f32_pipeline: id,
-            rms_norm_reduced_pipeline: id,
-            residual_rms_norm_pipeline: id,
-            attention_pipeline: id,
-            expert_mlp_pipeline: id,
-            silu_product_pipeline: id,
-            shared_expert_activation_pipeline: id,
-            combine_expert_phase_pipeline: id,
-            fill_zero_pipeline: id,
-            lm_head_pipeline: id,
-            topk_vocab_pipeline: id,
-            linear_conv1d_pipeline: id,
-            linear_rms_norm_qk_pipeline: id,
-            linear_decay_beta_pipeline: id,
-            linear_delta_step_pipeline: id,
-            linear_gated_rms_norm_pipeline: id,
-        };
+        let pipelines = test_objc_pipeline_set(id);
         let builder =
             MetalResidentPostAttentionPrepBuilder::new(id, id, &pipelines, &dense, &buffers);
         let projections = Cmd2ResidentPostAttentionPrepProjections::new(

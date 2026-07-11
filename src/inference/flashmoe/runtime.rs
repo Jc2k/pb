@@ -238,21 +238,22 @@ impl MetalExecutionFacade {
         }
     }
 
-    pub(super) fn resident_q4_top_candidates(
+    pub(super) fn resident_top_candidates(
         &self,
-        projection: &DenseQ4MmapMatvecProjection,
+        projection: &ResidentMmapMatvecProjection,
         input: &[f32],
+        output_rows: usize,
         top_k: usize,
     ) -> Result<Vec<(usize, f32)>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             self.inner
-                .resident_q4_top_candidates(projection, input, top_k)
+                .resident_top_candidates(projection, input, output_rows, top_k)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (projection, input, top_k);
-            bail!("FlashMoe unsupported resident Q4 topK path: Apple Silicon Metal is required")
+            let _ = (projection, input, output_rows, top_k);
+            bail!("FlashMoe unsupported resident topK path: Apple Silicon Metal is required")
         }
     }
 
@@ -271,16 +272,16 @@ impl MetalExecutionFacade {
                 plan.layer
             );
         }
-        match &plan.source {
-            RouterScoreProjectionTopKSource::ResidentDense(projection) => bail!(
-                "FlashMoe unsupported router-score layout for layer {}: resolved Metal graph requires resident Q4, got {}",
-                plan.layer,
-                projection.dtype
-            ),
-            RouterScoreProjectionTopKSource::ResidentQ4(projection) => self
-                .resident_q4_top_candidates(projection, hidden, plan.active_experts)
-                .map(Some),
-        }
+        let projection = match &plan.source {
+            RouterScoreProjectionTopKSource::ResidentDense(projection) => {
+                ResidentMmapMatvecProjection::Dense(projection.clone())
+            }
+            RouterScoreProjectionTopKSource::ResidentQ4(projection) => {
+                ResidentMmapMatvecProjection::Q4(projection.clone())
+            }
+        };
+        self.resident_top_candidates(&projection, hidden, plan.experts, plan.active_experts)
+            .map(Some)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

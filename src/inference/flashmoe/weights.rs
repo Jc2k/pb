@@ -2869,45 +2869,20 @@ impl DenseStore {
         let vocab_rows = tokenizer.vocab_size();
         let top_k = sampler.top_k.min(vocab_rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
-        let TensorQuantization::Q4 {
-            group_size,
-            scale_bias_dtype,
-            ..
-        } = &entry.quantization
-        else {
-            bail!(
-                "FlashMoe unsupported resolved LM-head path: tensor {lm_head_name} is not resident Q4"
-            );
-        };
-        let layout =
-            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
-        let scales_offset = entry
-            .byte_offset
-            .checked_add(layout.packed_bytes as u64)
-            .context("LM-head q4 mmap scales offset overflow")?;
-        let biases_offset = scales_offset
-            .checked_add(layout.scales_bytes as u64)
-            .context("LM-head q4 mmap biases offset overflow")?;
         let repeated_vocab_tokens = repeated.iter().filter(|token| **token < vocab_rows).count();
         let raw_candidate_count = top_k
             .saturating_add(repeated_vocab_tokens)
             .min(vocab_rows)
             .max(1);
-        let projection = DenseQ4MmapMatvecProjection {
-            tensor_name: lm_head_name.to_string(),
-            packed_byte_offset: entry.byte_offset,
-            scales_byte_offset: scales_offset,
-            biases_byte_offset: biases_offset,
-            rows,
-            cols,
-            output_width: vocab_rows.min(rows),
-            row_packed_bytes: layout.row_packed_bytes,
-            groups_per_row: layout.groups_per_row,
-            group_size: *group_size,
-            scale_bias_dtype: scale_bias_dtype.clone(),
-        };
+        let projection = self
+            .resident_mmap_projection(lm_head_name, rows, cols)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported resolved LM-head path: missing resident projection {lm_head_name}"
+                )
+            })?;
         let raw_candidates =
-            metal.resident_q4_top_candidates(&projection, hidden, raw_candidate_count)?;
+            metal.resident_top_candidates(&projection, hidden, vocab_rows, raw_candidate_count)?;
         Ok(rerank_resident_lm_head_candidates(
             &raw_candidates,
             top_k,

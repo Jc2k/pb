@@ -13519,11 +13519,26 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(dispatches, 3);
-        for (dtype, output) in ["BF16", "F16", "F32"].iter().zip(actual.iter()) {
+        for (index, dtype) in ["BF16", "F16", "F32"].iter().enumerate() {
+            let output = &actual[index];
             for (row, (actual, expected)) in output.iter().zip(expected.iter()).enumerate() {
                 assert!(
                     (actual - expected).abs() <= 1e-5,
                     "{dtype} row {row}: Metal {actual} != CPU {expected}"
+                );
+            }
+            let actual_candidates = metal
+                .resident_top_candidates(&projections[index], &input, 2, 2)
+                .unwrap();
+            let expected_candidates = top_k(&expected[..2], 2);
+            assert_eq!(actual_candidates.len(), expected_candidates.len());
+            for ((actual_id, actual_score), (expected_id, expected_score)) in
+                actual_candidates.iter().zip(&expected_candidates)
+            {
+                assert_eq!(actual_id, expected_id, "{dtype} topK id diverged");
+                assert!(
+                    (actual_score - expected_score).abs() <= 1e-5,
+                    "{dtype} topK score {actual_score} != {expected_score}"
                 );
             }
         }

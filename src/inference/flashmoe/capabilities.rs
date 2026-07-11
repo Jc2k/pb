@@ -94,7 +94,7 @@ pub enum FlashMoeStageImplementation {
     CpuSoftmaxTopK,
     ParallelPositionedFixedQ4Reads,
     MetalFixedQ4ExpertSharedCombine,
-    MetalResidentQ4LmHeadSampler,
+    MetalResidentLmHeadSampler,
 }
 
 impl FlashMoeStageImplementation {
@@ -118,7 +118,9 @@ impl FlashMoeStageImplementation {
             Self::MetalFixedQ4ExpertSharedCombine => {
                 "Metal fixed-Q4 active experts and declared shared/no-shared combine"
             }
-            Self::MetalResidentQ4LmHeadSampler => "Metal resident-Q4 LM-head and sampler",
+            Self::MetalResidentLmHeadSampler => {
+                "Metal resident Q4/BF16/F16/F32 LM-head and sampler"
+            }
         }
     }
 }
@@ -338,35 +340,27 @@ impl FlashMoeCapabilityPlan {
                 &[kernels::SHARED_EXPERT_ACTIVATION],
             )?;
         }
-        if dense_layout != ResidentDenseLayout::Q4 {
-            let (stage, reason) = if layout.shared_experts > 0 {
-                (
-                    FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
-                    format!(
-                        "CMD2 resolves {}, but the unified CMD3 shared-expert builder does not yet consume that layout",
-                        dense_layout.as_str()
-                    ),
-                )
-            } else {
-                (
-                    FlashMoeGraphStage::LmHeadAndSampling,
-                    format!(
-                        "CMD1/CMD2 resolve {}, but the unified LM-head sampler does not yet consume that layout",
-                        dense_layout.as_str()
-                    ),
-                )
-            };
+        if dense_layout != ResidentDenseLayout::Q4 && layout.shared_experts > 0 {
             return Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
-                stage,
-                reason,
+                FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
+                format!(
+                    "CMD2 resolves {}, but the unified CMD3 shared-expert builder does not yet consume that layout",
+                    dense_layout.as_str()
+                ),
             ));
         }
+        let lm_head_projection_kernel = match dense_layout {
+            ResidentDenseLayout::Q4 => kernels::Q4_MMAP_FMA_MATVEC,
+            ResidentDenseLayout::Bf16 => kernels::DENSE_MMAP_FMA_MATVEC_BF16,
+            ResidentDenseLayout::F16 => kernels::DENSE_MMAP_FMA_MATVEC_F16,
+            ResidentDenseLayout::F32 => kernels::DENSE_MMAP_FMA_MATVEC_F32,
+        };
         require_stage_kernels(
             layout.family,
             &metal,
             FlashMoeGraphStage::LmHeadAndSampling,
-            &[kernels::LM_HEAD_LOGITS, kernels::TOPK_VOCAB],
+            &[lm_head_projection_kernel, kernels::TOPK_VOCAB],
         )?;
 
         let stages = vec![
@@ -413,7 +407,7 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::LmHeadAndSampling,
                 FlashMoeStagePlacement::Sampler,
-                FlashMoeStageImplementation::MetalResidentQ4LmHeadSampler,
+                FlashMoeStageImplementation::MetalResidentLmHeadSampler,
             ),
         ];
         let plan = Self {
@@ -786,6 +780,12 @@ mod tests {
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
+    fn metal_without_topk_vocab() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.topk_vocab = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
     #[test]
     fn qwen35_q4_capability_plan_resolves_concrete_storage_and_device() {
         let mut layout = qwen35_layout();
@@ -862,24 +862,29 @@ mod tests {
     }
 
     #[test]
-    fn qwen_full_attention_non_q4_dense_resolves_cmd2_then_fails_at_next_missing_stage() {
+    fn qwen_full_attention_non_q4_dense_resolves_complete_unified_graph() {
         let layout = qwen3_moe_layout(Some(true));
         for dense_layout in [
             ResidentDenseLayout::Bf16,
             ResidentDenseLayout::F16,
             ResidentDenseLayout::F32,
         ] {
-            let error = FlashMoeCapabilityPlan::resolve(
+            let plan = FlashMoeCapabilityPlan::resolve(
                 &layout,
                 text_adapter(),
                 dense_layout,
                 fixed_q4_experts(&layout),
                 Some(full_metal()),
             )
-            .unwrap_err();
-            assert_eq!(error.stage, FlashMoeGraphStage::LmHeadAndSampling);
-            assert!(error.reason.contains(dense_layout.as_str()), "{error}");
-            assert!(error.reason.contains("CMD1/CMD2 resolve"), "{error}");
+            .unwrap();
+            plan.validate_complete().unwrap();
+            assert_eq!(plan.dense_layout, dense_layout);
+            assert_eq!(
+                plan.stage(FlashMoeGraphStage::LmHeadAndSampling)
+                    .unwrap()
+                    .implementation,
+                FlashMoeStageImplementation::MetalResidentLmHeadSampler
+            );
         }
 
         let kernel_error = FlashMoeCapabilityPlan::resolve(
@@ -919,17 +924,41 @@ mod tests {
             "{cmd2_kernel_error}"
         );
 
+        let lm_head_kernel_error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Bf16,
+            fixed_q4_experts(&layout),
+            Some(metal_without_topk_vocab()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            lm_head_kernel_error.stage,
+            FlashMoeGraphStage::LmHeadAndSampling
+        );
+        assert!(
+            lm_head_kernel_error.reason.contains(kernels::TOPK_VOCAB),
+            "{lm_head_kernel_error}"
+        );
+
         let vl_layout = qwen3_vl_layout();
-        let vl_error = FlashMoeCapabilityPlan::resolve(
+        let vl_plan = FlashMoeCapabilityPlan::resolve(
             &vl_layout,
             qwen_vl_adapter(),
             ResidentDenseLayout::Bf16,
             fixed_q4_experts(&vl_layout),
             Some(full_metal()),
         )
-        .unwrap_err();
-        assert_eq!(vl_error.stage, FlashMoeGraphStage::LmHeadAndSampling);
-        assert!(vl_error.reason.contains("CMD1/CMD2 resolve"), "{vl_error}");
+        .unwrap();
+        vl_plan.validate_complete().unwrap();
+        assert_eq!(vl_plan.dense_layout, ResidentDenseLayout::Bf16);
+        assert_eq!(
+            vl_plan
+                .stage(FlashMoeGraphStage::LmHeadAndSampling)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::MetalResidentLmHeadSampler
+        );
     }
 
     #[test]
