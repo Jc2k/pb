@@ -310,6 +310,10 @@ Baseline reviewed on 2026-07-11:
   stale model-family import were removed from `legacy.rs`; partial expert-layer readiness now uses
   expert metadata directly under the planning owner. Expert buffer recycling and stale temporary
   file cleanup are tested beside the expert store, and all three legacy copies have been removed.
+- Scheduler-owned positioned reads now have an owner-local PBQ4 import-store integration fixture
+  that proves routed order, normalization and scale, warm-read accounting, and worker failure
+  metrics. Six overlapping coordinator tests and the duplicate expert-I/O guardrail test were
+  removed from `legacy.rs`; the lower-level scheduler and expert policy tests retain each contract.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the

@@ -3701,9 +3701,10 @@ impl ExpertSchedulerSnapshot {
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{
-        DenseExpertDtype, ExpertLayerPackMetadata, ExpertPackMetadata, ExpertRawPayload,
-        ExpertSlotSpec, ExpertStoreExecutionDescriptor, FixedDenseExpertPayload,
-        FixedDenseExpertSlotSpec, FixedQ4ExpertPayload, FixedQ4ExpertSlotSpec, expert_layer_path,
+        DenseExpertDtype, EXPERT_SCALE_BIAS_DTYPE_F32, ExpertLayerPackMetadata, ExpertPackMetadata,
+        ExpertPackRecord, ExpertRawPayload, ExpertSlotSpec, ExpertStoreExecutionDescriptor,
+        FixedDenseExpertPayload, FixedDenseExpertSlotSpec, FixedQ4ExpertPayload,
+        FixedQ4ExpertSlotSpec, PBQ4_EXPERT_MAGIC, expert_layer_path,
         write_expert_metadata_atomically,
     };
     use crate::inference::flashmoe::math::causal_attention;
@@ -3724,7 +3725,9 @@ mod tests {
         RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
         SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
     };
-    use crate::inference::flashmoe::{QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
+    use crate::inference::flashmoe::{
+        GROUP_SIZE, QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout,
+    };
     use std::{fs, path::Path};
 
     fn qwen35_layout() -> QwenMoeModelLayout {
@@ -3771,6 +3774,63 @@ mod tests {
         )
         .unwrap();
         QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
+    }
+
+    fn pbq4_import_store(experts: &[usize]) -> (tempfile::TempDir, ExpertSlotStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut packs = Vec::new();
+        for expert in experts {
+            let tensor = format!("model.layers.0.mlp.experts.{expert}.down_proj.weight");
+            let mut bytes = PBQ4_EXPERT_MAGIC.to_vec();
+            let record_offset = bytes.len() as u64;
+            bytes.extend_from_slice(&(tensor.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(tensor.as_bytes());
+            bytes.extend_from_slice(&2u64.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&0.5f32.to_le_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            bytes.extend_from_slice(&[0x21, 0x43]);
+            let metadata = ExpertPackMetadata {
+                layer: 0,
+                expert: *expert,
+                packed_bytes: bytes.len() as u64,
+                records: vec![ExpertPackRecord {
+                    tensor,
+                    dtype: "F32".to_string(),
+                    shape: vec![1, 4],
+                    source_offsets: [0, 4],
+                    source_hash: Some(format!("fixture-{expert}")),
+                    record_offset,
+                    packed_bytes: 2,
+                    groups: 1,
+                    group_size: GROUP_SIZE,
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                }],
+            };
+            packs.push((*expert, bytes, metadata));
+        }
+        let slot_size = packs
+            .iter()
+            .map(|(_, bytes, _)| bytes.len())
+            .max()
+            .unwrap_or(1);
+        let expert_count = experts.iter().copied().max().unwrap_or(0) + 1;
+        let mut layer = vec![0; slot_size * expert_count];
+        let mut metadata = Vec::new();
+        for (expert, bytes, pack) in packs {
+            let offset = expert * slot_size;
+            layer[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            metadata.push(pack);
+        }
+        fs::write(expert_layer_path(temp.path(), 0), layer).unwrap();
+        write_expert_metadata_atomically(
+            temp.path(),
+            0,
+            &ExpertLayerPackMetadata::new(0, slot_size as u64, expert_count, metadata),
+        )
+        .unwrap();
+        let store = ExpertSlotStore::open(temp.path().to_path_buf()).unwrap();
+        (temp, store)
     }
 
     fn tiny_fixed_q4_layout() -> QwenMoeQ4ExpertLayout {
@@ -7824,6 +7884,83 @@ mod tests {
         assert!(repeated.issues()[0].warm);
         assert!(repeated.issues()[1].warm);
         assert_eq!(scheduler.snapshot().issued_reads, 4);
+    }
+
+    #[test]
+    fn scheduled_read_coordinator_streams_routed_slots_in_order() {
+        let (_temp, store) = pbq4_import_store(&[1, 3, 7]);
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let routing = graph
+            .build_routing_topk(
+                0,
+                graph.experts_per_layer(),
+                3,
+                ScheduledRoutingCandidateSource::CpuRouterScores,
+            )
+            .unwrap();
+        let command = routing.command_from_routes(vec![(7, 2.0), (1, 1.0), (3, -1.0)]);
+        let mut coordinator =
+            ScheduledExpertReadCoordinator::new_with_routed_expert_scale(store, 0.9);
+
+        let pending = coordinator.issue_routing_command(&command).unwrap();
+        let scheduled = coordinator.finish_routes(pending).unwrap();
+
+        assert_eq!(coordinator.worker_count(), 3);
+        assert_eq!(
+            scheduled
+                .experts
+                .iter()
+                .map(|expert| expert.expert())
+                .collect::<Vec<_>>(),
+            vec![7, 1, 3]
+        );
+        let mut expected = vec![2.0, 1.0, -1.0];
+        softmax_in_place(&mut expected);
+        for weight in &mut expected {
+            *weight *= 0.9;
+        }
+        for (actual, expected) in scheduled.weights.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+        let first = coordinator.snapshot();
+        assert_eq!(first.issued_reads, 3);
+        assert_eq!(first.positioned_reads, 3);
+        assert_eq!(first.read_failures, 0);
+        assert_eq!(first.warm_reads, 0);
+
+        let pending = coordinator.issue(0, &[3]).unwrap();
+        let repeated = coordinator.finish(pending).unwrap();
+        assert_eq!(repeated[0].expert(), 3);
+        let second = coordinator.snapshot();
+        assert_eq!(second.issued_reads, 4);
+        assert_eq!(second.positioned_reads, 4);
+        assert_eq!(second.warm_reads, 1);
+        assert!(second.warm_bytes_read > 0);
+    }
+
+    #[test]
+    fn scheduled_read_coordinator_records_positioned_read_failure() {
+        let (temp, store) = pbq4_import_store(&[2]);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(expert_layer_path(temp.path(), 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut coordinator = ScheduledExpertReadCoordinator::new(store);
+
+        let pending = coordinator.issue(0, &[2]).unwrap();
+        let error = coordinator.finish(pending).unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to read expert 2"),
+            "{error:#}"
+        );
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.issued_reads, 1);
+        assert_eq!(snapshot.positioned_reads, 1);
+        assert_eq!(snapshot.read_failures, 1);
     }
 
     #[test]
