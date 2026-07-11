@@ -927,6 +927,257 @@ fn quantized_q4_group(values: &[f32], scale: f32, bias: f32, codes: Vec<u8>) -> 
 mod tests {
     use super::*;
 
+    fn silu(value: f32) -> f32 {
+        value / (1.0 + (-value).exp())
+    }
+
+    fn conv1d_reference_step(
+        state: &[f32],
+        input: &[f32],
+        weight: &[f32],
+        channels: usize,
+        kernel_size: usize,
+    ) -> Vec<f32> {
+        (0..channels)
+            .map(|channel| {
+                let history = (0..kernel_size - 1)
+                    .map(|tap| {
+                        state[tap * channels + channel] * weight[channel * kernel_size + tap]
+                    })
+                    .sum::<f32>();
+                silu(
+                    history
+                        + input[channel]
+                            * weight[channel * kernel_size + kernel_size.saturating_sub(1)],
+                )
+            })
+            .collect()
+    }
+
+    fn gated_delta_reference(
+        layout: LinearAttentionLayout,
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        a_log: &[f32],
+        dt_bias: &[f32],
+    ) -> Vec<f32> {
+        let heads_per_key = layout.value_heads_per_key_head();
+        let matrix_len = layout.value_dim * layout.key_dim;
+        let mut output = vec![0.0; layout.num_value_heads * layout.value_dim];
+        for value_head in 0..layout.num_value_heads {
+            let key_head = value_head / heads_per_key;
+            let decay = (-(a_log[value_head].exp())
+                * (1.0 + (alpha[value_head] + dt_bias[value_head]).exp()).ln())
+            .exp();
+            let beta_gate = 1.0 / (1.0 + (-beta[value_head]).exp());
+            let state_base = value_head * matrix_len;
+            let key = &k[key_head * layout.key_dim..(key_head + 1) * layout.key_dim];
+            let query = &q[key_head * layout.key_dim..(key_head + 1) * layout.key_dim];
+            let value = &v[value_head * layout.value_dim..(value_head + 1) * layout.value_dim];
+            for value_index in 0..layout.value_dim {
+                let row_base = state_base + value_index * layout.key_dim;
+                let row = &mut state[row_base..row_base + layout.key_dim];
+                for slot in row.iter_mut() {
+                    *slot *= decay;
+                }
+                let remembered = row
+                    .iter()
+                    .zip(key)
+                    .map(|(state, key)| state * key)
+                    .sum::<f32>();
+                let delta = (value[value_index] - remembered) * beta_gate;
+                for (state, key) in row.iter_mut().zip(key) {
+                    *state += key * delta;
+                }
+                output[value_head * layout.value_dim + value_index] = row
+                    .iter()
+                    .zip(query)
+                    .map(|(state, query)| state * query)
+                    .sum();
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn routing_top_k_is_stable_and_softmax_normalizes() {
+        let selected = top_k(&[0.1, 0.9, 0.9, -1.0], 2);
+        assert_eq!(selected, vec![(1, 0.9), (2, 0.9)]);
+        let mut weights: Vec<f32> = selected.iter().map(|(_, score)| *score).collect();
+        softmax_in_place(&mut weights);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn optional_qk_norm_absent_leaves_projection_unchanged() {
+        let mut values = vec![3.0, 4.0, 5.0, 12.0];
+        let original = values.clone();
+        apply_optional_per_head_rms_norm(&mut values, 2, 2, None).unwrap();
+        assert_eq!(values, original);
+
+        apply_optional_per_head_rms_norm(&mut values, 2, 2, Some(&[1.0, 1.0])).unwrap();
+        assert_ne!(values, original);
+    }
+
+    #[test]
+    fn fused_qk_norm_rope_matches_separate_steps() {
+        let layout = FullAttentionLayout {
+            q_layout: FullAttentionQLayout::Standard,
+            q_projection_width: 16,
+            q_width: 16,
+            kv_width: 8,
+            head_dim: 8,
+            rotary_dim: 8,
+            num_q_heads: 2,
+            kv_heads: 1,
+            rotary_pairing: RotaryPairing::SplitHalf,
+        };
+        let q_weight = [0.5, 1.0, 1.5, 2.0, 0.75, 1.25, 1.75, 2.25];
+        let k_weight = [1.25, 0.75, 1.5, 0.5, 2.0, 1.0, 0.875, 1.125];
+        let mut expected_q: Vec<f32> = (0..layout.q_width)
+            .map(|index| ((index as f32) * 0.31).sin() + 0.125)
+            .collect();
+        let mut expected_k: Vec<f32> = (0..layout.kv_width)
+            .map(|index| ((index as f32) * 0.19).cos() - 0.25)
+            .collect();
+        let mut actual_q = expected_q.clone();
+        let mut actual_k = expected_k.clone();
+        let position = MropePosition {
+            temporal: 7,
+            height: 3,
+            width: 5,
+        };
+
+        apply_optional_per_head_rms_norm(
+            &mut expected_q,
+            layout.num_q_heads,
+            layout.head_dim,
+            Some(&q_weight),
+        )
+        .unwrap();
+        apply_optional_per_head_rms_norm(
+            &mut expected_k,
+            layout.kv_heads,
+            layout.head_dim,
+            Some(&k_weight),
+        )
+        .unwrap();
+        apply_rotary_for_layout(
+            &mut expected_q,
+            &mut expected_k,
+            position,
+            1_000_000.0,
+            layout,
+            Some([1, 1, 1]),
+        );
+        apply_full_attention_qk_norm_and_rotary(
+            &mut actual_q,
+            &mut actual_k,
+            layout,
+            position,
+            1_000_000.0,
+            Some([1, 1, 1]),
+            Some(&q_weight),
+            Some(&k_weight),
+        )
+        .unwrap();
+
+        for (actual, expected) in actual_q
+            .iter()
+            .chain(&actual_k)
+            .zip(expected_q.iter().chain(&expected_k))
+        {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn causal_attention_gqa_matches_independent_reference() {
+        let query = [0.2, -0.1, 0.4, 0.3, -0.5, 0.7, 0.6, -0.2];
+        let k0 = [0.1, 0.3, -0.2, 0.4];
+        let v0 = [1.0, 2.0, 3.0, 4.0];
+        let k1 = [0.5, -0.4, 0.6, 0.2];
+        let v1 = [-1.0, 0.5, 2.0, -0.5];
+        let keys_values = [(&k0[..], &v0[..]), (&k1[..], &v1[..])];
+
+        let actual = causal_attention(&query, &keys_values, 4, 2, 2);
+        let mut expected = vec![0.0f32; query.len()];
+        let scale = (2.0f32).sqrt().recip();
+        for query_head in 0..4 {
+            let key_head = query_head / 2;
+            let q = &query[query_head * 2..query_head * 2 + 2];
+            let mut scores = keys_values
+                .iter()
+                .map(|(key, _)| {
+                    let key = &key[key_head * 2..key_head * 2 + 2];
+                    q.iter().zip(key).map(|(q, key)| q * key).sum::<f32>() * scale
+                })
+                .collect::<Vec<_>>();
+            softmax_in_place(&mut scores);
+            for (score, (_, value)) in scores.iter().zip(keys_values) {
+                let value = &value[key_head * 2..key_head * 2 + 2];
+                expected[query_head * 2] += score * value[0];
+                expected[query_head * 2 + 1] += score * value[1];
+            }
+        }
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn causal_conv1d_reference_uses_chronological_state_order() {
+        let actual = conv1d_reference_step(
+            &[1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+            &[4.0, 40.0],
+            &[0.1, 0.2, 0.3, 0.4, -0.2, 0.05, 0.15, -0.1],
+            2,
+            4,
+        );
+        let expected = [
+            silu(1.0 * 0.1 + 2.0 * 0.2 + 3.0 * 0.3 + 4.0 * 0.4),
+            silu(10.0 * -0.2 + 20.0 * 0.05 + 30.0 * 0.15 + 40.0 * -0.1),
+        ];
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn gated_delta_reference_preserves_value_major_state_layout() {
+        let layout = LinearAttentionLayout {
+            num_key_heads: 1,
+            num_value_heads: 2,
+            key_dim: 2,
+            value_dim: 2,
+            total_key_width: 2,
+            total_value_width: 4,
+            conv_dim: 6,
+            conv_kernel_size: 2,
+        };
+        let mut state = vec![0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, -0.1];
+        let output = gated_delta_reference(
+            layout,
+            &mut state,
+            &[0.7, -0.2],
+            &[0.4, 0.1],
+            &[0.2, -0.1, 0.6, 0.05],
+            &[0.1, -0.3],
+            &[0.2, 0.5],
+            &[-0.2, 0.4],
+            &[0.05, -0.15],
+        );
+
+        assert_eq!(output.len(), layout.total_value_width);
+        assert!(output.iter().all(|value| value.is_finite()));
+        assert!(state.iter().all(|value| value.is_finite()));
+        assert_ne!(state, vec![0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, -0.1]);
+    }
+
     #[test]
     fn gated_q_projection_splits_query_and_gate_by_head() {
         let layout = FullAttentionLayout {

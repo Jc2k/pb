@@ -301,8 +301,10 @@ Baseline reviewed on 2026-07-11:
   consumes it. Remaining legacy helpers must compile as dependencies of registered parity or
   compatibility tests.
 - Gate 7 removed the duplicate Accelerate-backed gated-delta execution path, CBLAS bridge, and
-  scratch dispatch from the test-only legacy boundary. Recurrence parity retains one direct scalar
-  oracle; production recurrence remains solely the resolved Metal stage.
+  scratch dispatch from the test-only legacy boundary. The math owner now retains the direct
+  value-major recurrence oracle together with QK normalization/rotary, grouped-query attention,
+  causal convolution ordering, and routing parity. Their legacy tests and scalar recurrence helper
+  were removed; production recurrence remains solely the resolved Metal stage.
 - Exact duplicate PBQ4 metadata parser/error tests and Qwen3Next norm-offset detection coverage
   were deleted from `legacy.rs`; their registered `experts.rs` and `weights.rs` owner tests remain.
 - Planning now owns its model alias, typed cache layout, missing-artifact, stale-runtime cleanup,
