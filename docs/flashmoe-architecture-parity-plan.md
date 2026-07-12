@@ -251,8 +251,10 @@ Baseline reviewed on 2026-07-11:
   CLI prefill/decode runs and eventually exhausting Metal allocations. One RAII encoding owner ends
   the compute encoder on every success, error, and early-return path before releasing it or recycling
   referenced buffers; deferred CMD3 explicitly transfers its ended command buffer to the submission.
-  If a new buffer allocation still encounters pressure, the buffer pool releases all currently idle
-  reusable buffers and retries once, reporting the requested and released byte counts on failure.
+  The reusable pool uses best-fit allocation so tiny transients cannot consume cached whole-expert
+  buffers, and under capacity pressure it retains larger buffers instead of the earliest small ones.
+  If a new allocation still fails, the pool releases all currently idle buffers and retries once,
+  reporting the requested and released byte counts on failure.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch
   used by full-attention CMD1 and deferred state. `weights.rs` resolves one
   `ResidentMmapMatvecProjection` from manifest dtype/quantization metadata; CPU or GPU input

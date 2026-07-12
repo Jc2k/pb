@@ -226,6 +226,25 @@ pub(crate) struct MetalReusableBuffer {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn best_fit_reusable_buffer_index(buffers: &[MetalReusableBuffer], len: usize) -> Option<usize> {
+    buffers
+        .iter()
+        .enumerate()
+        .filter(|(_, buffer)| buffer.len >= len)
+        .min_by_key(|(_, buffer)| buffer.len)
+        .map(|(index, _)| index)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reusable_buffer_replacement_index(buffers: &[MetalReusableBuffer], len: usize) -> Option<usize> {
+    buffers
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, buffer)| buffer.len)
+        .and_then(|(index, buffer)| (buffer.len < len).then_some(index))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalReusableBuffer {
     pub(crate) fn new(id: MetalObjcId, len: usize) -> Self {
         Self { id, len }
@@ -248,7 +267,7 @@ impl MetalBufferPool {
         unsafe {
             {
                 let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-                if let Some(index) = reusable.iter().position(|buffer| buffer.len >= len) {
+                if let Some(index) = best_fit_reusable_buffer_index(&reusable, len) {
                     return Ok(reusable.swap_remove(index).id);
                 }
             }
@@ -340,9 +359,17 @@ impl MetalBufferPool {
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
             if reusable.len() < METAL_REUSABLE_BUFFER_POOL_LIMIT {
                 reusable.push(MetalReusableBuffer::new(buffer, len));
-            } else {
-                release(buffer);
+                return;
             }
+            let Some(index) = reusable_buffer_replacement_index(&reusable, len) else {
+                drop(reusable);
+                release(buffer);
+                return;
+            };
+            let evicted =
+                std::mem::replace(&mut reusable[index], MetalReusableBuffer::new(buffer, len));
+            drop(reusable);
+            release(evicted.id);
         }
     }
 
@@ -8613,6 +8640,25 @@ mod tests {
             assert_eq!(read_f32_buffer(g_decay.id(), 2), vec![0.0; 2]);
             assert_eq!(read_f32_buffer(beta_gate.id(), 2), vec![0.0; 2]);
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn reusable_metal_buffer_selection_is_best_fit_and_size_aware() {
+        let id = std::ptr::null_mut();
+        let buffers = vec![
+            MetalReusableBuffer::new(id, 2_654_208),
+            MetalReusableBuffer::new(id, 16),
+            MetalReusableBuffer::new(id, 4_096),
+            MetalReusableBuffer::new(id, 8_192),
+        ];
+
+        assert_eq!(best_fit_reusable_buffer_index(&buffers, 1), Some(1));
+        assert_eq!(best_fit_reusable_buffer_index(&buffers, 64), Some(2));
+        assert_eq!(best_fit_reusable_buffer_index(&buffers, 2_654_208), Some(0));
+        assert_eq!(best_fit_reusable_buffer_index(&buffers, 2_654_209), None);
+        assert_eq!(reusable_buffer_replacement_index(&buffers, 32), Some(1));
+        assert_eq!(reusable_buffer_replacement_index(&buffers, 16), None);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
