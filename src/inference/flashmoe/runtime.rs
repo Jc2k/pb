@@ -2302,6 +2302,39 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
     ) -> Result<u32> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return autoreleasepool(|_| {
+                self.sample_from_hidden_in_autoreleasepool(
+                    sampler,
+                    hidden,
+                    prompt_tokens,
+                    generated,
+                    trace_candidates,
+                    progress,
+                )
+            });
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        self.sample_from_hidden_in_autoreleasepool(
+            sampler,
+            hidden,
+            prompt_tokens,
+            generated,
+            trace_candidates,
+            progress,
+        )
+    }
+
+    fn sample_from_hidden_in_autoreleasepool(
+        &self,
+        sampler: &mut TokenSampler,
+        hidden: &[f32],
+        prompt_tokens: &[u32],
+        generated: &[u32],
+        trace_candidates: bool,
+        progress: &GenerationProgress<'_>,
+    ) -> Result<u32> {
         if trace_candidates {
             let logits = self.dense.lm_head_logits_with_metal(
                 Some(&self.metal),

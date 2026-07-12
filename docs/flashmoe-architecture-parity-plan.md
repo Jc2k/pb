@@ -244,12 +244,15 @@ Baseline reviewed on 2026-07-11:
   binding, recurrent-state allocation/reset/release, and the reusable buffer pool. The former
   `MetalExecutorInner` and all recurrent Obj-C lifecycle helpers have left `legacy.rs`; its
   `MetalExecutionFacade` only validates construction policy and calls typed Metal APIs.
-- The runtime scopes every token forward pass to an Objective-C autorelease pool. Retained
+- The runtime scopes every token forward pass and vocabulary-sampling command to an Objective-C
+  autorelease pool. Retained
   device/queue/pipeline, mmap, recurrent-state, and reusable buffers keep their declared owners,
   while transient command objects are drained after each token instead of accumulating across long
   CLI prefill/decode runs and eventually exhausting Metal allocations. One RAII encoding owner ends
   the compute encoder on every success, error, and early-return path before releasing it or recycling
   referenced buffers; deferred CMD3 explicitly transfers its ended command buffer to the submission.
+  If a new buffer allocation still encounters pressure, the buffer pool releases all currently idle
+  reusable buffers and retries once, reporting the requested and released byte counts on failure.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch
   used by full-attention CMD1 and deferred state. `weights.rs` resolves one
   `ResidentMmapMatvecProjection` from manifest dtype/quantization metadata; CPU or GPU input

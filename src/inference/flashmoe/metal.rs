@@ -254,10 +254,35 @@ impl MetalBufferPool {
             }
             let buffer =
                 msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
-            if buffer.is_null() {
-                anyhow::bail!("failed to allocate Flash-MoE Metal output buffer");
+            if !buffer.is_null() {
+                return Ok(buffer);
             }
-            Ok(buffer)
+
+            let (released_buffers, released_bytes) = {
+                let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+                let released_buffers = reusable.len();
+                let released_bytes = reusable
+                    .iter()
+                    .map(|buffer| buffer.len)
+                    .fold(0usize, usize::saturating_add);
+                for reusable_buffer in reusable.drain(..) {
+                    release(reusable_buffer.id);
+                }
+                (released_buffers, released_bytes)
+            };
+            let retry = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
+            if retry.is_null() {
+                anyhow::bail!(
+                    "failed to allocate Flash-MoE Metal buffer: requested_bytes={len} released_pooled_buffers={released_buffers} released_pooled_bytes={released_bytes}"
+                );
+            }
+            tracing::warn!(
+                requested_bytes = len,
+                released_pooled_buffers = released_buffers,
+                released_pooled_bytes = released_bytes,
+                "FlashMoe Metal allocation recovered after draining the reusable buffer pool"
+            );
+            Ok(retry)
         }
     }
 
