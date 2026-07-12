@@ -20,20 +20,9 @@ const HARNESS_GIT_NAME: &str = "pb harness";
 const HARNESS_GIT_EMAIL: &str = "harness@pb.local";
 const HARNESS_AGENT_TOOLS: &[&str] = &[
     "session_title",
-    "todo",
-    "read_file",
-    "glob",
-    "ripgrep",
-    "search",
-    "git_log",
-    "session_changes",
     "run_command",
-    "edit_file",
     "apply_patch",
-    "mv",
-    "rm",
     "git_commit",
-    "git_revert",
     "sub_agent",
 ];
 
@@ -578,6 +567,20 @@ fn compact_detail(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_agent_tool_surface_is_minimal_but_complete() {
+        assert_eq!(
+            HARNESS_AGENT_TOOLS,
+            [
+                "session_title",
+                "run_command",
+                "apply_patch",
+                "git_commit",
+                "sub_agent"
+            ]
+        );
+    }
 
     #[test]
     fn scratch_workspace_is_persistent_git_repository() {
