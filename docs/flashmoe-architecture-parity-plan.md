@@ -246,8 +246,10 @@ Baseline reviewed on 2026-07-11:
   `MetalExecutionFacade` only validates construction policy and calls typed Metal APIs.
 - The runtime scopes every token forward pass to an Objective-C autorelease pool. Retained
   device/queue/pipeline, mmap, recurrent-state, and reusable buffers keep their declared owners,
-  while transient command buffers and encoders are drained after each token instead of accumulating
-  across long CLI prefill/decode runs and eventually exhausting Metal allocations.
+  while transient command objects are drained after each token instead of accumulating across long
+  CLI prefill/decode runs and eventually exhausting Metal allocations. One RAII encoding owner ends
+  the compute encoder on every success, error, and early-return path before releasing it or recycling
+  referenced buffers; deferred CMD3 explicitly transfers its ended command buffer to the submission.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch
   used by full-attention CMD1 and deferred state. `weights.rs` resolves one
   `ResidentMmapMatvecProjection` from manifest dtype/quantization metadata; CPU or GPU input

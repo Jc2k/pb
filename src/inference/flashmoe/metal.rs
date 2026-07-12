@@ -780,6 +780,81 @@ impl Drop for OwnedMetalObject {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+struct MetalCommandEncoding {
+    command_buffer: MetalObjcId,
+    encoder: MetalObjcId,
+    ended: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCommandEncoding {
+    unsafe fn new(
+        command_queue: MetalObjcId,
+        command_buffer_error: &'static str,
+        encoder_error: &'static str,
+    ) -> anyhow::Result<Self> {
+        unsafe {
+            let command_buffer = retain(msg_send_id0(command_queue, sel("commandBuffer")));
+            if command_buffer.is_null() {
+                anyhow::bail!(command_buffer_error);
+            }
+            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
+            if encoder.is_null() {
+                release(command_buffer);
+                anyhow::bail!(encoder_error);
+            }
+            Ok(Self {
+                command_buffer,
+                encoder,
+                ended: false,
+            })
+        }
+    }
+
+    fn command_buffer(&self) -> MetalObjcId {
+        self.command_buffer
+    }
+
+    fn encoder(&self) -> MetalObjcId {
+        self.encoder
+    }
+
+    unsafe fn end_encoding(&mut self) {
+        unsafe {
+            if !self.ended {
+                msg_send_void0(self.encoder, sel("endEncoding"));
+                self.ended = true;
+            }
+        }
+    }
+
+    unsafe fn into_command_buffer(mut self) -> MetalObjcId {
+        unsafe {
+            self.end_encoding();
+            release(self.encoder);
+            self.encoder = ptr::null_mut();
+            let command_buffer = self.command_buffer;
+            self.command_buffer = ptr::null_mut();
+            command_buffer
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalCommandEncoding {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.encoder.is_null() {
+                self.end_encoding();
+                release(self.encoder);
+            }
+            release(self.command_buffer);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 pub(crate) struct MetalRuntime {
     pub(crate) device: MetalObjcId,
     pub(crate) command_queue: MetalObjcId,
@@ -1289,17 +1364,18 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                 }
             };
 
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.buffers.recycle_or_release(&transient, true);
-                anyhow::bail!("failed to create Flash-MoE resident topK command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.buffers.recycle_or_release(&transient, true);
-                anyhow::bail!("failed to create Flash-MoE resident topK compute encoder");
-            }
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                "failed to create Flash-MoE resident topK command buffer",
+                "failed to create Flash-MoE resident topK compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.buffers.recycle_or_release(&transient, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
 
             if let Err(error) = encode_resident_projection_rows(
                 self.pipelines,
@@ -1311,8 +1387,7 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                 logits_buffer,
                 0,
             ) {
-                release(encoder);
-                release(command_buffer);
+                drop(encoding);
                 self.buffers.recycle_or_release(&transient, true);
                 return Err(error);
             }
@@ -1324,7 +1399,7 @@ impl<'a> MetalResidentTopKBuilder<'a> {
             set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
             set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
             dispatch_threads(encoder, 1);
-            msg_send_void0(encoder, sel("endEncoding"));
+            encoding.end_encoding();
 
             let context = MetalCommandContext::new("resident_topk")
                 .with("tensor", projection.tensor_name())
@@ -1332,9 +1407,10 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                 .with("physical_rows", projection.rows())
                 .with("cols", projection.cols())
                 .with("top_k", top_k);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
                 self.buffers
                     .recycle_or_release(&transient, error.should_release_buffers());
                 return Err(error.into());
@@ -1346,8 +1422,7 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                 .map(|index| (*indices_ptr.add(index) as usize, *values_ptr.add(index)))
                 .collect();
 
-            release(encoder);
-            release(command_buffer);
+            drop(encoding);
             self.buffers.recycle_or_release(&transient, false);
             Ok(candidates)
         }
@@ -1447,17 +1522,18 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 &mut owned,
             )?;
 
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.buffers.recycle_or_release(&owned, true);
-                anyhow::bail!("failed to create Flash-MoE CMD2 post-attention command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.buffers.recycle_or_release(&owned, true);
-                anyhow::bail!("failed to create Flash-MoE CMD2 post-attention compute encoder");
-            }
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                "failed to create Flash-MoE CMD2 post-attention command buffer",
+                "failed to create Flash-MoE CMD2 post-attention compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.buffers.recycle_or_release(&owned, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
 
             let encode_result = (|| -> Result<()> {
                 encode_resident_projection(
@@ -1492,12 +1568,11 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 )
             })();
             if let Err(error) = encode_result {
-                release(encoder);
-                release(command_buffer);
+                drop(encoding);
                 self.buffers.recycle_or_release(&owned, true);
                 return Err(error);
             }
-            msg_send_void0(encoder, sel("endEncoding"));
+            encoding.end_encoding();
 
             let context = MetalCommandContext::new("cmd2_resident_post_attention")
                 .with("layer", plan.layer)
@@ -1508,9 +1583,10 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 .with("routing_topk", "cpu")
                 .with("out_proj", projections.out_proj.tensor_name())
                 .with("router", projections.router.tensor_name());
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
                 self.buffers
                     .recycle_or_release(&owned, error.should_release_buffers());
                 return Err(error.into());
@@ -1530,8 +1606,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 normed_buffer,
             );
 
-            release(encoder);
-            release(command_buffer);
+            drop(encoding);
             if output.is_err() {
                 self.buffers.recycle_or_release(&owned, false);
                 return output;
@@ -1797,20 +1872,18 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 }
             };
 
-            let command_buffer = retain(msg_send_id0(
+            let mut encoding = match MetalCommandEncoding::new(
                 self.runtime.command_queue,
-                sel("commandBuffer"),
-            ));
-            if command_buffer.is_null() {
-                self.buffers.recycle_or_release_phase(phase_buffers, true);
-                anyhow::bail!("failed to create Flash-MoE scheduled CMD3 command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.buffers.recycle_or_release_phase(phase_buffers, true);
-                anyhow::bail!("failed to create Flash-MoE scheduled CMD3 compute encoder");
-            }
+                "failed to create Flash-MoE scheduled CMD3 command buffer",
+                "failed to create Flash-MoE scheduled CMD3 compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
 
             let encode_result = (|| -> anyhow::Result<()> {
                 let mut source_buffers = MetalExpertSourceBufferCache::default();
@@ -1926,15 +1999,14 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     set_buffer(encoder, next_buffers.width, 3);
                     dispatch_single_threadgroup(encoder, next_plan.dispatch_threads);
                 }
-                msg_send_void0(encoder, sel("endEncoding"));
                 Ok(())
             })();
             if let Err(error) = encode_result {
-                release(encoder);
-                release(command_buffer);
+                drop(encoding);
                 self.buffers.recycle_or_release_phase(phase_buffers, true);
                 return Err(error);
             }
+            encoding.end_encoding();
 
             let output = match MetalCmd3DeferredOutput::new(
                 output_buffers.hidden,
@@ -1943,8 +2015,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             ) {
                 Ok(output) => output,
                 Err(error) => {
-                    release(encoder);
-                    release(command_buffer);
+                    drop(encoding);
                     self.buffers.recycle_or_release_phase(phase_buffers, true);
                     return Err(error);
                 }
@@ -1955,8 +2026,8 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 .collect::<Vec<_>>()
                 .join(",");
             let context = command_plan.command_context(expert_ids);
+            let command_buffer = encoding.into_command_buffer();
             commit_metal_command_buffer(command_buffer, &context);
-            release(encoder);
             Ok(MetalScheduledCmd3Submission {
                 buffers: Arc::clone(&self.buffers),
                 command_buffer,
@@ -2843,25 +2914,22 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             if let Some(buffer) = owned_residual_input_buffer {
                 owned_buffers.push(buffer);
             }
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                "failed to create Flash-MoE fused linear-attention command buffer",
+                "failed to create Flash-MoE fused linear-attention compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    if let Some(buffer) = owned_input_buffer {
+                        self.recycle(buffer);
+                    }
+                    self.recycle_or_release_buffers(&owned_buffers, true);
+                    drop(state_guard);
+                    return Err(error);
                 }
-                self.recycle_or_release_buffers(&owned_buffers, true);
-                drop(state_guard);
-                bail!("failed to create Flash-MoE fused linear-attention command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                if let Some(buffer) = owned_input_buffer {
-                    self.recycle(buffer);
-                }
-                self.recycle_or_release_buffers(&owned_buffers, true);
-                drop(state_guard);
-                bail!("failed to create Flash-MoE fused linear-attention compute encoder");
-            }
+            };
+            let encoder = encoding.encoder();
 
             for (idx, projection) in projections.iter().enumerate() {
                 if let Err(error) = encode_resident_projection(
@@ -2873,8 +2941,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                     projection_buffer,
                     output_byte_offsets[idx],
                 ) {
-                    release(encoder);
-                    release(command_buffer);
+                    drop(encoding);
                     if let Some(buffer) = owned_input_buffer {
                         self.recycle_or_release_buffers(&[buffer], true);
                     }
@@ -3084,8 +3151,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 )
             })();
             if let Err(error) = post_projection_result {
-                release(encoder);
-                release(command_buffer);
+                drop(encoding);
                 if let Some(buffer) = owned_input_buffer {
                     self.recycle_or_release_buffers(&[buffer], true);
                 }
@@ -3094,7 +3160,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 return Err(error);
             }
 
-            msg_send_void0(encoder, sel("endEncoding"));
+            encoding.end_encoding();
 
             let active_count = top_k.min(router.rows()).max(1);
             let context = MetalCommandContext::new("linear_attention_fused_post")
@@ -3104,9 +3170,10 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 .with("input_len", input_len)
                 .with("experts", router.rows())
                 .with("top_k", active_count);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
                 if let Some(buffer) = owned_input_buffer {
                     self.recycle_or_release_buffers(&[buffer], error.should_release_buffers());
                 }
@@ -3121,8 +3188,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 std::slice::from_raw_parts(router_logits_ptr, router.rows()).to_vec();
             let active = routing_softmax_top_k(&router_scores, active_count);
 
-            release(encoder);
-            release(command_buffer);
+            drop(encoding);
             if let Some(buffer) = owned_input_buffer {
                 self.recycle(buffer);
             }
@@ -3332,34 +3398,37 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             let mut buffers = vec![input_buffer, output_buffer];
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
-            }
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                "failed to create Flash-MoE dense q4 mmap batch Metal command buffer",
+                "failed to create Flash-MoE dense q4 mmap batch Metal compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
 
             let q4_projections = projections
                 .iter()
                 .map(ResidentMmapMatvecProjection::q4)
                 .collect::<Option<Vec<_>>>();
-            let dispatch_count = if let Some(q4_projections) = q4_projections
-                && self.try_encode_q4_mmap_projection_batch(
-                    encoder,
-                    &q4_projections,
-                    input_buffer,
-                    output_buffer,
-                    &output_offsets,
-                    total_rows,
-                    &mut buffers,
-                )? {
-                1
-            } else {
+            let encode_result = (|| -> Result<usize> {
+                if let Some(q4_projections) = q4_projections
+                    && self.try_encode_q4_mmap_projection_batch(
+                        encoder,
+                        &q4_projections,
+                        input_buffer,
+                        output_buffer,
+                        &output_offsets,
+                        total_rows,
+                        &mut buffers,
+                    )?
+                {
+                    return Ok(1);
+                }
                 for (idx, projection) in projections.iter().enumerate() {
                     let output_offset = output_offsets[idx]
                         .checked_mul(std::mem::size_of::<f32>())
@@ -3375,9 +3444,17 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                         output_offset,
                     )?;
                 }
-                projections.len()
+                Ok(projections.len())
+            })();
+            let dispatch_count = match encode_result {
+                Ok(dispatch_count) => dispatch_count,
+                Err(error) => {
+                    drop(encoding);
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
             };
-            msg_send_void0(encoder, sel("endEncoding"));
+            encoding.end_encoding();
 
             let dispatch_started = Instant::now();
             let names = projections
@@ -3391,9 +3468,10 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 .with("rows", total_rows)
                 .with("input_len", input.len())
                 .with("tensors", names);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
@@ -3412,8 +3490,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 outputs.push(output);
             }
 
-            release(encoder);
-            release(command_buffer);
+            drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
             }
@@ -3452,34 +3529,37 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             let mut buffers = vec![output_buffer];
             timing.buffer_upload += upload_started.elapsed();
 
-            let command_buffer = retain(msg_send_id0(self.command_queue, sel("commandBuffer")));
-            if command_buffer.is_null() {
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal command buffer");
-            }
-            let encoder = retain(msg_send_id0(command_buffer, sel("computeCommandEncoder")));
-            if encoder.is_null() {
-                release(command_buffer);
-                self.recycle_or_release_buffers(&buffers, true);
-                bail!("failed to create Flash-MoE dense q4 mmap batch Metal compute encoder");
-            }
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                "failed to create Flash-MoE dense q4 mmap batch Metal command buffer",
+                "failed to create Flash-MoE dense q4 mmap batch Metal compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
 
             let q4_projections = projections
                 .iter()
                 .map(ResidentMmapMatvecProjection::q4)
                 .collect::<Option<Vec<_>>>();
-            let dispatch_count = if let Some(q4_projections) = q4_projections
-                && self.try_encode_q4_mmap_projection_batch(
-                    encoder,
-                    &q4_projections,
-                    input_buffer,
-                    output_buffer,
-                    &output_offsets,
-                    total_rows,
-                    &mut buffers,
-                )? {
-                1
-            } else {
+            let encode_result = (|| -> Result<usize> {
+                if let Some(q4_projections) = q4_projections
+                    && self.try_encode_q4_mmap_projection_batch(
+                        encoder,
+                        &q4_projections,
+                        input_buffer,
+                        output_buffer,
+                        &output_offsets,
+                        total_rows,
+                        &mut buffers,
+                    )?
+                {
+                    return Ok(1);
+                }
                 for (idx, projection) in projections.iter().enumerate() {
                     let output_offset = output_offsets[idx]
                         .checked_mul(std::mem::size_of::<f32>())
@@ -3495,9 +3575,17 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                         output_offset,
                     )?;
                 }
-                projections.len()
+                Ok(projections.len())
+            })();
+            let dispatch_count = match encode_result {
+                Ok(dispatch_count) => dispatch_count,
+                Err(error) => {
+                    drop(encoding);
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
             };
-            msg_send_void0(encoder, sel("endEncoding"));
+            encoding.end_encoding();
 
             let dispatch_started = Instant::now();
             let names = projections
@@ -3511,9 +3599,10 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 .with("rows", total_rows)
                 .with("input_len", input_len)
                 .with("tensors", names);
-            if let Err(error) = commit_and_wait_metal_command_buffer(command_buffer, &context) {
-                release(encoder);
-                release(command_buffer);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
@@ -3532,8 +3621,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 outputs.push(output);
             }
 
-            release(encoder);
-            release(command_buffer);
+            drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
             }
@@ -8426,6 +8514,25 @@ mod tests {
                 .contains("does not match the resolved resident state"),
             "{shape_err:#}"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn metal_command_encoding_drop_ends_encoder_before_autorelease() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let device = OwnedMetalObject::new(metal_default_device()).unwrap();
+            let command_queue =
+                OwnedMetalObject::new(msg_send_id0(device.id(), sel("newCommandQueue"))).unwrap();
+            let encoding = MetalCommandEncoding::new(
+                command_queue.id(),
+                "test command buffer allocation failed",
+                "test command encoder allocation failed",
+            )
+            .unwrap();
+
+            drop(encoding);
+        });
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
