@@ -452,6 +452,10 @@ pub struct AgentRequest {
     pub branch: Option<String>,
     pub max_steps: usize,
     pub max_tokens: i32,
+    /// Optional authoritative per-turn cap. Normal agent requests retain the profile floor and
+    /// truncation retry behavior; direct harness callers can request a smaller, bounded turn.
+    #[serde(default)]
+    pub turn_max_tokens_cap: Option<i32>,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -3056,7 +3060,7 @@ fn generate_and_parse_action_with_retries(
                     return Ok(Err(failure));
                 }
 
-                let next_max_tokens = next_retry_max_tokens(max_tokens);
+                let next_max_tokens = next_retry_max_tokens(max_tokens, args.turn_max_tokens_cap);
                 if next_max_tokens <= max_tokens {
                     return Ok(Err(failure));
                 }
@@ -3073,6 +3077,9 @@ fn generate_and_parse_action_with_retries(
 }
 
 fn boosted_max_tokens(args: &AgentRequest) -> i32 {
+    if let Some(cap) = args.turn_max_tokens_cap {
+        return args.max_tokens.min(cap).max(1);
+    }
     let profile_floor = match args.profile {
         AgentProfile::Research => RESEARCH_TURN_MAX_TOKENS,
         _ => DEFAULT_TURN_MAX_TOKENS,
@@ -3080,8 +3087,11 @@ fn boosted_max_tokens(args: &AgentRequest) -> i32 {
     args.max_tokens.max(profile_floor)
 }
 
-fn next_retry_max_tokens(current: i32) -> i32 {
-    current.saturating_mul(2).min(MAX_TOKEN_RETRY_CAP)
+fn next_retry_max_tokens(current: i32, cap: Option<i32>) -> i32 {
+    current
+        .saturating_mul(2)
+        .min(MAX_TOKEN_RETRY_CAP)
+        .min(cap.unwrap_or(i32::MAX).max(1))
 }
 
 fn duration_millis(started: Instant) -> u64 {
@@ -5601,6 +5611,7 @@ mod tests {
             branch: None,
             max_steps: 10,
             max_tokens,
+            turn_max_tokens_cap: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -5800,11 +5811,20 @@ mod tests {
     }
 
     #[test]
+    fn boosted_max_tokens_honors_explicit_turn_cap() {
+        let mut args = test_agent_request(AgentProfile::Build, 256);
+        args.turn_max_tokens_cap = Some(256);
+
+        assert_eq!(boosted_max_tokens(&args), 256);
+        assert_eq!(next_retry_max_tokens(256, args.turn_max_tokens_cap), 256);
+    }
+
+    #[test]
     fn next_retry_max_tokens_doubles_until_hard_cap() {
-        assert_eq!(next_retry_max_tokens(2_048), 4_096);
-        assert_eq!(next_retry_max_tokens(4_096), MAX_TOKEN_RETRY_CAP);
+        assert_eq!(next_retry_max_tokens(2_048, None), 4_096);
+        assert_eq!(next_retry_max_tokens(4_096, None), MAX_TOKEN_RETRY_CAP);
         assert_eq!(
-            next_retry_max_tokens(MAX_TOKEN_RETRY_CAP),
+            next_retry_max_tokens(MAX_TOKEN_RETRY_CAP, None),
             MAX_TOKEN_RETRY_CAP
         );
     }
@@ -6388,6 +6408,7 @@ mod tests {
             branch: None,
             max_steps: 10,
             max_tokens: 2048,
+            turn_max_tokens_cap: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -6446,6 +6467,7 @@ mod tests {
             branch: None,
             max_steps: 10,
             max_tokens: 2048,
+            turn_max_tokens_cap: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,

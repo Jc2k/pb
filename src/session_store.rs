@@ -319,6 +319,7 @@ mod tests {
             branch: Some("pb/test".to_string()),
             max_steps: 1,
             max_tokens: 1,
+            turn_max_tokens_cap: None,
             ctx_size: 128,
             threads: None,
             threads_batch: None,

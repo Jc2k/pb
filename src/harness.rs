@@ -165,6 +165,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .clone()
         .or_else(|| user_config.effective_model_dir());
     let models_root = model_dir.clone().unwrap_or_else(crate::default_models_dir);
+    let turn_max_tokens_cap = args.max_tokens;
     let request = AgentRequest {
         task: args.task.clone(),
         model: args
@@ -180,6 +181,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         max_tokens: args
             .max_tokens
             .unwrap_or_else(|| user_config.effective_max_tokens()),
+        turn_max_tokens_cap,
         ctx_size: args
             .ctx_size
             .unwrap_or_else(|| user_config.effective_ctx_size()),
