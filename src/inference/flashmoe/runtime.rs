@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tracing::info;
+use tracing::{info, trace};
 
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::ExpertSlotStore;
@@ -70,6 +70,27 @@ impl FlashMoeTimingBuckets {
 }
 
 pub(super) type GenerationProgress<'a> = Option<Rc<RefCell<&'a mut dyn FnMut(String)>>>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn trace_cmd2_state(position: usize, layer: usize, prep: &MetalPostAttentionPrep) {
+    if !tracing::enabled!(target: "flashmoe_cmd2_state", tracing::Level::TRACE) {
+        return;
+    }
+    let residual = unsafe { read_f32_buffer(prep.residual_buffer, prep.width) };
+    let normed = unsafe { read_f32_buffer(prep.normed_buffer, prep.width) };
+    let vector_rms = |values: &[f32]| {
+        (values.iter().map(|value| value * value).sum::<f32>() / values.len().max(1) as f32).sqrt()
+    };
+    trace!(
+        target: "flashmoe_cmd2_state",
+        position,
+        layer,
+        residual_rms = vector_rms(&residual),
+        normed_rms = vector_rms(&normed),
+        routes = ?prep.active,
+        "flashmoe resolved CMD2 state"
+    );
+}
 
 struct SampledDecode {
     token: u32,
@@ -923,6 +944,9 @@ impl FlashMoeEngine {
                 active
             };
             layer_timing.active_experts = active.routes.len();
+            if let Some(prep) = metal_post_attention_prep.as_ref() {
+                trace_cmd2_state(position, layer, prep);
+            }
             let layer_schedule = layer_schedule.resolve(&active)?;
             let pending_cmd3 = layer_schedule.issue_cmd3(&mut self.scheduler, &active)?;
             // While expert reads are still pending, prepare the always-active

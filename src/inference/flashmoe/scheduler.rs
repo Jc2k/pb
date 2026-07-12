@@ -8,7 +8,9 @@ use super::experts::{
     ExpertSlotDescriptor, ExpertSlotStore, ExpertStorageLayout, FLASHMOE_EXPERT_IO_POLICY,
     Q4MatvecPayload, Q4MatvecSource,
 };
-use super::math::{softmax_in_place, top_k};
+use super::math::routing_softmax_top_k;
+#[cfg(test)]
+use super::math::{routing_top_k, softmax_in_place, top_k};
 use super::model_family::{QwenMoeFamily, QwenMoeLayerKind, QwenMoeRoutingWeightNormalization};
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
@@ -1842,7 +1844,7 @@ impl ScheduledRoutingTopK {
                 );
             }
         }
-        Ok(top_k(scores, active_experts))
+        Ok(routing_softmax_top_k(scores, active_experts))
     }
 
     pub(crate) fn select_command_from_scores<TScores>(
@@ -2918,7 +2920,17 @@ impl ScheduledExpertRoutes {
         let mut weights: Vec<f32> = routes.iter().map(|route| route.score).collect();
         match normalization {
             QwenMoeRoutingWeightNormalization::RenormalizeSelected => {
-                softmax_in_place(&mut weights);
+                let sum = weights.iter().sum::<f32>();
+                if !(sum.is_finite() && sum > 0.0) {
+                    bail!("selected expert probabilities must have a positive finite sum");
+                }
+                let inverse_sum = sum.recip();
+                for weight in &mut weights {
+                    if *weight < 0.0 {
+                        bail!("selected expert probabilities must be non-negative");
+                    }
+                    *weight *= inverse_sum;
+                }
             }
             QwenMoeRoutingWeightNormalization::PreserveFullSoftmax => bail!(
                 "FlashMoe unsupported routing weights: preserving probabilities from the full expert softmax requires a declared scheduler implementation"
@@ -4570,8 +4582,13 @@ mod tests {
         }
 
         let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
-        let active = top_k(&router_scores, active_experts);
-        assert_eq!(active, vec![(8, 4.0), (3, 3.0), (5, 2.5), (1, 2.0)]);
+        let mut router_probabilities = router_scores.to_vec();
+        softmax_in_place(&mut router_probabilities);
+        let active = routing_top_k(&router_probabilities, active_experts);
+        assert_eq!(
+            active.iter().map(|(expert, _)| *expert).collect::<Vec<_>>(),
+            vec![5, 1, 8, 3]
+        );
 
         let (temp, mut scheduler) = test_execution_scheduler();
         write_identity_fixed_q4_layer(temp.path(), layer, experts);
@@ -4655,12 +4672,12 @@ mod tests {
                             .iter()
                             .map(|expert| expert.expert())
                             .collect::<Vec<_>>(),
-                        vec![8, 3, 5, 1]
+                        vec![5, 1, 8, 3]
                     );
                     for (actual, expected) in command
                         .weights
                         .iter()
-                        .zip([0.5213327, 0.19178757, 0.11632504, 0.07055471])
+                        .zip([0.12925005, 0.07839412, 0.57925856, 0.2130973])
                     {
                         assert!((actual - expected).abs() <= 1e-6);
                     }
@@ -4677,8 +4694,11 @@ mod tests {
                         .zip(shared_output.iter())
                         .map(|((residual, expert), shared)| residual + expert + shared)
                         .collect();
-                    for (actual, expected) in hidden.iter().zip([2.9453208, 0.34506905]) {
-                        assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+                    for (actual, expected) in hidden.iter().zip([3.0771027, 0.36557937]) {
+                        assert!(
+                            (actual - expected).abs() <= 1e-5,
+                            "{actual} != {expected}; hidden={hidden:?}"
+                        );
                     }
                     let next_normed =
                         reference_rms_norm(&hidden, command.next_norm_weights.values().unwrap());
@@ -4705,11 +4725,11 @@ mod tests {
                 FlashMoeExpertPhaseApplication::HiddenAndNextNormed,
             )
             .unwrap();
-        for (actual, expected) in token_state.hidden().iter().zip([2.9453208, 0.34506905]) {
+        for (actual, expected) in token_state.hidden().iter().zip([3.0771027, 0.36557937]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let next_normed = token_state.take_next_layer_normed_as_normed().unwrap();
-        for (actual, expected) in next_normed.iter().zip([1.4046044, 0.08228089]) {
+        for (actual, expected) in next_normed.iter().zip([1.404337, 0.08342209]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
     }
@@ -4738,19 +4758,12 @@ mod tests {
         let residual = [0.5 + attention[0], -1.0 + attention[1]];
         let normed = reference_rms_norm(&residual, &[1.0, 1.0]);
         let router_scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
-        let active = top_k(&router_scores, active_experts);
+        let mut router_probabilities = router_scores.to_vec();
+        softmax_in_place(&mut router_probabilities);
+        let active = routing_top_k(&router_probabilities, active_experts);
         assert_eq!(
-            active,
-            vec![
-                (8, 4.0),
-                (3, 3.0),
-                (5, 2.5),
-                (1, 2.0),
-                (7, 1.5),
-                (4, 0.5),
-                (0, 0.1),
-                (6, -0.2),
-            ]
+            active.iter().map(|(expert, _)| *expert).collect::<Vec<_>>(),
+            vec![0, 1, 8, 3, 4, 5, 6, 7]
         );
 
         let (temp, mut scheduler) = test_qwen3_execution_scheduler();
@@ -4827,17 +4840,17 @@ mod tests {
                             .iter()
                             .map(|expert| expert.expert())
                             .collect::<Vec<_>>(),
-                        vec![8, 3, 5, 1, 7, 4, 0, 6]
+                        vec![0, 1, 8, 3, 4, 5, 6, 7]
                     );
                     for (actual, expected) in command.weights.iter().zip([
+                        0.010802226,
+                        0.072222546,
                         0.5336564,
                         0.19632123,
-                        0.11907485,
-                        0.072222546,
-                        0.04380519,
                         0.016115028,
-                        0.010802226,
+                        0.11907485,
                         0.008002486,
+                        0.04380519,
                     ]) {
                         assert!((actual - expected).abs() <= 1e-6);
                     }
@@ -4934,14 +4947,17 @@ mod tests {
             )
             .unwrap();
         let hidden_0 = token_state.hidden().to_vec();
-        for (actual, expected) in hidden_0.iter().zip([0.9850961, -1.1830133]) {
-            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        for (actual, expected) in hidden_0.iter().zip([1.011218, -1.1477928]) {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "{actual} != {expected}; hidden={hidden_0:?}"
+            );
         }
         let next_normed_0 = token_state
             .take_next_layer_normed_as_normed()
             .unwrap()
             .into_values();
-        for (actual, expected) in next_normed_0.iter().zip([0.9049467, -0.54338086]) {
+        for (actual, expected) in next_normed_0.iter().zip([0.9348729, -0.5305683]) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let recurrent_after_linear = token_state.recurrent_value();
@@ -4988,7 +5004,7 @@ mod tests {
             .unwrap();
         assert_ne!(token_state.recurrent_value(), recurrent_after_linear);
         let hidden_1 = token_state.hidden().to_vec();
-        for (actual, expected) in hidden_1.iter().zip([3.1801152, -0.8707439]) {
+        for (actual, expected) in hidden_1.iter().zip([3.3762858, -0.8388142]) {
             assert!(
                 (actual - expected).abs() <= 1e-5,
                 "{actual} != {expected}; hidden={hidden_1:?}"
@@ -5004,15 +5020,15 @@ mod tests {
         ];
         for (actual, expected) in logits
             .iter()
-            .zip([3.1801152, -0.8707439, -3.615487, 1.4480867])
+            .zip([3.3762858, -0.8388142, -3.795693, 1.4731821])
         {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
         let candidates = top_k(&logits, 2);
         assert_eq!(candidates[0].0, 0);
         assert_eq!(candidates[1].0, 3);
-        assert!((candidates[0].1 - 3.1801152).abs() <= 1e-5);
-        assert!((candidates[1].1 - 1.4480867).abs() <= 1e-5);
+        assert!((candidates[0].1 - 3.3762858).abs() <= 1e-5);
+        assert!((candidates[1].1 - 1.4731821).abs() <= 1e-5);
         let metrics = scheduler.snapshot();
         assert_eq!(metrics.positioned_reads, 8);
         assert_eq!(metrics.bytes_read, 8 * 48);
@@ -5894,15 +5910,18 @@ mod tests {
             .build_routing_topk(3, 5, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
 
+        let logits = [0.0, 2.0, 2.0, -1.0, 1.0];
         let selected = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
                 3,
                 ScheduledRoutingCandidateSource::CpuRouterScores,
-                &[0.0, 2.0, 2.0, -1.0, 1.0],
+                &logits,
             ))
             .unwrap();
 
-        assert_eq!(selected, vec![(1, 2.0), (2, 2.0), (4, 1.0)]);
+        let mut probabilities = logits.to_vec();
+        softmax_in_place(&mut probabilities);
+        assert_eq!(selected, routing_top_k(&probabilities, 3));
 
         let layer_err = routing
             .select_from_scores(&ScheduledRoutingScoreView::new(
@@ -6040,7 +6059,9 @@ mod tests {
             routed.source,
             ScheduledRoutingCandidateSource::CpuRouterScores
         );
-        assert_eq!(routed.routes, vec![(1, 9.0), (3, 4.0)]);
+        let mut probabilities = vec![0.5, 9.0, -1.0, 4.0, 3.0];
+        softmax_in_place(&mut probabilities);
+        assert_eq!(routed.routes, routing_top_k(&probabilities, 2));
 
         let err = routing
             .build_score_projection_command(Some(projection), 8)
@@ -7780,14 +7801,10 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_expert_routes_normalize_and_scale_scores() {
+    fn scheduled_expert_routes_renormalize_and_scale_full_softmax_probabilities() {
         let scheduled =
-            ScheduledExpertRoutes::from_scores(12, &[(7, 1.0), (3, 2.0), (9, -1.0)], 0.25).unwrap();
-        let mut expected = vec![1.0, 2.0, -1.0];
-        softmax_in_place(&mut expected);
-        for weight in &mut expected {
-            *weight *= 0.25;
-        }
+            ScheduledExpertRoutes::from_scores(12, &[(7, 0.2), (3, 0.6), (9, 0.1)], 0.25).unwrap();
+        let expected = [0.25 * 2.0 / 9.0, 0.25 * 6.0 / 9.0, 0.25 * 1.0 / 9.0];
 
         assert_eq!(scheduled.layer, 12);
         assert_eq!(
@@ -7795,15 +7812,15 @@ mod tests {
             vec![
                 ExpertRoute {
                     expert: 7,
-                    score: 1.0,
+                    score: 0.2,
                 },
                 ExpertRoute {
                     expert: 3,
-                    score: 2.0,
+                    score: 0.6,
                 },
                 ExpertRoute {
                     expert: 9,
-                    score: -1.0,
+                    score: 0.1,
                 },
             ]
         );
@@ -7833,17 +7850,13 @@ mod tests {
         let routing = graph
             .build_routing_topk(12, 10, 3, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
-        let command = routing.command_from_routes(vec![(7, 1.0), (3, 2.0), (9, -1.0)]);
+        let command = routing.command_from_routes(vec![(7, 0.2), (3, 0.6), (9, 0.1)]);
 
         let scheduled = ScheduledExpertRoutes::from_routing_command(&command, 0.25).unwrap();
 
         assert_eq!(scheduled.layer, 12);
         assert_eq!(scheduled.expert_ids().collect::<Vec<_>>(), vec![7, 3, 9]);
-        let mut expected = vec![1.0, 2.0, -1.0];
-        softmax_in_place(&mut expected);
-        for weight in &mut expected {
-            *weight *= 0.25;
-        }
+        let expected = [0.25 * 2.0 / 9.0, 0.25 * 6.0 / 9.0, 0.25 * 1.0 / 9.0];
         for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
@@ -7856,7 +7869,7 @@ mod tests {
         let routing = graph
             .build_routing_topk(12, 10, 2, ScheduledRoutingCandidateSource::CpuRouterScores)
             .unwrap();
-        let command = routing.command_from_routes(vec![(7, 1.0), (3, 2.0)]);
+        let command = routing.command_from_routes(vec![(7, 0.25), (3, 0.75)]);
         let mut scheduler = ActiveExpertReadScheduler::new(0.25);
 
         let issued = scheduler.issue_routed_reads(&command).unwrap();
@@ -7869,11 +7882,7 @@ mod tests {
         assert!(!issued.issues()[0].warm);
         assert!(!issued.issues()[1].warm);
         let routes = issued.into_routes();
-        let mut expected = vec![1.0, 2.0];
-        softmax_in_place(&mut expected);
-        for weight in &mut expected {
-            *weight *= 0.25;
-        }
+        let expected = [0.25 * 0.25, 0.25 * 0.75];
         for (actual, expected) in routes.weights.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
@@ -7899,7 +7908,7 @@ mod tests {
                 ScheduledRoutingCandidateSource::CpuRouterScores,
             )
             .unwrap();
-        let command = routing.command_from_routes(vec![(7, 2.0), (1, 1.0), (3, -1.0)]);
+        let command = routing.command_from_routes(vec![(7, 0.6), (1, 0.3), (3, 0.1)]);
         let mut coordinator =
             ScheduledExpertReadCoordinator::new_with_routed_expert_scale(store, 0.9);
 
@@ -7915,11 +7924,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7, 1, 3]
         );
-        let mut expected = vec![2.0, 1.0, -1.0];
-        softmax_in_place(&mut expected);
-        for weight in &mut expected {
-            *weight *= 0.9;
-        }
+        let expected = [0.54, 0.27, 0.09];
         for (actual, expected) in scheduled.weights.iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-6);
         }
@@ -7976,7 +7981,7 @@ mod tests {
 
     #[test]
     fn scheduled_expert_batch_validates_route_weight_and_expert_counts() {
-        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 2.0), (4, 1.0)], 1.0).unwrap();
+        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 0.6), (4, 0.4)], 1.0).unwrap();
         let batch = ScheduledExpertBatch::from_parts(routes, vec!["expert-8", "expert-4"]).unwrap();
 
         assert_eq!(batch.layer, 3);
@@ -7984,7 +7989,7 @@ mod tests {
         assert!(!batch.is_empty());
         assert_eq!(batch.experts.as_ref(), ["expert-8", "expert-4"]);
 
-        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 2.0), (4, 1.0)], 1.0).unwrap();
+        let routes = ScheduledExpertRoutes::from_scores(3, &[(8, 0.6), (4, 0.4)], 1.0).unwrap();
         let err = ScheduledExpertBatch::from_parts(routes, vec!["expert-8"]).unwrap_err();
         assert!(
             err.to_string()

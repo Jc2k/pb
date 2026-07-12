@@ -452,10 +452,10 @@ Baseline reviewed on 2026-07-11:
   fixed-slot contract remain PBQ4 import data rather than entering CMD3.
 - Routing-weight normalization and routed-expert scaling are now resolved graph policy. The
   scheduler constructs its expert-read coordinator from that policy, so production cannot pair a
-  graph with different route math. Qwen3.5 uses selected-route softmax with scale 0.9; Qwen MoE
-  advances only when `norm_topk_prob=true`, while a missing value or `false` reports the routing
-  stage as unsupported. Moving this ownership exposed and corrected parity fixtures that had
-  accidentally injected scale 1.0 beside a Qwen3.5 graph.
+  graph with different route math. Qwen3.5 and Qwen MoE use the upstream contract: softmax over all
+  router logits, fixed-slot top-K selection, selected-route renormalization, and routed scale 1.0.
+  Qwen MoE advances only when `norm_topk_prob=true`, while a missing value or `false` reports the
+  routing stage as unsupported.
 - The declared CPU-KV attention stage is now a Qwen-family full-attention implementation rather
   than a Qwen3.5 label. Full-attention manifests and runtime CMD1 execution require both per-head
   Q and K RMSNorm bindings; an absent tensor is an explicit load/runtime error instead of silently
@@ -463,7 +463,9 @@ Baseline reviewed on 2026-07-11:
 - CMD3 treats a model configuration with zero shared experts as the declared no-shared-expert
   implementation. Models that declare shared experts must resolve every resident
   Q4/BF16/F16/F32 shared projection; a missing projection or invalid declared shape is an
-  unsupported binding error and cannot collapse into the no-shared case.
+  unsupported binding error and cannot collapse into the no-shared case. The supported single
+  shared expert applies its sigmoid router gate after the down projection, matching upstream;
+  configurations with multiple shared experts remain an explicit unsupported capability.
 - Text-only Qwen MoE Q4 now resolves the same nine-stage scheduler graph as Qwen3.5 Q4. Its model
   metadata selects full attention, configured K, routed scale 1.0, selected-route normalization,
   dimension-derived fixed-Q4 slots, and the declared no-shared CMD3 source. Production load applies
@@ -479,8 +481,9 @@ Baseline reviewed on 2026-07-11:
   production CMD1/CMD2/router construction consumes the resulting scheduler-owned values.
 - A linked Qwen MoE Q4 fixture resolves the Qwen3 graph and follows one K=8 full-attention
   transaction through selected-route softmax at scale 1.0, eight scheduler-owned positioned reads,
-  whole-slot typed Q4 SwiGLU payloads, declared no-shared CMD3 combine, and deferred hidden/next-norm
-  state. Its route weights and output state are checked against independent golden values.
+  whole-slot typed Q4 payloads through staged gate/up, SiLU product, and down projection, declared
+  no-shared CMD3 combine, and deferred hidden/next-norm state. Its route weights and output state
+  are checked against independent golden values.
 - The production Q4 `mlx-community/Qwen3-30B-A3B-4bit` checkpoint now builds through the same cache
   transaction: all 48 layers publish 128 fixed-Q4 whole-expert slots, load resolves the nine-stage
   graph with K=8 and no shared expert, and real one-token inference exits successfully. Raw

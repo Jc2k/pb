@@ -620,10 +620,34 @@ pub fn softmax_in_place(values: &mut [f32]) {
         sum += *value;
     }
     if sum > 0.0 && sum.is_finite() {
+        let inverse_sum = sum.recip();
         for value in values {
-            *value /= sum;
+            *value *= inverse_sum;
         }
     }
+}
+
+pub fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let k = k.min(scores.len());
+    let mut selected = vec![(0usize, -1.0e30f32); k];
+    for (expert, score) in scores.iter().copied().enumerate() {
+        let mut minimum = 0;
+        for candidate in 1..k {
+            if selected[candidate].1 < selected[minimum].1 {
+                minimum = candidate;
+            }
+        }
+        if k > 0 && score > selected[minimum].1 {
+            selected[minimum] = (expert, score);
+        }
+    }
+    selected
+}
+
+pub fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut probabilities = scores.to_vec();
+    softmax_in_place(&mut probabilities);
+    routing_top_k(&probabilities, k)
 }
 
 pub fn q4_fma_matvec(
@@ -1014,6 +1038,28 @@ mod tests {
         let mut weights: Vec<f32> = selected.iter().map(|(_, score)| *score).collect();
         softmax_in_place(&mut weights);
         assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn routing_stage_preserves_upstream_replacement_slot_order() {
+        let scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
+        let selected = routing_top_k(&scores, 4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(expert, _)| *expert)
+                .collect::<Vec<_>>(),
+            vec![5, 1, 8, 3]
+        );
+
+        let selected = routing_softmax_top_k(&scores, 4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(expert, _)| *expert)
+                .collect::<Vec<_>>(),
+            vec![5, 1, 8, 3]
+        );
     }
 
     #[test]

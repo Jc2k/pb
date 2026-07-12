@@ -21,13 +21,14 @@ use super::experts::{
     EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::math::top_k;
+use super::math::routing_softmax_top_k;
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
     ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
     ScheduledDenseExpertPhaseMlpPayload, ScheduledExpertPhaseMlpPayload, ScheduledExpertSlot,
-    ScheduledQ4ExpertPhaseMlpPayload, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
-    ScheduledSharedExpertPhaseRef,
+    ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
@@ -1519,7 +1520,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
             let router_scores =
                 std::slice::from_raw_parts(router_logits_ptr, projections.router.rows()).to_vec();
-            let active = top_k(&router_scores, plan.active_count);
+            let active = routing_softmax_top_k(&router_scores, plan.active_count);
             let output = MetalPostAttentionPrep::new(
                 plan.layer,
                 plan.width,
@@ -1813,7 +1814,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
 
             let encode_result = (|| -> anyhow::Result<()> {
                 let mut source_buffers = MetalExpertSourceBufferCache::default();
-                self.encode_shared(
+                let shared_router = self.encode_shared(
                     encoder,
                     &command_plan,
                     input_buffers,
@@ -1832,14 +1833,45 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     )?;
                     match payload {
                         ScheduledExpertPhaseMlpPayload::Q4(payload) => {
-                            self.encode_q4_swiglu(
+                            let gate_out = active_stage
+                                .work
+                                .gate_out
+                                .context("Metal Q4 expert stage has no gate projection buffer")?;
+                            let up_out = active_stage
+                                .work
+                                .up_out
+                                .context("Metal Q4 expert stage has no up projection buffer")?;
+                            self.encode_q4_matvec(
                                 encoder,
-                                payload,
+                                &payload.gate,
+                                payload.gate_source(),
                                 active_stage.normed,
-                                active_stage.activated,
+                                gate_out,
+                                0,
                                 &mut phase_buffers,
                                 &mut source_buffers,
                             )?;
+                            self.encode_q4_matvec(
+                                encoder,
+                                &payload.up,
+                                payload.up_source(),
+                                active_stage.normed,
+                                up_out,
+                                0,
+                                &mut phase_buffers,
+                                &mut source_buffers,
+                            )?;
+                            let intermediate = active_stage.plan.intermediate_u32()?;
+                            msg_send_void1_id(
+                                encoder,
+                                sel("setComputePipelineState:"),
+                                self.runtime.pipelines.silu_product_pipeline,
+                            );
+                            set_buffer(encoder, gate_out, 0);
+                            set_buffer(encoder, up_out, 1);
+                            set_buffer(encoder, active_stage.activated, 2);
+                            set_bytes(encoder, u32_as_bytes(&intermediate), 3);
+                            dispatch_threads(encoder, active_stage.plan.intermediate as u64);
                             self.encode_q4_matvec(
                                 encoder,
                                 &payload.down,
@@ -1868,6 +1900,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     input_buffers,
                     &output_buffers,
                     combine_buffers,
+                    shared_router,
                 )?;
                 if let (Some(weight), Some(next_normed), Some(next_plan)) = (
                     next_norm_weight,
@@ -2050,7 +2083,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         combine: MetalCmd3CombineBuffers,
         shared: ScheduledSharedExpertPhaseRef<'_>,
         buffers: &mut Vec<MetalPhaseBuffer>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<MetalObjcId> {
         unsafe {
             match command.shared.source {
                 MetalCmd3SharedPhaseSource::Resident => {
@@ -2116,6 +2149,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         stage.shared_output,
                         0,
                     )?;
+                    Ok(work.router_out)
                 }
                 MetalCmd3SharedPhaseSource::None => {
                     let fill_width = u32::try_from(command.shared.fill_zero_width())
@@ -2134,10 +2168,10 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     set_buffer(encoder, stage.shared_output, 0);
                     set_bytes(encoder, u32_as_bytes(&fill_width), 1);
                     dispatch_threads(encoder, command.shared.fill_zero_width() as u64);
+                    Ok(stage.shared_output)
                 }
                 MetalCmd3SharedPhaseSource::Dense => unreachable!("rejected before encoding"),
             }
-            Ok(())
         }
     }
 
@@ -2148,6 +2182,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         inputs: MetalCmd3InputBuffers,
         outputs: &MetalCmd3OutputBuffers,
         combine: MetalCmd3CombineBuffers,
+        shared_router: MetalObjcId,
     ) -> anyhow::Result<()> {
         unsafe {
             let stage = MetalCmd3CombineStageBuffers::new(plan, inputs, outputs, combine)?;
@@ -2163,6 +2198,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             set_buffer(encoder, stage.hidden, 4);
             set_buffer(encoder, stage.width, 5);
             set_buffer(encoder, stage.active_count, 6);
+            set_buffer(encoder, shared_router, 7);
             dispatch_threads(encoder, stage.plan.dispatch_threads);
             Ok(())
         }
@@ -2301,48 +2337,6 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             set_bytes(encoder, u32_as_bytes(&groups), 7);
             set_bytes(encoder, u32_as_bytes(&group_size), 8);
             dispatch_q4_threadgroups(encoder, payload.rows as u64);
-            Ok(())
-        }
-    }
-
-    unsafe fn encode_q4_swiglu(
-        &self,
-        encoder: MetalObjcId,
-        payload: &ScheduledQ4ExpertPhaseMlpPayload<'_>,
-        input: MetalObjcId,
-        output: MetalObjcId,
-        buffers: &mut Vec<MetalPhaseBuffer>,
-        source_buffers: &mut MetalExpertSourceBufferCache,
-    ) -> anyhow::Result<()> {
-        unsafe {
-            let gate = &payload.gate;
-            let gate_source = payload.gate_source();
-            let up_source = payload.up_source();
-            let buffer = self.expert_source_buffer(gate_source.bytes, buffers, source_buffers)?;
-            let rows = u32::try_from(gate.rows).context("Metal CMD3 SwiGLU rows exceed u32")?;
-            let cols = u32::try_from(gate.cols).context("Metal CMD3 SwiGLU cols exceed u32")?;
-            let groups = u32::try_from(gate.cols.div_ceil(gate.group_size).max(1))
-                .context("Metal CMD3 SwiGLU groups exceed u32")?;
-            let group_size = u32::try_from(gate.group_size)
-                .context("Metal CMD3 SwiGLU group size exceeds u32")?;
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.runtime.pipelines.q4_swiglu_bf16_scale_bias_pipeline,
-            );
-            set_buffer_with_offset(encoder, buffer, gate_source.packed_offset as u64, 0);
-            set_buffer_with_offset(encoder, buffer, up_source.packed_offset as u64, 1);
-            set_buffer(encoder, input, 2);
-            set_buffer_with_offset(encoder, buffer, gate_source.scale_offset as u64, 3);
-            set_buffer_with_offset(encoder, buffer, gate_source.bias_offset as u64, 4);
-            set_buffer_with_offset(encoder, buffer, up_source.scale_offset as u64, 5);
-            set_buffer_with_offset(encoder, buffer, up_source.bias_offset as u64, 6);
-            set_buffer(encoder, output, 7);
-            set_bytes(encoder, u32_as_bytes(&rows), 8);
-            set_bytes(encoder, u32_as_bytes(&cols), 9);
-            set_bytes(encoder, u32_as_bytes(&groups), 10);
-            set_bytes(encoder, u32_as_bytes(&group_size), 11);
-            dispatch_q4_threadgroups(encoder, gate.rows as u64);
             Ok(())
         }
     }
@@ -3125,7 +3119,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
             let router_scores =
                 std::slice::from_raw_parts(router_logits_ptr, router.rows()).to_vec();
-            let active = super::math::top_k(&router_scores, active_count);
+            let active = routing_softmax_top_k(&router_scores, active_count);
 
             release(encoder);
             release(command_buffer);
@@ -4349,7 +4343,7 @@ impl MetalCmd3ActiveExpertWorkBuffers {
         up_out: Option<MetalObjcId>,
         activated: MetalObjcId,
     ) -> anyhow::Result<Self> {
-        let requires_projection_outputs = plan.source == MetalCmd3ActiveExpertSource::Dense;
+        let requires_projection_outputs = true;
         if gate_out.is_some() != requires_projection_outputs
             || up_out.is_some() != requires_projection_outputs
         {
@@ -4435,9 +4429,7 @@ impl MetalCmd3ActiveExpertPlan {
         Ok(MetalCmd3ActiveExpertBufferLayout {
             intermediate_u32: self.intermediate_u32()?,
             activation_bytes: self.activation_bytes()?,
-            projection_output_bytes: (self.source == MetalCmd3ActiveExpertSource::Dense)
-                .then(|| self.projection_output_bytes())
-                .transpose()?,
+            projection_output_bytes: Some(self.projection_output_bytes()?),
         })
     }
 
@@ -6259,22 +6251,28 @@ kernel void rms_norm_reduced(
     device const float* weight [[buffer(1)]],
     device float* output [[buffer(2)]],
     constant uint& width [[buffer(3)]],
-    uint lid [[thread_position_in_threadgroup]]) {
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint threads = 256;
-    threadgroup float partial[256];
+    threadgroup float partial[32];
     float sum = 0.0f;
     for (uint i = lid; i < width; i += threads) {
-        sum = fma(input[i], input[i], sum);
+        sum += input[i] * input[i];
     }
-    partial[lid] = sum;
+    float simd_value = simd_sum(sum);
+    if (simd_lane == 0) {
+        partial[simd_group] = simd_value;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            partial[lid] += partial[lid + stride];
+    if (simd_group == 0) {
+        float value = simd_lane < 8 ? partial[simd_lane] : 0.0f;
+        value = simd_sum(value);
+        if (simd_lane == 0) {
+            partial[0] = value;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
     for (uint i = lid; i < width; i += threads) {
@@ -6289,23 +6287,29 @@ kernel void residual_add_rms_norm(
     device float* hidden [[buffer(3)]],
     device float* normed [[buffer(4)]],
     constant uint& width [[buffer(5)]],
-    uint lid [[thread_position_in_threadgroup]]) {
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint threads = 256;
-    threadgroup float partial[256];
+    threadgroup float partial[32];
     float sum = 0.0f;
     for (uint i = lid; i < width; i += threads) {
         float value = projected[i] + residual[i];
-        sum = fma(value, value, sum);
+        sum += value * value;
     }
-    partial[lid] = sum;
+    float simd_value = simd_sum(sum);
+    if (simd_lane == 0) {
+        partial[simd_group] = simd_value;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            partial[lid] += partial[lid + stride];
+    if (simd_group == 0) {
+        float value = simd_lane < 8 ? partial[simd_lane] : 0.0f;
+        value = simd_sum(value);
+        if (simd_lane == 0) {
+            partial[0] = value;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
     for (uint i = lid; i < width; i += threads) {
@@ -6364,11 +6368,8 @@ kernel void shared_expert_activation(
     constant uint& total_intermediate [[buffer(5)]],
     uint idx [[thread_position_in_grid]]) {
     if (idx >= total_intermediate) { return; }
-    uint shared_idx = intermediate == 0 ? 0 : idx / intermediate;
-    float route = router[shared_idx];
-    float route_weight = 1.0f / (1.0f + exp(-route));
     float g = gate[idx];
-    output[idx] = (g / (1.0f + exp(-g))) * up[idx] * route_weight;
+    output[idx] = (g / (1.0f + exp(-g))) * up[idx];
 }
 
 kernel void combine_expert_phase(
@@ -6379,13 +6380,16 @@ kernel void combine_expert_phase(
     device float* hidden [[buffer(4)]],
     constant uint& width [[buffer(5)]],
     constant uint& active_experts [[buffer(6)]],
+    device const float* shared_router [[buffer(7)]],
     uint idx [[thread_position_in_grid]]) {
     if (idx >= width) { return; }
-    float acc = residual[idx] + shared[idx];
+    float route = shared_router[0];
+    float shared_weight = 1.0f / (1.0f + exp(-route));
+    float moe = 0.0f;
     for (uint expert = 0; expert < active_experts; ++expert) {
-        acc = fma(expert_outputs[expert * width + idx], weights[expert], acc);
+        moe += weights[expert] * expert_outputs[expert * width + idx];
     }
-    hidden[idx] = acc;
+    hidden[idx] = residual[idx] + moe + shared_weight * shared[idx];
 }
 
 kernel void fill_zero(
@@ -7799,20 +7803,26 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn cmd3_active_expert_work_buffers_carry_fused_layout() {
+    fn cmd3_active_expert_work_buffers_carry_staged_projection_layout() {
         let output_state = FlashMoeCmd3OutputState::gpu_resident(4, false);
         let phase = MetalCmd3PhasePlan::new(9, 3, 2, 4, 2, 2, output_state, false).unwrap();
         let payload = ScheduledExpertPhaseMlpPayload::Q4(test_q4_expert_payload(6, 4));
         let plan = MetalCmd3ActiveExpertPlan::new(phase, 1, &payload).unwrap();
 
-        let fused =
-            MetalCmd3ActiveExpertWorkBuffers::new(plan, None, None, 0x1000usize as MetalObjcId)
-                .unwrap();
+        let staged = MetalCmd3ActiveExpertWorkBuffers::new(
+            plan,
+            Some(0x1100usize as MetalObjcId),
+            Some(0x1200usize as MetalObjcId),
+            0x1000usize as MetalObjcId,
+        )
+        .unwrap();
 
-        assert_eq!(fused.activated, 0x1000usize as MetalObjcId);
-        assert_eq!(fused.layout.intermediate_u32, 6);
-        assert_eq!(fused.layout.activation_bytes, 6 * 4);
-        assert_eq!(fused.layout.projection_output_bytes, None);
+        assert_eq!(staged.gate_out, Some(0x1100usize as MetalObjcId));
+        assert_eq!(staged.up_out, Some(0x1200usize as MetalObjcId));
+        assert_eq!(staged.activated, 0x1000usize as MetalObjcId);
+        assert_eq!(staged.layout.intermediate_u32, 6);
+        assert_eq!(staged.layout.activation_bytes, 6 * 4);
+        assert_eq!(staged.layout.projection_output_bytes, Some(6 * 4));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7852,8 +7862,8 @@ mod tests {
         let active_plan = execution.active_experts[1];
         let work = MetalCmd3ActiveExpertWorkBuffers::new(
             active_plan,
-            None,
-            None,
+            Some(0x6100usize as MetalObjcId),
+            Some(0x6200usize as MetalObjcId),
             0x6000usize as MetalObjcId,
         )
         .unwrap();
@@ -8048,7 +8058,7 @@ mod tests {
             MetalCmd3ActiveExpertBufferLayout {
                 intermediate_u32: 6,
                 activation_bytes: 6 * 4,
-                projection_output_bytes: None,
+                projection_output_bytes: Some(6 * 4),
             }
         );
     }

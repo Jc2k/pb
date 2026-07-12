@@ -335,7 +335,7 @@ impl FlashMoeCapabilityPlan {
         let active_expert_kernels: &[&str] = match expert_storage.layout {
             ExpertStorageLayout::FixedQ4 => &[
                 kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
-                kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS,
+                kernels::SILU_PRODUCT,
             ],
             ExpertStorageLayout::FixedBf16 => {
                 &[kernels::DENSE_MMAP_FMA_MATVEC_BF16, kernels::SILU_PRODUCT]
@@ -360,7 +360,14 @@ impl FlashMoeCapabilityPlan {
                 kernels::FILL_ZERO,
             ],
         )?;
-        if layout.shared_experts > 0 {
+        if layout.shared_experts > 1 {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
+                "post-down shared-expert gating currently supports exactly one shared expert",
+            ));
+        }
+        if layout.shared_experts == 1 {
             require_stage_kernels(
                 layout.family,
                 &metal,
@@ -904,6 +911,25 @@ mod tests {
     }
 
     #[test]
+    fn capability_resolution_rejects_unimplemented_multi_shared_post_down_gate() {
+        let mut layout = qwen35_layout();
+        layout.shared_experts = 2;
+
+        let error = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &attention_layers(&layout),
+            Some(full_metal()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.stage, FlashMoeGraphStage::Cmd3ExpertAndSharedCombine);
+        assert!(error.reason.contains("exactly one shared expert"));
+    }
+
+    #[test]
     fn capability_resolution_rejects_manifest_attention_schedule_mismatches() {
         let layout = qwen3_moe_layout(Some(true));
         let mut wrong_kind = attention_layers(&layout);
@@ -1425,7 +1451,7 @@ mod tests {
             experts_per_layer: 512,
             active_experts: 4,
             routing_weight_normalization: QwenMoeRoutingWeightNormalization::RenormalizeSelected,
-            routed_expert_scale: 0.9,
+            routed_expert_scale: 1.0,
             state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
             attention_layers: attention_layers(&layout).into_boxed_slice(),
             stages: vec![FlashMoeStageCapability::new(

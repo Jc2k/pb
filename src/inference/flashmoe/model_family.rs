@@ -779,10 +779,7 @@ impl QwenMoeModelLayout {
             QwenMoeFamily::Qwen35A17B => configured_active_experts,
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => configured_active_experts,
         };
-        let routed_expert_scale = match family {
-            QwenMoeFamily::Qwen35A17B => 0.9,
-            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => 1.0,
-        };
+        let routed_expert_scale = 1.0;
         let routing_weight_normalization = match family {
             QwenMoeFamily::Qwen35A17B => {
                 Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
@@ -1080,7 +1077,7 @@ mod tests {
         assert_eq!(layout.kv_heads, 2);
         assert_eq!(layout.configured_active_experts, 10);
         assert_eq!(layout.scheduled_active_experts, 4);
-        assert_eq!(layout.routed_expert_scale, 0.9);
+        assert_eq!(layout.routed_expert_scale, 1.0);
         assert_eq!(
             layout.routing_weight_normalization,
             Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
