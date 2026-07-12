@@ -1,6 +1,8 @@
 //! Owner-local Qwen-VL preprocessing, placeholder, and MRoPE parity tests.
 
 use super::*;
+use crate::inference::flashmoe::math::apply_rotary_split_half_mrope;
+use crate::inference::flashmoe::test_fixtures::assert_close;
 use crate::inference::flashmoe::text::{
     QwenTokenizer, test_qwen3vl_tokenizer_json, test_qwen3vl_tool_tokenizer_config_json,
 };
@@ -740,4 +742,85 @@ fn qwen3vl_vision_patch_coords_are_block_major() {
             (3, 3),
         ]
     );
+}
+
+#[test]
+fn qwen3vl_mrope_interleaves_height_and_width_frequency_slots() {
+    let position = MropePosition {
+        temporal: 2,
+        height: 5,
+        width: 7,
+    };
+    let section = [2, 1, 1];
+    let head_dim = 8usize;
+    let theta = 10_000.0f64;
+
+    let mut got = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+    apply_rotary_split_half_mrope(&mut got, position, head_dim, head_dim, theta, section);
+
+    let mut expected = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+    let half = head_dim / 2;
+    for i in 0..half {
+        let axis = match i {
+            1 => position.height,
+            2 => position.width,
+            _ => position.temporal,
+        };
+        let freq = 1.0f32 / (theta as f32).powf((2 * i) as f32 / head_dim as f32);
+        let angle = axis as f32 * freq;
+        let (sin_a, cos_a) = angle.sin_cos();
+        let x0 = expected[i];
+        let x1 = expected[i + half];
+        expected[i] = x0 * cos_a - x1 * sin_a;
+        expected[i + half] = x0 * sin_a + x1 * cos_a;
+    }
+
+    for (left, right) in got.iter().zip(expected.iter()) {
+        assert_close(*left, *right);
+    }
+}
+
+#[test]
+fn qwen3vl_image_mrope_positions_match_single_image_get_rope_index_shape() {
+    let tokens = [101, 999, 999, 999, 999, 102, 201, 202];
+    let (positions, next_position) =
+        qwen3vl_single_image_mrope_positions(&tokens, 999, 2, 2).unwrap();
+
+    assert_eq!(positions[0], MropePosition::text(0));
+    assert_eq!(
+        positions[1],
+        MropePosition {
+            temporal: 1,
+            height: 1,
+            width: 1,
+        }
+    );
+    assert_eq!(
+        positions[2],
+        MropePosition {
+            temporal: 1,
+            height: 1,
+            width: 2,
+        }
+    );
+    assert_eq!(
+        positions[3],
+        MropePosition {
+            temporal: 1,
+            height: 2,
+            width: 1,
+        }
+    );
+    assert_eq!(
+        positions[4],
+        MropePosition {
+            temporal: 1,
+            height: 2,
+            width: 2,
+        }
+    );
+    assert_eq!(positions[5], MropePosition::text(3));
+    assert_eq!(positions[6], MropePosition::text(4));
+    assert_eq!(positions[7], MropePosition::text(5));
+    assert_eq!(next_position, 6);
 }

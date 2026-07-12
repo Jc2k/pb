@@ -924,6 +924,10 @@ fn quantized_q4_group(values: &[f32], scale: f32, bias: f32, codes: Vec<u8>) -> 
 }
 
 #[cfg(test)]
+#[path = "math_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

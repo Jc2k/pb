@@ -1,11 +1,12 @@
 //! Owner-local PBQ4 import and fixed-slot compatibility parity tests.
 
 use super::*;
-use crate::inference::flashmoe::cache::build_manifest;
-use crate::inference::flashmoe::math::q4_fma_matvec_with_group_size;
+use crate::inference::flashmoe::cache::{build_cache_from_hf_snapshot, build_manifest};
+use crate::inference::flashmoe::math::{q4_fma_matvec, q4_fma_matvec_with_group_size};
 use crate::inference::flashmoe::model_family::{QwenMoeExpertComponentKind, QwenMoeQ4ExpertLayout};
 use crate::inference::flashmoe::planning::plan_unchecked;
 use crate::inference::flashmoe::test_fixtures::*;
+use crate::inference::flashmoe::text::test_tokenizer_json;
 use crate::inference::flashmoe::types::*;
 
 fn silu(value: f32) -> f32 {
@@ -1178,4 +1179,190 @@ fn aggregate_expert_reuse_rejects_changed_source_bytes() {
         .unwrap();
 
     assert_ne!(before, after);
+}
+
+#[test]
+fn expert_cache_requires_complete_qwen_expert_mlp_triplet() {
+    let tensor = ExpertTensorRef {
+        tensor: "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+        shard: "expert.safetensors".to_string(),
+        layer: Some(0),
+        expert: Some(0),
+        dtype: Some("BF16".to_string()),
+        shape: vec![16, 8],
+        source_offsets: Some([0, 16]),
+        q4_sources: None,
+    };
+    let err = validate_expert_tensor_group(0, 0, &[&tensor], None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("missing required tensor up_proj.weight"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn expert_q4_payload_borrows_record_buffers() {
+    let tensor = PackedExpertTensor {
+        name: "model.layers.0.mlp.experts.0.gate_proj.weight".to_string(),
+        dtype: "Q4".to_string(),
+        shape: vec![2, 4],
+        source_offsets: [0, 0],
+        source_hash: None,
+        group_size: 2,
+        scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+        packed: vec![0x10, 0x32, 0x54, 0x76],
+        scales: vec![0.5, 0.25, 0.125, 0.0625],
+        biases: vec![1.0, 2.0, 3.0, 4.0],
+        scale_bytes: vec![
+            0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00,
+            0x80, 0x3d,
+        ],
+        bias_bytes: vec![
+            0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+            0x80, 0x40,
+        ],
+    };
+    let payload = tensor.matvec_payload(&[1.0, 2.0, 3.0, 4.0], 2).unwrap();
+
+    assert_eq!(payload.rows, 2);
+    assert_eq!(payload.cols, 4);
+    assert_eq!(payload.packed.as_ptr(), tensor.packed.as_ptr());
+    assert_eq!(payload.scales.as_ptr(), tensor.scales.as_ptr());
+    assert_eq!(payload.biases.as_ptr(), tensor.biases.as_ptr());
+}
+
+#[test]
+fn expert_cache_quantizes_decoded_bf16_values_not_raw_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+    write_test_config(&snapshot);
+    std::fs::write(
+        snapshot.join("dense.safetensors"),
+        make_safetensors(&[("model.layers.0.self_attn.q_proj.weight", b"dense")]),
+    )
+    .unwrap();
+    let mut gate_bytes = Vec::new();
+    for value in 1u32..=128 {
+        gate_bytes.extend_from_slice(&(((value as f32).to_bits() >> 16) as u16).to_le_bytes());
+    }
+    let mut up_bytes = Vec::new();
+    for _ in 0..(16 * 8) {
+        up_bytes.extend_from_slice(&0x3f80u16.to_le_bytes());
+    }
+    let mut down_bytes = Vec::new();
+    for _ in 0..(8 * 16) {
+        down_bytes.extend_from_slice(&0x3f80u16.to_le_bytes());
+    }
+    std::fs::write(
+        snapshot.join("expert.safetensors"),
+        make_typed_safetensors(&[
+            (
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &gate_bytes,
+            ),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                "BF16",
+                vec![16, 8],
+                &up_bytes,
+            ),
+            (
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "BF16",
+                vec![8, 16],
+                &down_bytes,
+            ),
+        ]),
+    )
+    .unwrap();
+    std::fs::write(
+        snapshot.join("model.safetensors.index.json"),
+        expert_triplet_weight_map(0, 0),
+    )
+    .unwrap();
+
+    let plan = build_cache_from_hf_snapshot(QWEN35_MODEL, &snapshot).unwrap();
+    let records = read_pbq4_expert_records(&plan.experts_dir, 0, 0).unwrap();
+    let record = records
+        .iter()
+        .find(|record| record.name.ends_with("gate_proj.weight"))
+        .unwrap();
+    let input = [1.0; 8];
+    let payload = record.matvec_payload(&input, 1).unwrap();
+    let out = q4_fma_matvec(payload.packed, &input, payload.scales, payload.biases, 1, 8).unwrap();
+    assert!((out[0] - 36.0).abs() < 1.0, "decoded q4 sum was {}", out[0]);
+}
+
+#[test]
+fn q4_bf16_expert_pack_matches_flashmoe_uint32_nibble_reference() {
+    let tensor = "model.layers.0.mlp.experts.0.gate_proj.weight";
+    let input = [1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, -0.75];
+    let mut pack = Vec::new();
+    pack.extend_from_slice(PBQ4_EXPERT_MAGIC);
+    pack.extend_from_slice(&(tensor.len() as u32).to_le_bytes());
+    pack.extend_from_slice(tensor.as_bytes());
+    pack.extend_from_slice(&4u64.to_le_bytes());
+    pack.extend_from_slice(&1u64.to_le_bytes());
+    pack.extend_from_slice(&f32_to_bf16_bits(0.5).to_le_bytes());
+    pack.extend_from_slice(&f32_to_bf16_bits(1.0).to_le_bytes());
+    pack.extend_from_slice(&0x7654_3210u32.to_le_bytes());
+
+    let metadata = ExpertPackMetadata {
+        layer: 0,
+        expert: 0,
+        packed_bytes: pack.len() as u64,
+        records: vec![ExpertPackRecord {
+            tensor: tensor.to_string(),
+            dtype: "Q4".to_string(),
+            shape: vec![1, 8],
+            source_offsets: [0, 8],
+            source_hash: Some("synthetic".to_string()),
+            record_offset: PBQ4_EXPERT_MAGIC.len() as u64,
+            packed_bytes: 4,
+            groups: 1,
+            group_size: 8,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        }],
+    };
+    let records = parse_pbq4_expert_pack(&pack, Some(&metadata)).unwrap();
+    let payload = records[0].matvec_payload(&input, 1).unwrap();
+    let actual = q4_fma_matvec_with_group_size(
+        payload.packed,
+        &input,
+        payload.scales,
+        payload.biases,
+        payload.rows,
+        payload.cols,
+        payload.group_size,
+    )
+    .unwrap();
+
+    let packed_word = u32::from_le_bytes([
+        payload.packed[0],
+        payload.packed[1],
+        payload.packed[2],
+        payload.packed[3],
+    ]);
+    let expected: f32 = input
+        .iter()
+        .enumerate()
+        .map(|(n, x)| {
+            let nibble = ((packed_word >> (n * 4)) & 0x0f) as f32;
+            (nibble * 0.5 + 1.0) * x
+        })
+        .sum();
+
+    assert_eq!(payload.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+    assert_eq!(payload.scale_bytes.len(), 2);
+    assert_eq!(payload.bias_bytes.len(), 2);
+    assert!(
+        (actual[0] - expected).abs() <= 1e-6,
+        "bf16 q4 matvec diverged from uint32 nibble reference: actual={} expected={expected}",
+        actual[0]
+    );
 }

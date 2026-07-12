@@ -6,8 +6,6 @@
 mod cache;
 mod capabilities;
 mod experts;
-#[cfg(test)]
-mod legacy;
 mod math;
 mod metal;
 mod model_family;

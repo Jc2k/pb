@@ -287,19 +287,17 @@ Baseline reviewed on 2026-07-11:
   before PBQ4 compatibility upgrade or graph construction. Q4, BF16, and F16 resolve only against
   their matching fixed-slot layout; all six mismatches are precise expert-storage-policy errors
   naming both the requested and actual layout, with no cache mutation or runtime fallback.
-- Production no longer compiles or imports `legacy.rs`. Runtime owns timing aggregation; weights
+- `legacy.rs` is deleted and no module declares or imports it. Runtime owns timing aggregation; weights
   owns required-manifest and resident-Q4 graph-binding validation plus the F32 Accelerate matvec;
   and the unused runtime expert-store adapter has been deleted. The test-only `ExpertWeights`
   decoded/component execution adapter and CPU expert-phase substitute are also gone. PBQ4 tests
   inspect import records through experts-owned helpers; fixed-slot execution tests use
-  `FixedQ4ExpertPayload` or scheduler-owned `ScheduledExpertSlot` directly. This satisfies Gate 7's
-  no-production-owner criterion, but does not complete Gate 7 while Gate 6 checkpoint evidence and
-  the post-refactor benchmark work remain open.
-- The test-only legacy boundary no longer suppresses dead-code warnings. Unused synthetic-runtime
+  `FixedQ4ExpertPayload` or scheduler-owned `ScheduledExpertSlot` directly. This completes Gate 7's
+  legacy-removal criterion; only sustained equivalent upstream comparison remains open.
+- Before deletion, the test-only legacy boundary stopped suppressing dead-code warnings. Unused synthetic-runtime
   gates, decoded-expert methods, tokenizer data, and an unregistered duplicate state test were
   deleted; deterministic synthetic dense-weight hashing moved to the `weights.rs` fixture that
-  consumes it. Remaining legacy helpers must compile as dependencies of registered parity or
-  compatibility tests.
+  consumes it. The remaining active parity contracts now compile only under their target owners.
 - Gate 7 removed the duplicate Accelerate-backed gated-delta execution path, CBLAS bridge, and
   scratch dispatch from the test-only legacy boundary. The math owner now retains the direct
   value-major recurrence oracle together with QK normalization/rotary, grouped-query attention,
@@ -317,8 +315,8 @@ Baseline reviewed on 2026-07-11:
   metrics. Six overlapping coordinator tests and the duplicate expert-I/O guardrail test were
   removed from `legacy.rs`; the lower-level scheduler and expert policy tests retain each contract.
 - Text now owns the shared tokenizer fixtures and its sampling, chat-template, Qwen/Qwen-VL tool
-  serialization, parser, and byte-level BPE parity suite in `text_parity_tests.rs`. Remaining legacy
-  integration fixtures borrow those owner fixtures temporarily; the 782-line tokenizer/text block
+  serialization, parser, and byte-level BPE parity suite in `text_parity_tests.rs`. Cross-owner
+  integration fixtures borrow those test-only owner fixtures; the 782-line tokenizer/text block
   and a duplicate non-FlashMoe backend-selection test have left `legacy.rs`.
 - Vision now owns Qwen-VL image preprocessing, placeholder expansion, multi-image span, MRoPE,
   config validation, and patch-order parity in `vision_parity_tests.rs`. The 741-line adapter test
@@ -349,8 +347,13 @@ Baseline reviewed on 2026-07-11:
   expert import test that exercises that boundary.
 - Weights now owns the dense registry/manifest validators, attention and linear-attention layouts,
   resident BF16/Q4 projections, Metal batch and post-attention parity, dense-store caching, runtime
-  shape, and LM-head integration suite in `weights_parity_tests.rs`. Moving that coherent block
-  reduced `legacy.rs` to a small set of expert/math/rope and Metal-compile compatibility cases.
+  shape, and LM-head integration suite in `weights_parity_tests.rs`.
+- The final sampling/topK, routing/Q4 math, expert edge-case, dense validation, and rope tests moved
+  to text, math, experts, weights, cache, and vision parity modules. Duplicate tokenizer/routing and
+  Qwen3Next norm tests were deleted, as was the ignored legacy-only Metal compile fixture; release
+  build plus the required smoke are the active Metal construction proof. `legacy.rs` and its module
+  declaration are now gone. The post-removal suite passes 658 tests with six device-dependent tests
+  ignored; web assets and release rebuilt, and the required default smoke printed `4`.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
@@ -547,13 +550,15 @@ Baseline reviewed on 2026-07-11:
   floating-point route scores use an explicit numerical tolerance rather than bitwise equality
   across CPU and Metal implementations.
 
-The architecture is not yet at the target:
+The architecture implementation is at the target; Gate 7 still requires post-refactor comparison
+evidence before the overall goal closes:
 
 - The engine container, load path, and public generation/session orchestration are now in
   `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
   is in `weights.rs`. The extracted `cache.rs` transaction delegates dense conversion to
   `weights.rs`, expert packing to `experts.rs`, and source-header parsing to `safetensors.rs`.
-  Expert fixture implementation and test/compatibility helpers remain in test-only `legacy.rs`.
+  Owner-local parity modules and the shared `cfg(test)` binary-fixture module replace the deleted
+  test-only compatibility boundary.
 - General caches and explicitly diagnostic/test helpers still use `Option` for data availability,
   but no supported graph-stage implementation or CPU/GPU placement is selected from those values.
 - Text-only Qwen MoE Q4 and Qwen-VL Q4 now have linked fixtures plus real-checkpoint cache, load,
@@ -573,9 +578,10 @@ The architecture is not yet at the target:
   non-Q4 checkpoints remain useful validation, but their implementations already resolve through
   the same graph and have direct storage, capability, scheduler, and local-Metal reference evidence.
 
-At this checkpoint, Gates 1 through 6 are complete. Qwen3.5, Qwen3 text, and Qwen3-VL Q4 have
-resolved production graphs and real-checkpoint evidence; typed non-Q4 implementations use the same
-contracts. Gate 7 test-only legacy cleanup and sustained upstream comparison remain.
+At this checkpoint, Gates 1 through 6 are complete and Gate 7 legacy cleanup is complete. Qwen3.5,
+Qwen3 text, and Qwen3-VL Q4 have resolved production graphs and real-checkpoint evidence; typed
+non-Q4 implementations use the same contracts. Sustained equivalent upstream comparison and its
+post-comparison correctness rerun remain before Gate 7 and the overall goal complete.
 
 ## Completion Gates
 
@@ -590,7 +596,7 @@ exit criteria hold in production code and tests.
 | 4. Weights And State Ownership | Complete | Runtime storage and state have single owners. |
 | 5. Qwen3.5 Q4 Correctness Closure | Complete | The first production graph has parity evidence. |
 | 6. Unified Variant Implementations | Complete | Other variants use the same graph/runtime. |
-| 7. Legacy Removal And Benchmarking | Active | Remove the compatibility boundary, then benchmark the unified runtime. |
+| 7. Legacy Removal And Benchmarking | Active: comparison | Compatibility boundary removed; compare the unified runtime with equivalent upstream inference. |
 
 ### Gate 1: Concrete Graph Resolution
 
@@ -825,14 +831,14 @@ Objective: finish the migration and only then evaluate sustained decode performa
 
 Required work:
 
-- Reduce `legacy.rs` to a facade/compatibility boundary or remove it.
-- Delete stale test-only adapters that no longer protect an active compatibility contract.
+- [x] Remove `legacy.rs` and relocate active compatibility/parity contracts to target owners.
+- [x] Delete stale test-only adapters that no longer protect an active compatibility contract.
 - Run sustained decode comparisons against upstream using equivalent generation settings.
 - Report decode throughput separately from TTFT/prefill.
 
 Exit criteria:
 
-- No production inference owner remains in `legacy.rs`.
+- `legacy.rs` is absent and no production or test module depends on it.
 - The bulk-refactor benchmark lock below is satisfied.
 - Correctness remains green before and after performance tuning.
 
@@ -917,8 +923,9 @@ Do not run FlashMoe benchmarks or optimize tok/s until all of these are true:
 Microbenchmarks, isolated kernel experiments, hidden environment toggles, Q4-only alternate
 runtimes, and experiment-led reversions are prohibited before this lock opens.
 
-Lock status: open after Gate 6. Gate 7 still removes the test-only compatibility boundary before
-running sustained comparisons; performance work must remain on the unified graph.
+Lock status: open. Gates 1-6 are complete, the compatibility boundary is deleted, all-target tests,
+release build, and the required smoke are green. Sustained comparison may now run, but performance
+work must remain on the unified graph.
 
 ## Current Active Goal Prompt
 
@@ -945,17 +952,15 @@ North star:
   the benchmark lock opens.
 
 For Gate 7:
-1. Audit every remaining item in test-only `legacy.rs`. Move still-valid owner tests to their target
-   modules and delete stale compatibility adapters or fixtures that no longer protect an active
-   file-format, math, or upstream-parity contract. Do not move production behavior back into it.
-2. Remove `legacy.rs` entirely when its last active compatibility contract has a target-owned test,
-   or reduce it to the smallest explicitly documented fixture boundary if deletion is not yet
-   honest. Prove no production module imports or depends on it.
-3. Keep focused tests, `cargo test --all-targets`, the release build, the required default smoke,
-   and the real Qwen3/Qwen-VL checkpoints green through cleanup.
-4. Only after the compatibility-boundary cleanup, run sustained decode comparisons against
+1. Legacy cleanup is complete: preserve the owner-local parity modules and do not recreate a broad
+   compatibility module or alternate runtime.
+2. Run sustained decode comparisons against
    upstream with equivalent model, prompt, K, token count, sampling, and cache conditions. Report
    TTFT/prefill separately from steady decode throughput.
+3. Use enough generated tokens to separate warm steady decode from first-token setup. Record the
+   exact pb and upstream commands, checkpoint, prompt, routing K, sampling, and cache conditions.
+4. Keep focused tests, `cargo test --all-targets`, the release build, the required default smoke,
+   and the real Qwen3/Qwen-VL checkpoints green through comparison.
 5. Make any performance change only in the unified graph and rerun correctness before and after.
    Do not add hidden toggles, a Q4-only runtime, silent fallback, or experiment-led reversion.
 

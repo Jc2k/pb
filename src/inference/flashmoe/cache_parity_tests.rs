@@ -402,3 +402,19 @@ fn build_cache_accepts_qwen3_style_index_with_qknorm_and_shared_expert() {
     validate_required_tensor_manifest(&config, &registry)
         .expect("Qwen3-style manifest should pass validation");
 }
+
+#[test]
+fn expert_tensor_classifier_ignores_mtp_speculative_layers() {
+    assert!(is_expert_tensor_name(
+        "model.layers.0.mlp.experts.gate_up_proj"
+    ));
+    assert!(is_expert_tensor_name(
+        "model.layers.0.mlp.experts.7.gate_proj.weight"
+    ));
+    assert!(is_expert_tensor_name(
+        "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    ));
+    assert!(!is_expert_tensor_name(
+        "mtp.layers.0.mlp.experts.7.gate_proj.weight"
+    ));
+}

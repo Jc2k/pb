@@ -1,6 +1,7 @@
 //! Owner-local tokenizer, sampling, chat-template, and tool-call parity tests.
 
 use super::*;
+use crate::inference::flashmoe::math::top_k;
 use crate::inference::flashmoe::planning::plan_unchecked;
 use crate::inference::flashmoe::types::QWEN35_MODEL;
 
@@ -772,4 +773,39 @@ fn qwen_tokenizer_uses_byte_level_bpe_from_tokenizer_json() {
         tokenizer.encode("<|im_start|>hello<|im_end|>").unwrap(),
         vec![100, 8, 101]
     );
+}
+
+#[test]
+fn resident_lm_head_candidate_superset_preserves_repeat_penalized_top_k() {
+    let logits = vec![10.0, 9.99, 9.98, 9.97, 9.96, 9.0, 8.0];
+    let sampler = TokenSampler::new(0.7, 2, 99);
+    let prompt = vec![0, 1, 2];
+    let repeated = sampler.repeated_tokens(&prompt, &[]);
+    let raw_count = sampler.top_k + repeated.len();
+    let raw_candidates = top_k(&logits, raw_count);
+
+    let reranked = rerank_resident_lm_head_candidates(
+        &raw_candidates,
+        sampler.top_k,
+        sampler.repeat_penalty,
+        &repeated,
+    );
+
+    assert_eq!(reranked, sampler.top_candidates(&logits, &prompt, &[]));
+    assert_eq!(
+        reranked.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+}
+
+#[test]
+fn top_k_candidates_matches_full_top_k_across_tiles() {
+    let scores = [0.2, 1.0, 0.9, -1.0, 3.0, 2.0, 3.0];
+    let mut candidates = TopKCandidates::new(3);
+    for (offset, chunk) in scores.chunks(2).enumerate() {
+        for (inner, score) in chunk.iter().copied().enumerate() {
+            candidates.push(offset * 2 + inner, score);
+        }
+    }
+    assert_eq!(candidates.into_sorted_vec(), top_k(&scores, 3));
 }

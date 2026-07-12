@@ -2908,3 +2908,152 @@ fn lm_head_logits_accepts_padded_vocab_rows() {
 
     assert_eq!(logits, vec![2.0, 4.0, 6.0]);
 }
+
+#[test]
+fn dense_projection_rejects_input_width_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dense_path = tmp.path().join("dense.bin");
+    let manifest_path = tmp.path().join("manifest.json");
+
+    let mut bytes = Vec::new();
+    for value in 0..6u32 {
+        bytes.extend_from_slice(&(value as f32).to_le_bytes());
+    }
+    fs::write(&dense_path, &bytes).unwrap();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "proj.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![2, 3],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let store = DenseStore::open(dense_path, manifest_path).unwrap();
+    let err = store
+        .matvec_tensor_prefix("proj.weight", &[1.0, 1.0], 2)
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("proj.weight"), "{err:#}");
+    assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+    assert!(message.contains("actual shape [2, 3]"), "{err:#}");
+    assert!(message.contains("input length 2"), "{err:#}");
+}
+
+#[test]
+fn dense_projection_rejects_output_width_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dense_path = tmp.path().join("dense.bin");
+    let manifest_path = tmp.path().join("manifest.json");
+
+    let mut bytes = Vec::new();
+    for value in 0..2u32 {
+        bytes.extend_from_slice(&(value as f32).to_le_bytes());
+    }
+    fs::write(&dense_path, &bytes).unwrap();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "proj.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 2],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let store = DenseStore::open(dense_path, manifest_path).unwrap();
+    let err = store
+        .project_dense_tensor_with_metal(None, "proj.weight", &[1.0, 1.0], 2)
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("proj.weight"), "{err:#}");
+    assert!(message.contains("expected shape [2, 2]"), "{err:#}");
+    assert!(message.contains("actual shape [1, 2]"), "{err:#}");
+}
+
+#[test]
+fn lm_head_logits_rejects_missing_vocab_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dense_path = tmp.path().join("dense.bin");
+    let manifest_path = tmp.path().join("manifest.json");
+
+    let tokenizer = QwenTokenizer::from_json_bytes(
+            br#"{
+  "added_tokens": [
+    {"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "a": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#,
+        )
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    for row_idx in 0..2usize {
+        let value = (row_idx as f32) + 1.0;
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(&dense_path, &bytes).unwrap();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&FlashMoeManifest {
+            model: QWEN35_MODEL.to_string(),
+            cache_version: CACHE_VERSION.to_string(),
+            dense_shards: vec!["dense.safetensors".to_string()],
+            expert_tensors: Vec::new(),
+            dense_tensors: vec![DenseTensorRef {
+                tensor: "lm_head.weight".to_string(),
+                shard: "dense.safetensors".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![2, 2],
+                source_offsets: [0, bytes.len() as u64],
+                runtime_offset: 0,
+                byte_len: bytes.len() as u64,
+                quantization: TensorQuantization::None,
+                q4_sources: None,
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let store = DenseStore::open(dense_path, manifest_path).unwrap();
+    let err = store
+        .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("lm_head.weight"), "{err:#}");
+    assert!(message.contains("expected at least [3, 2]"), "{err:#}");
+    assert!(message.contains("actual shape [2, 2]"), "{err:#}");
+}
