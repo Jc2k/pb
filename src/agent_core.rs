@@ -1338,7 +1338,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect once, then create or edit files with apply_patch; use `*** Add File:` for a new file. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect once, then create or edit files with apply_patch. A new-file patch must use this envelope exactly: `*** Begin Patch\\n*** Add File: index.html\\n+content\\n*** End Patch`. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
@@ -1349,7 +1349,7 @@ fn build_direct_harness_instructions(
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
     format!(
-        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text: {{\"type\":\"tool_calls\",\"calls\":[{{\"tool\":\"session_title\",\"arguments\":{{\"title\":\"Build task\"}}}},{{\"tool\":\"run_command\",\"arguments\":{{\"cmd\":\"pwd\"}}}}]}}. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the model interface.",
+        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text: {{\"type\":\"tool_calls\",\"calls\":[{{\"tool\":\"session_title\",\"arguments\":{{\"title\":\"Build task\"}}}},{{\"tool\":\"run_command\",\"arguments\":{{\"cmd\":\"pwd\"}}}}]}}. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise summary. Available tools: {tools}.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -6141,7 +6141,7 @@ mod tests {
         assert!(instructions.len() < 1_500, "instructions: {instructions}");
         assert!(instructions.contains("review sub_agent"));
         assert!(instructions.contains("never repeat an inspection whose result was empty"));
-        assert!(instructions.contains("use `*** Add File:` for a new file"));
+        assert!(instructions.contains("*** Add File: index.html\\n+content"));
         assert!(instructions.contains("rerun tests"));
         assert!(instructions.contains("semantic message"));
         assert!(instructions.contains("session_title(title)"));
