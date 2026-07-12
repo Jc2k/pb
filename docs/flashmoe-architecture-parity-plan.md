@@ -257,7 +257,8 @@ Baseline reviewed on 2026-07-11:
   resource through synchronous completion or deferred-submission transfer; completed commands no
   longer pin a token's streamed expert buffers until the outer autorelease pool drains.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
-  reporting the requested and released byte counts on failure.
+  reporting the requested and released byte counts plus Metal's current and recommended working-set
+  sizes on failure.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch
   used by full-attention CMD1 and deferred state. `weights.rs` resolves one
   `ResidentMmapMatvecProjection` from manifest dtype/quantization metadata; CPU or GPU input

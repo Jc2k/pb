@@ -291,8 +291,11 @@ impl MetalBufferPool {
             };
             let retry = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
             if retry.is_null() {
+                let current_allocated_bytes = msg_send_usize0(device, sel("currentAllocatedSize"));
+                let recommended_working_set_bytes =
+                    msg_send_usize0(device, sel("recommendedMaxWorkingSetSize"));
                 anyhow::bail!(
-                    "failed to allocate Flash-MoE Metal buffer: requested_bytes={len} released_pooled_buffers={released_buffers} released_pooled_bytes={released_bytes}"
+                    "failed to allocate Flash-MoE Metal buffer: requested_bytes={len} released_pooled_buffers={released_buffers} released_pooled_bytes={released_bytes} current_allocated_bytes={current_allocated_bytes} recommended_working_set_bytes={recommended_working_set_bytes}"
                 );
             }
             tracing::warn!(
