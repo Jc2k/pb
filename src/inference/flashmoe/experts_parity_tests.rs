@@ -1,11 +1,12 @@
 //! Owner-local PBQ4 import and fixed-slot compatibility parity tests.
 
 use super::*;
+use crate::inference::flashmoe::cache::build_manifest;
 use crate::inference::flashmoe::math::q4_fma_matvec_with_group_size;
 use crate::inference::flashmoe::model_family::{QwenMoeExpertComponentKind, QwenMoeQ4ExpertLayout};
-use crate::inference::flashmoe::test_fixtures::{
-    assert_close, test_expert_pack, test_expert_pack_metadata, write_test_expert_layer,
-};
+use crate::inference::flashmoe::planning::plan_unchecked;
+use crate::inference::flashmoe::test_fixtures::*;
+use crate::inference::flashmoe::types::*;
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
@@ -577,4 +578,604 @@ fn expert_store_parses_pbq4expert_records_as_import_data_only() {
         + (3.0 * 0.5 + 1.0) * 3.0
         + (4.0 * 0.5 + 1.0) * 4.0;
     assert!((out[0] - expected).abs() < 1e-6);
+}
+
+#[test]
+fn packer_splits_qwen35_aggregate_expert_tensors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+    fs::create_dir_all(&snapshot).unwrap();
+    let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+    fs::create_dir_all(&plan.experts_dir).unwrap();
+
+    let gate_up_bytes: Vec<u8> = (0u8..16).collect();
+    let down_bytes: Vec<u8> = (16u8..24).collect();
+    fs::write(
+        snapshot.join("expert.safetensors"),
+        make_typed_safetensors(&[
+            (
+                "model.layers.1.mlp.experts.gate_up_proj",
+                "U8",
+                vec![2, 4, 2],
+                &gate_up_bytes,
+            ),
+            (
+                "model.layers.1.mlp.experts.down_proj",
+                "U8",
+                vec![2, 2, 2],
+                &down_bytes,
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+    let tensors = vec![
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.experts.gate_up_proj".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 4, 2],
+            source_offsets: Some([0, 16]),
+            q4_sources: None,
+        },
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 2, 2],
+            source_offsets: Some([16, 24]),
+            q4_sources: None,
+        },
+    ];
+
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &tensors,
+        Some(&config),
+    )
+    .unwrap();
+
+    let layer_path = expert_layer_path(&plan.experts_dir, 1);
+    let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
+        .unwrap()
+        .unwrap();
+    assert!(layer_path.is_file());
+    assert_eq!(
+        fs::metadata(&layer_path).unwrap().len(),
+        metadata.expert_size * metadata.experts as u64
+    );
+    assert_eq!(metadata.experts, 2);
+    assert_eq!(metadata.packs.len(), 2);
+    assert!(metadata.pack_for(0).is_some());
+    assert!(metadata.pack_for(1).is_some());
+
+    let expert0 = read_pbq4_expert_records(&plan.experts_dir, 1, 0).unwrap();
+    let expert1 = read_pbq4_expert_records(&plan.experts_dir, 1, 1).unwrap();
+    assert!(expert_pack_is_complete(&plan.experts_dir, 1, 0));
+    assert!(expert_pack_is_complete(&plan.experts_dir, 1, 1));
+    for records in [&expert0, &expert1] {
+        assert_eq!(records.len(), 3);
+        assert!(packed_expert_record_suffix(records, "gate_proj.weight").is_some());
+        assert!(packed_expert_record_suffix(records, "up_proj.weight").is_some());
+        assert!(packed_expert_record_suffix(records, "down_proj.weight").is_some());
+    }
+    let input = [1.0, 1.0];
+    let expert0_gate = project_packed_expert_record(
+        packed_expert_record_suffix(&expert0, "gate_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert0_up = project_packed_expert_record(
+        packed_expert_record_suffix(&expert0, "up_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert1_gate = project_packed_expert_record(
+        packed_expert_record_suffix(&expert1, "gate_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert1_down = project_packed_expert_record(
+        packed_expert_record_suffix(&expert1, "down_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    for (actual, expected) in expert0_gate.iter().zip([1.0, 5.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert0_up.iter().zip([9.0, 13.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert1_gate.iter().zip([17.0, 21.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert1_down.iter().zip([41.0, 45.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+}
+
+#[test]
+fn packer_splits_mlx_switch_mlp_aggregate_expert_tensors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+    fs::create_dir_all(&snapshot).unwrap();
+    let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+    fs::create_dir_all(&plan.experts_dir).unwrap();
+
+    let gate_bytes: Vec<u8> = (0u8..8).collect();
+    let up_bytes: Vec<u8> = (8u8..16).collect();
+    let down_bytes: Vec<u8> = (16u8..24).collect();
+    fs::write(
+        snapshot.join("expert.safetensors"),
+        make_typed_safetensors(&[
+            (
+                "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+                "U8",
+                vec![2, 2, 2],
+                &gate_bytes,
+            ),
+            (
+                "model.layers.1.mlp.switch_mlp.up_proj.weight",
+                "U8",
+                vec![2, 2, 2],
+                &up_bytes,
+            ),
+            (
+                "model.layers.1.mlp.switch_mlp.down_proj.weight",
+                "U8",
+                vec![2, 2, 2],
+                &down_bytes,
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+    let tensors = vec![
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.switch_mlp.gate_proj.weight".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 2, 2],
+            source_offsets: Some([0, 8]),
+            q4_sources: None,
+        },
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 2, 2],
+            source_offsets: Some([8, 16]),
+            q4_sources: None,
+        },
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 2, 2],
+            source_offsets: Some([16, 24]),
+            q4_sources: None,
+        },
+    ];
+
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &tensors,
+        Some(&config),
+    )
+    .unwrap();
+
+    let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.experts, 2);
+    assert_eq!(metadata.packs.len(), 2);
+    let expert0 = read_pbq4_expert_records(&plan.experts_dir, 1, 0).unwrap();
+    let expert1 = read_pbq4_expert_records(&plan.experts_dir, 1, 1).unwrap();
+    for records in [&expert0, &expert1] {
+        assert_eq!(records.len(), 3);
+        assert!(packed_expert_record_suffix(records, "gate_proj.weight").is_some());
+        assert!(packed_expert_record_suffix(records, "up_proj.weight").is_some());
+        assert!(packed_expert_record_suffix(records, "down_proj.weight").is_some());
+    }
+    let input = [1.0, 1.0];
+    let expert0_gate = project_packed_expert_record(
+        packed_expert_record_suffix(&expert0, "gate_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert0_up = project_packed_expert_record(
+        packed_expert_record_suffix(&expert0, "up_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert1_gate = project_packed_expert_record(
+        packed_expert_record_suffix(&expert1, "gate_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    let expert1_down = project_packed_expert_record(
+        packed_expert_record_suffix(&expert1, "down_proj.weight").unwrap(),
+        &input,
+        2,
+    )
+    .unwrap();
+    for (actual, expected) in expert0_gate.iter().zip([1.0, 5.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert0_up.iter().zip([17.0, 21.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert1_gate.iter().zip([9.0, 13.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+    for (actual, expected) in expert1_down.iter().zip([41.0, 45.0]) {
+        assert_close_with_tolerance(*actual, expected, 0.01);
+    }
+}
+
+#[test]
+fn packer_copies_native_mlx_q4_switch_mlp_experts_without_requantizing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+    fs::create_dir_all(&snapshot).unwrap();
+    let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+    fs::create_dir_all(&plan.experts_dir).unwrap();
+
+    let packed_words: Vec<u32> = (0..16).map(|_| 0x7654_3210).collect();
+    let gate_packed = u32_tensor_bytes(&packed_words);
+    let up_words: Vec<u32> = (0..16)
+        .map(|row| 0x0123_4567u32.wrapping_add(row))
+        .collect();
+    let up_packed = u32_tensor_bytes(&up_words);
+    let down_words: Vec<u32> = (0..16)
+        .map(|row| 0x89ab_cdefu32.wrapping_add(row))
+        .collect();
+    let down_packed = u32_tensor_bytes(&down_words);
+    let gate_scales = bf16_tensor_bytes(&[0.5; 16]);
+    let gate_biases = bf16_tensor_bytes(&[1.0; 16]);
+    let up_scales = bf16_tensor_bytes(&[0.25; 16]);
+    let up_biases = bf16_tensor_bytes(&[2.0; 16]);
+    let down_scales = bf16_tensor_bytes(&[0.125; 16]);
+    let down_biases = bf16_tensor_bytes(&[3.0; 16]);
+    let tensors = vec![
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight".to_string(),
+            "U32".to_string(),
+            vec![2, 8, 1],
+            gate_packed.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            gate_scales.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            gate_biases.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
+            "U32".to_string(),
+            vec![2, 8, 1],
+            up_packed.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            up_scales.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            up_biases.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+            "U32".to_string(),
+            vec![2, 8, 1],
+            down_packed.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            down_scales.clone(),
+        ),
+        (
+            "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases".to_string(),
+            EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            vec![2, 8, 1],
+            down_biases.clone(),
+        ),
+    ];
+    let fixture_refs = typed_fixture_refs(&tensors);
+    fs::write(
+        snapshot.join("experts.safetensors"),
+        make_typed_safetensors(&fixture_refs),
+    )
+    .unwrap();
+    let mut weight_map = serde_json::Map::new();
+    for (name, _, _, _) in &tensors {
+        weight_map.insert(
+            name.clone(),
+            serde_json::Value::String("experts.safetensors".to_string()),
+        );
+    }
+    let index = serde_json::Value::Object(serde_json::Map::from_iter([(
+        "weight_map".to_string(),
+        serde_json::Value::Object(weight_map),
+    )]));
+    let index_path = snapshot.join("model.safetensors.index.json");
+    fs::write(&index_path, index.to_string()).unwrap();
+
+    let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, &snapshot, &index_path).unwrap();
+    assert!(visual_refs.is_empty());
+    assert!(manifest.dense_tensors.is_empty());
+    assert_eq!(manifest.expert_tensors.len(), 3);
+    assert!(manifest.expert_tensors.iter().all(|tensor| {
+        tensor.q4_sources.is_some()
+            && tensor.shape == vec![2, 8, 8]
+            && tensor.dtype.as_deref() == Some("U32")
+    }));
+
+    let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":8,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":8}"#,
+        )
+        .unwrap();
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &manifest.expert_tensors,
+        Some(&config),
+    )
+    .unwrap();
+
+    let expert0 = read_pbq4_expert_records(&plan.experts_dir, 1, 0).unwrap();
+    let gate0 = packed_expert_record_suffix(&expert0, "gate_proj.weight").unwrap();
+    assert_eq!(gate0.dtype, "U32");
+    assert_eq!(gate0.shape, vec![8, 8]);
+    assert_eq!(gate0.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+    assert_eq!(gate0.packed, gate_packed[..32]);
+    assert_eq!(gate0.scale_bytes, gate_scales[..16]);
+    assert_eq!(gate0.bias_bytes, gate_biases[..16]);
+    let input = [1.0; 8];
+    let projected = project_packed_expert_record(gate0, &input, 8).unwrap();
+    assert_eq!(projected, vec![22.0; 8]);
+
+    let expert1 = read_pbq4_expert_records(&plan.experts_dir, 1, 1).unwrap();
+    let up1 = packed_expert_record_suffix(&expert1, "up_proj.weight").unwrap();
+    assert_eq!(up1.packed, up_packed[32..]);
+    assert_eq!(up1.scale_bytes, up_scales[16..]);
+    assert_eq!(up1.bias_bytes, up_biases[16..]);
+    let down1 = packed_expert_record_suffix(&expert1, "down_proj.weight").unwrap();
+    assert_eq!(down1.packed, down_packed[32..]);
+    assert_eq!(down1.scale_bytes, down_scales[16..]);
+    assert_eq!(down1.bias_bytes, down_biases[16..]);
+}
+
+#[test]
+fn native_q4_qwen35_expert_pack_uses_fixed_slot_layout() {
+    let fixed = QwenMoeQ4ExpertLayout::qwen35_a17b();
+    let native_input = |tensor: &str,
+                        shape: Vec<usize>,
+                        weight_kind: QwenMoeExpertComponentKind,
+                        scale_kind: QwenMoeExpertComponentKind,
+                        bias_kind: QwenMoeExpertComponentKind,
+                        packed_byte: u8,
+                        scale_byte: u8,
+                        bias_byte: u8| {
+        NativeQ4ExpertRecordInput {
+            tensor: tensor.to_string(),
+            dtype: "U32".to_string(),
+            shape,
+            source_offsets: [0, 1],
+            source_hash: Some(format!("{tensor}:hash")),
+            packed: vec![packed_byte; fixed.component(weight_kind).bytes],
+            scale_bytes: vec![scale_byte; fixed.component(scale_kind).bytes],
+            bias_bytes: vec![bias_byte; fixed.component(bias_kind).bytes],
+            groups: fixed.component(scale_kind).bytes / 2,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        }
+    };
+
+    let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_5_moe_text","num_hidden_layers":60,"hidden_size":4096,"num_attention_heads":32,"head_dim":256,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":1024,"shared_expert_intermediate_size":1024}"#,
+        )
+        .unwrap();
+    let layout = AggregateExpertLayout::new(
+        config.experts(),
+        config.hidden_size,
+        config.moe_intermediate_size.unwrap(),
+    )
+    .unwrap();
+    let (packed, metadata) = build_fixed_native_q4_expert_pack(
+        0,
+        7,
+        fixed,
+        vec![
+            native_input(
+                "model.layers.0.mlp.experts.7.gate_proj.weight",
+                vec![1024, 4096],
+                QwenMoeExpertComponentKind::GateWeight,
+                QwenMoeExpertComponentKind::GateScale,
+                QwenMoeExpertComponentKind::GateBias,
+                0x11,
+                0x22,
+                0x33,
+            ),
+            native_input(
+                "model.layers.0.mlp.experts.7.up_proj.weight",
+                vec![1024, 4096],
+                QwenMoeExpertComponentKind::UpWeight,
+                QwenMoeExpertComponentKind::UpScale,
+                QwenMoeExpertComponentKind::UpBias,
+                0x44,
+                0x55,
+                0x66,
+            ),
+            native_input(
+                "model.layers.0.mlp.experts.7.down_proj.weight",
+                vec![4096, 1024],
+                QwenMoeExpertComponentKind::DownWeight,
+                QwenMoeExpertComponentKind::DownScale,
+                QwenMoeExpertComponentKind::DownBias,
+                0x77,
+                0x88,
+                0x99,
+            ),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(layout.hidden, 4096);
+    assert_eq!(layout.intermediate, 1024);
+    assert_eq!(packed.len(), fixed.expert_bytes);
+    assert!(!packed.starts_with(PBQ4_EXPERT_MAGIC));
+    assert_eq!(metadata.layer, 0);
+    assert_eq!(metadata.expert, 7);
+    assert_eq!(metadata.packed_bytes, fixed.expert_bytes as u64);
+    assert_eq!(metadata.records.len(), 3);
+    assert_eq!(
+        &packed[fixed
+            .component(QwenMoeExpertComponentKind::GateWeight)
+            .offset
+            ..fixed
+                .component(QwenMoeExpertComponentKind::GateWeight)
+                .offset
+                + 4],
+        &[0x11; 4]
+    );
+    assert_eq!(
+        &packed[fixed.component(QwenMoeExpertComponentKind::UpScale).offset
+            ..fixed.component(QwenMoeExpertComponentKind::UpScale).offset + 4],
+        &[0x55; 4]
+    );
+    assert_eq!(
+        &packed[fixed.component(QwenMoeExpertComponentKind::DownBias).offset
+            ..fixed.component(QwenMoeExpertComponentKind::DownBias).offset + 4],
+        &[0x99; 4]
+    );
+}
+
+#[test]
+fn aggregate_expert_reuse_rejects_changed_source_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(QWEN35_MODEL));
+    fs::create_dir_all(&snapshot).unwrap();
+    let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
+    fs::create_dir_all(&plan.experts_dir).unwrap();
+
+    let config: QwenModelConfig = serde_json::from_slice(
+            br#"{"model_type":"qwen3_moe","num_hidden_layers":2,"hidden_size":2,"num_attention_heads":1,"vocab_size":16,"torch_dtype":"bfloat16","num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":2}"#,
+        )
+        .unwrap();
+    let tensors = vec![
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.experts.gate_up_proj".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 4, 2],
+            source_offsets: Some([0, 16]),
+            q4_sources: None,
+        },
+        ExpertTensorRef {
+            tensor: "model.layers.1.mlp.experts.down_proj".to_string(),
+            shard: "expert.safetensors".to_string(),
+            layer: Some(1),
+            expert: None,
+            dtype: Some("U8".to_string()),
+            shape: vec![2, 2, 2],
+            source_offsets: Some([16, 24]),
+            q4_sources: None,
+        },
+    ];
+
+    let write_expert_shard = |gate_up_bytes: Vec<u8>, down_bytes: Vec<u8>| {
+        fs::write(
+            snapshot.join("expert.safetensors"),
+            make_typed_safetensors(&[
+                (
+                    "model.layers.1.mlp.experts.gate_up_proj",
+                    "U8",
+                    vec![2, 4, 2],
+                    gate_up_bytes.as_slice(),
+                ),
+                (
+                    "model.layers.1.mlp.experts.down_proj",
+                    "U8",
+                    vec![2, 2, 2],
+                    down_bytes.as_slice(),
+                ),
+            ]),
+        )
+        .unwrap();
+    };
+
+    write_expert_shard((0u8..16).collect(), (16u8..24).collect());
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &tensors,
+        Some(&config),
+    )
+    .unwrap();
+    let before = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
+        .unwrap()
+        .unwrap()
+        .records[0]
+        .source_hash
+        .clone()
+        .unwrap();
+
+    write_expert_shard((100u8..116).collect(), (200u8..208).collect());
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &tensors,
+        Some(&config),
+    )
+    .unwrap();
+    let after = read_expert_pack_metadata(&plan.experts_dir, 1, 0)
+        .unwrap()
+        .unwrap()
+        .records[0]
+        .source_hash
+        .clone()
+        .unwrap();
+
+    assert_ne!(before, after);
 }

@@ -343,6 +343,10 @@ Baseline reviewed on 2026-07-11:
 - Cache now owns runtime artifact emission, Qwen-VL artifact readiness, safetensors-index ingestion,
   and Qwen3 QK-norm/shared-expert manifest classification in `cache_parity_tests.rs`. These assembly
   tests no longer sit between unrelated math, weights, and expert tests in `legacy.rs`.
+- Expert parity now also owns aggregate Qwen3.5 and MLX switch-MLP splitting, native-Q4 passthrough,
+  fixed-slot layout, and source-reuse invalidation. The contiguous packer block and its model-layout
+  imports were removed from `legacy.rs`; cache manifest construction is imported only by the one
+  expert import test that exercises that boundary.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
