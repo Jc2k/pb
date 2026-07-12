@@ -256,6 +256,10 @@ Baseline reviewed on 2026-07-11:
   Command buffers use Metal's unretained-reference mode because pb explicitly owns every encoded
   resource through synchronous completion or deferred-submission transfer; completed commands no
   longer pin a token's streamed expert buffers until the outer autorelease pool drains.
+  Scheduler `pread` expert payloads are copied into those bounded reusable Metal buffers instead of
+  creating a new no-copy mapping for every active expert. This preserves scheduler-owned streaming
+  and OS page-cache behavior while preventing Metal's accounted working set from growing by roughly
+  one full active-expert set per layer and token during prefill.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
   sizes on failure.
