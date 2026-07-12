@@ -1722,7 +1722,7 @@ impl MetalScheduledCmd3Submission {
     }
 
     pub(crate) fn finish_without_readback(self) -> anyhow::Result<()> {
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             let wait = wait_for_metal_command_buffer(self.command_buffer, &self.context);
             release(self.command_buffer);
             match wait {
@@ -1737,11 +1737,11 @@ impl MetalScheduledCmd3Submission {
                     Err(error.into())
                 }
             }
-        }
+        })
     }
 
     pub(crate) fn wait(self) -> anyhow::Result<FlashMoeExpertPhaseOutput> {
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
                 release(self.command_buffer);
                 self.buffers
@@ -1762,7 +1762,7 @@ impl MetalScheduledCmd3Submission {
                 .recycle_or_release_phase(self.phase_buffers, false);
             self.scheduled_output
                 .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
-        }
+        })
     }
 }
 
@@ -8571,7 +8571,7 @@ mod tests {
             let baseline = msg_send_usize0(device.id(), sel("currentAllocatedSize"));
 
             for _ in 0..32 {
-                objc2::rc::autoreleasepool(|_| {
+                let (command_buffer, buffer) = objc2::rc::autoreleasepool(|_| {
                     let buffer = OwnedMetalObject::new(msg_send_id2_usize_u64(
                         device.id(),
                         sel("newBufferWithLength:options:"),
@@ -8587,11 +8587,21 @@ mod tests {
                     .unwrap();
                     set_buffer(encoding.encoder(), buffer.id(), 0);
                     encoding.end_encoding();
-                    commit_and_wait_metal_command_buffer(
-                        encoding.command_buffer(),
+                    let command_buffer = encoding.into_command_buffer();
+                    commit_metal_command_buffer(
+                        command_buffer,
                         &MetalCommandContext::new("nested autorelease test"),
+                    );
+                    (command_buffer, buffer)
+                });
+                objc2::rc::autoreleasepool(|_| {
+                    wait_for_metal_command_buffer(
+                        command_buffer,
+                        &MetalCommandContext::new("nested autorelease completion test"),
                     )
                     .unwrap();
+                    release(command_buffer);
+                    drop(buffer);
                 });
             }
 

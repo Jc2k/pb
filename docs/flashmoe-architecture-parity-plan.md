@@ -256,13 +256,14 @@ Baseline reviewed on 2026-07-11:
   Command buffers use Metal's unretained-reference mode because pb explicitly owns every encoded
   resource through synchronous completion or deferred-submission transfer. The RAII owner claims
   autoreleased command-buffer and encoder return values with Objective-C's return-value handshake,
-  so its explicit releases deallocate completed command objects immediately. Each deferred CMD3
-  submission is also created inside a nested autorelease pool, which drains Metal's committed-command
-  auxiliaries at the layer boundary instead of leaving their expert-buffer references alive until the
-  outer token autorelease pool drains. Scheduler `pread` expert payloads are copied into bounded,
-  reusable Metal staging buffers for only the active expert slots. This avoids the cumulative Metal
-  accounting observed for no-copy mappings during long prefills; nested command draining prevents the
-  copied staging path from retaining tens of gigabytes of completed-command resources before jetsam.
+  so its explicit releases deallocate completed command objects immediately. Deferred CMD3 command
+  creation and its later completion/status polling each run inside a nested autorelease pool. The
+  completion pool drains Metal's committed-command auxiliaries at the layer boundary instead of
+  leaving their expert-buffer references alive until the outer token autorelease pool drains.
+  Scheduler `pread` expert payloads are copied into bounded, reusable Metal staging buffers for only
+  the active expert slots. This avoids the cumulative Metal accounting observed for no-copy mappings
+  during long prefills; scoped command completion prevents the copied staging path from retaining tens
+  of gigabytes of completed-command resources before jetsam.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
   sizes on failure.
