@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use objc2::rc::autoreleasepool;
 use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::FlashMoeCapabilityPlan;
@@ -609,6 +611,32 @@ impl MetalExecutionFacade {
 impl FlashMoeEngine {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn forward_token_input(
+        &mut self,
+        input: FlashMoeTokenInput<'_>,
+        kv_cache: &mut KvCache,
+        position: usize,
+        record_generated: bool,
+        timing: Option<&mut FlashMoeTokenTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<Vec<f32>> {
+        // Raw `commandBuffer`/encoder Objective-C messages return autoreleased
+        // objects. A CLI process has no ambient AppKit autorelease pool, so a
+        // long prefill or decode must drain those transients at the token
+        // boundary while retained model/state buffers remain alive.
+        autoreleasepool(|_| {
+            self.forward_token_input_in_autoreleasepool(
+                input,
+                kv_cache,
+                position,
+                record_generated,
+                timing,
+                progress,
+            )
+        })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn forward_token_input_in_autoreleasepool(
         &mut self,
         input: FlashMoeTokenInput<'_>,
         kv_cache: &mut KvCache,
