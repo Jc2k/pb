@@ -253,6 +253,9 @@ Baseline reviewed on 2026-07-11:
   referenced buffers; deferred CMD3 explicitly transfers its ended command buffer to the submission.
   The reusable pool uses best-fit allocation so tiny transients cannot consume cached whole-expert
   buffers, and under capacity pressure it retains larger buffers instead of the earliest small ones.
+  Command buffers use Metal's unretained-reference mode because pb explicitly owns every encoded
+  resource through synchronous completion or deferred-submission transfer; completed commands no
+  longer pin a token's streamed expert buffers until the outer autorelease pool drains.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts on failure.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch

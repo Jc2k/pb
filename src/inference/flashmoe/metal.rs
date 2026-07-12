@@ -846,7 +846,14 @@ impl MetalCommandEncoding {
         encoder_error: &'static str,
     ) -> anyhow::Result<Self> {
         unsafe {
-            let command_buffer = retain(msg_send_id0(command_queue, sel("commandBuffer")));
+            // Every encoded resource is held explicitly until completion (or transferred to a
+            // deferred submission). Avoid Metal retaining those buffers again through the
+            // autoreleased command object, which otherwise pins a token's expert buffers until
+            // the outer autorelease pool drains.
+            let command_buffer = retain(msg_send_id0(
+                command_queue,
+                sel("commandBufferWithUnretainedReferences"),
+            ));
             if command_buffer.is_null() {
                 anyhow::bail!(command_buffer_error);
             }
