@@ -1150,14 +1150,6 @@ fn build_agent_instructions(
             "Do not talk about running, launching, or spawning sub-agents in user-facing final content.\n",
         );
     }
-    let available_tools = available_tool_specs(
-        profile,
-        command_backend_kind,
-        allow_sub_agents,
-        repository_less,
-        mcp_registry,
-        lsp_registry,
-    );
     let available_tool_signatures = available_tool_signatures(
         profile,
         command_backend_kind,
@@ -1166,18 +1158,13 @@ fn build_agent_instructions(
         mcp_registry,
         lsp_registry,
     );
-    let tool_schema_json = serde_json::to_string_pretty(&available_tools)
-        .context("failed to serialize tool schemas")?;
     instructions.push_str(&format!(
         "Available tools: {}.\n",
         available_tool_signatures.join(", ")
     ));
     instructions.push_str(
-        "Tool schemas use the MCP tool shape with name, description, and inputSchema JSON Schema fields. Pass arguments that conform to the selected tool's inputSchema.\n",
+        "Tool definitions and JSON Schemas are supplied through the model runtime's native tool interface. Pass arguments that conform to the selected tool's input schema.\n",
     );
-    instructions.push_str("Tool schemas:\n");
-    instructions.push_str(&tool_schema_json);
-    instructions.push('\n');
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
             "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Use vision_describe directly when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
@@ -2083,6 +2070,7 @@ fn tool_allowed(
         | "web_fetch"
         | "git_log"
         | "session_changes"
+        | "session_title"
         | "todo"
         | "skill_search"
         | "skill"
@@ -5965,7 +5953,7 @@ mod tests {
     }
 
     #[test]
-    fn build_profile_instructions_include_mcp_shaped_tool_schemas() {
+    fn build_profile_instructions_do_not_duplicate_native_tool_schemas() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let instructions = build_agent_instructions(
             tmp.path(),
@@ -5980,11 +5968,12 @@ mod tests {
             &LspToolRegistry::default(),
         )
         .unwrap();
-        assert!(instructions.contains("Tool schemas use the MCP tool shape"));
-        assert!(instructions.contains(r#""inputSchema": {"#));
-        assert!(instructions.contains(r#""name": "read_file""#));
-        assert!(instructions.contains(r#""required": ["#));
-        assert!(instructions.contains(r#""additionalProperties": false"#));
+        assert!(
+            instructions.contains("supplied through the model runtime's native tool interface")
+        );
+        assert!(instructions.contains("read_file(path,start,end)"));
+        assert!(!instructions.contains(r#""inputSchema": {"#));
+        assert!(!instructions.contains(r#""name": "read_file""#));
     }
 
     #[test]
