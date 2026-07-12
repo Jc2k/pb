@@ -395,7 +395,7 @@ impl MetalBufferPool {
     ) {
         unsafe {
             for buffer in buffers {
-                if release_only || !buffer.recycle {
+                if release_only {
                     release(buffer.id);
                 } else {
                     self.recycle(buffer.id);
@@ -2486,32 +2486,19 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         if let Some(buffer) = cache.get(bytes) {
             return Ok(buffer);
         }
-        let phase = unsafe { self.borrowed_or_copied_buffer(bytes, 16)? };
+        let phase = unsafe { self.copied_expert_source_buffer(bytes)? };
         let buffer = phase.id;
         buffers.push(phase);
         cache.insert(bytes, buffer);
         Ok(buffer)
     }
 
-    unsafe fn borrowed_or_copied_buffer(
-        &self,
-        bytes: &[u8],
-        alignment: usize,
-    ) -> anyhow::Result<MetalPhaseBuffer> {
+    unsafe fn copied_expert_source_buffer(&self, bytes: &[u8]) -> anyhow::Result<MetalPhaseBuffer> {
         unsafe {
-            if !bytes.is_empty() && (bytes.as_ptr() as usize) % alignment == 0 {
-                let buffer = msg_send_id4_ptr_usize_u64_ptr(
-                    self.runtime.device,
-                    sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
-                    bytes.as_ptr() as *mut c_void,
-                    bytes.len(),
-                    0,
-                    ptr::null_mut(),
-                );
-                if !buffer.is_null() {
-                    return Ok(MetalPhaseBuffer::borrowed(buffer));
-                }
-            }
+            // Metal accounts ephemeral no-copy expert mappings cumulatively across long prefills,
+            // even after their command resources are released. Copy scheduler `pread` payloads
+            // into the bounded reusable pool; the command/encoder RAII owner now releases promptly,
+            // so evicted pool buffers cannot accumulate until the outer token autorelease pool.
             let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
             Ok(MetalPhaseBuffer::recyclable(buffer))
         }
@@ -4738,17 +4725,12 @@ impl MetalCmd3ExecutionPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalPhaseBuffer {
     pub(crate) id: MetalObjcId,
-    pub(crate) recycle: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalPhaseBuffer {
     pub(crate) fn recyclable(id: MetalObjcId) -> Self {
-        Self { id, recycle: true }
-    }
-
-    pub(crate) fn borrowed(id: MetalObjcId) -> Self {
-        Self { id, recycle: false }
+        Self { id }
     }
 }
 
@@ -8883,15 +8865,10 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn phase_buffer_declares_recyclable_or_borrowed_lifecycle() {
+    fn phase_buffer_tracks_recyclable_metal_allocation() {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
 
         let recyclable = MetalPhaseBuffer::recyclable(id);
         assert_eq!(recyclable.id, id);
-        assert!(recyclable.recycle);
-
-        let borrowed = MetalPhaseBuffer::borrowed(id);
-        assert_eq!(borrowed.id, id);
-        assert!(!borrowed.recycle);
     }
 }
