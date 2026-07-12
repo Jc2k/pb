@@ -139,7 +139,8 @@ impl EventSink for HarnessEventSink {
                     .writer
                     .write_all(b"\n")
                     .map_err(|error| error.to_string())
-            });
+            })
+            .and_then(|_| state.writer.flush().map_err(|error| error.to_string()));
         if let Err(error) = write_result {
             state.write_error = Some(error);
         }
@@ -593,6 +594,7 @@ mod tests {
             timestamp_ms: None,
         });
 
+        assert_eq!(std::fs::read_to_string(&events).unwrap().lines().count(), 1);
         let (_, summary) = sink.snapshot().unwrap();
         assert_eq!(summary.branch, "pb/task-harness-1");
         assert_eq!(std::fs::read_to_string(events).unwrap().lines().count(), 1);
