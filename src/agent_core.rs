@@ -1349,7 +1349,7 @@ fn build_direct_harness_instructions(
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
     format!(
-        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Use native tool calls for actions and call session_title near the start. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the native model interface.",
+        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Your first response must use native tool calls: call session_title and run_command to inspect the repository immediately. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the native model interface.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -6143,6 +6143,8 @@ mod tests {
         assert!(instructions.contains("rerun tests"));
         assert!(instructions.contains("semantic message"));
         assert!(instructions.contains("session_title(title)"));
+        assert!(instructions.contains("first response must use native tool calls"));
+        assert!(instructions.contains("before a tool result and repository mutation"));
         assert!(!instructions.contains("Ballmer peak"));
         assert!(!instructions.contains("memory_search"));
         assert!(!instructions.contains("web_search"));
