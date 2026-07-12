@@ -1153,6 +1153,20 @@ fn build_agent_instructions_with_tool_allowlist(
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Result<String> {
+    if let Some(tool_allowlist) = tool_allowlist {
+        return Ok(build_direct_harness_instructions(
+            workspace_root,
+            branch,
+            continuing,
+            command_backend_kind,
+            profile,
+            allow_sub_agents,
+            repository_less,
+            tool_allowlist,
+            mcp_registry,
+            lsp_registry,
+        ));
+    }
     let mut instructions = String::from(
         "You are pb, a local coding agent. Use the provided tools when you need actions. When the task is complete, answer normally with the final user-visible summary.\n",
     );
@@ -1298,6 +1312,52 @@ fn build_agent_instructions_with_tool_allowlist(
     }
 
     Ok(instructions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_direct_harness_instructions(
+    workspace_root: &Path,
+    branch: &str,
+    continuing: bool,
+    command_backend_kind: Option<CommandBackendKind>,
+    profile: AgentProfile,
+    allow_sub_agents: bool,
+    repository_less: bool,
+    tool_allowlist: &[String],
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+) -> String {
+    let signatures = available_tool_signatures(
+        profile,
+        command_backend_kind,
+        allow_sub_agents,
+        repository_less,
+        Some(tool_allowlist),
+        mcp_registry,
+        lsp_registry,
+    );
+    let role = match profile {
+        AgentProfile::Build => {
+            "Build the requested artifact autonomously. Inspect and test with run_command; create or edit files with apply_patch. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+        }
+        AgentProfile::Review => {
+            "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
+        }
+        AgentProfile::Monitor => {
+            "Audit the current run for loops, blockers, progress, and whether more steps are justified. Return concise evidence and a stop or continue recommendation."
+        }
+        _ => "Complete the assigned bounded task using only the available native tools.",
+    };
+    format!(
+        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Use native tool calls for actions and call session_title near the start. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the native model interface.",
+        continuation = if continuing {
+            "on a continuing task"
+        } else {
+            "on a new task"
+        },
+        workspace = workspace_root.display(),
+        tools = signatures.join(", "),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -6051,6 +6111,41 @@ mod tests {
         assert!(instructions.contains("read_file(path,start,end)"));
         assert!(!instructions.contains(r#""inputSchema": {"#));
         assert!(!instructions.contains(r#""name": "read_file""#));
+    }
+
+    #[test]
+    fn direct_harness_instructions_are_concise_and_preserve_build_gates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowlist = vec![
+            "session_title".to_string(),
+            "run_command".to_string(),
+            "apply_patch".to_string(),
+            "git_commit".to_string(),
+            "sub_agent".to_string(),
+        ];
+        let instructions = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            true,
+            false,
+            Some(&allowlist),
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(instructions.len() < 1_500, "instructions: {instructions}");
+        assert!(instructions.contains("review sub_agent"));
+        assert!(instructions.contains("rerun tests"));
+        assert!(instructions.contains("semantic message"));
+        assert!(instructions.contains("session_title(title)"));
+        assert!(!instructions.contains("Ballmer peak"));
+        assert!(!instructions.contains("memory_search"));
+        assert!(!instructions.contains("web_search"));
     }
 
     #[test]
