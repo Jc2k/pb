@@ -4951,6 +4951,10 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 #[cfg(test)]
+#[path = "weights_parity_tests.rs"]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

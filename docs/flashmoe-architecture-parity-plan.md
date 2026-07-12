@@ -347,6 +347,10 @@ Baseline reviewed on 2026-07-11:
   fixed-slot layout, and source-reuse invalidation. The contiguous packer block and its model-layout
   imports were removed from `legacy.rs`; cache manifest construction is imported only by the one
   expert import test that exercises that boundary.
+- Weights now owns the dense registry/manifest validators, attention and linear-attention layouts,
+  resident BF16/Q4 projections, Metal batch and post-attention parity, dense-store caching, runtime
+  shape, and LM-head integration suite in `weights_parity_tests.rs`. Moving that coherent block
+  reduced `legacy.rs` to a small set of expert/math/rope and Metal-compile compatibility cases.
 - Whole-slot raw reads no longer carry test-only slot-spec or recycle-pool fields used by the
   deleted adapter. Fixed-Q4 payloads no longer retain an optional decoded scale/bias component
   cache; CPU reference projection decodes the authoritative whole-slot bytes on demand, while the
