@@ -1338,7 +1338,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect once, then create or edit files with apply_patch; if the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect once, then create or edit files with apply_patch; use `*** Add File:` for a new file. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
@@ -6141,6 +6141,7 @@ mod tests {
         assert!(instructions.len() < 1_500, "instructions: {instructions}");
         assert!(instructions.contains("review sub_agent"));
         assert!(instructions.contains("never repeat an inspection whose result was empty"));
+        assert!(instructions.contains("use `*** Add File:` for a new file"));
         assert!(instructions.contains("rerun tests"));
         assert!(instructions.contains("semantic message"));
         assert!(instructions.contains("session_title(title)"));
