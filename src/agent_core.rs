@@ -456,6 +456,9 @@ pub struct AgentRequest {
     /// truncation retry behavior; direct harness callers can request a smaller, bounded turn.
     #[serde(default)]
     pub turn_max_tokens_cap: Option<i32>,
+    /// Optional native-tool allowlist for bounded direct harness runs.
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -1003,7 +1006,7 @@ pub fn run_agent<S: EventSink>(
         PolicyConfig::load(&workspace_root)?.unwrap_or_default()
     };
 
-    let instructions = build_agent_instructions(
+    let instructions = build_agent_instructions_with_tool_allowlist(
         &workspace_root,
         &branch,
         is_continuation,
@@ -1012,6 +1015,7 @@ pub fn run_agent<S: EventSink>(
         args.profile,
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
+        args.tool_allowlist.as_deref(),
         &mcp_registry,
         &lsp_registry,
     )?;
@@ -1108,6 +1112,7 @@ pub fn run_agent<S: EventSink>(
     })
 }
 
+#[cfg(test)]
 fn build_agent_instructions(
     workspace_root: &Path,
     branch: &str,
@@ -1117,6 +1122,34 @@ fn build_agent_instructions(
     profile: AgentProfile,
     allow_sub_agents: bool,
     repository_less: bool,
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+) -> Result<String> {
+    build_agent_instructions_with_tool_allowlist(
+        workspace_root,
+        branch,
+        continuing,
+        command_backend_kind,
+        env_config,
+        profile,
+        allow_sub_agents,
+        repository_less,
+        None,
+        mcp_registry,
+        lsp_registry,
+    )
+}
+
+fn build_agent_instructions_with_tool_allowlist(
+    workspace_root: &Path,
+    branch: &str,
+    continuing: bool,
+    command_backend_kind: Option<CommandBackendKind>,
+    env_config: Option<&EnvironmentConfig>,
+    profile: AgentProfile,
+    allow_sub_agents: bool,
+    repository_less: bool,
+    tool_allowlist: Option<&[String]>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Result<String> {
@@ -1155,6 +1188,7 @@ fn build_agent_instructions(
         command_backend_kind,
         allow_sub_agents,
         repository_less,
+        tool_allowlist,
         mcp_registry,
         lsp_registry,
     );
@@ -1274,11 +1308,32 @@ struct BuiltInToolSchema {
     input_schema: Value,
 }
 
+#[cfg(test)]
 fn available_tool_specs(
     profile: AgentProfile,
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
     repository_less: bool,
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+) -> Vec<BuiltInToolSchema> {
+    available_tool_specs_with_allowlist(
+        profile,
+        command_backend_kind,
+        allow_sub_agents,
+        repository_less,
+        None,
+        mcp_registry,
+        lsp_registry,
+    )
+}
+
+fn available_tool_specs_with_allowlist(
+    profile: AgentProfile,
+    command_backend_kind: Option<CommandBackendKind>,
+    allow_sub_agents: bool,
+    repository_less: bool,
+    tool_allowlist: Option<&[String]>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Vec<BuiltInToolSchema> {
@@ -1291,22 +1346,38 @@ fn available_tool_specs(
                 command_backend_kind,
                 allow_sub_agents,
                 repository_less,
-            )
+            ) && tool_allowlist.is_none_or(|allowlist| allowlist.contains(&tool.name))
         })
         .collect();
-    tools.extend(mcp_registry.tools.values().map(|tool| BuiltInToolSchema {
-        name: tool.tool_name.clone(),
-        description: format!(
-            "{} (MCP server: {}, tool: {})",
-            tool.description, tool.server_name, tool.server_tool_name
-        ),
-        input_schema: tool.input_schema.clone(),
-    }));
-    tools.extend(lsp_registry.tools.values().map(|tool| BuiltInToolSchema {
-        name: tool.tool_name.clone(),
-        description: tool.description.clone(),
-        input_schema: tool.input_schema.clone(),
-    }));
+    tools.extend(
+        mcp_registry
+            .tools
+            .values()
+            .filter(|tool| {
+                tool_allowlist.is_none_or(|allowlist| allowlist.contains(&tool.tool_name))
+            })
+            .map(|tool| BuiltInToolSchema {
+                name: tool.tool_name.clone(),
+                description: format!(
+                    "{} (MCP server: {}, tool: {})",
+                    tool.description, tool.server_name, tool.server_tool_name
+                ),
+                input_schema: tool.input_schema.clone(),
+            }),
+    );
+    tools.extend(
+        lsp_registry
+            .tools
+            .values()
+            .filter(|tool| {
+                tool_allowlist.is_none_or(|allowlist| allowlist.contains(&tool.tool_name))
+            })
+            .map(|tool| BuiltInToolSchema {
+                name: tool.tool_name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+            }),
+    );
     tools
 }
 
@@ -1370,14 +1441,16 @@ fn available_tool_signatures(
     command_backend_kind: Option<CommandBackendKind>,
     allow_sub_agents: bool,
     repository_less: bool,
+    tool_allowlist: Option<&[String]>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Vec<String> {
-    available_tool_specs(
+    available_tool_specs_with_allowlist(
         profile,
         command_backend_kind,
         allow_sub_agents,
         repository_less,
+        tool_allowlist,
         mcp_registry,
         lsp_registry,
     )
@@ -2166,11 +2239,12 @@ fn run_agent_steps(
     let mut repeated_parse_failures = 0usize;
     let mut tool_loop_guard = ToolLoopGuard::default();
     let gate_state = RefCell::new(GateState::default());
-    let available_tools = available_tool_specs(
+    let available_tools = available_tool_specs_with_allowlist(
         args.profile,
         command_backend.map(CommandBackend::kind),
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
+        args.tool_allowlist.as_deref(),
         mcp_registry,
         lsp_registry,
     );
@@ -2477,7 +2551,7 @@ fn run_step_limit_monitor(
         timestamp_ms: Some(now_millis()),
     });
 
-    let instructions = build_agent_instructions(
+    let instructions = build_agent_instructions_with_tool_allowlist(
         workspace_root,
         args.branch.as_deref().unwrap_or("monitor"),
         true,
@@ -2486,6 +2560,7 @@ fn run_step_limit_monitor(
         AgentProfile::Monitor,
         false,
         args.repository_less,
+        args.tool_allowlist.as_deref(),
         mcp_registry,
         lsp_registry,
     )?;
@@ -4105,7 +4180,7 @@ fn run_sub_agent(
         timestamp_ms: Some(now_millis()),
     });
 
-    let instructions = build_agent_instructions(
+    let instructions = build_agent_instructions_with_tool_allowlist(
         context.workspace_root,
         context.request.branch.as_deref().unwrap_or("sub-agent"),
         true,
@@ -4114,6 +4189,7 @@ fn run_sub_agent(
         profile,
         false,
         context.request.repository_less,
+        context.request.tool_allowlist.as_deref(),
         context.mcp_registry,
         context.lsp_registry,
     )?;
@@ -5600,6 +5676,7 @@ mod tests {
             max_steps: 10,
             max_tokens,
             turn_max_tokens_cap: None,
+            tool_allowlist: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -6049,6 +6126,28 @@ mod tests {
     }
 
     #[test]
+    fn available_tool_specs_honor_direct_run_allowlist() {
+        let allowlist = vec!["read_file".to_string(), "git_commit".to_string()];
+        let tools = available_tool_specs_with_allowlist(
+            AgentProfile::Build,
+            Some(CommandBackendKind::Local),
+            true,
+            false,
+            Some(&allowlist),
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        );
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "git_commit"]
+        );
+    }
+
+    #[test]
     fn vision_is_a_tool_not_an_agent_profile() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let instructions = build_agent_instructions(
@@ -6398,6 +6497,7 @@ mod tests {
             max_steps: 10,
             max_tokens: 2048,
             turn_max_tokens_cap: None,
+            tool_allowlist: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -6457,6 +6557,7 @@ mod tests {
             max_steps: 10,
             max_tokens: 2048,
             turn_max_tokens_cap: None,
+            tool_allowlist: None,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,

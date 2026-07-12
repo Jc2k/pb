@@ -18,6 +18,24 @@ use crate::session_store::now_millis;
 
 const HARNESS_GIT_NAME: &str = "pb harness";
 const HARNESS_GIT_EMAIL: &str = "harness@pb.local";
+const HARNESS_AGENT_TOOLS: &[&str] = &[
+    "session_title",
+    "todo",
+    "read_file",
+    "glob",
+    "ripgrep",
+    "search",
+    "git_log",
+    "session_changes",
+    "run_command",
+    "edit_file",
+    "apply_patch",
+    "mv",
+    "rm",
+    "git_commit",
+    "git_revert",
+    "sub_agent",
+];
 
 #[derive(Debug)]
 struct ScratchLayout {
@@ -182,6 +200,12 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             .max_tokens
             .unwrap_or_else(|| user_config.effective_max_tokens()),
         turn_max_tokens_cap,
+        tool_allowlist: Some(
+            HARNESS_AGENT_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        ),
         ctx_size: args
             .ctx_size
             .unwrap_or_else(|| user_config.effective_ctx_size()),

@@ -320,6 +320,7 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             turn_max_tokens_cap: None,
+            tool_allowlist: None,
             ctx_size: 128,
             threads: None,
             threads_batch: None,
