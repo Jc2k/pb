@@ -1349,7 +1349,7 @@ fn build_direct_harness_instructions(
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
     format!(
-        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text: {{\"type\":\"tool_calls\",\"calls\":[{{\"tool\":\"session_title\",\"arguments\":{{\"title\":\"Build task\"}}}},{{\"tool\":\"run_command\",\"arguments\":{{\"command\":\"pwd\"}}}}]}}. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the model interface.",
+        "You are pb, a local coding agent working {continuation} in the isolated repository `{workspace}` on branch `{branch}`. Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text: {{\"type\":\"tool_calls\",\"calls\":[{{\"tool\":\"session_title\",\"arguments\":{{\"title\":\"Build task\"}}}},{{\"tool\":\"run_command\",\"arguments\":{{\"cmd\":\"pwd\"}}}}]}}. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise user-visible summary. Available tools: {tools}. Tool definitions and JSON Schemas are provided by the model interface.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -6147,6 +6147,7 @@ mod tests {
         assert!(instructions.contains("before a tool result and repository mutation"));
         assert!(instructions.contains("run_command starts in the workspace"));
         assert!(instructions.contains("exactly one JSON object"));
+        assert!(instructions.contains(r#""arguments":{"cmd":"pwd"}"#));
         assert!(!instructions.contains("Ballmer peak"));
         assert!(!instructions.contains("memory_search"));
         assert!(!instructions.contains("web_search"));
