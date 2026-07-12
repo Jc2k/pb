@@ -260,10 +260,12 @@ Baseline reviewed on 2026-07-11:
   creation and its later completion/status polling each run inside a nested autorelease pool. The
   completion pool drains Metal's committed-command auxiliaries at the layer boundary instead of
   leaving their expert-buffer references alive until the outer token autorelease pool drains.
-  Scheduler `pread` expert payloads are copied into bounded, reusable Metal staging buffers for only
-  the active expert slots. This avoids the cumulative Metal accounting observed for no-copy mappings
-  during long prefills; scoped command completion prevents the copied staging path from retaining tens
-  of gigabytes of completed-command resources before jetsam.
+  Scheduler `pread` expert payloads are copied into transient Metal staging buffers for only the
+  active expert slots. After the command completes, each staging resource is marked purgeable-empty
+  and released instead of entering the general reusable pool. A long-prefill VM profile showed that
+  ordinary release left one 2,654,208-byte IOAccelerator mapping per expert projection binding; the
+  explicit purge removes those mappings at the layer boundary while general phase buffers remain
+  reusable.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
   sizes on failure.

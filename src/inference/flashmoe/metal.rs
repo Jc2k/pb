@@ -276,7 +276,6 @@ impl MetalBufferPool {
             if !buffer.is_null() {
                 return Ok(buffer);
             }
-
             let (released_buffers, released_bytes) = {
                 let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
                 let released_buffers = reusable.len();
@@ -309,6 +308,19 @@ impl MetalBufferPool {
     }
 
     pub(crate) unsafe fn buffer_with_bytes(
+        &self,
+        device: MetalObjcId,
+        bytes: &[u8],
+    ) -> anyhow::Result<MetalObjcId> {
+        unsafe {
+            let buffer = self.buffer_with_len(device, bytes.len())?;
+            let contents = msg_send_ptr0(buffer, sel("contents"));
+            ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            Ok(buffer)
+        }
+    }
+
+    pub(crate) unsafe fn transient_expert_buffer_with_bytes(
         &self,
         device: MetalObjcId,
         bytes: &[u8],
@@ -395,7 +407,9 @@ impl MetalBufferPool {
     ) {
         unsafe {
             for buffer in buffers {
-                if release_only {
+                if buffer.class == MetalPhaseBufferClass::TransientExpert {
+                    purge_and_release_metal_buffer(buffer.id);
+                } else if release_only {
                     release(buffer.id);
                 } else {
                     self.recycle(buffer.id);
@@ -850,9 +864,7 @@ impl MetalCommandEncoding {
     ) -> anyhow::Result<Self> {
         unsafe {
             // Every encoded resource is held explicitly until completion (or transferred to a
-            // deferred submission). Avoid Metal retaining those buffers again through the
-            // autoreleased command object, which otherwise pins a token's expert buffers until
-            // the outer autorelease pool drains.
+            // deferred submission), so the command buffer does not need to retain it again.
             let command_buffer = retain_autoreleased_return_value(msg_send_id0(
                 command_queue,
                 sel("commandBufferWithUnretainedReferences"),
@@ -2495,8 +2507,10 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
 
     unsafe fn copied_expert_source_buffer(&self, bytes: &[u8]) -> anyhow::Result<MetalPhaseBuffer> {
         unsafe {
-            let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
-            Ok(MetalPhaseBuffer::recyclable(buffer))
+            let buffer = self
+                .buffers
+                .transient_expert_buffer_with_bytes(self.runtime.device, bytes)?;
+            Ok(MetalPhaseBuffer::transient_expert(buffer))
         }
     }
 
@@ -4719,14 +4733,32 @@ impl MetalCmd3ExecutionPlan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetalPhaseBufferClass {
+    General,
+    TransientExpert,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalPhaseBuffer {
     pub(crate) id: MetalObjcId,
+    pub(crate) class: MetalPhaseBufferClass,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalPhaseBuffer {
     pub(crate) fn recyclable(id: MetalObjcId) -> Self {
-        Self { id }
+        Self {
+            id,
+            class: MetalPhaseBufferClass::General,
+        }
+    }
+
+    pub(crate) fn transient_expert(id: MetalObjcId) -> Self {
+        Self {
+            id,
+            class: MetalPhaseBufferClass::TransientExpert,
+        }
     }
 }
 
@@ -5226,6 +5258,16 @@ pub(crate) unsafe fn release(receiver: MetalObjcId) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn purge_and_release_metal_buffer(buffer: MetalObjcId) {
+    unsafe {
+        // MTLResourcePurgeableStateEmpty. Expert staging is never reused after its command;
+        // marking it empty tells IOAccelerator to discard dirty backing and per-binding mappings.
+        let _ = msg_send_usize1_usize(buffer, sel("setPurgeableState:"), 4);
+        release(buffer);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn retain_autoreleased_return_value(receiver: MetalObjcId) -> MetalObjcId {
     unsafe { objc_retainAutoreleasedReturnValue(receiver) }
 }
@@ -5442,6 +5484,19 @@ pub(crate) unsafe fn msg_send_usize0(receiver: MetalObjcId, selector: MetalSelec
         let f: unsafe extern "C" fn(MetalObjcId, MetalSelector) -> usize =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_usize1_usize(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    arg: usize,
+) -> usize {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, usize) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, arg)
     }
 }
 
@@ -8565,34 +8620,67 @@ mod tests {
     #[ignore = "requires a local Metal device"]
     fn metal_nested_autorelease_releases_completed_command_resources() {
         objc2::rc::autoreleasepool(|_| unsafe {
-            let device = OwnedMetalObject::new(metal_default_device()).unwrap();
-            let command_queue =
-                OwnedMetalObject::new(msg_send_id0(device.id(), sel("newCommandQueue"))).unwrap();
-            let baseline = msg_send_usize0(device.id(), sel("currentAllocatedSize"));
+            let physical_footprint = || {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+                let result = libc::proc_pid_rusage(
+                    libc::getpid(),
+                    libc::RUSAGE_INFO_V2,
+                    usage.as_mut_ptr().cast(),
+                );
+                assert_eq!(result, 0, "proc_pid_rusage failed");
+                usage.assume_init().ri_phys_footprint
+            };
+            let runtime =
+                MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new()).unwrap();
+            let baseline = msg_send_usize0(runtime.device, sel("currentAllocatedSize"));
+            let baseline_footprint = physical_footprint();
 
-            for _ in 0..32 {
-                let (command_buffer, buffer) = objc2::rc::autoreleasepool(|_| {
-                    let buffer = OwnedMetalObject::new(msg_send_id2_usize_u64(
-                        device.id(),
-                        sel("newBufferWithLength:options:"),
-                        1024 * 1024,
-                        0,
-                    ))
-                    .unwrap();
+            for _ in 0..16 {
+                let (command_buffer, buffers) = objc2::rc::autoreleasepool(|_| {
+                    let buffers = (0..30)
+                        .map(|_| {
+                            OwnedMetalObject::new(msg_send_id2_usize_u64(
+                                runtime.device,
+                                sel("newBufferWithLength:options:"),
+                                1024 * 1024,
+                                0,
+                            ))
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    for buffer in &buffers {
+                        ptr::write_bytes(
+                            msg_send_ptr0(buffer.id(), sel("contents")).cast::<u8>(),
+                            0xA5,
+                            1024 * 1024,
+                        );
+                    }
                     let mut encoding = MetalCommandEncoding::new(
-                        command_queue.id(),
+                        runtime.command_queue,
                         "test command buffer allocation failed",
                         "test command encoder allocation failed",
                     )
                     .unwrap();
-                    set_buffer(encoding.encoder(), buffer.id(), 0);
+                    msg_send_void1_id(
+                        encoding.encoder(),
+                        sel("setComputePipelineState:"),
+                        runtime.pipelines.fill_zero_pipeline,
+                    );
+                    set_buffer(encoding.encoder(), buffers[0].id(), 0);
+                    for (index, buffer) in buffers.iter().enumerate().skip(1) {
+                        set_buffer(encoding.encoder(), buffer.id(), index as u64 + 1);
+                    }
+                    for width in 1..=64u32 {
+                        set_bytes(encoding.encoder(), u32_as_bytes(&width), 1);
+                    }
+                    dispatch_threads(encoding.encoder(), 1);
                     encoding.end_encoding();
                     let command_buffer = encoding.into_command_buffer();
                     commit_metal_command_buffer(
                         command_buffer,
                         &MetalCommandContext::new("nested autorelease test"),
                     );
-                    (command_buffer, buffer)
+                    (command_buffer, buffers)
                 });
                 objc2::rc::autoreleasepool(|_| {
                     wait_for_metal_command_buffer(
@@ -8601,15 +8689,23 @@ mod tests {
                     )
                     .unwrap();
                     release(command_buffer);
-                    drop(buffer);
+                    for buffer in buffers {
+                        purge_and_release_metal_buffer(buffer.into_raw());
+                    }
                 });
             }
 
-            let allocated = msg_send_usize0(device.id(), sel("currentAllocatedSize"));
+            let allocated = msg_send_usize0(runtime.device, sel("currentAllocatedSize"));
+            let footprint = physical_footprint();
             assert!(
-                allocated.saturating_sub(baseline) < 8 * 1024 * 1024,
+                allocated.saturating_sub(baseline) < 64 * 1024 * 1024,
                 "completed commands retained {} bytes across nested autorelease pools",
                 allocated.saturating_sub(baseline)
+            );
+            assert!(
+                footprint.saturating_sub(baseline_footprint) < 192 * 1024 * 1024,
+                "completed commands grew physical footprint by {} bytes",
+                footprint.saturating_sub(baseline_footprint)
             );
         });
     }
@@ -8876,10 +8972,15 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn phase_buffer_tracks_recyclable_metal_allocation() {
+    fn phase_buffer_tracks_recycling_class() {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
 
         let recyclable = MetalPhaseBuffer::recyclable(id);
         assert_eq!(recyclable.id, id);
+        assert_eq!(recyclable.class, MetalPhaseBufferClass::General);
+
+        let expert = MetalPhaseBuffer::transient_expert(id);
+        assert_eq!(expert.id, id);
+        assert_eq!(expert.class, MetalPhaseBufferClass::TransientExpert);
     }
 }
