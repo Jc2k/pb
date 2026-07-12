@@ -1227,7 +1227,10 @@ fn router_scores_use_cached_full_tensor_matvec() {
     );
     assert_eq!(routing_command.layer, 0);
     assert_eq!(routing_command.active_experts, 1);
-    assert_eq!(routing_command.routes, vec![(1, 9.0)]);
+    assert_eq!(routing_command.routes.len(), 1);
+    assert_eq!(routing_command.routes[0].0, 1);
+    let expected_probability = 1.0 / (1.0 + (-4.5f32).exp());
+    assert!((routing_command.routes[0].1 - expected_probability).abs() < 1e-6);
     assert_eq!(
         store
             .decoded_tensor_tiles

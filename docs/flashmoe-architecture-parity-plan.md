@@ -456,6 +456,12 @@ Baseline reviewed on 2026-07-11:
   router logits, fixed-slot top-K selection, selected-route renormalization, and routed scale 1.0.
   Qwen MoE advances only when `norm_topk_prob=true`, while a missing value or `false` reports the
   routing stage as unsupported.
+- Norm-weight semantics are concrete model metadata rather than a value-based runtime probe.
+  Qwen3.5, Qwen, and Qwen-VL cache tensors are multiplicative RMSNorm weights; an actual
+  `qwen3_next` config selects the typed `1 + weight` implementation. Removing the former
+  mean-below-0.75 heuristic fixed the first real-checkpoint divergence at Qwen3.5 layer 35: its
+  Q/K/V projections, gated attention, CMD2 residual, and generated continuation now match
+  upstream.
 - The declared CPU-KV attention stage is now a Qwen-family full-attention implementation rather
   than a Qwen3.5 label. Full-attention manifests and runtime CMD1 execution require both per-head
   Q and K RMSNorm bindings; an absent tensor is an explicit load/runtime error instead of silently
@@ -489,7 +495,9 @@ Baseline reviewed on 2026-07-11:
   graph with K=8 and no shared expert, and real one-token inference exits successfully. Raw
   `1+1=` emits `2` in both FlashMoe and upstream MLX-LM. Raw `2+2=` emits `5` in both engines for
   this checkpoint, proving that result is checkpoint behavior rather than a reason to alter the
-  unified math or restore a fallback. The required default Qwen3.5 smoke remains `4`.
+  unified math or restore a fallback. After the upstream route and norm contracts were aligned,
+  the raw Qwen3.5 `2+2=` smoke selects token 10992 (`？`) in both engines; the earlier pb-only `4`
+  was evidence of divergent math and is not a parity target.
 - `vision.rs` now owns Qwen-VL image decoding, smart resize, normalization, block-major patch
   packing, the serialized ViT configuration contract, visual encoding output, M-RoPE positions,
   placeholder-span validation, multi-image embedding/DeepStack assembly, and the typed
@@ -553,8 +561,7 @@ Baseline reviewed on 2026-07-11:
   floating-point route scores use an explicit numerical tolerance rather than bitwise equality
   across CPU and Metal implementations.
 
-The architecture implementation is at the target; Gate 7 still requires post-refactor comparison
-evidence before the overall goal closes:
+The architecture implementation is at the target and Gate 7 comparison evidence is complete:
 
 - The engine container, load path, and public generation/session orchestration are now in
   `runtime.rs`, tokenizer/sampling ownership is in `text.rs`, and dense runtime-layout resolution
@@ -581,10 +588,11 @@ evidence before the overall goal closes:
   non-Q4 checkpoints remain useful validation, but their implementations already resolve through
   the same graph and have direct storage, capability, scheduler, and local-Metal reference evidence.
 
-At this checkpoint, Gates 1 through 6 are complete and Gate 7 legacy cleanup is complete. Qwen3.5,
-Qwen3 text, and Qwen3-VL Q4 have resolved production graphs and real-checkpoint evidence; typed
-non-Q4 implementations use the same contracts. Sustained equivalent upstream comparison and its
-post-comparison correctness rerun remain before Gate 7 and the overall goal complete.
+At this checkpoint, Gates 1 through 7 are complete. Qwen3.5, Qwen3 text, and Qwen3-VL Q4 have
+resolved production graphs and real-checkpoint evidence; typed non-Q4 implementations use the same
+contracts. The equivalent sustained upstream comparison is recorded below, and focused tests, the
+all-target suite, release build, required smoke, and exact 32-token continuation were rerun after
+the final parity correction.
 
 ## Completion Gates
 
@@ -599,7 +607,7 @@ exit criteria hold in production code and tests.
 | 4. Weights And State Ownership | Complete | Runtime storage and state have single owners. |
 | 5. Qwen3.5 Q4 Correctness Closure | Complete | The first production graph has parity evidence. |
 | 6. Unified Variant Implementations | Complete | Other variants use the same graph/runtime. |
-| 7. Legacy Removal And Benchmarking | Active: comparison | Compatibility boundary removed; compare the unified runtime with equivalent upstream inference. |
+| 7. Legacy Removal And Benchmarking | Complete | Compatibility boundary removed; equivalent sustained comparison and post-comparison correctness recorded. |
 
 ### Gate 1: Concrete Graph Resolution
 
@@ -836,8 +844,27 @@ Required work:
 
 - [x] Remove `legacy.rs` and relocate active compatibility/parity contracts to target owners.
 - [x] Delete stale test-only adapters that no longer protect an active compatibility contract.
-- Run sustained decode comparisons against upstream using equivalent generation settings.
-- Report decode throughput separately from TTFT/prefill.
+- [x] Run sustained decode comparisons against upstream using equivalent generation settings.
+- [x] Report decode throughput separately from TTFT/prefill.
+
+Final equivalent comparison, 2026-07-12:
+
+- Checkpoint: `mlx-community/Qwen3.5-397B-A17B-4bit`, resident MLX Q4 dense weights and fixed-Q4
+  expert slots.
+- Prompt: raw `Hello, what is`, token IDs `[9419, 11, 1092, 369]`; 32 generated tokens; greedy
+  sampling; routing K=4; application expert cache disabled; warm OS page cache retained in both
+  runs.
+- pb command:
+  `target/aarch64-apple-darwin/release/pb flashmoe infer --model hf://mlx-community/Qwen3.5-397B-A17B-4bit --raw --max-tokens 32 --top-k 1 --temperature 0 "Hello, what is"`
+- Upstream command:
+  `/private/tmp/flash-moe-reference/metal_infer/infer --model /private/tmp/upstream-model --weights /private/tmp/upstream-model/model_weights.bin --manifest /private/tmp/upstream-model/model_weights.json --vocab /private/tmp/upstream-model/vocab.bin --prompt-tokens /private/tmp/upstream-model/prompt_hello.bin --tokens 32 --k 4 --cache-entries 0`
+- Both engines generated the same continuation through `...fierce debates about whether to`.
+  Upstream recorded TTFT 993 ms and 31-token decode at 11.11 tok/s. pb recorded TTFT 2082 ms and
+  31-token decode at 2.512 tok/s. The gap is follow-up performance work on the unified graph; it is
+  not an incomplete architecture gate or justification for an alternate runtime.
+- Post-comparison verification: norm-semantics and routing fixtures pass; `cargo test --all-targets`
+  passes with 661 tests and six device-dependent tests ignored; web assets and the release binary
+  rebuild; the required raw `2+2=` smoke exits zero and matches upstream token 10992 (`？`).
 
 Exit criteria:
 
@@ -847,13 +874,13 @@ Exit criteria:
 
 ## Goal Execution System
 
-Use one active completion gate at a time. Work may prepare the next gate only when required to
-complete the current one; it must not create a second runtime or a speculative fast path.
+This system governed the migration. All completion gates are now closed; future architecture
+extensions should add an explicit new gate before changing ownership boundaries and must not
+create a second runtime or speculative fast path.
 
-Completing an active gate is a checkpoint, not completion of the architecture goal. In the same
-semantic commit that records the final evidence for a gate, update the status table, make the next
-gate active, update the Current Active Goal Prompt, and continue. The overall architecture goal is
-complete only when Gate 7 is complete.
+For a future active gate, completion is a checkpoint rather than permission to weaken the target.
+In the same semantic commit that records its final evidence, update the status table and follow-up
+guardrail. The architecture goal recorded here completed only when Gate 7 completed.
 
 Do not mark a gate complete based on types, tests, or call-throughs alone while its production owner
 remains unchanged. If an exit criterion is discovered to be wrong, update the plan explicitly before
@@ -926,46 +953,37 @@ Do not run FlashMoe benchmarks or optimize tok/s until all of these are true:
 Microbenchmarks, isolated kernel experiments, hidden environment toggles, Q4-only alternate
 runtimes, and experiment-led reversions are prohibited before this lock opens.
 
-Lock status: open. Gates 1-6 are complete, the compatibility boundary is deleted, all-target tests,
-release build, and the required smoke are green. Sustained comparison may now run, but performance
-work must remain on the unified graph.
+Lock status: open. Gates 1-7 are complete, the compatibility boundary is deleted, all-target tests,
+release build, required smoke, and equivalent sustained comparison are recorded. Future
+performance work must remain on the unified graph.
 
-## Current Active Goal Prompt
+## Completed Goal Guardrail
 
-Use this prompt for implementation work:
+The architecture migration completed on 2026-07-12. Use this guardrail for follow-up performance
+work:
 
 ```text
-Implement docs/flashmoe-architecture-parity-plan.md. Do not stop at another plan.
-
-Active gate: Gate 7, Legacy Removal And Benchmarking.
-
-Move production ownership quickly, make it compile, and make focused tests, all-target tests, and
-the required smoke work. Make regular semantic commits. Treat existing worktree changes as live
-user work and do not revert them.
-
-Start by inspecting git status, the active gate's exit criteria, and the production call sites that
-still own the behavior. Work in coherent ownership slices, not one-field or one-wrapper commits.
+Preserve the completed architecture in docs/flashmoe-architecture-parity-plan.md while improving
+the unified FlashMoe graph. Make focused changes, compile them, and keep parity tests, all-target
+tests, release build, and real-model smokes green. Treat existing worktree changes as live user
+work and do not revert them.
 
 North star:
 - One resolved scheduler-owned execution graph for supported Qwen-family MoE models.
 - Q4/BF16/F16/F32 and Qwen3.5/Qwen/Qwen-VL differences are typed stage implementations.
 - Missing support is an explicit load-time unsupported-capability error.
 - CPU/GPU placement is resolved policy, never a fallback.
-- No experiments, microbenchmarks, tok/s work, hidden toggles, or Q4-only alternate runtime before
-  the benchmark lock opens.
+- Performance work is now permitted, but it must modify the unified graph and preserve correctness.
 
-For Gate 7:
-1. Legacy cleanup is complete: preserve the owner-local parity modules and do not recreate a broad
-   compatibility module or alternate runtime.
-2. Run sustained decode comparisons against
-   upstream with equivalent model, prompt, K, token count, sampling, and cache conditions. Report
-   TTFT/prefill separately from steady decode throughput.
-3. Use enough generated tokens to separate warm steady decode from first-token setup. Record the
-   exact pb and upstream commands, checkpoint, prompt, routing K, sampling, and cache conditions.
+For follow-up work:
+1. Preserve owner-local parity modules and do not recreate a broad compatibility module or
+   alternate runtime.
+2. Attribute the recorded pb/upstream gap to concrete unified-graph stages before changing code.
+3. Report TTFT/prefill separately from steady decode throughput with equivalent model, prompt, K,
+   token count, sampling, and cache conditions.
 4. Keep focused tests, `cargo test --all-targets`, the release build, the required default smoke,
-   and the real Qwen3/Qwen-VL checkpoints green through comparison.
-5. Make any performance change only in the unified graph and rerun correctness before and after.
-   Do not add hidden toggles, a Q4-only runtime, silent fallback, or experiment-led reversion.
+   and the real Qwen3/Qwen-VL checkpoints green.
+5. Do not add hidden toggles, a Q4-only runtime, silent fallback, or experiment-led reversion.
 
 Do not spend a commit on another isolated descriptor or buffer wrapper. A descriptor is useful only
 inside the ownership slice that routes production execution through it.
@@ -978,6 +996,6 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-Gate 7 completes the architecture goal only when legacy cleanup, sustained equivalent comparison,
-and post-comparison correctness are all recorded. Do not mark the overall goal complete earlier.
+The architecture goal is complete. Any new unsupported combination must remain a precise
+capability error until its typed stage implementation is added to this graph.
 ```

@@ -63,6 +63,12 @@ pub enum QwenMoeLayerKind {
     LinearAttention,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenNormWeightSemantics {
+    Multiplicative,
+    Offset,
+}
+
 impl From<QwenMoeLayerKind> for FlashMoeLayerKind {
     fn from(value: QwenMoeLayerKind) -> Self {
         match value {
@@ -477,14 +483,21 @@ impl QwenModelConfig {
             .unwrap_or_else(|| usize::from(self.shared_expert_intermediate_size.unwrap_or(0) > 0))
     }
 
-    pub(super) fn uses_qwen3next_norm_offsets(&self) -> bool {
-        self.model_type.as_deref().is_some_and(|model_type| {
-            model_type.contains("qwen3_5_moe") || model_type.contains("qwen3_next")
-        }) || self.architectures.as_ref().is_some_and(|architectures| {
-            architectures
-                .iter()
-                .any(|architecture| architecture.contains("Qwen3Next"))
-        })
+    pub(crate) fn norm_weight_semantics(&self) -> QwenNormWeightSemantics {
+        if self
+            .model_type
+            .as_deref()
+            .is_some_and(|model_type| model_type.contains("qwen3_next"))
+            || self.architectures.as_ref().is_some_and(|architectures| {
+                architectures
+                    .iter()
+                    .any(|architecture| architecture.contains("Qwen3Next"))
+            })
+        {
+            QwenNormWeightSemantics::Offset
+        } else {
+            QwenNormWeightSemantics::Multiplicative
+        }
     }
 
     pub(super) fn linear_attention_qkv_projection_requires_reorder(&self) -> bool {
@@ -1039,6 +1052,21 @@ mod tests {
         assert_eq!(config.kv_heads(), 8);
         assert_eq!(config.experts(), 512);
         assert_eq!(config.config_active_experts(), 10);
+    }
+
+    #[test]
+    fn norm_weight_semantics_are_resolved_from_the_concrete_model_config() {
+        assert_eq!(
+            qwen35_config().norm_weight_semantics(),
+            QwenNormWeightSemantics::Multiplicative
+        );
+        let qwen3_next = config(
+            br#"{"model_type":"qwen3_next_moe","architectures":["Qwen3NextForCausalLM"],"num_hidden_layers":1,"hidden_size":64,"num_attention_heads":8,"vocab_size":128,"num_experts":2,"num_experts_per_tok":1}"#,
+        );
+        assert_eq!(
+            qwen3_next.norm_weight_semantics(),
+            QwenNormWeightSemantics::Offset
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ use super::math::{q4_dequantize_rows_with_group_size, quantize_q4};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
-use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind};
+use super::model_family::{
+    QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind, QwenNormWeightSemantics,
+};
 use super::runtime::MetalExecutionFacade;
 use super::safetensors::{SafetensorShard, parse_safetensors_header};
 use super::scheduler::{ScheduledRouterScoreProjectionCommand, ScheduledRoutingCommand};
@@ -2317,8 +2319,11 @@ where
     PreparedScheduledNextNormWeights::cpu_visible(name, values, width)
 }
 
-pub(crate) fn qwen3next_norm_uses_offset(norm_offsets_enabled: bool, canonical_name: &str) -> bool {
-    norm_offsets_enabled
+pub(crate) fn qwen_norm_uses_offset(
+    semantics: QwenNormWeightSemantics,
+    canonical_name: &str,
+) -> bool {
+    semantics == QwenNormWeightSemantics::Offset
         && (canonical_name == "model.norm.weight"
             || canonical_name.contains(".input_layernorm.weight")
             || canonical_name.contains(".post_attention_layernorm.weight")
@@ -2326,29 +2331,12 @@ pub(crate) fn qwen3next_norm_uses_offset(norm_offsets_enabled: bool, canonical_n
             || canonical_name.contains(".self_attn.k_norm.weight"))
 }
 
-pub(crate) fn qwen3next_norm_weight_needs_offset(weight: &[f32]) -> bool {
-    if weight.is_empty() {
-        return false;
-    }
-
-    let mut sum = 0.0f32;
-    let mut has_negative = false;
-    for value in weight {
-        sum += *value;
-        has_negative |= *value < 0.0;
-    }
-
-    has_negative || sum / (weight.len() as f32) < 0.75
-}
-
-pub(crate) fn apply_qwen3next_norm_offset_if_needed(
-    norm_offsets_enabled: bool,
+pub(crate) fn apply_qwen_norm_weight_semantics(
+    semantics: QwenNormWeightSemantics,
     canonical_name: &str,
     weight: &mut [f32],
 ) {
-    if qwen3next_norm_uses_offset(norm_offsets_enabled, canonical_name)
-        && qwen3next_norm_weight_needs_offset(weight)
-    {
+    if qwen_norm_uses_offset(semantics, canonical_name) {
         for value in weight {
             *value += 1.0;
         }
@@ -7194,7 +7182,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3next_plain_rms_norm_offset_policy_matches_reference_names() {
+    fn qwen_norm_offset_policy_matches_declared_semantics_and_reference_names() {
         for name in [
             "model.norm.weight",
             "model.layers.0.input_layernorm.weight",
@@ -7203,7 +7191,7 @@ mod tests {
             "model.layers.3.self_attn.k_norm.weight",
         ] {
             assert!(
-                qwen3next_norm_uses_offset(true, name),
+                qwen_norm_uses_offset(QwenNormWeightSemantics::Offset, name),
                 "{name} should use Qwen3Next 1+weight RMSNorm semantics"
             );
         }
@@ -7213,32 +7201,22 @@ mod tests {
             "model.layers.0.mlp.shared_expert_gate.weight",
         ] {
             assert!(
-                !qwen3next_norm_uses_offset(true, name),
+                !qwen_norm_uses_offset(QwenNormWeightSemantics::Offset, name),
                 "{name} is not a plain Qwen3NextRMSNorm weight"
             );
         }
 
-        assert!(!qwen3next_norm_uses_offset(false, "model.norm.weight"));
+        assert!(!qwen_norm_uses_offset(
+            QwenNormWeightSemantics::Multiplicative,
+            "model.norm.weight"
+        ));
     }
 
     #[test]
-    fn qwen3next_norm_offset_is_applied_only_to_offset_style_weights() {
-        assert!(qwen3next_norm_weight_needs_offset(&[
-            -0.0498, -0.0654, -0.0209, 0.0547
-        ]));
-        assert!(qwen3next_norm_weight_needs_offset(&[
-            0.6679, 0.7187, 0.7265, 0.7031
-        ]));
-        assert!(!qwen3next_norm_weight_needs_offset(&[
-            0.9492, 0.9335, 0.9804, 0.9609
-        ]));
-        assert!(!qwen3next_norm_weight_needs_offset(&[
-            1.6718, 1.7187, 1.7265, 1.7031
-        ]));
-
+    fn qwen_norm_semantics_are_resolved_without_value_probing() {
         let mut offset = vec![0.6679, 0.7187, 0.7265, 0.7031];
-        apply_qwen3next_norm_offset_if_needed(
-            true,
+        apply_qwen_norm_weight_semantics(
+            QwenNormWeightSemantics::Offset,
             "model.layers.0.input_layernorm.weight",
             &mut offset,
         );
@@ -7247,7 +7225,11 @@ mod tests {
         }
 
         let mut disabled = vec![0.6679, 0.7187, 0.7265, 0.7031];
-        apply_qwen3next_norm_offset_if_needed(false, "model.norm.weight", &mut disabled);
+        apply_qwen_norm_weight_semantics(
+            QwenNormWeightSemantics::Multiplicative,
+            "model.norm.weight",
+            &mut disabled,
+        );
         assert_eq!(disabled, vec![0.6679, 0.7187, 0.7265, 0.7031]);
     }
 

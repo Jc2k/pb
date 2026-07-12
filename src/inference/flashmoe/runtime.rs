@@ -2079,8 +2079,8 @@ impl FlashMoeEngine {
         let Some(mut weight) = self.dense.norm_weight(canonical_name, width)? else {
             return Ok(None);
         };
-        apply_qwen3next_norm_offset_if_needed(
-            self.config.uses_qwen3next_norm_offsets(),
+        apply_qwen_norm_weight_semantics(
+            self.config.norm_weight_semantics(),
             canonical_name,
             &mut weight,
         );
