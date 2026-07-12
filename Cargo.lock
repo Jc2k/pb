@@ -1745,6 +1745,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "block2",
  "clap",
  "dirs",
  "encoding_rs",

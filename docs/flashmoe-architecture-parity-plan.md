@@ -258,9 +258,10 @@ Baseline reviewed on 2026-07-11:
   autoreleased command-buffer and encoder return values with Objective-C's return-value handshake,
   so its explicit releases deallocate completed command objects immediately instead of leaving their
   expert-buffer references alive until the outer token autorelease pool drains. Scheduler `pread`
-  expert payloads are copied into the bounded reusable Metal pool: aligned no-copy mappings remain
-  cumulatively accounted by Metal across long prefills even after object release, while the combined
-  pooled-copy and prompt command-object release path bounds both Metal mappings and process memory.
+  expert payloads use aligned no-copy Metal mappings with an explicit no-op deallocator block while
+  the submission owns the backing bytes. Metal then retires each mapping when its buffer is released;
+  passing a nil deallocator left mappings cumulatively accounted across long prefills, while copying
+  every expert payload caused ~100 GiB of compressed process memory before jetsam.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
   sizes on failure.

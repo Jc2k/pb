@@ -15,6 +15,8 @@ use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::{Context as _, Result, bail};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use block2::RcBlock;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::experts::{
@@ -395,7 +397,7 @@ impl MetalBufferPool {
     ) {
         unsafe {
             for buffer in buffers {
-                if release_only {
+                if release_only || !buffer.recycle {
                     release(buffer.id);
                 } else {
                     self.recycle(buffer.id);
@@ -2486,19 +2488,36 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         if let Some(buffer) = cache.get(bytes) {
             return Ok(buffer);
         }
-        let phase = unsafe { self.copied_expert_source_buffer(bytes)? };
+        let phase = unsafe { self.borrowed_or_copied_buffer(bytes, 16)? };
         let buffer = phase.id;
         buffers.push(phase);
         cache.insert(bytes, buffer);
         Ok(buffer)
     }
 
-    unsafe fn copied_expert_source_buffer(&self, bytes: &[u8]) -> anyhow::Result<MetalPhaseBuffer> {
+    unsafe fn borrowed_or_copied_buffer(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> anyhow::Result<MetalPhaseBuffer> {
         unsafe {
-            // Metal accounts ephemeral no-copy expert mappings cumulatively across long prefills,
-            // even after their command resources are released. Copy scheduler `pread` payloads
-            // into the bounded reusable pool; the command/encoder RAII owner now releases promptly,
-            // so evicted pool buffers cannot accumulate until the outer token autorelease pool.
+            if !bytes.is_empty() && (bytes.as_ptr() as usize) % alignment == 0 {
+                // The scheduler owns `bytes` through the deferred submission. A real deallocator
+                // block tells Metal to retire the no-copy mapping when the MTLBuffer dies; passing
+                // nil leaves mappings cumulatively accounted across long prompt prefills.
+                let deallocator = RcBlock::new(|_pointer: *mut c_void, _length: usize| {});
+                let buffer = msg_send_id4_ptr_usize_u64_ptr(
+                    self.runtime.device,
+                    sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+                    bytes.as_ptr() as *mut c_void,
+                    bytes.len(),
+                    0,
+                    RcBlock::as_ptr(&deallocator).cast(),
+                );
+                if !buffer.is_null() {
+                    return Ok(MetalPhaseBuffer::borrowed(buffer));
+                }
+            }
             let buffer = self.buffers.buffer_with_bytes(self.runtime.device, bytes)?;
             Ok(MetalPhaseBuffer::recyclable(buffer))
         }
@@ -4725,12 +4744,17 @@ impl MetalCmd3ExecutionPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalPhaseBuffer {
     pub(crate) id: MetalObjcId,
+    pub(crate) recycle: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalPhaseBuffer {
     pub(crate) fn recyclable(id: MetalObjcId) -> Self {
-        Self { id }
+        Self { id, recycle: true }
+    }
+
+    pub(crate) fn borrowed(id: MetalObjcId) -> Self {
+        Self { id, recycle: false }
     }
 }
 
@@ -8606,6 +8630,38 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires a local Metal device"]
+    fn metal_no_copy_deallocator_retires_released_mappings() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let device = OwnedMetalObject::new(metal_default_device()).unwrap();
+            let backing = vec![0u128; (1024 * 1024) / std::mem::size_of::<u128>()];
+            let baseline = msg_send_usize0(device.id(), sel("currentAllocatedSize"));
+
+            for _ in 0..32 {
+                let deallocator = RcBlock::new(|_pointer: *mut c_void, _length: usize| {});
+                let buffer = msg_send_id4_ptr_usize_u64_ptr(
+                    device.id(),
+                    sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+                    backing.as_ptr().cast_mut().cast(),
+                    std::mem::size_of_val(backing.as_slice()),
+                    0,
+                    RcBlock::as_ptr(&deallocator).cast(),
+                );
+                assert!(!buffer.is_null());
+                release(buffer);
+            }
+
+            let allocated = msg_send_usize0(device.id(), sel("currentAllocatedSize"));
+            assert!(
+                allocated.saturating_sub(baseline) < 8 * 1024 * 1024,
+                "released no-copy mappings retained {} bytes",
+                allocated.saturating_sub(baseline)
+            );
+        });
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
     fn recurrent_session_snapshot_round_trips_metal_recurrent_buffers() {
         let device = unsafe { OwnedMetalObject::new(metal_default_device()).unwrap() };
         let allocate = |len: usize, label: &str| {
@@ -8865,10 +8921,15 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn phase_buffer_tracks_recyclable_metal_allocation() {
+    fn phase_buffer_declares_recyclable_or_borrowed_lifecycle() {
         let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
 
         let recyclable = MetalPhaseBuffer::recyclable(id);
         assert_eq!(recyclable.id, id);
+        assert!(recyclable.recycle);
+
+        let borrowed = MetalPhaseBuffer::borrowed(id);
+        assert_eq!(borrowed.id, id);
+        assert!(!borrowed.recycle);
     }
 }
