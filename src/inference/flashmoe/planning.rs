@@ -6,9 +6,8 @@ use anyhow::{Context, Result, bail};
 use super::experts::first_missing_expert_pack_for_shape;
 use super::model_family::{QwenModelConfig, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias};
 use super::types::{
-    ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CacheStatus, EXPECTED_EXPERT_BYTES,
-    ExpertQuantization, HIDDEN_DIM, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS, NUM_LAYERS,
-    QWEN35_BF16_MODEL, QWEN35_MODEL,
+    ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CacheStatus, ExpertQuantization,
+    LEGACY_QWEN_CODER_MARKER, QWEN35_BF16_MODEL, QWEN35_MODEL,
 };
 
 const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
@@ -316,17 +315,32 @@ impl FlashMoePlan {
     }
 
     pub fn describe(&self) -> String {
+        let config = QwenModelConfig::from_file(&self.model_config).ok();
+        let describe_value = |value: Option<usize>| {
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        let layers = describe_value(config.as_ref().map(|config| config.num_hidden_layers));
+        let experts = describe_value(config.as_ref().map(QwenModelConfig::experts));
+        let active_experts =
+            describe_value(config.as_ref().map(QwenModelConfig::config_active_experts));
+        let hidden = describe_value(config.as_ref().map(|config| config.hidden_size));
+        let expert_store_gib = expert_store_size(&self.experts_dir)
+            .ok()
+            .map(|(_, bytes)| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
+            .unwrap_or_else(|| "unknown".to_string());
         format!(
             "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
             self.quantization.cache_version(),
             self.model,
-            NUM_LAYERS,
-            NUM_EXPERTS,
-            ACTIVE_EXPERTS_PER_TOKEN,
-            HIDDEN_DIM,
+            layers,
+            experts,
+            active_experts,
+            hidden,
             self.runtime_dir.display(),
             self.experts_dir.display(),
-            EXPECTED_EXPERT_BYTES / (1024 * 1024 * 1024)
+            expert_store_gib,
         )
     }
 }
@@ -604,6 +618,43 @@ mod tests {
         assert!(qwen35.uses_metal);
         assert!(qwen35.streams_experts_from_nand);
         assert!(qwen35.describe().contains("397B"));
+    }
+
+    #[test]
+    fn plan_description_uses_cached_model_shape_and_expert_store_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked("hf://Qwen/Qwen3-VL-30B-A3B-Instruct", temp.path());
+        fs::create_dir_all(&plan.experts_dir).unwrap();
+        fs::write(
+            &plan.model_config,
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "qwen3_vl_moe",
+                "architectures": ["Qwen3VLMoeForConditionalGeneration"],
+                "text_config": {
+                    "num_hidden_layers": 48,
+                    "hidden_size": 2048,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 4,
+                    "vocab_size": 151936,
+                    "torch_dtype": "bfloat16",
+                    "num_experts": 128,
+                    "num_experts_per_tok": 8,
+                    "moe_intermediate_size": 768,
+                    "norm_topk_prob": true
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(plan.experts_dir.join("layer_00.bin"), vec![0u8; 1024]).unwrap();
+
+        let description = plan.describe();
+        assert!(description.contains("48 layers"), "{description}");
+        assert!(description.contains("128 experts/layer"), "{description}");
+        assert!(description.contains("K=8"), "{description}");
+        assert!(description.contains("hidden=2048"), "{description}");
+        assert!(description.contains("(~0.0 GiB)"), "{description}");
+        assert!(!description.contains("60 layers"), "{description}");
     }
 
     #[test]
