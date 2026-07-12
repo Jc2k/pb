@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tracing::{info, trace};
+use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::FlashMoeCapabilityPlan;
 use super::experts::ExpertSlotStore;
@@ -55,6 +55,19 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
 
 type ScheduledExpertCommand<'a> =
     ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
+
+#[derive(Debug, Clone, Copy)]
+struct OptionalInstant(Option<Instant>);
+
+impl OptionalInstant {
+    fn now(enabled: bool) -> Self {
+        Self(enabled.then(Instant::now))
+    }
+
+    fn elapsed(self) -> Duration {
+        self.0.map_or(Duration::ZERO, |started| started.elapsed())
+    }
+}
 
 impl FlashMoeTimingBuckets {
     pub(super) fn add_expert_scheduler_delta(&mut self, delta: ExpertSchedulerSnapshot) {
@@ -605,9 +618,18 @@ impl FlashMoeEngine {
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
         let runtime = &self.runtime;
-        let token_started = Instant::now();
+        let record_detailed_timing = timing.is_some();
+        let token_started = OptionalInstant::now(record_detailed_timing);
         let previous = input.token();
         let rope_position = input.rope_position();
+        let token_span = trace_span!(
+            target: "flashmoe::perf",
+            "token",
+            token_position = position,
+            input_token = previous,
+            record_generated
+        );
+        let _token_span = token_span.enter();
         let hidden_values = match input.precomputed_embedding(runtime.width)? {
             Some(values) => values.to_vec(),
             None => self.dense.embedding(previous, runtime.width)?,
@@ -622,20 +644,16 @@ impl FlashMoeEngine {
         for layer in 0..self.config.num_hidden_layers {
             let layer_addition = input.layer_addition(layer, runtime.width)?;
             let allow_deferred_output = layer_addition.is_none();
-            let report_layer_progress = progress.is_some()
-                || layer == 0
-                || layer + 1 == self.config.num_hidden_layers
-                || layer % 10 == 0;
+            let report_layer_progress = progress.is_some();
             if report_layer_progress {
-                report_generation_progress(
-                    &progress,
+                report_generation_progress(&progress, || {
                     format!(
                         "forward layer begin position={} layer={}/{}",
                         position,
                         layer + 1,
                         self.config.num_hidden_layers
-                    ),
-                );
+                    )
+                });
             }
             let mut pending_for_layer = deferred_expert_phase.take();
             let (deferred_attention_input, deferred_residual_input) = {
@@ -661,13 +679,20 @@ impl FlashMoeEngine {
                 let pending = pending_for_layer
                     .take()
                     .context("missing deferred expert phase")?;
-                let wait_started = Instant::now();
+                let wait_span = trace_span!(
+                    target: "flashmoe::perf",
+                    "expert_wait",
+                    token_position = position,
+                    completed_layer = layer.saturating_sub(1)
+                );
+                let _wait_span = wait_span.enter();
+                let wait_started = OptionalInstant::now(record_detailed_timing);
                 let output = pending.wait()?;
                 let wait_elapsed = wait_started.elapsed();
-                info!(
+                trace!(
+                    target: "flashmoe::perf",
                     token_position = position,
                     completed_layer = layer.saturating_sub(1),
-                    wait_ms = wait_elapsed.as_millis(),
                     "flashmoe deferred expert wait complete"
                 );
                 if let Some(timing) = timing.as_deref_mut() {
@@ -706,7 +731,15 @@ impl FlashMoeEngine {
                 allow_deferred_output,
             )?;
             let attention_implementation = layer_schedule.attention_implementation();
-            let layer_started = Instant::now();
+            let layer_span = trace_span!(
+                target: "flashmoe::perf",
+                "layer",
+                token_position = position,
+                layer,
+                layer_kind = ?attention_implementation
+            );
+            let _layer_span = layer_span.enter();
+            let layer_started = OptionalInstant::now(record_detailed_timing);
             let mut layer_timing = FlashMoeLayerTiming {
                 layer,
                 layer_kind: match attention_implementation {
@@ -721,7 +754,7 @@ impl FlashMoeEngine {
                 dimensions: self.layer_dimensions(layer),
                 buckets: FlashMoeTimingBuckets::default(),
             };
-            let combine_started = Instant::now();
+            let combine_started = OptionalInstant::now(record_detailed_timing);
             let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
             let mut normed =
                 if deferred_attention_input.is_some() {
@@ -735,7 +768,7 @@ impl FlashMoeEngine {
                     )?)
                 };
             layer_timing.buckets.combine_norm += combine_started.elapsed();
-            let attention_started = Instant::now();
+            let attention_started = OptionalInstant::now(record_detailed_timing);
             let cmd1_input = if deferred_attention_input.is_some() {
                 ScheduledCmd1InputSource::DeferredMetalNextNormed
             } else {
@@ -778,7 +811,7 @@ impl FlashMoeEngine {
                         residual_input,
                         &post_norm_weight,
                         runtime,
-                        Some(&mut layer_timing.buckets),
+                        record_detailed_timing.then_some(&mut layer_timing.buckets),
                     )?;
                     if deferred_residual_input.is_some()
                         && let Some(pending) = pending_for_layer.take()
@@ -797,7 +830,7 @@ impl FlashMoeEngine {
                         position,
                         rope_position,
                         runtime,
-                        Some(&mut layer_timing.buckets),
+                        record_detailed_timing.then_some(&mut layer_timing.buckets),
                     )?;
                     post_attention_values_for_prep =
                         Some((attention_tensor_name(layer, "o_proj"), values));
@@ -812,13 +845,21 @@ impl FlashMoeEngine {
                 && let Some(pending) = pending_for_layer.take()
                 && !can_defer_residual_wait_for_post_prep
             {
-                let wait_started = Instant::now();
-                let output = pending.wait()?;
-                let wait_elapsed = wait_started.elapsed();
-                info!(
+                let wait_span = trace_span!(
+                    target: "flashmoe::perf",
+                    "expert_wait",
                     token_position = position,
                     completed_layer = layer.saturating_sub(1),
-                    wait_ms = wait_elapsed.as_millis(),
+                    after_input_projection = true
+                );
+                let _wait_span = wait_span.enter();
+                let wait_started = OptionalInstant::now(record_detailed_timing);
+                let output = pending.wait()?;
+                let wait_elapsed = wait_started.elapsed();
+                trace!(
+                    target: "flashmoe::perf",
+                    token_position = position,
+                    completed_layer = layer.saturating_sub(1),
                     "flashmoe deferred expert wait complete after input projection"
                 );
                 if let Some(timing) = timing.as_deref_mut() {
@@ -870,7 +911,7 @@ impl FlashMoeEngine {
                 scheduled_cmd2.input_state().residual().len(),
                 cmd2_residual_len
             );
-            let combine_started = Instant::now();
+            let combine_started = OptionalInstant::now(record_detailed_timing);
             let mut precomputed_active: Option<ScheduledRoutingCommand> = None;
             if let Some(prep) = metal_post_attention_prep.as_mut() {
                 let routing_command = self.scheduler.routing_from_post_attention_prep(
@@ -938,7 +979,7 @@ impl FlashMoeEngine {
                     self.rms_norm_with_model_weight(post_norm_name.as_str(), token_state.hidden())?,
                 );
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
-                let routing_started = Instant::now();
+                let routing_started = OptionalInstant::now(record_detailed_timing);
                 let active = self.route_layer(layer, &normed, scheduled_cmd2.active_experts)?;
                 layer_timing.buckets.routing += routing_started.elapsed();
                 active
@@ -951,7 +992,7 @@ impl FlashMoeEngine {
             let pending_cmd3 = layer_schedule.issue_cmd3(&mut self.scheduler, &active)?;
             // While expert reads are still pending, prepare the always-active
             // shared-expert branch for the deferred expert command buffer.
-            let shared_compute_started = Instant::now();
+            let shared_compute_started = OptionalInstant::now(record_detailed_timing);
             let shared_phase = match self.shared_expert_weights.layer(layer)? {
                 SharedExpertLayerWeights::Resident(shared) => {
                     SharedExpertPhaseRef::Resident(shared)
@@ -959,7 +1000,7 @@ impl FlashMoeEngine {
                 SharedExpertLayerWeights::None => SharedExpertPhaseRef::None,
             };
             layer_timing.buckets.expert_compute += shared_compute_started.elapsed();
-            let cmd3_prepare_started = Instant::now();
+            let cmd3_prepare_started = OptionalInstant::now(record_detailed_timing);
             let prepared_next_norm_weights = prepare_scheduled_next_norm_weights(
                 layer,
                 self.config.num_hidden_layers,
@@ -1022,30 +1063,24 @@ impl FlashMoeEngine {
                 token_state.clear_next_layer_normed();
             }
             trace_layer_values(position, layer, "moe", token_state.hidden());
-            let combine_started = Instant::now();
+            let combine_started = OptionalInstant::now(record_detailed_timing);
             if deferred_expert_phase.is_some() {
                 kv_cache
                     .record_layer_state_record(token_state.layer_state_record(position, layer))?;
                 layer_timing.buckets.combine_norm += combine_started.elapsed();
                 layer_timing.buckets.total_wall = layer_started.elapsed();
-                info!(
+                trace!(
+                    target: "flashmoe::perf",
                     token_position = position,
                     layer,
                     layer_kind = layer_timing.layer_kind.as_str(),
                     active_experts = layer_timing.active_experts,
                     expert_deferred = true,
-                    attention_ms = layer_timing.buckets.attention_projection.as_millis(),
-                    routing_ms = layer_timing.buckets.routing.as_millis(),
-                    expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
-                    expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
-                    expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
-                    total_ms = layer_timing.buckets.total_wall.as_millis(),
                     bytes_read = expert_delta.bytes_read,
                     "flashmoe layer complete"
                 );
                 if report_layer_progress {
-                    report_generation_progress(
-                        &progress,
+                    report_generation_progress(&progress, || {
                         format!(
                             "forward layer complete position={} layer={}/{} attention_ms={} routing_ms={} expert_io_ms={} expert_read_ms={} expert_compute_ms={} combine_norm_ms={} total_ms={}",
                             position,
@@ -1058,8 +1093,8 @@ impl FlashMoeEngine {
                             layer_timing.buckets.expert_compute.as_millis(),
                             layer_timing.buckets.combine_norm.as_millis(),
                             layer_started.elapsed().as_millis()
-                        ),
-                    );
+                        )
+                    });
                 }
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.buckets.add(layer_timing.buckets);
@@ -1070,24 +1105,18 @@ impl FlashMoeEngine {
             kv_cache.record_layer_state_record(token_state.layer_state_record(position, layer))?;
             layer_timing.buckets.combine_norm += combine_started.elapsed();
             layer_timing.buckets.total_wall = layer_started.elapsed();
-            info!(
+            trace!(
+                target: "flashmoe::perf",
                 token_position = position,
                 layer,
                 layer_kind = layer_timing.layer_kind.as_str(),
                 active_experts = layer_timing.active_experts,
                 expert_deferred = false,
-                attention_ms = layer_timing.buckets.attention_projection.as_millis(),
-                routing_ms = layer_timing.buckets.routing.as_millis(),
-                expert_io_ms = layer_timing.buckets.expert_io.as_millis(),
-                expert_read_ms = layer_timing.buckets.expert_read.as_millis(),
-                expert_compute_ms = layer_timing.buckets.expert_compute.as_millis(),
-                total_ms = layer_timing.buckets.total_wall.as_millis(),
                 bytes_read = expert_delta.bytes_read,
                 "flashmoe layer complete"
             );
             if report_layer_progress {
-                report_generation_progress(
-                    &progress,
+                report_generation_progress(&progress, || {
                     format!(
                         "forward layer complete position={} layer={}/{} attention_ms={} routing_ms={} expert_io_ms={} expert_read_ms={} expert_compute_ms={} combine_norm_ms={} total_ms={}",
                         position,
@@ -1100,8 +1129,8 @@ impl FlashMoeEngine {
                         layer_timing.buckets.expert_compute.as_millis(),
                         layer_timing.buckets.combine_norm.as_millis(),
                         layer_started.elapsed().as_millis()
-                    ),
-                );
+                    )
+                });
             }
             if let Some(timing) = timing.as_deref_mut() {
                 timing.buckets.add(layer_timing.buckets);
@@ -1109,13 +1138,21 @@ impl FlashMoeEngine {
             }
         }
         if let Some(pending) = deferred_expert_phase.take() {
-            let wait_started = Instant::now();
-            let output = pending.wait()?;
-            let wait_elapsed = wait_started.elapsed();
-            info!(
+            let wait_span = trace_span!(
+                target: "flashmoe::perf",
+                "expert_wait",
                 token_position = position,
                 completed_layer = self.config.num_hidden_layers.saturating_sub(1),
-                wait_ms = wait_elapsed.as_millis(),
+                final_wait = true
+            );
+            let _wait_span = wait_span.enter();
+            let wait_started = OptionalInstant::now(record_detailed_timing);
+            let output = pending.wait()?;
+            let wait_elapsed = wait_started.elapsed();
+            trace!(
+                target: "flashmoe::perf",
+                token_position = position,
+                completed_layer = self.config.num_hidden_layers.saturating_sub(1),
                 "flashmoe deferred expert wait complete"
             );
             if let Some(timing) = timing.as_deref_mut() {
@@ -1132,7 +1169,7 @@ impl FlashMoeEngine {
         }
         token_state.clear_next_layer_normed();
 
-        let combine_started = Instant::now();
+        let combine_started = OptionalInstant::now(record_detailed_timing);
         token_state.replace_hidden(
             self.rms_norm_with_model_weight("model.norm.weight", token_state.hidden())?,
         );
@@ -1183,7 +1220,7 @@ impl FlashMoeEngine {
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Vec<f32>> {
         let layout = runtime.full_attention_layout(layer)?;
-        let subphase_started = Instant::now();
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let input_requests = full_attention_input_projection_requests(
             layer,
             layout.q_projection_width,
@@ -1221,7 +1258,7 @@ impl FlashMoeEngine {
             buckets.attention_input_projection += subphase_started.elapsed();
         }
 
-        let subphase_started = Instant::now();
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let (mut q, q_gate) = split_q_projection(q_projected, layout)?;
 
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
@@ -1262,7 +1299,7 @@ impl FlashMoeEngine {
             buckets.attention_misc += subphase_started.elapsed();
         }
 
-        let subphase_started = Instant::now();
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
         let attention_output =
             self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
@@ -1382,7 +1419,7 @@ impl FlashMoeEngine {
                 "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: neither deferred Metal nor CPU normed input is available"
             );
         };
-        let started = Instant::now();
+        let started = OptionalInstant::now(attention_buckets.is_some());
         let prep = self.dense.linear_attention_post_attention_prep_with_metal(
             metal,
             layout,
@@ -1415,7 +1452,7 @@ impl FlashMoeEngine {
         &mut self,
         request: &StructuredGenerationRequest,
     ) -> Result<GenerationOutput> {
-        Ok(self.generate_structured_inner(request, None)?.output)
+        Ok(self.generate_structured_inner(request, None, false)?.output)
     }
 
     pub fn generate_in_session(
@@ -1439,7 +1476,7 @@ impl FlashMoeEngine {
             return self.generate_structured(request);
         }
         Ok(self
-            .generate_structured_inner_with_session(request, Some(session_id), None)?
+            .generate_structured_inner_with_session(request, Some(session_id), None, false)?
             .output)
     }
 
@@ -1478,13 +1515,8 @@ impl FlashMoeEngine {
         &mut self,
         request: &StructuredGenerationRequest,
     ) -> Result<TimedGenerationOutput> {
-        let mut timing = FlashMoeGenerationTiming {
-            model: self.plan.model.clone(),
-            dimensions: self.model_dimensions(),
-            tokens: Vec::new(),
-            total_wall: Duration::ZERO,
-        };
-        self.generate_structured_inner_with_session(request, None, Some(&mut timing))
+        let mut timing = self.new_generation_timing();
+        self.generate_structured_inner_with_session(request, None, Some(&mut timing), true)
     }
 
     pub fn generate_structured_timed_with_progress(
@@ -1492,27 +1524,67 @@ impl FlashMoeEngine {
         request: &StructuredGenerationRequest,
         progress: &mut dyn FnMut(String),
     ) -> Result<TimedGenerationOutput> {
-        let mut timing = FlashMoeGenerationTiming {
-            model: self.plan.model.clone(),
-            dimensions: self.model_dimensions(),
-            tokens: Vec::new(),
-            total_wall: Duration::ZERO,
-        };
+        let mut timing = self.new_generation_timing();
         let progress = Some(Rc::new(RefCell::new(progress)));
         self.generate_structured_inner_with_session_progress(
             request,
             None,
             Some(&mut timing),
             progress,
+            true,
         )
+    }
+
+    pub fn generate_structured_summary_timed(
+        &mut self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = self.new_generation_timing();
+        self.generate_structured_inner_with_session(request, None, Some(&mut timing), false)
+    }
+
+    pub fn generate_structured_summary_timed_with_progress(
+        &mut self,
+        request: &StructuredGenerationRequest,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = self.new_generation_timing();
+        let progress = Some(Rc::new(RefCell::new(progress)));
+        self.generate_structured_inner_with_session_progress(
+            request,
+            None,
+            Some(&mut timing),
+            progress,
+            false,
+        )
+    }
+
+    fn new_generation_timing(&self) -> FlashMoeGenerationTiming {
+        FlashMoeGenerationTiming {
+            model: self.plan.model.clone(),
+            dimensions: self.model_dimensions(),
+            prefill_or_ttft_tokens: 0,
+            prefill_or_ttft_wall: Duration::ZERO,
+            decode_tokens: 0,
+            decode_wall: Duration::ZERO,
+            tokens: Vec::new(),
+            total_wall: Duration::ZERO,
+        }
     }
 
     fn generate_structured_inner(
         &mut self,
         request: &StructuredGenerationRequest,
         timing: Option<&mut FlashMoeGenerationTiming>,
+        detailed_timing: bool,
     ) -> Result<TimedGenerationOutput> {
-        self.generate_structured_inner_with_session_progress(request, None, timing, None)
+        self.generate_structured_inner_with_session_progress(
+            request,
+            None,
+            timing,
+            None,
+            detailed_timing,
+        )
     }
 
     fn generate_structured_inner_with_session(
@@ -1520,8 +1592,15 @@ impl FlashMoeEngine {
         request: &StructuredGenerationRequest,
         session_id: Option<&str>,
         timing: Option<&mut FlashMoeGenerationTiming>,
+        detailed_timing: bool,
     ) -> Result<TimedGenerationOutput> {
-        self.generate_structured_inner_with_session_progress(request, session_id, timing, None)
+        self.generate_structured_inner_with_session_progress(
+            request,
+            session_id,
+            timing,
+            None,
+            detailed_timing,
+        )
     }
 
     fn generate_structured_inner_with_session_progress(
@@ -1530,6 +1609,7 @@ impl FlashMoeEngine {
         session_id: Option<&str>,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
+        detailed_timing: bool,
     ) -> Result<TimedGenerationOutput> {
         let generation_started = Instant::now();
         let render_started = Instant::now();
@@ -1557,17 +1637,26 @@ impl FlashMoeEngine {
         let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
-        report_generation_progress(
-            &progress,
+        let generation_span = trace_span!(
+            target: "flashmoe::perf",
+            "generation",
+            model = %self.plan.model,
+            prompt_tokens = prompt_tokens.len(),
+            max_tokens = request.max_tokens.max(0),
+            raw_prompt = request.raw_prompt
+        );
+        let _generation_span = generation_span.enter();
+        report_generation_progress(&progress, || {
             format!(
                 "rendered prompt chars={} tokens={} render_ms={} encode_ms={}",
                 prompt.len(),
                 prompt_tokens.len(),
                 render_elapsed.as_millis(),
                 encode_elapsed.as_millis()
-            ),
-        );
-        info!(
+            )
+        });
+        debug!(
+            target: "flashmoe::lifecycle",
             "flashmoe: rendered prompt chars={} tokens={} render_ms={} encode_ms={} tools={} session={}",
             prompt.len(),
             prompt_tokens.len(),
@@ -1586,7 +1675,8 @@ impl FlashMoeEngine {
         let prefill_start = generation.prefill_start();
         let prompt_len = generation.prompt_len();
         if prefill_start > 0 {
-            info!(
+            debug!(
+                target: "flashmoe::lifecycle",
                 "flashmoe: reusing session cache prefix_tokens={} prompt_tokens={}",
                 prefill_start, prompt_len
             );
@@ -1600,8 +1690,10 @@ impl FlashMoeEngine {
             self.metal
                 .restore_linear_attention_session_state(&recurrent)?;
         }
+        let prefill_or_ttft_started = Instant::now();
         let prefill_hidden = if prefill_start == prompt_len {
-            info!(
+            debug!(
+                target: "flashmoe::lifecycle",
                 "flashmoe: prompt prefill fully cached tokens={}",
                 prompt_len
             );
@@ -1610,38 +1702,43 @@ impl FlashMoeEngine {
                 .context("session cache entry is missing the final hidden state")?
         } else {
             let prefill_started = Instant::now();
-            report_generation_progress(
-                &progress,
+            report_generation_progress(&progress, || {
                 format!(
                     "prefill begin start_token={} remaining_tokens={}",
                     prefill_start,
                     prompt_len.saturating_sub(prefill_start)
-                ),
-            );
-            info!(
+                )
+            });
+            debug!(
+                target: "flashmoe::lifecycle",
                 "flashmoe: prefill begin start_token={} remaining_tokens={}",
                 prefill_start,
                 prompt_len.saturating_sub(prefill_start)
             );
             let hidden = {
                 let (prompt_tokens, prefill_start, kv_cache) = generation.prefill_inputs();
+                let detailed = if detailed_timing {
+                    timing.as_deref_mut()
+                } else {
+                    None
+                };
                 self.prefill_from(
                     prompt_tokens,
                     prefill_start,
                     kv_cache,
-                    timing.as_deref_mut(),
+                    detailed,
                     progress.clone(),
                 )?
             };
-            report_generation_progress(
-                &progress,
+            report_generation_progress(&progress, || {
                 format!(
                     "prefill complete tokens={} elapsed_ms={}",
                     prompt_len.saturating_sub(prefill_start),
                     prefill_started.elapsed().as_millis()
-                ),
-            );
-            info!(
+                )
+            });
+            debug!(
+                target: "flashmoe::lifecycle",
                 "flashmoe: prefill complete tokens={} elapsed_ms={}",
                 prompt_len.saturating_sub(prefill_start),
                 prefill_started.elapsed().as_millis()
@@ -1656,8 +1753,8 @@ impl FlashMoeEngine {
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         if generation.should_sample_first() {
             let sample_started = Instant::now();
-            report_generation_progress(&progress, "first-token sampling begin".to_string());
-            info!("flashmoe: first-token sampling begin");
+            report_generation_progress(&progress, || "first-token sampling begin".to_string());
+            debug!(target: "flashmoe::lifecycle", "flashmoe: first-token sampling begin");
             let token = {
                 let (prompt_tokens, generated) = generation.sample_inputs();
                 self.sample_from_hidden(
@@ -1669,20 +1766,21 @@ impl FlashMoeEngine {
                     &progress,
                 )?
             };
-            report_generation_progress(
-                &progress,
+            report_generation_progress(&progress, || {
                 format!(
                     "first-token sampling complete token={} elapsed_ms={}",
                     token,
                     sample_started.elapsed().as_millis()
-                ),
-            );
-            info!(
+                )
+            });
+            debug!(
+                target: "flashmoe::lifecycle",
                 "flashmoe: first-token sampling complete token={} elapsed_ms={}",
                 token,
                 sample_started.elapsed().as_millis()
             );
-            if let Some(timing) = timing.as_deref_mut()
+            if detailed_timing
+                && let Some(timing) = timing.as_deref_mut()
                 && let Some(last) = timing.tokens.last_mut()
             {
                 let elapsed = sample_started.elapsed();
@@ -1692,24 +1790,34 @@ impl FlashMoeEngine {
             }
             generation.record_sampled_token(token, self.tokenizer.is_eos(token));
         }
+        let prefill_or_ttft_wall = prefill_or_ttft_started.elapsed();
+        let decode_phase_started = Instant::now();
+        let mut decode_tokens = 0usize;
+        let report_decode_progress = progress.is_some()
+            || tracing::enabled!(target: "flashmoe::perf", tracing::Level::TRACE);
         while generation.should_decode() {
             let generated_len = generation.generated_len();
             let max_tokens = generation.max_tokens();
             let position = generation.decode_inputs()?.3;
-            report_generation_progress(
-                &progress,
+            report_generation_progress(&progress, || {
                 format!(
                     "decode begin generated={}/{} position={}",
                     generated_len, max_tokens, position
-                ),
-            );
-            info!(
+                )
+            });
+            trace!(
+                target: "flashmoe::perf",
                 "flashmoe: decode begin generated={}/{} position={}",
                 generated_len, max_tokens, position
             );
-            let decode_started = Instant::now();
+            let decode_started = OptionalInstant::now(report_decode_progress);
             let sampled = {
                 let (prompt_tokens, generated, kv_cache, position) = generation.decode_inputs()?;
+                let detailed = if detailed_timing {
+                    timing.as_deref_mut()
+                } else {
+                    None
+                };
                 self.sample_next_token(
                     &mut sampler,
                     prompt_tokens,
@@ -1717,23 +1825,24 @@ impl FlashMoeEngine {
                     kv_cache,
                     position,
                     MropePosition::text(position),
-                    timing.as_deref_mut(),
+                    detailed,
                     request.trace_candidates,
                     progress.clone(),
                 )?
             };
             let token = sampled.token;
-            report_generation_progress(
-                &progress,
+            decode_tokens = decode_tokens.saturating_add(1);
+            report_generation_progress(&progress, || {
                 format!(
                     "decode complete generated={}/{} token={} elapsed_ms={}",
                     generated_len + 1,
                     max_tokens,
                     token,
                     decode_started.elapsed().as_millis()
-                ),
-            );
-            info!(
+                )
+            });
+            trace!(
+                target: "flashmoe::perf",
                 "flashmoe: decode complete generated={}/{} token={} elapsed_ms={}",
                 generated_len + 1,
                 max_tokens,
@@ -1742,6 +1851,7 @@ impl FlashMoeEngine {
             );
             generation.record_sampled_token(token, self.tokenizer.is_eos(token));
         }
+        let decode_wall = decode_phase_started.elapsed();
 
         self.session_cache.commit_generation(&mut generation)?;
 
@@ -1760,21 +1870,23 @@ impl FlashMoeEngine {
             total_wall.as_millis()
         );
         if let Some(timing) = timing {
+            timing.prefill_or_ttft_tokens = prompt_len.saturating_sub(prefill_start);
+            timing.prefill_or_ttft_wall = prefill_or_ttft_wall;
+            timing.decode_tokens = decode_tokens;
+            timing.decode_wall = decode_wall;
             timing.total_wall = total_wall;
             return Ok(TimedGenerationOutput {
                 output,
                 timing: timing.clone(),
             });
         }
-        Ok(TimedGenerationOutput {
-            output,
-            timing: FlashMoeGenerationTiming {
-                model: self.plan.model.clone(),
-                dimensions: self.model_dimensions(),
-                tokens: Vec::new(),
-                total_wall,
-            },
-        })
+        let mut timing = self.new_generation_timing();
+        timing.prefill_or_ttft_tokens = prompt_len.saturating_sub(prefill_start);
+        timing.prefill_or_ttft_wall = prefill_or_ttft_wall;
+        timing.decode_tokens = decode_tokens;
+        timing.decode_wall = decode_wall;
+        timing.total_wall = total_wall;
+        Ok(TimedGenerationOutput { output, timing })
     }
 
     fn prefill_from(
@@ -1792,8 +1904,10 @@ impl FlashMoeEngine {
             );
         }
         let mut last_hidden = None;
-        let progress_started = Instant::now();
-        let mut last_progress = Instant::now();
+        let report_prefill_progress = progress.is_some()
+            || tracing::enabled!(target: "flashmoe::lifecycle", tracing::Level::DEBUG);
+        let progress_started = OptionalInstant::now(report_prefill_progress);
+        let mut last_progress = OptionalInstant::now(report_prefill_progress);
         for (position, token) in prompt_tokens
             .iter()
             .copied()
@@ -1801,17 +1915,17 @@ impl FlashMoeEngine {
             .skip(start_position)
         {
             kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
-            let mut token_timing =
-                FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token);
-            report_generation_progress(
-                &progress,
+            let mut token_timing = timing.as_ref().map(|_| {
+                FlashMoeTokenTiming::new(position, position, FlashMoeTokenPhase::Prefill, token)
+            });
+            report_generation_progress(&progress, || {
                 format!(
                     "prefill token begin processed={} remaining={} position={}",
                     position.saturating_sub(start_position) + 1,
                     prompt_tokens.len().saturating_sub(position + 1),
                     position
-                ),
-            );
+                )
+            });
             // Populate the causal KV cache with the prompt tokens so decode can
             // attend to the full rendered prompt rather than only the latest
             // generated token.
@@ -1820,41 +1934,40 @@ impl FlashMoeEngine {
                 kv_cache,
                 position,
                 false,
-                if timing.is_some() {
-                    Some(&mut token_timing)
-                } else {
-                    None
-                },
+                token_timing.as_mut(),
                 progress.clone(),
             )?);
-            if let Some(timing) = timing.as_deref_mut() {
+            if let Some(token_timing) = token_timing
+                && let Some(timing) = timing.as_deref_mut()
+            {
                 timing.tokens.push(token_timing);
             }
             let processed = position.saturating_sub(start_position) + 1;
             let remaining = prompt_tokens.len().saturating_sub(position + 1);
-            let should_report = processed == 1
-                || remaining == 0
-                || processed % 16 == 0
-                || last_progress.elapsed() >= Duration::from_secs(10);
+            let should_report = report_prefill_progress
+                && (processed == 1
+                    || remaining == 0
+                    || processed % 16 == 0
+                    || last_progress.elapsed() >= Duration::from_secs(10));
             if should_report {
-                report_generation_progress(
-                    &progress,
+                report_generation_progress(&progress, || {
                     format!(
                         "prefill progress processed={} remaining={} position={} elapsed_ms={}",
                         processed,
                         remaining,
                         position,
                         progress_started.elapsed().as_millis()
-                    ),
-                );
-                info!(
+                    )
+                });
+                debug!(
+                    target: "flashmoe::lifecycle",
                     "flashmoe: prefill progress processed={} remaining={} position={} elapsed_ms={}",
                     processed,
                     remaining,
                     position,
                     progress_started.elapsed().as_millis()
                 );
-                last_progress = Instant::now();
+                last_progress = OptionalInstant::now(report_prefill_progress);
             }
         }
         last_hidden.context("cannot generate from an empty prompt")
@@ -2115,25 +2228,23 @@ impl FlashMoeEngine {
             .copied()
             .or_else(|| prompt_tokens.last().copied())
             .unwrap_or_else(|| self.tokenizer.eos_token_id());
-        let mut token_timing = FlashMoeTokenTiming::new(
-            prompt_tokens.len() + generated.len(),
-            position,
-            FlashMoeTokenPhase::Decode,
-            previous,
-        );
+        let mut token_timing = timing.as_ref().map(|_| {
+            FlashMoeTokenTiming::new(
+                prompt_tokens.len() + generated.len(),
+                position,
+                FlashMoeTokenPhase::Decode,
+                previous,
+            )
+        });
         let hidden = self.forward_token_input(
             FlashMoeTokenInput::resident(previous, rope_position),
             kv_cache,
             position,
             true,
-            if timing.is_some() {
-                Some(&mut token_timing)
-            } else {
-                None
-            },
+            token_timing.as_mut(),
             progress.clone(),
         )?;
-        let sample_started = Instant::now();
+        let sample_started = OptionalInstant::now(token_timing.is_some());
         let token = self.sample_from_hidden(
             sampler,
             &hidden,
@@ -2143,11 +2254,13 @@ impl FlashMoeEngine {
             &progress,
         )?;
         let elapsed = sample_started.elapsed();
-        token_timing.buckets.sampling += elapsed;
-        token_timing.buckets.total_wall += elapsed;
-        token_timing.sampled_token = Some(token);
-        if let Some(timing) = timing {
-            timing.tokens.push(token_timing);
+        if let Some(mut token_timing) = token_timing {
+            token_timing.buckets.sampling += elapsed;
+            token_timing.buckets.total_wall += elapsed;
+            token_timing.sampled_token = Some(token);
+            if let Some(timing) = timing {
+                timing.tokens.push(token_timing);
+            }
         }
         Ok(SampledDecode { token })
     }

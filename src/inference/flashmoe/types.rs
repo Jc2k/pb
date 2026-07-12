@@ -268,6 +268,10 @@ pub struct TimedGenerationOutput {
 pub struct FlashMoeGenerationTiming {
     pub model: String,
     pub dimensions: FlashMoeModelDimensions,
+    pub prefill_or_ttft_tokens: usize,
+    pub prefill_or_ttft_wall: Duration,
+    pub decode_tokens: usize,
+    pub decode_wall: Duration,
     pub tokens: Vec<FlashMoeTokenTiming>,
     pub total_wall: Duration,
 }

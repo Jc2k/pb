@@ -36,15 +36,14 @@ pub(super) fn trace_sampling_candidates(
         .join(" ");
     let (hidden_rms, hidden_max, hidden_finite) = vector_rms_max_finite(hidden);
     let (logits_rms, logits_max, logits_finite) = vector_rms_max_finite(logits);
-    report_generation_progress(
-        progress,
+    report_generation_progress(progress, || {
         format!(
             "sampling candidates prompt_tokens={} generated_tokens={} hidden_rms={hidden_rms:.6} hidden_max={hidden_max:.6} hidden_finite={hidden_finite} logits_rms={logits_rms:.6} logits_max={logits_max:.6} logits_finite={logits_finite} {}",
             prompt_len,
             generated.len(),
             rendered
-        ),
-    );
+        )
+    });
 }
 
 fn trace_token_text(tokenizer: &QwenTokenizer, token: usize) -> String {
@@ -1054,9 +1053,12 @@ impl TopKCandidates {
     }
 }
 
-pub(super) fn report_generation_progress(progress: &GenerationProgress<'_>, message: String) {
+pub(super) fn report_generation_progress<F>(progress: &GenerationProgress<'_>, message: F)
+where
+    F: FnOnce() -> String,
+{
     if let Some(callback) = progress {
-        (callback.borrow_mut())(message);
+        (callback.borrow_mut())(message());
     }
 }
 
@@ -1082,6 +1084,16 @@ pub(super) use parity_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_generation_progress_does_not_format_message() {
+        let mut formatted = false;
+        report_generation_progress(&None, || {
+            formatted = true;
+            "unused".to_string()
+        });
+        assert!(!formatted);
+    }
 
     #[test]
     fn deterministic_sampling_uses_the_highest_candidate() {

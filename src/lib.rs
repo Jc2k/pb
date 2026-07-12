@@ -336,7 +336,7 @@ pub enum ServiceCommand {
 pub enum FlashMoeCommand {
     /// Run a single FlashMoe inference and print the model response
     Infer(FlashMoeInferArgs),
-    /// Benchmark FlashMoe generation and emit per-token/per-layer timing TSV
+    /// Benchmark FlashMoe generation with lightweight throughput summaries
     Bench(FlashMoeBenchArgs),
     /// Inspect and optionally delete stale FlashMoe cache artifacts
     CacheClean(FlashMoeCacheCleanArgs),
@@ -486,6 +486,10 @@ pub struct FlashMoeBenchArgs {
     /// Print detailed load/generation progress to stderr
     #[arg(long)]
     pub verbose: bool,
+
+    /// Collect and emit per-token/per-layer timing TSV (adds instrumentation overhead)
+    #[arg(long)]
+    pub detailed_timings: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1686,9 +1690,10 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
                 eprintln!("flashmoe infer: {message}");
             }
         };
-        engine.generate_structured_timed_with_progress(&structured_request, &mut progress)?
+        engine
+            .generate_structured_summary_timed_with_progress(&structured_request, &mut progress)?
     } else {
-        engine.generate_structured_timed(&structured_request)?
+        engine.generate_structured_summary_timed(&structured_request)?
     };
     eprintln!(
         "flashmoe infer: generated {} tokens in {} ms",
@@ -1780,9 +1785,18 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
         None
     };
 
+    let collect_detailed_timings = args.detailed_timings || args.results.is_some();
     let mut smoke_results = Vec::new();
     let mut tsv = String::new();
-    tsv.push_str(FLASHMOE_TIMING_TSV_HEADER);
+    if collect_detailed_timings {
+        tsv.push_str(FLASHMOE_TIMING_TSV_HEADER);
+    }
+    let mut total_generated = 0usize;
+    let mut total_generation_wall = Duration::ZERO;
+    let mut total_prefill_or_ttft_wall = Duration::ZERO;
+    let mut total_decode_tokens = 0usize;
+    let mut total_decode_wall = Duration::ZERO;
+    let mut quality_failed = false;
     for (prompt_index, prompt) in prompts.iter().enumerate() {
         eprintln!(
             "flashmoe bench: generating prompt {}/{} max_tokens={}",
@@ -1790,7 +1804,6 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             prompts.len(),
             args.max_tokens
         );
-        let generation_started = Instant::now();
         let request = inference::flashmoe::GenerationRequest {
             prompt: prompt.clone(),
             max_tokens: args.max_tokens,
@@ -1798,41 +1811,44 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             top_k,
             seed,
         };
+        let mut structured_request =
+            inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
+        if args.raw {
+            structured_request.raw_prompt = true;
+            structured_request.add_generation_prompt = false;
+        }
         let timed = if args.verbose {
-            if args.raw {
-                engine.generate_raw_timed_with_progress(&request, |message| {
-                    eprintln!("flashmoe bench: {message}");
-                })?
+            let mut progress = |message| eprintln!("flashmoe bench: {message}");
+            if collect_detailed_timings {
+                engine
+                    .generate_structured_timed_with_progress(&structured_request, &mut progress)?
             } else {
-                engine.generate_timed_with_progress(&request, |message| {
-                    eprintln!("flashmoe bench: {message}");
-                })?
+                engine.generate_structured_summary_timed_with_progress(
+                    &structured_request,
+                    &mut progress,
+                )?
             }
-        } else if args.raw {
-            let mut request =
-                inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
-            request.raw_prompt = true;
-            request.add_generation_prompt = false;
-            engine.generate_structured_timed(&request)?
+        } else if collect_detailed_timings {
+            engine.generate_structured_timed(&structured_request)?
         } else {
-            engine.generate_timed(&request)?
+            engine.generate_structured_summary_timed(&structured_request)?
         };
-        eprintln!(
-            "flashmoe bench: prompt {} generated {} tokens in {} ms",
-            prompt_index + 1,
-            timed.output.generated_tokens,
-            generation_started.elapsed().as_millis()
-        );
         let throughput = flashmoe_throughput_summary(&timed);
         eprintln!(
-            "flashmoe bench: prompt {} throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+            "flashmoe bench: prompt {} generated={} elapsed_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
             prompt_index + 1,
+            timed.output.generated_tokens,
             throughput.total_wall.as_millis(),
             throughput.prefill_or_ttft_wall.as_millis(),
             throughput.decode_tokens,
             throughput.decode_wall.as_millis(),
             fmt_optional_tok_s(throughput.decode_tok_s())
         );
+        total_generated = total_generated.saturating_add(timed.output.generated_tokens);
+        total_generation_wall += throughput.total_wall;
+        total_prefill_or_ttft_wall += throughput.prefill_or_ttft_wall;
+        total_decode_tokens = total_decode_tokens.saturating_add(throughput.decode_tokens);
+        total_decode_wall += throughput.decode_wall;
         let expected = baseline.as_ref().and_then(|baseline| {
             baseline
                 .results
@@ -1845,13 +1861,32 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             Some(_) => "fail",
             None => "NA",
         };
+        quality_failed |= quality == "fail";
         smoke_results.push(FlashMoeSmokeResult {
             prompt: prompt.clone(),
             output: timed.output.content.clone(),
             generated_tokens: timed.output.generated_tokens,
         });
-        append_flashmoe_timing_tsv(&mut tsv, status, prompt_index, prompt, quality, &timed);
+        if collect_detailed_timings {
+            append_flashmoe_timing_tsv(&mut tsv, status, prompt_index, prompt, quality, &timed);
+        }
     }
+
+    let aggregate_tok_s = if total_decode_tokens == 0 || total_decode_wall.is_zero() {
+        None
+    } else {
+        Some(total_decode_tokens as f64 / total_decode_wall.as_secs_f64())
+    };
+    eprintln!(
+        "flashmoe bench: complete prompts={} generated={} elapsed_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+        prompts.len(),
+        total_generated,
+        total_generation_wall.as_millis(),
+        total_prefill_or_ttft_wall.as_millis(),
+        total_decode_tokens,
+        total_decode_wall.as_millis(),
+        fmt_optional_tok_s(aggregate_tok_s)
+    );
 
     if args.update_baseline {
         let path = args
@@ -1874,8 +1909,10 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     if let Some(path) = &args.results {
         append_or_create_flashmoe_results(path, &tsv)?;
     }
-    print!("{tsv}");
-    if tsv.lines().any(|line| line.contains("\tfail\t")) {
+    if collect_detailed_timings {
+        print!("{tsv}");
+    }
+    if quality_failed {
         bail!("FlashMoe quality smoke failed against baseline");
     }
     Ok(())
@@ -2084,29 +2121,13 @@ impl FlashMoeThroughputSummary {
 fn flashmoe_throughput_summary(
     timed: &inference::flashmoe::TimedGenerationOutput,
 ) -> FlashMoeThroughputSummary {
-    let mut summary = FlashMoeThroughputSummary {
-        prefill_or_ttft_tokens: 0,
-        decode_tokens: 0,
-        prefill_or_ttft_wall: Duration::ZERO,
-        decode_wall: Duration::ZERO,
+    FlashMoeThroughputSummary {
+        prefill_or_ttft_tokens: timed.timing.prefill_or_ttft_tokens,
+        decode_tokens: timed.timing.decode_tokens,
+        prefill_or_ttft_wall: timed.timing.prefill_or_ttft_wall,
+        decode_wall: timed.timing.decode_wall,
         total_wall: timed.timing.total_wall,
-    };
-    for token in &timed.timing.tokens {
-        match token.phase {
-            inference::flashmoe::FlashMoeTokenPhase::Prefill => {
-                summary.prefill_or_ttft_tokens += 1;
-                summary.prefill_or_ttft_wall += token.buckets.total_wall;
-            }
-            inference::flashmoe::FlashMoeTokenPhase::Decode => {
-                summary.decode_tokens += 1;
-                summary.decode_wall += token.buckets.total_wall;
-            }
-        }
     }
-    if timed.timing.tokens.is_empty() {
-        summary.prefill_or_ttft_wall = timed.timing.total_wall;
-    }
-    summary
 }
 
 fn fmt_optional_tok_s(value: Option<f64>) -> String {
@@ -3284,6 +3305,28 @@ mod tests {
     }
 
     #[test]
+    fn flashmoe_bench_detailed_timings_are_opt_in() {
+        let default = Cli::try_parse_from(["pb", "flashmoe", "bench"]).unwrap();
+        let Commands::FlashMoe {
+            command: FlashMoeCommand::Bench(default),
+        } = default.command
+        else {
+            panic!("expected flashmoe bench command");
+        };
+        assert!(!default.detailed_timings);
+
+        let detailed =
+            Cli::try_parse_from(["pb", "flashmoe", "bench", "--detailed-timings"]).unwrap();
+        let Commands::FlashMoe {
+            command: FlashMoeCommand::Bench(detailed),
+        } = detailed.command
+        else {
+            panic!("expected flashmoe bench command");
+        };
+        assert!(detailed.detailed_timings);
+    }
+
+    #[test]
     fn flashmoe_timing_tsv_rows_match_header_columns() {
         let timed = crate::inference::flashmoe::TimedGenerationOutput {
             output: crate::inference::flashmoe::GenerationOutput {
@@ -3304,6 +3347,10 @@ mod tests {
                     moe_intermediate_size: Some(2),
                     shared_experts: Some(1),
                 },
+                prefill_or_ttft_tokens: 0,
+                prefill_or_ttft_wall: Duration::ZERO,
+                decode_tokens: 1,
+                decode_wall: Duration::from_millis(9),
                 tokens: vec![crate::inference::flashmoe::FlashMoeTokenTiming {
                     token_index: 0,
                     position: 0,
@@ -3360,7 +3407,7 @@ mod tests {
 
     #[test]
     fn flashmoe_throughput_summary_reports_decode_only_tok_s() {
-        let mut timed = crate::inference::flashmoe::TimedGenerationOutput {
+        let timed = crate::inference::flashmoe::TimedGenerationOutput {
             output: crate::inference::flashmoe::GenerationOutput {
                 content: "ok".to_string(),
                 tool_calls: Vec::new(),
@@ -3379,42 +3426,14 @@ mod tests {
                     moe_intermediate_size: Some(2),
                     shared_experts: Some(1),
                 },
+                prefill_or_ttft_tokens: 1,
+                prefill_or_ttft_wall: Duration::from_millis(600),
+                decode_tokens: 2,
+                decode_wall: Duration::from_millis(500),
                 tokens: Vec::new(),
                 total_wall: Duration::from_millis(1100),
             },
         };
-        timed
-            .timing
-            .tokens
-            .push(crate::inference::flashmoe::FlashMoeTokenTiming {
-                token_index: 0,
-                position: 0,
-                phase: crate::inference::flashmoe::FlashMoeTokenPhase::Prefill,
-                input_token: 1,
-                sampled_token: Some(2),
-                layers: Vec::new(),
-                buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
-                    total_wall: Duration::from_millis(600),
-                    ..Default::default()
-                },
-            });
-        for token_index in 1..=2 {
-            timed
-                .timing
-                .tokens
-                .push(crate::inference::flashmoe::FlashMoeTokenTiming {
-                    token_index,
-                    position: token_index,
-                    phase: crate::inference::flashmoe::FlashMoeTokenPhase::Decode,
-                    input_token: token_index as u32,
-                    sampled_token: Some((token_index + 1) as u32),
-                    layers: Vec::new(),
-                    buckets: crate::inference::flashmoe::FlashMoeTimingBuckets {
-                        total_wall: Duration::from_millis(250),
-                        ..Default::default()
-                    },
-                });
-        }
 
         let summary = flashmoe_throughput_summary(&timed);
 
