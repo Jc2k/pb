@@ -10,7 +10,7 @@
 ## Architecture
 
 - **Entry point**: `src/main.rs` → `pb::run(Cli::parse()).async`
-- **CLI commands** defined in `src/lib.rs`: `serve`, `queue`, `self`, `tray`, `projects`, `env`, `service`, `init`
+- **CLI commands** defined in `src/lib.rs`: `serve`, `queue`, `self`, `tray`, `projects`, `env`, `service`, `init`; the hidden `harness` surface is documented in `docs/harness.md`
 - **Web UI**: React app in `webui/` served by Rust backend; builds to `webui/dist/`
 - **Agent profiles**: `build|scout|review|explore|plan|ask|research` - see `src/agent_core.rs`
 
@@ -33,7 +33,7 @@
 - Keep the upstream `danveloper/flash-moe` data flow visible: 4-bit quality is the production target, K=4 routing is the Qwen3.5 baseline, expert I/O should stream through scheduler-owned parallel `pread`, and the OS page cache should be trusted.
 - Do not chase isolated FlashMoe microbenchmarks or add Q4-only fast paths without a plan for all supported Qwen MoE variants to use the same data flow, scheduling, and CPU/GPU handoff.
 - Do not reintroduce hidden FlashMoe environment toggles, application expert caches, cache migrations, or alternate runtimes without updating the architecture plan first.
-- After FlashMoe backend changes, run the narrow smoke at minimum: `target/aarch64-apple-darwin/release/pb flashmoe infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`. It must exit 0 and print a sensible answer.
+- After FlashMoe backend changes, run the narrow smoke at minimum: `target/aarch64-apple-darwin/release/pb harness infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`. It must exit 0 and print a sensible answer.
 
 ## Release process
 

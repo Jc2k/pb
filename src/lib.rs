@@ -28,6 +28,7 @@ pub mod energy;
 pub mod environment;
 pub mod events;
 mod github_oauth;
+pub mod harness;
 pub mod inference;
 pub mod init;
 pub mod integrations;
@@ -109,11 +110,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// FlashMoe backend utilities
-    #[command(name = "flashmoe")]
-    FlashMoe {
+    /// Internal testing harness
+    #[command(name = "harness", hide = true)]
+    Harness {
         #[command(subcommand)]
-        command: FlashMoeCommand,
+        command: HarnessCommand,
     },
     /// Inspect a project and configure it for use with pb
     Init(InitArgs),
@@ -333,13 +334,77 @@ pub enum ServiceCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum FlashMoeCommand {
+pub enum HarnessCommand {
     /// Run a single FlashMoe inference and print the model response
     Infer(FlashMoeInferArgs),
     /// Benchmark FlashMoe generation with lightweight throughput summaries
     Bench(FlashMoeBenchArgs),
     /// Inspect and optionally delete stale FlashMoe cache artifacts
     CacheClean(FlashMoeCacheCleanArgs),
+    /// Run one complete agent task directly in a persistent scratch workspace
+    Agent(HarnessAgentArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessAgentArgs {
+    /// Task for the agent to complete
+    pub task: String,
+
+    /// Persistent scratch root to create; defaults to a unique system temporary directory
+    #[arg(long)]
+    pub scratch_dir: Option<PathBuf>,
+
+    /// Model identifier; defaults to the configured model
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Directory containing pulled model blobs; defaults to the configured model directory
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Maximum number of think/tool iterations
+    #[arg(long)]
+    pub max_steps: Option<usize>,
+
+    /// Maximum new tokens per model turn
+    #[arg(long)]
+    pub max_tokens: Option<i32>,
+
+    /// Context size
+    #[arg(long)]
+    pub ctx_size: Option<u32>,
+
+    /// Number of CPU threads for decoding
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    /// Number of CPU threads for prompt processing
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    /// Number of transformer layers to offload to GPU
+    #[arg(long)]
+    pub gpu_layers: Option<u32>,
+
+    /// Temperature
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Agent profile; defaults to build
+    #[arg(long, value_enum, default_value_t = AgentProfile::Build)]
+    pub profile: AgentProfile,
+
+    /// Attach an image file to the task (may be repeated)
+    #[arg(long = "image", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
+
+    /// Top-k for sampling
+    #[arg(long)]
+    pub top_k: Option<i32>,
+
+    /// RNG seed
+    #[arg(long)]
+    pub seed: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -754,7 +819,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Mcp { command } => run_mcp_command(command).await,
         Commands::Integrations { command } => run_integrations_command(command).await,
         Commands::Service { command } => run_service_command(command),
-        Commands::FlashMoe { command } => run_flashmoe_command(command),
+        Commands::Harness { command } => run_harness_command(command),
         Commands::Init(args) => init::run_init(args.workdir, args.backend),
     }
 }
@@ -1497,11 +1562,12 @@ fn run_service_command(command: ServiceCommand) -> Result<()> {
     }
 }
 
-fn run_flashmoe_command(command: FlashMoeCommand) -> Result<()> {
+fn run_harness_command(command: HarnessCommand) -> Result<()> {
     match command {
-        FlashMoeCommand::Infer(args) => run_flashmoe_infer(args),
-        FlashMoeCommand::Bench(args) => run_flashmoe_bench(args),
-        FlashMoeCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
+        HarnessCommand::Infer(args) => run_flashmoe_infer(args),
+        HarnessCommand::Bench(args) => run_flashmoe_bench(args),
+        HarnessCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
+        HarnessCommand::Agent(args) => harness::run_agent_task(args),
     }
 }
 
@@ -3283,7 +3349,7 @@ mod tests {
 
         let infer = Cli::try_parse_from([
             "pb",
-            "flashmoe",
+            "harness",
             "infer",
             "2+2=",
             "--model",
@@ -3294,11 +3360,11 @@ mod tests {
             "public/icon-192.png",
         ])
         .unwrap();
-        let Commands::FlashMoe {
-            command: FlashMoeCommand::Infer(infer),
+        let Commands::Harness {
+            command: HarnessCommand::Infer(infer),
         } = infer.command
         else {
-            panic!("expected flashmoe infer command");
+            panic!("expected harness infer command");
         };
         assert_eq!(infer.expert_storage, Some(FlashMoeExpertStorageArg::Bf16));
         assert_eq!(infer.images, vec![PathBuf::from("public/icon-192.png")]);
@@ -3306,24 +3372,54 @@ mod tests {
 
     #[test]
     fn flashmoe_bench_detailed_timings_are_opt_in() {
-        let default = Cli::try_parse_from(["pb", "flashmoe", "bench"]).unwrap();
-        let Commands::FlashMoe {
-            command: FlashMoeCommand::Bench(default),
+        let default = Cli::try_parse_from(["pb", "harness", "bench"]).unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Bench(default),
         } = default.command
         else {
-            panic!("expected flashmoe bench command");
+            panic!("expected harness bench command");
         };
         assert!(!default.detailed_timings);
 
         let detailed =
-            Cli::try_parse_from(["pb", "flashmoe", "bench", "--detailed-timings"]).unwrap();
-        let Commands::FlashMoe {
-            command: FlashMoeCommand::Bench(detailed),
+            Cli::try_parse_from(["pb", "harness", "bench", "--detailed-timings"]).unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Bench(detailed),
         } = detailed.command
         else {
-            panic!("expected flashmoe bench command");
+            panic!("expected harness bench command");
         };
         assert!(detailed.detailed_timings);
+    }
+
+    #[test]
+    fn harness_is_hidden_and_old_flashmoe_name_is_rejected() {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let help = command.render_long_help().to_string();
+        assert!(!help.contains("harness"));
+        assert!(Cli::try_parse_from(["pb", "flashmoe", "infer", "2+2="]).is_err());
+    }
+
+    #[test]
+    fn harness_agent_parses_direct_run_options() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "agent",
+            "Build a tiny Rust CLI",
+            "--max-steps",
+            "20",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Agent(args),
+        } = parsed.command
+        else {
+            panic!("expected harness agent command");
+        };
+        assert_eq!(args.task, "Build a tiny Rust CLI");
+        assert_eq!(args.max_steps, Some(20));
+        assert_eq!(args.profile, AgentProfile::Build);
     }
 
     #[test]

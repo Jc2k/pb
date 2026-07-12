@@ -855,7 +855,7 @@ Final equivalent comparison, 2026-07-12:
   sampling; routing K=4; application expert cache disabled; warm OS page cache retained in both
   runs.
 - pb command:
-  `target/aarch64-apple-darwin/release/pb flashmoe infer --model hf://mlx-community/Qwen3.5-397B-A17B-4bit --raw --max-tokens 32 --top-k 1 --temperature 0 "Hello, what is"`
+  `target/aarch64-apple-darwin/release/pb harness infer --model hf://mlx-community/Qwen3.5-397B-A17B-4bit --raw --max-tokens 32 --top-k 1 --temperature 0 "Hello, what is"`
 - Upstream command:
   `/private/tmp/flash-moe-reference/metal_infer/infer --model /private/tmp/upstream-model --weights /private/tmp/upstream-model/model_weights.bin --manifest /private/tmp/upstream-model/model_weights.json --vocab /private/tmp/upstream-model/vocab.bin --prompt-tokens /private/tmp/upstream-model/prompt_hello.bin --tokens 32 --k 4 --cache-entries 0`
 - Both engines generated the same continuation through `...fierce debates about whether to`.
@@ -936,7 +936,7 @@ Do not report descriptor count, commit count, or tok/s as progress toward a gate
 - Run `cargo test --all-targets` after significant behavior changes.
 - Build web assets before a release build: `deno task build:web`.
 - After FlashMoe backend changes, build the release binary and run:
-  `target/aarch64-apple-darwin/release/pb flashmoe infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`
+  `target/aarch64-apple-darwin/release/pb harness infer --raw --max-tokens 1 --top-k 1 --temperature 0 "2+2="`
 - A passing smoke is necessary but does not replace K=4 routing/logit/state parity fixtures.
 
 ### Benchmark Lock
