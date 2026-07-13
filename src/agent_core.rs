@@ -4507,6 +4507,13 @@ fn collect_patch_path(path: &str, workspace_root: &Path, paths: &mut Vec<String>
 }
 
 fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
+    let normalized;
+    let patch = if patch.ends_with('\n') {
+        patch
+    } else {
+        normalized = format!("{patch}\n");
+        normalized.as_str()
+    };
     git_apply_stdin(
         &["apply", "--check", "--recount", "-"],
         patch,
@@ -6984,7 +6991,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let patch = "diff --git a/index.html b/index.html\nnew file mode 100644\n--- /dev/null\n+++ b/index.html\n@@ -0,0 +1 @@\n+<!doctype html>\n+<title>Typing Game</title>\n+<main>Play</main>\n";
+        let patch = "diff --git a/index.html b/index.html\nnew file mode 100644\n--- /dev/null\n+++ b/index.html\n@@ -0,0 +1 @@\n+<!doctype html>\n+<title>Typing Game</title>\n+<main>Play</main>";
 
         run_git_apply_patch(patch, &workspace).unwrap();
 
