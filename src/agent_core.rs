@@ -1338,7 +1338,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect once, then create or edit files with apply_patch. A new file must use a git diff: `diff --git a/index.html b/index.html\\nnew file mode 100644\\n--- /dev/null\\n+++ b/index.html\\n@@ -0,0 +1 @@\\n+content`. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect once, then create new files with write_file and edit existing files with apply_patch. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
@@ -1536,6 +1536,7 @@ impl BuiltInToolSchema {
             "skill" => "skill(name)",
             "ask_user" => "ask_user(question)",
             "run_command" => "run_command(cmd)",
+            "write_file" => "write_file(path,content)",
             "edit_file" => "edit_file(path,old_text,new_text)",
             "apply_patch" => "apply_patch(patch)",
             "mv" => "mv(source,destination)",
@@ -1788,6 +1789,17 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                     "Shell command to execute from the project root.",
                 )],
                 ["cmd"],
+            ),
+        ),
+        builtin_tool(
+            "write_file",
+            "Create a new project file; use an edit tool when the path already exists.",
+            object_schema(
+                [
+                    string_property("path", "Project-relative path for the new file."),
+                    string_property("content", "Complete file contents."),
+                ],
+                ["path", "content"],
             ),
         ),
         builtin_tool(
@@ -2231,7 +2243,7 @@ fn tool_allowed(
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
         "run_command" => command_backend_kind.is_some(),
-        "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
+        "write_file" | "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
         "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
@@ -3698,6 +3710,35 @@ fn run_tool(
             let relative_path = arguments.get("path").and_then(Value::as_str);
             let limit = tool_result_limit(arguments, tool, MAX_SEARCH_RESULTS)?;
             run_ripgrep(pattern, relative_path, limit, workspace_root)
+        }
+        "write_file" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .context("write_file requires string argument: path")?;
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .context("write_file requires string argument: content")?;
+            let resolved = resolve_workspace_path(workspace_root, path, false)?;
+            if resolved.exists() {
+                bail!("write_file refuses to overwrite existing file {path}");
+            }
+            if let Some(parent) = resolved.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::write(&resolved, content)
+                .with_context(|| format!("failed to write {}", resolved.display()))?;
+            sink.emit(AgentEvent::Diff {
+                path: path.to_string(),
+                diff: unified_diff("", content, path),
+                nesting_depth: (context.request.sub_agent_depth > 0)
+                    .then_some(context.request.sub_agent_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            context.gate_state.borrow_mut().wrote_file = true;
+            Ok(format!("created {}", resolved.display()))
         }
         "edit_file" => {
             let path = arguments
@@ -6130,6 +6171,7 @@ mod tests {
         let allowlist = vec![
             "session_title".to_string(),
             "run_command".to_string(),
+            "write_file".to_string(),
             "apply_patch".to_string(),
             "git_commit".to_string(),
             "sub_agent".to_string(),
@@ -6152,7 +6194,7 @@ mod tests {
         assert!(instructions.len() < 1_500, "instructions: {instructions}");
         assert!(instructions.contains("review sub_agent"));
         assert!(instructions.contains("never repeat an inspection whose result was empty"));
-        assert!(instructions.contains("--- /dev/null\\n+++ b/index.html"));
+        assert!(instructions.contains("write_file(path,content)"));
         assert!(instructions.contains("rerun tests"));
         assert!(instructions.contains("semantic message"));
         assert!(instructions.contains("session_title(title)"));
@@ -7023,7 +7065,7 @@ mod tests {
 
     #[test]
     fn write_tools_are_only_available_for_write_profiles() {
-        for tool in ["apply_patch", "mv", "rm"] {
+        for tool in ["write_file", "apply_patch", "mv", "rm"] {
             assert!(tool_allowed(tool, AgentProfile::Build, None, false, false));
             assert!(tool_allowed(tool, AgentProfile::Scout, None, false, false));
             assert!(!tool_allowed(
