@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "mutation": "required",
+  "allowed_paths": ["game.js", "game-logic.test.mjs"],
+  "checks": [
+    {
+      "id": "logic",
+      "command": "deno test game-logic.test.mjs",
+      "cwd": ".",
+      "required": true,
+      "timeout_seconds": 60
+    }
+  ],
+  "commit": { "required": true, "semantic": true },
+  "review": {
+    "required": true,
+    "read_paths": ["game.js"],
+    "check_ids": ["logic"]
+  },
+  "workspace_clean": true
+}

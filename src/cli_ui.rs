@@ -42,6 +42,29 @@ pub fn render_event(event: &AgentEvent) {
             };
             print_block(&label, result);
         }
+        AgentEvent::CheckResult {
+            check_id,
+            exit_status,
+            success,
+            timed_out,
+            output,
+            duration_ms,
+            ..
+        } => {
+            let disposition = if *timed_out {
+                "timed out"
+            } else if *success {
+                "passed"
+            } else {
+                "failed"
+            };
+            print_block(
+                &format!(
+                    "check {check_id} ({disposition}, status {exit_status}, {duration_ms} ms)"
+                ),
+                output,
+            );
+        }
         AgentEvent::UserQuestion {
             question_id,
             question,

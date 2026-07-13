@@ -29,6 +29,7 @@ pub mod environment;
 pub mod events;
 mod github_oauth;
 pub mod harness;
+pub mod harness_contract;
 pub mod harness_eval;
 pub mod inference;
 pub mod init;
@@ -354,6 +355,10 @@ pub struct HarnessAgentArgs {
     /// Persistent scratch root to create or resume; defaults to a unique system temporary directory
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
+
+    /// Trusted JSON acceptance contract to validate before model loading
+    #[arg(long, value_name = "PATH")]
+    pub contract: Option<PathBuf>,
 
     /// Model identifier; defaults to the configured model
     #[arg(long)]
@@ -870,6 +875,7 @@ async fn run_serve() -> Result<()> {
         environment: None,
         session_id: String::new(),
         attachments: Vec::new(),
+        contract: None,
     };
     let server_args = web::ServeArgs {
         host: resolved_host.clone(),
@@ -3504,6 +3510,8 @@ mod tests {
             "Build a tiny Rust CLI",
             "--max-steps",
             "20",
+            "--contract",
+            "contract.json",
         ])
         .unwrap();
         let Commands::Harness {
@@ -3514,6 +3522,7 @@ mod tests {
         };
         assert_eq!(args.task, "Build a tiny Rust CLI");
         assert_eq!(args.max_steps, Some(20));
+        assert_eq!(args.contract, Some(PathBuf::from("contract.json")));
         assert_eq!(args.profile, AgentProfile::Build);
     }
 

@@ -336,6 +336,7 @@ mod tests {
             environment: None::<EnvironmentConfig>,
             session_id: String::new(),
             attachments: Vec::new(),
+            contract: None,
         }
     }
 

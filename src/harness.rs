@@ -21,6 +21,7 @@ const HARNESS_GIT_EMAIL: &str = "harness@pb.local";
 const HARNESS_AGENT_TOOLS: &[&str] = &[
     "session_title",
     "run_command",
+    "run_check",
     "read_file",
     "write_file",
     "replace_file",
@@ -171,6 +172,13 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         bail!("harness agent task must not be empty");
     }
 
+    let contract = args
+        .contract
+        .as_deref()
+        .map(crate::harness_contract::HarnessContractDocument::from_path)
+        .transpose()?
+        .map(crate::harness_contract::HarnessContractDocument::normalize)
+        .transpose()?;
     let layout = prepare_scratch(args.scratch_dir.as_deref())?;
     println!("pb harness: scratch={}", layout.root.display());
     println!("pb harness: workspace={}", layout.workspace.display());
@@ -231,6 +239,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         environment: Some(harness_environment()),
         session_id: format!("harness-{}", now_millis()),
         attachments: harness_attachments(&args.images)?,
+        contract,
     };
 
     let sink = HarnessEventSink::new(&layout.events, layout.resumed)?;
@@ -608,6 +617,7 @@ mod tests {
             [
                 "session_title",
                 "run_command",
+                "run_check",
                 "read_file",
                 "write_file",
                 "replace_file",

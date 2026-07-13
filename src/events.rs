@@ -118,6 +118,20 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    CheckResult {
+        check_id: String,
+        exit_status: i32,
+        success: bool,
+        timed_out: bool,
+        output: String,
+        truncated: bool,
+        duration_ms: u64,
+        fingerprint: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     UserQuestion {
         question_id: String,
         question: String,
@@ -345,6 +359,32 @@ impl EventEnvelope {
                     energy_joules,
                     energy_kwh,
                     average_power_watts,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::CheckResult {
+                check_id,
+                exit_status,
+                success,
+                timed_out,
+                output,
+                truncated,
+                duration_ms,
+                fingerprint,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::CheckResult {
+                    check_id,
+                    exit_status,
+                    success,
+                    timed_out,
+                    output,
+                    truncated,
+                    duration_ms,
+                    fingerprint,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },

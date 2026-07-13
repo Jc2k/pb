@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -60,6 +60,7 @@ const MONITOR_TURN_MAX_TOKENS: i32 = 512;
 const MONITOR_TRANSCRIPT_MESSAGES: usize = 8;
 const MONITOR_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
 const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
+const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
@@ -488,6 +489,9 @@ pub struct AgentRequest {
     pub session_id: String,
     #[serde(default)]
     pub attachments: Vec<SessionAttachment>,
+    /// Optional trusted acceptance contract, normalized by the harness before model loading.
+    #[serde(default)]
+    pub contract: Option<crate::harness_contract::AgentContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -665,6 +669,15 @@ enum CommandBackend {
     Local { workspace_root: PathBuf },
 }
 
+#[derive(Debug)]
+struct CheckCommandOutput {
+    exit_status: i32,
+    timed_out: bool,
+    output: String,
+    truncated: bool,
+    duration_ms: u64,
+}
+
 impl CommandBackend {
     fn start(config: &EnvironmentConfig, workspace_root: &Path) -> Result<Self> {
         match config.backend {
@@ -729,6 +742,134 @@ impl CommandBackend {
                 run_local_shell_command(cmd, workspace_root)
             }
         }
+    }
+
+    fn exec_check(
+        &self,
+        check: &crate::harness_contract::AgentCheckContract,
+        workspace_root: &Path,
+    ) -> Result<CheckCommandOutput> {
+        match self {
+            CommandBackend::Local { .. } => run_local_check_command(check, workspace_root),
+            CommandBackend::Container(_) => bail!(
+                "named harness checks are not supported by the container command backend; use the daemon-free local harness"
+            ),
+        }
+    }
+}
+
+fn run_local_check_command(
+    check: &crate::harness_contract::AgentCheckContract,
+    workspace_root: &Path,
+) -> Result<CheckCommandOutput> {
+    let cwd = resolve_workspace_path(workspace_root, &check.cwd, true)
+        .with_context(|| format!("failed to resolve cwd for check '{}'", check.id))?;
+    if !cwd.is_dir() {
+        bail!(
+            "check '{}' cwd is not a directory: {}",
+            check.id,
+            cwd.display()
+        );
+    }
+    let started = Instant::now();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&check.command)
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn named check '{}'", check.id))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("named check stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("named check stderr was unavailable")?;
+    let stdout_reader = std::thread::spawn(move || drain_bounded_output(stdout));
+    let stderr_reader = std::thread::spawn(move || drain_bounded_output(stderr));
+    let timeout = Duration::from_secs(check.timeout_seconds);
+    let (status, timed_out) = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll named check '{}'", check.id))?
+        {
+            break (status, false);
+        }
+        if started.elapsed() >= timeout {
+            #[cfg(unix)]
+            unsafe {
+                unsafe extern "C" {
+                    fn kill(pid: i32, signal: i32) -> i32;
+                }
+                const SIGKILL: i32 = 9;
+                let _ = kill(-(child.id() as i32), SIGKILL);
+            }
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to reap timed-out check '{}'", check.id))?;
+            break (status, true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("named check '{}' stdout reader panicked", check.id))??;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("named check '{}' stderr reader panicked", check.id))??;
+    let output = format_check_output(&stdout, &stderr);
+    Ok(CheckCommandOutput {
+        exit_status: if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(-1)
+        },
+        timed_out,
+        output,
+        truncated: stdout_truncated || stderr_truncated,
+        duration_ms: duration_millis(started),
+    })
+}
+
+fn drain_bounded_output(mut reader: impl Read) -> Result<(Vec<u8>, bool)> {
+    let per_stream_limit = MAX_CHECK_OUTPUT_BYTES / 2;
+    let mut captured = Vec::with_capacity(per_stream_limit.min(4096));
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("failed to read named check output")?;
+        if read == 0 {
+            break;
+        }
+        let remaining = per_stream_limit.saturating_sub(captured.len());
+        let keep = remaining.min(read);
+        captured.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok((captured, truncated))
+}
+
+fn format_check_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => "(no output)".to_string(),
+        (stdout, "") => stdout.to_string(),
+        ("", stderr) => format!("stderr:\n{stderr}"),
+        (stdout, stderr) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
     }
 }
 
@@ -1024,6 +1165,7 @@ pub fn run_agent<S: EventSink>(
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
         args.tool_allowlist.as_deref(),
+        args.contract.as_ref(),
         &mcp_registry,
         &lsp_registry,
     )?;
@@ -1143,6 +1285,7 @@ fn build_agent_instructions(
         allow_sub_agents,
         repository_less,
         None,
+        None,
         mcp_registry,
         lsp_registry,
     )
@@ -1158,6 +1301,7 @@ fn build_agent_instructions_with_tool_allowlist(
     allow_sub_agents: bool,
     repository_less: bool,
     tool_allowlist: Option<&[String]>,
+    contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Result<String> {
@@ -1171,6 +1315,7 @@ fn build_agent_instructions_with_tool_allowlist(
             allow_sub_agents,
             repository_less,
             tool_allowlist,
+            contract,
             mcp_registry,
             lsp_registry,
         ));
@@ -1211,6 +1356,7 @@ fn build_agent_instructions_with_tool_allowlist(
         allow_sub_agents,
         repository_less,
         tool_allowlist,
+        contract,
         mcp_registry,
         lsp_registry,
     );
@@ -1332,6 +1478,7 @@ fn build_direct_harness_instructions(
     allow_sub_agents: bool,
     repository_less: bool,
     tool_allowlist: &[String],
+    contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> String {
@@ -1341,6 +1488,7 @@ fn build_direct_harness_instructions(
         allow_sub_agents,
         repository_less,
         Some(tool_allowlist),
+        contract,
         mcp_registry,
         lsp_registry,
     );
@@ -1370,8 +1518,14 @@ fn build_direct_harness_instructions(
             "Use only the tools needed for the assigned role, then return a concise final response."
         }
     };
+    let contract_instructions = contract.map_or_else(String::new, |contract| {
+        format!(
+            " The trusted harness acceptance contract below is authoritative. Use run_check(id) for its named checks; run_command never satisfies them. Do not finalize until all applicable facts are current after the last mutation.\n{}\n",
+            contract.prompt_summary()
+        )
+    });
     format!(
-        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text using either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{...}}}} or {{\"type\":\"final\",\"content\":\"...\"}}. {action_contract} {role} Do not claim completion until the assigned role is complete. Finish with a concise summary. Available tools: {tools}.",
+        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text using either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{...}}}} or {{\"type\":\"final\",\"content\":\"...\"}}. {action_contract} {role}{contract_instructions} Do not claim completion until the assigned role is complete. Finish with a concise summary. Available tools: {tools}.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -1405,6 +1559,7 @@ fn available_tool_specs(
         allow_sub_agents,
         repository_less,
         None,
+        None,
         mcp_registry,
         lsp_registry,
     )
@@ -1416,6 +1571,7 @@ fn available_tool_specs_with_allowlist(
     allow_sub_agents: bool,
     repository_less: bool,
     tool_allowlist: Option<&[String]>,
+    contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Vec<BuiltInToolSchema> {
@@ -1429,6 +1585,8 @@ fn available_tool_specs_with_allowlist(
                 allow_sub_agents,
                 repository_less,
             ) && tool_allowlist.is_none_or(|allowlist| allowlist.contains(&tool.name))
+                && (tool.name != "run_check"
+                    || contract.is_some_and(|contract| !contract.checks.is_empty()))
         })
         .collect();
     tools.extend(
@@ -1524,6 +1682,7 @@ fn available_tool_signatures(
     allow_sub_agents: bool,
     repository_less: bool,
     tool_allowlist: Option<&[String]>,
+    contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> Vec<String> {
@@ -1533,6 +1692,7 @@ fn available_tool_signatures(
         allow_sub_agents,
         repository_less,
         tool_allowlist,
+        contract,
         mcp_registry,
         lsp_registry,
     )
@@ -1558,6 +1718,7 @@ impl BuiltInToolSchema {
             "skill" => "skill(name)",
             "ask_user" => "ask_user(question)",
             "run_command" => "run_command(cmd)",
+            "run_check" => "run_check(id)",
             "write_file" => "write_file(path,content)",
             "replace_file" => "replace_file(path,content)",
             "edit_file" => "edit_file(path,old_text,new_text)",
@@ -1812,6 +1973,17 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                     "Shell command to execute from the project root.",
                 )],
                 ["cmd"],
+            ),
+        ),
+        builtin_tool(
+            "run_check",
+            "Run one trusted acceptance check by contract ID. Arbitrary commands are not accepted.",
+            object_schema(
+                [string_property(
+                    "id",
+                    "Named check ID from the harness contract.",
+                )],
+                ["id"],
             ),
         ),
         builtin_tool(
@@ -2276,7 +2448,7 @@ fn tool_allowed(
         "ask_user" => profile == AgentProfile::Plan,
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
-        "run_command" => command_backend_kind.is_some(),
+        "run_command" | "run_check" => command_backend_kind.is_some(),
         "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm"
         | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
@@ -2292,6 +2464,7 @@ struct StepRunOutcome {
     reached_final: bool,
     final_content: Option<String>,
     metrics: RunMetrics,
+    gate_state: GateState,
 }
 
 struct ToolExecutionEnv<'a> {
@@ -2311,9 +2484,24 @@ struct ToolExecutionEnv<'a> {
     nesting_depth: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct NamedCheckEvidence {
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewContractEvidence {
+    fingerprint: String,
+    read_paths: HashSet<String>,
+    check_ids: HashSet<String>,
+}
+
+#[derive(Debug, Default, Clone)]
 struct GateState {
     read_paths: HashSet<String>,
+    contract_read_evidence: HashMap<String, String>,
+    named_check_evidence: HashMap<String, NamedCheckEvidence>,
+    review_contract_evidence: Option<ReviewContractEvidence>,
     wrote_file: bool,
     review_completed_successfully: bool,
     review_read_evidence_gathered: bool,
@@ -2323,8 +2511,15 @@ struct GateState {
 
 impl GateState {
     fn record_content_mutation(&mut self) {
+        self.record_workspace_change(true);
+    }
+
+    fn record_workspace_change(&mut self, content_changed: bool) {
         self.wrote_file = true;
-        self.review_completed_successfully = false;
+        if content_changed {
+            self.review_completed_successfully = false;
+            self.review_contract_evidence = None;
+        }
     }
 }
 
@@ -2382,6 +2577,7 @@ fn run_agent_steps(
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
         args.tool_allowlist.as_deref(),
+        args.contract.as_ref(),
         mcp_registry,
         lsp_registry,
     );
@@ -2468,8 +2664,12 @@ fn run_agent_steps(
                         timestamp_ms: Some(now_millis()),
                     });
                 }
-                if let Some(feedback) = completion_gate_feedback(args.profile, &gate_state.borrow())
-                {
+                let gate_feedback = if args.contract.is_some() {
+                    contract_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?
+                } else {
+                    completion_gate_feedback(args.profile, &gate_state.borrow())
+                };
+                if let Some(feedback) = gate_feedback {
                     sink.emit(AgentEvent::Correction {
                         message: "Agent tried to end session too soon".to_string(),
                         summary: "Completion gate blocked final response".to_string(),
@@ -2494,6 +2694,7 @@ fn run_agent_steps(
                     reached_final: true,
                     final_content: Some(content),
                     metrics,
+                    gate_state: gate_state.into_inner(),
                 });
             }
             AgentAction::ToolCall {
@@ -2677,6 +2878,7 @@ fn run_agent_steps(
         reached_final: false,
         final_content: None,
         metrics,
+        gate_state: gate_state.into_inner(),
     })
 }
 
@@ -2720,6 +2922,7 @@ fn run_step_limit_monitor(
         false,
         args.repository_less,
         args.tool_allowlist.as_deref(),
+        None,
         mcp_registry,
         lsp_registry,
     )?;
@@ -3883,6 +4086,148 @@ struct ToolContext<'a> {
     gate_state: &'a RefCell<GateState>,
 }
 
+fn contract_completion_gate_feedback(
+    request: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<Option<String>> {
+    let contract = request
+        .contract
+        .as_ref()
+        .context("contract completion gate requires a normalized contract")?;
+    let fingerprint = git_worktree_content_fingerprint(workspace_root)?;
+    let mut missing = Vec::new();
+
+    if request.profile == AgentProfile::Review {
+        for path in &contract.review.read_paths {
+            match gate_state.contract_read_evidence.get(path) {
+                Some(evidence) if evidence == &fingerprint => {}
+                Some(_) => missing.push(format!(
+                    "read required path '{path}' after the last mutation"
+                )),
+                None => missing.push(format!("read required path '{path}'")),
+            }
+        }
+        for id in &contract.review.check_ids {
+            match gate_state.named_check_evidence.get(id) {
+                Some(evidence) if evidence.fingerprint == fingerprint => {}
+                Some(_) => {
+                    missing.push(format!("rerun named check '{id}' after the last mutation"))
+                }
+                None => missing.push(format!("run named check '{id}' successfully")),
+            }
+        }
+        return Ok((!missing.is_empty()).then(|| {
+            format!(
+                "Review contract is not satisfied: {}. Gather all named evidence before finalizing.",
+                missing.join("; ")
+            )
+        }));
+    }
+
+    let changed_paths = git_changed_paths_from_main(workspace_root)?;
+    match contract.mutation {
+        crate::harness_contract::MutationRequirement::Required if changed_paths.is_empty() => {
+            missing.push("the contract requires a final workspace mutation".to_string());
+        }
+        crate::harness_contract::MutationRequirement::Forbidden if !changed_paths.is_empty() => {
+            missing.push(format!(
+                "the contract forbids workspace mutations, but these paths changed: {}",
+                changed_paths.join(", ")
+            ));
+        }
+        _ => {}
+    }
+
+    let forbidden = contract_forbidden_changed_paths(contract, workspace_root)?;
+    if !forbidden.is_empty() {
+        missing.push(format!(
+            "changed paths are outside allowed_paths: {}",
+            forbidden.join(", ")
+        ));
+    }
+
+    for check in contract.checks.iter().filter(|check| check.required) {
+        match gate_state.named_check_evidence.get(&check.id) {
+            Some(evidence) if evidence.fingerprint == fingerprint => {}
+            Some(_) => missing.push(format!(
+                "named check '{}' is stale after a later content mutation",
+                check.id
+            )),
+            None => missing.push(format!("named check '{}' has not succeeded", check.id)),
+        }
+    }
+
+    let commit_subjects = git_session_commit_subjects(workspace_root)?;
+    if contract.commit.required && commit_subjects.is_empty() {
+        missing.push("the contract requires at least one task commit".to_string());
+    }
+    if contract.commit.semantic {
+        let invalid = commit_subjects
+            .iter()
+            .filter(|subject| !is_semantic_commit_message(subject))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !invalid.is_empty() {
+            missing.push(format!(
+                "task commits must use semantic messages; invalid: {}",
+                invalid.join(", ")
+            ));
+        }
+    }
+
+    if contract.review.required {
+        match gate_state.review_contract_evidence.as_ref() {
+            Some(review) if review.fingerprint == fingerprint => {
+                let missing_reads = contract
+                    .review
+                    .read_paths
+                    .iter()
+                    .filter(|path| !review.read_paths.contains(*path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let missing_checks = contract
+                    .review
+                    .check_ids
+                    .iter()
+                    .filter(|id| !review.check_ids.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing_reads.is_empty() {
+                    missing.push(format!(
+                        "review omitted required path(s): {}",
+                        missing_reads.join(", ")
+                    ));
+                }
+                if !missing_checks.is_empty() {
+                    missing.push(format!(
+                        "review omitted required check(s): {}",
+                        missing_checks.join(", ")
+                    ));
+                }
+            }
+            Some(_) => missing.push("review evidence is stale after a later mutation".to_string()),
+            None => {
+                missing.push("the required review has not passed with named evidence".to_string())
+            }
+        }
+    }
+
+    if contract.workspace_clean {
+        let status = git_status_porcelain(workspace_root)?;
+        if !status.trim().is_empty() {
+            missing.push("the contract requires a clean workspace".to_string());
+        }
+    }
+
+    Ok((!missing.is_empty()).then(|| {
+        format!(
+            "Harness acceptance contract is not satisfied: {}. Resolve all listed facts before finalizing.",
+            missing.join("; ")
+        )
+    }))
+}
+
 fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
     if profile == AgentProfile::Review {
         let mut missing = Vec::new();
@@ -4100,17 +4445,24 @@ fn run_tool(
                         .with_context(|| format!("failed to read file: {}", resolved.display()));
                 }
             };
-            context
-                .gate_state
-                .borrow_mut()
-                .read_paths
-                .insert(gate_path_key(workspace_root, &resolved));
-            if context.request.profile == AgentProfile::Review {
-                context
-                    .gate_state
-                    .borrow_mut()
-                    .review_read_evidence_gathered = true;
+            let path_key = gate_path_key(workspace_root, &resolved);
+            let fingerprint = context
+                .request
+                .contract
+                .as_ref()
+                .map(|_| git_worktree_content_fingerprint(workspace_root))
+                .transpose()?;
+            let mut gate_state = context.gate_state.borrow_mut();
+            gate_state.read_paths.insert(path_key.clone());
+            if let Some(fingerprint) = fingerprint {
+                gate_state
+                    .contract_read_evidence
+                    .insert(path_key, fingerprint);
             }
+            if context.request.profile == AgentProfile::Review {
+                gate_state.review_read_evidence_gathered = true;
+            }
+            drop(gate_state);
 
             let lines: Vec<_> = text.lines().collect();
             if let Some(end) = end
@@ -4160,6 +4512,7 @@ fn run_tool(
                 .get("content")
                 .and_then(Value::as_str)
                 .context("write_file requires string argument: content")?;
+            ensure_contract_paths_allowed(context.request, [path])?;
             let resolved = resolve_workspace_path(workspace_root, path, false)?;
             if resolved.exists() {
                 bail!("write_file refuses to overwrite existing file {path}");
@@ -4189,6 +4542,7 @@ fn run_tool(
                 .get("content")
                 .and_then(Value::as_str)
                 .context("replace_file requires string argument: content")?;
+            ensure_contract_paths_allowed(context.request, [path])?;
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
             ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             let existing = std::fs::read_to_string(&resolved)
@@ -4219,6 +4573,7 @@ fn run_tool(
                 .and_then(Value::as_str)
                 .context("edit_file requires string argument: new_text")?;
 
+            ensure_contract_paths_allowed(context.request, [path])?;
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
             ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             let existing = std::fs::read_to_string(&resolved)
@@ -4249,6 +4604,10 @@ fn run_tool(
                 .and_then(Value::as_str)
                 .context("apply_patch requires string argument: patch")?;
             let changed_paths = validate_patch_paths(patch, workspace_root)?;
+            ensure_contract_paths_allowed(
+                context.request,
+                changed_paths.iter().map(String::as_str),
+            )?;
             for path in &changed_paths {
                 let resolved = resolve_workspace_path(workspace_root, path, false)?;
                 ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
@@ -4276,6 +4635,7 @@ fn run_tool(
                 .get("destination")
                 .and_then(Value::as_str)
                 .context("mv requires string argument: destination")?;
+            ensure_contract_paths_allowed(context.request, [source, destination])?;
             let source_path = resolve_workspace_path(workspace_root, source, true)?;
             let destination_path = resolve_workspace_path(workspace_root, destination, false)?;
             ensure_file_was_read(context.gate_state, workspace_root, &source_path, source)?;
@@ -4317,6 +4677,7 @@ fn run_tool(
                 .get("recursive")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            ensure_contract_paths_allowed(context.request, [path])?;
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
             ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             if resolved == workspace_root {
@@ -4453,6 +4814,32 @@ fn run_tool(
         "sub_agent" => run_sub_agent(arguments, context, sink, metrics),
         "attachments" => Ok(serde_json::to_string_pretty(&context.request.attachments)?),
         "vision_describe" => run_vision_describe(arguments, context),
+        "run_check" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .context("run_check requires string argument: id")?;
+            let contract = context
+                .request
+                .contract
+                .as_ref()
+                .context("run_check is unavailable without a harness contract")?;
+            let check = contract
+                .check(id)
+                .with_context(|| format!("harness contract has no check named '{id}'"))?;
+            let backend = command_backend
+                .context("run_check is not available: no project environment is configured")?;
+            run_named_contract_check(
+                id,
+                check,
+                contract,
+                backend,
+                workspace_root,
+                context.gate_state,
+                context.request.sub_agent_depth,
+                sink,
+            )
+        }
         "run_command" => {
             let cmd = arguments
                 .get("cmd")
@@ -4464,6 +4851,7 @@ fn run_tool(
                 backend,
                 cmd,
                 workspace_root,
+                context.request,
                 context.gate_state,
             )?;
             if context.request.profile == AgentProfile::Review {
@@ -4482,28 +4870,102 @@ fn tool_is_in_request_allowlist(tool: &str, allowlist: Option<&[String]>) -> boo
     allowlist.is_none_or(|allowlist| allowlist.iter().any(|allowed| allowed == tool))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_named_contract_check(
+    id: &str,
+    check: &crate::harness_contract::AgentCheckContract,
+    contract: &crate::harness_contract::AgentContract,
+    backend: &CommandBackend,
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<String> {
+    let marker_before = git_completion_marker(workspace_root);
+    let fingerprint_before = git_worktree_content_fingerprint(workspace_root)?;
+    let output = backend.exec_check(check, workspace_root)?;
+    let marker_after = git_completion_marker(workspace_root);
+    let fingerprint = git_worktree_content_fingerprint(workspace_root)?;
+    if marker_before != marker_after {
+        gate_state
+            .borrow_mut()
+            .record_workspace_change(fingerprint_before != fingerprint);
+    }
+    let forbidden = contract_forbidden_changed_paths(contract, workspace_root)?;
+    let success = output.exit_status == 0 && !output.timed_out && forbidden.is_empty();
+    let mut state = gate_state.borrow_mut();
+    if success {
+        state.named_check_evidence.insert(
+            id.to_string(),
+            NamedCheckEvidence {
+                fingerprint: fingerprint.clone(),
+            },
+        );
+    } else {
+        state.named_check_evidence.remove(id);
+    }
+    drop(state);
+    sink.emit(AgentEvent::CheckResult {
+        check_id: id.to_string(),
+        exit_status: output.exit_status,
+        success,
+        timed_out: output.timed_out,
+        output: output.output.clone(),
+        truncated: output.truncated,
+        duration_ms: output.duration_ms,
+        fingerprint: fingerprint.clone(),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    if !forbidden.is_empty() {
+        bail!(
+            "named check '{id}' changed forbidden path(s): {}",
+            forbidden.join(", ")
+        );
+    }
+    Ok(serde_json::to_string(&json!({
+        "check_id": id,
+        "exit_status": output.exit_status,
+        "success": success,
+        "timed_out": output.timed_out,
+        "output": output.output,
+        "truncated": output.truncated,
+        "duration_ms": output.duration_ms,
+        "fingerprint": fingerprint,
+    }))?)
+}
+
 fn run_command_and_record_workspace_change(
     backend: &CommandBackend,
     cmd: &str,
     workspace_root: &Path,
+    request: &AgentRequest,
     gate_state: &RefCell<GateState>,
 ) -> Result<String> {
     let before = git_completion_marker(workspace_root);
-    let reviewed_content_before = gate_state
-        .borrow()
-        .review_completed_successfully
-        .then(|| git_worktree_content_fingerprint(workspace_root))
-        .transpose()?;
+    let reviewed_content_before = {
+        let state = gate_state.borrow();
+        (state.review_completed_successfully || state.review_contract_evidence.is_some())
+            .then(|| git_worktree_content_fingerprint(workspace_root))
+            .transpose()?
+    };
     let result = backend.exec(cmd);
     let after = git_completion_marker(workspace_root);
     if before != after {
-        let reviewed_content_changed = reviewed_content_before.as_ref().is_some_and(|before| {
+        let content_changed = reviewed_content_before.as_ref().is_some_and(|before| {
             git_worktree_content_fingerprint(workspace_root).map_or(true, |after| &after != before)
         });
-        let mut state = gate_state.borrow_mut();
-        state.wrote_file = true;
-        if reviewed_content_changed {
-            state.review_completed_successfully = false;
+        gate_state
+            .borrow_mut()
+            .record_workspace_change(content_changed);
+        if let Some(contract) = request.contract.as_ref() {
+            let forbidden = contract_forbidden_changed_paths(contract, workspace_root)?;
+            if !forbidden.is_empty() {
+                bail!(
+                    "run_command changed path(s) forbidden by the harness contract: {}",
+                    forbidden.join(", ")
+                );
+            }
         }
     }
     result
@@ -4585,6 +5047,75 @@ fn git_worktree_content_fingerprint(workdir: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn git_changed_paths_from_main(workdir: &Path) -> Result<Vec<String>> {
+    let mut paths = HashSet::new();
+    for args in [
+        &["diff", "--name-only", "-z", "main...HEAD"][..],
+        &["diff", "--name-only", "-z", "HEAD"][..],
+        &["ls-files", "--others", "--exclude-standard", "-z"][..],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "git {} failed while validating harness contract: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        for raw in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            paths.insert(
+                std::str::from_utf8(raw)
+                    .context("git returned a non-UTF-8 changed path")?
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn contract_forbidden_changed_paths(
+    contract: &crate::harness_contract::AgentContract,
+    workdir: &Path,
+) -> Result<Vec<String>> {
+    if contract.allowed_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(git_changed_paths_from_main(workdir)?
+        .into_iter()
+        .filter(|path| !contract.allowed_paths.iter().any(|allowed| allowed == path))
+        .collect())
+}
+
+fn git_session_commit_subjects(workdir: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["log", "--format=%s", "main..HEAD"])
+        .current_dir(workdir)
+        .output()
+        .context("failed to inspect harness session commits")?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect harness session commits: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn question_choices(arguments: &Value) -> Result<Vec<String>> {
     let Some(raw_choices) = arguments.get("choices") else {
         return Ok(Vec::new());
@@ -4619,6 +5150,39 @@ fn gate_path_key(workspace_root: &Path, resolved: &Path) -> String {
         .unwrap_or(resolved)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn ensure_contract_paths_allowed<'a>(
+    request: &AgentRequest,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let Some(contract) = request.contract.as_ref() else {
+        return Ok(());
+    };
+    if contract.allowed_paths.is_empty() {
+        return Ok(());
+    }
+    let forbidden = paths
+        .into_iter()
+        .map(|path| path.trim_start_matches("./").replace('\\', "/"))
+        .filter(|path| {
+            !contract.allowed_paths.iter().any(|allowed| {
+                path.as_str() == allowed
+                    || allowed
+                        .strip_suffix('/')
+                        .is_some_and(|directory| path.starts_with(&format!("{directory}/")))
+            })
+        })
+        .collect::<Vec<_>>();
+    if forbidden.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "harness contract forbids changing path(s): {}. Allowed paths: {}",
+            forbidden.join(", "),
+            contract.allowed_paths.join(", ")
+        )
+    }
 }
 
 fn ensure_file_was_read(
@@ -4923,6 +5487,7 @@ fn run_sub_agent(
         false,
         context.request.repository_less,
         context.request.tool_allowlist.as_deref(),
+        context.request.contract.as_ref(),
         context.mcp_registry,
         context.lsp_registry,
     )?;
@@ -4938,6 +5503,9 @@ fn run_sub_agent(
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
     sub_request.repository_less = context.request.repository_less;
     sub_request.workdir = Some(sub_workspace_root.to_path_buf());
+    if profile != AgentProfile::Review {
+        sub_request.contract = None;
+    }
 
     let mut llama_generator;
     let mut flashmoe_generator;
@@ -5015,10 +5583,30 @@ fn run_sub_agent(
             .as_deref()
             .is_some_and(review_final_passes);
     if review_passed {
-        context
+        let source_fingerprint = git_worktree_content_fingerprint(context.workspace_root)?;
+        let read_paths = outcome
             .gate_state
-            .borrow_mut()
-            .review_completed_successfully = true;
+            .contract_read_evidence
+            .iter()
+            .filter_map(|(path, fingerprint)| {
+                (fingerprint == &source_fingerprint).then_some(path.clone())
+            })
+            .collect();
+        let check_ids = outcome
+            .gate_state
+            .named_check_evidence
+            .iter()
+            .filter_map(|(id, evidence)| {
+                (evidence.fingerprint == source_fingerprint).then_some(id.clone())
+            })
+            .collect();
+        let mut parent_gate = context.gate_state.borrow_mut();
+        parent_gate.review_completed_successfully = true;
+        parent_gate.review_contract_evidence = Some(ReviewContractEvidence {
+            fingerprint: source_fingerprint,
+            read_paths,
+            check_ids,
+        });
     }
 
     let result = if review_mutated_workspace {
@@ -6754,7 +7342,48 @@ mod tests {
             environment: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
+            contract: None,
         }
+    }
+
+    fn init_contract_test_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "--allow-empty", "-m", "chore: initialize"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        tmp
+    }
+
+    fn normalized_test_contract(command: &str) -> crate::harness_contract::AgentContract {
+        crate::harness_contract::HarnessContractDocument {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Optional,
+            allowed_paths: vec!["game.js".to_string()],
+            checks: vec![crate::harness_contract::HarnessCheckDocument {
+                id: "logic".to_string(),
+                command: command.to_string(),
+                cwd: ".".to_string(),
+                required: true,
+                timeout_seconds: 2,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        }
+        .normalize()
+        .unwrap()
     }
 
     #[test]
@@ -7276,6 +7905,7 @@ mod tests {
             true,
             false,
             Some(&allowlist),
+            None,
             &McpToolRegistry::default(),
             &LspToolRegistry::default(),
         )
@@ -7312,6 +7942,7 @@ mod tests {
             false,
             false,
             Some(&allowlist),
+            None,
             &McpToolRegistry::default(),
             &LspToolRegistry::default(),
         )
@@ -7379,6 +8010,7 @@ mod tests {
             false,
             false,
             Some(&allowlist),
+            None,
             &McpToolRegistry::default(),
             &LspToolRegistry::default(),
         )
@@ -7488,6 +8120,7 @@ mod tests {
             true,
             false,
             Some(&allowlist),
+            None,
             &McpToolRegistry::default(),
             &LspToolRegistry::default(),
         );
@@ -7775,6 +8408,324 @@ mod tests {
     }
 
     #[test]
+    fn named_checks_are_successful_only_at_the_current_content_fingerprint() {
+        let tmp = init_contract_test_repo();
+        let contract = normalized_test_contract("true");
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let gate_state = RefCell::new(GateState::default());
+        let mut events = Vec::new();
+        let mut sink = |event| events.push(event);
+
+        run_named_contract_check(
+            "logic",
+            contract.check("logic").unwrap(),
+            &contract,
+            &backend,
+            tmp.path(),
+            &gate_state,
+            0,
+            &mut sink,
+        )
+        .unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.contract = Some(contract.clone());
+        assert!(
+            contract_completion_gate_feedback(&request, &gate_state.borrow(), tmp.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                check_id,
+                success: true,
+                ..
+            } if check_id == "logic"
+        )));
+
+        std::fs::write(tmp.path().join("game.js"), "changed\n").unwrap();
+        gate_state.borrow_mut().record_content_mutation();
+        let feedback =
+            contract_completion_gate_feedback(&request, &gate_state.borrow(), tmp.path())
+                .unwrap()
+                .unwrap();
+        assert!(feedback.contains("stale"), "{feedback}");
+    }
+
+    #[test]
+    fn failed_or_generic_commands_do_not_satisfy_named_checks() {
+        let tmp = init_contract_test_repo();
+        let contract = normalized_test_contract("false");
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let gate_state = RefCell::new(GateState::default());
+        let mut events = Vec::new();
+        let mut sink = |event| events.push(event);
+        run_named_contract_check(
+            "logic",
+            contract.check("logic").unwrap(),
+            &contract,
+            &backend,
+            tmp.path(),
+            &gate_state,
+            0,
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            !gate_state
+                .borrow()
+                .named_check_evidence
+                .contains_key("logic")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                exit_status: 1,
+                success: false,
+                ..
+            }
+        )));
+
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.contract = Some(contract);
+        run_command_and_record_workspace_change(
+            &backend,
+            "true",
+            tmp.path(),
+            &request,
+            &gate_state,
+        )
+        .unwrap();
+        let feedback =
+            contract_completion_gate_feedback(&request, &gate_state.borrow(), tmp.path())
+                .unwrap()
+                .unwrap();
+        assert!(feedback.contains("has not succeeded"), "{feedback}");
+    }
+
+    #[test]
+    fn contract_rejects_forbidden_changes_and_incomplete_review_evidence() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("game.js"), "ok\n").unwrap();
+        let mut contract = normalized_test_contract("true");
+        contract.review = crate::harness_contract::HarnessReviewContract {
+            required: true,
+            read_paths: vec!["game.js".to_string()],
+            check_ids: vec!["logic".to_string()],
+        };
+        let fingerprint = git_worktree_content_fingerprint(tmp.path()).unwrap();
+        let gate_state = GateState {
+            named_check_evidence: HashMap::from([(
+                "logic".to_string(),
+                NamedCheckEvidence {
+                    fingerprint: fingerprint.clone(),
+                },
+            )]),
+            review_contract_evidence: Some(ReviewContractEvidence {
+                fingerprint,
+                read_paths: HashSet::new(),
+                check_ids: HashSet::new(),
+            }),
+            ..GateState::default()
+        };
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.contract = Some(contract);
+        let feedback = contract_completion_gate_feedback(&request, &gate_state, tmp.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            feedback.contains("review omitted required path"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("review omitted required check"),
+            "{feedback}"
+        );
+
+        std::fs::write(tmp.path().join("forbidden.js"), "bad\n").unwrap();
+        let feedback = contract_completion_gate_feedback(&request, &gate_state, tmp.path())
+            .unwrap()
+            .unwrap();
+        assert!(feedback.contains("outside allowed_paths"), "{feedback}");
+    }
+
+    #[test]
+    fn run_check_tool_is_exposed_only_for_contracts_with_named_checks() {
+        let contract = normalized_test_contract("true");
+        let allowlist = vec!["run_check".to_string()];
+        let without_contract = available_tool_specs_with_allowlist(
+            AgentProfile::Build,
+            Some(CommandBackendKind::Local),
+            false,
+            false,
+            Some(&allowlist),
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        );
+        assert!(without_contract.is_empty());
+        let with_contract = available_tool_specs_with_allowlist(
+            AgentProfile::Build,
+            Some(CommandBackendKind::Local),
+            false,
+            false,
+            Some(&allowlist),
+            Some(&contract),
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        );
+        assert_eq!(with_contract.len(), 1);
+        assert_eq!(with_contract[0].name, "run_check");
+    }
+
+    #[test]
+    fn named_check_timeout_terminates_the_command_group() {
+        let tmp = init_contract_test_repo();
+        let mut contract = normalized_test_contract("sleep 5");
+        contract.checks[0].timeout_seconds = 1;
+        let started = Instant::now();
+        let output = run_local_check_command(&contract.checks[0], tmp.path()).unwrap();
+        assert!(output.timed_out);
+        assert_eq!(output.exit_status, 124);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn generic_command_reports_forbidden_contract_mutations() {
+        let tmp = init_contract_test_repo();
+        let contract = normalized_test_contract("true");
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.contract = Some(contract);
+        let gate_state = RefCell::new(GateState::default());
+        let error = run_command_and_record_workspace_change(
+            &backend,
+            "printf 'bad\\n' > forbidden.js",
+            tmp.path(),
+            &request,
+            &gate_state,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("forbidden.js"), "{error}");
+        assert!(gate_state.borrow().wrote_file);
+    }
+
+    #[test]
+    fn named_check_records_a_failed_result_before_reporting_forbidden_mutations() {
+        let tmp = init_contract_test_repo();
+        let contract = normalized_test_contract("printf 'bad\\n' > forbidden.js");
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let gate_state = RefCell::new(GateState::default());
+        let mut events = Vec::new();
+        let mut sink = |event| events.push(event);
+
+        let error = run_named_contract_check(
+            "logic",
+            contract.check("logic").unwrap(),
+            &contract,
+            &backend,
+            tmp.path(),
+            &gate_state,
+            0,
+            &mut sink,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("forbidden.js"), "{error}");
+        assert!(
+            !gate_state
+                .borrow()
+                .named_check_evidence
+                .contains_key("logic")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                check_id,
+                exit_status: 0,
+                success: false,
+                ..
+            } if check_id == "logic"
+        )));
+    }
+
+    #[test]
+    fn complete_contract_accepts_named_post_mutation_evidence() {
+        let tmp = init_contract_test_repo();
+        assert!(
+            Command::new("git")
+                .args(["checkout", "-b", "task"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(tmp.path().join("game.js"), "done\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "game.js"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "feat: add game"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut contract = normalized_test_contract("true");
+        contract.mutation = crate::harness_contract::MutationRequirement::Required;
+        contract.commit = crate::harness_contract::HarnessCommitContract {
+            required: true,
+            semantic: true,
+        };
+        contract.review = crate::harness_contract::HarnessReviewContract {
+            required: true,
+            read_paths: vec!["game.js".to_string()],
+            check_ids: vec!["logic".to_string()],
+        };
+        contract.workspace_clean = true;
+        let fingerprint = git_worktree_content_fingerprint(tmp.path()).unwrap();
+        let gate_state = GateState {
+            named_check_evidence: HashMap::from([(
+                "logic".to_string(),
+                NamedCheckEvidence {
+                    fingerprint: fingerprint.clone(),
+                },
+            )]),
+            review_contract_evidence: Some(ReviewContractEvidence {
+                fingerprint,
+                read_paths: HashSet::from(["game.js".to_string()]),
+                check_ids: HashSet::from(["logic".to_string()]),
+            }),
+            wrote_file: true,
+            review_completed_successfully: true,
+            ..GateState::default()
+        };
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.contract = Some(contract);
+        assert!(
+            contract_completion_gate_feedback(&request, &gate_state, tmp.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn content_mutation_invalidates_a_previous_review() {
         let mut state = GateState {
             review_completed_successfully: true,
@@ -7830,6 +8781,7 @@ mod tests {
         let backend = CommandBackend::Local {
             workspace_root: tmp.path().to_path_buf(),
         };
+        let request = test_agent_request(AgentProfile::Build, 256);
         let gate_state = RefCell::new(GateState {
             review_completed_successfully: true,
             ..GateState::default()
@@ -7838,6 +8790,7 @@ mod tests {
             &backend,
             "git commit --allow-empty -m 'test: metadata only'",
             tmp.path(),
+            &request,
             &gate_state,
         )
         .unwrap();
@@ -7847,6 +8800,7 @@ mod tests {
             &backend,
             "printf 'after\\n' > tracked.txt",
             tmp.path(),
+            &request,
             &gate_state,
         )
         .unwrap();
@@ -7917,12 +8871,14 @@ mod tests {
         let backend = CommandBackend::Local {
             workspace_root: tmp.path().to_path_buf(),
         };
+        let request = test_agent_request(AgentProfile::Build, 256);
         let gate_state = RefCell::new(GateState::default());
 
         run_command_and_record_workspace_change(
             &backend,
             "git add tracked.txt && git commit -m 'test: update tracked file'",
             tmp.path(),
+            &request,
             &gate_state,
         )
         .unwrap();
@@ -8074,6 +9030,7 @@ mod tests {
             environment: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
+            contract: None,
         };
 
         let workdir = tempfile::tempdir().unwrap();
@@ -8135,6 +9092,7 @@ mod tests {
             environment: None,
             session_id: "session-456".to_string(),
             attachments: Vec::new(),
+            contract: None,
         };
 
         // Should find and use existing branch with same session_id

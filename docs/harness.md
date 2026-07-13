@@ -16,6 +16,31 @@ The command blocks until `agent_core::run_agent` completes or fails. Existing we
 session paths continue to use their normal daemon lifecycle. `journal.md` is initialized before model
 loading, so an interrupted run still leaves the scratch location and raw-event recovery guidance.
 
+### Acceptance contracts
+
+An optional trusted JSON contract makes completion externally verifiable:
+
+```bash
+pb harness agent --contract docs/harness-contract-v1.example.json \
+  "Build the requested game and satisfy the supplied contract"
+```
+
+Version 1 can require a final mutation, restrict changed paths, define named checks, require
+semantic commits, require a clean worktree, and state the exact paths/checks a review must inspect.
+See `docs/harness-contract-v1.example.json` for the complete shape.
+
+The agent receives `run_check(id)` only when the contract defines checks. The check command is
+trusted caller input; the model supplies only its ID. Each run records its exit status, bounded
+stdout/stderr, duration, timeout state, and the current worktree content fingerprint. `run_command`
+is still available for exploration but never satisfies a named check. A successful check or review
+becomes stale after any later content mutation, and finalization reports all currently missing
+contract facts together. Contracts are parsed and normalized before model loading.
+
+An empty `allowed_paths` list means unrestricted paths. Otherwise built-in write tools reject a
+path outside the list before mutation, while `run_command` and final validation detect indirect
+forbidden changes. Check timeouts are limited to one hour and terminate the local command process
+group. Contract-free invocations retain the existing profile gates and daemon/socket workflows.
+
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
 

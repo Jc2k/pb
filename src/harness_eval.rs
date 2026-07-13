@@ -30,6 +30,8 @@ pub struct ControlFixture {
     pub max_steps: usize,
     pub completion_supported: bool,
     #[serde(default)]
+    pub contract: Option<crate::harness_contract::HarnessContractDocument>,
+    #[serde(default)]
     pub tool_allowlist: Vec<String>,
     #[serde(default)]
     pub initial_files: BTreeMap<String, String>,
@@ -132,6 +134,11 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         environment: None,
         session_id: format!("control-fixture-{}", fixture.id),
         attachments: Vec::new(),
+        contract: fixture
+            .contract
+            .clone()
+            .map(crate::harness_contract::HarnessContractDocument::normalize)
+            .transpose()?,
     };
     let completions = fixture
         .turns
@@ -354,9 +361,28 @@ mod tests {
             assert!(!observation.priority.trim().is_empty());
             assert!(!observation.evidence.trim().is_empty());
         }
+        assert_eq!(baseline.results.len(), actual.len());
+        assert!(
+            baseline
+                .results
+                .iter()
+                .find(|result| result.id == "irrelevant_review_evidence")
+                .is_some_and(|result| result.false_completion),
+            "historical baseline must preserve the pre-contract false completion"
+        );
+        for id in ["irrelevant_review_evidence", "check_then_mutation"] {
+            let result = actual.iter().find(|result| result.id == id).unwrap();
+            assert!(!result.reached_final, "{id} must not reach final");
+            assert!(!result.false_completion, "{id} must not falsely complete");
+            assert_eq!(result.gate_corrections, 1, "{id}");
+        }
         assert_eq!(
-            actual, baseline.results,
-            "deterministic harness control behavior changed; update runtime assertions first and preserve this historical baseline separately when the change is intentional"
+            actual
+                .iter()
+                .find(|result| result.id == "check_then_mutation")
+                .unwrap()
+                .executed_checks,
+            1
         );
     }
 
