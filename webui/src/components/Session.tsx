@@ -458,12 +458,134 @@ function AssistantMessageRow({
   );
 }
 
+function handoffOutcomeLabel(outcome?: string): string {
+  switch (outcome) {
+    case "ready": return "Ready to hand back";
+    case "no_change": return "No code changes";
+    case "checks_failed":
+    case "repair_exhausted": return "Needs another pass";
+    case "executor_unavailable":
+    case "commit_blocked": return "Needs help";
+    default: return "Checking the handoff";
+  }
+}
+
+function TeamMessageBubble({
+  envelope,
+  events,
+}: {
+  envelope: EventEnvelope;
+  events: EventEnvelope[];
+}) {
+  const event = envelope.event;
+  if (event.type !== "team_message") return null;
+
+  const index = events.indexOf(envelope);
+  const priorEvents = events.slice(0, index < 0 ? events.length : index);
+  const recentPriorEvents = [...priorEvents].reverse();
+  const followingEvents = events.slice(index < 0 ? 0 : index + 1);
+  const evidenceIds = new Set(event.evidence_ids || []);
+  const checkEvidence = Array.from(evidenceIds)
+    .filter((id) => id.startsWith("check:"))
+    .map((id) => id.slice("check:".length))
+    .map((checkId) => recentPriorEvents.find((candidate) =>
+      candidate.event.type === "check_result" && candidate.event.check_id === checkId
+    ))
+    .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
+  const commitEvidence = Array.from(evidenceIds)
+    .filter((id) => id.startsWith("commit:"))
+    .map((id) => id.slice("commit:".length))
+    .map((oid) => recentPriorEvents.find((candidate) =>
+      candidate.event.type === "commit_result" && candidate.event.oid === oid
+    ))
+    .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
+  const handoff = followingEvents.find((candidate) =>
+    candidate.event.type === "handoff_summary"
+  );
+  const summary = handoff?.event.type === "handoff_summary" ? handoff.event.summary : undefined;
+  const start = events.find((candidate) => candidate.event.type === "started");
+  const focusRoot = start?.event.type === "started" ? start.event.focus_root : undefined;
+  const hasEvidence = checkEvidence.length > 0 || commitEvidence.length > 0 || Boolean(summary) || Boolean(event.detail);
+
+  return (
+    <article className={`bot message-row assistant-message team-message tone-${event.tone}`}>
+      <div className="bot-avatar team-avatar">
+        <img src="/avatar-monitor.png" alt="Trinity Walker" />
+      </div>
+      <div className="message-container">
+        <div className="author-line">
+          <strong>Trinity Walker</strong>
+          <span>Team handoff</span>
+          {event.timestamp_ms ? <time>{formatEventTime(event.timestamp_ms)}</time> : null}
+        </div>
+        <div className="bubble thought-bubble team-bubble">
+          <span className="handoff-state">{handoffOutcomeLabel(summary?.outcome)}</span>
+          <p>{event.message}</p>
+          {hasEvidence ? (
+            <details className="handoff-evidence">
+              <summary>What I ran</summary>
+              {summary?.affected_components.length ? (
+                <p className="handoff-scope">
+                  <strong>Affected:</strong> {summary.affected_components.join(", ")}
+                </p>
+              ) : null}
+              {focusRoot ? (
+                <p className="handoff-scope"><strong>Focus:</strong> <code>{focusRoot}</code></p>
+              ) : null}
+              {event.detail ? <pre className="handoff-detail">{event.detail}</pre> : null}
+              {checkEvidence.map((candidate) => {
+                if (candidate.event.type !== "check_result") return null;
+                const check = candidate.event;
+                const status = check.skip_reason
+                  ? "skipped"
+                  : check.reused
+                    ? "reused"
+                    : check.success
+                      ? "passed"
+                      : "failed";
+                return (
+                  <section className={`handoff-check ${status}`} key={`check-${check.check_id}`}>
+                    <div>
+                      <strong>{check.check_id}</strong>
+                      <span>{status}</span>
+                    </div>
+                    {check.command ? <code>{check.command}</code> : null}
+                    <small>
+                      {check.executor ? `Executor: ${check.executor}` : ""}
+                      {check.cwd ? ` · From: ${check.cwd}` : ""}
+                      {` · Exit: ${check.exit_status}`}
+                    </small>
+                    {check.skip_reason ? <p>{check.skip_reason}</p> : null}
+                    {check.output?.trim() ? <pre>{check.output}</pre> : null}
+                  </section>
+                );
+              })}
+              {commitEvidence.map((candidate) => {
+                if (candidate.event.type !== "commit_result") return null;
+                const commit = candidate.event;
+                return (
+                  <section className="handoff-commit" key={`commit-${commit.oid}`}>
+                    <strong>{commit.reused ? "Existing commit" : "Commit"}</strong>
+                    <code>{commit.oid?.slice(0, 12)} {commit.subject}</code>
+                  </section>
+                );
+              })}
+            </details>
+          ) : null}
+        </div>
+      </div>
+    </article>
+  );
+}
+
 export function MessageBubble({
   envelope,
   activityProfile,
+  evidenceEvents = [],
 }: {
   envelope: EventEnvelope;
   activityProfile?: string;
+  evidenceEvents?: EventEnvelope[];
 }) {
   const e = envelope.event;
 
@@ -551,6 +673,9 @@ export function MessageBubble({
 
     case "correction":
       return <CorrectionNotice event={e} />;
+
+    case "team_message":
+      return <TeamMessageBubble envelope={envelope} events={evidenceEvents} />;
 
     case "user_answer":
       return (
@@ -641,6 +766,13 @@ export function MessageBubble({
       );
 
     case "llm_invocation":
+      return null;
+
+    case "executor_started":
+    case "check_result":
+    case "commit_result":
+    case "handoff_summary":
+    case "final_grace":
       return null;
 
     case "session_metrics": {
@@ -736,6 +868,22 @@ export function SessionCard({
     ) : (
       <span className="badge bg-warning text-dark">Paused after restart</span>
     );
+  } else if (session.handoff_outcome === "no_change") {
+    badge = <span className="badge bg-secondary">No code changes</span>;
+  } else if (session.handoff_outcome === "ready") {
+    badge = <span className="badge bg-success">Ready</span>;
+  } else if (
+    session.handoff_outcome === "checks_failed" ||
+    session.handoff_outcome === "repair_exhausted"
+  ) {
+    badge = <span className="badge bg-warning text-dark">Needs another pass</span>;
+  } else if (
+    session.handoff_outcome === "executor_unavailable" ||
+    session.handoff_outcome === "commit_blocked"
+  ) {
+    badge = <span className="badge bg-danger">Needs help</span>;
+  } else if (session.status === "failed") {
+    badge = <span className="badge bg-danger">Stopped</span>;
   } else if (session.branch) {
     badge = <span className="badge bg-success">{session.branch}</span>;
   } else {

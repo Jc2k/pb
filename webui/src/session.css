@@ -348,6 +348,105 @@ article.user div.message-container {
     border: 1px solid var(--assistant-border);
     border-top-left-radius: 7px;
 }
+
+.team-message .team-bubble {
+    border-left: 4px solid #64748b;
+    padding-top: 0.75rem;
+}
+
+.team-message.tone-success .team-bubble { border-left-color: #16a34a; }
+.team-message.tone-warning .team-bubble { border-left-color: #d97706; }
+.team-message.tone-error .team-bubble { border-left-color: #dc2626; }
+.team-message.tone-info .team-bubble { border-left-color: #2563eb; }
+
+.handoff-state {
+    display: inline-flex;
+    width: fit-content;
+    margin-bottom: 0.55rem;
+    border: 1px solid var(--soft-line);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.72);
+    color: #475569;
+    padding: 0.15rem 0.52rem;
+    font-size: 0.72rem;
+    font-weight: 750;
+    letter-spacing: 0.02em;
+}
+
+.handoff-evidence {
+    margin: 0.25rem 0 0.45rem;
+    border-top: 1px solid var(--soft-line);
+    padding-top: 0.55rem;
+}
+
+.handoff-evidence > summary {
+    cursor: pointer;
+    color: #475569;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+.handoff-scope {
+    margin: 0.5rem 0 0 !important;
+    color: var(--muted);
+    font-size: 0.76rem;
+}
+
+.handoff-check,
+.handoff-commit {
+    display: grid;
+    gap: 0.35rem;
+    margin-top: 0.6rem;
+    border: 1px solid var(--soft-line);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.65);
+    padding: 0.6rem;
+    font-size: 0.76rem;
+}
+
+.handoff-check > div {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.handoff-check > div span {
+    color: var(--muted);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.67rem;
+}
+
+.handoff-check > code,
+.handoff-commit > code {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.handoff-check > small { color: var(--muted); }
+
+.handoff-check > pre {
+    max-height: 13rem;
+    margin: 0;
+    overflow: auto;
+    border-radius: 8px;
+    background: #111827;
+    color: #e5e7eb;
+    padding: 0.55rem;
+    white-space: pre-wrap;
+}
+
+.handoff-detail {
+    max-height: 13rem;
+    margin: 0.55rem 0 0;
+    overflow: auto;
+    border-radius: 8px;
+    background: #f8fafc;
+    color: #475569;
+    padding: 0.55rem;
+    white-space: pre-wrap;
+    font-size: 0.72rem;
+}
 .user-message {
     justify-content: flex-end;
 }

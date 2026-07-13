@@ -4,6 +4,7 @@ import type { EventEnvelope } from "../types/index";
 import {
   getAvatarForProfile,
   groupToolEvents,
+  handoffNotificationTitle,
   projectName,
   projectSettingsPath,
   sessionPageDocumentTitle,
@@ -15,6 +16,17 @@ Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () 
   equal(sessionTitle({ title: "  Fix login  ", task: "Investigate auth" }), "Fix login");
   equal(sessionTitle({ title: "   ", task: "Investigate auth" }), "Investigate auth");
   equal(sessionTitle({ title: null, task: "Investigate auth" }), "Investigate auth");
+});
+
+Deno.test("handoff notifications use team outcome language", () => {
+  equal(handoffNotificationTitle("ready", "completed"), "The team wrapped this up");
+  equal(handoffNotificationTitle("no_change", "completed"), "The team left the code untouched");
+  equal(handoffNotificationTitle("checks_failed", "failed"), "This needs another pass");
+  equal(
+    handoffNotificationTitle("executor_unavailable", "failed"),
+    "The team needs help to continue",
+  );
+  equal(handoffNotificationTitle(undefined, "failed"), "The task stopped before handoff");
 });
 
 Deno.test("sessionPageDocumentTitle follows updated session title", () => {

@@ -44,6 +44,64 @@ export type AgentEvent =
       timestamp_ms?: number;
     }
   | {
+      type: "executor_started";
+      executor_id: string;
+      kind: string;
+      success: boolean;
+      detail?: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "check_result";
+      check_id: string;
+      exit_status: number;
+      success: boolean;
+      timed_out: boolean;
+      output: string;
+      truncated: boolean;
+      duration_ms: number;
+      fingerprint: string;
+      command?: string;
+      cwd?: string;
+      executor?: string;
+      source?: string;
+      command_fingerprint?: string;
+      dependency_outputs?: Record<string, string>;
+      output_fingerprint?: string;
+      reused?: boolean;
+      skip_reason?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "team_message";
+      actor: TeamActor;
+      tone: TeamMessageTone;
+      message: string;
+      detail?: string;
+      evidence_ids?: string[];
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "handoff_summary";
+      summary: HandoffSummary;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "commit_result";
+      success: boolean;
+      created: boolean;
+      reused: boolean;
+      oid?: string;
+      subject?: string;
+      changed_paths?: string[];
+      detail?: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
       type: "user_question";
       question_id: string;
       question: string;
@@ -83,6 +141,13 @@ export type AgentEvent =
   | { type: "diff"; path: string; diff: string; nesting_depth?: number; timestamp_ms?: number }
   | { type: "final"; content: string; profile: string; nesting_depth?: number; timestamp_ms?: number }
   | {
+      type: "final_grace";
+      status: "started" | "accepted" | "rejected";
+      detail: string;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
       type: "llm_invocation";
       step: number;
       duration_ms: number;
@@ -118,6 +183,10 @@ export type AgentEvent =
       type: "session_summary";
       branch: string;
       commits: string;
+      reached_final?: boolean;
+      contract_status?: "unspecified" | "unsatisfied" | "satisfied";
+      verified_completed?: boolean;
+      termination_reason?: string;
       summary?: string;
       power_summary?: string;
       diff_stat?: string;
@@ -132,6 +201,31 @@ export type AgentEvent =
       nesting_depth?: number;
       timestamp_ms?: number;
     };
+
+export type TeamActor =
+  | { kind: "agent"; id: string }
+  | { kind: "automation"; id: "handoff" };
+
+export type TeamMessageTone = "info" | "success" | "warning" | "error";
+
+export type HandoffOutcome =
+  | "pending"
+  | "ready"
+  | "no_change"
+  | "checks_failed"
+  | "executor_unavailable"
+  | "commit_blocked"
+  | "repair_exhausted"
+  | "incomplete";
+
+export interface HandoffSummary {
+  outcome: HandoffOutcome;
+  affected_components: string[];
+  checks: { check_id: string; status: string }[];
+  commit?: { oid: string; subject: string };
+  changed_paths: string[];
+  detail?: string;
+}
 
 
 export interface SessionAttachment {
@@ -172,6 +266,7 @@ export interface SessionItem {
   status: SessionStatus;
   branch?: string;
   workdir?: string;
+  handoff_outcome?: HandoffOutcome;
   pending_question?: { question_id: string; question: string; choices?: string[] };
   updated_at_ms: number;
   metrics?: SessionMetricsSnapshot | null;
@@ -186,6 +281,7 @@ export interface SessionDetails {
   status: SessionStatus;
   branch?: string;
   workdir?: string;
+  handoff_outcome?: HandoffOutcome;
   pending_question?: { question_id: string; question: string; choices?: string[] };
   events: EventEnvelope[];
   updated_at_ms: number;

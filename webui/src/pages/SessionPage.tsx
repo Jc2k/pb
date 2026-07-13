@@ -278,6 +278,7 @@ export function SessionPage() {
                       key={i}
                       envelope={grouped as EventEnvelope}
                       activityProfile={latestAssistantProfile(events)}
+                      evidenceEvents={events}
                     />
                   );
                 },

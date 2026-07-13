@@ -76,6 +76,7 @@ pub fn run_handoff(
             tone: TeamMessageTone::Info,
             message: "There’s no repository change to hand off, so I don’t have anything to test or commit."
                 .to_string(),
+            detail: None,
             evidence_ids: Vec::new(),
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
@@ -98,6 +99,7 @@ pub fn run_handoff(
                 "I’m checking the affected parts before we wrap this up: {}.",
                 natural_list(&labels)
             ),
+            detail: None,
             evidence_ids: Vec::new(),
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
@@ -129,6 +131,7 @@ pub fn run_handoff(
                 message: format!(
                     "I couldn’t run the affected checks because their environment is unavailable. The team may need help setting it up before we can finish. {detail}"
                 ),
+                detail: Some(detail.clone()),
                 evidence_ids: Vec::new(),
                 nesting_depth: event_nesting_depth,
                 timestamp_ms: Some(now_millis()),
@@ -138,7 +141,7 @@ pub fn run_handoff(
         }
     };
     let checks = handoff_check_summaries(&plan.checks, &run);
-    let evidence_ids = plan
+    let mut evidence_ids = plan
         .checks
         .iter()
         .map(|id| format!("check:{id}"))
@@ -166,6 +169,7 @@ pub fn run_handoff(
                     message: format!(
                         "Everything affected passed, but I couldn’t create a safe commit. I left the workspace intact: {detail}"
                     ),
+                    detail: Some(detail.clone()),
                     evidence_ids,
                     nesting_depth: event_nesting_depth,
                     timestamp_ms: Some(now_millis()),
@@ -179,6 +183,9 @@ pub fn run_handoff(
         } else {
             HandoffOutcome::Ready
         };
+        if let Some(commit) = &commit {
+            evidence_ids.push(format!("commit:{}", commit.oid));
+        }
         let summary = HandoffSummary {
             outcome,
             affected_components: plan.affected_components,
@@ -206,6 +213,7 @@ pub fn run_handoff(
             actor: handoff_actor(),
             tone: TeamMessageTone::Success,
             message,
+            detail: None,
             evidence_ids,
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
@@ -258,6 +266,7 @@ pub fn run_handoff(
             "{} failed. I’ve sent that back to Kate for another pass.",
             natural_list(&failed.iter().map(String::as_str).collect::<Vec<_>>())
         ),
+        detail: Some(feedback.clone()),
         evidence_ids,
         nesting_depth: event_nesting_depth,
         timestamp_ms: Some(now_millis()),

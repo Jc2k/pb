@@ -66,12 +66,24 @@ Deno.test("session metrics show a concise human summary after session summary", 
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
 });
 
-Deno.test("completed sessions currently render without a handoff outcome", async () => {
+Deno.test("handoff feedback renders as a teammate with expandable evidence", async () => {
   const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const css = await Deno.readTextFile("webui/src/session.css");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(page.includes('session.status === "completed"'));
   ok(types.includes('SessionStatus = "queued" | "running" | "paused" | "completed" | "failed"'));
-  ok(!types.includes('type: "team_message"'));
-  ok(!types.includes("handoff_outcome"));
+  ok(types.includes('type: "team_message"'));
+  ok(types.includes('type: "check_result"'));
+  ok(types.includes('type: "handoff_summary"'));
+  ok(types.includes("handoff_outcome"));
+  ok(component.includes("function TeamMessageBubble"));
+  ok(component.includes("Trinity Walker"));
+  ok(component.includes("What I ran"));
+  ok(component.includes("check.command"));
+  ok(component.includes("summary.affected_components"));
+  ok(component.includes("start.event.focus_root"));
+  ok(css.includes(".team-message"));
+  ok(!component.toLowerCase().includes("contract verified"));
 });

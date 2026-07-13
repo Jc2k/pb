@@ -153,6 +153,51 @@ Deno.test("latestAssistantProfile falls back to the started profile for early ac
   equal(latestAssistantProfile(events), "build");
 });
 
+Deno.test("handoff progress is replaced by the teammate result while raw evidence stays out of chat", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "team_message",
+        actor: { kind: "automation", id: "handoff" },
+        tone: "info",
+        message: "I’m checking the API tests.",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "check_result",
+        check_id: "api-test",
+        exit_status: 1,
+        success: false,
+        timed_out: false,
+        output: "failed",
+        truncated: false,
+        duration_ms: 10,
+        fingerprint: "input",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "team_message",
+        actor: { kind: "automation", id: "handoff" },
+        tone: "warning",
+        message: "The API tests failed. I sent that back to Kate.",
+      },
+    },
+  ];
+
+  deepEqual(
+    chatEventsWithOnlyLatestStep(events).map((event) => event.event.type),
+    ["team_message"],
+  );
+  const message = chatEventsWithOnlyLatestStep(events)[0].event;
+  equal(message.type, "team_message");
+  if (message.type === "team_message") equal(message.tone, "warning");
+});
+
 Deno.test("errorSummary prefers explicit error summaries", () => {
   equal(
     errorSummary({

@@ -275,6 +275,10 @@ pub enum AgentEvent {
         duration_ms: u64,
         fingerprint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         executor: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
@@ -297,6 +301,8 @@ pub enum AgentEvent {
         actor: TeamActor,
         tone: TeamMessageTone,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         evidence_ids: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -606,6 +612,8 @@ impl EventEnvelope {
                 truncated,
                 duration_ms,
                 fingerprint,
+                command,
+                cwd,
                 executor,
                 source,
                 command_fingerprint,
@@ -626,6 +634,8 @@ impl EventEnvelope {
                     truncated,
                     duration_ms,
                     fingerprint,
+                    command,
+                    cwd,
                     executor,
                     source,
                     command_fingerprint,
@@ -641,6 +651,7 @@ impl EventEnvelope {
                 actor,
                 tone,
                 message,
+                detail,
                 evidence_ids,
                 nesting_depth,
                 ..
@@ -650,6 +661,7 @@ impl EventEnvelope {
                     actor,
                     tone,
                     message,
+                    detail,
                     evidence_ids,
                     nesting_depth,
                     timestamp_ms: Some(now),
@@ -979,5 +991,33 @@ mod tests {
         assert_eq!(value["event"]["contract_status"], "unspecified");
         assert_eq!(value["event"]["verified_completed"], false);
         assert_eq!(value["event"]["termination_reason"], "final");
+    }
+
+    #[test]
+    fn handoff_team_messages_round_trip_for_restored_sessions() {
+        let envelope = EventEnvelope::new(AgentEvent::TeamMessage {
+            actor: TeamActor::Automation(AutomationActor::Handoff),
+            tone: TeamMessageTone::Warning,
+            message: "The web checks need another pass.".to_string(),
+            detail: Some("deno task test:web failed".to_string()),
+            evidence_ids: vec!["check:web-test".to_string()],
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let json = serde_json::to_string(&envelope).unwrap();
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::TeamMessage {
+                actor: TeamActor::Automation(AutomationActor::Handoff),
+                tone: TeamMessageTone::Warning,
+                message,
+                detail: Some(detail),
+                evidence_ids,
+                ..
+            } if message == "The web checks need another pass."
+                && detail == "deno task test:web failed"
+                && evidence_ids == vec!["check:web-test"]
+        ));
     }
 }

@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent_core::{AgentProfile, AgentRequest, EventSink, SessionAttachment, run_agent};
-use crate::events::{AgentEvent, EventEnvelope, SessionMetricsSnapshot};
+use crate::events::{AgentEvent, EventEnvelope, HandoffOutcome, SessionMetricsSnapshot};
 use crate::integrations::{
     self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
     MarketplaceIntegration,
@@ -119,6 +119,8 @@ pub struct SessionListItem {
     pub status: SessionStatus,
     pub branch: Option<String>,
     pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_outcome: Option<HandoffOutcome>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
 }
@@ -180,6 +182,8 @@ pub struct SessionDetails {
     pub status: SessionStatus,
     pub branch: Option<String>,
     pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
     pub updated_at_ms: u64,
@@ -908,6 +912,18 @@ fn effective_session_title(session: &SessionState) -> Option<String> {
         .or_else(|| session.title.clone())
 }
 
+fn latest_handoff_outcome(session: &SessionState) -> Option<HandoffOutcome> {
+    session.history.lock().ok().and_then(|history| {
+        history.iter().rev().find_map(|envelope| {
+            if let AgentEvent::HandoffSummary { summary, .. } = &envelope.event {
+                Some(summary.outcome)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 async fn list_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<SessionListItem>> {
@@ -926,6 +942,7 @@ async fn list_sessions(
                 .workdir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            handoff_outcome: latest_handoff_outcome(session),
             updated_at_ms: session.updated_at_ms,
             metrics: session.metrics.clone(),
         })
@@ -960,6 +977,7 @@ async fn get_session(
             .workdir
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+        handoff_outcome: latest_handoff_outcome(session),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
         updated_at_ms: session.updated_at_ms,
@@ -1746,6 +1764,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 .workdir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            handoff_outcome: latest_handoff_outcome(session),
             updated_at_ms: session.updated_at_ms,
             metrics: session.metrics.clone(),
         })
@@ -1788,6 +1807,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
             .workdir
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+        handoff_outcome: latest_handoff_outcome(session),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
         updated_at_ms: session.updated_at_ms,

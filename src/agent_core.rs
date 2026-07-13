@@ -2859,6 +2859,23 @@ fn run_agent_steps(
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
+                    sink.emit(AgentEvent::TeamMessage {
+                        actor: crate::events::TeamActor::Automation(
+                            crate::events::AutomationActor::Handoff,
+                        ),
+                        tone: crate::events::TeamMessageTone::Warning,
+                        message: if args.contract.is_some() {
+                            "I can’t hand this back yet. Some task requirements are still missing."
+                                .to_string()
+                        } else {
+                            "I can’t hand this back yet. I’ve sent the unfinished work back to Kate for another pass."
+                                .to_string()
+                        },
+                        detail: Some(feedback.clone()),
+                        evidence_ids: Vec::new(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
                     if args.contract.is_some() {
                         return Ok(StepRunOutcome {
                             reached_final: true,
@@ -2933,6 +2950,7 @@ fn run_agent_steps(
                                         "The affected checks still fail and there isn’t another repair turn available. This needs another pass."
                                             .to_string()
                                     },
+                                    detail: summary.detail.clone(),
                                     evidence_ids: summary
                                         .checks
                                         .iter()
@@ -5669,6 +5687,7 @@ fn run_tool(
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
+                        detail: Some(serde_json::to_string(&checks.failures)?),
                         evidence_ids: checks
                             .failed
                             .iter()
@@ -5930,6 +5949,8 @@ fn run_named_contract_check(
         truncated: output.truncated,
         duration_ms: output.duration_ms,
         fingerprint: fingerprint.clone(),
+        command: Some(check.command.clone()),
+        cwd: Some(check.cwd.clone()),
         executor: Some("project".to_string()),
         source: Some("agent_tool".to_string()),
         command_fingerprint: None,

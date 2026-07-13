@@ -48,6 +48,10 @@ impl EvidenceSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckEvidence {
     pub check_id: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub cwd: String,
     pub command_fingerprint: String,
     pub input_fingerprint: String,
     #[serde(default)]
@@ -87,6 +91,8 @@ impl CheckEvidenceLedger {
                 timed_out,
                 duration_ms,
                 fingerprint,
+                command,
+                cwd,
                 executor: Some(executor),
                 source: Some(source),
                 command_fingerprint: Some(command_fingerprint),
@@ -103,6 +109,8 @@ impl CheckEvidenceLedger {
             };
             ledger.record(CheckEvidence {
                 check_id: check_id.clone(),
+                command: command.clone().unwrap_or_default(),
+                cwd: cwd.clone().unwrap_or_default(),
                 command_fingerprint: command_fingerprint.clone(),
                 input_fingerprint: fingerprint.clone(),
                 dependency_outputs: dependency_outputs.clone(),
@@ -669,6 +677,8 @@ impl<'a> WorkspaceCheckRuntime<'a> {
                     truncated: false,
                     duration_ms: 0,
                     fingerprint: String::new(),
+                    command: Some(check.command.clone()),
+                    cwd: Some(check.cwd.clone()),
                     executor: Some(check.executor.clone()),
                     source: Some(source.as_str().to_string()),
                     command_fingerprint: Some(command_fingerprint(check)),
@@ -731,6 +741,8 @@ impl<'a> WorkspaceCheckRuntime<'a> {
             };
             let evidence = CheckEvidence {
                 check_id: check.id.clone(),
+                command: check.command.clone(),
+                cwd: check.cwd.clone(),
                 command_fingerprint: command_fingerprint(check),
                 input_fingerprint: input,
                 dependency_outputs,
@@ -804,6 +816,8 @@ fn check_result_event(
         truncated,
         duration_ms: if reused { 0 } else { evidence.duration_ms },
         fingerprint: evidence.input_fingerprint.clone(),
+        command: Some(evidence.command.clone()),
+        cwd: Some(evidence.cwd.clone()),
         executor: Some(evidence.executor.clone()),
         source: Some(evidence.source.as_str().to_string()),
         command_fingerprint: Some(evidence.command_fingerprint.clone()),

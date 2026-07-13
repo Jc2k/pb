@@ -217,7 +217,19 @@ function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventE
 }
 
 function isHiddenChatEvent(event: EventEnvelope): boolean {
-  return event.event.type === "sub_agent_started" || event.event.type === "sub_agent_finished";
+  const handoffCorrection = event.event.type === "correction" && [
+    "Acceptance contract rejected final response",
+    "Completion gate blocked final response",
+    "The handoff teammate returned failed checks for repair",
+  ].includes(event.event.summary || "");
+  return event.event.type === "sub_agent_started" ||
+    event.event.type === "sub_agent_finished" ||
+    event.event.type === "executor_started" ||
+    event.event.type === "check_result" ||
+    event.event.type === "commit_result" ||
+    event.event.type === "handoff_summary" ||
+    event.event.type === "final_grace" ||
+    handoffCorrection;
 }
 
 function isTransientActivityEvent(event: EventEnvelope): boolean {
@@ -251,9 +263,22 @@ export function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnve
       return normalized;
     });
   const lastVisibleIndex = chatEvents.length - 1;
-  return chatEvents.filter((event, index) =>
-    !isTransientActivityEvent(event) || index === lastVisibleIndex
-  );
+  return chatEvents.filter((event, index) => {
+    if (isTransientActivityEvent(event) && index !== lastVisibleIndex) return false;
+    if (
+      event.event.type === "team_message" &&
+      event.event.actor.kind === "automation" &&
+      event.event.actor.id === "handoff" &&
+      event.event.tone === "info"
+    ) {
+      return !chatEvents.slice(index + 1).some((later) =>
+        later.event.type === "team_message" &&
+        later.event.actor.kind === "automation" &&
+        later.event.actor.id === "handoff"
+      );
+    }
+    return true;
+  });
 }
 
 export function latestAssistantProfile(events: EventEnvelope[]): string | undefined {

@@ -1,4 +1,4 @@
-import type { EventEnvelope, InstalledIntegration, MarketplaceIntegration, ProjectEntry, ProjectUsageStats, SessionItem } from "../types/index";
+import type { EventEnvelope, HandoffOutcome, InstalledIntegration, MarketplaceIntegration, ProjectEntry, ProjectUsageStats, SessionItem } from "../types/index";
 
 export function uniqueIntegrations<
   T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
@@ -135,7 +135,7 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
   const project = projects.find((entry) => entry.path === session.workdir);
   if (!project?.notify_on_finish) return;
   if (!(await ensureNotificationPermission())) return;
-  const title = session.status === "completed" ? "pb session completed" : "pb session failed";
+  const title = handoffNotificationTitle(session.handoff_outcome, session.status);
   const body = `${project.name}: ${sessionTitle(session)}`;
   const url = `/sessions/${session.session_id}`;
   const registration = await navigator.serviceWorker?.getRegistration?.();
@@ -154,6 +154,22 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
     window.focus();
     window.location.href = url;
   };
+}
+
+export function handoffNotificationTitle(
+  outcome: HandoffOutcome | undefined,
+  status: SessionItem["status"],
+): string {
+  switch (outcome) {
+    case "ready": return "The team wrapped this up";
+    case "no_change": return "The team left the code untouched";
+    case "checks_failed":
+    case "repair_exhausted": return "This needs another pass";
+    case "executor_unavailable":
+    case "commit_blocked": return "The team needs help to continue";
+    case "incomplete": return "The task stopped before handoff";
+    default: return status === "completed" ? "The team wrapped this up" : "The task stopped before handoff";
+  }
 }
 
 export function projectName(workdir?: string): string {
