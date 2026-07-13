@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct ProjectEntry {
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<String>,
     #[serde(default)]
     pub notify_on_finish: bool,
 }
@@ -61,6 +63,11 @@ pub fn load_projects() -> Result<Vec<ProjectEntry>> {
     let registry: ProjectRegistry =
         toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
     let mut projects = registry.projects;
+    for project in &mut projects {
+        if project.repository_root.is_none() {
+            project.repository_root = repository_root_for(Path::new(&project.path));
+        }
+    }
     sort_projects(&mut projects);
     Ok(projects)
 }
@@ -83,6 +90,7 @@ pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
     let entry = ProjectEntry {
         name: name.clone(),
         path: path_string,
+        repository_root: repository_root_for(&path),
         notify_on_finish: existing_notify,
     };
 
@@ -143,6 +151,15 @@ fn sort_projects(projects: &mut [ProjectEntry]) {
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
 }
 
+fn repository_root_for(path: &Path) -> Option<String> {
+    crate::agent_core::find_git_root(path).map(|root| {
+        root.canonicalize()
+            .unwrap_or(root)
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +193,56 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
+    }
+
+    #[test]
+    fn nested_project_keeps_focus_and_records_repository_root() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let nested = repo.path().join("services").join("payments");
+        std::fs::create_dir_all(&nested).unwrap();
+        let entry = ProjectEntry {
+            name: "payments".to_string(),
+            path: nested
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            repository_root: repository_root_for(&nested),
+            notify_on_finish: false,
+        };
+
+        assert!(entry.path.ends_with("services/payments"));
+        assert_eq!(
+            entry.repository_root.as_deref(),
+            Some(
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn old_project_records_deserialize_without_repository_root() {
+        let entry: ProjectEntry = toml::from_str(
+            r#"
+name = "legacy"
+path = "/tmp/legacy"
+notify_on_finish = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(entry.repository_root, None);
+        assert!(entry.notify_on_finish);
     }
 }

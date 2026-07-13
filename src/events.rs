@@ -130,6 +130,8 @@ pub enum AgentEvent {
         task: String,
         model: String,
         workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_root: Option<String>,
         branch: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<SessionAttachment>,
@@ -354,6 +356,7 @@ impl EventEnvelope {
                 task,
                 model,
                 workspace,
+                focus_root,
                 branch,
                 attachments,
                 ..
@@ -363,6 +366,7 @@ impl EventEnvelope {
                     task,
                     model,
                     workspace,
+                    focus_root,
                     branch,
                     attachments,
                     timestamp_ms: Some(now),
@@ -710,6 +714,29 @@ mod tests {
                 contract_status: ContractStatus::Unspecified,
                 verified_completed: false,
                 termination_reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_started_event_deserializes_without_focus_root() {
+        let json = r#"{
+            "version":"v1",
+            "event":{
+                "type":"started",
+                "task":"legacy",
+                "model":"model",
+                "workspace":"/repo",
+                "branch":"pb/legacy",
+                "attachments":[]
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::Started {
+                focus_root: None,
                 ..
             }
         ));

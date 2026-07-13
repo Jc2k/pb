@@ -935,6 +935,8 @@ mod tests {
             AgentRunResult {
                 branch: "task".to_string(),
                 workspace_root: PathBuf::from("/tmp/task"),
+                focus_root: PathBuf::from("/tmp/task"),
+                repository_context: None,
                 reached_final,
                 contract_status,
                 verified_completed,
@@ -1016,6 +1018,7 @@ mod tests {
             task: "task".to_string(),
             model: "model".to_string(),
             workspace: "/tmp/workspace".to_string(),
+            focus_root: Some("/tmp/workspace".to_string()),
             branch: "pb/task-harness-1".to_string(),
             attachments: Vec::new(),
             timestamp_ms: None,
@@ -1053,6 +1056,7 @@ mod tests {
             task: task.to_string(),
             model: "scripted".to_string(),
             workspace: layout.workspace.display().to_string(),
+            focus_root: Some(layout.workspace.display().to_string()),
             branch: branch.to_string(),
             attachments: Vec::new(),
             timestamp_ms: None,
@@ -1061,6 +1065,8 @@ mod tests {
         let result = Ok(AgentRunResult {
             branch: branch.to_string(),
             workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
             reached_final: true,
             contract_status: crate::events::ContractStatus::Unspecified,
             verified_completed: false,

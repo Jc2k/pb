@@ -4,6 +4,7 @@ export type AgentEvent =
       task: string;
       model: string;
       workspace: string;
+      focus_root?: string;
       branch: string;
       attachments?: SessionAttachment[];
       profile: string;
@@ -194,6 +195,7 @@ export interface SessionDetails {
 export interface ProjectEntry {
   name: string;
   path: string;
+  repository_root?: string;
   notify_on_finish: boolean;
 }
 

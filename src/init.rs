@@ -41,6 +41,7 @@ pub struct ProjectInspection {
 
     // Already configured?
     pub has_pb_environment: bool,
+    pub has_pb_workspace: bool,
 
     // Vision / image assets
     /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
@@ -146,6 +147,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
 
     // --- Already configured? ---
     info.has_pb_environment = root.join(".pb").join("environment.toml").exists();
+    info.has_pb_workspace = root.join(".pb").join("workspace.toml").exists();
 
     Ok(info)
 }
@@ -440,6 +442,18 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
                 );
             }
         }
+    }
+
+    println!();
+    if info.has_pb_workspace {
+        println!(
+            "Existing workspace graph found at {}.",
+            root.join(".pb").join("workspace.toml").display()
+        );
+    } else {
+        println!(
+            "No explicit workspace graph found; repository-wide guard commands remain active until component discovery is configured."
+        );
     }
 
     Ok(())
@@ -1035,6 +1049,7 @@ mod tests {
         assert!(info.gitlab_ci_image.is_none());
         assert!(info.existing_agent_docs.is_empty());
         assert!(!info.has_pb_environment);
+        assert!(!info.has_pb_workspace);
     }
 
     #[test]
@@ -1107,6 +1122,14 @@ mod tests {
         );
         let info = inspect(dir.path()).unwrap();
         assert!(info.has_pb_environment);
+    }
+
+    #[test]
+    fn inspect_existing_pb_workspace() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".pb/workspace.toml", "version = 1\n");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_pb_workspace);
     }
 
     // ── suggest_environment ──

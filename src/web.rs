@@ -1097,10 +1097,14 @@ struct WebEventSink {
 impl EventSink for WebEventSink {
     fn emit(&mut self, event: AgentEvent) {
         if let AgentEvent::Started {
-            workspace, branch, ..
+            workspace,
+            focus_root,
+            branch,
+            ..
         } = &event
         {
-            self.persisted_workdir = Some(PathBuf::from(workspace));
+            self.persisted_workdir =
+                Some(PathBuf::from(focus_root.as_deref().unwrap_or(workspace)));
             self.persisted_branch = Some(branch.clone());
         }
         if let Some(metrics) = SessionMetricsSnapshot::from_event(&event) {
@@ -1293,7 +1297,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             match result {
                 Ok(Ok(run_result)) => {
                     session.branch = Some(run_result.branch);
-                    session.workdir = Some(run_result.workspace_root);
+                    session.workdir = Some(run_result.focus_root);
                     if !run_result.reached_final
                         || run_result.termination_reason != crate::events::TerminationReason::Final
                     {

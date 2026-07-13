@@ -504,6 +504,8 @@ pub struct AgentRequest {
 pub struct AgentRunResult {
     pub branch: String,
     pub workspace_root: PathBuf,
+    pub focus_root: PathBuf,
+    pub repository_context: Option<crate::workspace::RepositoryContext>,
     pub reached_final: bool,
     pub contract_status: ContractStatus,
     pub verified_completed: bool,
@@ -988,11 +990,11 @@ pub fn run_agent<S: EventSink>(
         .workdir
         .clone()
         .unwrap_or(std::env::current_dir().context("failed to get current working directory")?);
-    let workdir_canonical = workdir
+    let focus_root = workdir
         .canonicalize()
         .with_context(|| format!("failed to resolve workdir {}", workdir.display()))?;
     // Anchor to the git project root so tools cannot escape the repository boundary.
-    let workspace_root = find_git_root(&workdir_canonical).unwrap_or(workdir_canonical);
+    let workspace_root = find_git_root(&focus_root).unwrap_or_else(|| focus_root.clone());
 
     let (branch, is_continuation) = if args.repository_less {
         ("repository-less".to_string(), false)
@@ -1006,10 +1008,20 @@ pub fn run_agent<S: EventSink>(
         (branch, is_continuation)
     };
 
+    let repository_context = if args.repository_less {
+        None
+    } else {
+        Some(crate::workspace::RepositoryContext::capture(
+            &workspace_root,
+            &focus_root,
+        )?)
+    };
+
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
         model: model_label.clone(),
         workspace: workspace_root.display().to_string(),
+        focus_root: Some(focus_root.display().to_string()),
         branch: branch.clone(),
         attachments: args.attachments.clone(),
         timestamp_ms: Some(now_millis()),
@@ -1274,6 +1286,8 @@ pub fn run_agent<S: EventSink>(
     Ok(AgentRunResult {
         branch,
         workspace_root,
+        focus_root,
+        repository_context,
         reached_final,
         contract_status,
         verified_completed,

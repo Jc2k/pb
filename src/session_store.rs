@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,12 +102,16 @@ pub fn delete_session(workdir: &Path, session_id: &str) -> Result<()> {
 
 pub fn restore_registered_sessions(projects: &[ProjectEntry]) -> Vec<PersistedSession> {
     let mut sessions = Vec::new();
+    let mut restored_roots = HashSet::new();
     for project in projects {
         let path = PathBuf::from(&project.path);
         let Ok(root) = path.canonicalize() else {
             continue;
         };
         let root = find_git_root(&root).unwrap_or(root);
+        if !restored_roots.insert(root.clone()) {
+            continue;
+        }
         match restore_project_sessions(&root) {
             Ok(mut restored) => sessions.append(&mut restored),
             Err(err) => eprintln!(

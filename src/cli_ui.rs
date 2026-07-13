@@ -6,12 +6,18 @@ pub fn render_event(event: &AgentEvent) {
             task,
             model,
             workspace,
+            focus_root,
             branch,
             ..
         } => {
             print_header("local agent", &format!("task: {task}"));
             print_header("model", model);
             print_header("workspace", workspace);
+            if let Some(focus_root) = focus_root
+                && focus_root != workspace
+            {
+                print_header("focus", focus_root);
+            }
             print_header("branch", branch);
         }
         AgentEvent::StepStarted {
