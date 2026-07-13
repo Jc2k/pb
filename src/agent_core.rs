@@ -1361,7 +1361,7 @@ fn build_direct_harness_instructions(
             "Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Do not return prose-only planning or a final response before a tool result and repository mutation."
         }
         AgentProfile::Review => {
-            "Your first response must call read_file on a relevant file or run_command for a read-only check; a final response before a successful evidence tool result will be rejected. Inspect the workspace with read_file and read-only run_command checks. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
+            "Inspect at least one relevant implementation file with read_file and, when run_command is available, run at least one relevant read-only check; a final response before both required evidence types succeed will be rejected. Inspect each result before deciding the verdict. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
         }
         AgentProfile::Monitor => {
             "Do not call tools or teammates. Audit only the transcript supplied in the task and immediately return a concise final decision."
@@ -2316,7 +2316,9 @@ struct GateState {
     read_paths: HashSet<String>,
     wrote_file: bool,
     review_completed_successfully: bool,
-    review_evidence_gathered: bool,
+    review_read_evidence_gathered: bool,
+    review_command_evidence_gathered: bool,
+    review_command_required: bool,
 }
 
 impl GateState {
@@ -2326,12 +2328,18 @@ impl GateState {
     }
 }
 
-fn initial_gate_state(args: &AgentRequest, workspace_root: &Path) -> GateState {
+fn initial_gate_state(
+    args: &AgentRequest,
+    workspace_root: &Path,
+    command_backend_available: bool,
+) -> GateState {
     let wrote_file = args.accept_existing_workspace_changes
         && git_status_porcelain(workspace_root).is_ok_and(|status| !status.trim().is_empty());
     GateState {
         wrote_file,
-        review_evidence_gathered: args.repository_less,
+        review_read_evidence_gathered: args.repository_less,
+        review_command_evidence_gathered: args.repository_less,
+        review_command_required: !args.repository_less && command_backend_available,
         ..GateState::default()
     }
 }
@@ -2363,7 +2371,11 @@ fn run_agent_steps(
     let mut last_parse_failure_signature: Option<u64> = None;
     let mut repeated_parse_failures = 0usize;
     let mut tool_loop_guard = ToolLoopGuard::default();
-    let gate_state = RefCell::new(initial_gate_state(args, workspace_root));
+    let gate_state = RefCell::new(initial_gate_state(
+        args,
+        workspace_root,
+        command_backend.is_some(),
+    ));
     let available_tools = available_tool_specs_with_allowlist(
         args.profile,
         command_backend.map(CommandBackend::kind),
@@ -3740,11 +3752,20 @@ struct ToolContext<'a> {
 }
 
 fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
-    if profile == AgentProfile::Review && !gate_state.review_evidence_gathered {
-        return Some(
-            "Review tried to finalize without concrete evidence. Call read_file on at least one relevant file or run_command for a read-only check, inspect the result, and only then return REVIEW PASS or REVIEW FAIL."
-                .to_string(),
-        );
+    if profile == AgentProfile::Review {
+        let mut missing = Vec::new();
+        if !gate_state.review_read_evidence_gathered {
+            missing.push("read_file on at least one relevant implementation file");
+        }
+        if gate_state.review_command_required && !gate_state.review_command_evidence_gathered {
+            missing.push("run_command for at least one relevant successful read-only check");
+        }
+        if !missing.is_empty() {
+            return Some(format!(
+                "Review tried to finalize without concrete evidence. Before returning REVIEW PASS or REVIEW FAIL, gather all required evidence: {}. Inspect each result before deciding the verdict.",
+                missing.join(" and ")
+            ));
+        }
     }
     if profile != AgentProfile::Build {
         return None;
@@ -3953,7 +3974,10 @@ fn run_tool(
                 .read_paths
                 .insert(gate_path_key(workspace_root, &resolved));
             if context.request.profile == AgentProfile::Review {
-                context.gate_state.borrow_mut().review_evidence_gathered = true;
+                context
+                    .gate_state
+                    .borrow_mut()
+                    .review_read_evidence_gathered = true;
             }
 
             let lines: Vec<_> = text.lines().collect();
@@ -4311,7 +4335,10 @@ fn run_tool(
                 context.gate_state,
             )?;
             if context.request.profile == AgentProfile::Review {
-                context.gate_state.borrow_mut().review_evidence_gathered = true;
+                context
+                    .gate_state
+                    .borrow_mut()
+                    .review_command_evidence_gathered = true;
             }
             Ok(result)
         }
@@ -7144,8 +7171,8 @@ mod tests {
         assert!(instructions.contains("Return a final review"));
         assert!(instructions.contains("exactly REVIEW PASS or REVIEW FAIL"));
         assert!(instructions.contains("Never use REVIEW PASS when a requested check failed"));
-        assert!(instructions.contains("first response must call read_file"));
-        assert!(instructions.contains("successful evidence tool result"));
+        assert!(instructions.contains("Inspect at least one relevant implementation file"));
+        assert!(instructions.contains("both required evidence types succeed"));
         assert!(!instructions.contains("before a tool result and repository mutation"));
     }
 
@@ -7569,14 +7596,31 @@ mod tests {
 
     #[test]
     fn review_completion_gate_requires_successful_tool_evidence() {
-        let mut state = GateState::default();
+        let mut state = GateState {
+            review_command_required: true,
+            ..GateState::default()
+        };
         let feedback = completion_gate_feedback(AgentProfile::Review, &state)
             .expect("review should not finalize without evidence");
         assert!(feedback.contains("without concrete evidence"));
         assert!(feedback.contains("read_file"));
         assert!(feedback.contains("run_command"));
 
-        state.review_evidence_gathered = true;
+        state.review_read_evidence_gathered = true;
+        let feedback = completion_gate_feedback(AgentProfile::Review, &state)
+            .expect("review should still require command evidence");
+        assert!(!feedback.contains("read_file"));
+        assert!(feedback.contains("run_command"));
+
+        state.review_command_evidence_gathered = true;
+        assert!(completion_gate_feedback(AgentProfile::Review, &state).is_none());
+    }
+
+    #[test]
+    fn review_completion_gate_allows_read_only_evidence_without_command_backend() {
+        let mut state = GateState::default();
+        state.review_read_evidence_gathered = true;
+
         assert!(completion_gate_feedback(AgentProfile::Review, &state).is_none());
     }
 
@@ -7680,9 +7724,9 @@ mod tests {
         std::fs::write(tmp.path().join("pending.txt"), "pending\n").unwrap();
         let mut request = test_agent_request(AgentProfile::Build, 512);
 
-        assert!(!initial_gate_state(&request, tmp.path()).wrote_file);
+        assert!(!initial_gate_state(&request, tmp.path(), true).wrote_file);
         request.accept_existing_workspace_changes = true;
-        assert!(initial_gate_state(&request, tmp.path()).wrote_file);
+        assert!(initial_gate_state(&request, tmp.path(), true).wrote_file);
     }
 
     #[test]
