@@ -6560,11 +6560,11 @@ fn git_log_range(workdir: &Path, range: &str, n: usize) -> Result<String> {
 }
 
 fn git_diff_stat_from_main(workdir: &Path) -> Result<String> {
-    git_run(&["diff", "--stat", "main...HEAD"], workdir)
+    git_run(&["diff", "--stat", "main"], workdir)
 }
 
 fn git_diff_from_main(workdir: &Path) -> Result<String> {
-    git_run(&["diff", "--find-renames", "main...HEAD"], workdir)
+    git_run(&["diff", "--find-renames", "main"], workdir)
 }
 
 fn git_revert(commit: &str, workdir: &Path) -> Result<String> {
@@ -8055,6 +8055,50 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn session_diff_from_main_includes_uncommitted_tracked_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("game.js"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "game.js"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: initialize"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        std::fs::write(tmp.path().join("game.js"), "after\n").unwrap();
+
+        let diff = git_diff_from_main(tmp.path()).unwrap();
+        let stat = git_diff_stat_from_main(tmp.path()).unwrap();
+        assert!(diff.contains("-before"), "{diff}");
+        assert!(diff.contains("+after"), "{diff}");
+        assert!(stat.contains("game.js"), "{stat}");
     }
 
     #[test]
