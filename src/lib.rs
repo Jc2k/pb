@@ -29,6 +29,7 @@ pub mod environment;
 pub mod events;
 mod github_oauth;
 pub mod harness;
+pub mod harness_eval;
 pub mod inference;
 pub mod init;
 pub mod integrations;

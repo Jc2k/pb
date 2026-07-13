@@ -1,6 +1,6 @@
 # Harness reliability improvement plan
 
-Status: proposed
+Status: active
 
 This document turns the July 2026 `pb harness agent` supervision findings into an
 implementation plan. It is the tracking source for the goal described at the end of this
@@ -295,7 +295,7 @@ Acceptance:
 
 | ID | Priority | Depends on | Status | Required proof | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| H0 | P0 | — | proposed | Scripted fixture corpus and baseline metrics | — |
+| H0 | P0 | — | complete | Scripted fixture corpus and baseline metrics | `test: add deterministic harness control fixtures`; 7 fixtures; 705 Rust tests passed, 7 ignored |
 | R0 | P0 | H0 | proposed | Ledger tests, constrained abort, release soak, throughput comparison | — |
 | H1 | P1 | H0 | proposed | Contract parser, `run_check`, fingerprinted evidence tests | — |
 | H2 | P1 | H1 | proposed | Outcome/event/CLI compatibility tests | — |

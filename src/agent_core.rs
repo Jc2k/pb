@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -3227,6 +3227,106 @@ trait CompletionEngine {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
     ) -> Result<CompletionOutput>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptedCompletion {
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptedAgentOutcome {
+    pub reached_final: bool,
+    pub final_content: Option<String>,
+    pub llm_invocations: usize,
+    pub tool_calls: usize,
+    pub remaining_completions: usize,
+}
+
+struct ScriptedCompletionEngine {
+    completions: VecDeque<ScriptedCompletion>,
+}
+
+impl CompletionEngine for ScriptedCompletionEngine {
+    fn generate(
+        &mut self,
+        _args: &AgentRequest,
+        _messages: &[ChatMessage],
+        _tools: &[BuiltInToolSchema],
+    ) -> Result<CompletionOutput> {
+        let completion = self
+            .completions
+            .pop_front()
+            .context("scripted harness fixture exhausted its completion transcript")?;
+        Ok(CompletionOutput {
+            content: completion.content,
+            tool_calls: Vec::new(),
+            finish_reason: if completion.truncated {
+                CompletionFinishReason::MaxTokens
+            } else {
+                CompletionFinishReason::EndOfGeneration
+            },
+            prompt_tokens: 1,
+            generated_tokens: 1,
+            duration_ms: 0,
+            energy: None,
+        })
+    }
+}
+
+/// Exercise the real agent step loop with a deterministic completion transcript.
+///
+/// This is intentionally model-free: harness control fixtures should fail because control-flow
+/// behavior changed, not because a local model, Metal device, network, or container runtime varied.
+pub(crate) fn run_scripted_agent_steps(
+    args: &AgentRequest,
+    completions: Vec<ScriptedCompletion>,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<ScriptedAgentOutcome> {
+    let mut generator = ScriptedCompletionEngine {
+        completions: completions.into(),
+    };
+    let mut messages = vec![
+        ChatMessage::text(
+            "system",
+            "You are executing a deterministic pb harness control fixture.",
+        ),
+        ChatMessage::text("user", args.task.clone()),
+    ];
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let todo_memory = RefCell::new(TodoMemory::default());
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let policy_config = PolicyConfig::default();
+    let outcome = run_agent_steps(
+        &mut generator,
+        TextBackendKind::LlamaCpp,
+        None,
+        args,
+        &mut messages,
+        workspace_root,
+        workspace_root,
+        Some(&command_backend),
+        None,
+        &todo_memory,
+        &mcp_registry,
+        &lsp_registry,
+        &policy_config,
+        None,
+        0,
+        sink,
+    )?;
+    Ok(ScriptedAgentOutcome {
+        reached_final: outcome.reached_final,
+        final_content: outcome.final_content,
+        llm_invocations: outcome.metrics.llm_invocations,
+        tool_calls: outcome.metrics.tool_calls,
+        remaining_completions: generator.completions.len(),
+    })
 }
 
 struct LlamaCompletionEngine<'a> {

@@ -1,0 +1,169 @@
+{
+  "fixture_version": 1,
+  "captured_at": "2026-07-13",
+  "results": [
+    {
+      "id": "first_action_only",
+      "reached_final": true,
+      "termination_reason": "final",
+      "valid_actions": 2,
+      "llm_invocations": 2,
+      "tool_calls": 1,
+      "corrections": 0,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 0,
+      "final_events": 1,
+      "executed_checks": 0,
+      "false_completion": false,
+      "remaining_completions": 0,
+      "observed_paths": {"first.txt": true, "second.txt": false}
+    },
+    {
+      "id": "false_final_after_inspection",
+      "reached_final": false,
+      "termination_reason": "step_limit",
+      "valid_actions": 2,
+      "llm_invocations": 2,
+      "tool_calls": 1,
+      "corrections": 1,
+      "gate_corrections": 1,
+      "errors": 1,
+      "blocked_tool_loops": 0,
+      "final_events": 0,
+      "executed_checks": 0,
+      "false_completion": false,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true}
+    },
+    {
+      "id": "irrelevant_review_evidence",
+      "reached_final": true,
+      "termination_reason": "final",
+      "valid_actions": 3,
+      "llm_invocations": 3,
+      "tool_calls": 2,
+      "corrections": 0,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 0,
+      "final_events": 1,
+      "executed_checks": 0,
+      "false_completion": true,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true, "unrelated.txt": true}
+    },
+    {
+      "id": "check_then_mutation",
+      "reached_final": true,
+      "termination_reason": "final",
+      "valid_actions": 4,
+      "llm_invocations": 4,
+      "tool_calls": 3,
+      "corrections": 0,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 0,
+      "final_events": 1,
+      "executed_checks": 0,
+      "false_completion": true,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true}
+    },
+    {
+      "id": "repeated_blocked_action",
+      "reached_final": true,
+      "termination_reason": "final",
+      "valid_actions": 4,
+      "llm_invocations": 4,
+      "tool_calls": 2,
+      "corrections": 2,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 1,
+      "final_events": 1,
+      "executed_checks": 0,
+      "false_completion": false,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true}
+    },
+    {
+      "id": "final_at_step_limit",
+      "reached_final": true,
+      "termination_reason": "final",
+      "valid_actions": 2,
+      "llm_invocations": 2,
+      "tool_calls": 1,
+      "corrections": 0,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 0,
+      "final_events": 1,
+      "executed_checks": 0,
+      "false_completion": false,
+      "remaining_completions": 0,
+      "observed_paths": {"result.txt": true}
+    },
+    {
+      "id": "review_missing_check",
+      "reached_final": false,
+      "termination_reason": "step_limit",
+      "valid_actions": 2,
+      "llm_invocations": 2,
+      "tool_calls": 1,
+      "corrections": 1,
+      "gate_corrections": 1,
+      "errors": 1,
+      "blocked_tool_loops": 0,
+      "final_events": 0,
+      "executed_checks": 0,
+      "false_completion": false,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true}
+    }
+  ],
+  "observations": [
+    {
+      "id": "first_action_only",
+      "classification": "positive_evidence",
+      "priority": "P1",
+      "evidence": "Only first.txt exists after a response containing two prospective JSON actions."
+    },
+    {
+      "id": "false_final_after_inspection",
+      "classification": "positive_evidence",
+      "priority": "P1",
+      "evidence": "The build gate rejects an inspection-only final and reaches the step limit without a Final event."
+    },
+    {
+      "id": "irrelevant_review_evidence",
+      "classification": "pb_defect",
+      "priority": "P1",
+      "evidence": "An unrelated read and generic true command produce a Final event despite the fixture contract requiring a specific path and named check."
+    },
+    {
+      "id": "check_then_mutation",
+      "classification": "pb_defect",
+      "priority": "P1",
+      "evidence": "Generic command evidence remains sufficient when a later run_command mutates target.txt; the review reaches Final."
+    },
+    {
+      "id": "repeated_blocked_action",
+      "classification": "positive_evidence",
+      "priority": "P2",
+      "evidence": "The third identical read is blocked, only two tool calls execute, and the fixture can still finalize."
+    },
+    {
+      "id": "final_at_step_limit",
+      "classification": "positive_evidence",
+      "priority": "P2",
+      "evidence": "A valid final on step two of two emits Final without an unnecessary extension."
+    },
+    {
+      "id": "review_missing_check",
+      "classification": "positive_evidence",
+      "priority": "P1",
+      "evidence": "A review that reads the target but runs no command is rejected and emits no Final event."
+    }
+  ]
+}
