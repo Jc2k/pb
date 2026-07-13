@@ -3675,7 +3675,9 @@ fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Op
 
     let mut missing = Vec::new();
     if !gate_state.wrote_file {
-        missing.push("change at least one file");
+        missing.push(
+            "make the requested repository change now with write_file for a new path, or with replace_file/edit_file/apply_patch after reading an existing path. Inspection is already sufficient: do not run more status, log, test, or review actions until a write tool succeeds",
+        );
     }
     if !gate_state.review_completed_successfully {
         missing.push("ask Eugene (review) to review the completed work successfully");
@@ -7411,13 +7413,15 @@ mod tests {
     fn build_completion_gate_requires_change_and_review() {
         let mut state = GateState::default();
         let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
-        assert!(feedback.contains("change at least one file"));
+        assert!(feedback.contains("make the requested repository change now"));
+        assert!(feedback.contains("replace_file/edit_file/apply_patch"));
+        assert!(feedback.contains("do not run more status, log, test, or review actions"));
         assert!(feedback.contains("review"));
         assert!(feedback.contains("Agent tried to end session too soon"));
 
         state.wrote_file = true;
         let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
-        assert!(!feedback.contains("change at least one file"));
+        assert!(!feedback.contains("make the requested repository change now"));
         assert!(feedback.contains("review"));
 
         state.review_completed_successfully = true;
