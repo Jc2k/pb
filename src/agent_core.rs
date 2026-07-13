@@ -1338,7 +1338,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
@@ -1537,6 +1537,7 @@ impl BuiltInToolSchema {
             "ask_user" => "ask_user(question)",
             "run_command" => "run_command(cmd)",
             "write_file" => "write_file(path,content)",
+            "replace_file" => "replace_file(path,content)",
             "edit_file" => "edit_file(path,old_text,new_text)",
             "apply_patch" => "apply_patch(patch)",
             "mv" => "mv(source,destination)",
@@ -1798,6 +1799,17 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                 [
                     string_property("path", "Project-relative path for the new file."),
                     string_property("content", "Complete file contents."),
+                ],
+                ["path", "content"],
+            ),
+        ),
+        builtin_tool(
+            "replace_file",
+            "Replace the complete contents of an existing project file after reading it.",
+            object_schema(
+                [
+                    string_property("path", "Project-relative path for the existing file."),
+                    string_property("content", "Complete replacement file contents."),
                 ],
                 ["path", "content"],
             ),
@@ -2243,7 +2255,8 @@ fn tool_allowed(
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
         "run_command" => command_backend_kind.is_some(),
-        "write_file" | "edit_file" | "apply_patch" | "mv" | "rm" | "git_commit" | "git_revert" => {
+        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm"
+        | "git_commit" | "git_revert" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
         "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
@@ -3739,6 +3752,31 @@ fn run_tool(
             });
             context.gate_state.borrow_mut().wrote_file = true;
             Ok(format!("created {}", resolved.display()))
+        }
+        "replace_file" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .context("replace_file requires string argument: path")?;
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .context("replace_file requires string argument: content")?;
+            let resolved = resolve_workspace_path(workspace_root, path, true)?;
+            ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
+            let existing = std::fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+            std::fs::write(&resolved, content)
+                .with_context(|| format!("failed to write {}", resolved.display()))?;
+            sink.emit(AgentEvent::Diff {
+                path: path.to_string(),
+                diff: unified_diff(&existing, content, path),
+                nesting_depth: (context.request.sub_agent_depth > 0)
+                    .then_some(context.request.sub_agent_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            context.gate_state.borrow_mut().wrote_file = true;
+            Ok(format!("replaced {}", resolved.display()))
         }
         "edit_file" => {
             let path = arguments
@@ -6320,6 +6358,14 @@ mod tests {
             .expect("run_command should be available with a backend");
         assert_eq!(run_command.input_schema["type"], "object");
         assert_eq!(run_command.input_schema["required"], json!(["cmd"]));
+        let replace_file = build_tools
+            .iter()
+            .find(|tool| tool.name == "replace_file")
+            .expect("replace_file should be available to build profiles");
+        assert_eq!(
+            replace_file.input_schema["required"],
+            json!(["path", "content"])
+        );
         assert!(build_tools.iter().any(|tool| tool.name == "sub_agent"));
     }
 
