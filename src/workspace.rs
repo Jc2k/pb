@@ -239,6 +239,8 @@ pub struct WorkspaceConfigDocument {
     pub components: Vec<WorkspaceComponent>,
     #[serde(default)]
     pub checks: Vec<WorkspaceCheck>,
+    #[serde(default)]
+    pub cargo_workspaces: Vec<CargoWorkspace>,
 }
 
 impl WorkspaceConfigDocument {
@@ -274,6 +276,8 @@ impl WorkspaceConfigDocument {
         let executors = unique_by_id("executor", self.executors, |item| &item.id)?;
         let components = unique_by_id("component", self.components, |item| &item.id)?;
         let checks = unique_by_id("check", self.checks, |item| &item.id)?;
+        let cargo_workspaces =
+            unique_by_id("Cargo workspace", self.cargo_workspaces, |item| &item.id)?;
 
         for executor in executors.values() {
             validate_id("executor", &executor.id)?;
@@ -315,6 +319,15 @@ impl WorkspaceConfigDocument {
                     check.executor
                 );
             }
+            for component in &check.components {
+                if !components.contains_key(component) {
+                    bail!(
+                        "check '{}' references unknown component '{}'",
+                        check.id,
+                        component
+                    );
+                }
+            }
             validate_references("check", &check.id, &check.depends_on, &checks)?;
         }
         validate_acyclic(
@@ -329,12 +342,46 @@ impl WorkspaceConfigDocument {
                 .iter()
                 .map(|(id, item)| (id.as_str(), item.depends_on.as_slice())),
         )?;
+        for workspace in cargo_workspaces.values() {
+            validate_id("Cargo workspace", &workspace.id)?;
+            validate_relative_path("Cargo workspace root", &workspace.root, true)?;
+            validate_relative_path(
+                "Cargo workspace manifest_path",
+                &workspace.manifest_path,
+                false,
+            )?;
+            for member in workspace
+                .members
+                .iter()
+                .chain(workspace.default_members.iter())
+            {
+                if !components.contains_key(member) {
+                    bail!(
+                        "Cargo workspace '{}' references unknown component '{}'",
+                        workspace.id,
+                        member
+                    );
+                }
+            }
+            if workspace
+                .default_members
+                .iter()
+                .any(|member| !workspace.members.contains(member))
+            {
+                bail!(
+                    "Cargo workspace '{}' default_members must be workspace members",
+                    workspace.id
+                );
+            }
+        }
 
         Ok(WorkspaceGraph {
             version: self.version,
             executors,
             components,
             checks,
+            cargo_workspaces,
+            discovery_warnings: Vec::new(),
             source: WorkspaceGraphSource::Explicit,
         })
     }
@@ -346,6 +393,10 @@ pub struct WorkspaceGraph {
     pub executors: BTreeMap<String, Executor>,
     pub components: BTreeMap<String, WorkspaceComponent>,
     pub checks: BTreeMap<String, WorkspaceCheck>,
+    #[serde(default)]
+    pub cargo_workspaces: BTreeMap<String, CargoWorkspace>,
+    #[serde(default)]
+    pub discovery_warnings: Vec<String>,
     pub source: WorkspaceGraphSource,
 }
 
@@ -362,6 +413,26 @@ impl WorkspaceGraph {
                 .map(|config| config.guard_commands.as_slice())
                 .unwrap_or_default(),
         ))
+    }
+
+    pub fn load_or_discover(
+        repo_root: &Path,
+        environment: Option<&EnvironmentConfig>,
+    ) -> Result<Self> {
+        if let Some(document) = WorkspaceConfigDocument::load(repo_root)? {
+            return document.normalize();
+        }
+        crate::workspace_discovery::discover_workspace(repo_root, environment)
+    }
+
+    pub fn to_document(&self) -> WorkspaceConfigDocument {
+        WorkspaceConfigDocument {
+            version: self.version,
+            executors: self.executors.values().cloned().collect(),
+            components: self.components.values().cloned().collect(),
+            checks: self.checks.values().cloned().collect(),
+            cargo_workspaces: self.cargo_workspaces.values().cloned().collect(),
+        }
     }
 
     pub fn legacy(guard_commands: &[String]) -> Self {
@@ -390,6 +461,7 @@ impl WorkspaceGraph {
                     command: command.clone(),
                     cwd: ".".to_string(),
                     executor: executor.id.clone(),
+                    components: vec![component.id.clone()],
                     trigger: CheckTrigger::Changed,
                     inputs: vec!["**".to_string()],
                     outputs: Vec::new(),
@@ -404,6 +476,8 @@ impl WorkspaceGraph {
             executors: BTreeMap::from([(executor.id.clone(), executor)]),
             components: BTreeMap::from([(component.id.clone(), component)]),
             checks,
+            cargo_workspaces: BTreeMap::new(),
+            discovery_warnings: Vec::new(),
             source: WorkspaceGraphSource::LegacyGuards,
         }
     }
@@ -462,6 +536,8 @@ pub struct WorkspaceCheck {
     pub cwd: String,
     pub executor: String,
     #[serde(default)]
+    pub components: Vec<String>,
+    #[serde(default)]
     pub trigger: CheckTrigger,
     #[serde(default)]
     pub inputs: Vec<String>,
@@ -471,6 +547,15 @@ pub struct WorkspaceCheck {
     pub depends_on: Vec<String>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CargoWorkspace {
+    pub id: String,
+    pub root: String,
+    pub manifest_path: String,
+    pub members: Vec<String>,
+    pub default_members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

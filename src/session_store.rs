@@ -339,6 +339,7 @@ mod tests {
             top_k: 1,
             seed: 0,
             environment: None::<EnvironmentConfig>,
+            workspace_graph: None,
             session_id: String::new(),
             attachments: Vec::new(),
             contract: None,

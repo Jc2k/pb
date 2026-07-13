@@ -491,6 +491,9 @@ pub struct AgentRequest {
     pub seed: u32,
     /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
     pub environment: Option<EnvironmentConfig>,
+    /// Optional trusted normalized workspace graph. Ordinary sessions discover/load it at runtime.
+    #[serde(default)]
+    pub workspace_graph: Option<crate::workspace::WorkspaceGraph>,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -506,6 +509,7 @@ pub struct AgentRunResult {
     pub workspace_root: PathBuf,
     pub focus_root: PathBuf,
     pub repository_context: Option<crate::workspace::RepositoryContext>,
+    pub workspace_graph: Option<crate::workspace::WorkspaceGraph>,
     pub reached_final: bool,
     pub contract_status: ContractStatus,
     pub verified_completed: bool,
@@ -1138,6 +1142,16 @@ pub fn run_agent<S: EventSink>(
             EnvironmentConfig::load(&workspace_root).ok().flatten()
         }
     });
+    let workspace_graph = if args.repository_less {
+        None
+    } else if let Some(graph) = args.workspace_graph.clone() {
+        Some(graph)
+    } else {
+        Some(crate::workspace::WorkspaceGraph::load_or_discover(
+            &workspace_root,
+            env_config.as_ref(),
+        )?)
+    };
 
     // If an environment is configured, prepare the requested command backend for this task.
     let command_backend = if let Some(ref config) = env_config {
@@ -1288,6 +1302,7 @@ pub fn run_agent<S: EventSink>(
         workspace_root,
         focus_root,
         repository_context,
+        workspace_graph,
         reached_final,
         contract_status,
         verified_completed,
@@ -8170,6 +8185,7 @@ mod tests {
             top_k: 40,
             seed: 42,
             environment: None,
+            workspace_graph: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -10122,6 +10138,7 @@ mod tests {
             top_k: 40,
             seed: 42,
             environment: None,
+            workspace_graph: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -10184,6 +10201,7 @@ mod tests {
             top_k: 40,
             seed: 42,
             environment: None,
+            workspace_graph: None,
             session_id: "session-456".to_string(),
             attachments: Vec::new(),
             contract: None,

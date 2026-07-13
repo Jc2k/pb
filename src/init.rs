@@ -51,6 +51,7 @@ pub struct ProjectInspection {
     pub setup_commands: Vec<String>,
     pub session_commands: Vec<String>,
     pub guard_commands: Vec<String>,
+    pub documented_guard_commands: Vec<String>,
     pub prefers_local_backend: bool,
     pub prefers_container_backend: bool,
     pub scout_sources: Vec<PathBuf>,
@@ -451,9 +452,20 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
             root.join(".pb").join("workspace.toml").display()
         );
     } else {
+        let environment = EnvironmentConfig::load(&root)?;
+        let graph =
+            crate::workspace::WorkspaceGraph::load_or_discover(&root, environment.as_ref())?;
+        graph.to_document().save(&root)?;
         println!(
-            "No explicit workspace graph found; repository-wide guard commands remain active until component discovery is configured."
+            "Workspace graph written to {} ({} components, {} checks, {} executors).",
+            root.join(".pb").join("workspace.toml").display(),
+            graph.components.len(),
+            graph.checks.len(),
+            graph.executors.len()
         );
+        for warning in &graph.discovery_warnings {
+            println!("  warning: {warning}");
+        }
     }
 
     Ok(())
@@ -727,6 +739,7 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
                 info.session_commands.push(normalized.clone());
             }
             if is_guard_command(&cmd_lower, line) {
+                info.documented_guard_commands.push(normalized.clone());
                 info.guard_commands.push(normalized);
             }
         }
@@ -1130,6 +1143,26 @@ mod tests {
         write(dir.path(), ".pb/workspace.toml", "version = 1\n");
         let info = inspect(dir.path()).unwrap();
         assert!(info.has_pb_workspace);
+    }
+
+    #[test]
+    fn init_writes_normalized_workspace_graph_without_overwriting_environment_schema() {
+        let dir = TempDir::new().unwrap();
+        run_init(
+            Some(dir.path().to_path_buf()),
+            Some(EnvironmentBackend::Local),
+        )
+        .unwrap();
+
+        assert!(dir.path().join(".pb/environment.toml").is_file());
+        assert!(dir.path().join(".pb/workspace.toml").is_file());
+        let graph = crate::workspace::WorkspaceConfigDocument::load(dir.path())
+            .unwrap()
+            .unwrap()
+            .normalize()
+            .unwrap();
+        assert_eq!(graph.components.len(), 1);
+        assert_eq!(graph.components["repository"].root, ".");
     }
 
     // ── suggest_environment ──

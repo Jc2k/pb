@@ -46,6 +46,7 @@ pub mod tray;
 pub mod user;
 pub mod web;
 pub mod workspace;
+pub mod workspace_discovery;
 
 pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
@@ -923,6 +924,7 @@ async fn run_serve() -> Result<()> {
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
         environment: None,
+        workspace_graph: None,
         session_id: String::new(),
         attachments: Vec::new(),
         contract: None,
