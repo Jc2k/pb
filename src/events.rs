@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::agent_core::{AgentProfile, SessionAttachment};
 use crate::session_store::now_millis;
@@ -185,6 +186,15 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    ExecutorStarted {
+        executor_id: String,
+        kind: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     CheckResult {
         check_id: String,
         exit_status: i32,
@@ -194,6 +204,20 @@ pub enum AgentEvent {
         truncated: bool,
         duration_ms: u64,
         fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        executor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        dependency_outputs: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        reused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skip_reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,6 +359,10 @@ pub enum AgentEvent {
     },
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub version: String,
@@ -448,6 +476,22 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
+            AgentEvent::ExecutorStarted {
+                executor_id,
+                kind,
+                success,
+                detail,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ExecutorStarted {
+                    executor_id,
+                    kind,
+                    success,
+                    detail,
+                    timestamp_ms: Some(now),
+                },
+            },
             AgentEvent::CheckResult {
                 check_id,
                 exit_status,
@@ -457,6 +501,13 @@ impl EventEnvelope {
                 truncated,
                 duration_ms,
                 fingerprint,
+                executor,
+                source,
+                command_fingerprint,
+                dependency_outputs,
+                output_fingerprint,
+                reused,
+                skip_reason,
                 nesting_depth,
                 ..
             } => Self {
@@ -470,6 +521,13 @@ impl EventEnvelope {
                     truncated,
                     duration_ms,
                     fingerprint,
+                    executor,
+                    source,
+                    command_fingerprint,
+                    dependency_outputs,
+                    output_fingerprint,
+                    reused,
+                    skip_reason,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },

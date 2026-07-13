@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -33,6 +33,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::browser_tools;
+use crate::checks::{CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime};
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
@@ -494,6 +495,9 @@ pub struct AgentRequest {
     /// Optional trusted normalized workspace graph. Ordinary sessions discover/load it at runtime.
     #[serde(default)]
     pub workspace_graph: Option<crate::workspace::WorkspaceGraph>,
+    /// Runtime-owned repository/focus context and baselines. Older persisted requests omit it.
+    #[serde(default)]
+    pub repository_context: Option<crate::workspace::RepositoryContext>,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -674,27 +678,27 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandBackendKind {
+pub(crate) enum CommandBackendKind {
     Container,
     Local,
 }
 
-enum CommandBackend {
+pub(crate) enum CommandBackend {
     Container(container::ContainerHandle),
     Local { workspace_root: PathBuf },
 }
 
 #[derive(Debug)]
-struct CheckCommandOutput {
-    exit_status: i32,
-    timed_out: bool,
-    output: String,
-    truncated: bool,
-    duration_ms: u64,
+pub(crate) struct CheckCommandOutput {
+    pub exit_status: i32,
+    pub timed_out: bool,
+    pub output: String,
+    pub truncated: bool,
+    pub duration_ms: u64,
 }
 
 impl CommandBackend {
-    fn start(config: &EnvironmentConfig, workspace_root: &Path) -> Result<Self> {
+    pub(crate) fn start(config: &EnvironmentConfig, workspace_root: &Path) -> Result<Self> {
         match config.backend {
             EnvironmentBackend::AppleContainers => {
                 let runtime = container::detect_runtime().context(
@@ -743,34 +747,90 @@ impl CommandBackend {
         }
     }
 
-    fn kind(&self) -> CommandBackendKind {
+    pub(crate) fn kind(&self) -> CommandBackendKind {
         match self {
             CommandBackend::Container(_) => CommandBackendKind::Container,
             CommandBackend::Local { .. } => CommandBackendKind::Local,
         }
     }
 
-    fn exec(&self, cmd: &str) -> Result<String> {
+    pub(crate) fn exec(&self, cmd: &str) -> Result<String> {
         match self {
-            CommandBackend::Container(handle) => handle.exec(cmd),
+            CommandBackend::Container(handle) => handle.exec(&format!("cd /workspace && {cmd}")),
             CommandBackend::Local { workspace_root } => {
                 run_local_shell_command(cmd, workspace_root)
             }
         }
     }
 
-    fn exec_check(
+    pub(crate) fn exec_check(
         &self,
         check: &crate::harness_contract::AgentCheckContract,
         workspace_root: &Path,
     ) -> Result<CheckCommandOutput> {
         match self {
             CommandBackend::Local { .. } => run_local_check_command(check, workspace_root),
-            CommandBackend::Container(_) => bail!(
-                "named harness checks are not supported by the container command backend; use the daemon-free local harness"
-            ),
+            CommandBackend::Container(handle) => {
+                let cwd = resolve_workspace_path(workspace_root, &check.cwd, true)
+                    .with_context(|| format!("failed to resolve cwd for check '{}'", check.id))?;
+                if !cwd.is_dir() {
+                    bail!(
+                        "check '{}' cwd is not a directory: {}",
+                        check.id,
+                        cwd.display()
+                    );
+                }
+                let container_cwd = if check.cwd == "." {
+                    "/workspace".to_string()
+                } else {
+                    format!("/workspace/{}", check.cwd)
+                };
+                let command = format!("cd -- {} && {}", sh_quote(&container_cwd), check.command);
+                let started = Instant::now();
+                match handle.exec(&command) {
+                    Ok(output) => Ok(CheckCommandOutput {
+                        exit_status: 0,
+                        timed_out: false,
+                        output: if output.trim().is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            output
+                        },
+                        truncated: false,
+                        duration_ms: duration_millis(started),
+                    }),
+                    Err(error) => Ok(CheckCommandOutput {
+                        exit_status: 1,
+                        timed_out: false,
+                        output: format!("{error:#}"),
+                        truncated: false,
+                        duration_ms: duration_millis(started),
+                    }),
+                }
+            }
         }
     }
+
+    pub(crate) fn exec_workspace_check(
+        &self,
+        check: &crate::workspace::WorkspaceCheck,
+        workspace_root: &Path,
+    ) -> Result<CheckCommandOutput> {
+        self.exec_check(
+            &crate::harness_contract::AgentCheckContract {
+                id: check.id.clone(),
+                command: check.command.clone(),
+                cwd: check.cwd.clone(),
+                required: true,
+                timeout_seconds: check.timeout_seconds,
+            },
+            workspace_root,
+        )
+    }
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn run_local_check_command(
@@ -1020,6 +1080,7 @@ pub fn run_agent<S: EventSink>(
             &focus_root,
         )?)
     };
+    args.repository_context = repository_context.clone();
 
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
@@ -1152,10 +1213,15 @@ pub fn run_agent<S: EventSink>(
             env_config.as_ref(),
         )?)
     };
+    args.workspace_graph = workspace_graph.clone();
 
     // If an environment is configured, prepare the requested command backend for this task.
     let command_backend = if let Some(ref config) = env_config {
         Some(CommandBackend::start(config, &workspace_root)?)
+    } else if workspace_graph.is_some() {
+        Some(CommandBackend::Local {
+            workspace_root: workspace_root.clone(),
+        })
     } else {
         None
     };
@@ -2553,6 +2619,7 @@ struct ToolExecutionEnv<'a> {
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
     gate_state: &'a RefCell<GateState>,
+    workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
     nesting_depth: usize,
 }
 
@@ -2642,6 +2709,15 @@ fn run_agent_steps(
         workspace_root,
         command_backend.is_some(),
     ));
+    let workspace_checks = args.workspace_graph.as_ref().map(|graph| {
+        RefCell::new(WorkspaceCheckRuntime::new(
+            workspace_root,
+            graph,
+            env_config,
+            command_backend,
+            CheckEvidenceLedger::default(),
+        ))
+    });
     let available_tools = available_tool_specs_with_allowlist(
         args.profile,
         command_backend.map(CommandBackend::kind),
@@ -2901,6 +2977,7 @@ fn run_agent_steps(
                         policy_config,
                         personal_memory_repo,
                         gate_state: &gate_state,
+                        workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
                     messages,
@@ -2972,6 +3049,7 @@ fn run_agent_steps(
                         policy_config,
                         personal_memory_repo,
                         gate_state: &gate_state,
+                        workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
                     messages,
@@ -3535,6 +3613,7 @@ fn execute_tool_calls(
         policy_config: env.policy_config,
         personal_memory_repo: env.personal_memory_repo,
         gate_state: env.gate_state,
+        workspace_checks: env.workspace_checks,
     };
 
     let all_mcp = !runnable.is_empty()
@@ -4688,6 +4767,7 @@ struct ToolContext<'a> {
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
     gate_state: &'a RefCell<GateState>,
+    workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
 }
 
 fn contract_completion_gate_feedback(
@@ -5463,14 +5543,39 @@ fn run_tool(
                 .context("run_command requires string argument: cmd")?;
             let backend = command_backend
                 .context("run_command is not available: no project environment is configured")?;
-            let result = run_command_and_record_workspace_change(
-                backend,
-                cmd,
-                workspace_root,
-                context.request,
-                context.gate_state,
-            )?;
-            if context.request.profile == AgentProfile::Review {
+            let result = if let Some(check_id) = exact_workspace_check_id(context.request, cmd) {
+                let runtime = context.workspace_checks.with_context(|| {
+                    format!(
+                        "workspace check runtime is unavailable for declared check '{check_id}'"
+                    )
+                })?;
+                let before = workspace_change_observation(workspace_root, context.gate_state)?;
+                let summary = runtime.borrow_mut().run_named(
+                    &check_id,
+                    EvidenceSource::ExactGuardCommand,
+                    context.request.sub_agent_depth,
+                    sink,
+                )?;
+                record_workspace_change_observation(
+                    before,
+                    workspace_root,
+                    context.request,
+                    context.gate_state,
+                )?;
+                serde_json::to_string(&summary)?
+            } else {
+                run_command_and_record_workspace_change(
+                    backend,
+                    cmd,
+                    workspace_root,
+                    context.request,
+                    context.gate_state,
+                )?
+            };
+            if context.request.profile == AgentProfile::Review
+                && serde_json::from_str::<crate::checks::CheckRunSummary>(&result)
+                    .map_or(true, |summary| summary.all_succeeded())
+            {
                 context
                     .gate_state
                     .borrow_mut()
@@ -5480,6 +5585,16 @@ fn run_tool(
         }
         _ => bail!("unknown tool: {tool}"),
     }
+}
+
+fn exact_workspace_check_id(request: &AgentRequest, command: &str) -> Option<String> {
+    request.workspace_graph.as_ref().and_then(|graph| {
+        graph
+            .checks
+            .values()
+            .find(|check| check.cwd == "." && check.command.trim() == command.trim())
+            .map(|check| check.id.clone())
+    })
 }
 
 fn tool_is_in_request_allowlist(tool: &str, allowlist: Option<&[String]>) -> bool {
@@ -5530,6 +5645,13 @@ fn run_named_contract_check(
         truncated: output.truncated,
         duration_ms: output.duration_ms,
         fingerprint: fingerprint.clone(),
+        executor: Some("project".to_string()),
+        source: Some("agent_tool".to_string()),
+        command_fingerprint: None,
+        dependency_outputs: BTreeMap::new(),
+        output_fingerprint: None,
+        reused: false,
+        skip_reason: None,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -5558,16 +5680,35 @@ fn run_command_and_record_workspace_change(
     request: &AgentRequest,
     gate_state: &RefCell<GateState>,
 ) -> Result<String> {
-    let before = git_completion_marker(workspace_root);
-    let reviewed_content_before = {
+    let before = workspace_change_observation(workspace_root, gate_state)?;
+    let result = backend.exec(cmd);
+    record_workspace_change_observation(before, workspace_root, request, gate_state)?;
+    result
+}
+
+fn workspace_change_observation(
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<(Option<String>, Option<String>)> {
+    let marker = git_completion_marker(workspace_root);
+    let reviewed_content = {
         let state = gate_state.borrow();
         (state.review_completed_successfully || state.review_contract_evidence.is_some())
             .then(|| git_worktree_content_fingerprint(workspace_root))
             .transpose()?
     };
-    let result = backend.exec(cmd);
+    Ok((marker, reviewed_content))
+}
+
+fn record_workspace_change_observation(
+    before: (Option<String>, Option<String>),
+    workspace_root: &Path,
+    request: &AgentRequest,
+    gate_state: &RefCell<GateState>,
+) -> Result<()> {
+    let (marker_before, reviewed_content_before) = before;
     let after = git_completion_marker(workspace_root);
-    if before != after {
+    if marker_before != after {
         let content_changed = reviewed_content_before.as_ref().is_some_and(|before| {
             git_worktree_content_fingerprint(workspace_root).map_or(true, |after| &after != before)
         });
@@ -5584,7 +5725,7 @@ fn run_command_and_record_workspace_change(
             }
         }
     }
-    result
+    Ok(())
 }
 
 fn git_completion_marker(workdir: &Path) -> Option<String> {
@@ -8186,6 +8327,7 @@ mod tests {
             seed: 42,
             environment: None,
             workspace_graph: None,
+            repository_context: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -10139,6 +10281,7 @@ mod tests {
             seed: 42,
             environment: None,
             workspace_graph: None,
+            repository_context: None,
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -10202,6 +10345,7 @@ mod tests {
             seed: 42,
             environment: None,
             workspace_graph: None,
+            repository_context: None,
             session_id: "session-456".to_string(),
             attachments: Vec::new(),
             contract: None,

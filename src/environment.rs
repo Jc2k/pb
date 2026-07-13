@@ -93,11 +93,13 @@ impl EnvironmentConfig {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
+        Self::load_path(&path).map(Some)
+    }
+
+    pub fn load_path(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: Self =
-            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(Some(config))
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// Persist the config to `<workspace_root>/.pb/environment.toml`, creating directories as needed.

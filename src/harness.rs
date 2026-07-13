@@ -304,6 +304,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         seed: args.seed.unwrap_or_else(|| user_config.effective_seed()),
         environment: Some(harness_environment()),
         workspace_graph: None,
+        repository_context: None,
         session_id: format!("harness-{}", layout.run_id),
         attachments: harness_attachments(&args.images)?,
         contract,

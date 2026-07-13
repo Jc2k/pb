@@ -20,6 +20,7 @@ use base64::Engine as _;
 
 pub mod agent_core;
 pub mod browser_tools;
+pub mod checks;
 pub mod cli_ui;
 pub mod config;
 pub mod container;
@@ -925,6 +926,7 @@ async fn run_serve() -> Result<()> {
         seed: user_config.effective_seed(),
         environment: None,
         workspace_graph: None,
+        repository_context: None,
         session_id: String::new(),
         attachments: Vec::new(),
         contract: None,

@@ -340,6 +340,7 @@ mod tests {
             seed: 0,
             environment: None::<EnvironmentConfig>,
             workspace_graph: None,
+            repository_context: None,
             session_id: String::new(),
             attachments: Vec::new(),
             contract: None,

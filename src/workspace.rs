@@ -281,6 +281,9 @@ impl WorkspaceConfigDocument {
 
         for executor in executors.values() {
             validate_id("executor", &executor.id)?;
+            if let Some(environment) = &executor.environment {
+                validate_relative_path("executor environment", environment, false)?;
+            }
         }
         for component in components.values() {
             validate_id("component", &component.id)?;

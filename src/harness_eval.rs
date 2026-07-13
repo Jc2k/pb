@@ -202,6 +202,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         seed: 0,
         environment: None,
         workspace_graph: None,
+        repository_context: None,
         session_id: format!("control-fixture-{}", fixture.id),
         attachments: Vec::new(),
         contract: fixture
@@ -378,6 +379,7 @@ fn run_real_model_fixture(
         seed: configuration.seed,
         environment: None,
         workspace_graph: None,
+        repository_context: None,
         session_id: format!("harness-eval-{}", fixture.id),
         attachments: Vec::new(),
         contract: fixture

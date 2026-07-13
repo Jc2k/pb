@@ -48,6 +48,19 @@ pub fn render_event(event: &AgentEvent) {
             };
             print_block(&label, result);
         }
+        AgentEvent::ExecutorStarted {
+            executor_id,
+            kind,
+            success,
+            detail,
+            ..
+        } => {
+            let state = if *success { "ready" } else { "unavailable" };
+            print_header(
+                "executor",
+                &format!("{executor_id} ({kind}, {state}) {detail}"),
+            );
+        }
         AgentEvent::CheckResult {
             check_id,
             exit_status,
@@ -55,9 +68,15 @@ pub fn render_event(event: &AgentEvent) {
             timed_out,
             output,
             duration_ms,
+            reused,
+            skip_reason,
             ..
         } => {
-            let disposition = if *timed_out {
+            let disposition = if skip_reason.is_some() {
+                "skipped"
+            } else if *reused {
+                "reused"
+            } else if *timed_out {
                 "timed out"
             } else if *success {
                 "passed"
