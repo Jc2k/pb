@@ -2318,6 +2318,13 @@ struct GateState {
     review_completed_successfully: bool,
 }
 
+impl GateState {
+    fn record_content_mutation(&mut self) {
+        self.wrote_file = true;
+        self.review_completed_successfully = false;
+    }
+}
+
 fn initial_gate_state(args: &AgentRequest, workspace_root: &Path) -> GateState {
     let wrote_file = args.accept_existing_workspace_changes
         && git_status_porcelain(workspace_root).is_ok_and(|status| !status.trim().is_empty());
@@ -3932,7 +3939,7 @@ fn run_tool(
                     .then_some(context.request.sub_agent_depth),
                 timestamp_ms: Some(now_millis()),
             });
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("created {}", resolved.display()))
         }
         "replace_file" => {
@@ -3957,7 +3964,7 @@ fn run_tool(
                     .then_some(context.request.sub_agent_depth),
                 timestamp_ms: Some(now_millis()),
             });
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("replaced {}", resolved.display()))
         }
         "edit_file" => {
@@ -3995,7 +4002,7 @@ fn run_tool(
                     .then_some(context.request.sub_agent_depth),
                 timestamp_ms: Some(now_millis()),
             });
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("updated {}", resolved.display()))
         }
         "apply_patch" => {
@@ -4019,7 +4026,7 @@ fn run_tool(
                     timestamp_ms: Some(now_millis()),
                 });
             }
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
         }
         "mv" => {
@@ -4056,7 +4063,7 @@ fn run_tool(
                     destination_path.display()
                 )
             })?;
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!(
                 "moved {} to {}",
                 source_path.display(),
@@ -4089,7 +4096,7 @@ fn run_tool(
                 std::fs::remove_file(&resolved)
             }
             .with_context(|| format!("failed to remove {}", resolved.display()))?;
-            context.gate_state.borrow_mut().wrote_file = true;
+            context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("removed {}", resolved.display()))
         }
         "web_search" => {
@@ -4237,10 +4244,22 @@ fn run_command_and_record_workspace_change(
     gate_state: &RefCell<GateState>,
 ) -> Result<String> {
     let before = git_completion_marker(workspace_root);
+    let reviewed_content_before = gate_state
+        .borrow()
+        .review_completed_successfully
+        .then(|| git_worktree_content_fingerprint(workspace_root))
+        .transpose()?;
     let result = backend.exec(cmd);
     let after = git_completion_marker(workspace_root);
     if before != after {
-        gate_state.borrow_mut().wrote_file = true;
+        let reviewed_content_changed = reviewed_content_before.as_ref().is_some_and(|before| {
+            git_worktree_content_fingerprint(workspace_root).map_or(true, |after| &after != before)
+        });
+        let mut state = gate_state.borrow_mut();
+        state.wrote_file = true;
+        if reviewed_content_changed {
+            state.review_completed_successfully = false;
+        }
     }
     result
 }
@@ -4256,6 +4275,69 @@ fn git_completion_marker(workdir: &Path) -> Option<String> {
         .unwrap_or_else(|| "<unborn>".to_string());
     let status = git_status_porcelain(workdir).ok()?;
     Some(format!("{head}\n{status}"))
+}
+
+fn git_worktree_content_fingerprint(workdir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(workdir)
+        .output()
+        .context("failed to list worktree files")?;
+    if !output.status.success() {
+        bail!(
+            "failed to list worktree files: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    let mut digest = Sha256::new();
+    for raw_path in paths {
+        digest.update((raw_path.len() as u64).to_le_bytes());
+        digest.update(raw_path);
+        let relative = std::str::from_utf8(raw_path)
+            .context("worktree contains a non-UTF-8 tracked or untracked path")?;
+        let path = workdir.join(relative);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                digest.update(b"symlink");
+                digest.update(
+                    std::fs::read_link(&path)
+                        .with_context(|| format!("failed to read symlink {}", path.display()))?
+                        .to_string_lossy()
+                        .as_bytes(),
+                );
+            }
+            Ok(metadata) if metadata.is_file() => {
+                digest.update(b"file");
+                digest.update(
+                    std::fs::read(&path).with_context(|| {
+                        format!("failed to read worktree file {}", path.display())
+                    })?,
+                );
+            }
+            Ok(metadata) if metadata.is_dir() => digest.update(b"directory"),
+            Ok(_) => digest.update(b"other"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update(b"missing"),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect worktree path {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn question_choices(arguments: &Value) -> Result<Vec<String>> {
@@ -4534,7 +4616,13 @@ fn run_sub_agent(
         .map(|v| v as usize)
         .unwrap_or(DEFAULT_SUB_AGENT_MAX_STEPS)
         .clamp(1, context.request.max_steps.max(1));
-    let workspace_status_before = git_status_porcelain(context.workspace_root).ok();
+    let workspace_marker_before = git_completion_marker(context.workspace_root);
+    let reviewed_content_before = context
+        .gate_state
+        .borrow()
+        .review_completed_successfully
+        .then(|| git_worktree_content_fingerprint(context.workspace_root))
+        .transpose()?;
     let isolated_review = if profile == AgentProfile::Review && !context.request.repository_less {
         Some(prepare_isolated_review_workspace(context.workspace_root)?)
     } else {
@@ -4651,10 +4739,18 @@ fn run_sub_agent(
     )?;
 
     metrics.add(&outcome.metrics);
-    let workspace_status_after = git_status_porcelain(context.workspace_root).ok();
-    let workspace_changed = workspace_status_before.as_deref() != workspace_status_after.as_deref();
+    let workspace_marker_after = git_completion_marker(context.workspace_root);
+    let workspace_changed = workspace_marker_before != workspace_marker_after;
     if workspace_changed {
-        context.gate_state.borrow_mut().wrote_file = true;
+        let reviewed_content_changed = reviewed_content_before.as_ref().is_some_and(|before| {
+            git_worktree_content_fingerprint(context.workspace_root)
+                .map_or(true, |after| &after != before)
+        });
+        let mut state = context.gate_state.borrow_mut();
+        state.wrote_file = true;
+        if reviewed_content_changed {
+            state.review_completed_successfully = false;
+        }
     }
     let review_mutated_workspace = if let Some(before) = review_fingerprint_before.as_ref() {
         git_workspace_fingerprint(sub_workspace_root).map_or(true, |after| &after != before)
@@ -7287,6 +7383,85 @@ mod tests {
         state.review_completed_successfully = true;
         assert!(completion_gate_feedback(AgentProfile::Build, &state).is_none());
         assert!(completion_gate_feedback(AgentProfile::Ask, &GateState::default()).is_none());
+    }
+
+    #[test]
+    fn content_mutation_invalidates_a_previous_review() {
+        let mut state = GateState {
+            review_completed_successfully: true,
+            ..GateState::default()
+        };
+
+        state.record_content_mutation();
+
+        assert!(state.wrote_file);
+        assert!(!state.review_completed_successfully);
+        assert!(
+            completion_gate_feedback(AgentProfile::Build, &state)
+                .unwrap()
+                .contains("review")
+        );
+    }
+
+    #[test]
+    fn command_content_changes_invalidate_review_but_commits_do_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: initialize"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let gate_state = RefCell::new(GateState {
+            review_completed_successfully: true,
+            ..GateState::default()
+        });
+        run_command_and_record_workspace_change(
+            &backend,
+            "git commit --allow-empty -m 'test: metadata only'",
+            tmp.path(),
+            &gate_state,
+        )
+        .unwrap();
+        assert!(gate_state.borrow().review_completed_successfully);
+
+        run_command_and_record_workspace_change(
+            &backend,
+            "printf 'after\\n' > tracked.txt",
+            tmp.path(),
+            &gate_state,
+        )
+        .unwrap();
+        assert!(!gate_state.borrow().review_completed_successfully);
     }
 
     #[test]
