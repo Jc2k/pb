@@ -1546,6 +1546,14 @@ mod tests {
             metadata.source,
             path.canonicalize().unwrap().display().to_string()
         );
+
+        let layout = prepare_scratch(Some(&parent.path().join("run"))).unwrap();
+        assert!(!layout.workspace.join("workspace.toml").exists());
+        assert!(!layout.workspace.join(".pb/workspace.toml").exists());
+        let repository =
+            crate::workspace::RepositoryContext::capture(&layout.workspace, &layout.workspace)
+                .unwrap();
+        assert!(repository.task_changed_paths().unwrap().is_empty());
     }
 
     #[test]

@@ -9049,6 +9049,166 @@ mod tests {
     }
 
     #[test]
+    fn reverted_final_edit_enters_no_change_handoff() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 4;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        let mut graph = crate::workspace::WorkspaceGraph::legacy(&["false".to_string()]);
+        graph.checks.values_mut().for_each(|check| {
+            check.trigger = crate::workspace::CheckTrigger::Changed;
+        });
+        request.workspace_graph = Some(graph);
+        let write = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "write_file",
+                "arguments": {"path": "transient.txt", "content": "temporary\n"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let remove = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "rm",
+                "arguments": {"path": "transient.txt"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let read = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "read_file",
+                "arguments": {"path": "transient.txt"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![write, read, remove, scripted_final("reverted")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::Final,
+            "events: {events:#?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::HandoffSummary { summary, .. }
+                if summary.outcome == crate::events::HandoffOutcome::NoChange
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult { .. }
+                | AgentEvent::ExecutorStarted { .. }
+                | AgentEvent::CommitResult { .. }
+        )));
+        assert!(!tmp.path().join("transient.txt").exists());
+    }
+
+    #[test]
+    fn required_mutation_rejects_handoff_no_change() {
+        let tmp = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        let contract = crate::harness_contract::HarnessContractDocument {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["change.txt".to_string()],
+            checks: Vec::new(),
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        }
+        .normalize()
+        .unwrap();
+        let graph = contract
+            .compile_workspace_graph(crate::workspace::WorkspaceGraph::legacy(&[]))
+            .unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.repository_context = Some(repository);
+        request.workspace_graph = Some(graph);
+        request.contract = Some(contract);
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("nothing changed")],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.contract_status, ContractStatus::Unsatisfied);
+        assert!(!outcome.verified_completed);
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::ContractUnsatisfied
+        );
+    }
+
+    #[test]
+    fn failed_handoff_check_passes_after_one_repair_turn() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 3;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "test -f repaired.txt".to_string(),
+        ]));
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let repair = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "write_file",
+                "arguments": {"path": "repaired.txt", "content": "fixed\n"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done"), repair, scripted_final("repaired")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(outcome.llm_invocations, 3);
+        let check_results = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::CheckResult { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(check_results, vec![false, true]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TeamMessage { message, .. } if message.contains("Kate")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::HandoffSummary { summary, .. }
+                if summary.outcome == crate::events::HandoffOutcome::Ready
+        )));
+    }
+
+    #[test]
     fn identical_handoff_failure_gets_one_repair_turn_then_stops() {
         let tmp = init_contract_test_repo();
         let mut request = test_agent_request(AgentProfile::Scout, 256);
@@ -9083,6 +9243,30 @@ mod tests {
             event,
             AgentEvent::TeamMessage { message, .. } if message.contains("same checks failed again")
         )));
+    }
+
+    #[test]
+    fn failed_handoff_without_a_repair_turn_has_checks_failed_outcome() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "false".to_string()
+        ]));
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::ChecksFailed);
+        assert_eq!(outcome.llm_invocations, 1);
     }
 
     #[test]

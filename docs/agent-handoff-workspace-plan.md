@@ -1,6 +1,6 @@
 # Agent handoff and workspace execution plan
 
-Status: proposed
+Status: implemented; per-outcome real-model rollout remains a P2 experiment
 
 ## Outcome
 
@@ -788,22 +788,32 @@ work.
 
 ## Completion audit
 
-- [ ] Model final is treated as handoff intent rather than achievement proof.
-- [ ] The web UI presents deterministic feedback as a team member in the group chat.
-- [ ] Repository root and selected project focus remain distinct throughout a session.
-- [ ] Affected checks are selected from a typed workspace graph.
-- [ ] Polyglot components can use separate lazy executors.
-- [ ] Cargo workspaces use metadata-aware package/dependency selection.
-- [ ] Generated bundle dependencies are ordered and fingerprinted.
-- [ ] Current check evidence is reused and stale evidence is rerun.
-- [ ] Failed checks cannot produce a managed commit.
-- [ ] No-change sessions run no unnecessary change-conditioned work.
-- [ ] Managed commits contain only session-owned changes.
-- [ ] Explicit harness contracts converge on the same handoff implementation.
-- [ ] Harness resume preserves task ownership with distinct task and invocation baselines.
-- [ ] `pb harness agent` exits and `verified_completed` follow the documented matrix.
-- [ ] Harness journals and run index preserve handoff, evidence, team-message, and commit outcomes.
-- [ ] Harness evaluation accounts for runtime checks, repair, executors, no-change, and safe commit.
-- [ ] Non-agent harness subcommands remain behaviorally unchanged.
-- [ ] All new events/configuration retain backward-compatible reads.
-- [ ] Deterministic and full repository verification passes.
+- [x] Model final is treated as handoff intent rather than achievement proof.
+- [x] The web UI presents deterministic feedback as a team member in the group chat.
+- [x] Repository root and selected project focus remain distinct throughout a session.
+- [x] Affected checks are selected from a typed workspace graph.
+- [x] Polyglot components can use separate lazy executors.
+- [x] Cargo workspaces use metadata-aware package/dependency selection.
+- [x] Generated bundle dependencies are ordered and fingerprinted.
+- [x] Current check evidence is reused and stale evidence is rerun.
+- [x] Failed checks cannot produce a managed commit.
+- [x] No-change sessions run no unnecessary change-conditioned work.
+- [x] Managed commits contain only session-owned changes.
+- [x] Explicit harness contracts converge on the same handoff implementation.
+- [x] Harness resume preserves task ownership with distinct task and invocation baselines.
+- [x] `pb harness agent` exits and `verified_completed` follow the documented matrix.
+- [x] Harness journals and run index preserve handoff, evidence, team-message, and commit outcomes.
+- [x] Harness evaluation accounts for runtime checks, repair, executors, no-change, and safe commit.
+- [x] Non-agent harness subcommands remain behaviorally unchanged.
+- [x] All new events/configuration retain backward-compatible reads.
+- [x] Deterministic and full repository verification passes.
+
+## Rollout note — 2026-07-13
+
+The schema-v2 scripted corpus passes all 16 fixtures with deterministic sampling and no model or
+container dependency. A bounded CPU-only Qwen2.5-Coder 7B matrix was run afterward with a fixed
+seed and recorded configuration. It exercised both `ready` and `no_change`, including a resumed
+task whose inherited change was checked and committed, but the model did not follow the scripted
+action protocol reliably enough to reach every forced failure outcome. Per-outcome real-model
+coverage remains a P2 model/prompt experiment; it is not used to weaken or replace the deterministic
+control-plane acceptance suite.

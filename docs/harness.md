@@ -153,6 +153,9 @@ report contains no timestamps, scratch paths, or nondeterministic commit IDs and
 to diff directly; real-model records retain the resulting commit hash. A protocol mismatch exits
 non-zero. `artifact_quality` remains separate from protocol scoring. Schema-v1 fixture/result data
 is rejected explicitly rather than compared under changed metric meanings.
+The checked fixture corpus also models resumed scratch work: `resumed_files` are applied after the
+original task baseline is captured, so evaluation can prove that inherited uncommitted work remains
+task-owned, checkable, and committable without requiring a model or a second process.
 
 Real-model matrices are opt-in and must name the local model explicitly:
 

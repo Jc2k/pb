@@ -876,6 +876,8 @@ mod tests {
         git(repo.path(), &["commit", "-m", "test: add user fixture"]);
         std::fs::write(repo.path().join("user.txt"), "user work\n").unwrap();
         std::fs::write(repo.path().join("notes.txt"), "private notes\n").unwrap();
+        std::fs::create_dir_all(repo.path().join(".pb")).unwrap();
+        std::fs::write(repo.path().join(".pb/private.toml"), "user_owned = true\n").unwrap();
         let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
         std::fs::write(repo.path().join("task.txt"), "task work\n").unwrap();
 
@@ -894,10 +896,61 @@ mod tests {
             std::fs::read_to_string(repo.path().join("notes.txt")).unwrap(),
             "private notes\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".pb/private.toml")).unwrap(),
+            "user_owned = true\n"
+        );
         let status = git(repo.path(), &["status", "--porcelain"]);
         assert!(status.contains("user.txt"));
         assert!(status.contains("notes.txt"));
+        assert!(status.contains(".pb/"));
         assert!(!status.contains("task.txt"));
+    }
+
+    #[test]
+    fn resumed_uncommitted_work_remains_task_owned_checkable_and_committable() {
+        let repo = init_repo();
+        let task_context = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("task.txt"), "work from an earlier run\n").unwrap();
+
+        let repository =
+            RepositoryContext::resume(repo.path(), repo.path(), task_context.task_baseline)
+                .unwrap();
+        assert_ne!(
+            repository.task_baseline.id,
+            repository.invocation_baseline.id
+        );
+        assert_eq!(repository.task_changed_paths().unwrap(), vec!["task.txt"]);
+
+        let graph = graph("test -f task.txt", CheckTrigger::Changed);
+        let mut runtime = runtime(repo.path(), &graph);
+        let mut events = Vec::new();
+        let attempt = run_handoff(
+            &repository,
+            &graph,
+            &mut runtime,
+            "feat: finish resumed task fixture",
+            0,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        let HandoffAttempt::Ready(summary) = attempt else {
+            panic!("expected ready handoff");
+        };
+        assert_eq!(summary.changed_paths, vec!["task.txt"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                success: true,
+                reused: false,
+                ..
+            }
+        )));
+        assert_eq!(
+            git(repo.path(), &["show", "--pretty=", "--name-only", "HEAD"]).trim(),
+            "task.txt"
+        );
     }
 
     #[test]

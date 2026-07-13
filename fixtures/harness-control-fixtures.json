@@ -216,6 +216,51 @@
       "observe_paths": ["app.txt"]
     },
     {
+      "id": "handoff_required_mutation_no_change",
+      "hypothesis": "A required-mutation contract rejects a final whose repository content is unchanged.",
+      "profile": "scout",
+      "max_steps": 1,
+      "completion_supported": false,
+      "expected": {"reached_final":true,"contract_status":"unsatisfied","verified_completed":false,"termination_reason":"contract_unsatisfied","llm_invocations":1,"tool_calls":0,"false_completion":false,"observed_paths":{},"executed_checks":0,"reused_checks":0,"repair_turns":0},
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["app/**"]
+      },
+      "turns": [
+        {"content": "{\"type\":\"final\",\"content\":\"Done.\"}"}
+      ]
+    },
+    {
+      "id": "handoff_repair_succeeds",
+      "hypothesis": "A failed handoff check returns one bounded repair turn and passes after the repair changes its inputs.",
+      "profile": "scout",
+      "max_steps": 4,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":4,"tool_calls":2,"false_completion":false,"observed_paths":{"app/change.txt":true,"app/repaired.txt":true},"handoff_outcome":"ready","selected_checks":["app-test"],"executed_checks":2,"reused_checks":0,"executor_starts":["app"],"repair_turns":1,"commit_disposition":"created"},
+      "workspace": {
+        "version": 1,
+        "executors": [
+          {"id":"app","kind":"local"}
+        ],
+        "components": [
+          {"id":"app","root":"app","include":["app/**"],"executor":"app"}
+        ],
+        "checks": [
+          {"id":"app-test","command":"test -f app/repaired.txt","executor":"app","components":["app"],"trigger":"changed","inputs":["app/**"]}
+        ]
+      },
+      "tool_allowlist": ["write_file"],
+      "initial_files": {"app/base.txt":"before\n"},
+      "turns": [
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"app/change.txt\",\"content\":\"changed\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Done.\"}"},
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"app/repaired.txt\",\"content\":\"fixed\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Repaired.\"}"}
+      ],
+      "observe_paths": ["app/change.txt", "app/repaired.txt"]
+    },
+    {
       "id": "handoff_repeated_check_failure",
       "hypothesis": "The same failing handoff check gets one repair turn and then stops deterministically.",
       "profile": "scout",
@@ -235,6 +280,32 @@
         {"content": "{\"type\":\"final\",\"content\":\"Still done.\"}"}
       ],
       "observe_paths": ["app.txt"]
+    },
+    {
+      "id": "resumed_task_owned_change",
+      "hypothesis": "An uncommitted change inherited from an earlier invocation remains task-owned, checkable, and committable.",
+      "profile": "scout",
+      "max_steps": 1,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":1,"tool_calls":0,"false_completion":false,"observed_paths":{"api/resumed.txt":true},"handoff_outcome":"ready","selected_checks":["api-test"],"executed_checks":1,"reused_checks":0,"executor_starts":["api"],"repair_turns":0,"commit_disposition":"created"},
+      "workspace": {
+        "version": 1,
+        "executors": [
+          {"id":"api","kind":"local"}
+        ],
+        "components": [
+          {"id":"api","root":"api","include":["api/**"],"executor":"api"}
+        ],
+        "checks": [
+          {"id":"api-test","command":"test -f api/resumed.txt","executor":"api","components":["api"],"trigger":"changed","inputs":["api/**"]}
+        ]
+      },
+      "initial_files": {"api/base.txt":"before\n"},
+      "resumed_files": {"api/resumed.txt":"work from an earlier invocation\n"},
+      "turns": [
+        {"content": "{\"type\":\"final\",\"content\":\"Finish the resumed task.\"}"}
+      ],
+      "observe_paths": ["api/resumed.txt"]
     },
     {
       "id": "multi_executor_affected_selection",

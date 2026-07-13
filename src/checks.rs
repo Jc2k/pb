@@ -1216,6 +1216,20 @@ mod tests {
             .unwrap();
         assert_eq!(summary.reused, vec!["api-test"]);
         assert!(summary.executed.is_empty());
+
+        write(repo.path(), "api/input.txt", "two\n");
+        let mut stale_resume = WorkspaceCheckRuntime::new(
+            repo.path(),
+            &graph,
+            None,
+            None,
+            CheckEvidenceLedger::from_events(&events),
+        );
+        let stale_summary = stale_resume
+            .run_plan(&plan, EvidenceSource::Handoff, 0, &mut |_| {})
+            .unwrap();
+        assert_eq!(stale_summary.executed, vec!["api-test"]);
+        assert!(stale_summary.reused.is_empty());
     }
 
     #[test]
@@ -1306,8 +1320,11 @@ mod tests {
             checks: vec!["bundle".to_string(), "app-test".to_string()],
             reasons: BTreeMap::new(),
         };
+        let mut events = Vec::new();
         let summary = runtime
-            .run_plan(&plan, EvidenceSource::Handoff, 0, &mut |_| {})
+            .run_plan(&plan, EvidenceSource::Handoff, 0, &mut |event| {
+                events.push(event)
+            })
             .unwrap();
         assert!(summary.all_succeeded());
         assert!(
@@ -1316,9 +1333,27 @@ mod tests {
                 .contains_key("bundle")
         );
 
+        write(repo.path(), "app/main.txt", "app changed\n");
+        let app_plan = plan_checks_for_paths(&graph, vec!["app/main.txt".to_string()]).unwrap();
+        assert_eq!(app_plan.checks, vec!["bundle", "app-test"]);
+        let current_bundle = runtime
+            .run_plan(&app_plan, EvidenceSource::Handoff, 0, &mut |event| {
+                events.push(event)
+            })
+            .unwrap();
+        assert_eq!(current_bundle.executed, vec!["app-test"]);
+        assert_eq!(current_bundle.reused, vec!["bundle"]);
+
         std::fs::remove_file(repo.path().join("generated/bundle.txt")).unwrap();
-        let rerun = runtime
-            .run_plan(&plan, EvidenceSource::Handoff, 0, &mut |_| {})
+        let mut resumed = WorkspaceCheckRuntime::new(
+            repo.path(),
+            &graph,
+            None,
+            Some(&backend),
+            CheckEvidenceLedger::from_events(&events),
+        );
+        let rerun = resumed
+            .run_plan(&app_plan, EvidenceSource::Handoff, 0, &mut |_| {})
             .unwrap();
         assert_eq!(rerun.executed, vec!["bundle"]);
         assert_eq!(rerun.reused, vec!["app-test"]);

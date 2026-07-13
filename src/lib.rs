@@ -3618,6 +3618,34 @@ mod tests {
     }
 
     #[test]
+    fn harness_infer_and_bench_keep_their_runtime_validation_paths() {
+        let infer = Cli::try_parse_from(["pb", "harness", "infer", "   "]).unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(infer),
+        } = infer.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(
+            run_flashmoe_infer(infer).unwrap_err().to_string(),
+            "prompt cannot be empty"
+        );
+
+        let bench =
+            Cli::try_parse_from(["pb", "harness", "bench", "--status", "not-a-result"]).unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Bench(bench),
+        } = bench.command
+        else {
+            panic!("expected harness bench command");
+        };
+        assert_eq!(
+            run_flashmoe_bench(bench).unwrap_err().to_string(),
+            "--status must be kept or discarded"
+        );
+    }
+
+    #[test]
     fn harness_eval_defaults_to_scripted_and_records_model_options() {
         let scripted = Cli::try_parse_from(["pb", "harness", "eval"]).unwrap();
         let Commands::Harness {

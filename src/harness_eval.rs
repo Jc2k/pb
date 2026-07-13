@@ -44,6 +44,8 @@ pub struct ControlFixture {
     pub tool_allowlist: Vec<String>,
     #[serde(default)]
     pub initial_files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub resumed_files: BTreeMap<String, String>,
     pub turns: Vec<ControlFixtureTurn>,
     #[serde(default)]
     pub observe_paths: Vec<String>,
@@ -289,7 +291,17 @@ fn fixture_runtime(
     crate::workspace::RepositoryContext,
 )> {
     let (contract, workspace_graph) = fixture_workspace_graph(fixture)?;
-    let repository_context = crate::workspace::RepositoryContext::capture(workspace, workspace)?;
+    let task_context = crate::workspace::RepositoryContext::capture(workspace, workspace)?;
+    let repository_context = if fixture.resumed_files.is_empty() {
+        task_context
+    } else {
+        write_fixture_files(workspace, &fixture.resumed_files)?;
+        crate::workspace::RepositoryContext::resume(
+            workspace,
+            workspace,
+            task_context.task_baseline,
+        )?
+    };
     Ok((contract, workspace_graph, repository_context))
 }
 
@@ -1039,6 +1051,17 @@ fn initialize_fixture_workspace(root: &Path, files: &BTreeMap<String, String>) -
     run_git(root, &["init", "--initial-branch=main"])?;
     run_git(root, &["config", "user.name", "pb harness fixture"])?;
     run_git(root, &["config", "user.email", "fixture@pb.local"])?;
+    write_fixture_files(root, files)?;
+    run_git(root, &["add", "-A"])?;
+    run_git(
+        root,
+        &["commit", "--allow-empty", "-m", "test: initialize fixture"],
+    )?;
+    run_git(root, &["checkout", "-b", "harness-eval"])?;
+    Ok(())
+}
+
+fn write_fixture_files(root: &Path, files: &BTreeMap<String, String>) -> Result<()> {
     for (relative, content) in files {
         let path = fixture_path(root, relative)?;
         if let Some(parent) = path.parent() {
@@ -1048,12 +1071,6 @@ fn initialize_fixture_workspace(root: &Path, files: &BTreeMap<String, String>) -
         std::fs::write(&path, content)
             .with_context(|| format!("failed to write fixture file {}", path.display()))?;
     }
-    run_git(root, &["add", "-A"])?;
-    run_git(
-        root,
-        &["commit", "--allow-empty", "-m", "test: initialize fixture"],
-    )?;
-    run_git(root, &["checkout", "-b", "harness-eval"])?;
     Ok(())
 }
 
@@ -1194,6 +1211,33 @@ mod tests {
         assert_eq!(handoff.model_run_check_calls, 0);
         assert_eq!(handoff.executed_checks, 1);
         assert_eq!(handoff.commit_disposition.as_deref(), Some("created"));
+        let required_no_change = actual
+            .iter()
+            .find(|result| result.id == "handoff_required_mutation_no_change")
+            .unwrap();
+        assert_eq!(
+            required_no_change.termination_reason,
+            "contract_unsatisfied"
+        );
+        assert!(!required_no_change.verified_completed);
+        let repaired = actual
+            .iter()
+            .find(|result| result.id == "handoff_repair_succeeds")
+            .unwrap();
+        assert_eq!(repaired.executed_checks, 2);
+        assert_eq!(repaired.failed_checks, 1);
+        assert_eq!(repaired.repair_turns, 1);
+        assert_eq!(
+            repaired.handoff_outcome,
+            Some(crate::events::HandoffOutcome::Ready)
+        );
+        let resumed = actual
+            .iter()
+            .find(|result| result.id == "resumed_task_owned_change")
+            .unwrap();
+        assert_eq!(resumed.affected_components, vec!["api"]);
+        assert_eq!(resumed.executed_checks, 1);
+        assert_eq!(resumed.commit_disposition.as_deref(), Some("created"));
         let multi = actual
             .iter()
             .find(|result| result.id == "multi_executor_affected_selection")

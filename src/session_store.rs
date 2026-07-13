@@ -416,12 +416,25 @@ mod tests {
             Some(dir.path().to_path_buf()),
             true,
             SessionStatus::Running,
-            vec![EventEnvelope::new(AgentEvent::Final {
-                content: "done".to_string(),
-                profile: AgentProfile::Build,
-                nesting_depth: None,
-                timestamp_ms: None,
-            })],
+            vec![
+                EventEnvelope::new(AgentEvent::Final {
+                    content: "done".to_string(),
+                    profile: AgentProfile::Build,
+                    nesting_depth: None,
+                    timestamp_ms: None,
+                }),
+                EventEnvelope::new(AgentEvent::TeamMessage {
+                    actor: crate::events::TeamActor::Automation(
+                        crate::events::AutomationActor::Handoff,
+                    ),
+                    tone: crate::events::TeamMessageTone::Success,
+                    message: "Everything affected passed.".to_string(),
+                    detail: Some("cargo test --all-targets".to_string()),
+                    evidence_ids: vec!["check:rust".to_string()],
+                    nesting_depth: None,
+                    timestamp_ms: None,
+                }),
+            ],
         );
 
         save_session(&session).unwrap();
@@ -429,7 +442,19 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].session_id, "session-123");
         assert!(!restored[0].running);
-        assert_eq!(restored[0].events.len(), 1);
+        assert_eq!(restored[0].events.len(), 2);
+        assert!(matches!(
+            &restored[0].events[1].event,
+            AgentEvent::TeamMessage {
+                actor: crate::events::TeamActor::Automation(
+                    crate::events::AutomationActor::Handoff
+                ),
+                message,
+                evidence_ids,
+                ..
+            } if message == "Everything affected passed."
+                && evidence_ids == &vec!["check:rust".to_string()]
+        ));
 
         delete_session(dir.path(), "session-123").unwrap();
         assert!(restore_project_sessions(dir.path()).unwrap().is_empty());

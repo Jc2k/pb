@@ -942,6 +942,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::plan_checks_for_paths;
     use crate::environment::{EnvironmentBackend, EnvironmentMode};
 
     fn write(root: &Path, relative: &str, content: &str) {
@@ -1022,6 +1023,53 @@ mod tests {
             .normalize()
             .unwrap();
         assert_eq!(restored.cargo_workspaces, graph.cargo_workspaces);
+
+        let shared_plan =
+            plan_checks_for_paths(&graph, vec!["shared/src/lib.rs".to_string()]).unwrap();
+        assert!(shared_plan.affected_components.contains(shared));
+        for name in ["api", "worker"] {
+            assert!(
+                shared_plan
+                    .affected_components
+                    .iter()
+                    .any(|id| id.ends_with(&format!(".{name}")))
+            );
+        }
+
+        let lock_plan = plan_checks_for_paths(&graph, vec!["Cargo.lock".to_string()]).unwrap();
+        assert!(
+            lock_plan
+                .checks
+                .iter()
+                .any(|id| { graph.checks[id].command.contains("--workspace") })
+        );
+    }
+
+    #[test]
+    fn single_rust_package_has_changed_and_unchanged_handoff_plans() {
+        let repo = tempfile::tempdir().unwrap();
+        package(repo.path(), ".", "single", "");
+
+        let graph = discover_workspace(repo.path(), None).unwrap();
+        assert_eq!(graph.cargo_workspaces.len(), 1);
+        assert_eq!(
+            graph
+                .cargo_workspaces
+                .values()
+                .next()
+                .unwrap()
+                .members
+                .len(),
+            1
+        );
+
+        let changed = plan_checks_for_paths(&graph, vec!["src/lib.rs".to_string()]).unwrap();
+        assert!(!changed.checks.is_empty());
+        assert!(!changed.affected_components.is_empty());
+
+        let unchanged = plan_checks_for_paths(&graph, Vec::new()).unwrap();
+        assert!(unchanged.is_no_change());
+        assert!(unchanged.checks.is_empty());
     }
 
     #[test]
@@ -1066,6 +1114,25 @@ mod tests {
         assert!(graph.components.keys().any(|id| id.starts_with("python.")));
         assert!(graph.components.keys().any(|id| id.starts_with("go.")));
         assert!(graph.executors.len() >= 3);
+
+        let web_component = graph
+            .components
+            .values()
+            .find(|component| component.root == "web")
+            .unwrap();
+        let web_plan = plan_checks_for_paths(&graph, vec!["web/src/app.ts".to_string()]).unwrap();
+        assert_eq!(web_plan.affected_components, vec![web_component.id.clone()]);
+        assert!(!web_plan.checks.is_empty());
+        assert!(
+            web_plan
+                .checks
+                .iter()
+                .all(|id| { graph.checks[id].components.contains(&web_component.id) })
+        );
+        assert!(web_plan.checks.iter().all(|id| {
+            let check = &graph.checks[id];
+            !check.command.contains("pytest") && !check.command.starts_with("go test")
+        }));
     }
 
     #[test]
