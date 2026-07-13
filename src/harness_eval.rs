@@ -392,6 +392,15 @@ mod tests {
                 .executed_checks,
             1
         );
+        let repeated = actual
+            .iter()
+            .find(|result| result.id == "repeated_blocked_action")
+            .unwrap();
+        assert!(!repeated.reached_final);
+        assert_eq!(repeated.termination_reason, "gate_loop");
+        assert_eq!(repeated.llm_invocations, 3);
+        assert_eq!(repeated.blocked_tool_loops, 1);
+        assert_eq!(repeated.remaining_completions, 1);
     }
 
     #[test]

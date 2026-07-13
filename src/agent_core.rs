@@ -35,7 +35,7 @@ use crate::browser_tools;
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
-use crate::events::{AgentEvent, ContractStatus, TerminationReason};
+use crate::events::{AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
@@ -60,6 +60,8 @@ const MONITOR_TURN_MAX_TOKENS: i32 = 512;
 const MONITOR_TRANSCRIPT_MESSAGES: usize = 8;
 const MONITOR_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
 const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
+const MAX_IDENTICAL_GATE_FAILURES: usize = 2;
+const FINAL_GRACE_MAX_TOKENS: i32 = 256;
 const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
@@ -2600,8 +2602,7 @@ fn run_agent_steps(
     let mut monitor_used = false;
     let mut step = 1;
     let mut consecutive_parse_failures = 0usize;
-    let mut last_parse_failure_signature: Option<u64> = None;
-    let mut repeated_parse_failures = 0usize;
+    let mut deterministic_failures = DeterministicFailureTracker::default();
     let mut tool_loop_guard = ToolLoopGuard::default();
     let gate_state = RefCell::new(initial_gate_state(
         args,
@@ -2662,12 +2663,8 @@ fn run_agent_steps(
             Err(ParseFailure { output, error }) => {
                 consecutive_parse_failures = consecutive_parse_failures.saturating_add(1);
                 let signature = parse_failure_signature(&output, &error.to_string());
-                repeated_parse_failures = if last_parse_failure_signature == Some(signature) {
-                    repeated_parse_failures.saturating_add(1)
-                } else {
-                    1
-                };
-                last_parse_failure_signature = Some(signature);
+                let repeated_parse_failures =
+                    deterministic_failures.record(DeterministicFailureKind::Parse, signature);
 
                 let parse_summary = format!(
                     "Invalid pb JSON action on step {step}/{max_steps}",
@@ -2723,8 +2720,7 @@ fn run_agent_steps(
             }
         };
         consecutive_parse_failures = 0;
-        last_parse_failure_signature = None;
-        repeated_parse_failures = 0;
+        deterministic_failures.clear(DeterministicFailureKind::Parse);
 
         match action {
             AgentAction::Final { content, thinking } => {
@@ -2736,12 +2732,13 @@ fn run_agent_steps(
                         timestamp_ms: Some(now_millis()),
                     });
                 }
-                let gate_feedback = if args.contract.is_some() {
-                    contract_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?
-                } else {
-                    completion_gate_feedback(args.profile, &gate_state.borrow())
-                };
+                let gate_feedback =
+                    request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
                 if let Some(feedback) = gate_feedback {
+                    let gate_failure_count = deterministic_failures.record(
+                        DeterministicFailureKind::CompletionGate,
+                        stable_hash(feedback.as_str()),
+                    );
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: if args.contract.is_some() {
@@ -2759,6 +2756,25 @@ fn run_agent_steps(
                             verified_completed: false,
                             termination_reason: TerminationReason::ContractUnsatisfied,
                             final_content: Some(content),
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
+                    if gate_failure_count >= MAX_IDENTICAL_GATE_FAILURES {
+                        sink.emit(AgentEvent::Error {
+                            message: format!(
+                                "the same completion gate fact blocked finalization {gate_failure_count} times; stopping deterministically without a monitor retry"
+                            ),
+                            summary: "Deterministic completion gate loop".to_string(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::GateLoop,
+                            final_content: None,
                             metrics,
                             gate_state: gate_state.into_inner(),
                         });
@@ -2802,6 +2818,9 @@ fn run_agent_steps(
                     arguments,
                 }];
                 let loop_check = tool_loop_guard.record_calls(&calls);
+                let loop_failure_count = loop_check.signature.map(|signature| {
+                    deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
+                });
                 if loop_check.blocked {
                     record_blocked_tool_loop(
                         &output,
@@ -2810,6 +2829,24 @@ fn run_agent_steps(
                         messages,
                         sink,
                     );
+                    if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
+                    {
+                        sink.emit(AgentEvent::Error {
+                            message: "the same tool-loop signature reached its deterministic stop threshold; no further model turn will run".to_string(),
+                            summary: "Deterministic tool loop".to_string(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::GateLoop,
+                            final_content: None,
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
                     step += 1;
                     continue;
                 }
@@ -2852,6 +2889,9 @@ fn run_agent_steps(
             }
             AgentAction::ToolCalls { calls, thinking } => {
                 let loop_check = tool_loop_guard.record_calls(&calls);
+                let loop_failure_count = loop_check.signature.map(|signature| {
+                    deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
+                });
                 if loop_check.blocked {
                     record_blocked_tool_loop(
                         &output,
@@ -2860,6 +2900,24 @@ fn run_agent_steps(
                         messages,
                         sink,
                     );
+                    if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
+                    {
+                        sink.emit(AgentEvent::Error {
+                            message: "the same tool-loop signature reached its deterministic stop threshold; no further model turn will run".to_string(),
+                            summary: "Deterministic tool loop".to_string(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::GateLoop,
+                            final_content: None,
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
                     step += 1;
                     continue;
                 }
@@ -2899,6 +2957,29 @@ fn run_agent_steps(
                         &feedback,
                     ));
                 }
+            }
+        }
+
+        if step == original_max_steps {
+            let gate_feedback =
+                request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
+            if gate_feedback.is_none() {
+                return run_final_grace(
+                    generator,
+                    args,
+                    messages,
+                    workspace_root,
+                    gate_state.into_inner(),
+                    metrics,
+                    nesting_depth,
+                    sink,
+                );
+            }
+            if args.contract.is_some() {
+                // The missing contract evidence is structured state. A monitor may not reinterpret
+                // it as completion or grant steps past the ordinary budget.
+                step += 1;
+                continue;
             }
         }
 
@@ -2977,6 +3058,190 @@ fn run_agent_steps(
         metrics,
         gate_state: gate_state.into_inner(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_final_grace(
+    generator: &mut dyn CompletionEngine,
+    args: &AgentRequest,
+    messages: &mut Vec<ChatMessage>,
+    workspace_root: &Path,
+    gate_state: GateState,
+    mut metrics: RunMetrics,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<StepRunOutcome> {
+    let grace_step = args.max_steps.saturating_add(1);
+    sink.emit(AgentEvent::FinalGrace {
+        status: FinalGraceStatus::Started,
+        detail: format!(
+            "all completion evidence is current; allowing one final-only turn capped at {FINAL_GRACE_MAX_TOKENS} tokens"
+        ),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    messages.push(ChatMessage::text(
+        "user",
+        "FINAL GRACE: All required evidence is current. Tools are unavailable. Return exactly one JSON final action now: {\"type\":\"final\",\"content\":\"concise completion summary\"}. Do not return prose, a tool call, or any other action.",
+    ));
+    let mut grace_args = args.clone();
+    grace_args.max_tokens = FINAL_GRACE_MAX_TOKENS;
+    grace_args.turn_max_tokens_cap = Some(FINAL_GRACE_MAX_TOKENS);
+    let completion = match generator.generate(&grace_args, messages, &[]) {
+        Ok(completion) => completion,
+        Err(error) => {
+            let termination_reason = termination_reason_for_runtime_error(&error);
+            sink.emit(AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Rejected,
+                detail: format!("final-only generation failed: {error:#}"),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            sink.emit(AgentEvent::Error {
+                message: format!("{error:#}"),
+                summary: format!("Final grace terminated: {termination_reason}"),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            return Ok(StepRunOutcome {
+                reached_final: false,
+                contract_status: if args.contract.is_some() {
+                    ContractStatus::Satisfied
+                } else {
+                    ContractStatus::Unspecified
+                },
+                verified_completed: false,
+                termination_reason,
+                final_content: None,
+                metrics,
+                gate_state,
+            });
+        }
+    };
+    record_completion_metrics(&completion, grace_step, nesting_depth, &mut metrics, sink);
+
+    let action = if completion.finish_reason == CompletionFinishReason::EndOfGeneration
+        && completion.tool_calls.is_empty()
+    {
+        parse_action_json(completion.content.trim()).ok()
+    } else {
+        None
+    };
+    let Some(AgentAction::Final { content, thinking }) = action else {
+        sink.emit(AgentEvent::FinalGrace {
+            status: FinalGraceStatus::Rejected,
+            detail: "the grace turn did not return one exact, complete JSON final action; no tool or other action was executed".to_string(),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        return Ok(StepRunOutcome {
+            reached_final: false,
+            contract_status: if args.contract.is_some() {
+                ContractStatus::Satisfied
+            } else {
+                ContractStatus::Unspecified
+            },
+            verified_completed: false,
+            termination_reason: TerminationReason::StepLimit,
+            final_content: None,
+            metrics,
+            gate_state,
+        });
+    };
+
+    if let Some(reasoning) = thinking {
+        sink.emit(AgentEvent::Reasoning {
+            content: reasoning,
+            profile: args.profile,
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+    match request_completion_gate_feedback(args, &gate_state, workspace_root)? {
+        Some(feedback) => {
+            sink.emit(AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Rejected,
+                detail: feedback,
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            Ok(StepRunOutcome {
+                reached_final: true,
+                contract_status: incomplete_contract_status(args),
+                verified_completed: false,
+                termination_reason: if args.contract.is_some() {
+                    TerminationReason::ContractUnsatisfied
+                } else {
+                    TerminationReason::GateLoop
+                },
+                final_content: Some(content),
+                metrics,
+                gate_state,
+            })
+        }
+        None => {
+            sink.emit(AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Accepted,
+                detail: "exact final action accepted without reopening tools".to_string(),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            sink.emit(AgentEvent::Final {
+                content: content.clone(),
+                profile: args.profile,
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            Ok(StepRunOutcome {
+                reached_final: true,
+                contract_status: if args.contract.is_some() {
+                    ContractStatus::Satisfied
+                } else {
+                    ContractStatus::Unspecified
+                },
+                verified_completed: args.contract.is_some(),
+                termination_reason: TerminationReason::Final,
+                final_content: Some(content),
+                metrics,
+                gate_state,
+            })
+        }
+    }
+}
+
+fn record_completion_metrics(
+    completion: &CompletionOutput,
+    step: usize,
+    nesting_depth: usize,
+    metrics: &mut RunMetrics,
+    sink: &mut dyn EventSink,
+) {
+    metrics.llm_invocations += 1;
+    metrics.llm_runtime_ms = metrics
+        .llm_runtime_ms
+        .saturating_add(completion.duration_ms);
+    metrics.prompt_tokens = metrics
+        .prompt_tokens
+        .saturating_add(completion.prompt_tokens);
+    metrics.generated_tokens = metrics
+        .generated_tokens
+        .saturating_add(completion.generated_tokens);
+    add_energy(
+        &mut metrics.llm_energy_joules,
+        &mut metrics.llm_energy_kwh,
+        completion.energy,
+    );
+    sink.emit(AgentEvent::LlmInvocation {
+        step,
+        duration_ms: completion.duration_ms,
+        prompt_tokens: completion.prompt_tokens,
+        generated_tokens: completion.generated_tokens,
+        energy_joules: completion.energy.map(|estimate| estimate.joules),
+        energy_kwh: completion.energy.map(|estimate| estimate.kwh),
+        average_power_watts: completion.energy.map(|estimate| estimate.average_watts),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3379,6 +3644,12 @@ fn parse_failure_signature(output: &str, error: &str) -> u64 {
     hasher.finish()
 }
 
+fn stable_hash(value: &(impl Hash + ?Sized)) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn parse_failure_feedback(
     error: &str,
     consecutive_failures: usize,
@@ -3416,6 +3687,30 @@ fn parse_failure_feedback(
 
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_ACTIONS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DeterministicFailureKind {
+    Parse,
+    CompletionGate,
+    ToolLoop,
+}
+
+#[derive(Default)]
+struct DeterministicFailureTracker {
+    counts: HashMap<(DeterministicFailureKind, u64), usize>,
+}
+
+impl DeterministicFailureTracker {
+    fn record(&mut self, kind: DeterministicFailureKind, signature: u64) -> usize {
+        let count = self.counts.entry((kind, signature)).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    fn clear(&mut self, kind: DeterministicFailureKind) {
+        self.counts.retain(|(candidate, _), _| *candidate != kind);
+    }
+}
+
 #[derive(Default)]
 struct ToolLoopGuard {
     signatures_seen: HashMap<String, usize>,
@@ -3427,6 +3722,7 @@ impl ToolLoopGuard {
     fn record_calls(&mut self, calls: &[AgentToolCall]) -> ToolLoopCheck {
         let mut repeated = Vec::new();
         let action = calls.iter().map(tool_call_signature).collect::<Vec<_>>();
+        let action_signature = stable_hash(&action);
         if action == self.previous_action {
             self.consecutive_identical_actions =
                 self.consecutive_identical_actions.saturating_add(1);
@@ -3445,18 +3741,24 @@ impl ToolLoopGuard {
 
         let blocked = self.consecutive_identical_actions > MAX_CONSECUTIVE_IDENTICAL_TOOL_ACTIONS;
         let mut feedback = repeated_tool_call_feedback(&repeated);
+        let signature = feedback.as_ref().map(|_| action_signature);
         if blocked && let Some(feedback) = feedback.as_mut() {
             feedback.push_str(
                 "\nThis third consecutive identical tool action was blocked before execution. Choose a different action.",
             );
         }
-        ToolLoopCheck { feedback, blocked }
+        ToolLoopCheck {
+            feedback,
+            blocked,
+            signature,
+        }
     }
 }
 
 struct ToolLoopCheck {
     feedback: Option<String>,
     blocked: bool,
+    signature: Option<u64>,
 }
 
 fn record_blocked_tool_loop(
@@ -3545,19 +3847,25 @@ pub(crate) struct ScriptedAgentOutcome {
     pub llm_invocations: usize,
     pub tool_calls: usize,
     pub remaining_completions: usize,
+    pub generation_tool_counts: Vec<usize>,
+    pub generation_max_tokens: Vec<i32>,
 }
 
 struct ScriptedCompletionEngine {
     completions: VecDeque<ScriptedCompletion>,
+    generation_tool_counts: Vec<usize>,
+    generation_max_tokens: Vec<i32>,
 }
 
 impl CompletionEngine for ScriptedCompletionEngine {
     fn generate(
         &mut self,
-        _args: &AgentRequest,
+        args: &AgentRequest,
         _messages: &[ChatMessage],
-        _tools: &[BuiltInToolSchema],
+        tools: &[BuiltInToolSchema],
     ) -> Result<CompletionOutput> {
+        self.generation_tool_counts.push(tools.len());
+        self.generation_max_tokens.push(args.max_tokens);
         let completion = self
             .completions
             .pop_front()
@@ -3590,6 +3898,8 @@ pub(crate) fn run_scripted_agent_steps(
 ) -> Result<ScriptedAgentOutcome> {
     let mut generator = ScriptedCompletionEngine {
         completions: completions.into(),
+        generation_tool_counts: Vec::new(),
+        generation_max_tokens: Vec::new(),
     };
     let mut messages = vec![
         ChatMessage::text(
@@ -3632,6 +3942,8 @@ pub(crate) fn run_scripted_agent_steps(
         llm_invocations: outcome.metrics.llm_invocations,
         tool_calls: outcome.metrics.tool_calls,
         remaining_completions: generator.completions.len(),
+        generation_tool_counts: generator.generation_tool_counts,
+        generation_max_tokens: generator.generation_max_tokens,
     })
 }
 
@@ -4329,6 +4641,18 @@ fn contract_completion_gate_feedback(
             missing.join("; ")
         )
     }))
+}
+
+fn request_completion_gate_feedback(
+    request: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<Option<String>> {
+    if request.contract.is_some() {
+        contract_completion_gate_feedback(request, gate_state, workspace_root)
+    } else {
+        Ok(completion_gate_feedback(request.profile, gate_state))
+    }
 }
 
 fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
@@ -7609,6 +7933,139 @@ mod tests {
         assert_eq!(
             termination_reason_for_runtime_error(&error),
             TerminationReason::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn repeated_completion_gate_fact_stops_without_another_model_turn() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 5;
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                scripted_final("not done"),
+                scripted_final("still not done"),
+                scripted_final("must not run"),
+            ],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, MAX_IDENTICAL_GATE_FAILURES);
+        assert_eq!(outcome.remaining_completions, 1);
+    }
+
+    #[test]
+    fn repeated_parse_signature_stops_at_the_structured_threshold() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 5;
+        request.turn_max_tokens_cap = Some(256);
+        let invalid = ScriptedCompletion {
+            content: "{not-json".to_string(),
+            truncated: true,
+        };
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                invalid.clone(),
+                invalid.clone(),
+                invalid,
+                scripted_final("must not run"),
+            ],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::ParseLoop);
+        assert_eq!(outcome.llm_invocations, MAX_CONSECUTIVE_PARSE_FAILURES);
+        assert_eq!(outcome.remaining_completions, 1);
+    }
+
+    #[test]
+    fn final_grace_is_one_capped_turn_with_no_tools() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.tool_allowlist = Some(vec!["run_check".to_string()]);
+        request.contract = Some(normalized_test_contract("true"));
+        let completions = vec![
+            ScriptedCompletion {
+                content: r#"{"type":"tool_call","tool":"run_check","arguments":{"id":"logic"}}"#
+                    .to_string(),
+                truncated: false,
+            },
+            scripted_final("verified in grace"),
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert!(outcome.verified_completed);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(outcome.llm_invocations, 2);
+        assert_eq!(outcome.generation_tool_counts.last(), Some(&0));
+        assert_eq!(
+            outcome.generation_max_tokens.last(),
+            Some(&FINAL_GRACE_MAX_TOKENS)
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Accepted,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unsatisfied_contract_cannot_enter_final_grace_or_be_extended_by_monitor_text() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("game.js"), "before\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.tool_allowlist = Some(vec!["read_file".to_string()]);
+        request.contract = Some(normalized_test_contract("true"));
+        let completions = vec![
+            ScriptedCompletion {
+                content:
+                    r#"{"type":"tool_call","tool":"read_file","arguments":{"path":"game.js"}}"#
+                        .to_string(),
+                truncated: false,
+            },
+            scripted_final("must not run"),
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert!(monitor_recommends_more_steps("grant more steps: yes"));
+        assert!(!outcome.reached_final);
+        assert!(!outcome.verified_completed);
+        assert_eq!(outcome.contract_status, ContractStatus::Unsatisfied);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 1);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::FinalGrace { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SubAgentStarted { .. }))
         );
     }
 

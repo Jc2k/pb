@@ -43,6 +43,14 @@ pub enum TerminationReason {
     EngineError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalGraceStatus {
+    Started,
+    Accepted,
+    Rejected,
+}
+
 impl TerminationReason {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -238,6 +246,14 @@ pub enum AgentEvent {
     Final {
         content: String,
         profile: AgentProfile,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    FinalGrace {
+        status: FinalGraceStatus,
+        detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -546,6 +562,20 @@ impl EventEnvelope {
                 event: AgentEvent::Final {
                     content,
                     profile,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::FinalGrace {
+                status,
+                detail,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::FinalGrace {
+                    status,
+                    detail,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },

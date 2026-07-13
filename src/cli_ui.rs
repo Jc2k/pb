@@ -120,6 +120,9 @@ pub fn render_event(event: &AgentEvent) {
             profile: _,
             ..
         } => print_header("final", content),
+        AgentEvent::FinalGrace { status, detail, .. } => {
+            print_header("final grace", &format!("{status:?}: {detail}"));
+        }
         AgentEvent::LlmInvocation {
             step,
             duration_ms,

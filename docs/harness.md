@@ -50,6 +50,13 @@ contract is `verified_completed=true`. Step, parse, runtime-engine, and resource
 their own structured termination reasons. Older stored summaries without these fields remain
 readable with conservative defaults.
 
+Deterministic recovery is bounded. Repeated parse, completion-gate, and identical-tool signatures
+stop with `parse_loop` or `gate_loop` at their fixed thresholds, before another model or monitor
+turn can reinterpret the same fact. If the ordinary last step establishes all required evidence,
+the runtime emits `final_grace` events and permits exactly one 256-token generation with an empty
+tool schema. Only one exact JSON final action is accepted. Missing contract evidence disables both
+grace and monitor extension, so it cannot be converted into verified completion by prose.
+
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
 
