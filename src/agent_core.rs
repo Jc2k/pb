@@ -3271,16 +3271,58 @@ fn parse_action(output: &str) -> Result<AgentAction> {
     for json_candidate in &json_candidates {
         match serde_json::from_str::<AgentAction>(json_candidate) {
             Ok(action) => return Ok(action),
-            Err(error) if first_error.is_none() => {
-                first_error = Some((json_candidate.clone(), error));
+            Err(error) => {
+                let repaired = escape_json_string_control_chars(json_candidate);
+                if repaired != *json_candidate
+                    && let Ok(action) = serde_json::from_str::<AgentAction>(&repaired)
+                {
+                    return Ok(action);
+                }
+                if first_error.is_none() {
+                    first_error = Some((json_candidate.clone(), error));
+                }
             }
-            Err(_) => {}
         }
     }
 
     let (json_candidate, error) =
         first_error.expect("non-empty candidates should record parse error");
     Err(error).with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
+}
+
+fn escape_json_string_control_chars(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in input.chars() {
+        if in_string {
+            if escape {
+                output.push(ch);
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    output.push(ch);
+                    escape = true;
+                }
+                '"' => {
+                    output.push(ch);
+                    in_string = false;
+                }
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                _ => output.push(ch),
+            }
+        } else {
+            output.push(ch);
+            if ch == '"' {
+                in_string = true;
+            }
+        }
+    }
+    output
 }
 
 fn parse_model_tool_call_output(content: &mut String) -> Result<Vec<AgentToolCall>> {
@@ -5910,6 +5952,21 @@ mod tests {
         };
         assert_eq!(tool, "git_revert");
         assert_eq!(arguments["commit"], "a707c16");
+    }
+
+    #[test]
+    fn parse_action_repairs_raw_newlines_inside_json_strings() {
+        let output = "{\"type\":\"tool_call\",\"tool\":\"replace_file\",\"arguments\":{\"path\":\"game.js\",\"content\":\"line one\nline two\"}}";
+        let action = parse_action(output).expect("raw string newlines should be escaped");
+
+        let AgentAction::ToolCall {
+            tool, arguments, ..
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool, "replace_file");
+        assert_eq!(arguments["content"], "line one\nline two");
     }
 
     #[test]
