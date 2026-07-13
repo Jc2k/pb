@@ -2492,7 +2492,18 @@ fn run_agent_steps(
                     tool,
                     arguments,
                 }];
-                let loop_feedback = tool_loop_guard.record_calls(&calls);
+                let loop_check = tool_loop_guard.record_calls(&calls);
+                if loop_check.blocked {
+                    record_blocked_tool_loop(
+                        &output,
+                        &loop_check.feedback,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
+                    step += 1;
+                    continue;
+                }
                 execute_tool_calls(
                     calls,
                     thinking,
@@ -2517,7 +2528,7 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
-                if let Some(feedback) = loop_feedback {
+                if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
@@ -2531,7 +2542,18 @@ fn run_agent_steps(
                 }
             }
             AgentAction::ToolCalls { calls, thinking } => {
-                let loop_feedback = tool_loop_guard.record_calls(&calls);
+                let loop_check = tool_loop_guard.record_calls(&calls);
+                if loop_check.blocked {
+                    record_blocked_tool_loop(
+                        &output,
+                        &loop_check.feedback,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
+                    step += 1;
+                    continue;
+                }
                 execute_tool_calls(
                     calls,
                     thinking,
@@ -2556,7 +2578,7 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
-                if let Some(feedback) = loop_feedback {
+                if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
@@ -3078,14 +3100,26 @@ fn parse_failure_feedback(
     feedback
 }
 
+const MAX_CONSECUTIVE_IDENTICAL_TOOL_ACTIONS: usize = 2;
+
 #[derive(Default)]
 struct ToolLoopGuard {
     signatures_seen: HashMap<String, usize>,
+    previous_action: Vec<String>,
+    consecutive_identical_actions: usize,
 }
 
 impl ToolLoopGuard {
-    fn record_calls(&mut self, calls: &[AgentToolCall]) -> Option<String> {
+    fn record_calls(&mut self, calls: &[AgentToolCall]) -> ToolLoopCheck {
         let mut repeated = Vec::new();
+        let action = calls.iter().map(tool_call_signature).collect::<Vec<_>>();
+        if action == self.previous_action {
+            self.consecutive_identical_actions =
+                self.consecutive_identical_actions.saturating_add(1);
+        } else {
+            self.previous_action = action;
+            self.consecutive_identical_actions = 1;
+        }
         for call in calls {
             let signature = tool_call_signature(call);
             let seen = self.signatures_seen.entry(signature).or_insert(0);
@@ -3095,8 +3129,44 @@ impl ToolLoopGuard {
             }
         }
 
-        repeated_tool_call_feedback(&repeated)
+        let blocked = self.consecutive_identical_actions
+            > MAX_CONSECUTIVE_IDENTICAL_TOOL_ACTIONS;
+        let mut feedback = repeated_tool_call_feedback(&repeated);
+        if blocked && let Some(feedback) = feedback.as_mut() {
+            feedback.push_str(
+                "\nThis third consecutive identical tool action was blocked before execution. Choose a different action.",
+            );
+        }
+        ToolLoopCheck { feedback, blocked }
     }
+}
+
+struct ToolLoopCheck {
+    feedback: Option<String>,
+    blocked: bool,
+}
+
+fn record_blocked_tool_loop(
+    output: &str,
+    feedback: &Option<String>,
+    nesting_depth: usize,
+    messages: &mut Vec<ChatMessage>,
+    sink: &mut dyn EventSink,
+) {
+    let feedback = feedback.as_deref().unwrap_or(
+        "This consecutive duplicate tool action was blocked before execution. Choose a different action.",
+    );
+    sink.emit(AgentEvent::Correction {
+        message: feedback.to_string(),
+        summary: "Repeated tool call blocked".to_string(),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    messages.push(ChatMessage::text("assistant", output.to_string()));
+    messages.push(correction_chat_message(
+        "Repeated tool call blocked",
+        feedback,
+    ));
 }
 
 fn tool_call_signature(call: &AgentToolCall) -> String {
@@ -6700,15 +6770,48 @@ mod tests {
             arguments: json!({"pattern": "**/ProjectPage.*"}),
         };
 
-        assert!(guard.record_calls(std::slice::from_ref(&call)).is_none());
-        let feedback = guard
-            .record_calls(std::slice::from_ref(&call))
+        let first = guard.record_calls(std::slice::from_ref(&call));
+        assert!(first.feedback.is_none());
+        assert!(!first.blocked);
+        let second = guard.record_calls(std::slice::from_ref(&call));
+        let feedback = second
+            .feedback
             .expect("second identical call should trigger loop feedback");
 
+        assert!(!second.blocked);
         assert!(feedback.contains("Loop guard"));
         assert!(feedback.contains("same arguments"));
         assert!(feedback.contains("**/ProjectPage.*"));
         assert!(feedback.contains("broaden or correct"));
+    }
+
+    #[test]
+    fn tool_loop_guard_blocks_third_consecutive_identical_action() {
+        let mut guard = ToolLoopGuard::default();
+        let repeated = AgentToolCall {
+            id: None,
+            tool: "sub_agent".to_string(),
+            arguments: json!({"profile": "review", "task": "inspect"}),
+        };
+        let different = AgentToolCall {
+            id: None,
+            tool: "read_file".to_string(),
+            arguments: json!({"path": "index.html"}),
+        };
+
+        assert!(!guard.record_calls(std::slice::from_ref(&repeated)).blocked);
+        assert!(!guard.record_calls(std::slice::from_ref(&repeated)).blocked);
+        let third = guard.record_calls(std::slice::from_ref(&repeated));
+        assert!(third.blocked);
+        assert!(
+            third
+                .feedback
+                .as_deref()
+                .is_some_and(|feedback| feedback.contains("blocked before execution"))
+        );
+
+        assert!(!guard.record_calls(std::slice::from_ref(&different)).blocked);
+        assert!(!guard.record_calls(std::slice::from_ref(&repeated)).blocked);
     }
 
     #[test]
