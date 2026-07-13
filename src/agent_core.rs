@@ -285,16 +285,16 @@ impl AgentProfile {
 
     fn parse(input: &str) -> Result<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
-            "build" => Ok(Self::Build),
-            "scout" => Ok(Self::Scout),
-            "review" => Ok(Self::Review),
-            "explore" => Ok(Self::Explore),
-            "plan" => Ok(Self::Plan),
-            "ask" => Ok(Self::Ask),
-            "research" => Ok(Self::Research),
-            "monitor" => Ok(Self::Monitor),
+            "build" | "kate" | "kate libby" => Ok(Self::Build),
+            "scout" | "ramon" | "ramon sanchez" => Ok(Self::Scout),
+            "review" | "eugene" | "eugene belford" => Ok(Self::Review),
+            "explore" | "paul" | "paul cook" => Ok(Self::Explore),
+            "plan" | "dade" | "dade murphy" => Ok(Self::Plan),
+            "ask" | "joey" | "joey pardella" => Ok(Self::Ask),
+            "research" | "emmanuel" | "emmanuel goldstein" => Ok(Self::Research),
+            "monitor" | "trinity" | "trinity walker" => Ok(Self::Monitor),
             other => bail!(
-                "unknown agent profile '{other}'; expected one of: build, scout, review, explore, plan, ask, research, monitor"
+                "unknown agent profile '{other}'; expected a profile name or configured teammate name"
             ),
         }
     }
@@ -321,7 +321,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade to break the request into concrete build tasks; for a single clear change, proceed directly. Automatically call Ramon when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene to review the result before finalizing. If Eugene passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If Eugene does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
+                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade with sub_agent profile=\"plan\" to break the request into concrete build tasks; for a single clear change, proceed directly. Automatically call Ramon with sub_agent profile=\"scout\" when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene with sub_agent profile=\"review\" before finalizing. If the review profile passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If the review profile does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -1198,7 +1198,7 @@ fn build_agent_instructions_with_tool_allowlist(
     ));
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "When deciding to use sub_agent(profile,task,max_steps), talk about it as asking a teammate by first name: for example, 'I think Dade needs to look at this' or 'this is one for Dade.' Do not say that you are running, launching, or spawning a sub-agent in user-facing final content.\n",
+            "When calling sub_agent(profile,task,max_steps), pass an exact profile value such as profile=\"plan\" or profile=\"review\"; never pass a teammate's first name as the profile. In user-facing prose, talk about it as asking the teammate by first name, for example, 'I think Dade needs to look at this.' Do not say that you are running, launching, or spawning a sub-agent in user-facing final content.\n",
         );
     } else {
         instructions.push_str(
@@ -7012,10 +7012,11 @@ mod tests {
         assert!(instructions.contains("Trinity=monitor"));
         assert!(instructions.contains("Use I when talking about what you have done and We when talking about what needs to happen next"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
-        assert!(instructions.contains("call Eugene to review the result before finalizing"));
-        assert!(instructions.contains("If Eugene passes the work"));
+        assert!(instructions.contains("call Eugene with sub_agent profile=\"review\""));
+        assert!(instructions.contains("If the review profile passes the work"));
         assert!(instructions.contains("try to git_commit with a semantic commit message"));
-        assert!(instructions.contains("If Eugene does not pass the work"));
+        assert!(instructions.contains("If the review profile does not pass the work"));
+        assert!(instructions.contains("never pass a teammate's first name as the profile"));
         assert!(instructions.contains("trust the tool-reported diff"));
         assert!(instructions.contains("never revert working changes solely because of a hallucinated or unverified corruption concern"));
         assert!(instructions.contains("Batch obvious discovery reads/searches"));
@@ -7345,6 +7346,24 @@ mod tests {
         assert!(instructions.contains("Use vision_describe directly"));
         assert!(!instructions.contains("Lisa"));
         assert!(!instructions.contains("vision. Ask"));
+    }
+
+    #[test]
+    fn teammate_names_are_valid_agent_profile_aliases() {
+        let aliases = [
+            ("Kate", AgentProfile::Build),
+            ("Ramon Sanchez", AgentProfile::Scout),
+            ("Eugene", AgentProfile::Review),
+            ("Paul Cook", AgentProfile::Explore),
+            ("Dade", AgentProfile::Plan),
+            ("Joey Pardella", AgentProfile::Ask),
+            ("Emmanuel", AgentProfile::Research),
+            ("Trinity Walker", AgentProfile::Monitor),
+        ];
+
+        for (alias, expected) in aliases {
+            assert_eq!(AgentProfile::parse(alias).unwrap(), expected);
+        }
     }
 
     #[test]
