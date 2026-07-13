@@ -5181,7 +5181,7 @@ fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) 
     };
     let candidate = lexical_normalize(&candidate)?;
 
-    let normalized = if must_exist {
+    let normalized = if must_exist || candidate.exists() {
         candidate
             .canonicalize()
             .with_context(|| format!("failed to resolve path {}", candidate.display()))?
@@ -7879,6 +7879,20 @@ mod tests {
             resolved.canonicalize().unwrap_or(resolved),
             expected.canonicalize().unwrap_or(expected)
         );
+    }
+
+    #[test]
+    fn resolve_workspace_path_without_must_exist_preserves_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("index.html");
+        std::fs::write(&file, "existing").unwrap();
+
+        let resolved = resolve_workspace_path(&workspace, "index.html", false).unwrap();
+
+        assert_eq!(resolved, file.canonicalize().unwrap());
+        assert!(resolved.is_file());
     }
 
     #[test]
