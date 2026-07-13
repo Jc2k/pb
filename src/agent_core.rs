@@ -33,12 +33,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::browser_tools;
-use crate::checks::{CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime};
+use crate::checks::{CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, plan_checks};
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::{AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason};
-use crate::handoff::{HandoffAttempt, run_handoff};
+use crate::handoff::{HandoffAttempt, ManagedCommitOutcome, managed_commit, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
@@ -2995,6 +2995,23 @@ fn run_agent_steps(
                                 gate_state: gate_state.into_inner(),
                             });
                         }
+                        HandoffAttempt::CommitBlocked { detail, .. } => {
+                            sink.emit(AgentEvent::Error {
+                                message: detail,
+                                summary: "Handoff commit blocked".to_string(),
+                                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                timestamp_ms: Some(now_millis()),
+                            });
+                            return Ok(StepRunOutcome {
+                                reached_final: true,
+                                contract_status: incomplete_contract_status(args),
+                                verified_completed: false,
+                                termination_reason: TerminationReason::CommitBlocked,
+                                final_content: Some(content),
+                                metrics,
+                                gate_state: gate_state.into_inner(),
+                            });
+                        }
                     }
                 }
                 sink.emit(AgentEvent::Final {
@@ -3429,6 +3446,23 @@ fn run_final_grace(
                             contract_status: incomplete_contract_status(args),
                             verified_completed: false,
                             termination_reason: TerminationReason::ExecutorUnavailable,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state,
+                        });
+                    }
+                    HandoffAttempt::CommitBlocked { detail, .. } => {
+                        sink.emit(AgentEvent::FinalGrace {
+                            status: FinalGraceStatus::Rejected,
+                            detail,
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: true,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::CommitBlocked,
                             final_content: Some(content),
                             metrics,
                             gate_state,
@@ -5106,6 +5140,7 @@ fn run_deterministic_handoff(
         repository,
         graph,
         &mut runtime.borrow_mut(),
+        "feat: complete requested changes",
         nesting_depth,
         sink,
     )
@@ -5606,12 +5641,74 @@ fn run_tool(
                     "git_commit message must use Conventional Commits, for example: feat: add typing game"
                 );
             }
-            if let Some(config) = context.env_config {
-                run_guard_commands(config, command_backend, workspace_root)?;
-            }
-            match git_commit_all(message, workspace_root)? {
-                true => Ok(format!("committed: {message}")),
-                false => Ok("nothing to commit".to_string()),
+            if let (Some(repository), Some(graph), Some(runtime)) = (
+                context.request.repository_context.as_ref(),
+                context.request.workspace_graph.as_ref(),
+                context.workspace_checks,
+            ) {
+                let plan = plan_checks(graph, repository)?;
+                let checks = runtime.borrow_mut().run_plan(
+                    &plan,
+                    EvidenceSource::CommitTool,
+                    context.request.sub_agent_depth,
+                    sink,
+                )?;
+                if !checks.all_succeeded() {
+                    sink.emit(AgentEvent::TeamMessage {
+                        actor: crate::events::TeamActor::Automation(
+                            crate::events::AutomationActor::Handoff,
+                        ),
+                        tone: crate::events::TeamMessageTone::Warning,
+                        message: format!(
+                            "I stopped the commit because these checks still need attention: {}.",
+                            checks
+                                .failed
+                                .iter()
+                                .chain(checks.skipped.iter())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        evidence_ids: checks
+                            .failed
+                            .iter()
+                            .chain(checks.skipped.iter())
+                            .map(|id| format!("check:{id}"))
+                            .collect(),
+                        nesting_depth: (context.request.sub_agent_depth > 0)
+                            .then_some(context.request.sub_agent_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    bail!(
+                        "git_commit blocked because applicable checks failed: {}",
+                        serde_json::to_string(&checks.failures)?
+                    );
+                }
+                match managed_commit(
+                    repository,
+                    message,
+                    (context.request.sub_agent_depth > 0)
+                        .then_some(context.request.sub_agent_depth),
+                    sink,
+                )? {
+                    ManagedCommitOutcome::Created(commit) => {
+                        Ok(format!("committed {}: {}", commit.oid, commit.subject))
+                    }
+                    ManagedCommitOutcome::Reused(commit) => Ok(format!(
+                        "all task-owned changes are already committed in {}: {}",
+                        commit.oid, commit.subject
+                    )),
+                    ManagedCommitOutcome::NoChange => Ok("nothing to commit".to_string()),
+                    ManagedCommitOutcome::Blocked(detail) => bail!(detail),
+                }
+            } else {
+                if let Some(config) = context.env_config {
+                    run_guard_commands(config, command_backend, workspace_root)?;
+                }
+                match git_commit_all(message, workspace_root)? {
+                    true => Ok(format!("committed: {message}")),
+                    false => Ok("nothing to commit".to_string()),
+                }
             }
         }
         "git_log" => {
@@ -8206,7 +8303,7 @@ fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn is_semantic_commit_message(message: &str) -> bool {
+pub(crate) fn is_semantic_commit_message(message: &str) -> bool {
     let message = message.trim();
     if message.is_empty() || message.contains('\n') {
         return false;
@@ -8711,6 +8808,56 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::CheckResult { reused: true, .. }))
+        );
+    }
+
+    #[test]
+    fn git_commit_tool_uses_shared_checks_and_handoff_reuses_its_commit() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 2;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "true".to_string()
+        ]));
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let commit = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "git_commit",
+                "arguments": {"message": "feat: commit shared policy fixture"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![commit, scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CommitResult { created: true, .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CommitResult { reused: true, .. }))
+        );
+        assert_eq!(
+            git_run(&["rev-list", "--count", "HEAD"], tmp.path())
+                .unwrap()
+                .trim(),
+            "2"
         );
     }
 

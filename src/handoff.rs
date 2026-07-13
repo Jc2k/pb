@@ -1,4 +1,8 @@
-use anyhow::Result;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
 
 use crate::agent_core::EventSink;
 use crate::checks::{CheckRunSummary, EvidenceSource, WorkspaceCheckRuntime, plan_checks};
@@ -22,6 +26,10 @@ pub enum HandoffAttempt {
         summary: HandoffSummary,
         detail: String,
     },
+    CommitBlocked {
+        summary: HandoffSummary,
+        detail: String,
+    },
 }
 
 impl HandoffAttempt {
@@ -30,15 +38,25 @@ impl HandoffAttempt {
             Self::Ready(summary)
             | Self::NoChange(summary)
             | Self::NeedsRepair { summary, .. }
-            | Self::ExecutorUnavailable { summary, .. } => summary,
+            | Self::ExecutorUnavailable { summary, .. }
+            | Self::CommitBlocked { summary, .. } => summary,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedCommitOutcome {
+    Created(crate::events::HandoffCommitSummary),
+    Reused(crate::events::HandoffCommitSummary),
+    NoChange,
+    Blocked(String),
 }
 
 pub fn run_handoff(
     repository: &RepositoryContext,
     graph: &WorkspaceGraph,
     runtime: &mut WorkspaceCheckRuntime<'_>,
+    commit_subject: &str,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<HandoffAttempt> {
@@ -127,7 +145,36 @@ pub fn run_handoff(
         .collect::<Vec<_>>();
 
     if run.all_succeeded() {
-        let outcome = if plan.changed_paths.is_empty() {
+        let current_changed_paths = repository.task_changed_paths()?;
+        let commit = match managed_commit(repository, commit_subject, event_nesting_depth, sink)? {
+            ManagedCommitOutcome::Created(commit) | ManagedCommitOutcome::Reused(commit) => {
+                Some(commit)
+            }
+            ManagedCommitOutcome::NoChange => None,
+            ManagedCommitOutcome::Blocked(detail) => {
+                let summary = HandoffSummary {
+                    outcome: HandoffOutcome::CommitBlocked,
+                    affected_components: plan.affected_components,
+                    checks,
+                    commit: None,
+                    changed_paths: current_changed_paths,
+                    detail: Some(detail.clone()),
+                };
+                sink.emit(AgentEvent::TeamMessage {
+                    actor: handoff_actor(),
+                    tone: TeamMessageTone::Error,
+                    message: format!(
+                        "Everything affected passed, but I couldn’t create a safe commit. I left the workspace intact: {detail}"
+                    ),
+                    evidence_ids,
+                    nesting_depth: event_nesting_depth,
+                    timestamp_ms: Some(now_millis()),
+                });
+                emit_summary(sink, summary.clone(), event_nesting_depth);
+                return Ok(HandoffAttempt::CommitBlocked { summary, detail });
+            }
+        };
+        let outcome = if current_changed_paths.is_empty() {
             HandoffOutcome::NoChange
         } else {
             HandoffOutcome::Ready
@@ -136,8 +183,8 @@ pub fn run_handoff(
             outcome,
             affected_components: plan.affected_components,
             checks,
-            commit: None,
-            changed_paths: plan.changed_paths,
+            commit: commit.clone(),
+            changed_paths: current_changed_paths,
             detail: None,
         };
         let message = if outcome == HandoffOutcome::NoChange {
@@ -146,8 +193,14 @@ pub fn run_handoff(
         } else if plan.checks.is_empty() {
             "I found repository changes, but this project has no applicable checks configured. I’m ready to hand them back."
                 .to_string()
+        } else if let Some(commit) = &commit {
+            format!(
+                "Everything affected passed. Kate committed the changes as {}.",
+                short_oid(&commit.oid)
+            )
         } else {
-            "Everything affected passed. I’m ready to hand the repository changes back.".to_string()
+            "Everything affected passed. The task’s existing commit is ready to hand back."
+                .to_string()
         };
         sink.emit(AgentEvent::TeamMessage {
             actor: handoff_actor(),
@@ -215,6 +268,300 @@ pub fn run_handoff(
         feedback,
         failure_signature,
     })
+}
+
+pub fn managed_commit(
+    repository: &RepositoryContext,
+    subject: &str,
+    nesting_depth: Option<usize>,
+    sink: &mut dyn EventSink,
+) -> Result<ManagedCommitOutcome> {
+    if !crate::agent_core::is_semantic_commit_message(subject) {
+        let detail = format!("managed commit subject is not semantic: {subject}");
+        emit_commit_result(
+            sink,
+            false,
+            false,
+            false,
+            None,
+            Some(subject.to_string()),
+            Vec::new(),
+            detail.clone(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Blocked(detail));
+    }
+
+    let changed_paths = repository.task_changed_paths()?;
+    if changed_paths.is_empty() {
+        return Ok(ManagedCommitOutcome::NoChange);
+    }
+    let changed = changed_paths.iter().cloned().collect::<BTreeSet<_>>();
+    let baseline_dirty = repository
+        .task_baseline
+        .status
+        .dirty_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let overlap = changed
+        .intersection(&baseline_dirty)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !overlap.is_empty() {
+        let detail = format!(
+            "task changes overlap path(s) that were already dirty when the task started: {}",
+            overlap.join(", ")
+        );
+        emit_commit_result(
+            sink,
+            false,
+            false,
+            false,
+            None,
+            Some(subject.to_string()),
+            overlap,
+            detail.clone(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Blocked(detail));
+    }
+
+    let dirty = current_dirty_paths(&repository.repo_root)?;
+    let owned_dirty = dirty
+        .into_iter()
+        .filter(|path| changed.contains(path))
+        .collect::<BTreeSet<_>>();
+    let staged = git_path_list(
+        &repository.repo_root,
+        &["diff", "--cached", "--name-only", "-z"],
+    )?;
+    let unexpected_staged = staged.difference(&owned_dirty).cloned().collect::<Vec<_>>();
+    if !unexpected_staged.is_empty() {
+        let detail = format!(
+            "the index contains staged path(s) not owned by this task: {}",
+            unexpected_staged.join(", ")
+        );
+        emit_commit_result(
+            sink,
+            false,
+            false,
+            false,
+            None,
+            Some(subject.to_string()),
+            unexpected_staged,
+            detail.clone(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Blocked(detail));
+    }
+
+    if owned_dirty.is_empty() {
+        let commit = current_commit(&repository.repo_root)?.with_context(|| {
+            "task content differs from its baseline but no task-owned uncommitted path or commit exists"
+        })?;
+        if repository.task_baseline.head.as_deref() == Some(commit.oid.as_str()) {
+            let detail =
+                "task content differs from its baseline but HEAD did not advance".to_string();
+            emit_commit_result(
+                sink,
+                false,
+                false,
+                false,
+                Some(commit.oid),
+                Some(commit.subject),
+                changed_paths,
+                detail.clone(),
+                nesting_depth,
+            );
+            return Ok(ManagedCommitOutcome::Blocked(detail));
+        }
+        emit_commit_result(
+            sink,
+            true,
+            false,
+            true,
+            Some(commit.oid.clone()),
+            Some(commit.subject.clone()),
+            changed_paths,
+            "reused the task’s existing commit".to_string(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Reused(commit));
+    }
+
+    let owned_dirty = owned_dirty.into_iter().collect::<Vec<_>>();
+    let add = Command::new("git")
+        .arg("add")
+        .arg("--")
+        .args(&owned_dirty)
+        .current_dir(&repository.repo_root)
+        .output()
+        .context("failed to stage task-owned paths")?;
+    if !add.status.success() {
+        let detail = format!(
+            "failed to stage task-owned paths: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+        emit_commit_result(
+            sink,
+            false,
+            false,
+            false,
+            None,
+            Some(subject.to_string()),
+            owned_dirty,
+            detail.clone(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Blocked(detail));
+    }
+    let commit_output = Command::new("git")
+        .args(["commit", "-m", subject])
+        .current_dir(&repository.repo_root)
+        .output()
+        .context("failed to create managed commit")?;
+    if !commit_output.status.success() {
+        unstage_task_paths(&repository.repo_root, &owned_dirty);
+        let detail = format!(
+            "managed commit failed: {}",
+            String::from_utf8_lossy(&commit_output.stderr).trim()
+        );
+        emit_commit_result(
+            sink,
+            false,
+            false,
+            false,
+            None,
+            Some(subject.to_string()),
+            owned_dirty,
+            detail.clone(),
+            nesting_depth,
+        );
+        return Ok(ManagedCommitOutcome::Blocked(detail));
+    }
+    let commit = current_commit(&repository.repo_root)?
+        .context("managed commit succeeded but HEAD is unavailable")?;
+    let remaining = current_dirty_paths(&repository.repo_root)?
+        .into_iter()
+        .filter(|path| changed.contains(path))
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        bail!(
+            "managed commit left task-owned path(s) uncommitted: {}",
+            remaining.join(", ")
+        );
+    }
+    emit_commit_result(
+        sink,
+        true,
+        true,
+        false,
+        Some(commit.oid.clone()),
+        Some(commit.subject.clone()),
+        owned_dirty,
+        "created a task-owned commit after checks passed".to_string(),
+        nesting_depth,
+    );
+    Ok(ManagedCommitOutcome::Created(commit))
+}
+
+fn current_dirty_paths(repo_root: &Path) -> Result<BTreeSet<String>> {
+    let mut dirty = BTreeSet::new();
+    for args in [
+        &["diff", "--name-only", "-z"][..],
+        &["diff", "--cached", "--name-only", "-z"][..],
+        &["ls-files", "--others", "--exclude-standard", "-z"][..],
+    ] {
+        dirty.extend(git_path_list(repo_root, args)?);
+    }
+    Ok(dirty)
+}
+
+fn git_path_list(repo_root: &Path, args: &[&str]) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .context("git returned a non-UTF-8 path")
+                .map(|path| path.replace('\\', "/"))
+        })
+        .collect()
+}
+
+fn current_commit(repo_root: &Path) -> Result<Option<crate::events::HandoffCommitSummary>> {
+    let output = Command::new("git")
+        .args(["show", "-s", "--format=%H%x00%s", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to inspect current commit")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text =
+        String::from_utf8(output.stdout).context("git returned non-UTF-8 commit metadata")?;
+    let (oid, subject) = text
+        .trim_end()
+        .split_once('\0')
+        .context("git returned malformed commit metadata")?;
+    Ok(Some(crate::events::HandoffCommitSummary {
+        oid: oid.to_string(),
+        subject: subject.to_string(),
+    }))
+}
+
+fn unstage_task_paths(repo_root: &Path, paths: &[String]) {
+    let _ = Command::new("git")
+        .arg("reset")
+        .arg("--mixed")
+        .arg("HEAD")
+        .arg("--")
+        .args(paths)
+        .current_dir(repo_root)
+        .output();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_commit_result(
+    sink: &mut dyn EventSink,
+    success: bool,
+    created: bool,
+    reused: bool,
+    oid: Option<String>,
+    subject: Option<String>,
+    changed_paths: Vec<String>,
+    detail: String,
+    nesting_depth: Option<usize>,
+) {
+    sink.emit(AgentEvent::CommitResult {
+        success,
+        created,
+        reused,
+        oid,
+        subject,
+        changed_paths,
+        detail,
+        nesting_depth,
+        timestamp_ms: Some(now_millis()),
+    });
+}
+
+fn short_oid(oid: &str) -> &str {
+    oid.get(..8).unwrap_or(oid)
 }
 
 fn repair_feedback(run: &CheckRunSummary) -> String {
@@ -389,6 +736,21 @@ mod tests {
         WorkspaceCheckRuntime::new(root, graph, None, None, CheckEvidenceLedger::default())
     }
 
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     #[test]
     fn unchanged_task_stays_out_of_the_way_when_no_always_check_applies() {
         let repo = init_repo();
@@ -396,9 +758,14 @@ mod tests {
         let graph = graph("true", CheckTrigger::Changed);
         let mut runtime = runtime(repo.path(), &graph);
         let mut events = Vec::new();
-        let attempt = run_handoff(&repository, &graph, &mut runtime, 0, &mut |event| {
-            events.push(event)
-        })
+        let attempt = run_handoff(
+            &repository,
+            &graph,
+            &mut runtime,
+            "test: hand off fixture",
+            0,
+            &mut |event| events.push(event),
+        )
         .unwrap();
         assert!(matches!(attempt, HandoffAttempt::NoChange(_)));
         assert!(!events.iter().any(|event| matches!(
@@ -419,9 +786,14 @@ mod tests {
         let graph = graph("echo broken >&2; exit 7", CheckTrigger::Changed);
         let mut runtime = runtime(repo.path(), &graph);
         let mut events = Vec::new();
-        let attempt = run_handoff(&repository, &graph, &mut runtime, 0, &mut |event| {
-            events.push(event)
-        })
+        let attempt = run_handoff(
+            &repository,
+            &graph,
+            &mut runtime,
+            "test: hand off fixture",
+            0,
+            &mut |event| events.push(event),
+        )
         .unwrap();
         let HandoffAttempt::NeedsRepair { feedback, .. } = attempt else {
             panic!("expected repair handoff");
@@ -432,6 +804,10 @@ mod tests {
             event,
             AgentEvent::TeamMessage { message, .. } if message.contains("Kate")
         )));
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "HEAD"]).trim(),
+            repository.task_baseline.head.as_deref().unwrap()
+        );
     }
 
     #[test]
@@ -440,11 +816,146 @@ mod tests {
         let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
         let graph = graph("true", CheckTrigger::Always);
         let mut runtime = runtime(repo.path(), &graph);
-        let attempt = run_handoff(&repository, &graph, &mut runtime, 0, &mut |_| {}).unwrap();
+        let attempt = run_handoff(
+            &repository,
+            &graph,
+            &mut runtime,
+            "test: hand off fixture",
+            0,
+            &mut |_| {},
+        )
+        .unwrap();
         let HandoffAttempt::NoChange(summary) = attempt else {
             panic!("expected no-change handoff");
         };
         assert_eq!(summary.checks[0].status, "passed");
         assert!(summary.commit.is_none());
+    }
+
+    #[test]
+    fn successful_handoff_creates_one_task_owned_commit() {
+        let repo = init_repo();
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("app.txt"), "two\n").unwrap();
+        let graph = graph("true", CheckTrigger::Changed);
+        let mut runtime = runtime(repo.path(), &graph);
+        let attempt = run_handoff(
+            &repository,
+            &graph,
+            &mut runtime,
+            "feat: update app fixture",
+            0,
+            &mut |_| {},
+        )
+        .unwrap();
+        let HandoffAttempt::Ready(summary) = attempt else {
+            panic!("expected ready handoff");
+        };
+        assert_eq!(summary.commit.unwrap().subject, "feat: update app fixture");
+        assert!(git(repo.path(), &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            git(repo.path(), &["show", "--pretty=", "--name-only", "HEAD"]).trim(),
+            "app.txt"
+        );
+    }
+
+    #[test]
+    fn managed_commit_preserves_preexisting_unstaged_and_untracked_work() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("user.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "user.txt"]);
+        git(repo.path(), &["commit", "-m", "test: add user fixture"]);
+        std::fs::write(repo.path().join("user.txt"), "user work\n").unwrap();
+        std::fs::write(repo.path().join("notes.txt"), "private notes\n").unwrap();
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("task.txt"), "task work\n").unwrap();
+
+        let outcome =
+            managed_commit(&repository, "feat: add task fixture", None, &mut |_| {}).unwrap();
+        assert!(matches!(outcome, ManagedCommitOutcome::Created(_)));
+        assert_eq!(
+            git(repo.path(), &["show", "--pretty=", "--name-only", "HEAD"]).trim(),
+            "task.txt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("user.txt")).unwrap(),
+            "user work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("notes.txt")).unwrap(),
+            "private notes\n"
+        );
+        let status = git(repo.path(), &["status", "--porcelain"]);
+        assert!(status.contains("user.txt"));
+        assert!(status.contains("notes.txt"));
+        assert!(!status.contains("task.txt"));
+    }
+
+    #[test]
+    fn unrelated_staged_content_blocks_commit_without_changing_the_index() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("staged.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "staged.txt"]);
+        git(repo.path(), &["commit", "-m", "test: add staged fixture"]);
+        std::fs::write(repo.path().join("staged.txt"), "user staged\n").unwrap();
+        git(repo.path(), &["add", "staged.txt"]);
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("task.txt"), "task work\n").unwrap();
+        let index_before = git(repo.path(), &["diff", "--cached", "--binary"]);
+        let head_before = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let outcome =
+            managed_commit(&repository, "feat: add task fixture", None, &mut |_| {}).unwrap();
+        let ManagedCommitOutcome::Blocked(detail) = outcome else {
+            panic!("expected blocked commit");
+        };
+        assert!(detail.contains("staged.txt"));
+        assert_eq!(
+            index_before,
+            git(repo.path(), &["diff", "--cached", "--binary"])
+        );
+        assert_eq!(head_before, git(repo.path(), &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn overlapping_dirty_path_blocks_commit() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("app.txt"), "user work\n").unwrap();
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("app.txt"), "task overwrite\n").unwrap();
+        let outcome = managed_commit(
+            &repository,
+            "feat: overwrite app fixture",
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        let ManagedCommitOutcome::Blocked(detail) = outcome else {
+            panic!("expected overlapping path to block commit");
+        };
+        assert!(detail.contains("app.txt"));
+    }
+
+    #[test]
+    fn existing_task_commit_is_reused_without_duplication() {
+        let repo = init_repo();
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("task.txt"), "task work\n").unwrap();
+        git(repo.path(), &["add", "task.txt"]);
+        git(repo.path(), &["commit", "-m", "feat: agent task commit"]);
+        let head_before = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let outcome = managed_commit(
+            &repository,
+            "feat: redundant handoff commit",
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        let ManagedCommitOutcome::Reused(commit) = outcome else {
+            panic!("expected existing commit reuse");
+        };
+        assert_eq!(commit.subject, "feat: agent task commit");
+        assert_eq!(head_before, git(repo.path(), &["rev-parse", "HEAD"]));
     }
 }

@@ -67,6 +67,23 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::HandoffSummary { summary, .. } => {
             print_header("handoff", &format!("{:?}", summary.outcome));
         }
+        AgentEvent::CommitResult {
+            success,
+            oid,
+            subject,
+            detail,
+            ..
+        } => {
+            let state = if *success { "ready" } else { "blocked" };
+            print_header(
+                "commit",
+                &format!(
+                    "{state} {} {} {detail}",
+                    oid.as_deref().unwrap_or_default(),
+                    subject.as_deref().unwrap_or_default()
+                ),
+            );
+        }
         AgentEvent::CheckResult {
             check_id,
             exit_status,

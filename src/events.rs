@@ -45,6 +45,7 @@ pub enum TerminationReason {
     ChecksFailed,
     ExecutorUnavailable,
     RepairExhausted,
+    CommitBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ impl TerminationReason {
             Self::ChecksFailed => "checks_failed",
             Self::ExecutorUnavailable => "executor_unavailable",
             Self::RepairExhausted => "repair_exhausted",
+            Self::CommitBlocked => "commit_blocked",
         }
     }
 }
@@ -304,6 +306,23 @@ pub enum AgentEvent {
     },
     HandoffSummary {
         summary: HandoffSummary,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    CommitResult {
+        success: bool,
+        created: bool,
+        reused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -644,6 +663,30 @@ impl EventEnvelope {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::HandoffSummary {
                     summary,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::CommitResult {
+                success,
+                created,
+                reused,
+                oid,
+                subject,
+                changed_paths,
+                detail,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::CommitResult {
+                    success,
+                    created,
+                    reused,
+                    oid,
+                    subject,
+                    changed_paths,
+                    detail,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
