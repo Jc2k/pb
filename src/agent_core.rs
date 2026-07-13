@@ -3573,7 +3573,39 @@ fn parse_model_tool_call_output(content: &mut String) -> Result<Vec<AgentToolCal
     }
     text.push_str(remaining);
     *content = text.trim().to_string();
+    if tool_calls.is_empty()
+        && let Some(tool_call) = parse_textual_model_tool_call(content)?
+    {
+        tool_calls.push(tool_call);
+    }
     Ok(tool_calls)
+}
+
+fn parse_textual_model_tool_call(content: &str) -> Result<Option<AgentToolCall>> {
+    for line in content.lines() {
+        let Some(call) = line.trim().strip_prefix("tool=") else {
+            continue;
+        };
+        let Some((name, arguments)) = call.split_once(" args=") else {
+            continue;
+        };
+        let name = name.trim();
+        if !is_builtin_tool_name(name) {
+            continue;
+        }
+        let Some(arguments) = extract_json_objects(arguments).into_iter().next() else {
+            continue;
+        };
+        let arguments = serde_json::from_str::<Value>(&arguments).with_context(|| {
+            format!("failed to parse textual model tool arguments for {name}: {arguments}")
+        })?;
+        return Ok(Some(AgentToolCall {
+            id: None,
+            tool: name.to_string(),
+            arguments: parse_model_tool_arguments(&arguments)?,
+        }));
+    }
+    Ok(None)
 }
 
 fn parse_model_tool_call_block(block: &str) -> Result<AgentToolCall> {
@@ -6765,6 +6797,24 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "read_file");
         assert_eq!(calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn parse_model_tool_call_output_accepts_textual_tool_and_args() {
+        let mut output = "Tool calls:\ntool=read_file args={\"path\":\"probe.txt\"}\n\n[tool]\npretend result\nTool name: read_file\n\n[assistant]\ntool=run_command args={\"cmd\":\"false\"}".to_string();
+        let calls = parse_model_tool_call_output(&mut output).unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].arguments["path"], "probe.txt");
+    }
+
+    #[test]
+    fn parse_model_tool_call_output_ignores_unknown_textual_tools() {
+        let mut output = "tool=not_a_tool args={\"path\":\"probe.txt\"}".to_string();
+        let calls = parse_model_tool_call_output(&mut output).unwrap();
+
+        assert!(calls.is_empty());
     }
 
     #[test]
