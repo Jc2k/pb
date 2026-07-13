@@ -838,6 +838,7 @@ async fn run_serve() -> Result<()> {
         max_tokens: user_config.effective_max_tokens(),
         turn_max_tokens_cap: None,
         tool_allowlist: None,
+        accept_existing_workspace_changes: false,
         ctx_size: user_config.effective_ctx_size(),
         threads: user_config.effective_threads(),
         threads_batch: user_config.effective_threads_batch(),

@@ -464,6 +464,9 @@ pub struct AgentRequest {
     /// Optional native-tool allowlist for bounded direct harness runs.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Allow an explicitly resumed task to satisfy the change gate with pending workspace changes.
+    #[serde(default)]
+    pub accept_existing_workspace_changes: bool,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -2315,6 +2318,15 @@ struct GateState {
     review_completed_successfully: bool,
 }
 
+fn initial_gate_state(args: &AgentRequest, workspace_root: &Path) -> GateState {
+    let wrote_file = args.accept_existing_workspace_changes
+        && git_status_porcelain(workspace_root).is_ok_and(|status| !status.trim().is_empty());
+    GateState {
+        wrote_file,
+        ..GateState::default()
+    }
+}
+
 fn run_agent_steps(
     generator: &mut dyn CompletionEngine,
     text_backend: TextBackendKind,
@@ -2342,7 +2354,7 @@ fn run_agent_steps(
     let mut last_parse_failure_signature: Option<u64> = None;
     let mut repeated_parse_failures = 0usize;
     let mut tool_loop_guard = ToolLoopGuard::default();
-    let gate_state = RefCell::new(GateState::default());
+    let gate_state = RefCell::new(initial_gate_state(args, workspace_root));
     let available_tools = available_tool_specs_with_allowlist(
         args.profile,
         command_backend.map(CommandBackend::kind),
@@ -3606,7 +3618,7 @@ fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Op
         None
     } else {
         Some(format!(
-            "Agent tried to end session too soo. Completion gate is not satisfied: {}. Continue the task instead of finalizing.",
+            "Agent tried to end session too soon. Completion gate is not satisfied: {}. Continue the task instead of finalizing.",
             missing.join(" and ")
         ))
     }
@@ -4144,7 +4156,12 @@ fn run_tool(
                 .context("run_command requires string argument: cmd")?;
             let backend = command_backend
                 .context("run_command is not available: no project environment is configured")?;
-            backend.exec(cmd)
+            run_command_and_record_workspace_change(
+                backend,
+                cmd,
+                workspace_root,
+                context.gate_state,
+            )
         }
         _ => bail!("unknown tool: {tool}"),
     }
@@ -4152,6 +4169,34 @@ fn run_tool(
 
 fn tool_is_in_request_allowlist(tool: &str, allowlist: Option<&[String]>) -> bool {
     allowlist.is_none_or(|allowlist| allowlist.iter().any(|allowed| allowed == tool))
+}
+
+fn run_command_and_record_workspace_change(
+    backend: &CommandBackend,
+    cmd: &str,
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<String> {
+    let before = git_completion_marker(workspace_root);
+    let result = backend.exec(cmd);
+    let after = git_completion_marker(workspace_root);
+    if before != after {
+        gate_state.borrow_mut().wrote_file = true;
+    }
+    result
+}
+
+fn git_completion_marker(workdir: &Path) -> Option<String> {
+    let head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "<unborn>".to_string());
+    let status = git_status_porcelain(workdir).ok()?;
+    Some(format!("{head}\n{status}"))
 }
 
 fn question_choices(arguments: &Value) -> Result<Vec<String>> {
@@ -6248,6 +6293,7 @@ mod tests {
             max_tokens,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            accept_existing_workspace_changes: false,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -7075,7 +7121,7 @@ mod tests {
         let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
         assert!(feedback.contains("change at least one file"));
         assert!(feedback.contains("review"));
-        assert!(feedback.contains("Agent tried to end session too soo"));
+        assert!(feedback.contains("Agent tried to end session too soon"));
 
         state.wrote_file = true;
         let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
@@ -7085,6 +7131,84 @@ mod tests {
         state.review_completed_successfully = true;
         assert!(completion_gate_feedback(AgentProfile::Build, &state).is_none());
         assert!(completion_gate_feedback(AgentProfile::Ask, &GateState::default()).is_none());
+    }
+
+    #[test]
+    fn resumed_request_accepts_existing_pending_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "--allow-empty", "-m", "test: initialize"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("pending.txt"), "pending\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 512);
+
+        assert!(!initial_gate_state(&request, tmp.path()).wrote_file);
+        request.accept_existing_workspace_changes = true;
+        assert!(initial_gate_state(&request, tmp.path()).wrote_file);
+    }
+
+    #[test]
+    fn run_command_git_change_updates_completion_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: initialize"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+        let backend = CommandBackend::Local {
+            workspace_root: tmp.path().to_path_buf(),
+        };
+        let gate_state = RefCell::new(GateState::default());
+
+        run_command_and_record_workspace_change(
+            &backend,
+            "git add tracked.txt && git commit -m 'test: update tracked file'",
+            tmp.path(),
+            &gate_state,
+        )
+        .unwrap();
+
+        assert!(gate_state.borrow().wrote_file);
+        assert!(git_status_porcelain(tmp.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -7215,6 +7339,7 @@ mod tests {
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            accept_existing_workspace_changes: false,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,
@@ -7275,6 +7400,7 @@ mod tests {
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            accept_existing_workspace_changes: false,
             ctx_size: 4096,
             threads: None,
             threads_batch: None,

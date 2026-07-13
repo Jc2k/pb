@@ -208,6 +208,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
                 .map(|tool| (*tool).to_string())
                 .collect(),
         ),
+        accept_existing_workspace_changes: layout.resumed,
         ctx_size: args
             .ctx_size
             .unwrap_or_else(|| user_config.effective_ctx_size()),
