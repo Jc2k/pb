@@ -22,7 +22,9 @@ const HARNESS_AGENT_TOOLS: &[&str] = &[
     "session_title",
     "run_command",
     "write_file",
+    "edit_file",
     "apply_patch",
+    "rm",
     "git_commit",
     "sub_agent",
 ];
@@ -604,7 +606,9 @@ mod tests {
                 "session_title",
                 "run_command",
                 "write_file",
+                "edit_file",
                 "apply_patch",
+                "rm",
                 "git_commit",
                 "sub_agent"
             ]

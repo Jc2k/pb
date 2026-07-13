@@ -1338,7 +1338,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect once, then create new files with write_file and edit existing files with apply_patch. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect once, then create new files with write_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
