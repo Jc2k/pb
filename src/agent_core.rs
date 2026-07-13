@@ -16,6 +16,7 @@ use ignore::WalkBuilder;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -54,6 +55,10 @@ const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
 const MONITOR_STEP_BUDGET: usize = 3;
+const MONITOR_AGENT_MAX_STEPS: usize = 1;
+const MONITOR_TURN_MAX_TOKENS: i32 = 512;
+const MONITOR_TRANSCRIPT_MESSAGES: usize = 8;
+const MONITOR_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
 const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
@@ -1338,7 +1343,7 @@ fn build_direct_harness_instructions(
     );
     let role = match profile {
         AgentProfile::Build => {
-            "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent to inspect the implementation, address valid findings, rerun tests, and git_commit the completed work with a semantic message."
+            "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent only to inspect and report. After the review returns, address valid findings yourself, rerun tests yourself, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
@@ -1348,8 +1353,22 @@ fn build_direct_harness_instructions(
         }
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
+    let action_contract = match profile {
+        AgentProfile::Build | AgentProfile::Scout => {
+            "Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Do not return prose-only planning or a final response before a tool result and repository mutation."
+        }
+        AgentProfile::Review => {
+            "Inspect the workspace with read_file and read-only run_command checks. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence."
+        }
+        AgentProfile::Monitor => {
+            "Do not call tools or teammates. Audit only the transcript supplied in the task and immediately return a concise final decision."
+        }
+        _ => {
+            "Use only the tools needed for the assigned role, then return a concise final response."
+        }
+    };
     format!(
-        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text: {{\"type\":\"tool_calls\",\"calls\":[{{\"tool\":\"session_title\",\"arguments\":{{\"title\":\"Build task\"}}}},{{\"tool\":\"run_command\",\"arguments\":{{\"cmd\":\"pwd\"}}}}]}}. Do not return prose-only planning or a final response before a tool result and repository mutation. {role} Do not claim completion until the requested result is implemented and verified. Finish with a concise summary. Available tools: {tools}.",
+        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text using either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{...}}}} or {{\"type\":\"final\",\"content\":\"...\"}}. {action_contract} {role} Do not claim completion until the assigned role is complete. Finish with a concise summary. Available tools: {tools}.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -2649,7 +2668,7 @@ fn run_step_limit_monitor(
         mcp_registry,
         lsp_registry,
     )?;
-    let transcript = render_prompt(messages);
+    let transcript = render_monitor_transcript(messages);
     let mut monitor_messages = vec![
         ChatMessage::text("system", instructions),
         ChatMessage::text(
@@ -2660,7 +2679,9 @@ fn run_step_limit_monitor(
     let mut monitor_request = args.clone();
     monitor_request.task = monitor_task;
     monitor_request.profile = AgentProfile::Monitor;
-    monitor_request.max_steps = MONITOR_STEP_BUDGET;
+    monitor_request.max_steps = MONITOR_AGENT_MAX_STEPS;
+    monitor_request.turn_max_tokens_cap = Some(MONITOR_TURN_MAX_TOKENS);
+    monitor_request.tool_allowlist = Some(Vec::new());
     monitor_request.sub_agent_depth = args.sub_agent_depth + 1;
 
     let mut monitor_generator = LlamaCompletionEngine { llamacpp };
@@ -2693,6 +2714,50 @@ fn run_step_limit_monitor(
         timestamp_ms: Some(now_millis()),
     });
     Ok(Some(result))
+}
+
+fn render_monitor_transcript(messages: &[ChatMessage]) -> String {
+    let non_system = messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .collect::<Vec<_>>();
+    let start = non_system.len().saturating_sub(MONITOR_TRANSCRIPT_MESSAGES);
+    let mut transcript = String::new();
+    if start > 0 {
+        transcript.push_str("[earlier transcript omitted]\n");
+    }
+    for message in &non_system[start..] {
+        transcript.push_str(message.role);
+        transcript.push_str(": ");
+        transcript.push_str(&truncate_for_monitor(&message.content));
+        if !message.tool_calls.is_empty() {
+            transcript.push_str(" [tool calls: ");
+            transcript.push_str(
+                &message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.tool.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            transcript.push(']');
+        }
+        transcript.push('\n');
+    }
+    transcript
+}
+
+fn truncate_for_monitor(text: &str) -> String {
+    let mut chars = text.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MONITOR_TRANSCRIPT_MESSAGE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn monitor_recommends_more_steps(audit: &str) -> bool {
@@ -2907,6 +2972,7 @@ fn execute_tool_calls(
     Ok(())
 }
 
+#[cfg(test)]
 fn render_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     prompt.push_str("<conversation>\n");
@@ -3677,6 +3743,9 @@ fn run_tool(
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<String> {
+    if !tool_is_in_request_allowlist(tool, context.request.tool_allowlist.as_deref()) {
+        bail!("tool '{tool}' is not allowed for this bounded run");
+    }
     if context.mcp_registry.tool(tool).is_some() {
         return mcp::call_tool(context.mcp_registry, tool, arguments);
     }
@@ -4081,6 +4150,10 @@ fn run_tool(
     }
 }
 
+fn tool_is_in_request_allowlist(tool: &str, allowlist: Option<&[String]>) -> bool {
+    allowlist.is_none_or(|allowlist| allowlist.iter().any(|allowed| allowed == tool))
+}
+
 fn question_choices(arguments: &Value) -> Result<Vec<String>> {
     let Some(raw_choices) = arguments.get("choices") else {
         return Ok(Vec::new());
@@ -4358,6 +4431,38 @@ fn run_sub_agent(
         .unwrap_or(DEFAULT_SUB_AGENT_MAX_STEPS)
         .clamp(1, context.request.max_steps.max(1));
     let workspace_status_before = git_status_porcelain(context.workspace_root).ok();
+    let isolated_review = if profile == AgentProfile::Review && !context.request.repository_less {
+        Some(prepare_isolated_review_workspace(context.workspace_root)?)
+    } else {
+        None
+    };
+    let sub_workspace_root = isolated_review
+        .as_ref()
+        .map(|workspace| workspace.root.as_path())
+        .unwrap_or(context.workspace_root);
+    let isolated_command_backend = if isolated_review.is_some() {
+        match context.command_backend.map(CommandBackend::kind) {
+            Some(CommandBackendKind::Local) => Some(CommandBackend::Local {
+                workspace_root: sub_workspace_root.to_path_buf(),
+            }),
+            Some(CommandBackendKind::Container) => Some(CommandBackend::start(
+                context
+                    .env_config
+                    .context("review isolation requires the active container environment")?,
+                sub_workspace_root,
+            )?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let sub_command_backend = isolated_command_backend
+        .as_ref()
+        .or(context.command_backend);
+    let review_fingerprint_before = isolated_review
+        .as_ref()
+        .map(|_| git_workspace_fingerprint(sub_workspace_root))
+        .transpose()?;
 
     sink.emit(AgentEvent::SubAgentStarted {
         profile: profile.as_str().to_string(),
@@ -4367,10 +4472,10 @@ fn run_sub_agent(
     });
 
     let instructions = build_agent_instructions_with_tool_allowlist(
-        context.workspace_root,
+        sub_workspace_root,
         context.request.branch.as_deref().unwrap_or("sub-agent"),
         true,
-        context.command_backend.map(CommandBackend::kind),
+        sub_command_backend.map(CommandBackend::kind),
         context.env_config,
         profile,
         false,
@@ -4390,6 +4495,7 @@ fn run_sub_agent(
     sub_request.max_steps = max_steps;
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
     sub_request.repository_less = context.request.repository_less;
+    sub_request.workdir = Some(sub_workspace_root.to_path_buf());
 
     let mut llama_generator;
     let mut flashmoe_generator;
@@ -4427,9 +4533,9 @@ fn run_sub_agent(
         context.llamacpp,
         &sub_request,
         &mut messages,
-        context.workspace_root,
+        sub_workspace_root,
         context.models_root,
-        context.command_backend,
+        sub_command_backend,
         context.env_config,
         context.todo_memory,
         context.mcp_registry,
@@ -4446,7 +4552,11 @@ fn run_sub_agent(
     if workspace_changed {
         context.gate_state.borrow_mut().wrote_file = true;
     }
-    let review_mutated_workspace = profile == AgentProfile::Review && workspace_changed;
+    let review_mutated_workspace = if let Some(before) = review_fingerprint_before.as_ref() {
+        git_workspace_fingerprint(sub_workspace_root).map_or(true, |after| &after != before)
+    } else {
+        profile == AgentProfile::Review && workspace_changed
+    };
     if profile == AgentProfile::Review && outcome.reached_final && !review_mutated_workspace {
         context
             .gate_state
@@ -4455,7 +4565,7 @@ fn run_sub_agent(
     }
 
     let result = if review_mutated_workspace {
-        "review sub-agent did not pass: it changed the workspace despite the read-only review contract; inspect and revert or keep those changes deliberately, then request another review"
+        "review sub-agent did not pass: it attempted to change its isolated workspace despite the read-only review contract; the source workspace was protected, so request another review"
             .to_string()
     } else if outcome.reached_final {
         match outcome.final_content {
@@ -4707,6 +4817,232 @@ fn git_status_porcelain(workdir: &Path) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("git status failed: {stderr}")
     }
+}
+
+struct IsolatedReviewWorkspace {
+    _temp_dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+fn prepare_isolated_review_workspace(source_root: &Path) -> Result<IsolatedReviewWorkspace> {
+    let temp_dir = tempfile::tempdir().context("failed to create isolated review workspace")?;
+    let review_root = temp_dir.path().join("workspace");
+    let has_head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(source_root)
+        .output()
+        .context("failed to inspect review source HEAD")?
+        .status
+        .success();
+    if has_head {
+        let output = Command::new("git")
+            .args(["clone", "--quiet", "--no-hardlinks", "--no-local"])
+            .arg(source_root)
+            .arg(&review_root)
+            .output()
+            .context("failed to clone isolated review workspace")?;
+        if !output.status.success() {
+            bail!(
+                "failed to clone isolated review workspace: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(&review_root).with_context(|| {
+            format!(
+                "failed to create review workspace {}",
+                review_root.display()
+            )
+        })?;
+        let output = Command::new("git")
+            .arg("init")
+            .current_dir(&review_root)
+            .output()
+            .context("failed to initialize isolated review workspace")?;
+        if !output.status.success() {
+            bail!(
+                "failed to initialize isolated review workspace: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
+    let files = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(source_root)
+        .output()
+        .context("failed to list files for isolated review workspace")?;
+    if !files.status.success() {
+        bail!(
+            "failed to list files for isolated review workspace: {}",
+            String::from_utf8_lossy(&files.stderr).trim()
+        );
+    }
+    for raw_path in files
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative =
+            std::str::from_utf8(raw_path).context("review workspace contains a non-UTF-8 path")?;
+        let relative = Path::new(relative);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            bail!("unsafe review workspace path: {}", relative.display());
+        }
+        let source = source_root.join(relative);
+        let destination = review_root.join(relative);
+        match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                remove_snapshot_entry(&destination)?;
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let target = std::fs::read_link(&source)
+                    .with_context(|| format!("failed to read symlink {}", source.display()))?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &destination)
+                    .with_context(|| format!("failed to copy symlink {}", source.display()))?;
+                #[cfg(not(unix))]
+                std::fs::copy(&source, &destination).with_context(|| {
+                    format!("failed to copy symlink target {}", source.display())
+                })?;
+            }
+            Ok(metadata) if metadata.is_file() => {
+                remove_snapshot_entry(&destination)?;
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&source, &destination)
+                    .with_context(|| format!("failed to copy review file {}", source.display()))?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                std::fs::create_dir_all(&destination).with_context(|| {
+                    format!(
+                        "failed to create review directory {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(_) => bail!("unsupported review workspace entry: {}", source.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                remove_snapshot_entry(&destination)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect review file {}", source.display())
+                });
+            }
+        }
+    }
+
+    Ok(IsolatedReviewWorkspace {
+        _temp_dir: temp_dir,
+        root: review_root,
+    })
+}
+
+fn remove_snapshot_entry(path: &Path) -> Result<()> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove review directory {}", path.display()))
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove review file {}", path.display()))
+    }
+}
+
+fn git_workspace_fingerprint(workdir: &Path) -> Result<String> {
+    let mut digest = Sha256::new();
+    let head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .context("failed to inspect review workspace HEAD")?;
+    let head = if head.status.success() {
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    } else {
+        "<unborn>".to_string()
+    };
+    digest.update(head.as_bytes());
+    for args in [
+        &["diff", "--binary"][..],
+        &["diff", "--cached", "--binary"][..],
+        &["status", "--porcelain", "-z"][..],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to fingerprint review workspace: git {}",
+                    args.join(" ")
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "failed to fingerprint review workspace with git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        digest.update(&output.stdout);
+    }
+    let untracked = Command::new("git")
+        .args(["ls-files", "-z", "--others", "--exclude-standard"])
+        .current_dir(workdir)
+        .output()
+        .context("failed to list untracked review files")?;
+    if !untracked.status.success() {
+        bail!(
+            "failed to list untracked review files: {}",
+            String::from_utf8_lossy(&untracked.stderr).trim()
+        );
+    }
+    for raw_path in untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        digest.update(raw_path);
+        let relative = std::str::from_utf8(raw_path)
+            .context("review workspace contains a non-UTF-8 untracked path")?;
+        let path = workdir.join(relative);
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!("failed to inspect untracked review file {}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            digest.update(
+                std::fs::read_link(&path)
+                    .with_context(|| format!("failed to read review symlink {}", path.display()))?
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+        } else if metadata.is_file() {
+            digest.update(std::fs::read(&path).with_context(|| {
+                format!("failed to read untracked review file {}", path.display())
+            })?);
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn lexical_normalize(path: &Path) -> Result<PathBuf> {
@@ -6111,6 +6447,28 @@ mod tests {
     }
 
     #[test]
+    fn monitor_transcript_is_recent_and_bounded() {
+        let messages = (0..12)
+            .map(|index| {
+                ChatMessage::text(
+                    if index % 2 == 0 { "assistant" } else { "tool" },
+                    format!("message-{index}-{}", "x".repeat(2_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let transcript = render_monitor_transcript(&messages);
+
+        assert!(transcript.starts_with("[earlier transcript omitted]"));
+        assert!(!transcript.contains("message-0-"));
+        assert!(transcript.contains("message-11-"));
+        assert!(
+            transcript.chars().count()
+                <= MONITOR_TRANSCRIPT_MESSAGES * (MONITOR_TRANSCRIPT_MESSAGE_CHARS + 20) + 40
+        );
+    }
+
+    #[test]
     fn boosted_max_tokens_applies_general_floor() {
         let mut args = test_agent_request(AgentProfile::Ask, 384);
         assert_eq!(boosted_max_tokens(&args), DEFAULT_TURN_MAX_TOKENS);
@@ -6340,10 +6698,58 @@ mod tests {
         assert!(instructions.contains("before a tool result and repository mutation"));
         assert!(instructions.contains("run_command starts in the workspace"));
         assert!(instructions.contains("exactly one JSON object"));
-        assert!(instructions.contains(r#""arguments":{"cmd":"pwd"}"#));
+        assert!(instructions.contains(r#""type":"tool_call""#));
         assert!(!instructions.contains("Ballmer peak"));
         assert!(!instructions.contains("memory_search"));
         assert!(!instructions.contains("web_search"));
+    }
+
+    #[test]
+    fn direct_harness_review_instructions_forbid_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowlist = vec!["read_file".to_string(), "run_command".to_string()];
+        let instructions = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "test-branch",
+            true,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Review,
+            false,
+            false,
+            Some(&allowlist),
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(instructions.contains("Do not edit, stage, commit, reset, clean"));
+        assert!(instructions.contains("Return a final review"));
+        assert!(!instructions.contains("before a tool result and repository mutation"));
+    }
+
+    #[test]
+    fn direct_harness_monitor_instructions_require_immediate_final() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowlist = Vec::new();
+        let instructions = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "test-branch",
+            true,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Monitor,
+            false,
+            false,
+            Some(&allowlist),
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(instructions.contains("Do not call tools or teammates"));
+        assert!(instructions.contains("immediately return a concise final decision"));
+        assert!(!instructions.contains("repository mutation"));
     }
 
     #[test]
@@ -6424,6 +6830,16 @@ mod tests {
             json!(["path", "content"])
         );
         assert!(build_tools.iter().any(|tool| tool.name == "sub_agent"));
+    }
+
+    #[test]
+    fn bounded_run_tool_allowlist_is_enforced_at_execution_boundary() {
+        let allowlist = vec!["read_file".to_string(), "run_command".to_string()];
+
+        assert!(tool_is_in_request_allowlist("read_file", Some(&allowlist)));
+        assert!(!tool_is_in_request_allowlist("sub_agent", Some(&allowlist)));
+        assert!(tool_is_in_request_allowlist("sub_agent", None));
+        assert!(!tool_is_in_request_allowlist("run_command", Some(&[])));
     }
 
     #[test]
@@ -6893,6 +7309,72 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn review_workspace_isolated_copy_preserves_source_state() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(source.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(source.path().join("tracked.txt"), "before\n").unwrap();
+        std::fs::write(source.path().join("deleted.txt"), "delete me\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(source.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: initialize"])
+                .current_dir(source.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(source.path().join("tracked.txt"), "working copy\n").unwrap();
+        std::fs::write(source.path().join("untracked.txt"), "new\n").unwrap();
+        std::fs::remove_file(source.path().join("deleted.txt")).unwrap();
+
+        let isolated = prepare_isolated_review_workspace(source.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(isolated.root.join("tracked.txt")).unwrap(),
+            "working copy\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(isolated.root.join("untracked.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(!isolated.root.join("deleted.txt").exists());
+        let source_before = git_workspace_fingerprint(source.path()).unwrap();
+        let review_before = git_workspace_fingerprint(&isolated.root).unwrap();
+        std::fs::write(isolated.root.join("tracked.txt"), "review mutation\n").unwrap();
+        let review_after = git_workspace_fingerprint(&isolated.root).unwrap();
+
+        assert_ne!(review_before, review_after);
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("tracked.txt")).unwrap(),
+            "working copy\n"
+        );
+        assert_eq!(
+            source_before,
+            git_workspace_fingerprint(source.path()).unwrap()
+        );
     }
 
     #[test]
