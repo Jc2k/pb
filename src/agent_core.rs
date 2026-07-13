@@ -4507,8 +4507,12 @@ fn collect_patch_path(path: &str, workspace_root: &Path, paths: &mut Vec<String>
 }
 
 fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
-    git_apply_stdin(&["apply", "--check", "-"], patch, workspace_root)?;
-    git_apply_stdin(&["apply", "-"], patch, workspace_root)?;
+    git_apply_stdin(
+        &["apply", "--check", "--recount", "-"],
+        patch,
+        workspace_root,
+    )?;
+    git_apply_stdin(&["apply", "--recount", "-"], patch, workspace_root)?;
     Ok(())
 }
 
@@ -6967,6 +6971,27 @@ mod tests {
         let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n";
         let paths = validate_patch_paths(patch, &workspace).unwrap();
         assert_eq!(paths, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn git_apply_recounts_model_generated_hunk_lengths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let patch = "diff --git a/index.html b/index.html\nnew file mode 100644\n--- /dev/null\n+++ b/index.html\n@@ -0,0 +1 @@\n+<!doctype html>\n+<title>Typing Game</title>\n+<main>Play</main>\n";
+
+        run_git_apply_patch(patch, &workspace).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("index.html")).unwrap(),
+            "<!doctype html>\n<title>Typing Game</title>\n<main>Play</main>\n"
+        );
     }
 
     #[test]
