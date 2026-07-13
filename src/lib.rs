@@ -350,7 +350,7 @@ pub struct HarnessAgentArgs {
     /// Task for the agent to complete
     pub task: String,
 
-    /// Persistent scratch root to create; defaults to a unique system temporary directory
+    /// Persistent scratch root to create or resume; defaults to a unique system temporary directory
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
 

@@ -3891,6 +3891,11 @@ fn run_tool(
                 .get("message")
                 .and_then(Value::as_str)
                 .context("git_commit requires string argument: message")?;
+            if !is_semantic_commit_message(message) {
+                bail!(
+                    "git_commit message must use Conventional Commits, for example: feat: add typing game"
+                );
+            }
             if let Some(config) = context.env_config {
                 run_guard_commands(config, command_backend, workspace_root)?;
             }
@@ -4356,19 +4361,23 @@ fn run_sub_agent(
     )?;
 
     metrics.add(&outcome.metrics);
-    if workspace_status_before.as_deref()
-        != git_status_porcelain(context.workspace_root).ok().as_deref()
-    {
+    let workspace_status_after = git_status_porcelain(context.workspace_root).ok();
+    let workspace_changed = workspace_status_before.as_deref() != workspace_status_after.as_deref();
+    if workspace_changed {
         context.gate_state.borrow_mut().wrote_file = true;
     }
-    if profile == AgentProfile::Review && outcome.reached_final {
+    let review_mutated_workspace = profile == AgentProfile::Review && workspace_changed;
+    if profile == AgentProfile::Review && outcome.reached_final && !review_mutated_workspace {
         context
             .gate_state
             .borrow_mut()
             .review_completed_successfully = true;
     }
 
-    let result = if outcome.reached_final {
+    let result = if review_mutated_workspace {
+        "review sub-agent did not pass: it changed the workspace despite the read-only review contract; inspect and revert or keep those changes deliberately, then request another review"
+            .to_string()
+    } else if outcome.reached_final {
         match outcome.final_content {
             Some(content) if !content.trim().is_empty() => {
                 format!("sub-agent completed successfully:\n{}", content.trim())
@@ -5526,6 +5535,40 @@ fn git_commit_all(message: &str, workdir: &Path) -> Result<bool> {
     git_run(&["add", "-A"], workdir)?;
     git_run(&["commit", "-m", message], workdir)?;
     Ok(true)
+}
+
+fn is_semantic_commit_message(message: &str) -> bool {
+    let message = message.trim();
+    if message.is_empty() || message.contains('\n') {
+        return false;
+    }
+    let Some((kind, description)) = message.split_once(": ") else {
+        return false;
+    };
+    if description.trim().is_empty() {
+        return false;
+    }
+
+    let kind = kind.strip_suffix('!').unwrap_or(kind);
+    let commit_type = match kind.split_once('(') {
+        Some((commit_type, scope)) if scope.ends_with(')') && scope.len() > 1 => commit_type,
+        Some(_) => return false,
+        None => kind,
+    };
+    matches!(
+        commit_type,
+        "feat"
+            | "fix"
+            | "chore"
+            | "docs"
+            | "refactor"
+            | "test"
+            | "perf"
+            | "build"
+            | "ci"
+            | "style"
+            | "revert"
+    )
 }
 
 fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
@@ -6747,6 +6790,24 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn semantic_commit_messages_accept_conventional_commits() {
+        assert!(is_semantic_commit_message("feat: add typing game"));
+        assert!(is_semantic_commit_message(
+            "fix(harness)!: require valid review"
+        ));
+        assert!(is_semantic_commit_message("test: cover game logic"));
+    }
+
+    #[test]
+    fn semantic_commit_messages_reject_unstructured_messages() {
+        assert!(!is_semantic_commit_message("Initial commit"));
+        assert!(!is_semantic_commit_message("feature: add typing game"));
+        assert!(!is_semantic_commit_message("feat add typing game"));
+        assert!(!is_semantic_commit_message("feat: "));
+        assert!(!is_semantic_commit_message("feat(scope: broken"));
     }
 
     #[test]

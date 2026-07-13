@@ -1,6 +1,6 @@
 //! Direct, daemon-free harnesses for exercising pb internals.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +33,7 @@ struct ScratchLayout {
     workspace: PathBuf,
     events: PathBuf,
     journal: PathBuf,
+    resumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -63,10 +64,16 @@ struct HarnessEventSink {
 }
 
 impl HarnessEventSink {
-    fn new(path: &Path) -> Result<Self> {
-        let file = File::create(path).with_context(|| {
-            format!("failed to create harness event journal {}", path.display())
-        })?;
+    fn new(path: &Path, append: bool) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .with_context(|| {
+                format!("failed to create harness event journal {}", path.display())
+            })?;
         Ok(Self {
             state: Arc::new(Mutex::new(JournalState {
                 writer: BufWriter::new(file),
@@ -165,6 +172,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     println!("pb harness: workspace={}", layout.workspace.display());
     println!("pb harness: events={}", layout.events.display());
     println!("pb harness: journal={}", layout.journal.display());
+    println!("pb harness: resumed={}", layout.resumed);
     write_running_journal(&layout, &args.task)?;
 
     let user_config = UserConfig::load()?;
@@ -220,7 +228,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         attachments: harness_attachments(&args.images)?,
     };
 
-    let sink = HarnessEventSink::new(&layout.events)?;
+    let sink = HarnessEventSink::new(&layout.events, layout.resumed)?;
     let run_result = run_agent(request, &models_root, sink.clone());
     let (mut observations, summary) = sink.snapshot()?;
     add_run_observations(&mut observations, &run_result, &layout.workspace, &summary);
@@ -258,29 +266,48 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
 }
 
 fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
-    let root = match requested {
+    let (root, resumed) = match requested {
         Some(path) => {
             if path.exists() {
-                bail!("harness scratch path already exists: {}", path.display());
+                if !path.is_dir() {
+                    bail!(
+                        "harness scratch path is not a directory: {}",
+                        path.display()
+                    );
+                }
+                (path.to_path_buf(), true)
+            } else {
+                std::fs::create_dir_all(path).with_context(|| {
+                    format!("failed to create harness scratch {}", path.display())
+                })?;
+                (path.to_path_buf(), false)
             }
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("failed to create harness scratch {}", path.display()))?;
-            path.to_path_buf()
         }
-        None => create_unique_scratch_root()?,
+        None => (create_unique_scratch_root()?, false),
     };
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve harness scratch {}", root.display()))?;
     let workspace = root.join("workspace");
-    std::fs::create_dir(&workspace)
-        .with_context(|| format!("failed to create harness workspace {}", workspace.display()))?;
-    initialize_git_workspace(&workspace)?;
+    if resumed {
+        if !workspace.join(".git").is_dir() {
+            bail!(
+                "existing harness scratch has no git workspace: {}",
+                workspace.display()
+            );
+        }
+    } else {
+        std::fs::create_dir(&workspace).with_context(|| {
+            format!("failed to create harness workspace {}", workspace.display())
+        })?;
+        initialize_git_workspace(&workspace)?;
+    }
     Ok(ScratchLayout {
         events: root.join("events.jsonl"),
         journal: root.join("journal.md"),
         root,
         workspace,
+        resumed,
     })
 }
 
@@ -591,6 +618,7 @@ mod tests {
         let layout = prepare_scratch(Some(&root)).unwrap();
 
         assert_eq!(layout.root, root.canonicalize().unwrap());
+        assert!(!layout.resumed);
         assert!(layout.workspace.join(".git").is_dir());
         assert_eq!(
             require_git_success(&layout.workspace, &["branch", "--show-current"]).unwrap(),
@@ -599,6 +627,22 @@ mod tests {
         assert_eq!(
             require_git_success(&layout.workspace, &["log", "-1", "--pretty=%s"]).unwrap(),
             "chore: initialize harness workspace"
+        );
+    }
+
+    #[test]
+    fn existing_scratch_workspace_can_be_resumed() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let initial = prepare_scratch(Some(&root)).unwrap();
+        std::fs::write(initial.workspace.join("work.txt"), "in progress\n").unwrap();
+
+        let resumed = prepare_scratch(Some(&root)).unwrap();
+
+        assert!(resumed.resumed);
+        assert_eq!(
+            std::fs::read_to_string(resumed.workspace.join("work.txt")).unwrap(),
+            "in progress\n"
         );
     }
 
@@ -614,7 +658,7 @@ mod tests {
     fn event_journal_captures_started_branch_before_failures() {
         let parent = tempfile::tempdir().unwrap();
         let events = parent.path().join("events.jsonl");
-        let sink = HarnessEventSink::new(&events).unwrap();
+        let sink = HarnessEventSink::new(&events, false).unwrap();
         let mut emitter = sink.clone();
         emitter.emit(AgentEvent::Started {
             task: "task".to_string(),
