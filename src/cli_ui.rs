@@ -61,6 +61,12 @@ pub fn render_event(event: &AgentEvent) {
                 &format!("{executor_id} ({kind}, {state}) {detail}"),
             );
         }
+        AgentEvent::TeamMessage { message, .. } => {
+            print_block("team", message);
+        }
+        AgentEvent::HandoffSummary { summary, .. } => {
+            print_header("handoff", &format!("{:?}", summary.outcome));
+        }
         AgentEvent::CheckResult {
             check_id,
             exit_status,

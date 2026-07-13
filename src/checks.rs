@@ -650,6 +650,16 @@ impl<'a> WorkspaceCheckRuntime<'a> {
             if !failed_dependencies.is_empty() {
                 failed.insert(check.id.clone());
                 summary.skipped.push(check.id.clone());
+                summary.failures.push(CheckFailureSummary {
+                    check_id: check.id.clone(),
+                    exit_status: 125,
+                    timed_out: false,
+                    output: String::new(),
+                    skip_reason: Some(format!(
+                        "dependency failure: {}",
+                        failed_dependencies.join(", ")
+                    )),
+                });
                 sink.emit(AgentEvent::CheckResult {
                     check_id: check.id.clone(),
                     exit_status: 125,
@@ -737,6 +747,13 @@ impl<'a> WorkspaceCheckRuntime<'a> {
             if !success {
                 failed.insert(check.id.clone());
                 summary.failed.push(check.id.clone());
+                summary.failures.push(CheckFailureSummary {
+                    check_id: check.id.clone(),
+                    exit_status: output.exit_status,
+                    timed_out: output.timed_out,
+                    output: output_text.clone(),
+                    skip_reason: None,
+                });
             }
             sink.emit(check_result_event(
                 &evidence,
@@ -805,12 +822,24 @@ pub struct CheckRunSummary {
     pub reused: Vec<String>,
     pub failed: Vec<String>,
     pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<CheckFailureSummary>,
 }
 
 impl CheckRunSummary {
     pub fn all_succeeded(&self) -> bool {
         self.failed.is_empty() && self.skipped.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckFailureSummary {
+    pub check_id: String,
+    pub exit_status: i32,
+    pub timed_out: bool,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 #[cfg(test)]

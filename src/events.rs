@@ -42,6 +42,9 @@ pub enum TerminationReason {
     ContractUnsatisfied,
     ResourceLimit,
     EngineError,
+    ChecksFailed,
+    ExecutorUnavailable,
+    RepairExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,68 @@ pub enum FinalGraceStatus {
     Started,
     Accepted,
     Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationActor {
+    Handoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum TeamActor {
+    Agent(AgentProfile),
+    Automation(AutomationActor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMessageTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffOutcome {
+    Pending,
+    Ready,
+    NoChange,
+    ChecksFailed,
+    ExecutorUnavailable,
+    CommitBlocked,
+    RepairExhausted,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffCheckSummary {
+    pub check_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffCommitSummary {
+    pub oid: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffSummary {
+    pub outcome: HandoffOutcome,
+    #[serde(default)]
+    pub affected_components: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<HandoffCheckSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<HandoffCommitSummary>,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl TerminationReason {
@@ -62,6 +127,9 @@ impl TerminationReason {
             Self::ContractUnsatisfied => "contract_unsatisfied",
             Self::ResourceLimit => "resource_limit",
             Self::EngineError => "engine_error",
+            Self::ChecksFailed => "checks_failed",
+            Self::ExecutorUnavailable => "executor_unavailable",
+            Self::RepairExhausted => "repair_exhausted",
         }
     }
 }
@@ -218,6 +286,24 @@ pub enum AgentEvent {
         reused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skip_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    TeamMessage {
+        actor: TeamActor,
+        tone: TeamMessageTone,
+        message: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    HandoffSummary {
+        summary: HandoffSummary,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,6 +614,36 @@ impl EventEnvelope {
                     output_fingerprint,
                     reused,
                     skip_reason,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::TeamMessage {
+                actor,
+                tone,
+                message,
+                evidence_ids,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::TeamMessage {
+                    actor,
+                    tone,
+                    message,
+                    evidence_ids,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::HandoffSummary {
+                summary,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::HandoffSummary {
+                    summary,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },

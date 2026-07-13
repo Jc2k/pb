@@ -38,6 +38,7 @@ use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::{AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason};
+use crate::handoff::{HandoffAttempt, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
@@ -2896,6 +2897,106 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
+                if let Some(attempt) =
+                    run_deterministic_handoff(args, workspace_checks.as_ref(), nesting_depth, sink)?
+                {
+                    match attempt {
+                        HandoffAttempt::Ready(_) | HandoffAttempt::NoChange(_) => {
+                            deterministic_failures.clear(DeterministicFailureKind::Handoff);
+                        }
+                        HandoffAttempt::NeedsRepair {
+                            feedback,
+                            failure_signature,
+                            summary,
+                        } => {
+                            let failure_count = deterministic_failures.record(
+                                DeterministicFailureKind::Handoff,
+                                stable_hash(&failure_signature),
+                            );
+                            if failure_count >= MAX_IDENTICAL_GATE_FAILURES
+                                || step >= effective_max_steps
+                            {
+                                let reason = if failure_count >= MAX_IDENTICAL_GATE_FAILURES {
+                                    TerminationReason::RepairExhausted
+                                } else {
+                                    TerminationReason::ChecksFailed
+                                };
+                                sink.emit(AgentEvent::TeamMessage {
+                                    actor: crate::events::TeamActor::Automation(
+                                        crate::events::AutomationActor::Handoff,
+                                    ),
+                                    tone: crate::events::TeamMessageTone::Error,
+                                    message: if failure_count >= MAX_IDENTICAL_GATE_FAILURES {
+                                        "The same checks failed again without a relevant input change, so I’m stopping the handoff loop. This needs another pass."
+                                            .to_string()
+                                    } else {
+                                        "The affected checks still fail and there isn’t another repair turn available. This needs another pass."
+                                            .to_string()
+                                    },
+                                    evidence_ids: summary
+                                        .checks
+                                        .iter()
+                                        .map(|check| format!("check:{}", check.check_id))
+                                        .collect(),
+                                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                    timestamp_ms: Some(now_millis()),
+                                });
+                                let mut exhausted = summary;
+                                exhausted.outcome = if reason == TerminationReason::RepairExhausted
+                                {
+                                    crate::events::HandoffOutcome::RepairExhausted
+                                } else {
+                                    crate::events::HandoffOutcome::ChecksFailed
+                                };
+                                sink.emit(AgentEvent::HandoffSummary {
+                                    summary: exhausted,
+                                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                    timestamp_ms: Some(now_millis()),
+                                });
+                                return Ok(StepRunOutcome {
+                                    reached_final: true,
+                                    contract_status: incomplete_contract_status(args),
+                                    verified_completed: false,
+                                    termination_reason: reason,
+                                    final_content: Some(content),
+                                    metrics,
+                                    gate_state: gate_state.into_inner(),
+                                });
+                            }
+                            sink.emit(AgentEvent::Correction {
+                                message: feedback.clone(),
+                                summary: "The handoff teammate returned failed checks for repair"
+                                    .to_string(),
+                                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                timestamp_ms: Some(now_millis()),
+                            });
+                            messages.push(ChatMessage::text("assistant", output.clone()));
+                            messages.push(correction_chat_message(
+                                "The handoff teammate needs another implementation pass",
+                                &feedback,
+                            ));
+                            step += 1;
+                            continue;
+                        }
+                        HandoffAttempt::ExecutorUnavailable { detail, .. } => {
+                            sink.emit(AgentEvent::Error {
+                                message: detail,
+                                summary: "Handoff executor unavailable".to_string(),
+                                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                timestamp_ms: Some(now_millis()),
+                            });
+                            return Ok(StepRunOutcome {
+                                reached_final: true,
+                                contract_status: incomplete_contract_status(args),
+                                verified_completed: false,
+                                termination_reason: TerminationReason::ExecutorUnavailable,
+                                final_content: Some(content),
+                                metrics,
+                                gate_state: gate_state.into_inner(),
+                            });
+                        }
+                    }
+                }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
@@ -3080,7 +3181,8 @@ fn run_agent_steps(
                     args,
                     messages,
                     workspace_root,
-                    gate_state.into_inner(),
+                    gate_state.borrow().clone(),
+                    workspace_checks.as_ref(),
                     metrics,
                     nesting_depth,
                     sink,
@@ -3178,6 +3280,7 @@ fn run_final_grace(
     messages: &mut Vec<ChatMessage>,
     workspace_root: &Path,
     gate_state: GateState,
+    workspace_checks: Option<&RefCell<WorkspaceCheckRuntime<'_>>>,
     mut metrics: RunMetrics,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
@@ -3291,6 +3394,48 @@ fn run_final_grace(
             })
         }
         None => {
+            if let Some(attempt) =
+                run_deterministic_handoff(args, workspace_checks, nesting_depth, sink)?
+            {
+                match attempt {
+                    HandoffAttempt::Ready(_) | HandoffAttempt::NoChange(_) => {}
+                    HandoffAttempt::NeedsRepair { .. } => {
+                        sink.emit(AgentEvent::FinalGrace {
+                            status: FinalGraceStatus::Rejected,
+                            detail: "the final handoff checks failed and no repair turn remains"
+                                .to_string(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: true,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::ChecksFailed,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state,
+                        });
+                    }
+                    HandoffAttempt::ExecutorUnavailable { detail, .. } => {
+                        sink.emit(AgentEvent::FinalGrace {
+                            status: FinalGraceStatus::Rejected,
+                            detail,
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: true,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::ExecutorUnavailable,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state,
+                        });
+                    }
+                }
+            }
             sink.emit(AgentEvent::FinalGrace {
                 status: FinalGraceStatus::Accepted,
                 detail: "exact final action accepted without reopening tools".to_string(),
@@ -3804,6 +3949,7 @@ enum DeterministicFailureKind {
     Parse,
     CompletionGate,
     ToolLoop,
+    Handoff,
 }
 
 #[derive(Default)]
@@ -4919,9 +5065,51 @@ fn request_completion_gate_feedback(
 ) -> Result<Option<String>> {
     if request.contract.is_some() {
         contract_completion_gate_feedback(request, gate_state, workspace_root)
+    } else if request.profile == AgentProfile::Build
+        && request
+            .repository_context
+            .as_ref()
+            .is_some_and(|repository| {
+                repository
+                    .task_changed_paths()
+                    .is_ok_and(|paths| paths.is_empty())
+            })
+    {
+        // An unchanged repository is a valid handoff intent. The deterministic teammate decides
+        // whether an Always check applies and avoids forcing a fictional edit or review.
+        Ok(None)
     } else {
         Ok(completion_gate_feedback(request.profile, gate_state))
     }
+}
+
+fn run_deterministic_handoff(
+    request: &AgentRequest,
+    workspace_checks: Option<&RefCell<WorkspaceCheckRuntime<'_>>>,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<Option<HandoffAttempt>> {
+    if !matches!(request.profile, AgentProfile::Build | AgentProfile::Scout)
+        || request.repository_less
+        || request.sub_agent_depth > 0
+    {
+        return Ok(None);
+    }
+    let (Some(repository), Some(graph), Some(runtime)) = (
+        request.repository_context.as_ref(),
+        request.workspace_graph.as_ref(),
+        workspace_checks,
+    ) else {
+        return Ok(None);
+    };
+    run_handoff(
+        repository,
+        graph,
+        &mut runtime.borrow_mut(),
+        nesting_depth,
+        sink,
+    )
+    .map(Some)
 }
 
 fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
@@ -8413,6 +8601,117 @@ mod tests {
         assert_eq!(outcome.contract_status, ContractStatus::Unspecified);
         assert!(!outcome.verified_completed);
         assert_eq!(outcome.termination_reason, TerminationReason::Final);
+    }
+
+    #[test]
+    fn build_final_with_no_delta_enters_no_change_handoff_without_forcing_an_edit() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 1;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[]));
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("nothing changed")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::HandoffSummary { summary, .. }
+                if summary.outcome == crate::events::HandoffOutcome::NoChange
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult { .. } | AgentEvent::ExecutorStarted { .. }
+        )));
+    }
+
+    #[test]
+    fn identical_handoff_failure_gets_one_repair_turn_then_stops() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 2;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "echo broken >&2; exit 9".to_string(),
+        ]));
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done"), scripted_final("done again")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::RepairExhausted
+        );
+        assert_eq!(outcome.llm_invocations, 2);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Final { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TeamMessage { message, .. } if message.contains("same checks failed again")
+        )));
+    }
+
+    #[test]
+    fn exact_agent_check_evidence_is_reused_by_handoff() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 2;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "true".to_string()
+        ]));
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let command = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "run_command",
+                "arguments": {"cmd": "true"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![command, scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ExecutorStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CheckResult { reused: true, .. }))
+        );
     }
 
     #[test]

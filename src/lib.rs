@@ -29,6 +29,7 @@ pub mod energy;
 pub mod environment;
 pub mod events;
 mod github_oauth;
+pub mod handoff;
 pub mod harness;
 pub mod harness_contract;
 pub mod harness_eval;
