@@ -3336,7 +3336,7 @@ fn nonzero_f64(value: f64) -> Option<f64> {
 }
 
 fn parse_action(output: &str) -> Result<AgentAction> {
-    if let Ok(action) = serde_json::from_str::<AgentAction>(output.trim()) {
+    if let Ok(action) = parse_action_json(output.trim()) {
         return Ok(action);
     }
 
@@ -3347,12 +3347,12 @@ fn parse_action(output: &str) -> Result<AgentAction> {
 
     let mut first_error = None;
     for json_candidate in &json_candidates {
-        match serde_json::from_str::<AgentAction>(json_candidate) {
+        match parse_action_json(json_candidate) {
             Ok(action) => return Ok(action),
             Err(error) => {
                 let repaired = escape_json_string_control_chars(json_candidate);
                 if repaired != *json_candidate
-                    && let Ok(action) = serde_json::from_str::<AgentAction>(&repaired)
+                    && let Ok(action) = parse_action_json(&repaired)
                 {
                     return Ok(action);
                 }
@@ -3366,6 +3366,54 @@ fn parse_action(output: &str) -> Result<AgentAction> {
     let (json_candidate, error) =
         first_error.expect("non-empty candidates should record parse error");
     Err(error).with_context(|| format!("failed to parse agent JSON action:\n{json_candidate}"))
+}
+
+fn parse_action_json(input: &str) -> Result<AgentAction> {
+    let standard_error = match serde_json::from_str::<AgentAction>(input) {
+        Ok(action) => return Ok(action),
+        Err(error) => error,
+    };
+    let Value::Object(mut object) = serde_json::from_str::<Value>(input)
+        .with_context(|| format!("invalid agent action JSON: {standard_error}"))?
+    else {
+        return Err(standard_error).context("agent action must be a JSON object");
+    };
+    let Some(tool) = object
+        .remove("type")
+        .and_then(|value| value.as_str().map(str::to_string))
+    else {
+        return Err(standard_error).context("agent action is missing string field: type");
+    };
+    if !is_builtin_tool_name(&tool) {
+        return Err(standard_error)
+            .with_context(|| format!("unsupported agent action type '{tool}'"));
+    }
+    let thinking = object
+        .remove("thinking")
+        .and_then(|value| value.as_str().map(str::to_string));
+    object.remove("id");
+    let arguments = object
+        .remove("arguments")
+        .map(|value| parse_model_tool_arguments(&value))
+        .transpose()?
+        .unwrap_or_else(|| Value::Object(object));
+    Ok(AgentAction::ToolCall {
+        tool,
+        arguments,
+        thinking,
+    })
+}
+
+fn is_builtin_tool_name(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            all_builtin_tool_specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect()
+        })
+        .contains(name)
 }
 
 fn escape_json_string_control_chars(input: &str) -> String {
@@ -6365,6 +6413,41 @@ mod tests {
         assert_eq!(calls[1].tool, "mcp_github_search");
         assert_eq!(calls[1].arguments["query"], "pb");
         assert_eq!(thinking.as_deref(), Some("I can gather both inputs now."));
+    }
+
+    #[test]
+    fn parse_action_accepts_known_tool_name_as_direct_type() {
+        let output = r#"{
+            "type": "sub_agent",
+            "profile": "review",
+            "task": "Inspect and report",
+            "max_steps": 3
+        }"#;
+        let action = parse_action(output).expect("direct tool action should parse");
+        let AgentAction::ToolCall {
+            tool,
+            arguments,
+            thinking,
+        } = action
+        else {
+            panic!("expected one direct tool call");
+        };
+
+        assert_eq!(tool, "sub_agent");
+        assert_eq!(arguments["profile"], "review");
+        assert_eq!(arguments["task"], "Inspect and report");
+        assert_eq!(arguments["max_steps"], 3);
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn parse_action_rejects_unknown_direct_type() {
+        let error = match parse_action(r#"{"type":"git_add","path":"game.js"}"#) {
+            Ok(_) => panic!("unknown direct tool type should be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(error.contains("unsupported agent action type 'git_add'"));
     }
 
     #[test]
