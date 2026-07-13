@@ -6,6 +6,63 @@ use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractStatus {
+    #[default]
+    Unspecified,
+    Unsatisfied,
+    Satisfied,
+}
+
+impl ContractStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Unsatisfied => "unsatisfied",
+            Self::Satisfied => "satisfied",
+        }
+    }
+}
+
+impl std::fmt::Display for ContractStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    Final,
+    StepLimit,
+    GateLoop,
+    ParseLoop,
+    ContractUnsatisfied,
+    ResourceLimit,
+    EngineError,
+}
+
+impl TerminationReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::StepLimit => "step_limit",
+            Self::GateLoop => "gate_loop",
+            Self::ParseLoop => "parse_loop",
+            Self::ContractUnsatisfied => "contract_unsatisfied",
+            Self::ResourceLimit => "resource_limit",
+            Self::EngineError => "engine_error",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMetricsSnapshot {
     pub llm_invocations: usize,
@@ -230,6 +287,14 @@ pub enum AgentEvent {
     SessionSummary {
         branch: String,
         commits: String,
+        #[serde(default)]
+        reached_final: bool,
+        #[serde(default)]
+        contract_status: ContractStatus,
+        #[serde(default)]
+        verified_completed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        termination_reason: Option<TerminationReason>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -549,6 +614,10 @@ impl EventEnvelope {
             AgentEvent::SessionSummary {
                 branch,
                 commits,
+                reached_final,
+                contract_status,
+                verified_completed,
+                termination_reason,
                 summary,
                 power_summary,
                 diff_stat,
@@ -559,6 +628,10 @@ impl EventEnvelope {
                 event: AgentEvent::SessionSummary {
                     branch,
                     commits,
+                    reached_final,
+                    contract_status,
+                    verified_completed,
+                    termination_reason,
                     summary,
                     power_summary,
                     diff_stat,
@@ -581,5 +654,56 @@ impl EventEnvelope {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_session_summary_deserializes_with_truthful_defaults() {
+        let json = r#"{
+            "version":"v1",
+            "event":{
+                "type":"session_summary",
+                "branch":"task",
+                "commits":"",
+                "summary":"legacy"
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::SessionSummary {
+                reached_final: false,
+                contract_status: ContractStatus::Unspecified,
+                verified_completed: false,
+                termination_reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn new_session_summary_serializes_explicit_outcome_fields() {
+        let envelope = EventEnvelope::new(AgentEvent::SessionSummary {
+            branch: "task".to_string(),
+            commits: String::new(),
+            reached_final: true,
+            contract_status: ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: Some(TerminationReason::Final),
+            summary: "done".to_string(),
+            power_summary: String::new(),
+            diff_stat: String::new(),
+            diff: String::new(),
+            timestamp_ms: None,
+        });
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(value["event"]["reached_final"], true);
+        assert_eq!(value["event"]["contract_status"], "unspecified");
+        assert_eq!(value["event"]["verified_completed"], false);
+        assert_eq!(value["event"]["termination_reason"], "final");
     }
 }

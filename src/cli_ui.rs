@@ -168,13 +168,25 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::SessionSummary {
             branch,
             commits,
+            reached_final,
+            contract_status,
+            verified_completed,
+            termination_reason,
             summary,
             power_summary,
             diff_stat,
             diff,
             ..
         } => {
-            print_header("session", &format!("branch: {branch}"));
+            let termination = termination_reason
+                .map(|reason| reason.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            print_header(
+                "session",
+                &format!(
+                    "branch: {branch}; reached_final: {reached_final}; contract_status: {contract_status}; verified_completed: {verified_completed}; termination_reason: {termination}"
+                ),
+            );
             if !summary.trim().is_empty() {
                 print_block("session summary", summary);
             }

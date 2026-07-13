@@ -35,7 +35,7 @@ use crate::browser_tools;
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, ContractStatus, TerminationReason};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
 use crate::memory;
@@ -499,6 +499,9 @@ pub struct AgentRunResult {
     pub branch: String,
     pub workspace_root: PathBuf,
     pub reached_final: bool,
+    pub contract_status: ContractStatus,
+    pub verified_completed: bool,
+    pub termination_reason: TerminationReason,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1210,6 +1213,9 @@ pub fn run_agent<S: EventSink>(
         &mut sink,
     )?;
     let reached_final = outcome.reached_final;
+    let contract_status = outcome.contract_status;
+    let verified_completed = outcome.verified_completed;
+    let termination_reason = outcome.termination_reason;
     let summary = outcome.final_content.unwrap_or_default();
 
     let (commits, diff_stat, diff) = if args.repository_less {
@@ -1231,6 +1237,10 @@ pub fn run_agent<S: EventSink>(
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
         commits,
+        reached_final,
+        contract_status,
+        verified_completed,
+        termination_reason: Some(termination_reason),
         summary,
         power_summary,
         diff_stat,
@@ -1259,6 +1269,9 @@ pub fn run_agent<S: EventSink>(
         branch,
         workspace_root,
         reached_final,
+        contract_status,
+        verified_completed,
+        termination_reason,
     })
 }
 
@@ -2462,9 +2475,33 @@ fn tool_allowed(
 #[derive(Debug, Clone)]
 struct StepRunOutcome {
     reached_final: bool,
+    contract_status: ContractStatus,
+    verified_completed: bool,
+    termination_reason: TerminationReason,
     final_content: Option<String>,
     metrics: RunMetrics,
     gate_state: GateState,
+}
+
+fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
+    if args.contract.is_some() {
+        ContractStatus::Unsatisfied
+    } else {
+        ContractStatus::Unspecified
+    }
+}
+
+fn termination_reason_for_runtime_error(error: &anyhow::Error) -> TerminationReason {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("resource limit")
+        || message.contains("resource budget")
+        || message.contains("working-set limit")
+        || message.contains("out of memory")
+    {
+        TerminationReason::ResourceLimit
+    } else {
+        TerminationReason::EngineError
+    }
 }
 
 struct ToolExecutionEnv<'a> {
@@ -2590,7 +2627,7 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        let (output, action) = match generate_and_parse_action_with_retries(
+        let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
             messages,
@@ -2599,7 +2636,28 @@ fn run_agent_steps(
             &mut metrics,
             sink,
             nesting_depth,
-        )? {
+        ) {
+            Ok(generated) => generated,
+            Err(error) => {
+                let termination_reason = termination_reason_for_runtime_error(&error);
+                sink.emit(AgentEvent::Error {
+                    message: format!("{error:#}"),
+                    summary: format!("Agent terminated: {termination_reason}"),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                return Ok(StepRunOutcome {
+                    reached_final: false,
+                    contract_status: incomplete_contract_status(args),
+                    verified_completed: false,
+                    termination_reason,
+                    final_content: None,
+                    metrics,
+                    gate_state: gate_state.into_inner(),
+                });
+            }
+        };
+        let (output, action) = match generated {
             Ok(parsed) => parsed,
             Err(ParseFailure { output, error }) => {
                 consecutive_parse_failures = consecutive_parse_failures.saturating_add(1);
@@ -2641,9 +2699,23 @@ fn run_agent_steps(
                 if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                     || repeated_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                 {
-                    bail!(
-                        "model produced {consecutive_parse_failures} consecutive unparsable pb JSON actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
-                    );
+                    sink.emit(AgentEvent::Error {
+                        message: format!(
+                            "model produced {consecutive_parse_failures} consecutive unparsable pb JSON actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
+                        ),
+                        summary: "Parse retry limit reached".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::ParseLoop,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
                 }
 
                 step += 1;
@@ -2671,11 +2743,26 @@ fn run_agent_steps(
                 };
                 if let Some(feedback) = gate_feedback {
                     sink.emit(AgentEvent::Correction {
-                        message: "Agent tried to end session too soon".to_string(),
-                        summary: "Completion gate blocked final response".to_string(),
+                        message: feedback.clone(),
+                        summary: if args.contract.is_some() {
+                            "Acceptance contract rejected final response".to_string()
+                        } else {
+                            "Completion gate blocked final response".to_string()
+                        },
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
+                    if args.contract.is_some() {
+                        return Ok(StepRunOutcome {
+                            reached_final: true,
+                            contract_status: ContractStatus::Unsatisfied,
+                            verified_completed: false,
+                            termination_reason: TerminationReason::ContractUnsatisfied,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
                     messages.push(ChatMessage::text("assistant", output.clone()));
                     messages.push(correction_chat_message(
                         "Completion gate blocked final response",
@@ -2692,6 +2779,13 @@ fn run_agent_steps(
                 });
                 return Ok(StepRunOutcome {
                     reached_final: true,
+                    contract_status: if args.contract.is_some() {
+                        ContractStatus::Satisfied
+                    } else {
+                        ContractStatus::Unspecified
+                    },
+                    verified_completed: args.contract.is_some(),
+                    termination_reason: TerminationReason::Final,
                     final_content: Some(content),
                     metrics,
                     gate_state: gate_state.into_inner(),
@@ -2876,6 +2970,9 @@ fn run_agent_steps(
 
     Ok(StepRunOutcome {
         reached_final: false,
+        contract_status: incomplete_contract_status(args),
+        verified_completed: false,
+        termination_reason: TerminationReason::StepLimit,
         final_content: None,
         metrics,
         gate_state: gate_state.into_inner(),
@@ -3441,6 +3538,9 @@ pub(crate) struct ScriptedCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScriptedAgentOutcome {
     pub reached_final: bool,
+    pub contract_status: ContractStatus,
+    pub verified_completed: bool,
+    pub termination_reason: TerminationReason,
     pub final_content: Option<String>,
     pub llm_invocations: usize,
     pub tool_calls: usize,
@@ -3525,6 +3625,9 @@ pub(crate) fn run_scripted_agent_steps(
     )?;
     Ok(ScriptedAgentOutcome {
         reached_final: outcome.reached_final,
+        contract_status: outcome.contract_status,
+        verified_completed: outcome.verified_completed,
+        termination_reason: outcome.termination_reason,
         final_content: outcome.final_content,
         llm_invocations: outcome.metrics.llm_invocations,
         tool_calls: outcome.metrics.tool_calls,
@@ -5577,6 +5680,7 @@ fn run_sub_agent(
     };
     let review_passed = profile == AgentProfile::Review
         && outcome.reached_final
+        && (sub_request.contract.is_none() || outcome.verified_completed)
         && !review_mutated_workspace
         && outcome
             .final_content
@@ -5611,6 +5715,9 @@ fn run_sub_agent(
 
     let result = if review_mutated_workspace {
         "review sub-agent did not pass: it attempted to change its isolated workspace despite the read-only review contract; the source workspace was protected, so request another review"
+            .to_string()
+    } else if outcome.termination_reason == TerminationReason::ContractUnsatisfied {
+        "review sub-agent did not pass: its final response did not satisfy the named review evidence contract; request another review that reads the required paths and runs the required checks"
             .to_string()
     } else if profile == AgentProfile::Review && outcome.reached_final && !review_passed {
         let response = outcome
@@ -7384,6 +7491,125 @@ mod tests {
         }
         .normalize()
         .unwrap()
+    }
+
+    fn empty_test_contract() -> crate::harness_contract::AgentContract {
+        crate::harness_contract::HarnessContractDocument {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Optional,
+            allowed_paths: Vec::new(),
+            checks: Vec::new(),
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        }
+        .normalize()
+        .unwrap()
+    }
+
+    fn scripted_final(content: &str) -> ScriptedCompletion {
+        ScriptedCompletion {
+            content: serde_json::json!({"type": "final", "content": content}).to_string(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn uncontracted_final_is_reached_but_not_verified() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 1;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.contract_status, ContractStatus::Unspecified);
+        assert!(!outcome.verified_completed);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+    }
+
+    #[test]
+    fn contracted_unsatisfied_final_has_a_truthful_terminal_outcome() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 1;
+        request.contract = Some(normalized_test_contract("true"));
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("claimed done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.contract_status, ContractStatus::Unsatisfied);
+        assert!(!outcome.verified_completed);
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::ContractUnsatisfied
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { message, .. }
+                if message.contains("named check 'logic' has not succeeded")
+        )));
+    }
+
+    #[test]
+    fn satisfied_contract_final_is_verified() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 1;
+        request.contract = Some(empty_test_contract());
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.contract_status, ContractStatus::Satisfied);
+        assert!(outcome.verified_completed);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+    }
+
+    #[test]
+    fn completion_engine_error_has_a_structured_terminal_outcome() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 1;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, Vec::new(), tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::EngineError);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { summary, .. }
+                if summary == "Agent terminated: engine_error"
+        )));
+    }
+
+    #[test]
+    fn runtime_resource_failures_are_classified_separately() {
+        let error = anyhow!("Metal resource budget exceeded working-set limit");
+        assert_eq!(
+            termination_reason_for_runtime_error(&error),
+            TerminationReason::ResourceLimit
+        );
     }
 
     #[test]

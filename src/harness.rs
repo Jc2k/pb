@@ -255,17 +255,39 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     )?;
 
     match run_result {
-        Ok(result) if result.reached_final => {
+        Ok(result) if harness_outcome_succeeded(&result) => {
             println!(
-                "pb harness: completed=true reached_final=true branch={} workspace={} journal={}",
+                "pb harness: reached_final={} contract_status={} verified_completed={} termination_reason={} branch={} workspace={} journal={}",
+                result.reached_final,
+                result.contract_status,
+                result.verified_completed,
+                result.termination_reason,
                 result.branch,
                 result.workspace_root.display(),
                 layout.journal.display()
             );
             Ok(())
         }
+        Ok(result)
+            if result.termination_reason
+                == crate::events::TerminationReason::ContractUnsatisfied =>
+        {
+            bail!(
+                "harness agent final did not satisfy its acceptance contract; reached_final={} contract_status={} verified_completed={} termination_reason={} workspace={} journal={}",
+                result.reached_final,
+                result.contract_status,
+                result.verified_completed,
+                result.termination_reason,
+                result.workspace_root.display(),
+                layout.journal.display()
+            )
+        }
         Ok(result) => bail!(
-            "harness agent exhausted its run without a final answer; workspace={} journal={}",
+            "harness agent did not complete; reached_final={} contract_status={} verified_completed={} termination_reason={} workspace={} journal={}",
+            result.reached_final,
+            result.contract_status,
+            result.verified_completed,
+            result.termination_reason,
             result.workspace_root.display(),
             layout.journal.display()
         ),
@@ -277,6 +299,12 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             )
         }),
     }
+}
+
+fn harness_outcome_succeeded(result: &AgentRunResult) -> bool {
+    result.verified_completed
+        || (result.reached_final
+            && result.contract_status == crate::events::ContractStatus::Unspecified)
 }
 
 fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
@@ -446,6 +474,16 @@ fn add_run_observations(
             detail: "The step budget ended before the full task completion contract was satisfied."
                 .to_string(),
         }),
+        Ok(result) if !result.verified_completed && result.contract_status != crate::events::ContractStatus::Unspecified => {
+            observations.push(Observation {
+                rank: 0,
+                title: "acceptance contract was not satisfied".to_string(),
+                detail: format!(
+                    "The model emitted a final action, but the run terminated as {} with contract_status={}.",
+                    result.termination_reason, result.contract_status
+                ),
+            })
+        }
         Ok(_) => {}
     }
 
@@ -499,7 +537,14 @@ fn write_journal(
     });
     observations.dedup_by(|left, right| left.rank == right.rank && left.detail == right.detail);
     let status = match result {
-        Ok(result) if result.reached_final => "completed",
+        Ok(result) if result.verified_completed => "verified-completed",
+        Ok(result)
+            if result.reached_final
+                && result.contract_status == crate::events::ContractStatus::Unspecified =>
+        {
+            "final-unverified"
+        }
+        Ok(result) if result.reached_final => "contract-unsatisfied",
         Ok(_) => "incomplete",
         Err(_) => "failed",
     };
@@ -513,6 +558,21 @@ fn write_journal(
     let mut journal = String::new();
     journal.push_str("# pb harness journal\n\n");
     journal.push_str(&format!("- Status: `{status}`\n"));
+    if let Ok(result) = result {
+        journal.push_str(&format!("- Reached final: `{}`\n", result.reached_final));
+        journal.push_str(&format!(
+            "- Contract status: `{}`\n",
+            result.contract_status
+        ));
+        journal.push_str(&format!(
+            "- Verified completed: `{}`\n",
+            result.verified_completed
+        ));
+        journal.push_str(&format!(
+            "- Termination reason: `{}`\n",
+            result.termination_reason
+        ));
+    }
     journal.push_str(&format!("- Task: {task}\n"));
     journal.push_str(&format!("- Workspace: `{}`\n", layout.workspace.display()));
     journal.push_str(&format!("- Branch: `{branch}`\n"));
@@ -628,6 +688,39 @@ mod tests {
                 "sub_agent"
             ]
         );
+    }
+
+    #[test]
+    fn harness_exit_success_requires_legacy_final_or_verified_contract() {
+        let result = |reached_final, contract_status, verified_completed, termination_reason| {
+            AgentRunResult {
+                branch: "task".to_string(),
+                workspace_root: PathBuf::from("/tmp/task"),
+                reached_final,
+                contract_status,
+                verified_completed,
+                termination_reason,
+            }
+        };
+
+        assert!(harness_outcome_succeeded(&result(
+            true,
+            crate::events::ContractStatus::Unspecified,
+            false,
+            crate::events::TerminationReason::Final,
+        )));
+        assert!(harness_outcome_succeeded(&result(
+            true,
+            crate::events::ContractStatus::Satisfied,
+            true,
+            crate::events::TerminationReason::Final,
+        )));
+        assert!(!harness_outcome_succeeded(&result(
+            true,
+            crate::events::ContractStatus::Unsatisfied,
+            false,
+            crate::events::TerminationReason::ContractUnsatisfied,
+        )));
     }
 
     #[test]

@@ -41,6 +41,15 @@ path outside the list before mutation, while `run_command` and final validation 
 forbidden changes. Check timeouts are limited to one hour and terminate the local command process
 group. Contract-free invocations retain the existing profile gates and daemon/socket workflows.
 
+Terminal output and the `session_summary` event distinguish four independent facts:
+`reached_final`, `contract_status`, `verified_completed`, and `termination_reason`. A
+contract-free final keeps the historical zero exit behavior, but is reported as
+`contract_status=unspecified` and `verified_completed=false`. A final rejected by a supplied
+contract is recorded as `contract_unsatisfied` and exits non-zero; only a final with a satisfied
+contract is `verified_completed=true`. Step, parse, runtime-engine, and resource-limit exits use
+their own structured termination reasons. Older stored summaries without these fields remain
+readable with conservative defaults.
+
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
 

@@ -1294,7 +1294,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 Ok(Ok(run_result)) => {
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.workspace_root);
-                    if !run_result.reached_final {
+                    if !run_result.reached_final
+                        || run_result.termination_reason != crate::events::TerminationReason::Final
+                    {
                         final_status = SessionStatus::Failed;
                     }
                 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent_core::{
     AgentProfile, AgentRequest, ScriptedAgentOutcome, ScriptedCompletion, run_scripted_agent_steps,
 };
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, ContractStatus};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
 
@@ -52,6 +52,10 @@ pub struct ControlFixtureTurn {
 pub struct ControlFixtureResult {
     pub id: String,
     pub reached_final: bool,
+    #[serde(default)]
+    pub contract_status: ContractStatus,
+    #[serde(default)]
+    pub verified_completed: bool,
     pub termination_reason: String,
     pub valid_actions: usize,
     pub llm_invocations: usize,
@@ -195,6 +199,7 @@ fn summarize_fixture(
                 event,
                 AgentEvent::Correction { summary, .. }
                     if summary == "Completion gate blocked final response"
+                        || summary == "Acceptance contract rejected final response"
             )
         })
         .count();
@@ -234,11 +239,9 @@ fn summarize_fixture(
     Ok(ControlFixtureResult {
         id: fixture.id.clone(),
         reached_final: outcome.reached_final,
-        termination_reason: if outcome.reached_final {
-            "final".to_string()
-        } else {
-            "step_limit".to_string()
-        },
+        contract_status: outcome.contract_status,
+        verified_completed: outcome.verified_completed,
+        termination_reason: outcome.termination_reason.to_string(),
         valid_actions: llm_invocations.saturating_sub(invalid_actions),
         llm_invocations,
         tool_calls: outcome.tool_calls,
@@ -248,7 +251,9 @@ fn summarize_fixture(
         blocked_tool_loops,
         final_events,
         executed_checks,
-        false_completion: outcome.reached_final && !fixture.completion_supported,
+        false_completion: outcome.reached_final
+            && outcome.contract_status != ContractStatus::Unsatisfied
+            && !fixture.completion_supported,
         remaining_completions: outcome.remaining_completions,
         observed_paths,
         artifact_quality: None,
@@ -372,7 +377,10 @@ mod tests {
         );
         for id in ["irrelevant_review_evidence", "check_then_mutation"] {
             let result = actual.iter().find(|result| result.id == id).unwrap();
-            assert!(!result.reached_final, "{id} must not reach final");
+            assert!(result.reached_final, "{id} emitted a final action");
+            assert_eq!(result.contract_status, ContractStatus::Unsatisfied, "{id}");
+            assert!(!result.verified_completed, "{id} must not be verified");
+            assert_eq!(result.termination_reason, "contract_unsatisfied", "{id}");
             assert!(!result.false_completion, "{id} must not falsely complete");
             assert_eq!(result.gate_corrections, 1, "{id}");
         }
