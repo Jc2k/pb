@@ -4606,6 +4606,11 @@ fn run_sub_agent(
         .and_then(Value::as_str)
         .context("sub_agent requires string argument: profile")?;
     let profile = AgentProfile::parse(profile_name)?;
+    ensure_sub_agent_review_is_ready(
+        profile,
+        context.request.profile,
+        &context.gate_state.borrow(),
+    )?;
     let task = arguments
         .get("task")
         .and_then(Value::as_str)
@@ -4802,6 +4807,22 @@ fn run_sub_agent(
         timestamp_ms: Some(now_millis()),
     });
     Ok(result)
+}
+
+fn ensure_sub_agent_review_is_ready(
+    profile: AgentProfile,
+    parent_profile: AgentProfile,
+    gate_state: &GateState,
+) -> Result<()> {
+    if profile == AgentProfile::Review
+        && parent_profile == AgentProfile::Build
+        && !gate_state.wrote_file
+    {
+        bail!(
+            "review requested before any workspace change; implement and test the requested work before asking for review"
+        );
+    }
+    Ok(())
 }
 
 fn review_final_passes(content: &str) -> bool {
@@ -7024,6 +7045,25 @@ mod tests {
             "Review passes overall, but one check could not run."
         ));
         assert!(!review_final_passes(""));
+    }
+
+    #[test]
+    fn build_review_cannot_start_before_workspace_changes() {
+        let untouched = GateState::default();
+        let error =
+            ensure_sub_agent_review_is_ready(AgentProfile::Review, AgentProfile::Build, &untouched)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("implement and test"));
+
+        let changed = GateState {
+            wrote_file: true,
+            ..GateState::default()
+        };
+        ensure_sub_agent_review_is_ready(AgentProfile::Review, AgentProfile::Build, &changed)
+            .unwrap();
+        ensure_sub_agent_review_is_ready(AgentProfile::Review, AgentProfile::Ask, &untouched)
+            .unwrap();
     }
 
     #[test]
