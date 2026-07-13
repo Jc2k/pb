@@ -21,6 +21,7 @@ const HARNESS_GIT_EMAIL: &str = "harness@pb.local";
 const HARNESS_AGENT_TOOLS: &[&str] = &[
     "session_title",
     "run_command",
+    "read_file",
     "write_file",
     "edit_file",
     "apply_patch",
@@ -605,6 +606,7 @@ mod tests {
             [
                 "session_title",
                 "run_command",
+                "read_file",
                 "write_file",
                 "edit_file",
                 "apply_patch",
