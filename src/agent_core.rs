@@ -21,9 +21,10 @@ use similar::TextDiff;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt;
+use std::fs::File;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -63,6 +64,9 @@ const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
 const MAX_IDENTICAL_GATE_FAILURES: usize = 2;
 const FINAL_GRACE_MAX_TOKENS: i32 = 256;
 const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_PATCH_DIAGNOSTIC_SCAN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PATCH_DIAGNOSTIC_OUTPUT_CHARS: usize = 3_500;
+const MAX_PATCH_DIAGNOSTIC_LINE_CHARS: usize = 200;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
@@ -6420,13 +6424,238 @@ fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
         normalized = format!("{patch}\n");
         normalized.as_str()
     };
-    git_apply_stdin(
+    if let Err(error) = git_apply_stdin(
         &["apply", "--check", "--recount", "-"],
         patch,
         workspace_root,
-    )?;
+    ) {
+        let diagnostic = patch_mismatch_diagnostic(patch, workspace_root, &error.to_string())
+            .unwrap_or_else(|diagnostic_error| {
+                format!("Patch context diagnostic was unavailable: {diagnostic_error:#}")
+            });
+        bail!("{error:#}\n\n{diagnostic}");
+    }
     git_apply_stdin(&["apply", "--recount", "-"], patch, workspace_root)?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PatchHunkDiagnostic {
+    path: String,
+    expected_line: usize,
+    expected_context: Vec<String>,
+}
+
+fn patch_mismatch_diagnostic(patch: &str, workspace_root: &Path, error: &str) -> Result<String> {
+    let hunks = parse_patch_hunk_diagnostics(patch);
+    let error_target = parse_git_patch_failure_target(error);
+    let hunk = error_target
+        .as_ref()
+        .and_then(|(path, line)| {
+            hunks
+                .iter()
+                .find(|hunk| hunk.path == *path && hunk.expected_line == *line)
+                .or_else(|| hunks.iter().find(|hunk| hunk.path == *path))
+        })
+        .or_else(|| hunks.first());
+    let Some(hunk) = hunk else {
+        let paths = validate_patch_paths(patch, workspace_root)?;
+        let path = paths
+            .first()
+            .context("patch declares no diagnosable file")?;
+        return Ok(format!(
+            "Patch mismatch diagnostic\nFile: {path}\nExpected location: no textual hunk was available (the patch may be binary or structurally invalid).\nRecommendation: inspect the current file with read_file, then use replace_file for binary or substantially drifted content."
+        ));
+    };
+    let resolved = resolve_workspace_path(workspace_root, &hunk.path, false)?;
+    let nearby = bounded_patch_context(&resolved, hunk.expected_line)?;
+    let expected = if hunk.expected_context.is_empty() {
+        "(no bounded old-side context found)".to_string()
+    } else {
+        hunk.expected_context.join("\n")
+    };
+    let diagnostic = format!(
+        "Patch mismatch diagnostic\nFile: {path}\nExpected location: {path}:{line}\nExpected old-side context (bounded):\n{expected}\nCurrent nearby content (bounded):\n{nearby}\nRecommendation: use edit_file when one exact current fragment can be replaced; use replace_file when the target has drifted substantially or is binary. Re-read only this bounded area before retrying apply_patch.",
+        path = hunk.path,
+        line = hunk.expected_line,
+    );
+    Ok(diagnostic
+        .chars()
+        .take(MAX_PATCH_DIAGNOSTIC_OUTPUT_CHARS)
+        .collect())
+}
+
+fn parse_patch_hunk_diagnostics(patch: &str) -> Vec<PatchHunkDiagnostic> {
+    let mut path: Option<String> = None;
+    let mut hunks = Vec::new();
+    let mut lines = patch.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(raw) = line.strip_prefix("+++ ") {
+            path = normalized_patch_path(raw);
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("*** Update File: ") {
+            path = normalized_patch_path(raw);
+            continue;
+        }
+        let Some(expected_line) = parse_hunk_old_start(line) else {
+            continue;
+        };
+        let Some(path) = path.clone() else {
+            continue;
+        };
+        let mut expected_context = Vec::new();
+        while let Some(next) = lines.peek().copied() {
+            if next.starts_with("@@ ")
+                || next.starts_with("diff --git ")
+                || next.starts_with("--- ")
+                || next.starts_with("+++ ")
+            {
+                break;
+            }
+            lines.next();
+            if let Some(content) = next.strip_prefix(' ').or_else(|| next.strip_prefix('-'))
+                && !content.trim().is_empty()
+                && expected_context.len() < 4
+            {
+                expected_context.push(bounded_line(content));
+            }
+        }
+        hunks.push(PatchHunkDiagnostic {
+            path,
+            expected_line,
+            expected_context,
+        });
+    }
+    hunks
+}
+
+fn normalized_patch_path(raw: &str) -> Option<String> {
+    let raw = raw.split_whitespace().next()?.trim();
+    if raw.is_empty() || raw == "/dev/null" {
+        return None;
+    }
+    Some(
+        raw.strip_prefix("a/")
+            .or_else(|| raw.strip_prefix("b/"))
+            .unwrap_or(raw)
+            .to_string(),
+    )
+}
+
+fn parse_hunk_old_start(line: &str) -> Option<usize> {
+    let header = line.strip_prefix("@@ -")?;
+    let old_range = header.split_whitespace().next()?;
+    old_range
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()
+        .map(|line| line.max(1))
+}
+
+fn parse_git_patch_failure_target(error: &str) -> Option<(String, usize)> {
+    error.lines().find_map(|line| {
+        let target = line.trim().strip_prefix("error: patch failed: ")?;
+        let (path, line) = target.rsplit_once(':')?;
+        Some((path.to_string(), line.parse().ok()?))
+    })
+}
+
+fn bounded_patch_context(path: &Path, expected_line: usize) -> Result<String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("(file does not exist)".to_string());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect patch target {}", path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok("(target is not a regular file)".to_string());
+    }
+    let file = File::open(path)
+        .with_context(|| format!("failed to open patch target {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let window_start = expected_line.saturating_sub(3).max(1);
+    let window_end = expected_line.saturating_add(3);
+    let mut selected = Vec::new();
+    let mut tail = VecDeque::new();
+    let mut line_number = 0usize;
+    let mut scanned = 0usize;
+    let mut buffer = Vec::new();
+    let mut scan_capped = false;
+    loop {
+        buffer.clear();
+        let read = reader
+            .read_until(b'\n', &mut buffer)
+            .with_context(|| format!("failed to read patch target {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        scanned = scanned.saturating_add(read);
+        line_number = line_number.saturating_add(1);
+        if buffer.contains(&0) {
+            return Ok(format!(
+                "(binary/non-text file; diagnostic scan stopped at line {line_number})"
+            ));
+        }
+        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+            buffer.pop();
+        }
+        let rendered = format!(
+            "{:>6} | {}",
+            line_number,
+            bounded_line(&String::from_utf8_lossy(&buffer))
+        );
+        tail.push_back(rendered.clone());
+        if tail.len() > 7 {
+            tail.pop_front();
+        }
+        if (window_start..=window_end).contains(&line_number) {
+            selected.push(rendered);
+        }
+        if line_number >= window_end {
+            break;
+        }
+        if scanned >= MAX_PATCH_DIAGNOSTIC_SCAN_BYTES {
+            scan_capped = true;
+            break;
+        }
+    }
+    if line_number == 0 {
+        return Ok("(file is empty)".to_string());
+    }
+    if selected.is_empty() {
+        selected.extend(tail);
+    }
+    let mut excerpt = selected.join("\n");
+    if scan_capped {
+        excerpt.push_str(&format!(
+            "\n(diagnostic scan capped at {} bytes before expected line {})",
+            MAX_PATCH_DIAGNOSTIC_SCAN_BYTES, expected_line
+        ));
+    } else if line_number < expected_line {
+        excerpt.push_str(&format!(
+            "\n(file ended at line {line_number}, before expected line {expected_line})"
+        ));
+    }
+    Ok(excerpt)
+}
+
+fn bounded_line(line: &str) -> String {
+    let mut chars = line.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_PATCH_DIAGNOSTIC_LINE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
 }
 
 fn git_apply_stdin(args: &[&str], input: &str, workdir: &Path) -> Result<String> {
@@ -10388,6 +10617,75 @@ mod tests {
             std::fs::read_to_string(workspace.join("index.html")).unwrap(),
             "<!doctype html>\n<title>Typing Game</title>\n<main>Play</main>\n"
         );
+    }
+
+    #[test]
+    fn stale_patch_reports_bounded_nearby_context_without_mutation() {
+        let tmp = init_contract_test_repo();
+        let current = (1..=20)
+            .map(|line| {
+                if line == 10 {
+                    "line 10 changed upstream\n".to_string()
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect::<String>();
+        std::fs::write(tmp.path().join("notes.txt"), current).unwrap();
+        let before = git_worktree_content_fingerprint(tmp.path()).unwrap();
+        let patch = "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -8,5 +8,5 @@\n line 8\n line 9\n-line 10\n+line ten\n line 11\n line 12\n";
+
+        let error = run_git_apply_patch(patch, tmp.path())
+            .unwrap_err()
+            .to_string();
+        let after = git_worktree_content_fingerprint(tmp.path()).unwrap();
+
+        assert_eq!(before, after);
+        assert!(error.contains("File: notes.txt"), "{error}");
+        assert!(error.contains("Expected location: notes.txt:8"), "{error}");
+        assert!(error.contains("line 10 changed upstream"), "{error}");
+        assert!(error.contains("edit_file"), "{error}");
+        assert!(error.contains("replace_file"), "{error}");
+        assert!(error.chars().count() <= 4_500, "{}", error.len());
+    }
+
+    #[test]
+    fn stale_patch_context_stays_bounded_for_large_files() {
+        let tmp = init_contract_test_repo();
+        let current = (1..=10_000)
+            .map(|line| {
+                if line == 5_000 {
+                    "line 5000 drifted\n".to_string()
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect::<String>();
+        std::fs::write(tmp.path().join("large.txt"), current).unwrap();
+        let patch = "diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -4999,3 +4999,3 @@\n line 4999\n-line 5000\n+line five thousand\n line 5001\n";
+
+        let error = run_git_apply_patch(patch, tmp.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("line 5000 drifted"), "{error}");
+        assert!(error.chars().count() <= 4_500, "{}", error.len());
+        assert!(!error.contains("line 9000"), "{error}");
+    }
+
+    #[test]
+    fn stale_patch_context_handles_binary_targets_without_dumping_bytes() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("binary.dat"), b"header\0secret payload").unwrap();
+        let patch = "diff --git a/binary.dat b/binary.dat\n--- a/binary.dat\n+++ b/binary.dat\n@@ -1 +1 @@\n-header\n+changed\n";
+
+        let error = run_git_apply_patch(patch, tmp.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("binary/non-text"), "{error}");
+        assert!(!error.contains("secret payload"), "{error}");
+        assert!(error.chars().count() <= 4_500, "{}", error.len());
     }
 
     #[test]

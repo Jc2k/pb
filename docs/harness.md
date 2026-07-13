@@ -124,3 +124,9 @@ Every real-model record repeats the backend, model, resolved model directory, to
 GPU settings, sampling values, seed, and FlashMoe resource-policy version. One loaded engine is
 reused across the corpus. FlashMoe evaluation refuses to start if the versioned bounded-resource
 policy is inactive.
+
+Failed `apply_patch` checks now return a bounded mismatch diagnostic with the target file, expected
+hunk line, a few old-side patch lines, and numbered current content around that location. Large
+lines and the full diagnostic are capped; binary targets are identified without dumping bytes. The
+check path never mutates the file, and the correction recommends `edit_file` for exact current text
+or `replace_file` when the target has drifted substantially.
