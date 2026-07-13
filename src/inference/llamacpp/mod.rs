@@ -101,7 +101,7 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
     suppress_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     backend.void_logs();
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+    let model_params = model_params(gpu_layers)?;
     let loaded_model = LlamaModel::load_from_file(&backend, path, &model_params)
         .with_context(|| format!("failed to load model {}", path.display()))?;
     let chat_template = load_sidecar_chat_template(path)?;
@@ -111,6 +111,16 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
         chat_template,
         model_path: path.to_owned(),
     })
+}
+
+fn model_params(gpu_layers: u32) -> Result<LlamaModelParams> {
+    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+    if gpu_layers == 0 {
+        model_params = model_params
+            .with_devices(&[])
+            .context("failed to configure CPU-only llama.cpp model devices")?;
+    }
+    Ok(model_params)
 }
 
 impl LlamaCppBackend {
@@ -169,10 +179,17 @@ impl LlamaCppBackend {
             ctx_params = ctx_params.with_n_threads_batch(threads_batch);
         }
 
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .context("failed to create llama context")?;
+        let mut ctx = match self.model.new_context(&self.backend, ctx_params.clone()) {
+            Ok(ctx) => ctx,
+            Err(accelerated_error) => self
+                .model
+                .new_context(&self.backend, ctx_params.with_offload_kqv(false))
+                .with_context(|| {
+                    format!(
+                        "failed to create llama context, including CPU K/Q/V fallback after accelerated context error: {accelerated_error}"
+                    )
+                })?,
+        };
 
         let tokens = self
             .model
@@ -264,10 +281,17 @@ impl LlamaCppBackend {
         if let Some(threads_batch) = request.threads_batch.or(request.threads) {
             ctx_params = ctx_params.with_n_threads_batch(threads_batch);
         }
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .context("failed to create llama context for vision tool")?;
+        let mut ctx = match self.model.new_context(&self.backend, ctx_params.clone()) {
+            Ok(ctx) => ctx,
+            Err(accelerated_error) => self
+                .model
+                .new_context(&self.backend, ctx_params.with_offload_kqv(false))
+                .with_context(|| {
+                    format!(
+                        "failed to create llama context for vision tool, including CPU K/Q/V fallback after accelerated context error: {accelerated_error}"
+                    )
+                })?,
+        };
 
         let mtmd_params = MtmdContextParams {
             use_gpu: request.gpu_layers > 0,
@@ -506,6 +530,13 @@ fn duration_millis(started: std::time::Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_only_model_params_exclude_accelerator_devices() {
+        let params = model_params(0).unwrap();
+
+        assert!(params.devices().is_empty());
+    }
 
     #[test]
     fn prompt_batch_ranges_splits_prompts_larger_than_batch_capacity() {
