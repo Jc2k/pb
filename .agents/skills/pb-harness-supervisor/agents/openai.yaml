@@ -1,4 +1,4 @@
 interface:
   display_name: "PB Harness Supervisor"
-  short_description: "Run and audit daemon-free pb build tasks"
-  default_prompt: "Use $pb-harness-supervisor to create a goal that has pb build a small project, review the result, fix clear pb bugs, and produce a ranked improvement plan."
+  short_description: "Evaluate and improve daemon-free pb agent runs"
+  default_prompt: "Use $pb-harness-supervisor to run a bounded pb agent experiment, separate harness defects from model limitations, fix clear pb bugs, and produce a ranked improvement plan."
