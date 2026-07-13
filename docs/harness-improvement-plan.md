@@ -356,14 +356,28 @@ Objective:
 
 Completion audit:
 
-- [ ] H0 through H6 and R0 are marked complete with commit and test evidence.
-- [ ] Contracted runs cannot be verified when a required post-mutation check was skipped.
-- [ ] Uncontracted or merely final runs are not labelled verified.
-- [ ] Resume preserves immutable audit files for every invocation.
-- [ ] Deterministic blockers stop without unbounded inference.
-- [ ] Evaluation separates protocol compliance from artifact quality.
-- [ ] FlashMoe resource use is bounded and default release throughput has no material regression.
-- [ ] Existing daemon/socket agent workflows still pass their tests.
-- [ ] Documentation and the FlashMoe architecture plan describe the shipped behavior.
-- [ ] Every implementation change is included in a semantic commit and the worktree contains no
+- [x] H0 through H6 and R0 are marked complete with commit and test evidence.
+- [x] Contracted runs cannot be verified when a required post-mutation check was skipped.
+- [x] Uncontracted or merely final runs are not labelled verified.
+- [x] Resume preserves immutable audit files for every invocation.
+- [x] Deterministic blockers stop without unbounded inference.
+- [x] Evaluation separates protocol compliance from artifact quality.
+- [x] FlashMoe resource use is bounded and default release throughput has no material regression.
+- [x] Existing daemon/socket agent workflows still pass their tests.
+- [x] Documentation and the FlashMoe architecture plan describe the shipped behavior.
+- [x] Every implementation change is included in a semantic commit and the worktree contains no
       unintended changes.
+
+Final verification on 2026-07-13:
+
+- `deno task build:web` passed.
+- `cargo test --all-targets` passed: 742 passed, 7 ignored, 0 failed.
+- `deno task test:web` passed: 27 passed, 0 failed.
+- `cargo build --release --target aarch64-apple-darwin` passed.
+- Release `pb harness eval` produced 7 JSONL records with 7 protocol passes and 0 failures.
+- Release FlashMoe narrow smoke exited 0, loaded in 364 ms, and generated the sensible token `？`.
+- R0's 10×32 and 128-token bounded soaks, resource-zero final snapshots, and seven-trial throughput
+  comparison are recorded in `docs/benchmarks/harness-r0-after.md`; median decode throughput was
+  1.661 tok/s versus the 1.590 tok/s baseline, above the 1.542 tok/s regression floor.
+- The final worktree contained only the pre-existing, user-owned untracked `.pb/` directory; it was
+  not inspected, modified, staged, or committed by this goal.
