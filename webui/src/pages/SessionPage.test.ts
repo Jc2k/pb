@@ -65,3 +65,13 @@ Deno.test("session metrics show a concise human summary after session summary", 
   ok(!component.includes("e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
 });
+
+Deno.test("completed sessions currently render without a handoff outcome", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const types = await Deno.readTextFile("webui/src/types/index.ts");
+
+  ok(page.includes('session.status === "completed"'));
+  ok(types.includes('SessionStatus = "queued" | "running" | "paused" | "completed" | "failed"'));
+  ok(!types.includes('type: "team_message"'));
+  ok(!types.includes("handoff_outcome"));
+});

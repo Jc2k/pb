@@ -827,11 +827,27 @@ mod tests {
         assert_eq!(
             actual
                 .iter()
+                .find(|result| result.id == "irrelevant_review_evidence")
+                .unwrap()
+                .executed_checks,
+            0,
+            "the current gate rejects a missing named check instead of executing it"
+        );
+        assert_eq!(
+            actual
+                .iter()
                 .find(|result| result.id == "check_then_mutation")
                 .unwrap()
                 .executed_checks,
             1
         );
+        let current = actual
+            .iter()
+            .find(|result| result.id == "current_named_check")
+            .unwrap();
+        assert!(current.verified_completed);
+        assert_eq!(current.executed_checks, 1);
+        assert_eq!(current.named_check_compliance, Some(true));
         let repeated = actual
             .iter()
             .find(|result| result.id == "repeated_blocked_action")

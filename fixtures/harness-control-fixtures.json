@@ -97,6 +97,31 @@
       "observe_paths": ["target.txt"]
     },
     {
+      "id": "current_named_check",
+      "hypothesis": "A model-run named check remains current when no later content mutation occurs.",
+      "profile": "review",
+      "max_steps": 2,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"satisfied","verified_completed":true,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"named_check_compliance":true,"observed_paths":{"target.txt":true}},
+      "contract": {
+        "version": 1,
+        "allowed_paths": ["target.txt"],
+        "checks": [{"id": "logic", "command": "true", "required": true}],
+        "review": {"check_ids": ["logic"]}
+      },
+      "tool_allowlist": ["run_check"],
+      "initial_files": {"target.txt": "before\n"},
+      "turns": [
+        {
+          "content": "{\"type\":\"tool_call\",\"tool\":\"run_check\",\"arguments\":{\"id\":\"logic\"}}"
+        },
+        {
+          "content": "{\"type\":\"final\",\"content\":\"REVIEW PASS\"}"
+        }
+      ],
+      "observe_paths": ["target.txt"]
+    },
+    {
       "id": "repeated_blocked_action",
       "hypothesis": "The third consecutive identical tool action is blocked before execution.",
       "profile": "scout",

@@ -9446,6 +9446,18 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_build_gate_has_no_test_or_commit_evidence_requirement() {
+        let state = GateState {
+            wrote_file: true,
+            review_completed_successfully: true,
+            ..GateState::default()
+        };
+
+        assert!(state.named_check_evidence.is_empty());
+        assert!(completion_gate_feedback(AgentProfile::Build, &state).is_none());
+    }
+
+    #[test]
     fn review_completion_gate_requires_successful_tool_evidence() {
         let mut state = GateState {
             review_command_required: true,
@@ -10181,6 +10193,43 @@ mod tests {
             .unwrap();
         let committed = git_commit_all("test commit", tmp.path()).unwrap();
         assert!(!committed);
+    }
+
+    #[test]
+    fn git_commit_all_currently_includes_unrelated_dirty_paths() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("user.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "user.txt"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: add user file"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        std::fs::write(tmp.path().join("user.txt"), "unrelated\n").unwrap();
+        std::fs::write(tmp.path().join("agent.txt"), "task owned\n").unwrap();
+        assert!(git_commit_all("test: capture current staging", tmp.path()).unwrap());
+
+        let committed_paths = git_run(
+            &["show", "--pretty=format:", "--name-only", "HEAD"],
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(committed_paths.lines().any(|path| path == "agent.txt"));
+        assert!(
+            committed_paths.lines().any(|path| path == "user.txt"),
+            "the baseline must expose that git add -A captures unrelated work"
+        );
     }
 
     #[test]

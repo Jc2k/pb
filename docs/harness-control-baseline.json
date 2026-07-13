@@ -71,6 +71,26 @@
       "observed_paths": {"target.txt": true}
     },
     {
+      "id": "current_named_check",
+      "reached_final": true,
+      "contract_status": "satisfied",
+      "verified_completed": true,
+      "termination_reason": "final",
+      "valid_actions": 2,
+      "llm_invocations": 2,
+      "tool_calls": 1,
+      "corrections": 0,
+      "gate_corrections": 0,
+      "errors": 0,
+      "blocked_tool_loops": 0,
+      "final_events": 1,
+      "executed_checks": 1,
+      "false_completion": false,
+      "named_check_compliance": true,
+      "remaining_completions": 0,
+      "observed_paths": {"target.txt": true}
+    },
+    {
       "id": "repeated_blocked_action",
       "reached_final": true,
       "termination_reason": "final",
@@ -146,6 +166,12 @@
       "classification": "pb_defect",
       "priority": "P1",
       "evidence": "Generic command evidence remains sufficient when a later run_command mutates target.txt; the review reaches Final."
+    },
+    {
+      "id": "current_named_check",
+      "classification": "positive_evidence",
+      "priority": "P1",
+      "evidence": "A successful named check with no later content mutation remains current and satisfies the explicit contract."
     },
     {
       "id": "repeated_blocked_action",
