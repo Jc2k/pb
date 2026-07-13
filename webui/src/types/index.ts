@@ -187,6 +187,7 @@ export type AgentEvent =
       contract_status?: "unspecified" | "unsatisfied" | "satisfied";
       verified_completed?: boolean;
       termination_reason?: string;
+      handoff_outcome?: HandoffOutcome;
       summary?: string;
       power_summary?: string;
       diff_stat?: string;

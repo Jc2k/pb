@@ -8,16 +8,17 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent_core::{
     AgentProfile, AgentRequest, LocalModelEvalEngine, LocalModelEvalOutcome, ScriptedAgentOutcome,
-    ScriptedCompletion, git_worktree_content_fingerprint, run_local_model_eval_steps,
-    run_scripted_agent_steps,
+    ScriptedCompletion, run_local_model_eval_steps, run_scripted_agent_steps,
 };
 use crate::events::{AgentEvent, ContractStatus};
 use crate::{HarnessEvalArgs, config::UserConfig};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
+const HARNESS_EVAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +38,8 @@ pub struct ControlFixture {
     pub expected: ControlFixtureExpectation,
     #[serde(default)]
     pub contract: Option<crate::harness_contract::HarnessContractDocument>,
+    #[serde(default)]
+    pub workspace: Option<crate::workspace::WorkspaceConfigDocument>,
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
     #[serde(default)]
@@ -60,6 +63,20 @@ pub struct ControlFixtureExpectation {
     pub named_check_compliance: Option<bool>,
     #[serde(default)]
     pub observed_paths: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub handoff_outcome: Option<crate::events::HandoffOutcome>,
+    #[serde(default)]
+    pub selected_checks: Option<Vec<String>>,
+    #[serde(default)]
+    pub executed_checks: Option<usize>,
+    #[serde(default)]
+    pub reused_checks: Option<usize>,
+    #[serde(default)]
+    pub executor_starts: Option<Vec<String>>,
+    #[serde(default)]
+    pub repair_turns: Option<usize>,
+    #[serde(default)]
+    pub commit_disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +98,10 @@ pub struct HarnessEvalConfiguration {
     pub top_k: i32,
     pub seed: u32,
     pub flashmoe_resource_policy_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_config_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executor_policy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -119,6 +140,36 @@ pub struct ControlFixtureResult {
     pub blocked_tool_loops: usize,
     pub final_events: usize,
     pub executed_checks: usize,
+    #[serde(default)]
+    pub model_run_check_calls: usize,
+    #[serde(default)]
+    pub reused_checks: usize,
+    #[serde(default)]
+    pub failed_checks: usize,
+    #[serde(default)]
+    pub skipped_checks: usize,
+    #[serde(default)]
+    pub selected_checks: Vec<String>,
+    #[serde(default)]
+    pub affected_components: Vec<String>,
+    #[serde(default)]
+    pub executor_starts: Vec<String>,
+    #[serde(default)]
+    pub avoided_executor_starts: Vec<String>,
+    #[serde(default)]
+    pub team_messages: usize,
+    #[serde(default)]
+    pub repair_turns: usize,
+    #[serde(default)]
+    pub no_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_outcome: Option<crate::events::HandoffOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_oid: Option<String>,
+    #[serde(default)]
+    pub output_fingerprints: Vec<String>,
     pub false_completion: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named_check_compliance: Option<bool>,
@@ -139,11 +190,15 @@ pub struct ControlFixtureResult {
 }
 
 pub fn control_fixture_corpus() -> Result<ControlFixtureCorpus> {
-    let corpus: ControlFixtureCorpus = serde_json::from_str(CONTROL_FIXTURES)
+    parse_control_fixture_corpus(CONTROL_FIXTURES)
+}
+
+fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> {
+    let corpus: ControlFixtureCorpus = serde_json::from_str(contents)
         .context("failed to parse built-in harness control fixtures")?;
-    if corpus.version != 1 {
+    if corpus.version != 2 {
         bail!(
-            "unsupported harness control fixture version {}; expected 1",
+            "unsupported harness control fixture version {}; expected 2",
             corpus.version
         );
     }
@@ -177,6 +232,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         .tempdir()
         .context("failed to create harness control fixture scratch directory")?;
     initialize_fixture_workspace(scratch.path(), &fixture.initial_files)?;
+    let (contract, workspace_graph, repository_context) = fixture_runtime(fixture, scratch.path())?;
 
     let args = AgentRequest {
         task: fixture.hypothesis.clone(),
@@ -201,15 +257,12 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         top_k: 1,
         seed: 0,
         environment: None,
-        workspace_graph: None,
-        repository_context: None,
+        workspace_graph: Some(workspace_graph),
+        repository_context: Some(repository_context),
+        prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: format!("control-fixture-{}", fixture.id),
         attachments: Vec::new(),
-        contract: fixture
-            .contract
-            .clone()
-            .map(crate::harness_contract::HarnessContractDocument::normalize)
-            .transpose()?,
+        contract,
     };
     let completions = fixture
         .turns
@@ -224,7 +277,45 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         events.push(event)
     })?;
 
-    summarize_fixture(fixture, scratch.path(), outcome.into(), &events)
+    summarize_fixture(fixture, scratch.path(), outcome.into(), &events, false)
+}
+
+fn fixture_runtime(
+    fixture: &ControlFixture,
+    workspace: &Path,
+) -> Result<(
+    Option<crate::harness_contract::AgentContract>,
+    crate::workspace::WorkspaceGraph,
+    crate::workspace::RepositoryContext,
+)> {
+    let (contract, workspace_graph) = fixture_workspace_graph(fixture)?;
+    let repository_context = crate::workspace::RepositoryContext::capture(workspace, workspace)?;
+    Ok((contract, workspace_graph, repository_context))
+}
+
+fn fixture_workspace_graph(
+    fixture: &ControlFixture,
+) -> Result<(
+    Option<crate::harness_contract::AgentContract>,
+    crate::workspace::WorkspaceGraph,
+)> {
+    let contract = fixture
+        .contract
+        .clone()
+        .map(crate::harness_contract::HarnessContractDocument::normalize)
+        .transpose()?;
+    let base_graph = fixture
+        .workspace
+        .clone()
+        .map(crate::workspace::WorkspaceConfigDocument::normalize)
+        .transpose()?
+        .unwrap_or_else(|| crate::workspace::WorkspaceGraph::legacy(&[]));
+    let workspace_graph = contract
+        .as_ref()
+        .map(|contract| contract.compile_workspace_graph(base_graph.clone()))
+        .transpose()?
+        .unwrap_or(base_graph);
+    Ok((contract, workspace_graph))
 }
 
 pub fn run_control_fixture_corpus() -> Result<Vec<ControlFixtureResult>> {
@@ -283,6 +374,8 @@ fn scripted_configuration() -> HarnessEvalConfiguration {
         seed: 0,
         flashmoe_resource_policy_version:
             crate::inference::flashmoe::HARNESS_RESOURCE_POLICY_VERSION,
+        workspace_config_sha256: None,
+        executor_policy: Vec::new(),
     }
 }
 
@@ -323,6 +416,8 @@ fn run_real_model_corpus(
         seed: args.seed,
         flashmoe_resource_policy_version:
             crate::inference::flashmoe::HARNESS_RESOURCE_POLICY_VERSION,
+        workspace_config_sha256: None,
+        executor_policy: Vec::new(),
     };
     let mut results = Vec::with_capacity(corpus.fixtures.len());
     for fixture in &corpus.fixtures {
@@ -352,6 +447,7 @@ fn run_real_model_fixture(
         .tempdir()
         .context("failed to create model harness control fixture scratch directory")?;
     initialize_fixture_workspace(scratch.path(), &fixture.initial_files)?;
+    let (contract, workspace_graph, repository_context) = fixture_runtime(fixture, scratch.path())?;
     let request = AgentRequest {
         task: format!(
             "Harness control evaluation. Complete the repository task implied by this control objective, using only the exposed tools: {}",
@@ -378,21 +474,18 @@ fn run_real_model_fixture(
         top_k: configuration.top_k,
         seed: configuration.seed,
         environment: None,
-        workspace_graph: None,
-        repository_context: None,
+        workspace_graph: Some(workspace_graph),
+        repository_context: Some(repository_context),
+        prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: format!("harness-eval-{}", fixture.id),
         attachments: Vec::new(),
-        contract: fixture
-            .contract
-            .clone()
-            .map(crate::harness_contract::HarnessContractDocument::normalize)
-            .transpose()?,
+        contract,
     };
     let mut events = Vec::new();
     let outcome = run_local_model_eval_steps(engine, &request, scratch.path(), &mut |event| {
         events.push(event)
     })?;
-    summarize_fixture(fixture, scratch.path(), outcome.into(), &events)
+    summarize_fixture(fixture, scratch.path(), outcome.into(), &events, true)
 }
 
 fn build_eval_records(
@@ -420,16 +513,32 @@ fn build_eval_records(
                 );
             }
             let protocol_failures = protocol_failures(&fixture.expected, &result);
+            let mut record_configuration = configuration.clone();
+            if let Some((sha256, executor_policy)) = fixture_workspace_metadata(fixture)? {
+                record_configuration.workspace_config_sha256 = Some(sha256);
+                record_configuration.executor_policy = executor_policy;
+            }
             Ok(HarnessEvalRecord {
-                schema_version: 1,
+                schema_version: HARNESS_EVAL_SCHEMA_VERSION,
                 fixture_version: corpus.version,
-                configuration: configuration.clone(),
+                configuration: record_configuration,
                 protocol_pass: protocol_failures.is_empty(),
                 protocol_failures,
                 result,
             })
         })
         .collect()
+}
+
+fn validate_eval_record_schema(record: &HarnessEvalRecord) -> Result<()> {
+    if record.schema_version != HARNESS_EVAL_SCHEMA_VERSION {
+        bail!(
+            "unsupported harness evaluation schema {}; expected {}",
+            record.schema_version,
+            HARNESS_EVAL_SCHEMA_VERSION
+        );
+    }
+    Ok(())
 }
 
 fn protocol_failures(
@@ -458,7 +567,83 @@ fn protocol_failures(
     compare!(false_completion);
     compare!(named_check_compliance);
     compare!(observed_paths);
+    if let Some(expected) = &expected.handoff_outcome
+        && actual.handoff_outcome.as_ref() != Some(expected)
+    {
+        failures.push(format!(
+            "handoff_outcome expected {:?}, got {:?}",
+            expected, actual.handoff_outcome
+        ));
+    }
+    if let Some(expected) = &expected.selected_checks
+        && &actual.selected_checks != expected
+    {
+        failures.push(format!(
+            "selected_checks expected {:?}, got {:?}",
+            expected, actual.selected_checks
+        ));
+    }
+    for (field, expected, actual) in [
+        (
+            "executed_checks",
+            expected.executed_checks,
+            actual.executed_checks,
+        ),
+        (
+            "reused_checks",
+            expected.reused_checks,
+            actual.reused_checks,
+        ),
+        ("repair_turns", expected.repair_turns, actual.repair_turns),
+    ] {
+        if let Some(expected) = expected
+            && actual != expected
+        {
+            failures.push(format!("{field} expected {expected}, got {actual}"));
+        }
+    }
+    if let Some(expected) = &expected.executor_starts
+        && &actual.executor_starts != expected
+    {
+        failures.push(format!(
+            "executor_starts expected {:?}, got {:?}",
+            expected, actual.executor_starts
+        ));
+    }
+    if let Some(expected) = &expected.commit_disposition
+        && actual.commit_disposition.as_ref() != Some(expected)
+    {
+        failures.push(format!(
+            "commit_disposition expected {:?}, got {:?}",
+            expected, actual.commit_disposition
+        ));
+    }
     failures
+}
+
+fn fixture_workspace_metadata(fixture: &ControlFixture) -> Result<Option<(String, Vec<String>)>> {
+    let Some(document) = fixture.workspace.clone() else {
+        return Ok(None);
+    };
+    let graph = document.normalize()?;
+    let normalized = serde_json::to_vec(&graph.to_document())
+        .context("failed to serialize normalized fixture workspace")?;
+    let executor_policy = graph
+        .executors
+        .iter()
+        .map(|(id, executor)| {
+            let kind = match executor.kind {
+                crate::workspace::ExecutorKind::Project => "project",
+                crate::workspace::ExecutorKind::Local => "local",
+                crate::workspace::ExecutorKind::Container => "container",
+            };
+            format!("{id}:{kind}")
+        })
+        .collect();
+    Ok(Some((
+        format!("{:x}", Sha256::digest(normalized)),
+        executor_policy,
+    )))
 }
 
 fn write_eval_jsonl(path: Option<&Path>, records: &[HarnessEvalRecord]) -> Result<()> {
@@ -472,6 +657,7 @@ fn write_eval_jsonl(path: Option<&Path>, records: &[HarnessEvalRecord]) -> Resul
         None => Box::new(BufWriter::new(std::io::stdout().lock())),
     };
     for record in records {
+        validate_eval_record_schema(record)?;
         serde_json::to_writer(&mut writer, record)
             .context("failed to encode harness evaluation JSONL")?;
         writer
@@ -485,7 +671,7 @@ fn write_eval_jsonl(path: Option<&Path>, records: &[HarnessEvalRecord]) -> Resul
 
 fn render_eval_table(records: &[HarnessEvalRecord]) -> String {
     let mut table = String::from(
-        "fixture                         pass valid named false loop turns latency_ms tokens energy_kwh termination\n",
+        "fixture                         pass handoff          checks reuse execs commit      valid named false loop turns latency_ms tokens energy_kwh termination\n",
     );
     for record in records {
         let result = &record.result;
@@ -502,10 +688,19 @@ fn render_eval_table(records: &[HarnessEvalRecord]) -> String {
             .energy_kwh
             .map(|value| format!("{value:.3e}"))
             .unwrap_or_else(|| "-".to_string());
+        let handoff = result
+            .handoff_outcome
+            .map(|outcome| format!("{outcome:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "-".to_string());
         table.push_str(&format!(
-            "{:<31} {:<4} {:<5} {:<5} {:<5} {:<4} {:<5} {:<10} {:<6} {:<10} {}\n",
+            "{:<31} {:<4} {:<16} {:<6} {:<5} {:<5} {:<11} {:<5} {:<5} {:<5} {:<4} {:<5} {:<10} {:<6} {:<10} {}\n",
             result.id,
             if record.protocol_pass { "yes" } else { "no" },
+            handoff,
+            result.executed_checks,
+            result.reused_checks,
+            result.executor_starts.len(),
+            result.commit_disposition.as_deref().unwrap_or("-"),
             valid,
             named,
             if result.false_completion { "yes" } else { "no" },
@@ -557,6 +752,7 @@ fn summarize_fixture(
     workspace: &Path,
     outcome: FixtureOutcome,
     events: &[AgentEvent],
+    record_commit_oid: bool,
 ) -> Result<ControlFixtureResult> {
     let llm_invocations = events
         .iter()
@@ -605,7 +801,7 @@ fn summarize_fixture(
         .iter()
         .filter(|event| matches!(event, AgentEvent::Final { .. }))
         .count();
-    let executed_checks = events
+    let model_run_check_calls = events
         .iter()
         .filter(|event| {
             matches!(
@@ -614,6 +810,132 @@ fn summarize_fixture(
             )
         })
         .count();
+    let executed_checks = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CheckResult {
+                    reused: false,
+                    skip_reason: None,
+                    ..
+                }
+            )
+        })
+        .count();
+    let reused_checks = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::CheckResult { reused: true, .. }))
+        .count();
+    let failed_checks = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CheckResult {
+                    success: false,
+                    skip_reason: None,
+                    ..
+                }
+            )
+        })
+        .count();
+    let skipped_checks = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CheckResult {
+                    skip_reason: Some(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    let mut selected_checks = std::collections::BTreeSet::new();
+    let mut affected_components = std::collections::BTreeSet::new();
+    let mut handoff_outcome = None;
+    for event in events {
+        if let AgentEvent::HandoffSummary { summary, .. } = event {
+            handoff_outcome = Some(summary.outcome);
+            selected_checks.extend(summary.checks.iter().map(|check| check.check_id.clone()));
+            affected_components.extend(summary.affected_components.iter().cloned());
+        }
+    }
+    let executor_starts = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ExecutorStarted {
+                executor_id,
+                success: true,
+                ..
+            } => Some(executor_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let configured_executors = fixture
+        .workspace
+        .as_ref()
+        .map(|workspace| {
+            workspace
+                .executors
+                .iter()
+                .map(|executor| executor.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let avoided_executor_starts = configured_executors
+        .difference(&executor_starts)
+        .cloned()
+        .collect::<Vec<_>>();
+    let team_messages = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TeamMessage { .. }))
+        .count();
+    let repair_turns = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::Correction { summary, .. }
+                    if summary.contains("handoff teammate returned failed checks")
+            )
+        })
+        .count();
+    let commit = events.iter().rev().find_map(|event| match event {
+        AgentEvent::CommitResult {
+            success,
+            created,
+            reused,
+            oid,
+            ..
+        } => Some((
+            if *created {
+                "created"
+            } else if *reused {
+                "reused"
+            } else if *success {
+                "not_needed"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+            oid.clone(),
+        )),
+        _ => None,
+    });
+    let output_fingerprints = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::CheckResult {
+                output_fingerprint: Some(fingerprint),
+                ..
+            } => Some(fingerprint.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let (latency_ms, prompt_tokens, generated_tokens, energy_kwh) = events.iter().fold(
         (0u64, 0usize, 0usize, 0.0f64),
         |(latency, prompt, generated, energy), event| match event {
@@ -647,20 +969,12 @@ fn summarize_fixture(
     let named_check_compliance = if required_check_ids.is_empty() {
         None
     } else {
-        let fingerprint = git_worktree_content_fingerprint(workspace)?;
-        let successful = events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::CheckResult {
-                    check_id,
-                    success: true,
-                    fingerprint: check_fingerprint,
-                    ..
-                } if check_fingerprint == &fingerprint => Some(check_id.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        Some(required_check_ids.is_subset(&successful))
+        let (_, graph) = fixture_workspace_graph(fixture)?;
+        let ledger = crate::checks::CheckEvidenceLedger::from_events(events);
+        Some(required_check_ids.iter().all(|check_id| {
+            crate::checks::check_evidence_is_current(workspace, &graph, &ledger, check_id)
+                .unwrap_or(false)
+        }))
     };
     let mut observed_paths = BTreeMap::new();
     for relative in &fixture.observe_paths {
@@ -686,6 +1000,23 @@ fn summarize_fixture(
         blocked_tool_loops,
         final_events,
         executed_checks,
+        model_run_check_calls,
+        reused_checks,
+        failed_checks,
+        skipped_checks,
+        selected_checks: selected_checks.into_iter().collect(),
+        affected_components: affected_components.into_iter().collect(),
+        executor_starts: executor_starts.into_iter().collect(),
+        avoided_executor_starts,
+        team_messages,
+        repair_turns,
+        no_change: handoff_outcome == Some(crate::events::HandoffOutcome::NoChange),
+        handoff_outcome,
+        commit_disposition: commit.as_ref().map(|(disposition, _)| disposition.clone()),
+        commit_oid: record_commit_oid
+            .then(|| commit.and_then(|(_, oid)| oid))
+            .flatten(),
+        output_fingerprints,
         false_completion: outcome.reached_final
             && outcome.contract_status != ContractStatus::Unsatisfied
             && !fixture.completion_supported,
@@ -722,6 +1053,7 @@ fn initialize_fixture_workspace(root: &Path, files: &BTreeMap<String, String>) -
         root,
         &["commit", "--allow-empty", "-m", "test: initialize fixture"],
     )?;
+    run_git(root, &["checkout", "-b", "harness-eval"])?;
     Ok(())
 }
 
@@ -811,14 +1143,7 @@ mod tests {
             assert!(!observation.evidence.trim().is_empty());
         }
         assert_eq!(baseline.results.len(), actual.len());
-        assert!(
-            baseline
-                .results
-                .iter()
-                .find(|result| result.id == "irrelevant_review_evidence")
-                .is_some_and(|result| result.false_completion),
-            "historical baseline must preserve the pre-contract false completion"
-        );
+        assert_eq!(baseline.results, actual);
         for id in ["irrelevant_review_evidence", "check_then_mutation"] {
             let result = actual.iter().find(|result| result.id == id).unwrap();
             assert!(result.reached_final, "{id} emitted a final action");
@@ -861,6 +1186,26 @@ mod tests {
         assert_eq!(repeated.llm_invocations, 3);
         assert_eq!(repeated.blocked_tool_loops, 1);
         assert_eq!(repeated.remaining_completions, 1);
+
+        let handoff = actual
+            .iter()
+            .find(|result| result.id == "handoff_contract_check_commit")
+            .unwrap();
+        assert_eq!(handoff.model_run_check_calls, 0);
+        assert_eq!(handoff.executed_checks, 1);
+        assert_eq!(handoff.commit_disposition.as_deref(), Some("created"));
+        let multi = actual
+            .iter()
+            .find(|result| result.id == "multi_executor_affected_selection")
+            .unwrap();
+        assert_eq!(multi.executor_starts, vec!["api"]);
+        assert_eq!(multi.avoided_executor_starts, vec!["web"]);
+        let bundle = actual
+            .iter()
+            .find(|result| result.id == "generated_bundle_dependency")
+            .unwrap();
+        assert_eq!(bundle.executed_checks, 2);
+        assert_eq!(bundle.output_fingerprints.len(), 1);
     }
 
     #[test]
@@ -870,6 +1215,24 @@ mod tests {
         assert!(fixture_path(root.path(), "../escape.txt").is_err());
         assert!(fixture_path(root.path(), "/tmp/escape.txt").is_err());
         assert!(fixture_path(root.path(), ".git/config").is_err());
+    }
+
+    #[test]
+    fn version_one_fixture_and_result_schemas_are_rejected_explicitly() {
+        let error = parse_control_fixture_corpus(r#"{"version":1,"fixtures":[]}"#).unwrap_err();
+        assert!(error.to_string().contains("expected 2"));
+
+        let corpus = control_fixture_corpus().unwrap();
+        let mut record = build_eval_records(
+            &corpus,
+            scripted_configuration(),
+            run_control_fixture_corpus().unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+        record.schema_version = 1;
+        let error = validate_eval_record_schema(&record).unwrap_err();
+        assert!(error.to_string().contains("expected 2"));
     }
 
     #[test]
@@ -888,6 +1251,22 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(first.iter().all(|record| record.protocol_pass));
+        let multi = first
+            .iter()
+            .find(|record| record.result.id == "multi_executor_affected_selection")
+            .unwrap();
+        assert_eq!(
+            multi.configuration.executor_policy,
+            vec!["api:local", "web:local"]
+        );
+        assert_eq!(
+            multi
+                .configuration
+                .workspace_config_sha256
+                .as_deref()
+                .map(str::len),
+            Some(64)
+        );
         assert!(
             first
                 .iter()
@@ -906,7 +1285,7 @@ mod tests {
         assert_eq!(first_jsonl, second_jsonl);
         for line in first_jsonl.lines() {
             let record: HarnessEvalRecord = serde_json::from_str(line).unwrap();
-            assert_eq!(record.schema_version, 1);
+            assert_eq!(record.schema_version, 2);
             assert_eq!(record.configuration.mode, "scripted");
         }
     }
@@ -939,6 +1318,11 @@ mod tests {
         .unwrap();
         let table = render_eval_table(&records);
         for heading in [
+            "handoff",
+            "checks",
+            "reuse",
+            "execs",
+            "commit",
             "valid",
             "named",
             "false",
@@ -982,6 +1366,8 @@ mod tests {
             top_k: 1,
             seed: 42,
             flashmoe_resource_policy_version: 1,
+            workspace_config_sha256: Some("abc".to_string()),
+            executor_policy: vec!["app:local".to_string()],
         };
         let value = serde_json::to_value(configuration).unwrap();
         for field in [
@@ -998,6 +1384,8 @@ mod tests {
             "top_k",
             "seed",
             "flashmoe_resource_policy_version",
+            "workspace_config_sha256",
+            "executor_policy",
         ] {
             assert!(value.get(field).is_some(), "missing {field}: {value}");
         }

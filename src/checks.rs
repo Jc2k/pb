@@ -144,6 +144,59 @@ impl CheckEvidenceLedger {
     }
 }
 
+pub fn check_evidence_is_current(
+    repo_root: &Path,
+    graph: &WorkspaceGraph,
+    ledger: &CheckEvidenceLedger,
+    check_id: &str,
+) -> Result<bool> {
+    fn current(
+        repo_root: &Path,
+        graph: &WorkspaceGraph,
+        ledger: &CheckEvidenceLedger,
+        check_id: &str,
+        visiting: &mut HashSet<String>,
+    ) -> Result<bool> {
+        if !visiting.insert(check_id.to_string()) {
+            bail!("check dependency cycle includes '{check_id}'");
+        }
+        let check = graph
+            .checks
+            .get(check_id)
+            .with_context(|| format!("workspace has no check named '{check_id}'"))?;
+        for dependency in &check.depends_on {
+            if !current(repo_root, graph, ledger, dependency, visiting)? {
+                visiting.remove(check_id);
+                return Ok(false);
+            }
+        }
+        let dependency_outputs = check
+            .depends_on
+            .iter()
+            .filter_map(|dependency| {
+                ledger.get(dependency).map(|evidence| {
+                    (
+                        dependency.clone(),
+                        evidence
+                            .output_fingerprint
+                            .clone()
+                            .unwrap_or_else(|| evidence.input_fingerprint.clone()),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let input = input_fingerprint(repo_root, &check.inputs)?;
+        let output = output_fingerprint(repo_root, &check.outputs)?;
+        let is_current = ledger
+            .current(check, &input, &dependency_outputs, &output)
+            .is_some();
+        visiting.remove(check_id);
+        Ok(is_current)
+    }
+
+    current(repo_root, graph, ledger, check_id, &mut HashSet::new())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckPlan {
     pub changed_paths: Vec<String>,

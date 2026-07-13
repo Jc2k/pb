@@ -413,6 +413,10 @@ pub struct HarnessAgentArgs {
     #[arg(long, value_name = "PATH")]
     pub contract: Option<PathBuf>,
 
+    /// Trusted workspace topology TOML to validate outside the scratch workspace
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub workspace_config: Option<PathBuf>,
+
     /// Model identifier; defaults to the configured model
     #[arg(long)]
     pub model: Option<String>,
@@ -928,6 +932,7 @@ async fn run_serve() -> Result<()> {
         environment: None,
         workspace_graph: None,
         repository_context: None,
+        prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: String::new(),
         attachments: Vec::new(),
         contract: None,
@@ -3568,6 +3573,8 @@ mod tests {
             "20",
             "--contract",
             "contract.json",
+            "--workspace-config",
+            "workspace.toml",
         ])
         .unwrap();
         let Commands::Harness {
@@ -3579,7 +3586,35 @@ mod tests {
         assert_eq!(args.task, "Build a tiny Rust CLI");
         assert_eq!(args.max_steps, Some(20));
         assert_eq!(args.contract, Some(PathBuf::from("contract.json")));
+        assert_eq!(args.workspace_config, Some(PathBuf::from("workspace.toml")));
         assert_eq!(args.profile, AgentProfile::Build);
+    }
+
+    #[test]
+    fn harness_cache_clean_keeps_its_cli_and_dry_run_runtime() {
+        let models = tempfile::tempdir().unwrap();
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "cache-clean",
+            "--model",
+            "hf://example/model",
+            "--model-dir",
+            models.path().to_str().unwrap(),
+            "--source-shards",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::CacheClean(args),
+        } = parsed.command
+        else {
+            panic!("expected harness cache-clean command");
+        };
+        assert_eq!(args.model, "hf://example/model");
+        assert_eq!(args.model_dir.as_deref(), Some(models.path()));
+        assert!(args.source_shards);
+        assert!(!args.yes);
+        run_flashmoe_cache_clean(args).unwrap();
     }
 
     #[test]

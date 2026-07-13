@@ -1,13 +1,14 @@
 //! Direct, daemon-free harnesses for exercising pb internals.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::HarnessAgentArgs;
 use crate::agent_core::{AgentRequest, AgentRunResult, EventSink, SessionAttachment, run_agent};
@@ -43,6 +44,8 @@ struct ScratchLayout {
     run_id: String,
     run_events: PathBuf,
     run_journal: PathBuf,
+    task_baseline: PathBuf,
+    adoptions: PathBuf,
     resumed: bool,
 }
 
@@ -56,6 +59,8 @@ enum RunIndexRecord {
         task: String,
         run_events: String,
         run_journal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_config: Option<WorkspaceConfigMetadata>,
     },
     Finished {
         version: u32,
@@ -67,8 +72,58 @@ enum RunIndexRecord {
         verified_completed: bool,
         termination_reason: Option<crate::events::TerminationReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_outcome: Option<crate::events::HandoffOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_baseline_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_baseline_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_config: Option<WorkspaceConfigMetadata>,
+        #[serde(default)]
+        audit: HarnessRunAudit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceConfigMetadata {
+    source: String,
+    sha256: String,
+    #[serde(default)]
+    executor_policy: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct HarnessRunAudit {
+    #[serde(default)]
+    affected_components: Vec<String>,
+    #[serde(default)]
+    checks_planned: Vec<String>,
+    checks_reused: usize,
+    checks_executed: usize,
+    checks_passed: usize,
+    checks_failed: usize,
+    checks_skipped: usize,
+    #[serde(default)]
+    check_evidence_ids: Vec<String>,
+    #[serde(default)]
+    output_fingerprints: Vec<String>,
+    #[serde(default)]
+    executors_started: Vec<String>,
+    #[serde(default)]
+    executors_failed: Vec<String>,
+    repair_turns: usize,
+    team_messages: usize,
+    #[serde(default)]
+    feedback_evidence_ids: Vec<String>,
+    no_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_oid: Option<String>,
+    #[serde(default)]
+    commit_changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +146,7 @@ struct JournalState {
     run_writer: BufWriter<File>,
     observations: Vec<Observation>,
     summary: CapturedSummary,
+    audit: HarnessRunAudit,
     write_error: Option<String>,
 }
 
@@ -128,12 +184,13 @@ impl HarnessEventSink {
                 run_writer: BufWriter::new(run_file),
                 observations: Vec::new(),
                 summary: CapturedSummary::default(),
+                audit: HarnessRunAudit::default(),
                 write_error: None,
             })),
         })
     }
 
-    fn snapshot(&self) -> Result<(Vec<Observation>, CapturedSummary)> {
+    fn snapshot(&self) -> Result<(Vec<Observation>, CapturedSummary, HarnessRunAudit)> {
         let mut state = self
             .state
             .lock()
@@ -154,7 +211,11 @@ impl HarnessEventSink {
         if let Some(error) = state.write_error.as_deref() {
             bail!("failed to write harness event journal: {error}");
         }
-        Ok((state.observations.clone(), state.summary.clone()))
+        Ok((
+            state.observations.clone(),
+            state.summary.clone(),
+            state.audit.clone(),
+        ))
     }
 }
 
@@ -179,11 +240,16 @@ impl EventSink for HarnessEventSink {
             }),
             AgentEvent::Correction {
                 message, summary, ..
-            } => state.observations.push(Observation {
-                rank: 1,
-                title: nonempty_or(summary, "agent correction"),
-                detail: compact_detail(message),
-            }),
+            } => {
+                state.observations.push(Observation {
+                    rank: 1,
+                    title: nonempty_or(summary, "agent correction"),
+                    detail: compact_detail(message),
+                });
+                if summary.contains("handoff teammate returned failed checks") {
+                    state.audit.repair_turns += 1;
+                }
+            }
             AgentEvent::SessionSummary {
                 branch,
                 commits,
@@ -197,6 +263,90 @@ impl EventSink for HarnessEventSink {
                     summary: summary.clone(),
                     diff_stat: diff_stat.clone(),
                 };
+            }
+            AgentEvent::ExecutorStarted {
+                executor_id,
+                success,
+                ..
+            } => {
+                let target = if *success {
+                    &mut state.audit.executors_started
+                } else {
+                    &mut state.audit.executors_failed
+                };
+                if !target.contains(executor_id) {
+                    target.push(executor_id.clone());
+                }
+            }
+            AgentEvent::CheckResult {
+                check_id,
+                success,
+                reused,
+                skip_reason,
+                output_fingerprint,
+                ..
+            } => {
+                if *reused {
+                    state.audit.checks_reused += 1;
+                } else if skip_reason.is_some() {
+                    state.audit.checks_skipped += 1;
+                } else {
+                    state.audit.checks_executed += 1;
+                }
+                if *success {
+                    state.audit.checks_passed += 1;
+                } else if skip_reason.is_none() {
+                    state.audit.checks_failed += 1;
+                }
+                let evidence_id = format!("check:{check_id}");
+                if !state.audit.check_evidence_ids.contains(&evidence_id) {
+                    state.audit.check_evidence_ids.push(evidence_id);
+                }
+                if let Some(fingerprint) = output_fingerprint
+                    && !state.audit.output_fingerprints.contains(fingerprint)
+                {
+                    state.audit.output_fingerprints.push(fingerprint.clone());
+                }
+            }
+            AgentEvent::TeamMessage { evidence_ids, .. } => {
+                state.audit.team_messages += 1;
+                for evidence_id in evidence_ids {
+                    if !state.audit.feedback_evidence_ids.contains(evidence_id) {
+                        state.audit.feedback_evidence_ids.push(evidence_id.clone());
+                    }
+                }
+            }
+            AgentEvent::HandoffSummary { summary, .. } => {
+                state.audit.affected_components = summary.affected_components.clone();
+                state.audit.checks_planned = summary
+                    .checks
+                    .iter()
+                    .map(|check| check.check_id.clone())
+                    .collect();
+                state.audit.no_change = summary.outcome == crate::events::HandoffOutcome::NoChange;
+            }
+            AgentEvent::CommitResult {
+                success,
+                created,
+                reused,
+                oid,
+                changed_paths,
+                ..
+            } => {
+                state.audit.commit_disposition = Some(
+                    if *created {
+                        "created"
+                    } else if *reused {
+                        "reused"
+                    } else if *success {
+                        "not_needed"
+                    } else {
+                        "blocked"
+                    }
+                    .to_string(),
+                );
+                state.audit.commit_oid = oid.clone();
+                state.audit.commit_changed_paths = changed_paths.clone();
             }
             _ => {}
         }
@@ -243,6 +393,19 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .transpose()?
         .map(crate::harness_contract::HarnessContractDocument::normalize)
         .transpose()?;
+    let trusted_workspace_graph = args
+        .workspace_config
+        .as_deref()
+        .map(crate::workspace::WorkspaceConfigDocument::from_path)
+        .transpose()?
+        .map(crate::workspace::WorkspaceConfigDocument::normalize)
+        .transpose()?;
+    let workspace_config_metadata = args
+        .workspace_config
+        .as_deref()
+        .zip(trusted_workspace_graph.as_ref())
+        .map(|(path, graph)| workspace_config_metadata(path, graph))
+        .transpose()?;
     let layout = prepare_scratch(args.scratch_dir.as_deref())?;
     println!("pb harness: scratch={}", layout.root.display());
     println!("pb harness: workspace={}", layout.workspace.display());
@@ -260,6 +423,15 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .or_else(|| user_config.effective_model_dir());
     let models_root = model_dir.clone().unwrap_or_else(crate::default_models_dir);
     let turn_max_tokens_cap = args.max_tokens;
+    let repository_context = harness_repository_context(&layout)?;
+    let prior_check_evidence = load_check_evidence(&layout.events)?;
+    let base_workspace_graph =
+        trusted_workspace_graph.unwrap_or_else(|| crate::workspace::WorkspaceGraph::legacy(&[]));
+    let workspace_graph = contract
+        .as_ref()
+        .map(|contract| contract.compile_workspace_graph(base_workspace_graph.clone()))
+        .transpose()?
+        .unwrap_or(base_workspace_graph);
     let request = AgentRequest {
         task: args.task.clone(),
         model: args
@@ -303,33 +475,45 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         top_k: args.top_k.unwrap_or_else(|| user_config.effective_top_k()),
         seed: args.seed.unwrap_or_else(|| user_config.effective_seed()),
         environment: Some(harness_environment()),
-        workspace_graph: None,
-        repository_context: None,
+        workspace_graph: Some(workspace_graph),
+        repository_context: Some(repository_context),
+        prior_check_evidence,
         session_id: format!("harness-{}", layout.run_id),
         attachments: harness_attachments(&args.images)?,
         contract,
     };
 
-    write_running_journal(&layout, &args.task)?;
-    append_run_index_started(&layout, &args.task)?;
+    write_running_journal(&layout, &args.task, workspace_config_metadata.as_ref())?;
+    append_run_index_started(&layout, &args.task, workspace_config_metadata.as_ref())?;
     let sink = HarnessEventSink::new(&layout.events, &layout.run_events)?;
     let run_result = run_agent(request, &models_root, sink.clone());
-    let (mut observations, summary) = sink.snapshot()?;
+    let (mut observations, summary, audit) = sink.snapshot()?;
     add_run_observations(&mut observations, &run_result, &layout.workspace, &summary);
     write_journal(
         &layout,
         &args.task,
         &run_result,
         &summary,
+        &audit,
+        workspace_config_metadata.as_ref(),
         &mut observations,
     )?;
-    append_run_index_finished(&layout, &run_result)?;
+    append_run_index_finished(
+        &layout,
+        &run_result,
+        &audit,
+        workspace_config_metadata.as_ref(),
+    )?;
 
     match run_result {
         Ok(result) if harness_outcome_succeeded(&result) => {
             println!(
-                "pb harness: reached_final={} contract_status={} verified_completed={} termination_reason={} branch={} workspace={} journal={}",
+                "pb harness: reached_final={} handoff_outcome={} contract_status={} verified_completed={} termination_reason={} branch={} workspace={} journal={}",
                 result.reached_final,
+                result
+                    .handoff_outcome
+                    .map(|outcome| format!("{outcome:?}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "none".to_string()),
                 result.contract_status,
                 result.verified_completed,
                 result.termination_reason,
@@ -372,13 +556,85 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     }
 }
 
-fn harness_outcome_succeeded(result: &AgentRunResult) -> bool {
-    result.verified_completed
-        || (result.reached_final
-            && result.contract_status == crate::events::ContractStatus::Unspecified)
+fn workspace_config_metadata(
+    path: &Path,
+    graph: &crate::workspace::WorkspaceGraph,
+) -> Result<WorkspaceConfigMetadata> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read workspace config {}", path.display()))?;
+    let source = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workspace config {}", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let executor_policy = graph
+        .executors
+        .iter()
+        .map(|(id, executor)| {
+            let kind = match executor.kind {
+                crate::workspace::ExecutorKind::Project => "project",
+                crate::workspace::ExecutorKind::Local => "local",
+                crate::workspace::ExecutorKind::Container => "container",
+            };
+            format!("{id}:{kind}")
+        })
+        .collect();
+    Ok(WorkspaceConfigMetadata {
+        source,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        executor_policy,
+    })
 }
 
-fn append_run_index_started(layout: &ScratchLayout, task: &str) -> Result<()> {
+fn load_check_evidence(path: &Path) -> Result<crate::checks::CheckEvidenceLedger> {
+    if !path.exists() {
+        return Ok(crate::checks::CheckEvidenceLedger::default());
+    }
+    let file = File::open(path)
+        .with_context(|| format!("failed to open harness event journal {}", path.display()))?;
+    let mut events = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "failed to read harness event journal {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope: EventEnvelope = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse harness event journal {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        events.push(envelope.event);
+    }
+    Ok(crate::checks::CheckEvidenceLedger::from_events(&events))
+}
+
+fn harness_outcome_succeeded(result: &AgentRunResult) -> bool {
+    match result.handoff_outcome {
+        Some(crate::events::HandoffOutcome::Ready | crate::events::HandoffOutcome::NoChange) => {
+            result.contract_status != crate::events::ContractStatus::Unsatisfied
+        }
+        Some(_) => false,
+        None => {
+            result.verified_completed
+                || (result.reached_final
+                    && result.contract_status == crate::events::ContractStatus::Unspecified)
+        }
+    }
+}
+
+fn append_run_index_started(
+    layout: &ScratchLayout,
+    task: &str,
+    workspace_config: Option<&WorkspaceConfigMetadata>,
+) -> Result<()> {
     append_run_index_record(
         &layout.run_index,
         &RunIndexRecord::Started {
@@ -388,6 +644,7 @@ fn append_run_index_started(layout: &ScratchLayout, task: &str) -> Result<()> {
             task: task.to_string(),
             run_events: relative_to_root(&layout.root, &layout.run_events),
             run_journal: relative_to_root(&layout.root, &layout.run_journal),
+            workspace_config: workspace_config.cloned(),
         },
     )
 }
@@ -395,6 +652,8 @@ fn append_run_index_started(layout: &ScratchLayout, task: &str) -> Result<()> {
 fn append_run_index_finished(
     layout: &ScratchLayout,
     result: &Result<AgentRunResult>,
+    audit: &HarnessRunAudit,
+    workspace_config: Option<&WorkspaceConfigMetadata>,
 ) -> Result<()> {
     let (status, reached_final, contract_status, verified_completed, termination_reason, error) =
         match result {
@@ -403,6 +662,34 @@ fn append_run_index_finished(
                 result.reached_final,
                 result.contract_status,
                 true,
+                Some(result.termination_reason),
+                None,
+            ),
+            Ok(result) if result.handoff_outcome == Some(crate::events::HandoffOutcome::Ready) => (
+                "ready",
+                result.reached_final,
+                result.contract_status,
+                false,
+                Some(result.termination_reason),
+                None,
+            ),
+            Ok(result)
+                if result.handoff_outcome == Some(crate::events::HandoffOutcome::NoChange) =>
+            {
+                (
+                    "no_change",
+                    result.reached_final,
+                    result.contract_status,
+                    false,
+                    Some(result.termination_reason),
+                    None,
+                )
+            }
+            Ok(result) if result.handoff_outcome.is_some() => (
+                "incomplete",
+                result.reached_final,
+                result.contract_status,
+                false,
                 Some(result.termination_reason),
                 None,
             ),
@@ -447,6 +734,22 @@ fn append_run_index_finished(
             contract_status,
             verified_completed,
             termination_reason,
+            handoff_outcome: result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.handoff_outcome),
+            task_baseline_id: result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.repository_context.as_ref())
+                .map(|context| context.task_baseline.id.clone()),
+            invocation_baseline_id: result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.repository_context.as_ref())
+                .map(|context| context.invocation_baseline.id.clone()),
+            workspace_config: workspace_config.cloned(),
+            audit: audit.clone(),
             error,
         },
     )
@@ -520,6 +823,8 @@ fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
         run_index: root.join("run-index.jsonl"),
         run_events: run_dir.join("events.jsonl"),
         run_journal: run_dir.join("journal.md"),
+        task_baseline: root.join("task-baseline.json"),
+        adoptions: root.join("adoptions.jsonl"),
         run_id,
         root,
         workspace,
@@ -544,6 +849,69 @@ fn create_unique_run_dir(runs: &Path) -> Result<(String, PathBuf)> {
         }
     }
     bail!("could not allocate a unique harness run directory")
+}
+
+fn harness_repository_context(
+    layout: &ScratchLayout,
+) -> Result<crate::workspace::RepositoryContext> {
+    let task_baseline = if layout.task_baseline.exists() {
+        let bytes = std::fs::read(&layout.task_baseline).with_context(|| {
+            format!(
+                "failed to read harness task baseline {}",
+                layout.task_baseline.display()
+            )
+        })?;
+        serde_json::from_slice::<crate::workspace::WorkspaceBaseline>(&bytes).with_context(
+            || {
+                format!(
+                    "failed to parse harness task baseline {}",
+                    layout.task_baseline.display()
+                )
+            },
+        )?
+    } else {
+        let baseline = crate::workspace::WorkspaceBaseline::capture(&layout.workspace)?;
+        let bytes = serde_json::to_vec_pretty(&baseline)
+            .context("failed to serialize harness task baseline")?;
+        atomic_write(&layout.task_baseline, &bytes)?;
+        baseline
+    };
+    let context = crate::workspace::RepositoryContext::resume(
+        &layout.workspace,
+        &layout.workspace,
+        task_baseline,
+    )?;
+    if layout.resumed {
+        let adopted_paths = context.task_changed_paths()?;
+        if !adopted_paths.is_empty() {
+            let record = serde_json::json!({
+                "version": 1,
+                "type": "resume_adoption",
+                "run_id": layout.run_id,
+                "timestamp_ms": now_millis(),
+                "task_baseline_id": context.task_baseline.id,
+                "invocation_baseline_id": context.invocation_baseline.id,
+                "paths": adopted_paths,
+            });
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&layout.adoptions)
+                .with_context(|| {
+                    format!(
+                        "failed to open harness adoption journal {}",
+                        layout.adoptions.display()
+                    )
+                })?;
+            serde_json::to_writer(&mut file, &record)
+                .context("failed to encode harness adoption record")?;
+            file.write_all(b"\n")
+                .context("failed to append harness adoption record")?;
+            file.sync_data()
+                .context("failed to sync harness adoption record")?;
+        }
+    }
+    Ok(context)
 }
 
 fn create_unique_scratch_root() -> Result<PathBuf> {
@@ -682,7 +1050,10 @@ fn add_run_observations(
 
     let committed =
         require_git_success(workspace, &["log", "--oneline", "main..HEAD"]).unwrap_or_default();
-    if matches!(result, Ok(result) if result.reached_final) && committed.trim().is_empty() {
+    if matches!(result, Ok(result) if result.reached_final
+        && result.handoff_outcome != Some(crate::events::HandoffOutcome::NoChange))
+        && committed.trim().is_empty()
+    {
         observations.push(Observation {
             rank: 1,
             title: "completed run produced no commits".to_string(),
@@ -720,6 +1091,8 @@ fn write_journal(
     task: &str,
     result: &Result<AgentRunResult>,
     summary: &CapturedSummary,
+    audit: &HarnessRunAudit,
+    workspace_config: Option<&WorkspaceConfigMetadata>,
     observations: &mut Vec<Observation>,
 ) -> Result<()> {
     observations.sort_by(|left, right| {
@@ -731,6 +1104,13 @@ fn write_journal(
     observations.dedup_by(|left, right| left.rank == right.rank && left.detail == right.detail);
     let status = match result {
         Ok(result) if result.verified_completed => "verified-completed",
+        Ok(result) if result.handoff_outcome == Some(crate::events::HandoffOutcome::Ready) => {
+            "ready"
+        }
+        Ok(result) if result.handoff_outcome == Some(crate::events::HandoffOutcome::NoChange) => {
+            "no-change"
+        }
+        Ok(result) if result.handoff_outcome.is_some() => "incomplete",
         Ok(result)
             if result.reached_final
                 && result.contract_status == crate::events::ContractStatus::Unspecified =>
@@ -766,6 +1146,27 @@ fn write_journal(
             "- Termination reason: `{}`\n",
             result.termination_reason
         ));
+        journal.push_str(&format!(
+            "- Handoff outcome: `{}`\n",
+            result
+                .handoff_outcome
+                .map(|outcome| format!("{outcome:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        if let Some(context) = result.repository_context.as_ref() {
+            journal.push_str(&format!(
+                "- Task baseline: `{}`\n- Invocation baseline: `{}`\n",
+                context.task_baseline.id, context.invocation_baseline.id
+            ));
+        }
+    }
+    if let Some(metadata) = workspace_config {
+        journal.push_str(&format!(
+            "- Workspace config: `{}`\n- Workspace config SHA-256: `{}`\n- Executor policy: `{}`\n",
+            metadata.source,
+            metadata.sha256,
+            metadata.executor_policy.join(", ")
+        ));
     }
     journal.push_str(&format!("- Task: {task}\n"));
     journal.push_str(&format!("- Workspace: `{}`\n", layout.workspace.display()));
@@ -777,6 +1178,26 @@ fn write_journal(
     journal.push_str(&format!(
         "- Cumulative events: `{}`\n",
         layout.events.display()
+    ));
+    journal.push_str("\n## Handoff audit\n\n");
+    journal.push_str(&format!(
+        "- Affected components: `{}`\n- Checks planned: `{}`\n- Checks executed/reused/passed/failed/skipped: `{}/{}/{}/{}/{}`\n- Executors started/failed: `{}` / `{}`\n- Repair turns: `{}`\n- Team messages: `{}`\n- No change: `{}`\n- Commit disposition: `{}`\n- Commit OID: `{}`\n- Check evidence: `{}`\n- Output fingerprints: `{}`\n",
+        audit.affected_components.join(", "),
+        audit.checks_planned.join(", "),
+        audit.checks_executed,
+        audit.checks_reused,
+        audit.checks_passed,
+        audit.checks_failed,
+        audit.checks_skipped,
+        audit.executors_started.join(", "),
+        audit.executors_failed.join(", "),
+        audit.repair_turns,
+        audit.team_messages,
+        audit.no_change,
+        audit.commit_disposition.as_deref().unwrap_or("none"),
+        audit.commit_oid.as_deref().unwrap_or("none"),
+        audit.check_evidence_ids.join(", "),
+        audit.output_fingerprints.join(", "),
     ));
     journal.push_str("\n## Ranked observations\n\n");
     for observation in observations.iter() {
@@ -820,7 +1241,21 @@ fn write_journal(
     atomic_write(&layout.journal, journal.as_bytes())
 }
 
-fn write_running_journal(layout: &ScratchLayout, task: &str) -> Result<()> {
+fn write_running_journal(
+    layout: &ScratchLayout,
+    task: &str,
+    workspace_config: Option<&WorkspaceConfigMetadata>,
+) -> Result<()> {
+    let workspace_metadata = workspace_config
+        .map(|metadata| {
+            format!(
+                "- Workspace config: `{}`\n- Workspace config SHA-256: `{}`\n- Executor policy: `{}`\n",
+                metadata.source,
+                metadata.sha256,
+                metadata.executor_policy.join(", ")
+            )
+        })
+        .unwrap_or_default();
     let journal = format!(
         "# pb harness journal\n\n\
          - Status: `running`\n\
@@ -828,7 +1263,8 @@ fn write_running_journal(layout: &ScratchLayout, task: &str) -> Result<()> {
          - Task: {task}\n\
          - Workspace: `{workspace}`\n\
          - Run events: `{run_events}`\n\
-         - Cumulative events: `{events}`\n\n\
+         - Cumulative events: `{events}`\n\
+         {workspace_metadata}\n\
          ## Ranked observations\n\n\
          1. **P1 — run has not finalized.** If the harness was interrupted, inspect the raw event stream and workspace before deciding whether to rerun.\n\n\
          ## Follow-up improvement plan\n\n\
@@ -932,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_exit_success_requires_legacy_final_or_verified_contract() {
+    fn harness_exit_success_accepts_handoff_ready_no_change_and_legacy_final() {
         let result = |reached_final, contract_status, verified_completed, termination_reason| {
             AgentRunResult {
                 branch: "task".to_string(),
@@ -944,6 +1380,7 @@ mod tests {
                 contract_status,
                 verified_completed,
                 termination_reason,
+                handoff_outcome: None,
             }
         };
 
@@ -965,6 +1402,29 @@ mod tests {
             false,
             crate::events::TerminationReason::ContractUnsatisfied,
         )));
+
+        for outcome in [
+            crate::events::HandoffOutcome::Ready,
+            crate::events::HandoffOutcome::NoChange,
+        ] {
+            let mut handoff = result(
+                true,
+                crate::events::ContractStatus::Unspecified,
+                false,
+                crate::events::TerminationReason::Final,
+            );
+            handoff.handoff_outcome = Some(outcome);
+            assert!(harness_outcome_succeeded(&handoff));
+            assert!(!handoff.verified_completed);
+        }
+        let mut failed_handoff = result(
+            true,
+            crate::events::ContractStatus::Unspecified,
+            false,
+            crate::events::TerminationReason::ChecksFailed,
+        );
+        failed_handoff.handoff_outcome = Some(crate::events::HandoffOutcome::ChecksFailed);
+        assert!(!harness_outcome_succeeded(&failed_handoff));
     }
 
     #[test]
@@ -1003,6 +1463,124 @@ mod tests {
     }
 
     #[test]
+    fn resumed_scratch_preserves_task_baseline_and_records_adoption() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let first = prepare_scratch(Some(&root)).unwrap();
+        let first_context = harness_repository_context(&first).unwrap();
+        std::fs::write(first.workspace.join("work.txt"), "in progress\n").unwrap();
+
+        let resumed = prepare_scratch(Some(&root)).unwrap();
+        let resumed_context = harness_repository_context(&resumed).unwrap();
+
+        assert_eq!(
+            first_context.task_baseline.id,
+            resumed_context.task_baseline.id
+        );
+        assert_ne!(
+            first_context.invocation_baseline.id,
+            resumed_context.invocation_baseline.id
+        );
+        assert_eq!(
+            resumed_context.task_changed_paths().unwrap(),
+            vec!["work.txt"]
+        );
+        let adoption = std::fs::read_to_string(&resumed.adoptions).unwrap();
+        assert!(adoption.contains("resume_adoption"));
+        assert!(adoption.contains("work.txt"));
+    }
+
+    #[test]
+    fn prior_check_evidence_loads_from_cumulative_events() {
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(&events, &run_events).unwrap();
+        sink.emit(AgentEvent::CheckResult {
+            check_id: "logic".to_string(),
+            exit_status: 0,
+            success: true,
+            timed_out: false,
+            output: "ok".to_string(),
+            truncated: false,
+            duration_ms: 3,
+            fingerprint: "inputs".to_string(),
+            command: Some("true".to_string()),
+            cwd: Some(".".to_string()),
+            executor: Some("project".to_string()),
+            source: Some("handoff".to_string()),
+            command_fingerprint: Some("command".to_string()),
+            dependency_outputs: Default::default(),
+            output_fingerprint: Some("output".to_string()),
+            reused: false,
+            skip_reason: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        let ledger = load_check_evidence(&events).unwrap();
+        assert_eq!(
+            ledger.get("logic").unwrap().output_fingerprint.as_deref(),
+            Some("output")
+        );
+    }
+
+    #[test]
+    fn workspace_config_metadata_is_external_stable_and_executor_aware() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("workspace.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n\n[[executors]]\nid = \"local\"\nkind = \"local\"\n\n[[components]]\nid = \"app\"\nroot = \".\"\nexecutor = \"local\"\n",
+        )
+        .unwrap();
+        let graph = crate::workspace::WorkspaceConfigDocument::from_path(&path)
+            .unwrap()
+            .normalize()
+            .unwrap();
+        let metadata = workspace_config_metadata(&path, &graph).unwrap();
+
+        assert_eq!(metadata.sha256.len(), 64);
+        assert_eq!(metadata.executor_policy, vec!["local:local"]);
+        assert_eq!(
+            metadata.source,
+            path.canonicalize().unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn valid_no_change_does_not_report_a_missing_commit_problem() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::Final,
+            handoff_outcome: Some(crate::events::HandoffOutcome::NoChange),
+        });
+        let summary = CapturedSummary {
+            summary: "No changes were needed.".to_string(),
+            ..CapturedSummary::default()
+        };
+        let mut observations = Vec::new();
+
+        add_run_observations(&mut observations, &result, &layout.workspace, &summary);
+
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| observation.title == "completed run produced no commits")
+        );
+    }
+
+    #[test]
     fn compact_detail_is_single_line_and_bounded() {
         let detail = compact_detail(&format!("first\n{}", "x".repeat(900)));
         assert!(!detail.contains('\n'));
@@ -1028,7 +1606,7 @@ mod tests {
         });
 
         assert_eq!(std::fs::read_to_string(&events).unwrap().lines().count(), 1);
-        let (_, summary) = sink.snapshot().unwrap();
+        let (_, summary, _) = sink.snapshot().unwrap();
         assert_eq!(summary.branch, "pb/task-harness-1");
         assert_eq!(std::fs::read_to_string(events).unwrap().lines().count(), 1);
         assert_eq!(
@@ -1038,11 +1616,88 @@ mod tests {
     }
 
     #[test]
+    fn event_journal_summarizes_handoff_checks_team_feedback_and_commit() {
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(&events, &run_events).unwrap();
+        sink.emit(AgentEvent::ExecutorStarted {
+            executor_id: "web".to_string(),
+            kind: "local".to_string(),
+            success: true,
+            detail: String::new(),
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::TeamMessage {
+            actor: crate::events::TeamActor::Automation(crate::events::AutomationActor::Handoff),
+            tone: crate::events::TeamMessageTone::Warning,
+            message: "The web check needs attention.".to_string(),
+            detail: Some("failed".to_string()),
+            evidence_ids: vec!["check:web".to_string()],
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::HandoffSummary {
+            summary: crate::events::HandoffSummary {
+                outcome: crate::events::HandoffOutcome::Ready,
+                affected_components: vec!["web".to_string()],
+                checks: vec![crate::events::HandoffCheckSummary {
+                    check_id: "web".to_string(),
+                    status: "passed".to_string(),
+                }],
+                commit: None,
+                changed_paths: vec!["web/app.ts".to_string()],
+                detail: None,
+            },
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::CommitResult {
+            success: true,
+            created: true,
+            reused: false,
+            oid: Some("abc".to_string()),
+            subject: Some("feat: web".to_string()),
+            changed_paths: vec!["web/app.ts".to_string()],
+            detail: String::new(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        let (_, _, audit) = sink.snapshot().unwrap();
+        assert_eq!(audit.affected_components, vec!["web"]);
+        assert_eq!(audit.checks_planned, vec!["web"]);
+        assert_eq!(audit.executors_started, vec!["web"]);
+        assert_eq!(audit.team_messages, 1);
+        assert_eq!(audit.feedback_evidence_ids, vec!["check:web"]);
+        assert_eq!(audit.commit_disposition.as_deref(), Some("created"));
+        assert_eq!(audit.commit_oid.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn legacy_run_index_records_deserialize_with_empty_audit_defaults() {
+        let record: RunIndexRecord = serde_json::from_str(
+            r#"{"state":"finished","version":1,"run_id":"old","timestamp_ms":1,"status":"final_unverified","reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final"}"#,
+        )
+        .unwrap();
+        let RunIndexRecord::Finished {
+            handoff_outcome,
+            audit,
+            ..
+        } = record
+        else {
+            panic!("expected finished record");
+        };
+        assert_eq!(handoff_outcome, None);
+        assert_eq!(audit, HarnessRunAudit::default());
+    }
+
+    #[test]
     fn running_journal_exists_before_agent_completion() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
         let layout = prepare_scratch(Some(&root)).unwrap();
-        write_running_journal(&layout, "Build a test project").unwrap();
+        write_running_journal(&layout, "Build a test project", None).unwrap();
 
         let journal = std::fs::read_to_string(layout.journal).unwrap();
         assert!(journal.contains("Status: `running`"));
@@ -1051,8 +1706,8 @@ mod tests {
     }
 
     fn finish_test_run(layout: &ScratchLayout, task: &str, branch: &str) {
-        write_running_journal(layout, task).unwrap();
-        append_run_index_started(layout, task).unwrap();
+        write_running_journal(layout, task, None).unwrap();
+        append_run_index_started(layout, task, None).unwrap();
         let sink = HarnessEventSink::new(&layout.events, &layout.run_events).unwrap();
         let mut emitter = sink.clone();
         emitter.emit(AgentEvent::Started {
@@ -1064,7 +1719,7 @@ mod tests {
             attachments: Vec::new(),
             timestamp_ms: None,
         });
-        let (_, summary) = sink.snapshot().unwrap();
+        let (_, summary, audit) = sink.snapshot().unwrap();
         let result = Ok(AgentRunResult {
             branch: branch.to_string(),
             workspace_root: layout.workspace.clone(),
@@ -1075,9 +1730,19 @@ mod tests {
             contract_status: crate::events::ContractStatus::Unspecified,
             verified_completed: false,
             termination_reason: crate::events::TerminationReason::Final,
+            handoff_outcome: Some(crate::events::HandoffOutcome::Ready),
         });
-        write_journal(layout, task, &result, &summary, &mut Vec::new()).unwrap();
-        append_run_index_finished(layout, &result).unwrap();
+        write_journal(
+            layout,
+            task,
+            &result,
+            &summary,
+            &audit,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        append_run_index_finished(layout, &result, &audit, None).unwrap();
     }
 
     #[test]
@@ -1119,8 +1784,8 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
         let layout = prepare_scratch(Some(&root)).unwrap();
-        write_running_journal(&layout, "interrupted task").unwrap();
-        append_run_index_started(&layout, "interrupted task").unwrap();
+        write_running_journal(&layout, "interrupted task", None).unwrap();
+        append_run_index_started(&layout, "interrupted task", None).unwrap();
 
         let records = std::fs::read_to_string(&layout.run_index).unwrap();
         let records = records

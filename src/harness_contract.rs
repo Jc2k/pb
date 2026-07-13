@@ -178,6 +178,106 @@ impl AgentContract {
         serde_json::to_string_pretty(self)
             .unwrap_or_else(|_| "(contract could not be rendered)".to_string())
     }
+
+    pub fn compile_workspace_graph(
+        &self,
+        mut graph: crate::workspace::WorkspaceGraph,
+    ) -> Result<crate::workspace::WorkspaceGraph> {
+        use crate::workspace::{
+            CheckTrigger, Executor, ExecutorKind, WorkspaceCheck, WorkspaceComponent,
+        };
+
+        if self.checks.is_empty() {
+            return Ok(graph);
+        }
+        const EXECUTOR_ID: &str = "harness-contract";
+        const COMPONENT_ID: &str = "harness-contract";
+        match graph.executors.get(EXECUTOR_ID) {
+            Some(executor) if executor.kind != ExecutorKind::Project => {
+                bail!("workspace executor id '{EXECUTOR_ID}' is reserved by the harness contract")
+            }
+            Some(_) => {}
+            None => {
+                graph.executors.insert(
+                    EXECUTOR_ID.to_string(),
+                    Executor {
+                        id: EXECUTOR_ID.to_string(),
+                        kind: ExecutorKind::Project,
+                        environment: None,
+                    },
+                );
+            }
+        }
+        if let Some(component) = graph.components.get(COMPONENT_ID) {
+            if component.root != "." || component.executor != EXECUTOR_ID {
+                bail!(
+                    "workspace component id '{COMPONENT_ID}' is reserved by the harness contract"
+                );
+            }
+        } else {
+            graph.components.insert(
+                COMPONENT_ID.to_string(),
+                WorkspaceComponent {
+                    id: COMPONENT_ID.to_string(),
+                    root: ".".to_string(),
+                    include: vec!["**".to_string()],
+                    exclude: Vec::new(),
+                    executor: EXECUTOR_ID.to_string(),
+                    depends_on: Vec::new(),
+                },
+            );
+        }
+        let mut previous_required = None;
+        for check in &self.checks {
+            if let Some(existing) = graph.checks.get_mut(&check.id) {
+                if existing.command != check.command || existing.cwd != check.cwd {
+                    bail!(
+                        "harness contract check '{}' conflicts with the workspace check of the same id",
+                        check.id
+                    );
+                }
+                if check.required {
+                    existing.trigger = CheckTrigger::Always;
+                    if let Some(previous) = &previous_required
+                        && !existing.depends_on.contains(previous)
+                    {
+                        existing.depends_on.push(previous.clone());
+                    }
+                    previous_required = Some(check.id.clone());
+                }
+                continue;
+            }
+            let depends_on = if check.required {
+                previous_required.iter().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            graph.checks.insert(
+                check.id.clone(),
+                WorkspaceCheck {
+                    id: check.id.clone(),
+                    label: check.id.clone(),
+                    command: check.command.clone(),
+                    cwd: check.cwd.clone(),
+                    executor: EXECUTOR_ID.to_string(),
+                    components: vec![COMPONENT_ID.to_string()],
+                    trigger: if check.required {
+                        CheckTrigger::Always
+                    } else {
+                        CheckTrigger::Changed
+                    },
+                    inputs: vec!["**".to_string()],
+                    outputs: Vec::new(),
+                    depends_on,
+                    timeout_seconds: check.timeout_seconds,
+                },
+            );
+            if check.required {
+                previous_required = Some(check.id.clone());
+            }
+        }
+        graph.to_document().normalize()
+    }
 }
 
 fn normalize_unique_paths(field: &str, paths: Vec<String>, allow_dot: bool) -> Result<Vec<String>> {
@@ -289,5 +389,40 @@ mod tests {
         assert_eq!(contract.checks[0].cwd, ".");
         assert_eq!(contract.checks[0].timeout_seconds, 60);
         assert!(contract.checks[0].required);
+    }
+
+    #[test]
+    fn contract_checks_compile_into_always_ordered_workspace_checks() {
+        let document: HarnessContractDocument = serde_json::from_str(
+            r#"{"version":1,"checks":[{"id":"build","command":"make build"},{"id":"test","command":"make test"}]}"#,
+        )
+        .unwrap();
+        let contract = document.normalize().unwrap();
+        let graph = contract
+            .compile_workspace_graph(crate::workspace::WorkspaceGraph::legacy(&[]))
+            .unwrap();
+
+        assert_eq!(
+            graph.checks["build"].trigger,
+            crate::workspace::CheckTrigger::Always
+        );
+        assert_eq!(graph.checks["test"].depends_on, vec!["build"]);
+        assert_eq!(graph.checks["test"].executor, "harness-contract");
+        assert_eq!(graph.components["harness-contract"].root, ".");
+    }
+
+    #[test]
+    fn contract_check_conflicts_with_trusted_workspace_definition() {
+        let document: HarnessContractDocument =
+            serde_json::from_str(r#"{"version":1,"checks":[{"id":"test","command":"make test"}]}"#)
+                .unwrap();
+        let contract = document.normalize().unwrap();
+        let mut graph = contract
+            .compile_workspace_graph(crate::workspace::WorkspaceGraph::legacy(&[]))
+            .unwrap();
+        graph.checks.get_mut("test").unwrap().command = "other test".to_string();
+
+        let error = contract.compile_workspace_graph(graph).unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
     }
 }

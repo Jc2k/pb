@@ -729,6 +729,17 @@ async fn continue_session(
     request.infer_profile = true;
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
+    request.prior_check_evidence = {
+        let history = session
+            .history
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let events = history
+            .iter()
+            .map(|envelope| envelope.event.clone())
+            .collect::<Vec<_>>();
+        crate::checks::CheckEvidenceLedger::from_events(&events)
+    };
     session.task = request.task.clone();
     session.title = None;
     session.request_template = request.clone();
@@ -1314,6 +1325,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             let mut final_status = SessionStatus::Completed;
             match result {
                 Ok(Ok(run_result)) => {
+                    session.request_template.repository_context =
+                        run_result.repository_context.clone();
+                    session.request_template.workspace_graph = run_result.workspace_graph.clone();
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.focus_root);
                     if !run_result.reached_final

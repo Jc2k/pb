@@ -448,6 +448,8 @@ pub enum AgentEvent {
         verified_completed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         termination_reason: Option<TerminationReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_outcome: Option<HandoffOutcome>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -881,6 +883,7 @@ impl EventEnvelope {
                 contract_status,
                 verified_completed,
                 termination_reason,
+                handoff_outcome,
                 summary,
                 power_summary,
                 diff_stat,
@@ -895,6 +898,7 @@ impl EventEnvelope {
                     contract_status,
                     verified_completed,
                     termination_reason,
+                    handoff_outcome,
                     summary,
                     power_summary,
                     diff_stat,
@@ -980,6 +984,7 @@ mod tests {
             contract_status: ContractStatus::Unspecified,
             verified_completed: false,
             termination_reason: Some(TerminationReason::Final),
+            handoff_outcome: Some(HandoffOutcome::Ready),
             summary: "done".to_string(),
             power_summary: String::new(),
             diff_stat: String::new(),
@@ -991,6 +996,7 @@ mod tests {
         assert_eq!(value["event"]["contract_status"], "unspecified");
         assert_eq!(value["event"]["verified_completed"], false);
         assert_eq!(value["event"]["termination_reason"], "final");
+        assert_eq!(value["event"]["handoff_outcome"], "ready");
     }
 
     #[test]

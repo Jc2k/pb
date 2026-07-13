@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "fixtures": [
     {
       "id": "first_action_only",
@@ -21,11 +21,11 @@
     },
     {
       "id": "false_final_after_inspection",
-      "hypothesis": "A build final after inspection only is rejected.",
+      "hypothesis": "A build final after inspection only takes the no-change handoff path.",
       "profile": "build",
       "max_steps": 2,
-      "completion_supported": false,
-      "expected": {"reached_final":false,"contract_status":"unspecified","verified_completed":false,"termination_reason":"step_limit","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"target.txt":true}},
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"target.txt":true},"handoff_outcome":"no_change","selected_checks":[],"executed_checks":0,"reused_checks":0,"repair_turns":0},
       "tool_allowlist": ["read_file"],
       "initial_files": {"target.txt": "before\n"},
       "turns": [
@@ -47,7 +47,7 @@
       "expected": {"reached_final":true,"contract_status":"unsatisfied","verified_completed":false,"termination_reason":"contract_unsatisfied","llm_invocations":3,"tool_calls":2,"false_completion":false,"named_check_compliance":false,"observed_paths":{"target.txt":true,"unrelated.txt":true}},
       "contract": {
         "version": 1,
-        "checks": [{"id": "logic", "command": "true", "required": true}],
+        "checks": [{"id": "logic", "command": "printf logic", "required": true}],
         "review": {"required": true, "read_paths": ["target.txt"], "check_ids": ["logic"]}
       },
       "tool_allowlist": ["read_file", "run_command", "run_check"],
@@ -182,6 +182,119 @@
         }
       ],
       "observe_paths": ["target.txt"]
+    },
+    {
+      "id": "handoff_no_change",
+      "hypothesis": "A contract-free final with no content delta exits through no-change without checks or a commit.",
+      "profile": "scout",
+      "max_steps": 1,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":1,"tool_calls":0,"false_completion":false,"observed_paths":{},"handoff_outcome":"no_change","selected_checks":[],"executed_checks":0,"reused_checks":0,"repair_turns":0},
+      "turns": [
+        {"content": "{\"type\":\"final\",\"content\":\"Nothing needed changing.\"}"}
+      ]
+    },
+    {
+      "id": "handoff_contract_check_commit",
+      "hypothesis": "Handoff runs a missing contract check and commits task-owned changes after it passes.",
+      "profile": "scout",
+      "max_steps": 2,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"satisfied","verified_completed":true,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"named_check_compliance":true,"observed_paths":{"app.txt":true},"handoff_outcome":"ready","selected_checks":["logic"],"executed_checks":1,"reused_checks":0,"executor_starts":["harness-contract"],"repair_turns":0,"commit_disposition":"created"},
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["app.txt"],
+        "checks": [{"id": "logic", "command": "true", "required": true}],
+        "commit": {"required": true, "semantic": true}
+      },
+      "tool_allowlist": ["write_file"],
+      "turns": [
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"app.txt\",\"content\":\"done\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Done.\"}"}
+      ],
+      "observe_paths": ["app.txt"]
+    },
+    {
+      "id": "handoff_repeated_check_failure",
+      "hypothesis": "The same failing handoff check gets one repair turn and then stops deterministically.",
+      "profile": "scout",
+      "max_steps": 3,
+      "completion_supported": false,
+      "expected": {"reached_final":true,"contract_status":"unsatisfied","verified_completed":false,"termination_reason":"repair_exhausted","llm_invocations":3,"tool_calls":1,"false_completion":false,"named_check_compliance":false,"observed_paths":{"app.txt":true},"handoff_outcome":"repair_exhausted","selected_checks":["logic"],"executed_checks":2,"reused_checks":0,"executor_starts":["harness-contract"],"repair_turns":1},
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["app.txt"],
+        "checks": [{"id": "logic", "command": "false", "required": true}]
+      },
+      "tool_allowlist": ["write_file"],
+      "turns": [
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"app.txt\",\"content\":\"broken\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Done.\"}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Still done.\"}"}
+      ],
+      "observe_paths": ["app.txt"]
+    },
+    {
+      "id": "multi_executor_affected_selection",
+      "hypothesis": "An API-only change starts the API executor and avoids the unrelated web executor.",
+      "profile": "scout",
+      "max_steps": 2,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"api/new.txt":true},"handoff_outcome":"ready","selected_checks":["api-test"],"executed_checks":1,"reused_checks":0,"executor_starts":["api"],"repair_turns":0,"commit_disposition":"created"},
+      "workspace": {
+        "version": 1,
+        "executors": [
+          {"id":"api","kind":"local"},
+          {"id":"web","kind":"local"}
+        ],
+        "components": [
+          {"id":"api","root":"api","include":["api/**"],"executor":"api"},
+          {"id":"web","root":"web","include":["web/**"],"executor":"web"}
+        ],
+        "checks": [
+          {"id":"api-test","command":"true","executor":"api","components":["api"],"trigger":"changed","inputs":["api/**"]},
+          {"id":"web-test","command":"true","executor":"web","components":["web"],"trigger":"changed","inputs":["web/**"]}
+        ]
+      },
+      "tool_allowlist": ["write_file"],
+      "initial_files": {"api/input.txt":"before\n","web/input.txt":"before\n"},
+      "turns": [
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"api/new.txt\",\"content\":\"after\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"API updated.\"}"}
+      ],
+      "observe_paths": ["api/new.txt"]
+    },
+    {
+      "id": "generated_bundle_dependency",
+      "hypothesis": "A generated web bundle is built before the dependent app check and its output evidence is retained.",
+      "profile": "scout",
+      "max_steps": 2,
+      "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"web/dist/bundle.txt":true},"handoff_outcome":"ready","selected_checks":["app-test","web-bundle"],"executed_checks":2,"reused_checks":0,"executor_starts":["app","web"],"repair_turns":0,"commit_disposition":"created"},
+      "workspace": {
+        "version": 1,
+        "executors": [
+          {"id":"web","kind":"local"},
+          {"id":"app","kind":"local"}
+        ],
+        "components": [
+          {"id":"web","root":"web","include":["web/**"],"exclude":["web/dist/**"],"executor":"web"},
+          {"id":"app","root":"app","include":["app/**"],"executor":"app","depends_on":["web"]}
+        ],
+        "checks": [
+          {"id":"web-bundle","command":"mkdir -p web/dist && cp web/new.txt web/dist/bundle.txt","executor":"web","components":["web"],"trigger":"needed","inputs":["web/new.txt"],"outputs":["web/dist/**"]},
+          {"id":"app-test","command":"true","executor":"app","components":["app"],"trigger":"changed","inputs":["app/**"],"depends_on":["web-bundle"]}
+        ]
+      },
+      "tool_allowlist": ["write_file"],
+      "initial_files": {"app/main.txt":"app\n"},
+      "turns": [
+        {"content": "{\"type\":\"tool_call\",\"tool\":\"write_file\",\"arguments\":{\"path\":\"web/new.txt\",\"content\":\"bundle source\\n\"}}"},
+        {"content": "{\"type\":\"final\",\"content\":\"Bundle updated.\"}"}
+      ],
+      "observe_paths": ["web/dist/bundle.txt"]
     }
   ]
 }

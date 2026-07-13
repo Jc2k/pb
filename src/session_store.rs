@@ -341,6 +341,7 @@ mod tests {
             environment: None::<EnvironmentConfig>,
             workspace_graph: None,
             repository_context: None,
+            prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
             session_id: String::new(),
             attachments: Vec::new(),
             contract: None,

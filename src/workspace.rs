@@ -244,16 +244,18 @@ pub struct WorkspaceConfigDocument {
 }
 
 impl WorkspaceConfigDocument {
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+    }
+
     pub fn load(repo_root: &Path) -> Result<Option<Self>> {
         let path = repo_root.join(".pb").join("workspace.toml");
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let document =
-            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(Some(document))
+        Self::from_path(&path).map(Some)
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<()> {

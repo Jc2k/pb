@@ -499,6 +499,9 @@ pub struct AgentRequest {
     /// Runtime-owned repository/focus context and baselines. Older persisted requests omit it.
     #[serde(default)]
     pub repository_context: Option<crate::workspace::RepositoryContext>,
+    /// Successful check evidence restored from earlier invocations of the same task/session.
+    #[serde(default)]
+    pub prior_check_evidence: CheckEvidenceLedger,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -519,6 +522,7 @@ pub struct AgentRunResult {
     pub contract_status: ContractStatus,
     pub verified_completed: bool,
     pub termination_reason: TerminationReason,
+    pub handoff_outcome: Option<crate::events::HandoffOutcome>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1075,6 +1079,12 @@ pub fn run_agent<S: EventSink>(
 
     let repository_context = if args.repository_less {
         None
+    } else if let Some(existing) = args.repository_context.take() {
+        Some(crate::workspace::RepositoryContext::resume(
+            &workspace_root,
+            &focus_root,
+            existing.task_baseline,
+        )?)
     } else {
         Some(crate::workspace::RepositoryContext::capture(
             &workspace_root,
@@ -1214,6 +1224,10 @@ pub fn run_agent<S: EventSink>(
             env_config.as_ref(),
         )?)
     };
+    let workspace_graph = match (workspace_graph, args.contract.as_ref()) {
+        (Some(graph), Some(contract)) => Some(contract.compile_workspace_graph(graph)?),
+        (graph, _) => graph,
+    };
     args.workspace_graph = workspace_graph.clone();
 
     // If an environment is configured, prepare the requested command backend for this task.
@@ -1315,7 +1329,36 @@ pub fn run_agent<S: EventSink>(
     let contract_status = outcome.contract_status;
     let verified_completed = outcome.verified_completed;
     let termination_reason = outcome.termination_reason;
+    let handoff_outcome = classify_handoff_outcome(&args, &outcome, repository_context.as_ref())?;
     let summary = outcome.final_content.unwrap_or_default();
+
+    if handoff_outcome == Some(crate::events::HandoffOutcome::Incomplete) && !reached_final {
+        sink.emit(AgentEvent::TeamMessage {
+            actor: crate::events::TeamActor::Automation(crate::events::AutomationActor::Handoff),
+            tone: crate::events::TeamMessageTone::Warning,
+            message: "The task stopped before handoff.".to_string(),
+            detail: Some(format!("termination reason: {termination_reason}")),
+            evidence_ids: Vec::new(),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        sink.emit(AgentEvent::HandoffSummary {
+            summary: crate::events::HandoffSummary {
+                outcome: crate::events::HandoffOutcome::Incomplete,
+                affected_components: Vec::new(),
+                checks: Vec::new(),
+                commit: None,
+                changed_paths: repository_context
+                    .as_ref()
+                    .map(crate::workspace::RepositoryContext::task_changed_paths)
+                    .transpose()?
+                    .unwrap_or_default(),
+                detail: Some(format!("termination reason: {termination_reason}")),
+            },
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+    }
 
     let (commits, diff_stat, diff) = if args.repository_less {
         (String::new(), String::new(), String::new())
@@ -1340,6 +1383,7 @@ pub fn run_agent<S: EventSink>(
         contract_status,
         verified_completed,
         termination_reason: Some(termination_reason),
+        handoff_outcome,
         summary,
         power_summary,
         diff_stat,
@@ -1374,7 +1418,40 @@ pub fn run_agent<S: EventSink>(
         contract_status,
         verified_completed,
         termination_reason,
+        handoff_outcome,
     })
+}
+
+fn classify_handoff_outcome(
+    args: &AgentRequest,
+    outcome: &StepRunOutcome,
+    repository: Option<&crate::workspace::RepositoryContext>,
+) -> Result<Option<crate::events::HandoffOutcome>> {
+    use crate::events::HandoffOutcome;
+    if args.repository_less
+        || args.sub_agent_depth > 0
+        || !matches!(args.profile, AgentProfile::Build | AgentProfile::Scout)
+    {
+        return Ok(None);
+    }
+    Ok(Some(match outcome.termination_reason {
+        TerminationReason::Final => {
+            if repository
+                .map(crate::workspace::RepositoryContext::task_changed_paths)
+                .transpose()?
+                .is_none_or(|paths| paths.is_empty())
+            {
+                HandoffOutcome::NoChange
+            } else {
+                HandoffOutcome::Ready
+            }
+        }
+        TerminationReason::ChecksFailed => HandoffOutcome::ChecksFailed,
+        TerminationReason::ExecutorUnavailable => HandoffOutcome::ExecutorUnavailable,
+        TerminationReason::RepairExhausted => HandoffOutcome::RepairExhausted,
+        TerminationReason::CommitBlocked => HandoffOutcome::CommitBlocked,
+        _ => HandoffOutcome::Incomplete,
+    }))
 }
 
 #[cfg(test)]
@@ -2669,7 +2746,12 @@ fn initial_gate_state(
     command_backend_available: bool,
 ) -> GateState {
     let wrote_file = args.accept_existing_workspace_changes
-        && git_status_porcelain(workspace_root).is_ok_and(|status| !status.trim().is_empty());
+        && (args.repository_context.as_ref().is_some_and(|repository| {
+            repository
+                .task_changed_paths()
+                .is_ok_and(|paths| !paths.is_empty())
+        }) || git_status_porcelain(workspace_root)
+            .is_ok_and(|status| !status.trim().is_empty()));
     GateState {
         wrote_file,
         review_read_evidence_gathered: args.repository_less,
@@ -2716,7 +2798,7 @@ fn run_agent_steps(
             graph,
             env_config,
             command_backend,
-            CheckEvidenceLedger::default(),
+            args.prior_check_evidence.clone(),
         ))
     });
     let available_tools = available_tool_specs_with_allowlist(
@@ -3030,6 +3112,72 @@ fn run_agent_steps(
                                 gate_state: gate_state.into_inner(),
                             });
                         }
+                    }
+                }
+                if args.contract.is_some() {
+                    let feedback = if let Some(runtime) = workspace_checks.as_ref() {
+                        let runtime = runtime.borrow();
+                        contract_gate_feedback(
+                            args,
+                            &gate_state.borrow(),
+                            workspace_root,
+                            ContractGatePhase::HandoffComplete,
+                            Some(runtime.ledger()),
+                        )?
+                    } else {
+                        contract_gate_feedback(
+                            args,
+                            &gate_state.borrow(),
+                            workspace_root,
+                            ContractGatePhase::HandoffComplete,
+                            None,
+                        )?
+                    };
+                    if let Some(feedback) = feedback {
+                        sink.emit(AgentEvent::Correction {
+                            message: feedback.clone(),
+                            summary: "Task requirements remain after handoff".to_string(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        sink.emit(AgentEvent::TeamMessage {
+                            actor: crate::events::TeamActor::Automation(
+                                crate::events::AutomationActor::Handoff,
+                            ),
+                            tone: crate::events::TeamMessageTone::Warning,
+                            message: "The checks are done, but some task requirements are still missing. This needs another pass."
+                                .to_string(),
+                            detail: Some(feedback.clone()),
+                            evidence_ids: Vec::new(),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        sink.emit(AgentEvent::HandoffSummary {
+                            summary: crate::events::HandoffSummary {
+                                outcome: crate::events::HandoffOutcome::Incomplete,
+                                affected_components: Vec::new(),
+                                checks: Vec::new(),
+                                commit: None,
+                                changed_paths: args
+                                    .repository_context
+                                    .as_ref()
+                                    .map(crate::workspace::RepositoryContext::task_changed_paths)
+                                    .transpose()?
+                                    .unwrap_or_default(),
+                                detail: Some(feedback),
+                            },
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        return Ok(StepRunOutcome {
+                            reached_final: true,
+                            contract_status: ContractStatus::Unsatisfied,
+                            verified_completed: false,
+                            termination_reason: TerminationReason::ContractUnsatisfied,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
                     }
                 }
                 sink.emit(AgentEvent::Final {
@@ -3486,6 +3634,78 @@ fn run_final_grace(
                             gate_state,
                         });
                     }
+                }
+            }
+            if args.contract.is_some() {
+                let feedback = if let Some(runtime) = workspace_checks {
+                    let runtime = runtime.borrow();
+                    contract_gate_feedback(
+                        args,
+                        &gate_state,
+                        workspace_root,
+                        ContractGatePhase::HandoffComplete,
+                        Some(runtime.ledger()),
+                    )?
+                } else {
+                    contract_gate_feedback(
+                        args,
+                        &gate_state,
+                        workspace_root,
+                        ContractGatePhase::HandoffComplete,
+                        None,
+                    )?
+                };
+                if let Some(feedback) = feedback {
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Task requirements remain after final handoff".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    sink.emit(AgentEvent::TeamMessage {
+                        actor: crate::events::TeamActor::Automation(
+                            crate::events::AutomationActor::Handoff,
+                        ),
+                        tone: crate::events::TeamMessageTone::Warning,
+                        message: "The checks are done, but some task requirements are still missing. This needs another pass."
+                            .to_string(),
+                        detail: Some(feedback.clone()),
+                        evidence_ids: Vec::new(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    sink.emit(AgentEvent::HandoffSummary {
+                        summary: crate::events::HandoffSummary {
+                            outcome: crate::events::HandoffOutcome::Incomplete,
+                            affected_components: Vec::new(),
+                            checks: Vec::new(),
+                            commit: None,
+                            changed_paths: args
+                                .repository_context
+                                .as_ref()
+                                .map(crate::workspace::RepositoryContext::task_changed_paths)
+                                .transpose()?
+                                .unwrap_or_default(),
+                            detail: Some(feedback.clone()),
+                        },
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    sink.emit(AgentEvent::FinalGrace {
+                        status: FinalGraceStatus::Rejected,
+                        detail: feedback,
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: true,
+                        contract_status: ContractStatus::Unsatisfied,
+                        verified_completed: false,
+                        termination_reason: TerminationReason::ContractUnsatisfied,
+                        final_content: Some(content),
+                        metrics,
+                        gate_state,
+                    });
                 }
             }
             sink.emit(AgentEvent::FinalGrace {
@@ -4968,10 +5188,33 @@ struct ToolContext<'a> {
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
 }
 
+#[cfg(test)]
 fn contract_completion_gate_feedback(
     request: &AgentRequest,
     gate_state: &GateState,
     workspace_root: &Path,
+) -> Result<Option<String>> {
+    contract_gate_feedback(
+        request,
+        gate_state,
+        workspace_root,
+        ContractGatePhase::HandoffComplete,
+        None,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractGatePhase {
+    PrimaryFinal,
+    HandoffComplete,
+}
+
+fn contract_gate_feedback(
+    request: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+    phase: ContractGatePhase,
+    workspace_evidence: Option<&CheckEvidenceLedger>,
 ) -> Result<Option<String>> {
     let contract = request
         .contract
@@ -5029,32 +5272,38 @@ fn contract_completion_gate_feedback(
         ));
     }
 
-    for check in contract.checks.iter().filter(|check| check.required) {
-        match gate_state.named_check_evidence.get(&check.id) {
-            Some(evidence) if evidence.fingerprint == fingerprint => {}
-            Some(_) => missing.push(format!(
-                "named check '{}' is stale after a later content mutation",
-                check.id
-            )),
-            None => missing.push(format!("named check '{}' has not succeeded", check.id)),
+    if phase == ContractGatePhase::HandoffComplete {
+        for check in contract.checks.iter().filter(|check| check.required) {
+            let shared_current = workspace_evidence
+                .and_then(|ledger| ledger.get(&check.id))
+                .is_some_and(|evidence| evidence.success && !evidence.timed_out);
+            match gate_state.named_check_evidence.get(&check.id) {
+                Some(evidence) if evidence.fingerprint == fingerprint => {}
+                _ if shared_current => {}
+                Some(_) => missing.push(format!(
+                    "named check '{}' is stale after a later content mutation",
+                    check.id
+                )),
+                None => missing.push(format!("named check '{}' has not succeeded", check.id)),
+            }
         }
-    }
 
-    let commit_subjects = git_session_commit_subjects(workspace_root)?;
-    if contract.commit.required && commit_subjects.is_empty() {
-        missing.push("the contract requires at least one task commit".to_string());
-    }
-    if contract.commit.semantic {
-        let invalid = commit_subjects
-            .iter()
-            .filter(|subject| !is_semantic_commit_message(subject))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !invalid.is_empty() {
-            missing.push(format!(
-                "task commits must use semantic messages; invalid: {}",
-                invalid.join(", ")
-            ));
+        let commit_subjects = git_session_commit_subjects(workspace_root)?;
+        if contract.commit.required && commit_subjects.is_empty() {
+            missing.push("the contract requires at least one task commit".to_string());
+        }
+        if contract.commit.semantic {
+            let invalid = commit_subjects
+                .iter()
+                .filter(|subject| !is_semantic_commit_message(subject))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !invalid.is_empty() {
+                missing.push(format!(
+                    "task commits must use semantic messages; invalid: {}",
+                    invalid.join(", ")
+                ));
+            }
         }
     }
 
@@ -5095,7 +5344,7 @@ fn contract_completion_gate_feedback(
         }
     }
 
-    if contract.workspace_clean {
+    if phase == ContractGatePhase::HandoffComplete && contract.workspace_clean {
         let status = git_status_porcelain(workspace_root)?;
         if !status.trim().is_empty() {
             missing.push("the contract requires a clean workspace".to_string());
@@ -5116,7 +5365,13 @@ fn request_completion_gate_feedback(
     workspace_root: &Path,
 ) -> Result<Option<String>> {
     if request.contract.is_some() {
-        contract_completion_gate_feedback(request, gate_state, workspace_root)
+        contract_gate_feedback(
+            request,
+            gate_state,
+            workspace_root,
+            ContractGatePhase::PrimaryFinal,
+            None,
+        )
     } else if request.profile == AgentProfile::Build
         && request
             .repository_context
@@ -5827,6 +6082,47 @@ fn run_tool(
             let check = contract
                 .check(id)
                 .with_context(|| format!("harness contract has no check named '{id}'"))?;
+            if let (Some(runtime), Some(graph)) = (
+                context.workspace_checks,
+                context.request.workspace_graph.as_ref(),
+            ) && graph.checks.contains_key(id)
+            {
+                let before = workspace_change_observation(workspace_root, context.gate_state)?;
+                let summary = runtime.borrow_mut().run_named(
+                    id,
+                    EvidenceSource::AgentTool,
+                    context.request.sub_agent_depth,
+                    sink,
+                )?;
+                record_workspace_change_observation(
+                    before,
+                    workspace_root,
+                    context.request,
+                    context.gate_state,
+                )?;
+                let forbidden = contract_forbidden_changed_paths(contract, workspace_root)?;
+                if !forbidden.is_empty() {
+                    bail!(
+                        "named check '{id}' changed forbidden path(s): {}",
+                        forbidden.join(", ")
+                    );
+                }
+                if summary.all_succeeded() {
+                    context.gate_state.borrow_mut().named_check_evidence.insert(
+                        id.to_string(),
+                        NamedCheckEvidence {
+                            fingerprint: git_worktree_content_fingerprint(workspace_root)?,
+                        },
+                    );
+                } else {
+                    context
+                        .gate_state
+                        .borrow_mut()
+                        .named_check_evidence
+                        .remove(id);
+                }
+                return Ok(serde_json::to_string(&summary)?);
+            }
             let backend = command_backend
                 .context("run_check is not available: no project environment is configured")?;
             run_named_contract_check(
@@ -8634,6 +8930,7 @@ mod tests {
             environment: None,
             workspace_graph: None,
             repository_context: None,
+            prior_check_evidence: CheckEvidenceLedger::default(),
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -8789,6 +9086,97 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_handoff_executor_has_a_distinct_terminal_reason() {
+        let tmp = init_contract_test_repo();
+        let context = crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("service.txt"), "changed\n").unwrap();
+        let graph = crate::workspace::WorkspaceConfigDocument {
+            version: 1,
+            executors: vec![crate::workspace::Executor {
+                id: "service".to_string(),
+                kind: crate::workspace::ExecutorKind::Container,
+                environment: None,
+            }],
+            components: vec![crate::workspace::WorkspaceComponent {
+                id: "service".to_string(),
+                root: ".".to_string(),
+                include: vec!["service.txt".to_string()],
+                exclude: Vec::new(),
+                executor: "service".to_string(),
+                depends_on: Vec::new(),
+            }],
+            checks: vec![crate::workspace::WorkspaceCheck {
+                id: "service-test".to_string(),
+                label: "service test".to_string(),
+                command: "true".to_string(),
+                cwd: ".".to_string(),
+                executor: "service".to_string(),
+                components: vec!["service".to_string()],
+                trigger: crate::workspace::CheckTrigger::Changed,
+                inputs: vec!["service.txt".to_string()],
+                outputs: Vec::new(),
+                depends_on: Vec::new(),
+                timeout_seconds: 2,
+            }],
+            cargo_workspaces: Vec::new(),
+        }
+        .normalize()
+        .unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.repository_context = Some(context);
+        request.workspace_graph = Some(graph);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::ExecutorUnavailable
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ExecutorStarted { success: false, .. }))
+        );
+    }
+
+    #[test]
+    fn unsafe_staged_content_blocks_handoff_commit() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("user.txt"), "user-owned\n").unwrap();
+        git_run(&["add", "user.txt"], tmp.path()).unwrap();
+        let context = crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("task.txt"), "task-owned\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.repository_context = Some(context);
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[]));
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::CommitBlocked);
+        assert_eq!(
+            git_run(&["diff", "--cached", "--name-only"], tmp.path())
+                .unwrap()
+                .trim(),
+            "user.txt"
+        );
+    }
+
+    #[test]
     fn exact_agent_check_evidence_is_reused_by_handoff() {
         let tmp = init_contract_test_repo();
         let mut request = test_agent_request(AgentProfile::Scout, 256);
@@ -8829,6 +9217,145 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::CheckResult { reused: true, .. }))
+        );
+    }
+
+    #[test]
+    fn resumed_handoff_reuses_current_prior_evidence_without_starting_executor() {
+        let tmp = init_contract_test_repo();
+        git_run(&["checkout", "-b", "task"], tmp.path()).unwrap();
+        let task_context =
+            crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let graph = crate::workspace::WorkspaceGraph::legacy(&["true".to_string()]);
+        let mut first = test_agent_request(AgentProfile::Scout, 256);
+        first.max_steps = 1;
+        first.repository_context = Some(task_context.clone());
+        first.workspace_graph = Some(graph.clone());
+        let mut first_events = Vec::new();
+        let first_outcome = run_scripted_agent_steps(
+            &first,
+            vec![scripted_final("first")],
+            tmp.path(),
+            &mut |event| first_events.push(event),
+        )
+        .unwrap();
+        assert_eq!(first_outcome.termination_reason, TerminationReason::Final);
+
+        let mut resumed = test_agent_request(AgentProfile::Scout, 256);
+        resumed.max_steps = 1;
+        resumed.repository_context = Some(
+            crate::workspace::RepositoryContext::resume(
+                tmp.path(),
+                tmp.path(),
+                task_context.task_baseline,
+            )
+            .unwrap(),
+        );
+        resumed.workspace_graph = Some(graph);
+        resumed.prior_check_evidence = CheckEvidenceLedger::from_events(&first_events);
+        let mut resumed_events = Vec::new();
+        let resumed_outcome = run_scripted_agent_steps(
+            &resumed,
+            vec![scripted_final("resumed")],
+            tmp.path(),
+            &mut |event| resumed_events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(resumed_outcome.termination_reason, TerminationReason::Final);
+        assert!(
+            resumed_events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CheckResult { reused: true, .. }))
+        );
+        assert!(
+            !resumed_events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ExecutorStarted { .. }))
+        );
+        assert!(
+            resumed_events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CommitResult { reused: true, .. }))
+        );
+    }
+
+    #[test]
+    fn handoff_executes_missing_contract_check_and_creates_required_commit() {
+        let tmp = init_contract_test_repo();
+        git_run(&["checkout", "-b", "task"], tmp.path()).unwrap();
+        let repository_context =
+            crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("change.txt"), "changed\n").unwrap();
+        let contract = crate::harness_contract::HarnessContractDocument {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["change.txt".to_string()],
+            checks: vec![crate::harness_contract::HarnessCheckDocument {
+                id: "logic".to_string(),
+                command: "true".to_string(),
+                cwd: ".".to_string(),
+                required: true,
+                timeout_seconds: 2,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract {
+                required: true,
+                semantic: true,
+            },
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        }
+        .normalize()
+        .unwrap();
+        let graph = contract
+            .compile_workspace_graph(crate::workspace::WorkspaceGraph::legacy(&[]))
+            .unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 1;
+        request.repository_context = Some(repository_context);
+        request.workspace_graph = Some(graph);
+        request.contract = Some(contract);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.contract_status,
+            ContractStatus::Satisfied,
+            "events: {events:#?}"
+        );
+        assert!(outcome.verified_completed);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                check_id,
+                source: Some(source),
+                success: true,
+                reused: false,
+                ..
+            } if check_id == "logic" && source == "handoff"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CommitResult {
+                success: true,
+                created: true,
+                ..
+            }
+        )));
+        assert_eq!(
+            git_run(&["log", "-1", "--pretty=%s"], tmp.path())
+                .unwrap()
+                .trim(),
+            "feat: complete requested changes"
         );
     }
 
@@ -9052,7 +9579,7 @@ mod tests {
     }
 
     #[test]
-    fn unsatisfied_contract_cannot_enter_final_grace_or_be_extended_by_monitor_text() {
+    fn missing_executable_contract_fact_is_rejected_after_final_grace_without_a_runtime() {
         let tmp = init_contract_test_repo();
         std::fs::write(tmp.path().join("game.js"), "before\n").unwrap();
         let mut request = test_agent_request(AgentProfile::Scout, 256);
@@ -9075,17 +9602,29 @@ mod tests {
         .unwrap();
 
         assert!(monitor_recommends_more_steps("grant more steps: yes"));
-        assert!(!outcome.reached_final);
+        assert!(outcome.reached_final);
         assert!(!outcome.verified_completed);
         assert_eq!(outcome.contract_status, ContractStatus::Unsatisfied);
-        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
-        assert_eq!(outcome.llm_invocations, 1);
-        assert_eq!(outcome.remaining_completions, 1);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::FinalGrace { .. }))
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::ContractUnsatisfied
         );
+        assert_eq!(outcome.llm_invocations, 2);
+        assert_eq!(outcome.remaining_completions, 0);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Started,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Rejected,
+                ..
+            }
+        )));
         assert!(
             !events
                 .iter()
@@ -10544,11 +11083,22 @@ mod tests {
                     .success()
             );
         }
+        let repository_context =
+            crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
         std::fs::write(tmp.path().join("pending.txt"), "pending\n").unwrap();
         let mut request = test_agent_request(AgentProfile::Build, 512);
 
         assert!(!initial_gate_state(&request, tmp.path(), true).wrote_file);
         request.accept_existing_workspace_changes = true;
+        assert!(initial_gate_state(&request, tmp.path(), true).wrote_file);
+        git_run(&["add", "pending.txt"], tmp.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: preserve prior task work"],
+            tmp.path(),
+        )
+        .unwrap();
+        request.repository_context = Some(repository_context);
+        assert!(git_status_porcelain(tmp.path()).unwrap().is_empty());
         assert!(initial_gate_state(&request, tmp.path(), true).wrote_file);
     }
 
@@ -10749,6 +11299,7 @@ mod tests {
             environment: None,
             workspace_graph: None,
             repository_context: None,
+            prior_check_evidence: CheckEvidenceLedger::default(),
             session_id: "session-123".to_string(),
             attachments: Vec::new(),
             contract: None,
@@ -10813,6 +11364,7 @@ mod tests {
             environment: None,
             workspace_graph: None,
             repository_context: None,
+            prior_check_evidence: CheckEvidenceLedger::default(),
             session_id: "session-456".to_string(),
             attachments: Vec::new(),
             contract: None,
