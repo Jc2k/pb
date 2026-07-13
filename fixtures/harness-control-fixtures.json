@@ -7,6 +7,7 @@
       "profile": "scout",
       "max_steps": 2,
       "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"first.txt":true,"second.txt":false}},
       "tool_allowlist": ["write_file"],
       "turns": [
         {
@@ -24,6 +25,7 @@
       "profile": "build",
       "max_steps": 2,
       "completion_supported": false,
+      "expected": {"reached_final":false,"contract_status":"unspecified","verified_completed":false,"termination_reason":"step_limit","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"target.txt":true}},
       "tool_allowlist": ["read_file"],
       "initial_files": {"target.txt": "before\n"},
       "turns": [
@@ -42,6 +44,7 @@
       "profile": "review",
       "max_steps": 3,
       "completion_supported": false,
+      "expected": {"reached_final":true,"contract_status":"unsatisfied","verified_completed":false,"termination_reason":"contract_unsatisfied","llm_invocations":3,"tool_calls":2,"false_completion":false,"named_check_compliance":false,"observed_paths":{"target.txt":true,"unrelated.txt":true}},
       "contract": {
         "version": 1,
         "checks": [{"id": "logic", "command": "true", "required": true}],
@@ -68,6 +71,7 @@
       "profile": "review",
       "max_steps": 4,
       "completion_supported": false,
+      "expected": {"reached_final":true,"contract_status":"unsatisfied","verified_completed":false,"termination_reason":"contract_unsatisfied","llm_invocations":4,"tool_calls":3,"false_completion":false,"named_check_compliance":false,"observed_paths":{"target.txt":true}},
       "contract": {
         "version": 1,
         "allowed_paths": ["target.txt"],
@@ -98,6 +102,7 @@
       "profile": "scout",
       "max_steps": 4,
       "completion_supported": true,
+      "expected": {"reached_final":false,"contract_status":"unspecified","verified_completed":false,"termination_reason":"gate_loop","llm_invocations":3,"tool_calls":2,"false_completion":false,"observed_paths":{"target.txt":true}},
       "tool_allowlist": ["read_file"],
       "initial_files": {"target.txt": "before\n"},
       "turns": [
@@ -122,6 +127,7 @@
       "profile": "scout",
       "max_steps": 2,
       "completion_supported": true,
+      "expected": {"reached_final":true,"contract_status":"unspecified","verified_completed":false,"termination_reason":"final","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"result.txt":true}},
       "tool_allowlist": ["write_file"],
       "turns": [
         {
@@ -139,6 +145,7 @@
       "profile": "review",
       "max_steps": 2,
       "completion_supported": false,
+      "expected": {"reached_final":false,"contract_status":"unspecified","verified_completed":false,"termination_reason":"step_limit","llm_invocations":2,"tool_calls":1,"false_completion":false,"observed_paths":{"target.txt":true}},
       "tool_allowlist": ["read_file", "run_command"],
       "initial_files": {"target.txt": "before\n"},
       "turns": [

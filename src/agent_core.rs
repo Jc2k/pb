@@ -3947,6 +3947,139 @@ pub(crate) fn run_scripted_agent_steps(
     })
 }
 
+pub(crate) enum LocalModelEvalEngine {
+    LlamaCpp(LlamaCppBackend),
+    FlashMoe(crate::inference::flashmoe::FlashMoeEngine),
+}
+
+impl LocalModelEvalEngine {
+    pub(crate) fn load(model: &str, models_root: &Path, gpu_layers: u32) -> Result<Self> {
+        if let Some(plan) = crate::inference::flashmoe::plan(model, models_root) {
+            if crate::inference::flashmoe::HARNESS_RESOURCE_POLICY_VERSION == 0 {
+                bail!(
+                    "FlashMoe harness evaluation is disabled until a bounded resource policy is active"
+                );
+            }
+            return crate::inference::flashmoe::load(&plan)
+                .map(Self::FlashMoe)
+                .with_context(|| {
+                    format!(
+                        "failed to load FlashMoe harness evaluation model {} from {}",
+                        plan.model,
+                        plan.runtime_dir.display()
+                    )
+                });
+        }
+        let path = find_model_in_cache_in(models_root, model)?;
+        llamacpp::load_from_file(&path, gpu_layers)
+            .map(Self::LlamaCpp)
+            .with_context(|| {
+                format!(
+                    "failed to load llama.cpp harness evaluation model {}",
+                    path.display()
+                )
+            })
+    }
+
+    pub(crate) const fn backend_name(&self) -> &'static str {
+        match self {
+            Self::LlamaCpp(_) => "llama_cpp",
+            Self::FlashMoe(_) => "flashmoe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalModelEvalOutcome {
+    pub reached_final: bool,
+    pub contract_status: ContractStatus,
+    pub verified_completed: bool,
+    pub termination_reason: TerminationReason,
+}
+
+pub(crate) fn run_local_model_eval_steps(
+    engine: &mut LocalModelEvalEngine,
+    args: &AgentRequest,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<LocalModelEvalOutcome> {
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let instructions = build_agent_instructions_with_tool_allowlist(
+        workspace_root,
+        "harness-eval",
+        false,
+        Some(CommandBackendKind::Local),
+        None,
+        args.profile,
+        false,
+        false,
+        args.tool_allowlist.as_deref(),
+        args.contract.as_ref(),
+        &mcp_registry,
+        &lsp_registry,
+    )?;
+    let mut messages = vec![
+        ChatMessage::text("system", instructions),
+        ChatMessage::text("user", args.task.clone()),
+    ];
+    let todo_memory = RefCell::new(TodoMemory::default());
+    let policy_config = PolicyConfig::default();
+    let outcome = match engine {
+        LocalModelEvalEngine::LlamaCpp(llamacpp) => {
+            let mut generator = LlamaCompletionEngine { llamacpp };
+            run_agent_steps(
+                &mut generator,
+                TextBackendKind::LlamaCpp,
+                Some(llamacpp),
+                args,
+                &mut messages,
+                workspace_root,
+                workspace_root,
+                Some(&command_backend),
+                None,
+                &todo_memory,
+                &mcp_registry,
+                &lsp_registry,
+                &policy_config,
+                None,
+                0,
+                sink,
+            )?
+        }
+        LocalModelEvalEngine::FlashMoe(flashmoe) => {
+            let mut generator = BorrowedFlashMoeCompletionEngine { engine: flashmoe };
+            run_agent_steps(
+                &mut generator,
+                TextBackendKind::FlashMoe,
+                None,
+                args,
+                &mut messages,
+                workspace_root,
+                workspace_root,
+                Some(&command_backend),
+                None,
+                &todo_memory,
+                &mcp_registry,
+                &lsp_registry,
+                &policy_config,
+                None,
+                0,
+                sink,
+            )?
+        }
+    };
+    Ok(LocalModelEvalOutcome {
+        reached_final: outcome.reached_final,
+        contract_status: outcome.contract_status,
+        verified_completed: outcome.verified_completed,
+        termination_reason: outcome.termination_reason,
+    })
+}
+
 struct LlamaCompletionEngine<'a> {
     llamacpp: &'a LlamaCppBackend,
 }
@@ -3998,38 +4131,61 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
     ) -> Result<CompletionOutput> {
-        let energy_start = energy::sample();
-        let started = Instant::now();
-        let output = self.engine.generate_structured_in_session(
-            &args.session_id,
-            &StructuredGenerationRequest {
-                messages: to_model_messages(messages)?,
-                tools: to_model_tools(tools),
-                add_generation_prompt: true,
-                raw_prompt: false,
-                trace_candidates: false,
-                max_tokens: args.max_tokens,
-                temperature: args.temperature,
-                top_k: args.top_k,
-                seed: args.seed,
-            },
-        )?;
-        let energy =
-            energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
-        Ok(CompletionOutput {
-            content: output.content,
-            tool_calls: output
-                .tool_calls
-                .into_iter()
-                .map(AgentToolCall::from_model)
-                .collect(),
-            finish_reason: CompletionFinishReason::EndOfGeneration,
-            prompt_tokens: messages.iter().map(|message| message.content.len()).sum(),
-            generated_tokens: output.generated_tokens,
-            duration_ms: duration_millis(started),
-            energy,
-        })
+        generate_flashmoe_completion(&mut self.engine, args, messages, tools)
     }
+}
+
+struct BorrowedFlashMoeCompletionEngine<'a> {
+    engine: &'a mut crate::inference::flashmoe::FlashMoeEngine,
+}
+
+impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
+    fn generate(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+    ) -> Result<CompletionOutput> {
+        generate_flashmoe_completion(self.engine, args, messages, tools)
+    }
+}
+
+fn generate_flashmoe_completion(
+    engine: &mut crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+) -> Result<CompletionOutput> {
+    let energy_start = energy::sample();
+    let started = Instant::now();
+    let output = engine.generate_structured_in_session(
+        &args.session_id,
+        &StructuredGenerationRequest {
+            messages: to_model_messages(messages)?,
+            tools: to_model_tools(tools),
+            add_generation_prompt: true,
+            raw_prompt: false,
+            trace_candidates: false,
+            max_tokens: args.max_tokens,
+            temperature: args.temperature,
+            top_k: args.top_k,
+            seed: args.seed,
+        },
+    )?;
+    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+    Ok(CompletionOutput {
+        content: output.content,
+        tool_calls: output
+            .tool_calls
+            .into_iter()
+            .map(AgentToolCall::from_model)
+            .collect(),
+        finish_reason: CompletionFinishReason::EndOfGeneration,
+        prompt_tokens: messages.iter().map(|message| message.content.len()).sum(),
+        generated_tokens: output.generated_tokens,
+        duration_ms: duration_millis(started),
+        energy,
+    })
 }
 
 fn generate_and_parse_action_with_retries(
@@ -5411,7 +5567,7 @@ fn git_completion_marker(workdir: &Path) -> Option<String> {
     Some(format!("{head}\n{status}"))
 }
 
-fn git_worktree_content_fingerprint(workdir: &Path) -> Result<String> {
+pub(crate) fn git_worktree_content_fingerprint(workdir: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
             "ls-files",

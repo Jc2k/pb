@@ -21,6 +21,10 @@ mod types;
 mod vision;
 mod weights;
 
+/// Versioned proof that FlashMoe inference enforces the bounded Metal resource policy required by
+/// harness model matrices. A zero value means real-model harness evaluation must refuse FlashMoe.
+pub const HARNESS_RESOURCE_POLICY_VERSION: u32 = 1;
+
 pub use cache::{
     build_cache_from_hf_snapshot, build_cache_from_hf_snapshot_with_quantization,
     expected_hf_files, expected_vl_hf_files,

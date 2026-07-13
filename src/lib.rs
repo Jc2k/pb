@@ -345,6 +345,55 @@ pub enum HarnessCommand {
     CacheClean(FlashMoeCacheCleanArgs),
     /// Run one complete agent task directly in a persistent scratch workspace
     Agent(HarnessAgentArgs),
+    /// Run deterministic or explicitly selected local-model harness control evaluations
+    Eval(HarnessEvalArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessEvalArgs {
+    /// Explicit local model identifier; omit for the deterministic scripted CI suite
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Directory containing pulled model blobs; defaults to the configured model directory
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Write JSONL to this file instead of stdout
+    #[arg(long, value_name = "PATH")]
+    pub jsonl: Option<PathBuf>,
+
+    /// Maximum new tokens per real-model turn
+    #[arg(long, default_value_t = 512)]
+    pub max_tokens: i32,
+
+    /// Context size for real-model evaluation
+    #[arg(long, default_value_t = 32768)]
+    pub ctx_size: u32,
+
+    /// CPU decode threads for real-model evaluation
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    /// CPU prompt-processing threads for real-model evaluation
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    /// Transformer layers to offload for real-model evaluation
+    #[arg(long, default_value_t = GPU_FULL_OFFLOAD)]
+    pub gpu_layers: u32,
+
+    /// Sampling temperature for real-model evaluation
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Top-k sampling for real-model evaluation
+    #[arg(long, default_value_t = 1)]
+    pub top_k: i32,
+
+    /// RNG seed for reproducible real-model evaluation
+    #[arg(long, default_value_t = 0)]
+    pub seed: u32,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1594,6 +1643,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::Bench(args) => run_flashmoe_bench(args),
         HarnessCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
         HarnessCommand::Agent(args) => harness::run_agent_task(args),
+        HarnessCommand::Eval(args) => harness_eval::run_eval_command(args),
     }
 }
 
@@ -3524,6 +3574,44 @@ mod tests {
         assert_eq!(args.max_steps, Some(20));
         assert_eq!(args.contract, Some(PathBuf::from("contract.json")));
         assert_eq!(args.profile, AgentProfile::Build);
+    }
+
+    #[test]
+    fn harness_eval_defaults_to_scripted_and_records_model_options() {
+        let scripted = Cli::try_parse_from(["pb", "harness", "eval"]).unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Eval(scripted),
+        } = scripted.command
+        else {
+            panic!("expected harness eval command");
+        };
+        assert!(scripted.model.is_none());
+        assert_eq!(scripted.seed, 0);
+
+        let model = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--jsonl",
+            "report.jsonl",
+            "--max-tokens",
+            "768",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Eval(model),
+        } = model.command
+        else {
+            panic!("expected harness eval command");
+        };
+        assert_eq!(model.model.as_deref(), Some("model.gguf"));
+        assert_eq!(model.jsonl, Some(PathBuf::from("report.jsonl")));
+        assert_eq!(model.max_tokens, 768);
+        assert_eq!(model.seed, 42);
     }
 
     #[test]

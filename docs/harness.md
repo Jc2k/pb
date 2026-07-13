@@ -96,3 +96,31 @@ example `pb harness infer ...`. `infer` and `bench` accept
 only make the default policy stricter. `--resource-summary` prints the opt-in JSON resource ledger;
 normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
 resource-limit abort.
+
+## Control evaluation
+
+Run the deterministic, model-free control suite with:
+
+```bash
+pb harness eval --jsonl harness-eval.jsonl
+```
+
+The command writes one schema-versioned JSON object per fixture and prints a compact table covering
+valid actions, named-check compliance, false completion, recovery loops, turns, latency, tokens,
+energy, and termination. Without `--jsonl`, JSONL goes to stdout and the table goes to stderr so the
+machine stream stays parseable. The scripted report contains no timestamps or scratch paths and is
+stable enough to diff directly; a protocol mismatch exits non-zero. `artifact_quality` is a
+separate optional field and never contributes to protocol pass/fail.
+
+Real-model matrices are opt-in and must name the local model explicitly:
+
+```bash
+pb harness eval --model model.gguf --model-dir /path/to/models \
+  --max-tokens 512 --ctx-size 32768 --temperature 0 --top-k 1 --seed 0 \
+  --jsonl model-eval.jsonl
+```
+
+Every real-model record repeats the backend, model, resolved model directory, token/context/thread/
+GPU settings, sampling values, seed, and FlashMoe resource-policy version. One loaded engine is
+reused across the corpus. FlashMoe evaluation refuses to start if the versioned bounded-resource
+policy is inactive.

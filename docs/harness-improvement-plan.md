@@ -301,7 +301,7 @@ Acceptance:
 | H2 | P1 | H1 | complete | Outcome/event/CLI compatibility tests | `fix: distinguish final and verified harness outcomes`; scripted uncontracted, rejected-contract, satisfied-contract, engine-error, CLI-exit, and legacy-event tests |
 | H3 | P1 | H0 | complete | Two-run resume and interruption tests | `feat: preserve per-run harness journals`; dual event streams, append-only run index, atomic compatibility journal, resume/interruption tests |
 | H4 | P2 | H0, H1, H2 | complete | Loop-stop and final-grace transcript tests | `fix: bound harness recovery loops`; keyed parse/gate/tool thresholds, no-monitor contract proof, and capped tool-free grace tests |
-| H5 | P2 | R0, H0-H4 | proposed | Deterministic eval report and optional model mode | — |
+| H5 | P2 | R0, H0-H4 | complete | Deterministic eval report and optional model mode | `feat: add harness control evaluation`; stable 7-line JSONL, metric table, protocol/artifact separation, reusable local engine, reproducibility and FlashMoe-policy tests |
 | H6 | P3 | H0 | proposed | Bounded stale-patch diagnostic tests | — |
 
 H1 and R0 may proceed in parallel after H0, but long FlashMoe model evaluations remain blocked until
