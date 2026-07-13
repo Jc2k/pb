@@ -1349,7 +1349,7 @@ fn build_direct_harness_instructions(
             "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent only to inspect and report. After the review returns, address valid findings yourself, rerun tests yourself, and git_commit the completed work with a semantic message."
         }
         AgentProfile::Review => {
-            "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Return prioritized concrete findings, or clearly state that the review passes."
+            "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Begin the final response with exactly REVIEW PASS when every requested check succeeds and no findings remain. Otherwise begin it with exactly REVIEW FAIL and report prioritized concrete findings or failed checks."
         }
         AgentProfile::Monitor => {
             "Audit the current run for loops, blockers, progress, and whether more steps are justified. Return concise evidence and a stop or continue recommendation."
@@ -1361,7 +1361,7 @@ fn build_direct_harness_instructions(
             "Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Do not return prose-only planning or a final response before a tool result and repository mutation."
         }
         AgentProfile::Review => {
-            "Inspect the workspace with read_file and read-only run_command checks. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence."
+            "Inspect the workspace with read_file and read-only run_command checks. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
         }
         AgentProfile::Monitor => {
             "Do not call tools or teammates. Audit only the transcript supplied in the task and immediately return a concise final decision."
@@ -4661,7 +4661,14 @@ fn run_sub_agent(
     } else {
         profile == AgentProfile::Review && workspace_changed
     };
-    if profile == AgentProfile::Review && outcome.reached_final && !review_mutated_workspace {
+    let review_passed = profile == AgentProfile::Review
+        && outcome.reached_final
+        && !review_mutated_workspace
+        && outcome
+            .final_content
+            .as_deref()
+            .is_some_and(review_final_passes);
+    if review_passed {
         context
             .gate_state
             .borrow_mut()
@@ -4671,6 +4678,16 @@ fn run_sub_agent(
     let result = if review_mutated_workspace {
         "review sub-agent did not pass: it attempted to change its isolated workspace despite the read-only review contract; the source workspace was protected, so request another review"
             .to_string()
+    } else if profile == AgentProfile::Review && outcome.reached_final && !review_passed {
+        let response = outcome
+            .final_content
+            .as_deref()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .unwrap_or("(empty review response)");
+        format!(
+            "review sub-agent did not pass: its final response must begin with an exact REVIEW PASS verdict after all checks succeed; request another review after addressing failures. Reviewer response:\n{response}"
+        )
     } else if outcome.reached_final {
         match outcome.final_content {
             Some(content) if !content.trim().is_empty() => {
@@ -4689,6 +4706,14 @@ fn run_sub_agent(
         timestamp_ms: Some(now_millis()),
     });
     Ok(result)
+}
+
+fn review_final_passes(content: &str) -> bool {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        == Some("REVIEW PASS")
 }
 
 fn run_todo_tool(arguments: &Value, todo_memory: &RefCell<TodoMemory>) -> Result<String> {
@@ -6880,7 +6905,29 @@ mod tests {
 
         assert!(instructions.contains("Do not edit, stage, commit, reset, clean"));
         assert!(instructions.contains("Return a final review"));
+        assert!(instructions.contains("exactly REVIEW PASS or REVIEW FAIL"));
+        assert!(instructions.contains("Never use REVIEW PASS when a requested check failed"));
         assert!(!instructions.contains("before a tool result and repository mutation"));
+    }
+
+    #[test]
+    fn review_success_requires_an_exact_leading_pass_verdict() {
+        assert!(review_final_passes(
+            "REVIEW PASS\nAll requested checks passed."
+        ));
+        assert!(review_final_passes(
+            "\n  REVIEW PASS  \nNo findings remain."
+        ));
+        assert!(!review_final_passes(
+            "The check failed because npm is not installed."
+        ));
+        assert!(!review_final_passes(
+            "REVIEW FAIL\nP1: the requested check failed."
+        ));
+        assert!(!review_final_passes(
+            "Review passes overall, but one check could not run."
+        ));
+        assert!(!review_final_passes(""));
     }
 
     #[test]
