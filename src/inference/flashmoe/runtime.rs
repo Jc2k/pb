@@ -623,7 +623,7 @@ impl FlashMoeEngine {
         // objects. A CLI process has no ambient AppKit autorelease pool, so a
         // long prefill or decode must drain those transients at the token
         // boundary while retained model/state buffers remain alive.
-        autoreleasepool(|_| {
+        let hidden = autoreleasepool(|_| {
             self.forward_token_input_in_autoreleasepool(
                 input,
                 kv_cache,
@@ -632,7 +632,9 @@ impl FlashMoeEngine {
                 timing,
                 progress,
             )
-        })
+        })?;
+        self.metal.inner.finish_token_boundary(position)?;
+        Ok(hidden)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -870,8 +872,8 @@ impl FlashMoeEngine {
             let can_defer_residual_wait_for_post_prep =
                 deferred_residual_input.is_some() && post_attention_values_for_prep.is_some();
             if deferred_attention_input.is_some()
-                && let Some(pending) = pending_for_layer.take()
                 && !can_defer_residual_wait_for_post_prep
+                && let Some(pending) = pending_for_layer.take()
             {
                 let wait_span = trace_span!(
                     target: "flashmoe::perf",
@@ -1464,6 +1466,29 @@ impl FlashMoeEngine {
     }
 }
 impl FlashMoeEngine {
+    pub fn set_metal_working_set_limit_bytes(&mut self, limit: usize) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return self.metal.inner.set_working_set_limit_bytes(limit);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = limit;
+            bail!("FlashMoe Metal resource policy requires Apple Silicon Metal")
+        }
+    }
+
+    pub fn metal_resource_snapshot(&self) -> Option<FlashMoeMetalResourceSnapshot> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Some(self.metal.inner.resource_snapshot())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            None
+        }
+    }
+
     pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
         let request = StructuredGenerationRequest::from_prompt(request);
         self.generate_structured(&request)

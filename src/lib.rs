@@ -481,6 +481,14 @@ pub struct FlashMoeInferArgs {
     /// Print detailed load/generation progress to stderr
     #[arg(long)]
     pub verbose: bool,
+
+    /// Lower the default Metal working-set safety limit (MiB)
+    #[arg(long)]
+    pub metal_working_set_limit_mib: Option<usize>,
+
+    /// Print the final Metal resource ledger as JSON
+    #[arg(long)]
+    pub resource_summary: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -556,6 +564,14 @@ pub struct FlashMoeBenchArgs {
     /// Collect and emit per-token/per-layer timing TSV (adds instrumentation overhead)
     #[arg(long)]
     pub detailed_timings: bool,
+
+    /// Lower the default Metal working-set safety limit (MiB)
+    #[arg(long)]
+    pub metal_working_set_limit_mib: Option<usize>,
+
+    /// Print the Metal resource ledger after every prompt
+    #[arg(long)]
+    pub resource_summary: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1701,6 +1717,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     } else {
         inference::flashmoe::load(&plan)?
     };
+    configure_flashmoe_metal_resources(&mut engine, args.metal_working_set_limit_mib)?;
     eprintln!(
         "flashmoe infer: backend loaded in {} ms",
         load_started.elapsed().as_millis()
@@ -1743,6 +1760,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         if content.is_empty() {
             bail!("FlashMoe multimodal inference returned an empty response");
         }
+        print_flashmoe_resource_summary("infer", None, args.resource_summary, &engine)?;
         println!("{content}");
         return Ok(());
     }
@@ -1783,6 +1801,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if content.is_empty() {
         bail!("FlashMoe inference returned an empty response");
     }
+    print_flashmoe_resource_summary("infer", None, args.resource_summary, &engine)?;
     println!("{content}");
     Ok(())
 }
@@ -1834,6 +1853,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     } else {
         inference::flashmoe::load(&plan)?
     };
+    configure_flashmoe_metal_resources(&mut engine, args.metal_working_set_limit_mib)?;
     eprintln!(
         "flashmoe bench: backend loaded in {} ms",
         load_started.elapsed().as_millis()
@@ -1919,6 +1939,12 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
         total_prefill_or_ttft_wall += throughput.prefill_or_ttft_wall;
         total_decode_tokens = total_decode_tokens.saturating_add(throughput.decode_tokens);
         total_decode_wall += throughput.decode_wall;
+        print_flashmoe_resource_summary(
+            "bench",
+            Some(prompt_index + 1),
+            args.resource_summary,
+            &engine,
+        )?;
         let expected = baseline.as_ref().and_then(|baseline| {
             baseline
                 .results
@@ -1984,6 +2010,40 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     }
     if quality_failed {
         bail!("FlashMoe quality smoke failed against baseline");
+    }
+    Ok(())
+}
+
+fn configure_flashmoe_metal_resources(
+    engine: &mut inference::flashmoe::FlashMoeEngine,
+    limit_mib: Option<usize>,
+) -> Result<()> {
+    let Some(limit_mib) = limit_mib else {
+        return Ok(());
+    };
+    let limit_bytes = limit_mib
+        .checked_mul(1024 * 1024)
+        .context("--metal-working-set-limit-mib is too large")?;
+    engine.set_metal_working_set_limit_bytes(limit_bytes)
+}
+
+fn print_flashmoe_resource_summary(
+    command: &str,
+    prompt: Option<usize>,
+    enabled: bool,
+    engine: &inference::flashmoe::FlashMoeEngine,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let snapshot = engine
+        .metal_resource_snapshot()
+        .context("FlashMoe Metal resource summary is unavailable")?;
+    let json =
+        serde_json::to_string(&snapshot).context("failed to encode Metal resource summary")?;
+    match prompt {
+        Some(prompt) => eprintln!("flashmoe {command}: resources prompt={prompt} {json}"),
+        None => eprintln!("flashmoe {command}: resources {json}"),
     }
     Ok(())
 }
@@ -3384,9 +3444,19 @@ mod tests {
             panic!("expected harness bench command");
         };
         assert!(!default.detailed_timings);
+        assert_eq!(default.metal_working_set_limit_mib, None);
+        assert!(!default.resource_summary);
 
-        let detailed =
-            Cli::try_parse_from(["pb", "harness", "bench", "--detailed-timings"]).unwrap();
+        let detailed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "bench",
+            "--detailed-timings",
+            "--metal-working-set-limit-mib",
+            "4096",
+            "--resource-summary",
+        ])
+        .unwrap();
         let Commands::Harness {
             command: HarnessCommand::Bench(detailed),
         } = detailed.command
@@ -3394,6 +3464,27 @@ mod tests {
             panic!("expected harness bench command");
         };
         assert!(detailed.detailed_timings);
+        assert_eq!(detailed.metal_working_set_limit_mib, Some(4096));
+        assert!(detailed.resource_summary);
+
+        let infer = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "infer",
+            "2+2=",
+            "--metal-working-set-limit-mib",
+            "2048",
+            "--resource-summary",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(infer),
+        } = infer.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(infer.metal_working_set_limit_mib, Some(2048));
+        assert!(infer.resource_summary);
     }
 
     #[test]

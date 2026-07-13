@@ -268,7 +268,16 @@ Baseline reviewed on 2026-07-11:
   reusable.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
-  sizes on failure.
+  sizes on failure. The target runtime also owns a `MetalResourceLedger` beside the reusable pool.
+  It accounts for resident dense mappings, recurrent state, active general buffers, idle pooled
+  buffers, transient expert staging, and in-flight commands, and samples Metal's
+  `currentAllocatedSize` at token boundaries. The default fail-safe reserves 10% of
+  `recommendedMaxWorkingSetSize` (at least 1 GiB, capped at half the recommendation on small
+  devices); hidden harness `infer`/`bench` callers may lower, but not raise, that limit with an
+  explicit CLI argument. Idle pooled buffers are drained and the device is resampled before a
+  structured resource-limit abort. Successful token boundaries require zero active transient and
+  in-flight ownership. Detailed ledger snapshots are opt-in harness output; production logging is
+  limited to pressure recovery and abort diagnostics rather than per-buffer or per-token messages.
 - `MetalResidentProjectionBatchBuilder` now owns the Q4/BF16/F16/F32 resident projection batch
   used by full-attention CMD1 and deferred state. `weights.rs` resolves one
   `ResidentMmapMatvecProjection` from manifest dtype/quantization metadata; CPU or GPU input

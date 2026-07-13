@@ -1,6 +1,6 @@
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::collections::{BTreeMap, HashMap};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CStr, CString, c_char, c_void};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::types::FlashMoeMetalResourceSnapshot;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -219,6 +221,349 @@ impl MetalLinearAttentionLayerState {
 pub(crate) const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const METAL_WORKING_SET_HEADROOM_PERCENT: usize = 10;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const METAL_MINIMUM_WORKING_SET_HEADROOM_BYTES: usize = 1024 * 1024 * 1024;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalTrackedBufferClass {
+    ActiveGeneral,
+    Pooled,
+    TransientExpert,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+struct MetalTrackedBuffer {
+    len: usize,
+    class: MetalTrackedBufferClass,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct MetalResourceCounter {
+    count: usize,
+    bytes: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalResourceCounter {
+    fn add(&mut self, bytes: usize) {
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn remove(&mut self, bytes: usize) {
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalResourceLedgerState {
+    buffers: HashMap<usize, MetalTrackedBuffer>,
+    active_general: MetalResourceCounter,
+    pooled: MetalResourceCounter,
+    transient_expert: MetalResourceCounter,
+    resident_dense_bytes: usize,
+    recurrent_state_bytes: usize,
+    ledger_high_water_bytes: usize,
+    recommended_working_set_bytes: usize,
+    working_set_limit_bytes: usize,
+    current_allocated_bytes: usize,
+    unobserved_allocated_bytes: usize,
+    driver_high_water_bytes: usize,
+    in_flight_commands: usize,
+    command_high_water: usize,
+    token_boundaries: usize,
+    pressure_recoveries: usize,
+    resource_limit_aborts: usize,
+    buffer_allocations: usize,
+    buffer_reuses: usize,
+    buffer_recycles: usize,
+    buffer_releases: usize,
+    phase_cleanup_calls: usize,
+    phase_cleanup_buffers: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalResourceLedgerState {
+    fn new(recommended_working_set_bytes: usize, current_allocated_bytes: usize) -> Self {
+        Self {
+            buffers: HashMap::new(),
+            active_general: MetalResourceCounter::default(),
+            pooled: MetalResourceCounter::default(),
+            transient_expert: MetalResourceCounter::default(),
+            resident_dense_bytes: 0,
+            recurrent_state_bytes: 0,
+            ledger_high_water_bytes: 0,
+            recommended_working_set_bytes,
+            working_set_limit_bytes: default_metal_working_set_limit(recommended_working_set_bytes),
+            current_allocated_bytes,
+            unobserved_allocated_bytes: 0,
+            driver_high_water_bytes: current_allocated_bytes,
+            in_flight_commands: 0,
+            command_high_water: 0,
+            token_boundaries: 0,
+            pressure_recoveries: 0,
+            resource_limit_aborts: 0,
+            buffer_allocations: 0,
+            buffer_reuses: 0,
+            buffer_recycles: 0,
+            buffer_releases: 0,
+            phase_cleanup_calls: 0,
+            phase_cleanup_buffers: 0,
+        }
+    }
+
+    fn ledger_live_bytes(&self) -> usize {
+        self.resident_dense_bytes
+            .saturating_add(self.recurrent_state_bytes)
+            .saturating_add(self.active_general.bytes)
+            .saturating_add(self.pooled.bytes)
+            .saturating_add(self.transient_expert.bytes)
+    }
+
+    fn update_ledger_high_water(&mut self) {
+        self.ledger_high_water_bytes = self.ledger_high_water_bytes.max(self.ledger_live_bytes());
+    }
+
+    fn counter_mut(&mut self, class: MetalTrackedBufferClass) -> &mut MetalResourceCounter {
+        match class {
+            MetalTrackedBufferClass::ActiveGeneral => &mut self.active_general,
+            MetalTrackedBufferClass::Pooled => &mut self.pooled,
+            MetalTrackedBufferClass::TransientExpert => &mut self.transient_expert,
+        }
+    }
+
+    fn register_buffer(&mut self, id: usize, len: usize, class: MetalTrackedBufferClass) {
+        debug_assert!(!self.buffers.contains_key(&id));
+        if let Some(previous) = self.buffers.insert(id, MetalTrackedBuffer { len, class }) {
+            self.counter_mut(previous.class).remove(previous.len);
+        }
+        self.counter_mut(class).add(len);
+        self.buffer_allocations = self.buffer_allocations.saturating_add(1);
+        self.update_ledger_high_water();
+    }
+
+    fn transition_buffer(&mut self, id: usize, class: MetalTrackedBufferClass) {
+        let Some(previous) = self.buffers.get(&id).copied() else {
+            debug_assert!(false, "untracked Metal buffer transition: {id:#x}");
+            return;
+        };
+        if previous.class == class {
+            return;
+        }
+        self.counter_mut(previous.class).remove(previous.len);
+        self.counter_mut(class).add(previous.len);
+        if previous.class == MetalTrackedBufferClass::Pooled {
+            self.buffer_reuses = self.buffer_reuses.saturating_add(1);
+        }
+        if class == MetalTrackedBufferClass::Pooled {
+            self.buffer_recycles = self.buffer_recycles.saturating_add(1);
+        }
+        if let Some(buffer) = self.buffers.get_mut(&id) {
+            buffer.class = class;
+        }
+        self.update_ledger_high_water();
+    }
+
+    fn release_buffer(&mut self, id: usize) {
+        let Some(previous) = self.buffers.remove(&id) else {
+            debug_assert!(false, "untracked Metal buffer release: {id:#x}");
+            return;
+        };
+        self.counter_mut(previous.class).remove(previous.len);
+        self.buffer_releases = self.buffer_releases.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> FlashMoeMetalResourceSnapshot {
+        FlashMoeMetalResourceSnapshot {
+            recommended_working_set_bytes: self.recommended_working_set_bytes,
+            working_set_limit_bytes: self.working_set_limit_bytes,
+            current_allocated_bytes: self.current_allocated_bytes,
+            driver_high_water_bytes: self.driver_high_water_bytes,
+            ledger_live_bytes: self.ledger_live_bytes(),
+            ledger_high_water_bytes: self.ledger_high_water_bytes,
+            resident_dense_bytes: self.resident_dense_bytes,
+            recurrent_state_bytes: self.recurrent_state_bytes,
+            active_general_buffers: self.active_general.count,
+            active_general_bytes: self.active_general.bytes,
+            pooled_buffers: self.pooled.count,
+            pooled_bytes: self.pooled.bytes,
+            transient_expert_buffers: self.transient_expert.count,
+            transient_expert_bytes: self.transient_expert.bytes,
+            in_flight_commands: self.in_flight_commands,
+            command_high_water: self.command_high_water,
+            token_boundaries: self.token_boundaries,
+            pressure_recoveries: self.pressure_recoveries,
+            resource_limit_aborts: self.resource_limit_aborts,
+            buffer_allocations: self.buffer_allocations,
+            buffer_reuses: self.buffer_reuses,
+            buffer_recycles: self.buffer_recycles,
+            buffer_releases: self.buffer_releases,
+            phase_cleanup_calls: self.phase_cleanup_calls,
+            phase_cleanup_buffers: self.phase_cleanup_buffers,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn default_metal_working_set_limit(recommended: usize) -> usize {
+    if recommended == 0 {
+        return usize::MAX;
+    }
+    let percent_headroom = recommended / METAL_WORKING_SET_HEADROOM_PERCENT;
+    let headroom = percent_headroom
+        .max(METAL_MINIMUM_WORKING_SET_HEADROOM_BYTES)
+        .min(recommended / 2);
+    recommended.saturating_sub(headroom)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalResourceLedger {
+    state: Mutex<MetalResourceLedgerState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for MetalResourceLedger {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MetalResourceLedgerState::new(0, 0)),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalResourceLedger {
+    unsafe fn from_device(device: MetalObjcId) -> Self {
+        unsafe {
+            Self {
+                state: Mutex::new(MetalResourceLedgerState::new(
+                    msg_send_usize0(device, sel("recommendedMaxWorkingSetSize")),
+                    msg_send_usize0(device, sel("currentAllocatedSize")),
+                )),
+            }
+        }
+    }
+
+    fn register_buffer(&self, id: MetalObjcId, len: usize, class: MetalTrackedBufferClass) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.register_buffer(id as usize, len, class);
+        state.unobserved_allocated_bytes = state.unobserved_allocated_bytes.saturating_add(len);
+    }
+
+    fn transition_buffer(&self, id: MetalObjcId, class: MetalTrackedBufferClass) {
+        self.state
+            .lock()
+            .expect("Metal resource ledger poisoned")
+            .transition_buffer(id as usize, class);
+    }
+
+    fn release_buffer(&self, id: MetalObjcId) {
+        self.state
+            .lock()
+            .expect("Metal resource ledger poisoned")
+            .release_buffer(id as usize);
+    }
+
+    fn record_resident_resources(&self, dense_bytes: usize, recurrent_bytes: usize) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.resident_dense_bytes = dense_bytes;
+        state.recurrent_state_bytes = recurrent_bytes;
+        state.update_ledger_high_water();
+    }
+
+    fn set_working_set_limit_bytes(&self, requested: usize) -> anyhow::Result<()> {
+        if requested == 0 {
+            anyhow::bail!("FlashMoe Metal working-set limit must be greater than zero");
+        }
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        let default_limit = default_metal_working_set_limit(state.recommended_working_set_bytes);
+        state.working_set_limit_bytes = requested.min(default_limit);
+        Ok(())
+    }
+
+    unsafe fn sample_device(&self, device: MetalObjcId, token_boundary: bool) -> usize {
+        unsafe {
+            let current = msg_send_usize0(device, sel("currentAllocatedSize"));
+            let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+            let previous_high_water = state.driver_high_water_bytes;
+            state.current_allocated_bytes = current;
+            state.unobserved_allocated_bytes = 0;
+            state.driver_high_water_bytes = state.driver_high_water_bytes.max(current);
+            if token_boundary {
+                state.token_boundaries = state.token_boundaries.saturating_add(1);
+            }
+            let new_high_water = current > previous_high_water;
+            let high_water = state.driver_high_water_bytes;
+            drop(state);
+            if new_high_water {
+                tracing::debug!(
+                    target: "flashmoe::resources",
+                    current_allocated_bytes = current,
+                    driver_high_water_bytes = high_water,
+                    token_boundary,
+                    "FlashMoe Metal driver working-set high-water changed"
+                );
+            }
+            current
+        }
+    }
+
+    fn allocation_would_exceed_limit(&self, current: usize, requested: usize) -> bool {
+        let state = self.state.lock().expect("Metal resource ledger poisoned");
+        current.saturating_add(requested) > state.working_set_limit_bytes
+    }
+
+    fn estimated_allocation_would_exceed_limit(&self, requested: usize) -> bool {
+        let state = self.state.lock().expect("Metal resource ledger poisoned");
+        state
+            .current_allocated_bytes
+            .saturating_add(state.unobserved_allocated_bytes)
+            .saturating_add(requested)
+            > state.working_set_limit_bytes
+    }
+
+    fn record_pressure_recovery(&self) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.pressure_recoveries = state.pressure_recoveries.saturating_add(1);
+    }
+
+    fn record_resource_limit_abort(&self) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.resource_limit_aborts = state.resource_limit_aborts.saturating_add(1);
+    }
+
+    fn record_phase_cleanup(&self, buffers: usize) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.phase_cleanup_calls = state.phase_cleanup_calls.saturating_add(1);
+        state.phase_cleanup_buffers = state.phase_cleanup_buffers.saturating_add(buffers);
+    }
+
+    fn command_started(&self) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.in_flight_commands = state.in_flight_commands.saturating_add(1);
+        state.command_high_water = state.command_high_water.max(state.in_flight_commands);
+    }
+
+    fn command_finished(&self) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.in_flight_commands = state.in_flight_commands.saturating_sub(1);
+    }
+
+    fn snapshot(&self) -> FlashMoeMetalResourceSnapshot {
+        self.state
+            .lock()
+            .expect("Metal resource ledger poisoned")
+            .snapshot()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalReusableBuffer {
     pub(crate) id: MetalObjcId,
@@ -252,42 +597,63 @@ impl MetalReusableBuffer {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MetalBufferPool {
     reusable: Mutex<Vec<MetalReusableBuffer>>,
+    resources: Arc<MetalResourceLedger>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for MetalBufferPool {
+    fn default() -> Self {
+        Self::new(Arc::new(MetalResourceLedger::default()))
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalBufferPool {
+    fn new(resources: Arc<MetalResourceLedger>) -> Self {
+        Self {
+            reusable: Mutex::new(Vec::new()),
+            resources,
+        }
+    }
+
+    fn resources(&self) -> &Arc<MetalResourceLedger> {
+        &self.resources
+    }
+
     pub(crate) unsafe fn buffer_with_len(
         &self,
         device: MetalObjcId,
         len: usize,
     ) -> anyhow::Result<MetalObjcId> {
+        unsafe { self.buffer_with_len_class(device, len, MetalTrackedBufferClass::ActiveGeneral) }
+    }
+
+    unsafe fn buffer_with_len_class(
+        &self,
+        device: MetalObjcId,
+        len: usize,
+        class: MetalTrackedBufferClass,
+    ) -> anyhow::Result<MetalObjcId> {
         unsafe {
             {
                 let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
                 if let Some(index) = best_fit_reusable_buffer_index(&reusable, len) {
-                    return Ok(reusable.swap_remove(index).id);
+                    let buffer = reusable.swap_remove(index);
+                    self.resources.transition_buffer(buffer.id, class);
+                    return Ok(buffer.id);
                 }
             }
+            self.ensure_allocation_capacity(device, len)?;
             let buffer =
                 msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
             if !buffer.is_null() {
+                self.resources.register_buffer(buffer, len, class);
                 return Ok(buffer);
             }
-            let (released_buffers, released_bytes) = {
-                let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-                let released_buffers = reusable.len();
-                let released_bytes = reusable
-                    .iter()
-                    .map(|buffer| buffer.len)
-                    .fold(0usize, usize::saturating_add);
-                for reusable_buffer in reusable.drain(..) {
-                    release(reusable_buffer.id);
-                }
-                (released_buffers, released_bytes)
-            };
+            let (released_buffers, released_bytes) = self.release_idle_buffers();
             let retry = msg_send_id2_usize_u64(device, sel("newBufferWithLength:options:"), len, 0);
             if retry.is_null() {
                 let current_allocated_bytes = msg_send_usize0(device, sel("currentAllocatedSize"));
@@ -303,8 +669,73 @@ impl MetalBufferPool {
                 released_pooled_bytes = released_bytes,
                 "FlashMoe Metal allocation recovered after draining the reusable buffer pool"
             );
+            self.resources.register_buffer(retry, len, class);
             Ok(retry)
         }
+    }
+
+    unsafe fn ensure_allocation_capacity(
+        &self,
+        device: MetalObjcId,
+        requested_bytes: usize,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            if !self
+                .resources
+                .estimated_allocation_would_exceed_limit(requested_bytes)
+            {
+                return Ok(());
+            }
+            let current = self.resources.sample_device(device, false);
+            if !self
+                .resources
+                .allocation_would_exceed_limit(current, requested_bytes)
+            {
+                return Ok(());
+            }
+            let (released_buffers, released_bytes) = self.release_idle_buffers();
+            let after_drain = self.resources.sample_device(device, false);
+            if self
+                .resources
+                .allocation_would_exceed_limit(after_drain, requested_bytes)
+            {
+                self.resources.record_resource_limit_abort();
+                let snapshot = self.resources.snapshot();
+                anyhow::bail!(
+                    "FlashMoe Metal resource limit would be exceeded: requested_bytes={requested_bytes} current_allocated_bytes={after_drain} working_set_limit_bytes={} recommended_working_set_bytes={} released_pooled_buffers={released_buffers} released_pooled_bytes={released_bytes} driver_high_water_bytes={} ledger_live_bytes={}",
+                    snapshot.working_set_limit_bytes,
+                    snapshot.recommended_working_set_bytes,
+                    snapshot.driver_high_water_bytes,
+                    snapshot.ledger_live_bytes,
+                );
+            }
+            self.resources.record_pressure_recovery();
+            tracing::warn!(
+                requested_bytes,
+                current_allocated_bytes = current,
+                current_after_drain_bytes = after_drain,
+                released_pooled_buffers = released_buffers,
+                released_pooled_bytes = released_bytes,
+                "FlashMoe Metal working-set pressure recovered after draining idle buffers"
+            );
+            Ok(())
+        }
+    }
+
+    fn release_idle_buffers(&self) -> (usize, usize) {
+        let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
+        let released_buffers = reusable.len();
+        let released_bytes = reusable
+            .iter()
+            .map(|buffer| buffer.len)
+            .fold(0usize, usize::saturating_add);
+        unsafe {
+            for reusable_buffer in reusable.drain(..) {
+                self.resources.release_buffer(reusable_buffer.id);
+                release(reusable_buffer.id);
+            }
+        }
+        (released_buffers, released_bytes)
     }
 
     pub(crate) unsafe fn buffer_with_bytes(
@@ -326,7 +757,11 @@ impl MetalBufferPool {
         bytes: &[u8],
     ) -> anyhow::Result<MetalObjcId> {
         unsafe {
-            let buffer = self.buffer_with_len(device, bytes.len())?;
+            let buffer = self.buffer_with_len_class(
+                device,
+                bytes.len(),
+                MetalTrackedBufferClass::TransientExpert,
+            )?;
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
             Ok(buffer)
@@ -373,17 +808,23 @@ impl MetalBufferPool {
             let len = msg_send_usize0(buffer, sel("length"));
             let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
             if reusable.len() < METAL_REUSABLE_BUFFER_POOL_LIMIT {
+                self.resources
+                    .transition_buffer(buffer, MetalTrackedBufferClass::Pooled);
                 reusable.push(MetalReusableBuffer::new(buffer, len));
                 return;
             }
             let Some(index) = reusable_buffer_replacement_index(&reusable, len) else {
                 drop(reusable);
+                self.resources.release_buffer(buffer);
                 release(buffer);
                 return;
             };
+            self.resources
+                .transition_buffer(buffer, MetalTrackedBufferClass::Pooled);
             let evicted =
                 std::mem::replace(&mut reusable[index], MetalReusableBuffer::new(buffer, len));
             drop(reusable);
+            self.resources.release_buffer(evicted.id);
             release(evicted.id);
         }
     }
@@ -392,6 +833,7 @@ impl MetalBufferPool {
         unsafe {
             for buffer in buffers.iter().copied() {
                 if release_only {
+                    self.resources.release_buffer(buffer);
                     release(buffer);
                 } else {
                     self.recycle(buffer);
@@ -405,11 +847,14 @@ impl MetalBufferPool {
         buffers: Vec<MetalPhaseBuffer>,
         release_only: bool,
     ) {
+        self.resources.record_phase_cleanup(buffers.len());
         unsafe {
             for buffer in buffers {
                 if buffer.class == MetalPhaseBufferClass::TransientExpert {
+                    self.resources.release_buffer(buffer.id);
                     purge_and_release_metal_buffer(buffer.id);
                 } else if release_only {
+                    self.resources.release_buffer(buffer.id);
                     release(buffer.id);
                 } else {
                     self.recycle(buffer.id);
@@ -422,6 +867,7 @@ impl MetalBufferPool {
         let reusable = self.reusable.get_mut().expect("metal buffer pool poisoned");
         unsafe {
             for buffer in reusable.drain(..) {
+                self.resources.release_buffer(buffer.id);
                 release(buffer.id);
             }
         }
@@ -849,16 +1295,39 @@ impl Drop for OwnedMetalObject {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+struct MetalCommandLease {
+    resources: Arc<MetalResourceLedger>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalCommandLease {
+    fn new(resources: Arc<MetalResourceLedger>) -> Self {
+        resources.command_started();
+        Self { resources }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalCommandLease {
+    fn drop(&mut self) {
+        self.resources.command_finished();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 struct MetalCommandEncoding {
     command_buffer: MetalObjcId,
     encoder: MetalObjcId,
     ended: bool,
+    command_lease: Option<MetalCommandLease>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalCommandEncoding {
     unsafe fn new(
         command_queue: MetalObjcId,
+        resources: Arc<MetalResourceLedger>,
         command_buffer_error: &'static str,
         encoder_error: &'static str,
     ) -> anyhow::Result<Self> {
@@ -884,6 +1353,7 @@ impl MetalCommandEncoding {
                 command_buffer,
                 encoder,
                 ended: false,
+                command_lease: Some(MetalCommandLease::new(resources)),
             })
         }
     }
@@ -905,14 +1375,18 @@ impl MetalCommandEncoding {
         }
     }
 
-    unsafe fn into_command_buffer(mut self) -> MetalObjcId {
+    unsafe fn into_command_buffer(mut self) -> (MetalObjcId, MetalCommandLease) {
         unsafe {
             self.end_encoding();
             release(self.encoder);
             self.encoder = ptr::null_mut();
             let command_buffer = self.command_buffer;
             self.command_buffer = ptr::null_mut();
-            command_buffer
+            let command_lease = self
+                .command_lease
+                .take()
+                .expect("Metal command encoding is missing its resource lease");
+            (command_buffer, command_lease)
         }
     }
 }
@@ -1047,6 +1521,7 @@ pub(crate) struct MetalExecutionContext {
     dense_weights: Option<MetalDenseWeights>,
     linear_attention_state: Mutex<MetalLinearAttentionStateCache>,
     buffers: Arc<MetalBufferPool>,
+    resources: Arc<MetalResourceLedger>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1065,6 +1540,7 @@ impl Drop for MetalExecutionContext {
             if let Ok(linear_state) = self.linear_attention_state.get_mut() {
                 release_linear_attention_state(linear_state);
             }
+            self.resources.record_resident_resources(0, 0);
         }
     }
 }
@@ -1077,14 +1553,23 @@ impl MetalExecutionContext {
         linear_layouts: &[Option<LinearAttentionLayout>],
     ) -> anyhow::Result<Self> {
         let runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
+        let resources = Arc::new(unsafe { MetalResourceLedger::from_device(runtime.device) });
         let dense_weights = wrap_dense_mmap_as_metal_buffer(runtime.device, dense_mmap, dense_len)?;
         let linear_attention_state =
             allocate_linear_attention_state(runtime.device, linear_layouts)?;
+        resources.record_resident_resources(
+            dense_weights.as_ref().map_or(0, |weights| weights.len),
+            linear_attention_state_bytes(&linear_attention_state),
+        );
+        unsafe {
+            resources.sample_device(runtime.device, false);
+        }
         Ok(Self {
             runtime,
             dense_weights,
             linear_attention_state: Mutex::new(linear_attention_state),
-            buffers: Arc::new(MetalBufferPool::default()),
+            buffers: Arc::new(MetalBufferPool::new(Arc::clone(&resources))),
+            resources,
         })
     }
 
@@ -1098,6 +1583,70 @@ impl MetalExecutionContext {
 
     pub(crate) fn buffers(&self) -> &Arc<MetalBufferPool> {
         &self.buffers
+    }
+
+    pub(crate) fn set_working_set_limit_bytes(&self, limit: usize) -> anyhow::Result<()> {
+        self.resources.set_working_set_limit_bytes(limit)
+    }
+
+    pub(crate) fn resource_snapshot(&self) -> FlashMoeMetalResourceSnapshot {
+        unsafe {
+            self.resources.sample_device(self.runtime.device, false);
+        }
+        self.resources.snapshot()
+    }
+
+    pub(crate) fn finish_token_boundary(&self, position: usize) -> anyhow::Result<()> {
+        let current = unsafe { self.resources.sample_device(self.runtime.device, true) };
+        let mut snapshot = self.resources.snapshot();
+        if snapshot.active_general_buffers != 0
+            || snapshot.transient_expert_buffers != 0
+            || snapshot.in_flight_commands != 0
+        {
+            anyhow::bail!(
+                "FlashMoe Metal resource ownership imbalance at token boundary: position={position} active_general_buffers={} active_general_bytes={} pooled_buffers={} pooled_bytes={} transient_expert_buffers={} transient_expert_bytes={} in_flight_commands={} buffer_allocations={} buffer_reuses={} buffer_recycles={} buffer_releases={} phase_cleanup_calls={} phase_cleanup_buffers={}",
+                snapshot.active_general_buffers,
+                snapshot.active_general_bytes,
+                snapshot.pooled_buffers,
+                snapshot.pooled_bytes,
+                snapshot.transient_expert_buffers,
+                snapshot.transient_expert_bytes,
+                snapshot.in_flight_commands,
+                snapshot.buffer_allocations,
+                snapshot.buffer_reuses,
+                snapshot.buffer_recycles,
+                snapshot.buffer_releases,
+                snapshot.phase_cleanup_calls,
+                snapshot.phase_cleanup_buffers,
+            );
+        }
+        if current <= snapshot.working_set_limit_bytes {
+            return Ok(());
+        }
+
+        let (released_pooled_buffers, released_pooled_bytes) = self.buffers.release_idle_buffers();
+        let after_drain = unsafe { self.resources.sample_device(self.runtime.device, false) };
+        snapshot = self.resources.snapshot();
+        if after_drain > snapshot.working_set_limit_bytes {
+            self.resources.record_resource_limit_abort();
+            anyhow::bail!(
+                "FlashMoe Metal resource limit exceeded at token boundary: position={position} current_allocated_bytes={after_drain} working_set_limit_bytes={} recommended_working_set_bytes={} driver_high_water_bytes={} released_pooled_buffers={released_pooled_buffers} released_pooled_bytes={released_pooled_bytes} ledger_live_bytes={}",
+                snapshot.working_set_limit_bytes,
+                snapshot.recommended_working_set_bytes,
+                snapshot.driver_high_water_bytes,
+                snapshot.ledger_live_bytes,
+            );
+        }
+        self.resources.record_pressure_recovery();
+        tracing::warn!(
+            position,
+            current_allocated_bytes = current,
+            current_after_drain_bytes = after_drain,
+            released_pooled_buffers,
+            released_pooled_bytes,
+            "FlashMoe Metal token boundary recovered from working-set pressure"
+        );
+        Ok(())
     }
 
     pub(crate) fn has_resident_dense_weights(&self) -> bool {
@@ -1443,6 +1992,7 @@ impl<'a> MetalResidentTopKBuilder<'a> {
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE resident topK command buffer",
                 "failed to create Flash-MoE resident topK compute encoder",
             ) {
@@ -1601,6 +2151,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE CMD2 post-attention command buffer",
                 "failed to create Flash-MoE CMD2 post-attention compute encoder",
             ) {
@@ -1700,13 +2251,16 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
 }
 
 #[derive(Debug)]
+#[must_use = "scheduled Metal CMD3 submissions must be waited or explicitly finished"]
 pub(crate) struct MetalScheduledCmd3Submission {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     buffers: Arc<MetalBufferPool>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    command_buffer: MetalObjcId,
+    command_buffer: Option<MetalObjcId>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    phase_buffers: Vec<MetalPhaseBuffer>,
+    _command_lease: MetalCommandLease,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    phase_buffers: Option<Vec<MetalPhaseBuffer>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     _expert_slots: Arc<[Arc<ScheduledExpertSlot>]>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1733,31 +2287,38 @@ impl MetalScheduledCmd3Submission {
         MetalStateBuffer::new(self.output.hidden_buffer, self.output.output_state.hidden())
     }
 
-    pub(crate) fn finish_without_readback(self) -> anyhow::Result<()> {
+    pub(crate) fn finish_without_readback(mut self) -> anyhow::Result<()> {
         objc2::rc::autoreleasepool(|_| unsafe {
-            let wait = wait_for_metal_command_buffer(self.command_buffer, &self.context);
-            release(self.command_buffer);
+            let command_buffer = self
+                .command_buffer
+                .take()
+                .context("FlashMoe Metal CMD3 submission has already been finished")?;
+            let wait = wait_for_metal_command_buffer(command_buffer, &self.context);
+            release(command_buffer);
+            let phase_buffers = self.phase_buffers.take().unwrap_or_default();
             match wait {
                 Ok(()) => {
-                    self.buffers
-                        .recycle_or_release_phase(self.phase_buffers, false);
+                    self.buffers.recycle_or_release_phase(phase_buffers, false);
                     Ok(())
                 }
                 Err(error) => {
-                    self.buffers
-                        .recycle_or_release_phase(self.phase_buffers, true);
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
                     Err(error.into())
                 }
             }
         })
     }
 
-    pub(crate) fn wait(self) -> anyhow::Result<FlashMoeExpertPhaseOutput> {
+    pub(crate) fn wait(mut self) -> anyhow::Result<FlashMoeExpertPhaseOutput> {
         objc2::rc::autoreleasepool(|_| unsafe {
-            if let Err(error) = wait_for_metal_command_buffer(self.command_buffer, &self.context) {
-                release(self.command_buffer);
+            let command_buffer = self
+                .command_buffer
+                .take()
+                .context("FlashMoe Metal CMD3 submission has already been waited")?;
+            if let Err(error) = wait_for_metal_command_buffer(command_buffer, &self.context) {
+                release(command_buffer);
                 self.buffers
-                    .recycle_or_release_phase(self.phase_buffers, true);
+                    .recycle_or_release_phase(self.phase_buffers.take().unwrap_or_default(), true);
                 return Err(error.into());
             }
             let hidden = read_f32_buffer(
@@ -1769,12 +2330,41 @@ impl MetalScheduledCmd3Submission {
                 .next_normed_buffer
                 .zip(self.output.output_state.next_normed())
                 .map(|(buffer, state)| read_f32_buffer(buffer, state.len()));
-            release(self.command_buffer);
+            release(command_buffer);
             self.buffers
-                .recycle_or_release_phase(self.phase_buffers, false);
+                .recycle_or_release_phase(self.phase_buffers.take().unwrap_or_default(), false);
             self.scheduled_output
                 .validate_expert_phase_output(FlashMoeExpertPhaseOutput::new(hidden, next_normed))
         })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalScheduledCmd3Submission {
+    fn drop(&mut self) {
+        let Some(command_buffer) = self.command_buffer.take() else {
+            return;
+        };
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let wait = wait_for_metal_command_buffer(command_buffer, &self.context);
+            release(command_buffer);
+            self.buffers.recycle_or_release_phase(
+                self.phase_buffers.take().unwrap_or_default(),
+                wait.is_err(),
+            );
+            if let Err(error) = wait {
+                tracing::warn!(
+                    target: "flashmoe::resources",
+                    error = %error,
+                    "FlashMoe cleaned up an unfinished Metal CMD3 submission after a command failure"
+                );
+            } else {
+                tracing::warn!(
+                    target: "flashmoe::resources",
+                    "FlashMoe cleaned up a Metal CMD3 submission that was dropped without an explicit wait"
+                );
+            }
+        });
     }
 }
 
@@ -1951,6 +2541,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.runtime.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE scheduled CMD3 command buffer",
                 "failed to create Flash-MoE scheduled CMD3 compute encoder",
             ) {
@@ -2103,12 +2694,13 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 .collect::<Vec<_>>()
                 .join(",");
             let context = command_plan.command_context(expert_ids);
-            let command_buffer = encoding.into_command_buffer();
+            let (command_buffer, command_lease) = encoding.into_command_buffer();
             commit_metal_command_buffer(command_buffer, &context);
             Ok(MetalScheduledCmd3Submission {
                 buffers: Arc::clone(&self.buffers),
-                command_buffer,
-                phase_buffers,
+                command_buffer: Some(command_buffer),
+                _command_lease: command_lease,
+                phase_buffers: Some(phase_buffers),
                 _expert_slots: experts,
                 output,
                 context,
@@ -2978,6 +3570,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             }
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE fused linear-attention command buffer",
                 "failed to create Flash-MoE fused linear-attention compute encoder",
             ) {
@@ -3462,6 +4055,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE dense q4 mmap batch Metal command buffer",
                 "failed to create Flash-MoE dense q4 mmap batch Metal compute encoder",
             ) {
@@ -3593,6 +4187,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
+                Arc::clone(self.buffers.resources()),
                 "failed to create Flash-MoE dense q4 mmap batch Metal command buffer",
                 "failed to create Flash-MoE dense q4 mmap batch Metal compute encoder",
             ) {
@@ -4970,6 +5565,24 @@ unsafe fn release_linear_attention_state(state: &mut MetalLinearAttentionStateCa
             release_linear_attention_layer(&layer);
         }
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn linear_attention_state_bytes(state: &MetalLinearAttentionStateCache) -> usize {
+    state
+        .layers
+        .iter()
+        .flatten()
+        .map(|layer| {
+            layer
+                .conv_state_len
+                .saturating_add(layer.ssm_state_len)
+                .saturating_add(layer.conv_dim)
+                .saturating_add(layer.total_value_width)
+                .saturating_add(layer.num_value_heads.saturating_mul(2))
+                .saturating_mul(std::mem::size_of::<f32>())
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7165,6 +7778,102 @@ mod tests {
     use super::super::weights::SharedExpertPhaseShape;
     use super::*;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_working_set_limit_preserves_documented_headroom() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(default_metal_working_set_limit(10 * gib), 9 * gib);
+        assert_eq!(default_metal_working_set_limit(4 * gib), 3 * gib);
+        assert_eq!(default_metal_working_set_limit(gib), gib / 2);
+        assert_eq!(default_metal_working_set_limit(0), usize::MAX);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_resource_ledger_balances_buffer_ownership_transitions() {
+        let gib = 1024 * 1024 * 1024;
+        let ledger = MetalResourceLedger {
+            state: Mutex::new(MetalResourceLedgerState::new(10 * gib, 2 * gib)),
+        };
+        ledger.record_resident_resources(100, 200);
+        ledger.register_buffer(
+            0x1000usize as MetalObjcId,
+            64,
+            MetalTrackedBufferClass::ActiveGeneral,
+        );
+        ledger.register_buffer(
+            0x2000usize as MetalObjcId,
+            128,
+            MetalTrackedBufferClass::TransientExpert,
+        );
+
+        let active = ledger.snapshot();
+        assert_eq!(active.active_general_buffers, 1);
+        assert_eq!(active.transient_expert_buffers, 1);
+        assert_eq!(active.ledger_live_bytes, 492);
+        assert_eq!(active.driver_high_water_bytes, 2 * gib);
+
+        ledger.transition_buffer(0x1000usize as MetalObjcId, MetalTrackedBufferClass::Pooled);
+        ledger.release_buffer(0x2000usize as MetalObjcId);
+        let pooled = ledger.snapshot();
+        assert_eq!(pooled.active_general_buffers, 0);
+        assert_eq!(pooled.transient_expert_buffers, 0);
+        assert_eq!(pooled.pooled_buffers, 1);
+        assert_eq!(pooled.ledger_live_bytes, 364);
+
+        ledger.release_buffer(0x1000usize as MetalObjcId);
+        ledger.record_resident_resources(0, 0);
+        let released = ledger.snapshot();
+        assert_eq!(released.ledger_live_bytes, 0);
+        assert_eq!(released.pooled_buffers, 0);
+        assert_eq!(released.ledger_high_water_bytes, 492);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_resource_ledger_balances_injected_error_cleanup_and_commands() {
+        let resources = Arc::new(MetalResourceLedger::default());
+        resources.register_buffer(
+            0x1000usize as MetalObjcId,
+            16,
+            MetalTrackedBufferClass::ActiveGeneral,
+        );
+        resources.register_buffer(
+            0x2000usize as MetalObjcId,
+            32,
+            MetalTrackedBufferClass::ActiveGeneral,
+        );
+        let first = MetalCommandLease::new(Arc::clone(&resources));
+        let second = MetalCommandLease::new(Arc::clone(&resources));
+        assert_eq!(resources.snapshot().in_flight_commands, 2);
+        assert_eq!(resources.snapshot().command_high_water, 2);
+
+        resources.release_buffer(0x1000usize as MetalObjcId);
+        resources.release_buffer(0x2000usize as MetalObjcId);
+        drop(first);
+        drop(second);
+        let cleaned = resources.snapshot();
+        assert_eq!(cleaned.active_general_buffers, 0);
+        assert_eq!(cleaned.in_flight_commands, 0);
+        assert_eq!(cleaned.ledger_live_bytes, 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn explicit_metal_limit_can_only_lower_default_policy() {
+        let gib = 1024 * 1024 * 1024;
+        let ledger = MetalResourceLedger {
+            state: Mutex::new(MetalResourceLedgerState::new(10 * gib, 2 * gib)),
+        };
+        ledger.set_working_set_limit_bytes(6 * gib).unwrap();
+        assert_eq!(ledger.snapshot().working_set_limit_bytes, 6 * gib);
+        assert!(ledger.allocation_would_exceed_limit(6 * gib - 1, 2));
+
+        ledger.set_working_set_limit_bytes(20 * gib).unwrap();
+        assert_eq!(ledger.snapshot().working_set_limit_bytes, 9 * gib);
+        assert!(ledger.set_working_set_limit_bytes(0).is_err());
+    }
+
     #[test]
     fn command_context_label_includes_actionable_details() {
         let context = MetalCommandContext::new("deferred_expert_phase")
@@ -8632,11 +9341,12 @@ mod tests {
             };
             let runtime =
                 MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new()).unwrap();
+            let resources = Arc::new(MetalResourceLedger::default());
             let baseline = msg_send_usize0(runtime.device, sel("currentAllocatedSize"));
             let baseline_footprint = physical_footprint();
 
             for _ in 0..16 {
-                let (command_buffer, buffers) = objc2::rc::autoreleasepool(|_| {
+                let (command_buffer, command_lease, buffers) = objc2::rc::autoreleasepool(|_| {
                     let buffers = (0..30)
                         .map(|_| {
                             OwnedMetalObject::new(msg_send_id2_usize_u64(
@@ -8657,6 +9367,7 @@ mod tests {
                     }
                     let mut encoding = MetalCommandEncoding::new(
                         runtime.command_queue,
+                        Arc::clone(&resources),
                         "test command buffer allocation failed",
                         "test command encoder allocation failed",
                     )
@@ -8675,12 +9386,12 @@ mod tests {
                     }
                     dispatch_threads(encoding.encoder(), 1);
                     encoding.end_encoding();
-                    let command_buffer = encoding.into_command_buffer();
+                    let (command_buffer, command_lease) = encoding.into_command_buffer();
                     commit_metal_command_buffer(
                         command_buffer,
                         &MetalCommandContext::new("nested autorelease test"),
                     );
-                    (command_buffer, buffers)
+                    (command_buffer, command_lease, buffers)
                 });
                 objc2::rc::autoreleasepool(|_| {
                     wait_for_metal_command_buffer(
@@ -8689,6 +9400,7 @@ mod tests {
                     )
                     .unwrap();
                     release(command_buffer);
+                    drop(command_lease);
                     for buffer in buffers {
                         purge_and_release_metal_buffer(buffer.into_raw());
                     }

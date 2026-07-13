@@ -264,6 +264,35 @@ pub struct TimedGenerationOutput {
     pub timing: FlashMoeGenerationTiming,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlashMoeMetalResourceSnapshot {
+    pub recommended_working_set_bytes: usize,
+    pub working_set_limit_bytes: usize,
+    pub current_allocated_bytes: usize,
+    pub driver_high_water_bytes: usize,
+    pub ledger_live_bytes: usize,
+    pub ledger_high_water_bytes: usize,
+    pub resident_dense_bytes: usize,
+    pub recurrent_state_bytes: usize,
+    pub active_general_buffers: usize,
+    pub active_general_bytes: usize,
+    pub pooled_buffers: usize,
+    pub pooled_bytes: usize,
+    pub transient_expert_buffers: usize,
+    pub transient_expert_bytes: usize,
+    pub in_flight_commands: usize,
+    pub command_high_water: usize,
+    pub token_boundaries: usize,
+    pub pressure_recoveries: usize,
+    pub resource_limit_aborts: usize,
+    pub buffer_allocations: usize,
+    pub buffer_reuses: usize,
+    pub buffer_recycles: usize,
+    pub buffer_releases: usize,
+    pub phase_cleanup_calls: usize,
+    pub phase_cleanup_buffers: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlashMoeGenerationTiming {
     pub model: String,

@@ -40,4 +40,8 @@ The journal is an initial audit aid, not a substitute for review. A supervising 
    succeeds.
 
 FlashMoe inference, benchmark, and cache-clean utilities also live beneath the hidden harness, for
-example `pb harness infer ...`.
+example `pb harness infer ...`. `infer` and `bench` accept
+`--metal-working-set-limit-mib <MiB>` to lower the device-derived safety limit. The override can
+only make the default policy stricter. `--resource-summary` prints the opt-in JSON resource ledger;
+normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
+resource-limit abort.

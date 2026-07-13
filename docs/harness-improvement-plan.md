@@ -296,7 +296,7 @@ Acceptance:
 | ID | Priority | Depends on | Status | Required proof | Evidence |
 | --- | --- | --- | --- | --- | --- |
 | H0 | P0 | — | complete | Scripted fixture corpus and baseline metrics | `test: add deterministic harness control fixtures`; 7 fixtures; 705 Rust tests passed, 7 ignored |
-| R0 | P0 | H0 | in progress | Ledger tests, constrained abort, release soak, throughput comparison | Before-state: `docs/benchmarks/harness-r0-baseline.md`; repeated-prompt run exited 137; isolated median 1.590 tok/s |
+| R0 | P0 | H0 | complete | Ledger tests, constrained abort, release soak, throughput comparison | `fix: bound FlashMoe Metal resources`; `docs/benchmarks/harness-r0-after.md`; 10×32 and 128-token soaks passed; 1.661 tok/s median |
 | H1 | P1 | H0 | proposed | Contract parser, `run_check`, fingerprinted evidence tests | — |
 | H2 | P1 | H1 | proposed | Outcome/event/CLI compatibility tests | — |
 | H3 | P1 | H0 | proposed | Two-run resume and interruption tests | — |
