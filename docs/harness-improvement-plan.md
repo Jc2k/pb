@@ -299,7 +299,7 @@ Acceptance:
 | R0 | P0 | H0 | complete | Ledger tests, constrained abort, release soak, throughput comparison | `fix: bound FlashMoe Metal resources`; `docs/benchmarks/harness-r0-after.md`; 10×32 and 128-token soaks passed; 1.661 tok/s median |
 | H1 | P1 | H0 | complete | Contract parser, `run_check`, fingerprinted evidence tests | `feat: add harness acceptance contracts`; deterministic named-check, stale-evidence, path, review, and timeout tests |
 | H2 | P1 | H1 | complete | Outcome/event/CLI compatibility tests | `fix: distinguish final and verified harness outcomes`; scripted uncontracted, rejected-contract, satisfied-contract, engine-error, CLI-exit, and legacy-event tests |
-| H3 | P1 | H0 | proposed | Two-run resume and interruption tests | — |
+| H3 | P1 | H0 | complete | Two-run resume and interruption tests | `feat: preserve per-run harness journals`; dual event streams, append-only run index, atomic compatibility journal, resume/interruption tests |
 | H4 | P2 | H0, H1, H2 | proposed | Loop-stop and final-grace transcript tests | — |
 | H5 | P2 | R0, H0-H4 | proposed | Deterministic eval report and optional model mode | — |
 | H6 | P3 | H0 | proposed | Bounded stale-patch diagnostic tests | — |

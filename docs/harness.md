@@ -55,10 +55,20 @@ Each run creates a persistent scratch root under the system temporary directory 
 
 ```text
 pb-harness-.../
-├── workspace/    # isolated git repository used by the agent
-├── events.jsonl  # complete typed AgentEvent stream
-└── journal.md    # ranked observations, committed fixes, and review-plan scaffold
+├── workspace/       # isolated git repository used by the agent
+├── events.jsonl     # cumulative compatibility AgentEvent stream
+├── journal.md       # latest-run compatibility view
+├── run-index.jsonl  # append-only started/finished run records
+└── runs/<run-id>/
+    ├── events.jsonl # immutable event stream for this invocation
+    └── journal.md   # final journal, or running recovery journal if interrupted
 ```
+
+The harness allocates the run ID and writes the per-run `running` journal plus a `started` index
+record before model loading. Events are flushed to both streams. Final journals are atomically
+replaced and a `finished` index record captures the structured outcome. Resuming a scratch root
+creates a new run directory and never rewrites a prior run; any partial dual-write failure is
+surfaced instead of reporting verified completion.
 
 The workspace starts on `main` with one empty baseline commit. The agent receives the normal full
 agent runtime, a local command backend rooted in the scratch repository, and the build profile by
