@@ -361,6 +361,17 @@ impl PlanReviewArtifact {
         for challenge in &self.challenges {
             non_empty("plan challenge description", &challenge.description)?;
             validate_evidence(&challenge.evidence)?;
+            validate_references(
+                "plan challenge requirement",
+                &challenge.id,
+                &challenge.requirement_ids,
+                &plan
+                    .artifact
+                    .requirements
+                    .iter()
+                    .map(|requirement| requirement.id.as_str())
+                    .collect(),
+            )?;
         }
         let blocking = self
             .challenges
@@ -376,6 +387,26 @@ impl PlanReviewArtifact {
             _ => {}
         }
         artifact_bytes(self)?;
+        Ok(())
+    }
+
+    pub fn validate_observed_evidence(
+        &self,
+        graph: &WorkspaceGraph,
+        read_paths: &HashSet<String>,
+    ) -> Result<()> {
+        for evidence in self
+            .assessments
+            .iter()
+            .flat_map(|assessment| assessment.evidence.iter())
+            .chain(
+                self.challenges
+                    .iter()
+                    .flat_map(|challenge| challenge.evidence.iter()),
+            )
+        {
+            validate_observed_evidence_reference(evidence, graph, read_paths)?;
+        }
         Ok(())
     }
 }
@@ -578,7 +609,28 @@ fn validate_evidence(evidence: &[EvidenceReference]) -> Result<()> {
         if let Some(path) = &item.path {
             validate_repository_path("evidence path", path)?;
         }
+        if item.line == Some(0) || (item.line.is_some() && item.path.is_none()) {
+            bail!("evidence line must be positive and paired with a repository path");
+        }
         non_empty("evidence description", &item.description)?;
+    }
+    Ok(())
+}
+
+fn validate_observed_evidence_reference(
+    evidence: &EvidenceReference,
+    graph: &WorkspaceGraph,
+    read_paths: &HashSet<String>,
+) -> Result<()> {
+    if let Some(path) = &evidence.path
+        && !read_paths.contains(path)
+    {
+        bail!("review cites repository path '{path}' without reading it in this fresh context");
+    }
+    if let Some(check_id) = &evidence.check_id
+        && !graph.checks.contains_key(check_id)
+    {
+        bail!("review cites unknown workspace check '{check_id}'");
     }
     Ok(())
 }
@@ -765,6 +817,51 @@ mod tests {
         review.validate(&envelope).unwrap();
         review.plan_sha256 = "wrong".to_string();
         assert!(review.validate(&envelope).is_err());
+    }
+
+    #[test]
+    fn plan_review_cannot_claim_unread_or_unknown_evidence() {
+        let envelope = ArtifactEnvelope::new("plan-1", plan()).unwrap();
+        let mut review = PlanReviewArtifact {
+            plan_id: envelope.id.clone(),
+            plan_sha256: envelope.sha256.clone(),
+            assessments: REQUIRED_PLAN_ASSESSMENTS
+                .into_iter()
+                .map(|kind| PlanAssessment {
+                    kind,
+                    status: AssessmentStatus::Pass,
+                    evidence: Vec::new(),
+                    explanation: "assessed".to_string(),
+                })
+                .collect(),
+            challenges: Vec::new(),
+            verdict: ReviewVerdict::Pass,
+        };
+        review.assessments[0].evidence.push(EvidenceReference {
+            path: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            check_id: None,
+            description: "inspected source".to_string(),
+        });
+
+        assert!(
+            review
+                .validate_observed_evidence(&graph(), &HashSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("without reading")
+        );
+        let reads = HashSet::from(["src/lib.rs".to_string()]);
+        review.validate_observed_evidence(&graph(), &reads).unwrap();
+
+        review.assessments[0].evidence[0].check_id = Some("unknown-check".to_string());
+        assert!(
+            review
+                .validate_observed_evidence(&graph(), &reads)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown workspace check")
+        );
     }
 
     #[test]
