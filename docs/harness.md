@@ -12,6 +12,10 @@ daemon session:
 pb harness agent "Build a small Rust CLI that prints a greeting"
 ```
 
+`--intent deliver` is the default and runs the strict workflow. Use `--intent discuss` for a
+read-only conversational experiment or `--intent auto` to allow a read-only turn to request an
+explicit transition into delivery.
+
 The command blocks until `agent_core::run_agent` completes or fails. Existing web and `pb queue`
 session paths continue to use their normal daemon lifecycle. `journal.md` is initialized before model
 loading, so an interrupted run still leaves the scratch location and raw-event recovery guidance.
@@ -53,15 +57,18 @@ how work is checked; the v1 contract remains the separate source of task-specifi
 An empty `allowed_paths` list means unrestricted paths. Otherwise built-in write tools reject a
 path outside the list before mutation, while `run_command` and final validation detect indirect
 forbidden changes. Check timeouts are limited to one hour and terminate the local command process
-group. Contract-free invocations retain the existing profile gates and daemon/socket workflows.
+group. Contracts add task-specific facts to the strict workflow; they do not restore the former
+prompt-owned review or commit gates.
 
 Terminal output and the `session_summary` event distinguish `reached_final`, `handoff_outcome`,
-`contract_status`, `verified_completed`, and `termination_reason`. A model final is handoff intent.
-For top-level build/scout work the runtime then computes the task delta, selects affected checks,
-starts only their executors, reuses only current evidence, offers one bounded model repair after a
-failure, and creates or reuses a safe task-owned commit only after checks pass.
+`contract_status`, `verified_completed`, and `termination_reason`. In strict delivery, a model final
+cannot advance a stage. The named structured submission must pass harness validation before pb
+moves through planning, fresh plan review, implementation, checking, fresh code review, repair, or
+managed commit. pb computes the task delta, selects affected checks, starts only their executors,
+reuses only current fingerprint-bound evidence, and creates or reuses a safe task-owned commit only
+after the complete workflow passes.
 
-A contract-free `ready` or `no_change` handoff exits zero while retaining
+A contract-free `ready` or `no_change` workflow exits zero while retaining
 `contract_status=unspecified` and `verified_completed=false`. A satisfied explicit contract exits
 zero with `verified_completed=true`. Required mutation with no delta becomes
 `contract_unsatisfied`; persistent check failure, missing executor, repeated repair failure, and an
@@ -70,14 +77,14 @@ unsafe required commit remain distinct nonzero `checks_failed`, `executor_unavai
 exits keep their existing structured reasons. Older stored summaries without these additive fields
 remain readable with conservative defaults.
 
-Deterministic recovery is bounded. Repeated parse, completion-gate, and identical-tool signatures
-stop with `parse_loop` or `gate_loop` at their fixed thresholds, before another model or monitor
-turn can reinterpret the same fact. If the ordinary last step establishes all required evidence,
-the runtime emits `final_grace` events and permits exactly one 256-token generation with an empty
-tool schema. Only one exact JSON final action is accepted. Executable contract facts may be
-satisfied by deterministic handoff during that grace path; any remaining mutation, review,
-commit, or cleanliness fact still rejects the final and cannot be converted into verified
-completion by prose.
+Deterministic recovery is bounded. Repeated parse, artifact validation, identical-tool, plan-cycle,
+repair-cycle, invocation, token, stage-step, and advisory failures stop with explicit outcomes
+before another model turn can reinterpret the same fact. Strict workflow stages never use the old
+prose-final grace path. Literal `REVIEW PASS` text and model-requested commits have no current
+workflow meaning; code-review credit comes only from the structured, fingerprint-bound review
+artifact. The former profile gate/final-grace/handoff behavior is retained only in memory for an
+actually restored persisted request that predates conversation intent, so old sessions remain
+readable without letting a new request opt into weaker control by omitting fields.
 
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
@@ -112,9 +119,11 @@ output fingerprints, executor starts, repair turns, team feedback evidence, no-c
 classification, and commit disposition/hash. Raw process output stays in event JSONL. A valid
 no-change run does not produce the old misleading no-commit observation.
 
-The workspace starts on `main` with one empty baseline commit. The agent receives the normal full
-agent runtime, a local command backend rooted in the scratch repository, and the build profile by
-default. Its changes therefore stay reviewable as commits on the generated task branch.
+The workspace starts on `main` with one empty baseline commit. The agent receives the same
+conversation/workflow engine as web and queue, a local command backend rooted in the scratch
+repository, and the build profile by default. Strict stage capabilities—not the profile prompt—
+decide which tools are available. Changes stay reviewable as managed commits on the generated task
+branch.
 
 The journal is an initial audit aid, not a substitute for review. A supervising Codex run should:
 

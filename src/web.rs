@@ -557,6 +557,9 @@ async fn start_session_inner(
     }
     let workflow_policy = workflow_policy_for_request(request.workdir.as_deref())?;
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
+    // A new user turn in a restored conversation always uses current workflow policy. The
+    // compatibility marker applies only to resuming the exact pre-intent invocation.
+    request.legacy_prompt_owned_delivery = false;
     request.workflow_policy = Some(workflow_policy);
     request.workflow_stage = None;
     request.workflow_checkpoint = None;
@@ -2339,6 +2342,7 @@ mod workflow_tests {
             workflow_stage: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
+            legacy_prompt_owned_delivery: false,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.to_path_buf()),

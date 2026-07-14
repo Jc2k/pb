@@ -21,6 +21,25 @@ A local coding agent CLI with an optional web front end.
 - `pb serve` - start a Rust web server, the local Unix-socket RPC endpoint, and the embedded SPA for browser-based sessions.
 - `pb service start|stop|restart` - on macOS, control the installed launchd agents for `pb serve` and the menu bar item.
 
+## Project conversation and delivery
+
+The web composer separates **Discuss** from **Build**. Discuss is conversational and read-only: it
+supports brainstorming, rubber-ducking, explanation, repository inspection, and bounded advisory
+teammates without creating a branch or granting mutation tools. A discussion may propose a Build,
+but only an explicit Build selection starts delivery.
+
+Build uses a harness-owned workflow rather than asking the model to police itself. pb requires a
+structured plan, a fresh-context plan critique, implementation, affected configured checks, an
+isolated fresh-context code critique, bounded repair when needed, and finally a task-owned managed
+commit. Stage-specific structured submissions and content fingerprints advance the workflow;
+model prose, a teammate response, and a successful shell command do not. `run_command` remains
+available only during implementation and repair as a journaled escape hatch.
+
+`pb queue <task>` is an explicit Build request. The web interface can continue ordinary discussion
+after Ready, No change, or a failed/blocked workflow without silently starting another delivery.
+Read-only advisory profiles may compact investigation context, but build and scout cannot be
+delegated and no advisory call can advance a workflow stage.
+
 ## MCP server tools
 
 Global MCP servers live in `~/.config/pb/config.toml` under `[mcp.servers.<name>]`. Repository-specific servers live in `.pb/mcp.toml` with the same table shape; repo entries override global entries with the same name, and `disabled = true` removes a global server for that repo.

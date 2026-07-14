@@ -924,6 +924,7 @@ async fn run_serve() -> Result<()> {
         workflow_stage: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
+        legacy_prompt_owned_delivery: false,
         model: user_config.effective_model(),
         model_dir: user_config.effective_model_dir(),
         workdir: user_config.effective_workdir(),

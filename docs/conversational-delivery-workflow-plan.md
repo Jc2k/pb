@@ -1,6 +1,6 @@
 # Conversational sessions and enforced delivery workflow plan
 
-Status: planned
+Status: implemented through W8; W9 publication-seam verification remains
 
 ## Decision summary
 
@@ -67,7 +67,11 @@ invocations of one model are independent experts, or that incomplete project
 tests establish product correctness. UI and CLI language must preserve those
 distinctions.
 
-## Baseline and motivating defects
+## Baseline and motivating defects (historical)
+
+The defects in this section describe the pre-workflow baseline. New requests now use the
+harness-owned workflow described below; prompt-owned gates survive only for restored persisted
+requests that predate conversation intent.
 
 The current implementation already provides strong building blocks:
 
@@ -653,6 +657,15 @@ steps, maximum tokens, and a required bounded result schema. The harness
 decrements the workflow-wide budget before starting it. Advisory calls execute
 sequentially by default on local models and return only their structured result,
 never their full internal transcript.
+
+For compatibility, restoration detects an old persisted request by the absence
+of its serialized intent field and sets an in-memory legacy-control marker. Only
+that marker enables the old profile completion/review/handoff gates. It is never
+serialized as request authority. A new caller that omits intent is normalized
+through the current project workflow policy, so field omission cannot select the
+weaker path. Literal `REVIEW PASS` remains understood only inside that restored
+compatibility path; current code-review credit is the structured artifact stored
+on `WorkflowRun`.
 
 ## Model runner integration
 

@@ -592,6 +592,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workflow_stage: None,
         workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,
+        legacy_prompt_owned_delivery: false,
         model: args
             .model
             .clone()

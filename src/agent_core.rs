@@ -369,13 +369,19 @@ impl AgentProfile {
             .map_or(self.teammate_name(), |(first, _)| first)
     }
 
-    fn instructions(self) -> &'static str {
+    fn instructions(self, legacy_prompt_owned_delivery: bool) -> &'static str {
         match self {
-            Self::Build => {
+            Self::Build if legacy_prompt_owned_delivery => {
                 "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade with sub_agent profile=\"plan\" to break the request into concrete build tasks; for a single clear change, proceed directly. Implementation and environment mutation stay with the primary build stage: build and scout are not advisory sub-agent targets. After implementation, when you think you have finished building the requested work, call Eugene with sub_agent profile=\"review\" before finalizing. If the review profile passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If the review profile does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
             }
-            Self::Scout => {
+            Self::Build => {
+                "Profile: build. You are Kate. Perform only the implementation or repair work assigned by the current harness stage. The harness owns structured planning, fresh plan critique, affected checks, isolated code critique, repair transitions, and the managed commit. A teammate result is advice only: do not ask a teammate to approve the work, do not treat prose as workflow evidence, and do not attempt to advance or replace a harness stage. Use run_command when the stage exposes it as a journaled escape hatch, but do not treat its exit status as check, review, or commit credit."
+            }
+            Self::Scout if legacy_prompt_owned_delivery => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
+            }
+            Self::Scout => {
+                "Profile: scout. Inspect the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for development-environment setup and guard commands. Report evidence to the current harness stage. Do not decide delivery transitions, approve implementation, or create a commit; mutation is permitted only when the active stage explicitly exposes it."
             }
             Self::Review => {
                 "Profile: review. You are Eugene. Inspect the current workspace and recent changes for correctness, missing requirements, regressions, and test gaps. Run checks when available. Use todo(action=add,...) for required follow-up work found during review. Do not edit files or create commits. Return concise findings with severity and evidence. You may be dismissive of work done by your teammates when the evidence supports it, but keep critiques actionable."
@@ -527,6 +533,11 @@ pub struct AgentRequest {
     /// data, not authority: the planning stage must still map it into explicit requirements.
     #[serde(default)]
     pub conversation_handoff: Option<crate::workflow::ConversationHandoff>,
+    /// In-memory compatibility marker set only while restoring a persisted request that predates
+    /// conversation intent and strict workflows. New callers cannot acquire the prompt-owned
+    /// plan/review/commit path merely by omitting current fields.
+    #[serde(skip)]
+    pub(crate) legacy_prompt_owned_delivery: bool,
     pub model: String,
     pub model_dir: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
@@ -1237,6 +1248,36 @@ fn prepare_branch_for_request(
     Ok((branch, is_continuation))
 }
 
+fn normalize_request_workflow(args: &mut AgentRequest, workspace_root: &Path) -> Result<()> {
+    if args.intent.is_none() && args.legacy_prompt_owned_delivery {
+        return Ok(());
+    }
+    let policy = if let Some(policy) = args.workflow_policy.clone() {
+        policy.validate()?;
+        policy
+    } else if args.repository_less {
+        crate::workflow::WorkflowConfigDocument::default().compile()?
+    } else {
+        crate::workflow::WorkflowConfigDocument::load_or_default(workspace_root)?
+    };
+    if args.intent.is_none() {
+        args.intent = Some(policy.default_intent);
+    }
+    args.workflow_policy = Some(policy);
+    if args.turn_id.trim().is_empty() {
+        args.turn_id = format!(
+            "turn-{:016x}",
+            stable_hash(&format!(
+                "{}\0{}\0{}",
+                args.session_id,
+                args.task,
+                now_millis()
+            ))
+        );
+    }
+    Ok(())
+}
+
 pub fn run_agent<S: EventSink>(
     mut args: AgentRequest,
     models_root: &Path,
@@ -1257,28 +1298,7 @@ pub fn run_agent<S: EventSink>(
     // Anchor to the git project root so tools cannot escape the repository boundary.
     let workspace_root = find_git_root(&focus_root).unwrap_or_else(|| focus_root.clone());
 
-    if args.intent.is_some() {
-        let policy = if let Some(policy) = args.workflow_policy.clone() {
-            policy.validate()?;
-            policy
-        } else if args.repository_less {
-            crate::workflow::WorkflowConfigDocument::default().compile()?
-        } else {
-            crate::workflow::WorkflowConfigDocument::load_or_default(&workspace_root)?
-        };
-        args.workflow_policy = Some(policy);
-        if args.turn_id.trim().is_empty() {
-            args.turn_id = format!(
-                "turn-{:016x}",
-                stable_hash(&format!(
-                    "{}\0{}\0{}",
-                    args.session_id,
-                    args.task,
-                    now_millis()
-                ))
-            );
-        }
-    }
+    normalize_request_workflow(&mut args, &workspace_root)?;
 
     let discussion_turn = matches!(
         args.intent,
@@ -1498,6 +1518,7 @@ pub fn run_agent<S: EventSink>(
         args.profile,
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
         args.repository_less,
+        args.legacy_prompt_owned_delivery,
         args.tool_allowlist.as_deref(),
         args.contract.as_ref(),
         &mcp_registry,
@@ -1765,6 +1786,7 @@ fn build_agent_instructions(
         profile,
         allow_sub_agents,
         repository_less,
+        true,
         None,
         None,
         mcp_registry,
@@ -1781,6 +1803,7 @@ fn build_agent_instructions_with_tool_allowlist(
     profile: AgentProfile,
     allow_sub_agents: bool,
     repository_less: bool,
+    legacy_prompt_owned_delivery: bool,
     tool_allowlist: Option<&[String]>,
     contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
@@ -1795,6 +1818,7 @@ fn build_agent_instructions_with_tool_allowlist(
             profile,
             allow_sub_agents,
             repository_less,
+            legacy_prompt_owned_delivery,
             tool_allowlist,
             contract,
             mcp_registry,
@@ -1816,7 +1840,7 @@ fn build_agent_instructions_with_tool_allowlist(
     instructions.push_str(
         "Final content becomes the user-visible task summary. Explain what you did and why; when fixing a bug, include the root cause and how the change addresses it. Do not finalize merely because an initial search, file listing, or tool batch returned no matches; treat that as a signal to broaden the query, inspect parent or sibling directories, list candidate files, or ask a targeted teammate while you still have tool steps available. Only finalize when the task is complete, a real external blocker prevents progress, a required user decision is needed, or the step budget is exhausted by pb.\n",
     );
-    instructions.push_str(profile.instructions());
+    instructions.push_str(profile.instructions(legacy_prompt_owned_delivery));
     instructions.push('\n');
     instructions.push_str(&format!(
         "You are on a first-name basis with your team. You are {current}. Your teammates are Dade (plan), Kate (build), Eugene (review), Ramon (scout), Paul (explore), Emmanuel (research), Joey (ask), Trinity (monitor). Use I when talking about what you have done and We when talking about what needs to happen next. ",
@@ -1831,7 +1855,7 @@ fn build_agent_instructions_with_tool_allowlist(
             "Do not talk about running, launching, or spawning sub-agents in user-facing final content.\n",
         );
     }
-    let available_tool_signatures = available_tool_signatures(
+    let mut available_tool_signatures = available_tool_signatures(
         profile,
         command_backend_kind,
         allow_sub_agents,
@@ -1841,6 +1865,28 @@ fn build_agent_instructions_with_tool_allowlist(
         mcp_registry,
         lsp_registry,
     );
+    if !legacy_prompt_owned_delivery {
+        available_tool_signatures.retain(|signature| {
+            let name = signature
+                .split_once('(')
+                .map_or(signature.as_str(), |(name, _)| name);
+            !matches!(
+                name,
+                "run_command"
+                    | "run_check"
+                    | "write_file"
+                    | "replace_file"
+                    | "edit_file"
+                    | "apply_patch"
+                    | "mv"
+                    | "rm"
+                    | "git_commit"
+                    | "git_revert"
+                    | "memory_propose"
+                    | "memory_supersede"
+            )
+        });
+    }
     instructions.push_str(&format!(
         "Available tools: {}.\n",
         available_tool_signatures.join(", ")
@@ -1853,9 +1899,14 @@ fn build_agent_instructions_with_tool_allowlist(
             "Use sub_agent(profile,task,max_steps) to ask a read-only teammate for bounded advice in a fresh context. Advisory mapping: Dade=plan, Eugene=review, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Build and scout are not advisory targets and cannot be delegated. Use vision_describe directly when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is bounded and summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
-    if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
+    if matches!(profile, AgentProfile::Build | AgentProfile::Scout) && legacy_prompt_owned_delivery
+    {
         instructions.push_str(
             "When editing, keep changes minimal and safe. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. After an edit, trust the tool-reported diff as the primary source of what changed; do not conclude a file is corrupt from a partial read, unexpected line numbers, or model uncertainty alone. If you suspect corruption, verify with git diff plus a targeted parser/test command before attempting to undo work, and never revert working changes solely because of a hallucinated or unverified corruption concern. For build work, when you believe the implementation is complete, request a review before finalizing; if review passes, run applicable guard commands and try to git_commit with a semantic commit message that follows project guidelines; if review does not pass, address the review output before requesting another review.\n",
+        );
+    } else if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
+        instructions.push_str(
+            "Repository mutation is permitted only when the current harness stage exposes an editing capability. Use edit_file for exact replacements, apply_patch(patch) for unified diffs, mv(source,destination) to rename files, and rm(path,recursive) to remove files or directories. After an edit, trust the tool-reported diff and verify suspected corruption with repository evidence. The harness, not this profile or a teammate, owns delivery planning, checks, review, repair transitions, and managed commit.\n",
         );
     } else {
         instructions.push_str(
@@ -1892,14 +1943,14 @@ fn build_agent_instructions_with_tool_allowlist(
             workspace_root.display()
         ));
     }
-    match command_backend_kind {
-        Some(CommandBackendKind::Container) => instructions.push_str(
+    match (command_backend_kind, legacy_prompt_owned_delivery) {
+        (Some(CommandBackendKind::Container), true) => instructions.push_str(
             "Use run_command(cmd) to execute shell commands inside the sandboxed container environment. The project root is mounted at /workspace inside the container.\n",
         ),
-        Some(CommandBackendKind::Local) => instructions.push_str(
+        (Some(CommandBackendKind::Local), true) => instructions.push_str(
             "Use run_command(cmd) to execute shell commands locally from the project root on the host machine.\n",
         ),
-        None => {}
+        _ => {}
     }
     if let Some(config) = env_config {
         if let Some(source) = &config.source {
@@ -1908,9 +1959,11 @@ fn build_agent_instructions_with_tool_allowlist(
             instructions.push('\n');
         }
         if !config.guard_commands.is_empty() {
-            instructions.push_str(
-                "Commit guard commands to run before git_commit unless clearly impossible:\n",
-            );
+            instructions.push_str(if legacy_prompt_owned_delivery {
+                "Commit guard commands to run before git_commit unless clearly impossible:\n"
+            } else {
+                "Configured project guard commands available to harness-owned checking:\n"
+            });
             for cmd in &config.guard_commands {
                 instructions.push_str("- ");
                 instructions.push_str(cmd);
@@ -1958,6 +2011,7 @@ fn build_direct_harness_instructions(
     profile: AgentProfile,
     allow_sub_agents: bool,
     repository_less: bool,
+    legacy_prompt_owned_delivery: bool,
     tool_allowlist: &[String],
     contract: Option<&crate::harness_contract::AgentContract>,
     mcp_registry: &McpToolRegistry,
@@ -1974,11 +2028,17 @@ fn build_direct_harness_instructions(
         lsp_registry,
     );
     let role = match profile {
-        AgentProfile::Build => {
+        AgentProfile::Build if legacy_prompt_owned_delivery => {
             "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent only to inspect and report. After the review returns, address valid findings yourself, rerun tests yourself, and git_commit the completed work with a semantic message."
         }
-        AgentProfile::Review => {
+        AgentProfile::Build => {
+            "Perform only the implementation or repair work assigned by the harness. Use the exposed edit tools before reporting actual touched paths. run_command is a journaled escape hatch when available. Planning, checks, review transitions, and commit are harness-owned and cannot be satisfied by a teammate or prose."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery => {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Begin the final response with exactly REVIEW PASS when every requested check succeeds and no findings remain. Otherwise begin it with exactly REVIEW FAIL and report prioritized concrete findings or failed checks."
+        }
+        AgentProfile::Review => {
+            "Inspect the exact repository evidence assigned by the harness without editing it. Return findings through the named structured submission tool from the stage prompt. Prose and literal pass phrases do not advance delivery."
         }
         AgentProfile::Monitor => {
             "Audit the current run for loops, blockers, progress, and whether more steps are justified. Return concise evidence and a stop or continue recommendation."
@@ -1986,11 +2046,17 @@ fn build_direct_harness_instructions(
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
     let action_contract = match profile {
-        AgentProfile::Build | AgentProfile::Scout => {
+        AgentProfile::Build | AgentProfile::Scout if legacy_prompt_owned_delivery => {
             "Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Do not return prose-only planning or a final response before a tool result and repository mutation."
         }
-        AgentProfile::Review => {
+        AgentProfile::Build | AgentProfile::Scout => {
+            "Use only capabilities exposed for the current stage. A prose final cannot replace the named structured terminal submission."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery => {
             "Inspect at least one relevant implementation file with read_file and, when run_command is available, run at least one relevant read-only check; a final response before both required evidence types succeed will be rejected. Inspect each result before deciding the verdict. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
+        }
+        AgentProfile::Review => {
+            "Read the required changed paths and supplied check evidence. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Finish only through the named structured review submission."
         }
         AgentProfile::Monitor => {
             "Do not call tools or teammates. Audit only the transcript supplied in the task and immediately return a concise final decision."
@@ -2786,7 +2852,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "sub_agent",
-            "Delegate bounded work to another agent profile in a fresh context.",
+            "Request bounded read-only advice from an advisory profile in a fresh context. The result cannot mutate or advance delivery.",
             object_schema(
                 [
                     enum_property(
@@ -3328,7 +3394,7 @@ struct NamedCheckEvidence {
 }
 
 #[derive(Debug, Clone)]
-struct ReviewContractEvidence {
+struct LegacyReviewContractEvidence {
     fingerprint: String,
     read_paths: HashSet<String>,
     check_ids: HashSet<String>,
@@ -3339,12 +3405,12 @@ struct GateState {
     read_paths: HashSet<String>,
     contract_read_evidence: HashMap<String, String>,
     named_check_evidence: HashMap<String, NamedCheckEvidence>,
-    review_contract_evidence: Option<ReviewContractEvidence>,
+    legacy_review_contract_evidence: Option<LegacyReviewContractEvidence>,
     wrote_file: bool,
-    review_completed_successfully: bool,
-    review_read_evidence_gathered: bool,
-    review_command_evidence_gathered: bool,
-    review_command_required: bool,
+    legacy_review_completed_successfully: bool,
+    legacy_review_read_evidence_gathered: bool,
+    legacy_review_command_evidence_gathered: bool,
+    legacy_review_command_required: bool,
     workflow_submission: Option<crate::workflow::StageSubmission>,
     workflow_control_violation: Option<String>,
     delivery_proposal: Option<crate::workflow::DeliveryProposal>,
@@ -3359,8 +3425,8 @@ impl GateState {
     fn record_workspace_change(&mut self, content_changed: bool) {
         self.wrote_file = true;
         if content_changed {
-            self.review_completed_successfully = false;
-            self.review_contract_evidence = None;
+            self.legacy_review_completed_successfully = false;
+            self.legacy_review_contract_evidence = None;
         }
     }
 }
@@ -3379,9 +3445,9 @@ fn initial_gate_state(
             .is_ok_and(|status| !status.trim().is_empty()));
     GateState {
         wrote_file,
-        review_read_evidence_gathered: args.repository_less,
-        review_command_evidence_gathered: args.repository_less,
-        review_command_required: !args.repository_less && command_backend_available,
+        legacy_review_read_evidence_gathered: args.repository_less,
+        legacy_review_command_evidence_gathered: args.repository_less,
+        legacy_review_command_required: !args.repository_less && command_backend_available,
         ..GateState::default()
     }
 }
@@ -4644,6 +4710,7 @@ fn run_step_limit_monitor(
         AgentProfile::Monitor,
         false,
         args.repository_less,
+        args.legacy_prompt_owned_delivery,
         args.tool_allowlist.as_deref(),
         None,
         mcp_registry,
@@ -7337,6 +7404,7 @@ pub(crate) fn run_local_model_eval_steps(
         args.profile,
         false,
         false,
+        args.legacy_prompt_owned_delivery,
         args.tool_allowlist.as_deref(),
         args.contract.as_ref(),
         &mcp_registry,
@@ -8110,7 +8178,7 @@ fn contract_gate_feedback(
     }
 
     if contract.review.required {
-        match gate_state.review_contract_evidence.as_ref() {
+        match gate_state.legacy_review_contract_evidence.as_ref() {
             Some(review) if review.fingerprint == fingerprint => {
                 let missing_reads = contract
                     .review
@@ -8202,8 +8270,10 @@ fn request_completion_gate_feedback(
         // An unchanged repository is a valid handoff intent. The deterministic teammate decides
         // whether an Always check applies and avoids forcing a fictional edit or review.
         Ok(None)
-    } else {
+    } else if request.legacy_prompt_owned_delivery {
         Ok(completion_gate_feedback(request.profile, gate_state))
+    } else {
+        Ok(None)
     }
 }
 
@@ -8231,10 +8301,12 @@ fn run_deterministic_handoff(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<Option<HandoffAttempt>> {
-    if matches!(
-        request.intent,
-        Some(crate::workflow::TurnIntent::Discuss | crate::workflow::TurnIntent::Auto)
-    ) || !matches!(request.profile, AgentProfile::Build | AgentProfile::Scout)
+    if !request.legacy_prompt_owned_delivery
+        || matches!(
+            request.intent,
+            Some(crate::workflow::TurnIntent::Discuss | crate::workflow::TurnIntent::Auto)
+        )
+        || !matches!(request.profile, AgentProfile::Build | AgentProfile::Scout)
         || request.repository_less
         || request.sub_agent_depth > 0
     {
@@ -8261,10 +8333,12 @@ fn run_deterministic_handoff(
 fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Option<String> {
     if profile == AgentProfile::Review {
         let mut missing = Vec::new();
-        if !gate_state.review_read_evidence_gathered {
+        if !gate_state.legacy_review_read_evidence_gathered {
             missing.push("read_file on at least one relevant implementation file");
         }
-        if gate_state.review_command_required && !gate_state.review_command_evidence_gathered {
+        if gate_state.legacy_review_command_required
+            && !gate_state.legacy_review_command_evidence_gathered
+        {
             missing.push("run_command for at least one relevant successful read-only check");
         }
         if !missing.is_empty() {
@@ -8284,7 +8358,7 @@ fn completion_gate_feedback(profile: AgentProfile, gate_state: &GateState) -> Op
             "make the requested repository change now with write_file for a new path, or with replace_file/edit_file/apply_patch after reading an existing path. Inspection is already sufficient: do not run more status, log, test, or review actions until a write tool succeeds",
         );
     }
-    if !gate_state.review_completed_successfully {
+    if !gate_state.legacy_review_completed_successfully {
         missing.push("ask Eugene (review) to review the completed work successfully");
     }
     if missing.is_empty() {
@@ -8505,7 +8579,7 @@ fn run_tool(
                     .insert(path_key, fingerprint);
             }
             if context.request.profile == AgentProfile::Review {
-                gate_state.review_read_evidence_gathered = true;
+                gate_state.legacy_review_read_evidence_gathered = true;
             }
             drop(gate_state);
 
@@ -9145,7 +9219,7 @@ fn run_tool(
                 context
                     .gate_state
                     .borrow_mut()
-                    .review_command_evidence_gathered = true;
+                    .legacy_review_command_evidence_gathered = true;
             }
             Ok(result)
         }
@@ -9465,9 +9539,10 @@ fn workspace_change_observation(
     let marker = git_completion_marker(workspace_root);
     let reviewed_content = {
         let state = gate_state.borrow();
-        (state.review_completed_successfully || state.review_contract_evidence.is_some())
-            .then(|| git_worktree_content_fingerprint(workspace_root))
-            .transpose()?
+        (state.legacy_review_completed_successfully
+            || state.legacy_review_contract_evidence.is_some())
+        .then(|| git_worktree_content_fingerprint(workspace_root))
+        .transpose()?
     };
     Ok((marker, reviewed_content))
 }
@@ -9962,11 +10037,13 @@ fn run_sub_agent(
         .context("sub_agent requires string argument: profile")?;
     let profile = AgentProfile::parse(profile_name)?;
     ensure_sub_agent_target_allowed(context.request.profile, profile)?;
-    ensure_sub_agent_review_is_ready(
-        profile,
-        context.request.profile,
-        &context.gate_state.borrow(),
-    )?;
+    if context.request.legacy_prompt_owned_delivery {
+        ensure_sub_agent_review_is_ready(
+            profile,
+            context.request.profile,
+            &context.gate_state.borrow(),
+        )?;
+    }
     let task = arguments
         .get("task")
         .and_then(Value::as_str)
@@ -9981,11 +10058,18 @@ fn run_sub_agent(
         .clamp(1, context.request.max_steps.max(1));
     let workspace_marker_before = git_completion_marker(context.workspace_root);
     let reviewed_content_before = context
-        .gate_state
-        .borrow()
-        .review_completed_successfully
-        .then(|| git_worktree_content_fingerprint(context.workspace_root))
-        .transpose()?;
+        .request
+        .legacy_prompt_owned_delivery
+        .then(|| {
+            context
+                .gate_state
+                .borrow()
+                .legacy_review_completed_successfully
+                .then(|| git_worktree_content_fingerprint(context.workspace_root))
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
     let isolated_review = if !context.request.repository_less {
         Some(prepare_isolated_review_workspace(context.workspace_root)?)
     } else {
@@ -10044,6 +10128,7 @@ fn run_sub_agent(
         profile,
         false,
         context.request.repository_less,
+        context.request.legacy_prompt_owned_delivery,
         effective_tool_allowlist,
         context.request.contract.as_ref(),
         context.mcp_registry,
@@ -10132,7 +10217,7 @@ fn run_sub_agent(
         let mut state = context.gate_state.borrow_mut();
         state.wrote_file = true;
         if reviewed_content_changed {
-            state.review_completed_successfully = false;
+            state.legacy_review_completed_successfully = false;
         }
     }
     let review_mutated_workspace = if let Some(before) = review_fingerprint_before.as_ref() {
@@ -10140,7 +10225,8 @@ fn run_sub_agent(
     } else {
         workspace_changed
     };
-    let review_passed = profile == AgentProfile::Review
+    let review_passed = context.request.legacy_prompt_owned_delivery
+        && profile == AgentProfile::Review
         && outcome.reached_final
         && (sub_request.contract.is_none() || outcome.verified_completed)
         && !review_mutated_workspace
@@ -10167,8 +10253,8 @@ fn run_sub_agent(
             })
             .collect();
         let mut parent_gate = context.gate_state.borrow_mut();
-        parent_gate.review_completed_successfully = true;
-        parent_gate.review_contract_evidence = Some(ReviewContractEvidence {
+        parent_gate.legacy_review_completed_successfully = true;
+        parent_gate.legacy_review_contract_evidence = Some(LegacyReviewContractEvidence {
             fingerprint: source_fingerprint,
             read_paths,
             check_ids,
@@ -10187,7 +10273,11 @@ fn run_sub_agent(
             "the review did not satisfy the named evidence contract; request another review that reads the required paths and runs the required checks"
                 .to_string(),
         )
-    } else if profile == AgentProfile::Review && outcome.reached_final && !review_passed {
+    } else if context.request.legacy_prompt_owned_delivery
+        && profile == AgentProfile::Review
+        && outcome.reached_final
+        && !review_passed
+    {
         let response = outcome
             .final_content
             .as_deref()
@@ -12304,6 +12394,7 @@ mod tests {
             workflow_stage: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
+            legacy_prompt_owned_delivery: true,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -12357,6 +12448,7 @@ mod tests {
     fn workflow_request(profile: AgentProfile, workspace: &Path) -> AgentRequest {
         let mut request = test_agent_request(profile, 512);
         request.intent = Some(crate::workflow::TurnIntent::Deliver);
+        request.legacy_prompt_owned_delivery = false;
         request.workdir = Some(workspace.to_path_buf());
         request.workflow_policy = Some(
             crate::workflow::WorkflowConfigDocument::default()
@@ -16178,6 +16270,7 @@ mod tests {
             AgentProfile::Build,
             true,
             false,
+            true,
             Some(&allowlist),
             None,
             &McpToolRegistry::default(),
@@ -16203,6 +16296,89 @@ mod tests {
     }
 
     #[test]
+    fn current_build_prompt_leaves_delivery_control_to_the_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instructions = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "main",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            true,
+            false,
+            false,
+            None,
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(instructions.contains("The harness owns structured planning"));
+        assert!(instructions.contains("managed commit"));
+        assert!(instructions.contains("Build and scout are not advisory targets"));
+        assert!(!instructions.contains("call Dade"));
+        assert!(!instructions.contains("call Eugene"));
+        assert!(!instructions.contains("try to git_commit"));
+        assert!(!instructions.contains("git_commit(message)"));
+        assert!(!instructions.contains("run_command(cmd)"));
+    }
+
+    #[test]
+    fn current_direct_stage_prompts_do_not_use_legacy_review_or_commit_gates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let build_allowlist = vec![
+            "write_file".to_string(),
+            "run_command".to_string(),
+            "submit_implementation".to_string(),
+        ];
+        let build = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "delivery",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            false,
+            false,
+            false,
+            Some(&build_allowlist),
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+        assert!(
+            build.contains("Planning, checks, review transitions, and commit are harness-owned")
+        );
+        assert!(build.contains("run_command is a journaled escape hatch"));
+        assert!(!build.contains("review sub_agent"));
+        assert!(!build.contains("git_commit the completed work"));
+
+        let review_allowlist = vec!["read_file".to_string(), "submit_code_review".to_string()];
+        let review = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "delivery",
+            true,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Review,
+            false,
+            false,
+            false,
+            Some(&review_allowlist),
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+        assert!(review.contains("named structured review submission"));
+        assert!(!review.contains("REVIEW PASS"));
+        assert!(!review.contains("REVIEW FAIL"));
+    }
+
+    #[test]
     fn direct_harness_review_instructions_forbid_mutation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let allowlist = vec!["read_file".to_string(), "run_command".to_string()];
@@ -16215,6 +16391,7 @@ mod tests {
             AgentProfile::Review,
             false,
             false,
+            true,
             Some(&allowlist),
             None,
             &McpToolRegistry::default(),
@@ -16283,6 +16460,7 @@ mod tests {
             AgentProfile::Monitor,
             false,
             false,
+            true,
             Some(&allowlist),
             None,
             &McpToolRegistry::default(),
@@ -16641,7 +16819,7 @@ mod tests {
     }
 
     #[test]
-    fn build_completion_gate_requires_change_and_review() {
+    fn legacy_build_completion_gate_requires_change_and_review() {
         let mut state = GateState::default();
         let feedback = completion_gate_feedback(AgentProfile::Build, &state).unwrap();
         assert!(feedback.contains("make the requested repository change now"));
@@ -16655,16 +16833,16 @@ mod tests {
         assert!(!feedback.contains("make the requested repository change now"));
         assert!(feedback.contains("review"));
 
-        state.review_completed_successfully = true;
+        state.legacy_review_completed_successfully = true;
         assert!(completion_gate_feedback(AgentProfile::Build, &state).is_none());
         assert!(completion_gate_feedback(AgentProfile::Ask, &GateState::default()).is_none());
     }
 
     #[test]
-    fn ordinary_build_gate_has_no_test_or_commit_evidence_requirement() {
+    fn legacy_build_gate_has_no_test_or_commit_evidence_requirement() {
         let state = GateState {
             wrote_file: true,
-            review_completed_successfully: true,
+            legacy_review_completed_successfully: true,
             ..GateState::default()
         };
 
@@ -16673,9 +16851,9 @@ mod tests {
     }
 
     #[test]
-    fn review_completion_gate_requires_successful_tool_evidence() {
+    fn legacy_review_completion_gate_requires_successful_tool_evidence() {
         let mut state = GateState {
-            review_command_required: true,
+            legacy_review_command_required: true,
             ..GateState::default()
         };
         let feedback = completion_gate_feedback(AgentProfile::Review, &state)
@@ -16684,22 +16862,40 @@ mod tests {
         assert!(feedback.contains("read_file"));
         assert!(feedback.contains("run_command"));
 
-        state.review_read_evidence_gathered = true;
+        state.legacy_review_read_evidence_gathered = true;
         let feedback = completion_gate_feedback(AgentProfile::Review, &state)
             .expect("review should still require command evidence");
         assert!(!feedback.contains("read_file"));
         assert!(feedback.contains("run_command"));
 
-        state.review_command_evidence_gathered = true;
+        state.legacy_review_command_evidence_gathered = true;
         assert!(completion_gate_feedback(AgentProfile::Review, &state).is_none());
     }
 
     #[test]
-    fn review_completion_gate_allows_read_only_evidence_without_command_backend() {
+    fn legacy_review_completion_gate_allows_read_only_evidence_without_command_backend() {
         let mut state = GateState::default();
-        state.review_read_evidence_gathered = true;
+        state.legacy_review_read_evidence_gathered = true;
 
         assert!(completion_gate_feedback(AgentProfile::Review, &state).is_none());
+    }
+
+    #[test]
+    fn current_delivery_cannot_enter_legacy_completion_or_handoff_gates() {
+        let tmp = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Build, tmp.path());
+        let state = GateState::default();
+
+        assert!(
+            request_completion_gate_feedback(&request, &state, tmp.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            run_deterministic_handoff(&request, None, 0, &mut |_| {})
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -16820,7 +17016,7 @@ mod tests {
                     fingerprint: fingerprint.clone(),
                 },
             )]),
-            review_contract_evidence: Some(ReviewContractEvidence {
+            legacy_review_contract_evidence: Some(LegacyReviewContractEvidence {
                 fingerprint,
                 read_paths: HashSet::new(),
                 check_ids: HashSet::new(),
@@ -17002,13 +17198,13 @@ mod tests {
                     fingerprint: fingerprint.clone(),
                 },
             )]),
-            review_contract_evidence: Some(ReviewContractEvidence {
+            legacy_review_contract_evidence: Some(LegacyReviewContractEvidence {
                 fingerprint,
                 read_paths: HashSet::from(["game.js".to_string()]),
                 check_ids: HashSet::from(["logic".to_string()]),
             }),
             wrote_file: true,
-            review_completed_successfully: true,
+            legacy_review_completed_successfully: true,
             ..GateState::default()
         };
         let mut request = test_agent_request(AgentProfile::Build, 256);
@@ -17023,14 +17219,14 @@ mod tests {
     #[test]
     fn content_mutation_invalidates_a_previous_review() {
         let mut state = GateState {
-            review_completed_successfully: true,
+            legacy_review_completed_successfully: true,
             ..GateState::default()
         };
 
         state.record_content_mutation();
 
         assert!(state.wrote_file);
-        assert!(!state.review_completed_successfully);
+        assert!(!state.legacy_review_completed_successfully);
         assert!(
             completion_gate_feedback(AgentProfile::Build, &state)
                 .unwrap()
@@ -17078,7 +17274,7 @@ mod tests {
         };
         let request = test_agent_request(AgentProfile::Build, 256);
         let gate_state = RefCell::new(GateState {
-            review_completed_successfully: true,
+            legacy_review_completed_successfully: true,
             ..GateState::default()
         });
         run_command_and_record_workspace_change(
@@ -17089,7 +17285,7 @@ mod tests {
             &gate_state,
         )
         .unwrap();
-        assert!(gate_state.borrow().review_completed_successfully);
+        assert!(gate_state.borrow().legacy_review_completed_successfully);
 
         run_command_and_record_workspace_change(
             &backend,
@@ -17099,7 +17295,7 @@ mod tests {
             &gate_state,
         )
         .unwrap();
-        assert!(!gate_state.borrow().review_completed_successfully);
+        assert!(!gate_state.borrow().legacy_review_completed_successfully);
     }
 
     #[test]
@@ -17310,6 +17506,34 @@ mod tests {
     }
 
     #[test]
+    fn omitted_intent_uses_current_policy_unless_restored_as_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut current = test_agent_request(AgentProfile::Build, 128);
+        current.intent = None;
+        current.turn_id.clear();
+        current.workflow_policy = None;
+        current.legacy_prompt_owned_delivery = false;
+
+        normalize_request_workflow(&mut current, tmp.path()).unwrap();
+
+        assert_eq!(current.intent, Some(crate::workflow::TurnIntent::Discuss));
+        assert!(current.workflow_policy.is_some());
+        assert!(!current.turn_id.is_empty());
+
+        let mut legacy = test_agent_request(AgentProfile::Build, 128);
+        legacy.intent = None;
+        legacy.turn_id.clear();
+        legacy.workflow_policy = None;
+        legacy.legacy_prompt_owned_delivery = true;
+
+        normalize_request_workflow(&mut legacy, tmp.path()).unwrap();
+
+        assert!(legacy.intent.is_none());
+        assert!(legacy.workflow_policy.is_none());
+        assert!(legacy.turn_id.is_empty());
+    }
+
+    #[test]
     fn branch_includes_session_id() {
         let args = AgentRequest {
             task: "Fix login bug".to_string(),
@@ -17319,6 +17543,7 @@ mod tests {
             workflow_stage: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
+            legacy_prompt_owned_delivery: false,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -17390,6 +17615,7 @@ mod tests {
             workflow_stage: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
+            legacy_prompt_owned_delivery: false,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.path().to_path_buf()),

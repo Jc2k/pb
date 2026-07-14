@@ -181,7 +181,20 @@ fn read_note(workspace_root: &Path, note_ref: &str) -> Result<String> {
 }
 
 fn parse_session(payload: &str) -> Result<PersistedSession> {
-    serde_json::from_str(payload).context("failed to parse session note")
+    let value: serde_json::Value =
+        serde_json::from_str(payload).context("failed to parse session note")?;
+    let legacy_prompt_owned_delivery = value
+        .get("request_template")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|request| {
+            request
+                .get("intent")
+                .map_or(true, serde_json::Value::is_null)
+        });
+    let mut session: PersistedSession =
+        serde_json::from_value(value).context("failed to parse session note")?;
+    session.request_template.legacy_prompt_owned_delivery = legacy_prompt_owned_delivery;
+    Ok(session)
 }
 
 fn latest_session_metrics(events: &[EventEnvelope]) -> Option<SessionMetricsSnapshot> {
@@ -330,6 +343,7 @@ mod tests {
             workflow_stage: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
+            legacy_prompt_owned_delivery: false,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.to_path_buf()),
@@ -449,7 +463,7 @@ mod tests {
                 )
             });
 
-        let restored: PersistedSession = serde_json::from_value(value).unwrap();
+        let restored = parse_session(&serde_json::to_string(&value).unwrap()).unwrap();
         assert!(restored.workflow.is_none());
         assert!(restored.completed_workflows.is_empty());
         assert!(restored.request_template.intent.is_none());
@@ -457,6 +471,10 @@ mod tests {
         assert!(restored.request_template.workflow_stage.is_none());
         assert!(restored.request_template.turn_id.is_empty());
         assert!(restored.request_template.conversation_handoff.is_none());
+        assert!(restored.request_template.legacy_prompt_owned_delivery);
+
+        let restored_again = parse_session(&serde_json::to_string(&restored).unwrap()).unwrap();
+        assert!(restored_again.request_template.legacy_prompt_owned_delivery);
     }
 
     #[test]
@@ -496,6 +514,7 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].session_id, "session-123");
         assert!(!restored[0].running);
+        assert!(!restored[0].request_template.legacy_prompt_owned_delivery);
         assert_eq!(restored[0].events.len(), 2);
         assert!(matches!(
             &restored[0].events[1].event,
