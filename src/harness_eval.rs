@@ -238,6 +238,8 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
 
     let args = AgentRequest {
         task: fixture.hypothesis.clone(),
+        intent: Some(crate::workflow::TurnIntent::Deliver),
+        workflow_policy: None,
         model: "scripted-control-fixture".to_string(),
         model_dir: None,
         workdir: Some(scratch.path().to_path_buf()),
@@ -465,6 +467,8 @@ fn run_real_model_fixture(
             "Harness control evaluation. Complete the repository task implied by this control objective, using only the exposed tools: {}",
             fixture.hypothesis
         ),
+        intent: Some(crate::workflow::TurnIntent::Deliver),
+        workflow_policy: None,
         model: configuration.model.clone().unwrap_or_default(),
         model_dir: configuration.model_dir.as_ref().map(PathBuf::from),
         workdir: Some(scratch.path().to_path_buf()),

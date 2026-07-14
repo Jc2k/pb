@@ -213,6 +213,77 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    ConversationTurnStarted {
+        turn_id: String,
+        intent: crate::workflow::TurnIntent,
+        task: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    DeliveryProposed {
+        proposal_id: String,
+        source_turn_id: String,
+        task_summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowStarted {
+        workflow_id: String,
+        source_turn_id: String,
+        policy_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowStageStarted {
+        workflow_id: String,
+        stage: crate::workflow::WorkflowStage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowArtifactAccepted {
+        workflow_id: String,
+        artifact_kind: String,
+        artifact_id: String,
+        sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowChallengeRaised {
+        workflow_id: String,
+        challenge_id: String,
+        severity: crate::workflow::ReviewSeverity,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowEvidenceInvalidated {
+        workflow_id: String,
+        previous_fingerprint: String,
+        current_fingerprint: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowStageCompleted {
+        workflow_id: String,
+        stage: crate::workflow::WorkflowStage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowBlocked {
+        workflow_id: String,
+        outcome: crate::workflow::WorkflowOutcome,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowCompleted {
+        workflow_id: String,
+        outcome: crate::workflow::WorkflowOutcome,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     StepStarted {
         step: usize,
         max_steps: usize,
@@ -514,6 +585,144 @@ impl EventEnvelope {
                     focus_root,
                     branch,
                     attachments,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ConversationTurnStarted {
+                turn_id,
+                intent,
+                task,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ConversationTurnStarted {
+                    turn_id,
+                    intent,
+                    task,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::DeliveryProposed {
+                proposal_id,
+                source_turn_id,
+                task_summary,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::DeliveryProposed {
+                    proposal_id,
+                    source_turn_id,
+                    task_summary,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowStarted {
+                workflow_id,
+                source_turn_id,
+                policy_sha256,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowStarted {
+                    workflow_id,
+                    source_turn_id,
+                    policy_sha256,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowStageStarted {
+                workflow_id, stage, ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowStageStarted {
+                    workflow_id,
+                    stage,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowArtifactAccepted {
+                workflow_id,
+                artifact_kind,
+                artifact_id,
+                sha256,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowArtifactAccepted {
+                    workflow_id,
+                    artifact_kind,
+                    artifact_id,
+                    sha256,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowChallengeRaised {
+                workflow_id,
+                challenge_id,
+                severity,
+                summary,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowChallengeRaised {
+                    workflow_id,
+                    challenge_id,
+                    severity,
+                    summary,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowEvidenceInvalidated {
+                workflow_id,
+                previous_fingerprint,
+                current_fingerprint,
+                reason,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowEvidenceInvalidated {
+                    workflow_id,
+                    previous_fingerprint,
+                    current_fingerprint,
+                    reason,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowStageCompleted {
+                workflow_id, stage, ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowStageCompleted {
+                    workflow_id,
+                    stage,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowBlocked {
+                workflow_id,
+                outcome,
+                reason,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowBlocked {
+                    workflow_id,
+                    outcome,
+                    reason,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowCompleted {
+                workflow_id,
+                outcome,
+                checkpoint_sha256,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowCompleted {
+                    workflow_id,
+                    outcome,
+                    checkpoint_sha256,
                     timestamp_ms: Some(now),
                 },
             },
@@ -1028,6 +1237,28 @@ mod tests {
             } if message == "The web checks need another pass."
                 && detail == "deno task test:web failed"
                 && evidence_ids == vec!["check:web-test"]
+        ));
+    }
+
+    #[test]
+    fn workflow_events_round_trip_with_typed_stage_and_outcome() {
+        let envelope = EventEnvelope::with_timestamp(AgentEvent::WorkflowBlocked {
+            workflow_id: "workflow-1".to_string(),
+            outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
+            reason: "blocking findings remain".to_string(),
+            timestamp_ms: None,
+        });
+        let json = serde_json::to_string(&envelope).unwrap();
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+
+        assert!(matches!(
+            restored.event,
+            AgentEvent::WorkflowBlocked {
+                workflow_id,
+                outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
+                reason,
+                timestamp_ms: Some(_),
+            } if workflow_id == "workflow-1" && reason == "blocking findings remain"
         ));
     }
 }

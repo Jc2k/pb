@@ -735,6 +735,7 @@ mod tests {
                     timeout_seconds: 5,
                 },
             )]),
+            tasks: BTreeMap::new(),
             cargo_workspaces: BTreeMap::new(),
             discovery_warnings: Vec::new(),
             source: WorkspaceGraphSource::Explicit,

@@ -38,6 +38,7 @@ pub fn discover_workspace(
         executors: BTreeMap::new(),
         components: BTreeMap::new(),
         checks: BTreeMap::new(),
+        tasks: BTreeMap::new(),
         cargo_workspaces: BTreeMap::new(),
         discovery_warnings: Vec::new(),
         source: WorkspaceGraphSource::Discovered,

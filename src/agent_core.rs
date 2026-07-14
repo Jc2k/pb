@@ -472,6 +472,14 @@ pub struct SessionAttachment {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRequest {
     pub task: String,
+    /// Conversation intent. `None` is reserved for already-persisted legacy requests so restoring
+    /// one preserves its old control path rather than silently changing its completion claims.
+    #[serde(default)]
+    pub intent: Option<crate::workflow::TurnIntent>,
+    /// Optional trusted, already-normalized workflow policy supplied by daemon-free callers.
+    /// Ordinary project sessions load and snapshot `.pb/workflow.toml` when delivery starts.
+    #[serde(default)]
+    pub workflow_policy: Option<crate::workflow::CompiledWorkflowPolicy>,
     pub model: String,
     pub model_dir: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
@@ -535,6 +543,7 @@ pub struct AgentRunResult {
     pub verified_completed: bool,
     pub termination_reason: TerminationReason,
     pub handoff_outcome: Option<crate::events::HandoffOutcome>,
+    pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1518,6 +1527,7 @@ pub fn run_agent<S: EventSink>(
         verified_completed,
         termination_reason,
         handoff_outcome,
+        workflow: None,
     })
 }
 
@@ -9135,6 +9145,8 @@ mod tests {
     fn test_agent_request(profile: AgentProfile, max_tokens: i32) -> AgentRequest {
         AgentRequest {
             task: "test".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Discuss),
+            workflow_policy: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -9720,6 +9732,7 @@ mod tests {
                 depends_on: Vec::new(),
                 timeout_seconds: 2,
             }],
+            tasks: Vec::new(),
             cargo_workspaces: Vec::new(),
         }
         .normalize()
@@ -11898,6 +11911,8 @@ mod tests {
     fn branch_includes_session_id() {
         let args = AgentRequest {
             task: "Fix login bug".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Discuss),
+            workflow_policy: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -11963,6 +11978,8 @@ mod tests {
 
         let args = AgentRequest {
             task: "Another task".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Discuss),
+            workflow_policy: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.path().to_path_buf()),

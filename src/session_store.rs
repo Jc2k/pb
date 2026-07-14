@@ -39,6 +39,10 @@ pub struct PersistedSession {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -63,6 +67,8 @@ impl PersistedSession {
             status: Some(status),
             updated_at_ms: now_millis(),
             metrics: latest_session_metrics(&events),
+            workflow: None,
+            completed_workflows: Vec::new(),
             events: trim_events(events),
         }
     }
@@ -318,6 +324,8 @@ mod tests {
     fn request(workdir: &Path) -> AgentRequest {
         AgentRequest {
             task: "test task".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Discuss),
+            workflow_policy: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.to_path_buf()),
@@ -403,6 +411,35 @@ mod tests {
         );
 
         assert_eq!(session.title.as_deref(), Some("Tool supplied title"));
+    }
+
+    #[test]
+    fn legacy_persisted_session_deserializes_without_workflow_claims() {
+        let dir = init_repo();
+        let session = PersistedSession::from_parts(
+            "legacy-session".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let mut value = serde_json::to_value(session).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("workflow");
+        object.remove("completed_workflows");
+        object
+            .get_mut("request_template")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("intent");
+
+        let restored: PersistedSession = serde_json::from_value(value).unwrap();
+        assert!(restored.workflow.is_none());
+        assert!(restored.completed_workflows.is_empty());
+        assert!(restored.request_template.intent.is_none());
     }
 
     #[test]

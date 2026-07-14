@@ -434,6 +434,8 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .unwrap_or(base_workspace_graph);
     let request = AgentRequest {
         task: args.task.clone(),
+        intent: Some(crate::workflow::TurnIntent::Deliver),
+        workflow_policy: None,
         model: args
             .model
             .clone()
@@ -1381,6 +1383,7 @@ mod tests {
                 verified_completed,
                 termination_reason,
                 handoff_outcome: None,
+                workflow: None,
             }
         };
 
@@ -1572,6 +1575,7 @@ mod tests {
             verified_completed: false,
             termination_reason: crate::events::TerminationReason::Final,
             handoff_outcome: Some(crate::events::HandoffOutcome::NoChange),
+            workflow: None,
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
@@ -1739,6 +1743,7 @@ mod tests {
             verified_completed: false,
             termination_reason: crate::events::TerminationReason::Final,
             handoff_outcome: Some(crate::events::HandoffOutcome::Ready),
+            workflow: None,
         });
         write_journal(
             layout,

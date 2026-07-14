@@ -42,6 +42,7 @@ pub struct ProjectInspection {
     // Already configured?
     pub has_pb_environment: bool,
     pub has_pb_workspace: bool,
+    pub has_pb_workflow: bool,
 
     // Vision / image assets
     /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
@@ -149,6 +150,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     // --- Already configured? ---
     info.has_pb_environment = root.join(".pb").join("environment.toml").exists();
     info.has_pb_workspace = root.join(".pb").join("workspace.toml").exists();
+    info.has_pb_workflow = root.join(".pb").join("workflow.toml").exists();
 
     Ok(info)
 }
@@ -466,6 +468,24 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
         for warning in &graph.discovery_warnings {
             println!("  warning: {warning}");
         }
+    }
+
+    println!();
+    if info.has_pb_workflow {
+        let policy = crate::workflow::WorkflowConfigDocument::load(&root)?
+            .expect("workflow config exists after inspection")
+            .compile()?;
+        println!(
+            "Existing strict delivery workflow found at {} (policy {}).",
+            root.join(".pb").join("workflow.toml").display(),
+            &policy.sha256[..12]
+        );
+    } else {
+        crate::workflow::WorkflowConfigDocument::default().save(&root)?;
+        println!(
+            "Strict delivery workflow written to {}.",
+            root.join(".pb").join("workflow.toml").display()
+        );
     }
 
     Ok(())
@@ -1063,6 +1083,7 @@ mod tests {
         assert!(info.existing_agent_docs.is_empty());
         assert!(!info.has_pb_environment);
         assert!(!info.has_pb_workspace);
+        assert!(!info.has_pb_workflow);
     }
 
     #[test]
@@ -1146,6 +1167,14 @@ mod tests {
     }
 
     #[test]
+    fn inspect_existing_pb_workflow() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".pb/workflow.toml", "version = 1\n");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_pb_workflow);
+    }
+
+    #[test]
     fn init_writes_normalized_workspace_graph_without_overwriting_environment_schema() {
         let dir = TempDir::new().unwrap();
         run_init(
@@ -1156,6 +1185,7 @@ mod tests {
 
         assert!(dir.path().join(".pb/environment.toml").is_file());
         assert!(dir.path().join(".pb/workspace.toml").is_file());
+        assert!(dir.path().join(".pb/workflow.toml").is_file());
         let graph = crate::workspace::WorkspaceConfigDocument::load(dir.path())
             .unwrap()
             .unwrap()
@@ -1163,6 +1193,12 @@ mod tests {
             .unwrap();
         assert_eq!(graph.components.len(), 1);
         assert_eq!(graph.components["repository"].root, ".");
+        let policy = crate::workflow::WorkflowConfigDocument::load(dir.path())
+            .unwrap()
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert_eq!(policy.delivery, crate::workflow::DeliveryPolicy::Strict);
     }
 
     // ── suggest_environment ──

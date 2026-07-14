@@ -240,6 +240,8 @@ pub struct WorkspaceConfigDocument {
     #[serde(default)]
     pub checks: Vec<WorkspaceCheck>,
     #[serde(default)]
+    pub tasks: Vec<WorkspaceTask>,
+    #[serde(default)]
     pub cargo_workspaces: Vec<CargoWorkspace>,
 }
 
@@ -278,6 +280,7 @@ impl WorkspaceConfigDocument {
         let executors = unique_by_id("executor", self.executors, |item| &item.id)?;
         let components = unique_by_id("component", self.components, |item| &item.id)?;
         let checks = unique_by_id("check", self.checks, |item| &item.id)?;
+        let tasks = unique_by_id("task", self.tasks, |item| &item.id)?;
         let cargo_workspaces =
             unique_by_id("Cargo workspace", self.cargo_workspaces, |item| &item.id)?;
 
@@ -335,6 +338,24 @@ impl WorkspaceConfigDocument {
             }
             validate_references("check", &check.id, &check.depends_on, &checks)?;
         }
+        for task in tasks.values() {
+            validate_id("task", &task.id)?;
+            if task.command.trim().is_empty() {
+                bail!("task '{}' command must not be empty", task.id);
+            }
+            validate_relative_path("task cwd", &task.cwd, true)?;
+            validate_patterns("task allowed_changes", &task.allowed_changes)?;
+            if task.timeout_seconds == 0 {
+                bail!("task '{}' timeout_seconds must be positive", task.id);
+            }
+            if !executors.contains_key(&task.executor) {
+                bail!(
+                    "task '{}' references unknown executor '{}'",
+                    task.id,
+                    task.executor
+                );
+            }
+        }
         validate_acyclic(
             "component",
             components
@@ -385,6 +406,7 @@ impl WorkspaceConfigDocument {
             executors,
             components,
             checks,
+            tasks,
             cargo_workspaces,
             discovery_warnings: Vec::new(),
             source: WorkspaceGraphSource::Explicit,
@@ -398,6 +420,8 @@ pub struct WorkspaceGraph {
     pub executors: BTreeMap<String, Executor>,
     pub components: BTreeMap<String, WorkspaceComponent>,
     pub checks: BTreeMap<String, WorkspaceCheck>,
+    #[serde(default)]
+    pub tasks: BTreeMap<String, WorkspaceTask>,
     #[serde(default)]
     pub cargo_workspaces: BTreeMap<String, CargoWorkspace>,
     #[serde(default)]
@@ -436,6 +460,7 @@ impl WorkspaceGraph {
             executors: self.executors.values().cloned().collect(),
             components: self.components.values().cloned().collect(),
             checks: self.checks.values().cloned().collect(),
+            tasks: self.tasks.values().cloned().collect(),
             cargo_workspaces: self.cargo_workspaces.values().cloned().collect(),
         }
     }
@@ -481,6 +506,7 @@ impl WorkspaceGraph {
             executors: BTreeMap::from([(executor.id.clone(), executor)]),
             components: BTreeMap::from([(component.id.clone(), component)]),
             checks,
+            tasks: BTreeMap::new(),
             cargo_workspaces: BTreeMap::new(),
             discovery_warnings: Vec::new(),
             source: WorkspaceGraphSource::LegacyGuards,
@@ -550,6 +576,22 @@ pub struct WorkspaceCheck {
     pub outputs: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceTask {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    pub command: String,
+    #[serde(default = "dot_path")]
+    pub cwd: String,
+    pub executor: String,
+    #[serde(default)]
+    pub allowed_changes: Vec<String>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 }
@@ -821,6 +863,14 @@ command = "cargo test --all-targets"
 executor = "rust"
 inputs = ["src/**", "Cargo.toml"]
 depends_on = ["web-bundle"]
+
+[[tasks]]
+id = "format-rust"
+label = "Format Rust"
+command = "cargo fmt"
+executor = "rust"
+allowed_changes = ["src/**"]
+timeout_seconds = 30
 "#,
         )
         .unwrap();
@@ -828,6 +878,8 @@ depends_on = ["web-bundle"]
         assert_eq!(graph.components["app"].depends_on, vec!["web"]);
         assert_eq!(graph.checks["rust-tests"].depends_on, vec!["web-bundle"]);
         assert_eq!(graph.checks["web-bundle"].trigger, CheckTrigger::Needed);
+        assert_eq!(graph.tasks["format-rust"].command, "cargo fmt");
+        assert_eq!(graph.tasks["format-rust"].allowed_changes, vec!["src/**"]);
 
         let repo = init_repo();
         document.save(repo.path()).unwrap();
@@ -881,5 +933,38 @@ depends_on = ["a"]
         )
         .unwrap();
         assert!(cyclic.normalize().is_err());
+    }
+
+    #[test]
+    fn workspace_tasks_reject_unknown_executors_and_escaping_authority() {
+        let unknown_executor: WorkspaceConfigDocument = toml::from_str(
+            r#"
+version = 1
+[[executors]]
+id = "local"
+[[tasks]]
+id = "format"
+command = "cargo fmt"
+executor = "missing"
+"#,
+        )
+        .unwrap();
+        assert!(unknown_executor.normalize().is_err());
+
+        let escaping_changes: WorkspaceConfigDocument = toml::from_str(
+            r#"
+version = 1
+[[executors]]
+id = "local"
+[[tasks]]
+id = "generate"
+command = "generate"
+cwd = "../outside"
+executor = "local"
+allowed_changes = ["../outside/**"]
+"#,
+        )
+        .unwrap();
+        assert!(escaping_changes.normalize().is_err());
     }
 }

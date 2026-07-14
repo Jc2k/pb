@@ -20,6 +20,41 @@ pub fn render_event(event: &AgentEvent) {
             }
             print_header("branch", branch);
         }
+        AgentEvent::ConversationTurnStarted { intent, task, .. } => {
+            print_header("turn", &format!("{intent:?}: {task}"));
+        }
+        AgentEvent::DeliveryProposed { task_summary, .. } => {
+            print_header("delivery proposed", task_summary);
+        }
+        AgentEvent::WorkflowStarted { workflow_id, .. } => {
+            print_header("workflow", &format!("{workflow_id} started"));
+        }
+        AgentEvent::WorkflowStageStarted { stage, .. } => {
+            print_header("workflow stage", &format!("{stage:?}"));
+        }
+        AgentEvent::WorkflowArtifactAccepted {
+            artifact_kind,
+            artifact_id,
+            ..
+        } => print_header(
+            "workflow artifact",
+            &format!("{artifact_kind}: {artifact_id}"),
+        ),
+        AgentEvent::WorkflowChallengeRaised {
+            severity, summary, ..
+        } => print_header("workflow challenge", &format!("{severity:?}: {summary}")),
+        AgentEvent::WorkflowEvidenceInvalidated { reason, .. } => {
+            print_header("workflow evidence", &format!("invalidated: {reason}"));
+        }
+        AgentEvent::WorkflowStageCompleted { stage, .. } => {
+            print_header("workflow stage", &format!("{stage:?} completed"));
+        }
+        AgentEvent::WorkflowBlocked {
+            outcome, reason, ..
+        } => print_header("workflow blocked", &format!("{outcome:?}: {reason}")),
+        AgentEvent::WorkflowCompleted { outcome, .. } => {
+            print_header("workflow", &format!("completed: {outcome:?}"));
+        }
         AgentEvent::StepStarted {
             step, max_steps, ..
         } => {

@@ -47,6 +47,7 @@ pub mod session_store;
 pub mod tray;
 pub mod user;
 pub mod web;
+pub mod workflow;
 pub mod workspace;
 pub mod workspace_discovery;
 
@@ -909,6 +910,8 @@ async fn run_serve() -> Result<()> {
     let resolved_port = user_config.effective_web_port();
     let defaults = agent_core::AgentRequest {
         task: String::new(),
+        intent: Some(crate::workflow::TurnIntent::Discuss),
+        workflow_policy: None,
         model: user_config.effective_model(),
         model_dir: user_config.effective_model_dir(),
         workdir: user_config.effective_workdir(),
