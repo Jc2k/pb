@@ -62,6 +62,8 @@ pub struct CheckEvidence {
     pub success: bool,
     pub timed_out: bool,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub output: String,
     pub executor: String,
     pub source: EvidenceSource,
 }
@@ -90,6 +92,7 @@ impl CheckEvidenceLedger {
                 success,
                 timed_out,
                 duration_ms,
+                output,
                 fingerprint,
                 command,
                 cwd,
@@ -119,6 +122,7 @@ impl CheckEvidenceLedger {
                 success: *success,
                 timed_out: *timed_out,
                 duration_ms: *duration_ms,
+                output: output.clone(),
                 executor: executor.clone(),
                 source,
             });
@@ -215,6 +219,36 @@ impl CheckPlan {
 pub fn plan_checks(graph: &WorkspaceGraph, repository: &RepositoryContext) -> Result<CheckPlan> {
     let changed_paths = repository.task_changed_paths()?;
     plan_checks_for_paths(graph, changed_paths)
+}
+
+pub fn plan_checks_with_required(
+    graph: &WorkspaceGraph,
+    repository: &RepositoryContext,
+    required_check_ids: &[String],
+) -> Result<CheckPlan> {
+    let mut plan = plan_checks(graph, repository)?;
+    if plan.changed_paths.is_empty() {
+        return Ok(plan);
+    }
+    let mut selected = plan.checks.iter().cloned().collect::<BTreeSet<_>>();
+    for check_id in required_check_ids {
+        if !graph.checks.contains_key(check_id) {
+            bail!("required delivery check '{check_id}' is not in the workspace graph");
+        }
+        selected.insert(check_id.clone());
+        plan.reasons
+            .entry(check_id.clone())
+            .or_default()
+            .push("required by the accepted delivery plan".to_string());
+    }
+    add_check_dependencies(graph, &mut selected)?;
+    plan.checks = stable_topological_checks(graph, &selected)?;
+    for check_id in &plan.checks {
+        plan.reasons
+            .entry(check_id.clone())
+            .or_insert_with(|| vec!["dependency of a required delivery check".to_string()]);
+    }
+    Ok(plan)
 }
 
 pub fn plan_checks_for_paths(
@@ -804,6 +838,7 @@ impl<'a> WorkspaceCheckRuntime<'a> {
                 success,
                 timed_out: output.timed_out,
                 duration_ms: output.duration_ms,
+                output: output_text.clone(),
                 executor: check.executor.clone(),
                 source,
             };
@@ -1046,6 +1081,26 @@ mod tests {
         let plan = plan_checks_for_paths(&graph, Vec::new()).unwrap();
         assert!(plan.is_no_change());
         assert_eq!(plan.checks, vec!["worker-test"]);
+    }
+
+    #[test]
+    fn accepted_plan_checks_are_added_to_the_affected_delta_with_dependencies() {
+        let repo = init_repo();
+        write(repo.path(), "api/input.txt", "one\n");
+        commit_all(repo.path());
+        let repository = RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        write(repo.path(), "api/input.txt", "two\n");
+        let mut graph = graph();
+        graph.checks.get_mut("worker-test").unwrap().depends_on = vec!["shared-test".to_string()];
+
+        let plan =
+            plan_checks_with_required(&graph, &repository, &["worker-test".to_string()]).unwrap();
+
+        assert_eq!(plan.checks, vec!["api-test", "shared-test", "worker-test"]);
+        assert!(
+            plan.reasons["worker-test"]
+                .contains(&"required by the accepted delivery plan".to_string())
+        );
     }
 
     #[test]

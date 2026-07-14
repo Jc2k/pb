@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -33,7 +33,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::browser_tools;
-use crate::checks::{CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, plan_checks};
+use crate::checks::{
+    CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, check_evidence_is_current,
+    plan_checks, plan_checks_with_required,
+};
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
@@ -1500,19 +1503,21 @@ pub fn run_agent<S: EventSink>(
 
     let (outcome, workflow_checkpoint) =
         if args.intent == Some(crate::workflow::TurnIntent::Deliver) {
-            let delivery = run_delivery_planning(
+            let delivery = run_delivery_workflow(
                 generator,
                 text_backend,
                 llamacpp_backend.as_ref(),
                 &args,
                 &workspace_root,
                 models_root,
+                command_backend.as_ref(),
                 env_config.as_ref(),
                 &todo_memory,
                 &mcp_registry,
                 &lsp_registry,
                 &policy_config,
                 user_config.effective_personal_memory_repo().as_deref(),
+                None,
                 &mut sink,
             )?;
             (delivery.step, Some(delivery.checkpoint))
@@ -5017,19 +5022,21 @@ struct DeliveryRunOutcome {
 const MAX_IDENTICAL_WORKFLOW_VALIDATION_FAILURES: usize = 3;
 
 #[allow(clippy::too_many_arguments)]
-fn run_delivery_planning(
+fn run_delivery_workflow(
     generator: &mut dyn CompletionEngine,
     text_backend: TextBackendKind,
     llamacpp: Option<&LlamaCppBackend>,
     args: &AgentRequest,
     workspace_root: &Path,
     models_root: &Path,
+    command_backend: Option<&CommandBackend>,
     env_config: Option<&EnvironmentConfig>,
     todo_memory: &RefCell<TodoMemory>,
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
     policy_config: &PolicyConfig,
     personal_memory_repo: Option<&Path>,
+    stop_before_stage: Option<crate::workflow::WorkflowStage>,
     sink: &mut dyn EventSink,
 ) -> Result<DeliveryRunOutcome> {
     let policy = args
@@ -5065,34 +5072,60 @@ fn run_delivery_planning(
         policy_sha256: run.policy_sha256.clone(),
         timestamp_ms: Some(now_millis()),
     });
+    let workflow_control_baseline = git_control_state(workspace_root)?;
 
     let run_budget = RefCell::new(RunBudget::for_workflow(policy.limits));
+    let mut check_runtime = WorkspaceCheckRuntime::new(
+        workspace_root,
+        graph,
+        env_config,
+        command_backend,
+        args.prior_check_evidence.clone(),
+    );
     let mut metrics = RunMetrics::default();
     let mut validation_feedback: Option<String> = None;
     let mut validation_signature: Option<u64> = None;
     let mut repeated_validation_failures = 0usize;
+    let mut repair_context: Option<String> = None;
 
     loop {
-        if run.stage == crate::workflow::WorkflowStage::Implementing {
-            let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
+        if run.stage.is_terminal() {
+            return delivery_terminal_outcome(run, metrics, sink);
+        }
+        if stop_before_stage == Some(run.stage) {
             return Ok(DeliveryRunOutcome {
                 step: StepRunOutcome {
                     reached_final: false,
                     contract_status: ContractStatus::Unspecified,
                     verified_completed: false,
-                    termination_reason: TerminationReason::EngineError,
-                    final_content: Some(
-                        "The plan and independent plan challenge passed; implementation is pending."
-                            .to_string(),
-                    ),
+                    termination_reason: TerminationReason::ContractUnsatisfied,
+                    final_content: Some(format!("test observation stopped before {:?}", run.stage)),
                     metrics,
                     gate_state: GateState::default(),
                 },
-                checkpoint,
+                checkpoint: crate::workflow::WorkflowCheckpoint::new(run)?,
             });
         }
-        if run.stage.is_terminal() {
-            return delivery_terminal_outcome(run, metrics);
+        if run.stage == crate::workflow::WorkflowStage::Checking {
+            repair_context = run_delivery_checks(
+                &mut run,
+                graph,
+                &mut check_runtime,
+                &workflow_control_baseline,
+                workspace_root,
+                sink,
+            )?;
+            continue;
+        }
+        if run.stage == crate::workflow::WorkflowStage::Committing {
+            run_delivery_commit(
+                &mut run,
+                graph,
+                &workflow_control_baseline,
+                workspace_root,
+                sink,
+            )?;
+            continue;
         }
         let stage = run.stage;
         if !matches!(
@@ -5100,8 +5133,11 @@ fn run_delivery_planning(
             crate::workflow::WorkflowStage::Planning
                 | crate::workflow::WorkflowStage::PlanRevision
                 | crate::workflow::WorkflowStage::PlanReview
+                | crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing
+                | crate::workflow::WorkflowStage::CodeReview
         ) {
-            bail!("planning orchestrator cannot execute stage {stage:?}");
+            bail!("delivery orchestrator cannot execute stage {stage:?}");
         }
         sink.emit(AgentEvent::WorkflowStageStarted {
             workflow_id: run.id.clone(),
@@ -5110,12 +5146,45 @@ fn run_delivery_planning(
         });
         let contract =
             crate::workflow::StageContract::strict(stage, policy.limits, args.max_tokens)?;
-        let context = delivery_stage_context(&run, graph, validation_feedback.as_deref())?;
-        let isolated_review = if stage == crate::workflow::WorkflowStage::PlanReview {
+        if stage == crate::workflow::WorkflowStage::CodeReview {
+            let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+            if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
+                run.apply(crate::workflow::WorkflowEvent::Blocked {
+                    outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    reason: "repository content changed after harness checks and before isolated code review"
+                        .to_string(),
+                })?;
+                return delivery_terminal_outcome(run, metrics, sink);
+            }
+            if let Err(error) = validate_code_review_scope(&run, workspace_root) {
+                run.apply(crate::workflow::WorkflowEvent::Failed {
+                    outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
+                    reason: format!("code review scope is unsafe: {error:#}"),
+                })?;
+                return delivery_terminal_outcome(run, metrics, sink);
+            }
+        }
+        let context = delivery_stage_context(
+            &run,
+            graph,
+            validation_feedback.as_deref(),
+            repair_context.as_deref(),
+        )?;
+        let isolated_review = if matches!(
+            stage,
+            crate::workflow::WorkflowStage::PlanReview | crate::workflow::WorkflowStage::CodeReview
+        ) {
             let isolated = prepare_isolated_review_workspace(workspace_root)?;
             let snapshot = crate::workspace::ContentSnapshot::capture(&isolated.root)?;
-            if snapshot.fingerprint != run.repository.task_baseline.content.fingerprint {
-                bail!("fresh plan-review snapshot does not match the planning baseline");
+            let expected = if stage == crate::workflow::WorkflowStage::PlanReview {
+                run.repository.task_baseline.content.fingerprint.as_str()
+            } else {
+                run.content_fingerprint
+                    .as_deref()
+                    .context("code review requires a checked content fingerprint")?
+            };
+            if snapshot.fingerprint != expected {
+                bail!("fresh {stage:?} snapshot does not match the exact expected content");
             }
             Some(isolated)
         } else {
@@ -5133,7 +5202,13 @@ fn run_delivery_planning(
             context,
             stage_root,
             models_root,
-            None,
+            matches!(
+                stage,
+                crate::workflow::WorkflowStage::Implementing
+                    | crate::workflow::WorkflowStage::Repairing
+            )
+            .then_some(command_backend)
+            .flatten(),
             env_config,
             todo_memory,
             mcp_registry,
@@ -5144,11 +5219,33 @@ fn run_delivery_planning(
             sink,
         )?;
         metrics.add(&stage_outcome.metrics);
+        let current_control = git_control_state(workspace_root)?;
+        if workflow_control_baseline != current_control {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                reason: format!(
+                    "model stage {stage:?} changed Git control state ({}); content was preserved but delivery cannot continue",
+                    workflow_control_baseline.difference(&current_control)
+                ),
+            })?;
+            return delivery_terminal_outcome(run, metrics, sink);
+        }
+        if stage == crate::workflow::WorkflowStage::CodeReview {
+            let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+            if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
+                run.apply(crate::workflow::WorkflowEvent::Blocked {
+                    outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    reason: "repository content changed while isolated code review was running"
+                        .to_string(),
+                })?;
+                return delivery_terminal_outcome(run, metrics, sink);
+            }
+        }
         run.apply(crate::workflow::WorkflowEvent::UsageRecorded {
             usage: stage_outcome.usage,
         })?;
         if run.stage.is_terminal() {
-            return delivery_terminal_outcome(run, metrics);
+            return delivery_terminal_outcome(run, metrics, sink);
         }
         if stage_outcome.control_violation.is_some() {
             run.apply(crate::workflow::WorkflowEvent::Failed {
@@ -5157,7 +5254,7 @@ fn run_delivery_planning(
                     .control_violation
                     .unwrap_or_else(|| "workflow control state changed".to_string()),
             })?;
-            return delivery_terminal_outcome(run, metrics);
+            return delivery_terminal_outcome(run, metrics, sink);
         }
         let Some(submission) = stage_outcome.submission else {
             let workflow_outcome =
@@ -5169,9 +5266,10 @@ fn run_delivery_planning(
                     stage_outcome.termination_reason
                 ),
             })?;
-            return delivery_terminal_outcome(run, metrics);
+            return delivery_terminal_outcome(run, metrics, sink);
         };
 
+        let previous_content_fingerprint = run.content_fingerprint.clone();
         let accepted = match (stage, submission) {
             (
                 crate::workflow::WorkflowStage::Planning
@@ -5211,6 +5309,47 @@ fn run_delivery_planning(
                     })
                     .map(|_| ("plan_review", review.id, review.sha256))
             }
+            (
+                crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing,
+                crate::workflow::StageSubmission::Implementation { implementation },
+            ) => validate_implementation_submission(&implementation, &run, workspace_root)
+                .and_then(|_| {
+                    run.apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+                        implementation: implementation.clone(),
+                    })
+                })
+                .map(|_| ("implementation", implementation.id, implementation.sha256)),
+            (
+                crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing,
+                crate::workflow::StageSubmission::Replan { reason },
+            ) => {
+                let digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
+                run.apply(crate::workflow::WorkflowEvent::ReplanRequested {
+                    reason: reason.clone(),
+                })
+                .map(|_| {
+                    (
+                        "replan",
+                        format!("replan-{:016x}", stable_hash(&reason)),
+                        digest,
+                    )
+                })
+            }
+            (
+                crate::workflow::WorkflowStage::CodeReview,
+                crate::workflow::StageSubmission::CodeReview { review },
+            ) => {
+                let read_paths = stage_outcome.read_paths.into_iter().collect::<HashSet<_>>();
+                validate_code_review_submission(&review, &run, graph, workspace_root, &read_paths)
+                    .and_then(|_| {
+                        run.apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted {
+                            review: review.clone(),
+                        })
+                    })
+                    .map(|_| ("code_review", review.id, review.sha256))
+            }
             _ => Err(anyhow!(
                 "stage {stage:?} received a mismatched structured submission"
             )),
@@ -5221,6 +5360,9 @@ fn run_delivery_planning(
                 validation_feedback = None;
                 validation_signature = None;
                 repeated_validation_failures = 0;
+                if matches!(artifact_kind, "implementation" | "replan") {
+                    repair_context = None;
+                }
                 sink.emit(AgentEvent::WorkflowArtifactAccepted {
                     workflow_id: run.id.clone(),
                     artifact_kind: artifact_kind.to_string(),
@@ -5228,6 +5370,21 @@ fn run_delivery_planning(
                     sha256,
                     timestamp_ms: Some(now_millis()),
                 });
+                if artifact_kind == "implementation"
+                    && let (Some(previous), Some(current)) = (
+                        previous_content_fingerprint.as_deref(),
+                        run.content_fingerprint.as_deref(),
+                    )
+                    && previous != current
+                {
+                    sink.emit(AgentEvent::WorkflowEvidenceInvalidated {
+                        workflow_id: run.id.clone(),
+                        previous_fingerprint: previous.to_string(),
+                        current_fingerprint: current.to_string(),
+                        reason: "implementation or repair changed repository content".to_string(),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                }
                 if artifact_kind == "plan_review"
                     && let Some(review) = &run.plan_review
                 {
@@ -5237,6 +5394,19 @@ fn run_delivery_planning(
                             challenge_id: challenge.id.clone(),
                             severity: challenge.severity,
                             summary: challenge.description.clone(),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                    }
+                }
+                if artifact_kind == "code_review"
+                    && let Some(review) = &run.code_review
+                {
+                    for finding in &review.artifact.findings {
+                        sink.emit(AgentEvent::WorkflowChallengeRaised {
+                            workflow_id: run.id.clone(),
+                            challenge_id: finding.id.clone(),
+                            severity: finding.severity,
+                            summary: finding.explanation.clone(),
                             timestamp_ms: Some(now_millis()),
                         });
                     }
@@ -5263,13 +5433,24 @@ fn run_delivery_planning(
                     timestamp_ms: Some(now_millis()),
                 });
                 if repeated_validation_failures >= MAX_IDENTICAL_WORKFLOW_VALIDATION_FAILURES {
+                    let outcome = match stage {
+                        crate::workflow::WorkflowStage::Planning
+                        | crate::workflow::WorkflowStage::PlanRevision
+                        | crate::workflow::WorkflowStage::PlanReview => {
+                            crate::workflow::WorkflowOutcome::PlanRejected
+                        }
+                        crate::workflow::WorkflowStage::CodeReview => {
+                            crate::workflow::WorkflowOutcome::ReviewFailed
+                        }
+                        _ => crate::workflow::WorkflowOutcome::EngineError,
+                    };
                     run.apply(crate::workflow::WorkflowEvent::Failed {
-                        outcome: crate::workflow::WorkflowOutcome::PlanRejected,
+                        outcome,
                         reason: format!(
                             "the same invalid {stage:?} submission was rejected {repeated_validation_failures} times: {error:#}"
                         ),
                     })?;
-                    return delivery_terminal_outcome(run, metrics);
+                    return delivery_terminal_outcome(run, metrics, sink);
                 }
                 validation_feedback = Some(feedback);
             }
@@ -5277,10 +5458,480 @@ fn run_delivery_planning(
     }
 }
 
+fn validate_implementation_submission(
+    implementation: &crate::workflow::ArtifactEnvelope<crate::workflow::ImplementationArtifact>,
+    run: &crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+) -> Result<()> {
+    implementation.validate_digest()?;
+    let plan = run
+        .plan
+        .as_ref()
+        .context("implementation requires an accepted plan")?;
+    implementation.artifact.validate(plan)?;
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if implementation.artifact.content_fingerprint != current.fingerprint {
+        bail!(
+            "implementation supplied fingerprint {} but harness observed {}",
+            implementation.artifact.content_fingerprint,
+            current.fingerprint
+        );
+    }
+    let actual_paths = run
+        .repository
+        .task_baseline
+        .content
+        .changed_paths(&current)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let reported_paths = implementation
+        .artifact
+        .steps
+        .iter()
+        .flat_map(|step| step.touched_paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if actual_paths != reported_paths {
+        bail!(
+            "implementation touched paths do not match the harness delta; reported [{}], actual [{}]",
+            reported_paths
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            actual_paths.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if implementation.artifact.no_change != actual_paths.is_empty() {
+        bail!(
+            "implementation no_change={} disagrees with harness delta emptiness={}",
+            implementation.artifact.no_change,
+            actual_paths.is_empty()
+        );
+    }
+    let planned_paths = plan
+        .artifact
+        .steps
+        .iter()
+        .flat_map(|step| step.paths.iter().map(|planned| planned.path.clone()))
+        .collect::<BTreeSet<_>>();
+    let outside_plan = actual_paths
+        .difference(&planned_paths)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !outside_plan.is_empty() {
+        bail!(
+            "implementation changed path(s) outside the accepted plan: {}",
+            outside_plan.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn accepted_plan_check_ids(run: &crate::workflow::WorkflowRun) -> Vec<String> {
+    let mut checks = run
+        .plan
+        .iter()
+        .flat_map(|plan| plan.artifact.acceptance.iter())
+        .flat_map(|acceptance| acceptance.check_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    checks.sort();
+    checks.dedup();
+    checks
+}
+
+fn run_delivery_checks(
+    run: &mut crate::workflow::WorkflowRun,
+    graph: &crate::workspace::WorkspaceGraph,
+    runtime: &mut WorkspaceCheckRuntime<'_>,
+    control_baseline: &GitControlState,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<Option<String>> {
+    let stage = run.stage;
+    sink.emit(AgentEvent::WorkflowStageStarted {
+        workflow_id: run.id.clone(),
+        stage,
+        timestamp_ms: Some(now_millis()),
+    });
+    let content_before = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if run.content_fingerprint.as_deref() != Some(content_before.fingerprint.as_str()) {
+        bail!("checking stage does not reference current repository content");
+    }
+    let plan =
+        match plan_checks_with_required(graph, &run.repository, &accepted_plan_check_ids(run)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                run.apply(crate::workflow::WorkflowEvent::Blocked {
+                    outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                    reason: format!("failed to select affected checks: {error:#}"),
+                })?;
+                return Ok(None);
+            }
+        };
+    let summary = match runtime.run_plan(&plan, EvidenceSource::Handoff, 0, sink) {
+        Ok(summary) => summary,
+        Err(error) => {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                reason: format!("affected check executor unavailable: {error:#}"),
+            })?;
+            return Ok(None);
+        }
+    };
+    let current_control = git_control_state(workspace_root)?;
+    if control_baseline != &current_control {
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            reason: format!(
+                "project checks changed Git control state ({}); delivery stopped",
+                control_baseline.difference(&current_control)
+            ),
+        })?;
+        return Ok(None);
+    }
+    let content_after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if content_before.fingerprint != content_after.fingerprint {
+        run.apply(crate::workflow::WorkflowEvent::Failed {
+            outcome: crate::workflow::WorkflowOutcome::ChecksFailed,
+            reason: "project checks changed reviewable repository content; use a declared run_task output or make checks side-effect-free"
+                .to_string(),
+        })?;
+        return Ok(None);
+    }
+    let evidence = runtime.ledger().clone();
+    if summary.all_succeeded() {
+        run.apply(crate::workflow::WorkflowEvent::ChecksPassed {
+            content_fingerprint: content_after.fingerprint,
+            selected_checks: plan.checks,
+            evidence,
+        })?;
+        sink.emit(AgentEvent::WorkflowStageCompleted {
+            workflow_id: run.id.clone(),
+            stage,
+            timestamp_ms: Some(now_millis()),
+        });
+        return Ok(None);
+    }
+
+    let failed_check_ids = summary
+        .failed
+        .iter()
+        .chain(summary.skipped.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let feedback = summary
+        .failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "- {} (exit {}, timed_out={}): {}",
+                failure.check_id,
+                failure.exit_status,
+                failure.timed_out,
+                failure
+                    .skip_reason
+                    .as_deref()
+                    .unwrap_or(failure.output.trim())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    run.apply(crate::workflow::WorkflowEvent::ChecksFailed {
+        content_fingerprint: content_after.fingerprint,
+        selected_checks: plan.checks,
+        evidence,
+        failed_check_ids,
+    })?;
+    sink.emit(AgentEvent::WorkflowStageCompleted {
+        workflow_id: run.id.clone(),
+        stage,
+        timestamp_ms: Some(now_millis()),
+    });
+    Ok(Some(truncate_chars(&feedback, 12_000)))
+}
+
+fn validate_code_review_scope(
+    run: &crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+) -> Result<()> {
+    let changed_paths = run.repository.task_changed_paths()?;
+    if changed_paths.len() > run.policy.limits.review_paths {
+        bail!(
+            "task changes {} paths; configured review limit is {}",
+            changed_paths.len(),
+            run.policy.limits.review_paths
+        );
+    }
+    let material = workflow_review_material(run, workspace_root)?;
+    if material.len() > run.policy.limits.review_diff_bytes {
+        bail!(
+            "task review material is {} bytes; configured limit is {}",
+            material.len(),
+            run.policy.limits.review_diff_bytes
+        );
+    }
+    Ok(())
+}
+
+fn workflow_review_material(
+    run: &crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+) -> Result<String> {
+    let changed_paths = run.repository.task_changed_paths()?;
+    let mut command = Command::new("git");
+    command
+        .args(["diff", "--no-ext-diff", "--binary", "--"])
+        .args(&changed_paths)
+        .current_dir(workspace_root);
+    let output = command
+        .output()
+        .context("failed to render workflow review diff")?;
+    if !output.status.success() {
+        bail!(
+            "failed to render workflow review diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut material = String::from_utf8_lossy(&output.stdout).to_string();
+    for path in changed_paths {
+        let absolute = workspace_root.join(&path);
+        if !absolute.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&absolute)
+            .with_context(|| format!("failed to read review path {path}"))?;
+        material.push_str(&format!(
+            "\n\n===== CURRENT {path} ({} bytes) =====\n",
+            bytes.len()
+        ));
+        if bytes.contains(&0) {
+            material.push_str("[binary content omitted]");
+        } else {
+            material.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    Ok(material)
+}
+
+fn reviewable_current_path(workspace_root: &Path, path: &str) -> Result<bool> {
+    let absolute = workspace_root.join(path);
+    if !absolute.is_file() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(&absolute)
+        .with_context(|| format!("failed to inspect changed review path {path}"))?;
+    Ok(!bytes.contains(&0))
+}
+
+fn changed_binary_path_requires_check_evidence(workspace_root: &Path, path: &str) -> Result<bool> {
+    let absolute = workspace_root.join(path);
+    if !absolute.is_file() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(&absolute)
+        .with_context(|| format!("failed to inspect changed review path {path}"))?;
+    Ok(bytes.contains(&0))
+}
+
+fn validate_code_review_submission(
+    review: &crate::workflow::ArtifactEnvelope<crate::workflow::CodeReviewArtifact>,
+    run: &crate::workflow::WorkflowRun,
+    graph: &crate::workspace::WorkspaceGraph,
+    workspace_root: &Path,
+    read_paths: &HashSet<String>,
+) -> Result<()> {
+    validate_code_review_scope(run, workspace_root)?;
+    review.validate_digest()?;
+    let fingerprint = run
+        .content_fingerprint
+        .as_deref()
+        .context("code review requires a checked fingerprint")?;
+    review.artifact.validate(fingerprint)?;
+    let plan = run.plan.as_ref().context("code review requires a plan")?;
+    let requirement_ids = plan
+        .artifact
+        .requirements
+        .iter()
+        .map(|requirement| requirement.id.as_str())
+        .collect::<HashSet<_>>();
+    let step_ids = plan
+        .artifact
+        .steps
+        .iter()
+        .map(|step| step.id.as_str())
+        .collect::<HashSet<_>>();
+    for check_id in &run.selected_checks {
+        if !graph.checks.contains_key(check_id)
+            || !check_evidence_is_current(workspace_root, graph, &run.checks, check_id)?
+        {
+            bail!(
+                "code review requires current successful evidence for selected check '{check_id}'"
+            );
+        }
+    }
+    let changed_paths = run
+        .repository
+        .task_changed_paths()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for finding in &review.artifact.findings {
+        if let Some(path) = &finding.path
+            && !changed_paths.contains(path)
+        {
+            bail!(
+                "code finding '{}' cites path '{path}' outside the reviewed task delta",
+                finding.id
+            );
+        }
+        for requirement_id in &finding.requirement_ids {
+            if !requirement_ids.contains(requirement_id.as_str()) {
+                bail!(
+                    "code finding '{}' cites unknown requirement '{requirement_id}'",
+                    finding.id
+                );
+            }
+        }
+        for step_id in &finding.plan_step_ids {
+            if !step_ids.contains(step_id.as_str()) {
+                bail!(
+                    "code finding '{}' cites unknown plan step '{step_id}'",
+                    finding.id
+                );
+            }
+        }
+    }
+    for evidence in review
+        .artifact
+        .assessments
+        .iter()
+        .flat_map(|assessment| assessment.evidence.iter())
+        .chain(
+            review
+                .artifact
+                .findings
+                .iter()
+                .flat_map(|finding| finding.evidence.iter()),
+        )
+    {
+        if let Some(path) = &evidence.path
+            && !read_paths.contains(path)
+        {
+            bail!("code review cites path '{path}' without reading it in the fresh review context");
+        }
+        if let Some(check_id) = &evidence.check_id {
+            if !run.selected_checks.contains(check_id) {
+                bail!("code review cites check '{check_id}' that was not selected for this delta");
+            }
+            if !graph.checks.contains_key(check_id)
+                || !check_evidence_is_current(workspace_root, graph, &run.checks, check_id)?
+            {
+                bail!("code review cites check '{check_id}' without current successful evidence");
+            }
+        }
+    }
+    for path in changed_paths {
+        if reviewable_current_path(workspace_root, &path)? && !read_paths.contains(&path) {
+            bail!("fresh code reviewer did not read changed text path '{path}'");
+        }
+        if changed_binary_path_requires_check_evidence(workspace_root, &path)?
+            && run.selected_checks.is_empty()
+        {
+            bail!(
+                "changed binary path '{path}' requires current harness check evidence for review"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_delivery_commit(
+    run: &mut crate::workflow::WorkflowRun,
+    graph: &crate::workspace::WorkspaceGraph,
+    control_baseline: &GitControlState,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<()> {
+    let stage = run.stage;
+    sink.emit(AgentEvent::WorkflowStageStarted {
+        workflow_id: run.id.clone(),
+        stage,
+        timestamp_ms: Some(now_millis()),
+    });
+    let current_control = git_control_state(workspace_root)?;
+    if control_baseline != &current_control {
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            reason: format!(
+                "Git control state changed before managed commit ({})",
+                control_baseline.difference(&current_control)
+            ),
+        })?;
+        return Ok(());
+    }
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            reason: "repository content changed after code review".to_string(),
+        })?;
+        return Ok(());
+    }
+    for check_id in &run.selected_checks {
+        if !check_evidence_is_current(workspace_root, graph, &run.checks, check_id)? {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                reason: format!("check '{check_id}' is stale before commit"),
+            })?;
+            return Ok(());
+        }
+    }
+    let subject = run
+        .implementation
+        .as_ref()
+        .map(|implementation| implementation.artifact.semantic_commit_subject.as_str())
+        .context("managed commit requires implementation accounting")?;
+    let commit = match managed_commit(&run.repository, subject, None, sink) {
+        Err(error) => {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                reason: format!("managed commit failed: {error:#}"),
+            })?;
+            return Ok(());
+        }
+        Ok(ManagedCommitOutcome::Created(commit) | ManagedCommitOutcome::Reused(commit)) => commit,
+        Ok(ManagedCommitOutcome::Blocked(reason)) => {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                reason,
+            })?;
+            return Ok(());
+        }
+        Ok(ManagedCommitOutcome::NoChange) => {
+            run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                reason: "delta-bearing reviewed workflow had no task-owned change at commit"
+                    .to_string(),
+            })?;
+            return Ok(());
+        }
+    };
+    run.apply(crate::workflow::WorkflowEvent::CommitCompleted {
+        content_fingerprint: current.fingerprint,
+        commit,
+    })?;
+    sink.emit(AgentEvent::WorkflowStageCompleted {
+        workflow_id: run.id.clone(),
+        stage,
+        timestamp_ms: Some(now_millis()),
+    });
+    Ok(())
+}
+
 fn delivery_stage_context(
     run: &crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
     validation_feedback: Option<&str>,
+    repair_context: Option<&str>,
 ) -> Result<StageContext> {
     let graph_json = serde_json::to_string_pretty(graph)
         .context("failed to serialize normalized workspace graph for planning")?;
@@ -5289,6 +5940,9 @@ fn delivery_stage_context(
         .map(|feedback| {
             format!("\n\nHarness validation feedback from the previous attempt:\n{feedback}")
         })
+        .unwrap_or_default();
+    let repair_note = repair_context
+        .map(|feedback| format!("\n\nDeterministic check feedback to repair:\n{feedback}"))
         .unwrap_or_default();
     match run.stage {
         crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision => {
@@ -5323,6 +5977,56 @@ fn delivery_stage_context(
                 ),
             })
         }
+        crate::workflow::WorkflowStage::Implementing
+        | crate::workflow::WorkflowStage::Repairing => {
+            let plan = run
+                .plan
+                .as_ref()
+                .context("implementation context requires an accepted plan")?;
+            let plan_review = run
+                .plan_review
+                .as_ref()
+                .context("implementation context requires an accepted plan review")?;
+            let plan_json = serde_json::to_string_pretty(plan)?;
+            let review_json = serde_json::to_string_pretty(plan_review)?;
+            let findings = run
+                .code_review
+                .as_ref()
+                .map(|review| serde_json::to_string_pretty(&review.artifact.findings))
+                .transpose()?
+                .unwrap_or_else(|| "[]".to_string());
+            let current = crate::workspace::ContentSnapshot::capture(&run.repository.repo_root)?;
+            Ok(StageContext {
+                system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
+                user_prompt: format!(
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}{repair_note}{correction}",
+                    run.task, current.fingerprint,
+                ),
+            })
+        }
+        crate::workflow::WorkflowStage::CodeReview => {
+            let plan = run
+                .plan
+                .as_ref()
+                .context("code review context requires an accepted plan")?;
+            let implementation = run
+                .implementation
+                .as_ref()
+                .context("code review context requires implementation accounting")?;
+            let plan_json = serde_json::to_string_pretty(plan)?;
+            let implementation_json = serde_json::to_string_pretty(implementation)?;
+            let selected_checks_json = serde_json::to_string_pretty(&run.selected_checks)?;
+            let checks_json = serde_json::to_string_pretty(&run.checks)?;
+            let delta = workflow_review_material(run, &run.repository.repo_root)?;
+            Ok(StageContext {
+                system_prompt: "You are a fresh-context adversarial code critic. You did not receive implementation reasoning or tool transcript. Review the exact isolated checked bytes against the task and accepted plan. Read every changed text/source/test path yourself, assess correctness, requirements, architecture, tests, regressions, and maintainability, then end only with submit_code_review. Every cited path must have been read in this invocation. A pass containing P0/P1 findings is invalid.".to_string(),
+                user_prompt: format!(
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nImplementation accounting:\n{implementation_json}\n\nExact checked content fingerprint: {}\n\nSuccessful selected check ids:\n{selected_checks_json}\n\nHarness-owned check evidence and bounded output:\n{checks_json}\n\nBounded task delta:\n{delta}\n\n{handoff_note}{correction}",
+                    run.task,
+                    run.content_fingerprint.as_deref().unwrap_or("<missing>"),
+                ),
+            })
+        }
         stage => bail!("cannot build planning context for {stage:?}"),
     }
 }
@@ -5347,6 +6051,7 @@ fn workflow_outcome_for_termination(reason: TerminationReason) -> crate::workflo
 fn delivery_terminal_outcome(
     run: crate::workflow::WorkflowRun,
     metrics: RunMetrics,
+    sink: &mut dyn EventSink,
 ) -> Result<DeliveryRunOutcome> {
     let outcome = run
         .outcome
@@ -5378,6 +6083,23 @@ fn delivery_terminal_outcome(
         .clone()
         .unwrap_or_else(|| format!("delivery ended with {outcome:?}"));
     let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
+    if !matches!(
+        outcome,
+        crate::workflow::WorkflowOutcome::Ready | crate::workflow::WorkflowOutcome::NoChange
+    ) {
+        sink.emit(AgentEvent::WorkflowBlocked {
+            workflow_id: checkpoint.run.id.clone(),
+            outcome,
+            reason: detail.clone(),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+    sink.emit(AgentEvent::WorkflowCompleted {
+        workflow_id: checkpoint.run.id.clone(),
+        outcome,
+        checkpoint_sha256: checkpoint.sha256.clone(),
+        timestamp_ms: Some(now_millis()),
+    });
     Ok(DeliveryRunOutcome {
         step: StepRunOutcome {
             reached_final,
@@ -8074,8 +8796,11 @@ fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
 }
 
 fn gate_path_key(workspace_root: &Path, resolved: &Path) -> String {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     resolved
-        .strip_prefix(workspace_root)
+        .strip_prefix(&canonical_root)
         .unwrap_or(resolved)
         .to_string_lossy()
         .replace('\\', "/")
@@ -10883,7 +11608,7 @@ mod tests {
         let policy = PolicyConfig::default();
         let mut events = Vec::new();
 
-        let outcome = run_delivery_planning(
+        let outcome = run_delivery_workflow(
             &mut generator,
             TextBackendKind::LlamaCpp,
             None,
@@ -10891,11 +11616,13 @@ mod tests {
             repo.path(),
             repo.path(),
             None,
+            None,
             &todo,
             &mcp,
             &lsp,
             &policy,
             None,
+            Some(crate::workflow::WorkflowStage::Implementing),
             &mut |event| events.push(event),
         )
         .unwrap();
@@ -11078,6 +11805,732 @@ mod tests {
         .to_string()
     }
 
+    fn delivery_plan(
+        path: Option<(&str, crate::workflow::PlannedChange)>,
+        check_ids: Vec<String>,
+    ) -> crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact> {
+        crate::workflow::ArtifactEnvelope::new(
+            "plan-delivery",
+            crate::workflow::PlanArtifact {
+                summary: "Make the requested delivery change".to_string(),
+                requirements: vec![crate::workflow::PlanRequirement {
+                    id: "req-delivery".to_string(),
+                    description: "Deliver the requested repository behavior".to_string(),
+                    source: "current user turn".to_string(),
+                }],
+                steps: vec![crate::workflow::PlanStep {
+                    id: "step-delivery".to_string(),
+                    requirement_ids: vec!["req-delivery".to_string()],
+                    component_ids: vec!["repository".to_string()],
+                    paths: path
+                        .map(|(path, change)| {
+                            vec![crate::workflow::PlanPath {
+                                path: path.to_string(),
+                                change,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    description: "Apply the bounded repository change".to_string(),
+                }],
+                acceptance: vec![crate::workflow::PlanAcceptance {
+                    id: "accept-delivery".to_string(),
+                    requirement_ids: vec!["req-delivery".to_string()],
+                    check_ids,
+                    description: "The harness-selected checks pass".to_string(),
+                }],
+                risks: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                resolved_challenge_ids: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn plan_envelope_submission(
+        plan: &crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+    ) -> String {
+        json!({
+            "type": "tool_call",
+            "tool": "submit_plan",
+            "arguments": {"id": plan.id, "plan": plan.artifact}
+        })
+        .to_string()
+    }
+
+    fn implementation_submission(
+        plan: &crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+        content_fingerprint: &str,
+        touched_paths: Vec<&str>,
+        no_change: bool,
+    ) -> String {
+        json!({
+            "type": "tool_call",
+            "tool": "submit_implementation",
+            "arguments": {
+                "id": "implementation-delivery",
+                "implementation": {
+                    "plan_id": plan.id,
+                    "plan_sha256": plan.sha256,
+                    "content_fingerprint": content_fingerprint,
+                    "steps": [{
+                        "step_id": "step-delivery",
+                        "status": if no_change { "no_change" } else { "completed" },
+                        "touched_paths": touched_paths,
+                        "summary": if no_change { "No repository change was needed" } else { "Applied the planned change" }
+                    }],
+                    "summary": if no_change { "The requested state already holds" } else { "Implemented the accepted plan" },
+                    "no_change": no_change,
+                    "semantic_commit_subject": if no_change { "" } else { "feat: deliver requested behavior" }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn code_review_submission(
+        content_fingerprint: &str,
+        verdict: crate::workflow::ReviewVerdict,
+        blocking_path: Option<&str>,
+    ) -> String {
+        let assessments = crate::workflow::REQUIRED_CODE_ASSESSMENTS
+            .into_iter()
+            .map(|kind| {
+                json!({
+                    "kind": kind,
+                    "status": if verdict == crate::workflow::ReviewVerdict::Pass { "pass" } else { "concern" },
+                    "evidence": [],
+                    "explanation": "Reviewed this dimension against the checked bytes."
+                })
+            })
+            .collect::<Vec<_>>();
+        let findings = blocking_path
+            .map(|path| {
+                vec![json!({
+                    "id": "finding-blocking",
+                    "severity": "p1",
+                    "path": path,
+                    "line": 1,
+                    "requirement_ids": ["req-delivery"],
+                    "plan_step_ids": ["step-delivery"],
+                    "evidence": [],
+                    "explanation": "The first implementation does not satisfy the requested final state."
+                })]
+            })
+            .unwrap_or_default();
+        json!({
+            "type": "tool_call",
+            "tool": "submit_code_review",
+            "arguments": {
+                "id": if blocking_path.is_some() { "code-review-blocking" } else { "code-review-pass" },
+                "review": {
+                    "content_fingerprint": content_fingerprint,
+                    "assessments": assessments,
+                    "findings": findings,
+                    "verdict": if verdict == crate::workflow::ReviewVerdict::Pass { "pass" } else { "revise" }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn tool_completion(tool: &str, arguments: Value) -> ScriptedCompletion {
+        ScriptedCompletion {
+            content: json!({
+                "type": "tool_call",
+                "tool": tool,
+                "arguments": arguments
+            })
+            .to_string(),
+            truncated: false,
+        }
+    }
+
+    fn text_completion(content: String) -> ScriptedCompletion {
+        ScriptedCompletion {
+            content,
+            truncated: false,
+        }
+    }
+
+    fn run_scripted_delivery_workflow(
+        request: &AgentRequest,
+        workspace: &Path,
+        completions: Vec<ScriptedCompletion>,
+    ) -> (
+        DeliveryRunOutcome,
+        ScriptedCompletionEngine,
+        Vec<AgentEvent>,
+    ) {
+        let mut generator = ScriptedCompletionEngine {
+            completions: VecDeque::from(completions),
+            generation_tool_counts: Vec::new(),
+            generation_max_tokens: Vec::new(),
+            generation_tool_names: Vec::new(),
+        };
+        let todo = RefCell::new(TodoMemory::default());
+        let mcp = McpToolRegistry::default();
+        let lsp = LspToolRegistry::default();
+        let policy = PolicyConfig::default();
+        let mut events = Vec::new();
+        let outcome = run_delivery_workflow(
+            &mut generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            request,
+            workspace,
+            workspace,
+            None,
+            None,
+            &todo,
+            &mcp,
+            &lsp,
+            &policy,
+            None,
+            None,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        (outcome, generator, events)
+    }
+
+    fn fingerprint_with_file_content(workspace: &Path, path: &str, content: &str) -> String {
+        let absolute = workspace.join(path);
+        let original = std::fs::read(&absolute).unwrap();
+        std::fs::write(&absolute, content).unwrap();
+        let fingerprint = crate::workspace::ContentSnapshot::capture(workspace)
+            .unwrap()
+            .fingerprint;
+        std::fs::write(absolute, original).unwrap();
+        fingerprint
+    }
+
+    #[test]
+    fn strict_delivery_runs_plan_checks_fresh_code_review_and_managed_commit() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        std::fs::write(repo.path().join("unrelated.txt"), "preserve me\n").unwrap();
+        let expected_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "delivered\n");
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[
+            "test \"$(cat existing.txt)\" = delivered".to_string(),
+        ]);
+        let check_id = graph.checks.keys().next().unwrap().clone();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            vec![check_id.clone()],
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph = Some(graph);
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-strict-happy".to_string();
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "delivered\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &expected_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &expected_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{}\nevents: {:#?}",
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("no blocked reason"),
+            events
+        );
+        assert!(outcome.step.verified_completed);
+        assert_eq!(outcome.checkpoint.run.selected_checks, vec![check_id]);
+        assert!(outcome.checkpoint.run.commit.is_some());
+        assert!(generator.completions.is_empty());
+        assert_eq!(
+            git_run(&["log", "-1", "--pretty=%s"], repo.path())
+                .unwrap()
+                .trim(),
+            "feat: deliver requested behavior"
+        );
+        assert_eq!(
+            git_run(&["show", "--pretty=", "--name-only", "HEAD"], repo.path())
+                .unwrap()
+                .trim(),
+            "existing.txt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("unrelated.txt")).unwrap(),
+            "preserve me\n"
+        );
+        let started = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::WorkflowStageStarted { stage, .. } => Some(*stage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started,
+            vec![
+                crate::workflow::WorkflowStage::Planning,
+                crate::workflow::WorkflowStage::PlanReview,
+                crate::workflow::WorkflowStage::Implementing,
+                crate::workflow::WorkflowStage::Checking,
+                crate::workflow::WorkflowStage::CodeReview,
+                crate::workflow::WorkflowStage::Committing,
+            ]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowCompleted {
+                outcome: crate::workflow::WorkflowOutcome::Ready,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn strict_no_change_stops_after_harness_checks_without_review_or_commit() {
+        let repo = init_contract_test_repo();
+        let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let plan = delivery_plan(None, Vec::new());
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-strict-no-change".to_string();
+        let head_before = git_run(&["rev-parse", "HEAD"], repo.path()).unwrap();
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                text_completion(implementation_submission(
+                    &plan,
+                    &baseline.fingerprint,
+                    Vec::new(),
+                    true,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::NoChange)
+        );
+        assert!(!outcome.step.verified_completed);
+        assert!(outcome.checkpoint.run.code_review.is_none());
+        assert!(outcome.checkpoint.run.commit.is_none());
+        assert!(generator.completions.is_empty());
+        assert_eq!(
+            git_run(&["rev-parse", "HEAD"], repo.path()).unwrap(),
+            head_before
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowStageStarted {
+                stage: crate::workflow::WorkflowStage::CodeReview,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn failed_harness_check_forces_repair_and_recheck_before_review() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let bad_fingerprint = fingerprint_with_file_content(repo.path(), "existing.txt", "bad\n");
+        let good_fingerprint = fingerprint_with_file_content(repo.path(), "existing.txt", "good\n");
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[
+            "test \"$(cat existing.txt)\" = good".to_string(),
+        ]);
+        let check_id = graph.checks.keys().next().unwrap().clone();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            vec![check_id],
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph = Some(graph);
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-check-repair".to_string();
+
+        let (outcome, _, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "bad\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &bad_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "good\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &good_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &good_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready)
+        );
+        assert_eq!(outcome.checkpoint.run.counters.repair_cycles, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowStageStarted {
+                stage: crate::workflow::WorkflowStage::Repairing,
+                ..
+            }
+        )));
+        let check_results = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CheckResult { .. }))
+            .count();
+        assert_eq!(check_results, 2);
+    }
+
+    #[test]
+    fn blocking_code_critique_forces_repair_recheck_and_fresh_second_critique() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let first_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "first\n");
+        let repaired_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "repaired\n");
+        let graph = crate::workspace::WorkspaceGraph::legacy(&["test -s existing.txt".to_string()]);
+        let check_id = graph.checks.keys().next().unwrap().clone();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            vec![check_id],
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph = Some(graph);
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-review-repair".to_string();
+
+        let (outcome, _, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "first\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &first_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &first_fingerprint,
+                    crate::workflow::ReviewVerdict::Revise,
+                    Some("existing.txt"),
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "repaired\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &repaired_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &repaired_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready)
+        );
+        assert_eq!(outcome.checkpoint.run.counters.repair_cycles, 1);
+        let code_review_starts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::WorkflowStageStarted {
+                        stage: crate::workflow::WorkflowStage::CodeReview,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(code_review_starts, 2);
+        let check_results = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CheckResult { .. }))
+            .count();
+        assert_eq!(check_results, 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowEvidenceInvalidated {
+                previous_fingerprint,
+                current_fingerprint,
+                ..
+            } if previous_fingerprint == &first_fingerprint && current_fingerprint == &repaired_fingerprint
+        )));
+    }
+
+    #[test]
+    fn implementation_outside_the_accepted_plan_fails_closed_after_bounded_retries() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        std::fs::write(repo.path().join("outside.txt"), "outside\n").unwrap();
+        let outside_fingerprint = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        std::fs::remove_file(repo.path().join("outside.txt")).unwrap();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-outside-plan".to_string();
+        let invalid_submission =
+            implementation_submission(&plan, &outside_fingerprint, vec!["outside.txt"], false);
+        let head_before = git_run(&["rev-parse", "HEAD"], repo.path()).unwrap();
+
+        let (outcome, _, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion(
+                    "write_file",
+                    json!({"path": "outside.txt", "content": "outside\n"}),
+                ),
+                text_completion(invalid_submission.clone()),
+                text_completion(invalid_submission.clone()),
+                text_completion(invalid_submission),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::EngineError)
+        );
+        assert!(outcome.checkpoint.run.commit.is_none());
+        assert_eq!(
+            git_run(&["rev-parse", "HEAD"], repo.path()).unwrap(),
+            head_before
+        );
+        let corrections = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Correction { .. }))
+            .count();
+        assert_eq!(corrections, MAX_IDENTICAL_WORKFLOW_VALIDATION_FAILURES);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowBlocked {
+                outcome: crate::workflow::WorkflowOutcome::EngineError,
+                reason,
+                ..
+            } if reason.contains("outside the accepted plan")
+        )));
+    }
+
+    #[test]
+    fn mutation_after_passing_code_review_blocks_managed_commit() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let control_baseline = git_control_state(repo.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[]);
+        let policy = crate::workflow::WorkflowConfigDocument::default()
+            .compile()
+            .unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-post-review-mutation",
+            "turn-post-review-mutation",
+            "deliver",
+            policy,
+            repository,
+        )
+        .unwrap();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan: plan.clone() })
+            .unwrap();
+        let plan_review = crate::workflow::ArtifactEnvelope::new(
+            "plan-review-pass",
+            crate::workflow::PlanReviewArtifact {
+                plan_id: plan.id.clone(),
+                plan_sha256: plan.sha256.clone(),
+                assessments: crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+                    .into_iter()
+                    .map(|kind| crate::workflow::PlanAssessment {
+                        kind,
+                        status: crate::workflow::AssessmentStatus::Pass,
+                        evidence: Vec::new(),
+                        explanation: "checked".to_string(),
+                    })
+                    .collect(),
+                challenges: Vec::new(),
+                verdict: crate::workflow::ReviewVerdict::Pass,
+            },
+        )
+        .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted {
+            review: plan_review,
+        })
+        .unwrap();
+        std::fs::write(repo.path().join("existing.txt"), "reviewed\n").unwrap();
+        let reviewed = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let implementation = crate::workflow::ArtifactEnvelope::new(
+            "implementation-reviewed",
+            crate::workflow::ImplementationArtifact {
+                plan_id: plan.id.clone(),
+                plan_sha256: plan.sha256.clone(),
+                content_fingerprint: reviewed.fingerprint.clone(),
+                steps: vec![crate::workflow::ImplementationStep {
+                    step_id: "step-delivery".to_string(),
+                    status: crate::workflow::ImplementationStepStatus::Completed,
+                    touched_paths: vec!["existing.txt".to_string()],
+                    summary: "implemented".to_string(),
+                }],
+                summary: "implemented".to_string(),
+                no_change: false,
+                semantic_commit_subject: "feat: deliver reviewed content".to_string(),
+            },
+        )
+        .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::ImplementationSubmitted { implementation })
+            .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::ChecksPassed {
+            content_fingerprint: reviewed.fingerprint.clone(),
+            selected_checks: Vec::new(),
+            evidence: CheckEvidenceLedger::default(),
+        })
+        .unwrap();
+        let code_review = crate::workflow::ArtifactEnvelope::new(
+            "code-review-reviewed",
+            crate::workflow::CodeReviewArtifact {
+                content_fingerprint: reviewed.fingerprint,
+                assessments: crate::workflow::REQUIRED_CODE_ASSESSMENTS
+                    .into_iter()
+                    .map(|kind| crate::workflow::CodeAssessment {
+                        kind,
+                        status: crate::workflow::AssessmentStatus::Pass,
+                        evidence: Vec::new(),
+                        explanation: "checked".to_string(),
+                    })
+                    .collect(),
+                findings: Vec::new(),
+                verdict: crate::workflow::ReviewVerdict::Pass,
+            },
+        )
+        .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted {
+            review: code_review,
+        })
+        .unwrap();
+        assert_eq!(run.stage, crate::workflow::WorkflowStage::Committing);
+        let head_before = git_run(&["rev-parse", "HEAD"], repo.path()).unwrap();
+
+        std::fs::write(repo.path().join("existing.txt"), "tampered\n").unwrap();
+        run_delivery_commit(
+            &mut run,
+            &graph,
+            &control_baseline,
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(run.stage, crate::workflow::WorkflowStage::Blocked);
+        assert_eq!(
+            run.outcome,
+            Some(crate::workflow::WorkflowOutcome::CommitBlocked)
+        );
+        assert_eq!(
+            run.blocked_reason.as_deref(),
+            Some("repository content changed after code review")
+        );
+        assert_eq!(
+            git_run(&["rev-parse", "HEAD"], repo.path()).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("existing.txt")).unwrap(),
+            "tampered\n"
+        );
+    }
+
     #[test]
     fn delivery_cannot_reach_implementation_before_a_fresh_plan_critique_passes() {
         let repo = init_contract_test_repo();
@@ -11111,7 +12564,7 @@ mod tests {
         let policy = PolicyConfig::default();
         let mut events = Vec::new();
 
-        let outcome = run_delivery_planning(
+        let outcome = run_delivery_workflow(
             &mut generator,
             TextBackendKind::LlamaCpp,
             None,
@@ -11119,11 +12572,13 @@ mod tests {
             repo.path(),
             repo.path(),
             None,
+            None,
             &todo,
             &mcp,
             &lsp,
             &policy,
             None,
+            Some(crate::workflow::WorkflowStage::Implementing),
             &mut |event| events.push(event),
         )
         .unwrap();

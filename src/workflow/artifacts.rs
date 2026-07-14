@@ -566,6 +566,15 @@ impl CodeReviewArtifact {
             if let Some(path) = &finding.path {
                 validate_repository_path("code finding path", path)?;
             }
+            if finding.line == Some(0) || (finding.line.is_some() && finding.path.is_none()) {
+                bail!("code finding line must be positive and paired with a repository path");
+            }
+            if finding.requirement_ids.is_empty() || finding.plan_step_ids.is_empty() {
+                bail!(
+                    "code finding '{}' must reference an affected requirement and plan step",
+                    finding.id
+                );
+            }
             validate_evidence(&finding.evidence)?;
         }
         let blocking = self
