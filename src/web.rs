@@ -68,6 +68,10 @@ pub struct InlineAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionRequest {
     pub task: String,
+    #[serde(default)]
+    pub intent: Option<crate::workflow::TurnIntent>,
+    #[serde(default)]
+    pub proposal_id: Option<String>,
     pub model: Option<String>,
     pub model_dir: Option<String>,
     pub workdir: Option<String>,
@@ -89,6 +93,10 @@ pub struct StartSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueSessionRequest {
     pub task: String,
+    #[serde(default)]
+    pub intent: Option<crate::workflow::TurnIntent>,
+    #[serde(default)]
+    pub proposal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +125,8 @@ pub struct SessionListItem {
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +190,8 @@ pub struct SessionDetails {
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -528,6 +540,16 @@ async fn start_session_inner(
             request.infer_profile = req.profile.is_none();
         }
     }
+    let workflow_policy = workflow_policy_for_request(request.workdir.as_deref())?;
+    request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
+    request.workflow_policy = Some(workflow_policy);
+    request.workflow_stage = None;
+    request.turn_id = new_turn_id(&session_id);
+    if req.proposal_id.is_some() {
+        bail!("a new session cannot cite a proposal from an unrelated conversation");
+    }
+    request.conversation_handoff =
+        delivery_handoff_for_turn(request.intent, &request.turn_id, &request.task, None);
     request.branch = if request.repository_less {
         None
     } else {
@@ -720,12 +742,35 @@ async fn continue_session(
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if session.status != SessionStatus::Completed {
+    if !matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ) {
         return Err(StatusCode::CONFLICT);
     }
 
     let mut request = session.request_template.clone();
     request.task = req.task;
+    let workflow_policy = workflow_policy_for_request(session.workdir.as_deref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
+    request.workflow_policy = Some(workflow_policy);
+    request.workflow_stage = None;
+    request.turn_id = new_turn_id(&id);
+    let cited_proposal = {
+        let history = session
+            .history
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        proposal_from_history(&history, req.proposal_id.as_deref())
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    request.conversation_handoff = delivery_handoff_for_turn(
+        request.intent,
+        &request.turn_id,
+        &request.task,
+        cited_proposal.as_ref(),
+    );
     request.infer_profile = true;
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
@@ -948,6 +993,7 @@ async fn list_sessions(
             running: session.running,
             paused: session.paused,
             status: session.status,
+            intent: session.request_template.intent,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -983,6 +1029,7 @@ async fn get_session(
         running: session.running,
         paused: session.paused,
         status: session.status,
+        intent: session.request_template.intent,
         branch: session.branch.clone(),
         workdir: session
             .workdir
@@ -1330,7 +1377,15 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     session.request_template.workspace_graph = run_result.workspace_graph.clone();
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.focus_root);
-                    if !run_result.reached_final
+                    if let Some(handoff) = run_result.requested_delivery {
+                        session.request_template.intent =
+                            Some(crate::workflow::TurnIntent::Deliver);
+                        session.request_template.task = handoff.task_summary.clone();
+                        session.request_template.conversation_handoff = Some(handoff);
+                        session.request_template.workflow_stage = None;
+                        session.task = session.request_template.task.clone();
+                        final_status = SessionStatus::Queued;
+                    } else if !run_result.reached_final
                         || run_result.termination_reason != crate::events::TerminationReason::Final
                     {
                         final_status = SessionStatus::Failed;
@@ -1773,6 +1828,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
             running: session.running,
             paused: session.paused,
             status: session.status,
+            intent: session.request_template.intent,
             branch: session.branch.clone(),
             workdir: session
                 .workdir
@@ -1816,6 +1872,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         running: session.running,
         paused: session.paused,
         status: session.status,
+        intent: session.request_template.intent,
         branch: session.branch.clone(),
         workdir: session
             .workdir
@@ -1874,6 +1931,85 @@ fn serve_asset(path: &str) -> Response {
 fn new_session_id() -> String {
     let now = now_millis();
     format!("session-{now}")
+}
+
+fn new_turn_id(session_id: &str) -> String {
+    format!("turn-{session_id}-{}", now_millis())
+}
+
+fn workflow_policy_for_request(
+    workdir: Option<&std::path::Path>,
+) -> Result<crate::workflow::CompiledWorkflowPolicy> {
+    if let Some(workdir) = workdir {
+        let root =
+            crate::agent_core::find_git_root(workdir).unwrap_or_else(|| workdir.to_path_buf());
+        crate::workflow::WorkflowConfigDocument::load_or_default(&root)
+    } else {
+        crate::workflow::WorkflowConfigDocument::default().compile()
+    }
+}
+
+fn delivery_handoff_for_turn(
+    intent: Option<crate::workflow::TurnIntent>,
+    turn_id: &str,
+    task: &str,
+    proposal: Option<&crate::workflow::DeliveryProposal>,
+) -> Option<crate::workflow::ConversationHandoff> {
+    if intent != Some(crate::workflow::TurnIntent::Deliver) {
+        return None;
+    }
+    let mut handoff = proposal.map_or_else(
+        || crate::workflow::ConversationHandoff {
+            source_turn_ids: Vec::new(),
+            task_summary: bounded_handoff_text(task),
+            ..crate::workflow::ConversationHandoff::default()
+        },
+        crate::workflow::DeliveryProposal::handoff,
+    );
+    if !handoff.source_turn_ids.iter().any(|id| id == turn_id) {
+        handoff.source_turn_ids.push(turn_id.to_string());
+    }
+    Some(handoff)
+}
+
+fn bounded_handoff_text(text: &str) -> String {
+    const MAX_HANDOFF_CHARS: usize = 4_000;
+    let mut chars = text.trim().chars();
+    let bounded = chars.by_ref().take(MAX_HANDOFF_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+fn proposal_from_history(
+    history: &[EventEnvelope],
+    proposal_id: Option<&str>,
+) -> Result<Option<crate::workflow::DeliveryProposal>> {
+    let Some(proposal_id) = proposal_id else {
+        return Ok(None);
+    };
+    history
+        .iter()
+        .rev()
+        .find_map(|envelope| match &envelope.event {
+            AgentEvent::DeliveryProposed {
+                proposal_id: id,
+                source_turn_id,
+                task_summary,
+                ..
+            } if id == proposal_id => Some(crate::workflow::DeliveryProposal {
+                id: id.clone(),
+                source_turn_id: source_turn_id.clone(),
+                task_summary: task_summary.clone(),
+            }),
+            _ => None,
+        })
+        .map(Some)
+        .with_context(|| {
+            format!("delivery proposal '{proposal_id}' does not belong to this session")
+        })
 }
 
 fn now_millis() -> u64 {

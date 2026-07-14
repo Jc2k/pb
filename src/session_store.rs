@@ -324,9 +324,11 @@ mod tests {
     fn request(workdir: &Path) -> AgentRequest {
         AgentRequest {
             task: "test task".to_string(),
+            turn_id: "turn-test".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            conversation_handoff: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.to_path_buf()),
@@ -438,7 +440,11 @@ mod tests {
             .retain(|field, _| {
                 !matches!(
                     field.as_str(),
-                    "intent" | "workflow_policy" | "workflow_stage"
+                    "turn_id"
+                        | "intent"
+                        | "workflow_policy"
+                        | "workflow_stage"
+                        | "conversation_handoff"
                 )
             });
 
@@ -448,6 +454,8 @@ mod tests {
         assert!(restored.request_template.intent.is_none());
         assert!(restored.request_template.workflow_policy.is_none());
         assert!(restored.request_template.workflow_stage.is_none());
+        assert!(restored.request_template.turn_id.is_empty());
+        assert!(restored.request_template.conversation_handoff.is_none());
     }
 
     #[test]

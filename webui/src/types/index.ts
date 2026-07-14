@@ -1,5 +1,19 @@
 export type AgentEvent =
   | {
+      type: "conversation_turn_started";
+      turn_id: string;
+      intent: TurnIntent;
+      task: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "delivery_proposed";
+      proposal_id: string;
+      source_turn_id: string;
+      task_summary: string;
+      timestamp_ms?: number;
+    }
+  | {
       type: "started";
       task: string;
       model: string;
@@ -257,6 +271,7 @@ export interface EventEnvelope {
 }
 
 export type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
+export type TurnIntent = "discuss" | "deliver" | "auto";
 
 export interface SessionItem {
   session_id: string;
@@ -265,6 +280,7 @@ export interface SessionItem {
   running: boolean;
   paused: boolean;
   status: SessionStatus;
+  intent?: TurnIntent;
   branch?: string;
   workdir?: string;
   handoff_outcome?: HandoffOutcome;
@@ -280,6 +296,7 @@ export interface SessionDetails {
   running: boolean;
   paused: boolean;
   status: SessionStatus;
+  intent?: TurnIntent;
   branch?: string;
   workdir?: string;
   handoff_outcome?: HandoffOutcome;

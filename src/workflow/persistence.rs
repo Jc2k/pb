@@ -81,6 +81,24 @@ pub struct ConversationHandoff {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryProposal {
+    pub id: String,
+    pub source_turn_id: String,
+    pub task_summary: String,
+}
+
+impl DeliveryProposal {
+    pub fn handoff(&self) -> ConversationHandoff {
+        ConversationHandoff {
+            source_turn_ids: vec![self.source_turn_id.clone()],
+            task_summary: self.task_summary.clone(),
+            proposal_id: Some(self.id.clone()),
+            ..ConversationHandoff::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadyEvidenceBundle {
     pub workflow_id: String,
     pub commit_oid: String,

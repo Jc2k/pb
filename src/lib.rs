@@ -406,6 +406,10 @@ pub struct HarnessAgentArgs {
     /// Task for the agent to complete
     pub task: String,
 
+    /// Run a read-only conversation or an enforced delivery task
+    #[arg(long, value_enum, default_value_t = crate::workflow::TurnIntent::Deliver)]
+    pub intent: crate::workflow::TurnIntent,
+
     /// Persistent scratch root to create or resume; defaults to a unique system temporary directory
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
@@ -417,6 +421,10 @@ pub struct HarnessAgentArgs {
     /// Trusted workspace topology TOML to validate outside the scratch workspace
     #[arg(long, value_name = "PATH", hide = true)]
     pub workspace_config: Option<PathBuf>,
+
+    /// Trusted workflow policy TOML to validate before model loading
+    #[arg(long, value_name = "PATH")]
+    pub workflow_config: Option<PathBuf>,
 
     /// Model identifier; defaults to the configured model
     #[arg(long)]
@@ -910,9 +918,11 @@ async fn run_serve() -> Result<()> {
     let resolved_port = user_config.effective_web_port();
     let defaults = agent_core::AgentRequest {
         task: String::new(),
+        turn_id: String::new(),
         intent: Some(crate::workflow::TurnIntent::Discuss),
         workflow_policy: None,
         workflow_stage: None,
+        conversation_handoff: None,
         model: user_config.effective_model(),
         model_dir: user_config.effective_model_dir(),
         workdir: user_config.effective_workdir(),
@@ -1405,6 +1415,8 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             &socket_path,
             web::StartSessionRequest {
                 task,
+                intent: Some(crate::workflow::TurnIntent::Deliver),
+                proposal_id: None,
                 model: args.model.clone(),
                 model_dir: args
                     .model_dir
@@ -3579,6 +3591,10 @@ mod tests {
             "contract.json",
             "--workspace-config",
             "workspace.toml",
+            "--workflow-config",
+            "workflow.toml",
+            "--intent",
+            "discuss",
         ])
         .unwrap();
         let Commands::Harness {
@@ -3591,6 +3607,8 @@ mod tests {
         assert_eq!(args.max_steps, Some(20));
         assert_eq!(args.contract, Some(PathBuf::from("contract.json")));
         assert_eq!(args.workspace_config, Some(PathBuf::from("workspace.toml")));
+        assert_eq!(args.workflow_config, Some(PathBuf::from("workflow.toml")));
+        assert_eq!(args.intent, crate::workflow::TurnIntent::Discuss);
         assert_eq!(args.profile, AgentProfile::Build);
     }
 

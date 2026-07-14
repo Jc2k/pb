@@ -406,6 +406,13 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .zip(trusted_workspace_graph.as_ref())
         .map(|(path, graph)| workspace_config_metadata(path, graph))
         .transpose()?;
+    let workflow_policy = args
+        .workflow_config
+        .as_deref()
+        .map(crate::workflow::WorkflowConfigDocument::from_path)
+        .transpose()?
+        .unwrap_or_default()
+        .compile()?;
     let layout = prepare_scratch(args.scratch_dir.as_deref())?;
     println!("pb harness: scratch={}", layout.root.display());
     println!("pb harness: workspace={}", layout.workspace.display());
@@ -434,9 +441,11 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .unwrap_or(base_workspace_graph);
     let request = AgentRequest {
         task: args.task.clone(),
-        intent: Some(crate::workflow::TurnIntent::Deliver),
-        workflow_policy: None,
+        turn_id: format!("harness-turn-{}", layout.run_id),
+        intent: Some(args.intent),
+        workflow_policy: Some(workflow_policy),
         workflow_stage: None,
+        conversation_handoff: None,
         model: args
             .model
             .clone()
@@ -1385,6 +1394,8 @@ mod tests {
                 termination_reason,
                 handoff_outcome: None,
                 workflow: None,
+                delivery_proposal: None,
+                requested_delivery: None,
             }
         };
 
@@ -1577,6 +1588,8 @@ mod tests {
             termination_reason: crate::events::TerminationReason::Final,
             handoff_outcome: Some(crate::events::HandoffOutcome::NoChange),
             workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
@@ -1745,6 +1758,8 @@ mod tests {
             termination_reason: crate::events::TerminationReason::Final,
             handoff_outcome: Some(crate::events::HandoffOutcome::Ready),
             workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
         });
         write_journal(
             layout,

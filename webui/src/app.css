@@ -990,6 +990,54 @@ body {
   font-weight: 700;
 }
 
+.intent-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.2rem;
+  border: 1px solid #dfe5ee;
+  border-radius: 11px;
+  background: rgba(244, 247, 251, 0.9);
+}
+
+.intent-option {
+  border: 0;
+  border-radius: 8px;
+  padding: 0.42rem 0.68rem;
+  background: transparent;
+  color: #667085;
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.intent-option.active {
+  background: #fff;
+  color: #173b72;
+  box-shadow: 0 2px 8px rgba(26, 51, 88, 0.12);
+}
+
+.delivery-proposal-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 1rem 0.75rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #c9ddfb;
+  border-radius: 12px;
+  background: #f3f8ff;
+}
+
+.delivery-proposal-card div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.delivery-proposal-card span {
+  color: #52637a;
+  font-size: 0.88rem;
+}
+
 .send-btn {
   width: 52px;
   height: 52px;

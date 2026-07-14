@@ -1,5 +1,45 @@
 /// <reference lib="deno.ns" />
 import { ok } from "node:assert/strict";
+import { equal } from "node:assert/strict";
+import { latestPendingDeliveryProposal } from "./SessionPage.tsx";
+import type { EventEnvelope } from "../types/index.ts";
+
+Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "delivery_proposed",
+        proposal_id: "proposal-1",
+        source_turn_id: "turn-1",
+        task_summary: "Implement the agreed change",
+      },
+    },
+  ];
+  equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
+
+  events.push({
+    version: "v1",
+    event: {
+      type: "conversation_turn_started",
+      turn_id: "turn-2",
+      intent: "discuss",
+      task: "What would that affect?",
+    },
+  });
+  equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
+
+  events.push({
+    version: "v1",
+    event: {
+      type: "conversation_turn_started",
+      turn_id: "turn-3",
+      intent: "deliver",
+      task: "Go ahead",
+    },
+  });
+  equal(latestPendingDeliveryProposal(events), undefined);
+});
 
 Deno.test("paused session composer keeps resume action at intrinsic width", async () => {
   const markup = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");

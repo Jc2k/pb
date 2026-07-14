@@ -10,6 +10,7 @@ import type {
   ProjectUsageStats,
   SessionAttachment,
   SessionItem,
+  TurnIntent,
 } from "../types";
 import {
   IntegrationConfigForm,
@@ -25,6 +26,7 @@ import {
   UsageMetrics,
 } from "../components/SessionDashboard";
 import { PageShell } from "../components/PageShell";
+import { IntentControl } from "../components/IntentControl";
 import {
   ensureNotificationPermission,
   projectName,
@@ -144,6 +146,7 @@ export function ProjectPage() {
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [task, setTask] = useState("");
+  const [intent, setIntent] = useState<Exclude<TurnIntent, "auto">>("discuss");
   const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
@@ -222,6 +225,7 @@ export function ProjectPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           task: task.trim(),
+          intent,
           workdir: project.path,
           branch: defaultBranch,
           attachments: images,
@@ -307,17 +311,24 @@ export function ProjectPage() {
                   <ImageAttachments images={images} setImages={setImages} />
                   <div className="composer-actions">
                     <div className="quick-actions">
+                      <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
                       <button
                         className="btn btn-light"
                         type="button"
-                        onClick={() => setTask("fix bug")}
+                        onClick={() => {
+                          setIntent("deliver");
+                          setTask("fix bug");
+                        }}
                       >
                         <i className="bi bi-bug"></i> Fix bug
                       </button>
                       <button
                         className="btn btn-light"
                         type="button"
-                        onClick={() => setTask("add feature")}
+                        onClick={() => {
+                          setIntent("deliver");
+                          setTask("add feature");
+                        }}
                       >
                         <i className="bi bi-plus-lg"></i> Add feature
                       </button>

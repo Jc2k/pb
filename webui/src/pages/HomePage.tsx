@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "../components/PageShell";
+import { IntentControl } from "../components/IntentControl";
 import {
   AttachmentButton,
   ImageAttachments,
@@ -10,12 +11,13 @@ import {
   SessionRows,
   UsageMetrics,
 } from "../components/SessionDashboard";
-import type { ProjectUsageStats, SessionAttachment } from "../types";
+import type { ProjectUsageStats, SessionAttachment, TurnIntent } from "../types";
 import { relativeTime, usageStatsForToday } from "../lib/helpers";
 import { useProjectSessionData } from "../lib/hooks";
 
 export function HomePage() {
   const [task, setTask] = useState("");
+  const [intent, setIntent] = useState<Exclude<TurnIntent, "auto">>("discuss");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
@@ -57,7 +59,7 @@ export function HomePage() {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: task.trim(), attachments: images }),
+        body: JSON.stringify({ task: task.trim(), intent, attachments: images }),
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
@@ -100,24 +102,34 @@ export function HomePage() {
               <ImageAttachments images={images} setImages={setImages} />
               <div className="composer-actions">
                 <div className="quick-actions">
+                  <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
                   <button
                     className="btn btn-light"
                     type="button"
-                    onClick={() => setTask("Research ")}
+                    onClick={() => {
+                      setIntent("discuss");
+                      setTask("Research ");
+                    }}
                   >
                     <i className="bi bi-search"></i> Research
                   </button>
                   <button
                     className="btn btn-light"
                     type="button"
-                    onClick={() => setTask("Create a new repo called ")}
+                    onClick={() => {
+                      setIntent("deliver");
+                      setTask("Create a new repo called ");
+                    }}
                   >
                     <i className="bi bi-chat-square-plus"></i> Create repo
                   </button>
                   <button
                     className="btn btn-light"
                     type="button"
-                    onClick={() => setTask("Fix error ")}
+                    onClick={() => {
+                      setIntent("deliver");
+                      setTask("Fix error ");
+                    }}
                   >
                     <i className="bi bi-tools"></i> Fix error
                   </button>

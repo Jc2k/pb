@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Aside } from "../Aside";
-import type { EventEnvelope, SessionDetails } from "../types";
+import type { EventEnvelope, SessionDetails, TurnIntent } from "../types";
+import { IntentControl } from "../components/IntentControl";
 import { SCROLL_THRESHOLD } from "../lib/constants";
 import {
   formatStartTime,
@@ -31,6 +32,7 @@ export function SessionPage() {
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
+  const [intent, setIntent] = useState<Exclude<TurnIntent, "auto">>("discuss");
   const [answer, setAnswer] = useState("");
   const [shareMessage, setShareMessage] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
@@ -46,7 +48,8 @@ export function SessionPage() {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((prev) => [...prev, parsed]);
         if (parsed.event.type === "session_title") {
-          setSession((current) => current ? { ...current, title: parsed.event.title } : current);
+          const title = parsed.event.title;
+          setSession((current) => current ? { ...current, title } : current);
         }
         if (parsed.event.type === "user_question") {
           setSessionRunning(false);
@@ -57,6 +60,7 @@ export function SessionPage() {
           parsed.event.type === "session_summary"
         ) {
           setSessionRunning(false);
+          setIntent("discuss");
         }
       } catch (err) {
         console.error(err);
@@ -75,12 +79,16 @@ export function SessionPage() {
     setAnswer("");
   };
 
-  const continueSession = async () => {
-    if (!followUp.trim()) return;
+  const continueSession = async (
+    task = followUp.trim(),
+    requestedIntent = intent,
+    proposalId?: string,
+  ) => {
+    if (!task) return;
     await fetch(`/api/sessions/${sessionId}/continue`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: followUp.trim() }),
+      body: JSON.stringify({ task, intent: requestedIntent, proposal_id: proposalId }),
     });
     setFollowUp("");
     setSessionRunning(false);
@@ -144,6 +152,7 @@ export function SessionPage() {
   }, [events]);
 
   useEffect(() => {
+    if (!sessionId) return;
     atBottomRef.current = true;
     void fetchSession().then(() => openEvents(sessionId));
     return () => sourceRef.current?.close();
@@ -161,6 +170,7 @@ export function SessionPage() {
   }, [shareMessage]);
 
   const isRunning = session?.status === "running" || false;
+  const deliveryProposal = latestPendingDeliveryProposal(events);
 
   if (!session) {
     return (
@@ -331,6 +341,27 @@ export function SessionPage() {
           </aside>
         </div>
 
+        {deliveryProposal && !isRunning && session.status === "completed" && (
+          <div className="delivery-proposal-card" role="status">
+            <div>
+              <strong>Ready to turn this into a build?</strong>
+              <span>{deliveryProposal.task_summary}</span>
+            </div>
+            <button
+              className="btn btn-primary"
+              type="button"
+              onClick={() =>
+                void continueSession(
+                  deliveryProposal.task_summary,
+                  "deliver",
+                  deliveryProposal.proposal_id,
+                )}
+            >
+              Build this
+            </button>
+          </div>
+        )}
+
         {session.status === "paused" && session.pending_question ? (
           <form
             className="composer"
@@ -359,7 +390,6 @@ export function SessionPage() {
               <>
                 <input
                   className="form-control"
-                  rows={2}
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Answer the planning question…"
@@ -387,7 +417,7 @@ export function SessionPage() {
               Resume
             </button>
           </footer>
-        ) : !isRunning && session.status === "completed" ? (
+        ) : !isRunning && (session.status === "completed" || session.status === "failed") ? (
           <form
             className="composer"
             onSubmit={(e) => {
@@ -395,9 +425,7 @@ export function SessionPage() {
               void continueSession();
             }}
           >
-            <button className="btn btn-light rounded-circle" type="button">
-              <i className="bi bi-plus-lg"></i>
-            </button>
+            <IntentControl intent={intent} onChange={setIntent} />
             <input
               className="form-control"
               value={followUp}
@@ -416,4 +444,28 @@ export function SessionPage() {
       </section>
     </div>
   );
+}
+
+export interface PendingDeliveryProposal {
+  proposal_id: string;
+  source_turn_id: string;
+  task_summary: string;
+}
+
+export function latestPendingDeliveryProposal(
+  events: EventEnvelope[],
+): PendingDeliveryProposal | undefined {
+  let pending: PendingDeliveryProposal | undefined;
+  for (const { event } of events) {
+    if (event.type === "delivery_proposed") {
+      pending = {
+        proposal_id: event.proposal_id,
+        source_turn_id: event.source_turn_id,
+        task_summary: event.task_summary,
+      };
+    } else if (event.type === "conversation_turn_started" && event.intent === "deliver") {
+      pending = undefined;
+    }
+  }
+  return pending;
 }
