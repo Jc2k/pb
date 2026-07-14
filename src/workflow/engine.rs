@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::checks::CheckEvidenceLedger;
 use crate::events::HandoffCommitSummary;
-use crate::workspace::RepositoryContext;
+use crate::workspace::{ContentSnapshot, RepositoryContext};
 
 use super::{
     ArtifactEnvelope, CodeReviewArtifact, CompiledWorkflowPolicy, ImplementationArtifact,
@@ -69,7 +69,15 @@ pub struct WorkflowRun {
     pub stage: WorkflowStage,
     pub policy: CompiledWorkflowPolicy,
     pub policy_sha256: String,
+    #[serde(default)]
+    pub workspace_graph_sha256: String,
     pub repository: RepositoryContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_snapshot: Option<ContentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_control: Option<super::WorkflowGitControlState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_stage: Option<WorkflowStage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<ArtifactEnvelope<PlanArtifact>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,8 +121,12 @@ impl WorkflowRun {
             task,
             stage: WorkflowStage::Planning,
             policy_sha256: policy.sha256.clone(),
+            workspace_graph_sha256: String::new(),
             policy,
+            planning_snapshot: Some(repository.task_baseline.content.clone()),
             repository,
+            git_control: None,
+            paused_stage: None,
             plan: None,
             plan_review: None,
             implementation: None,
@@ -133,6 +145,12 @@ impl WorkflowRun {
         *self = reduce(self.clone(), event)?;
         Ok(())
     }
+
+    pub fn planning_content(&self) -> &ContentSnapshot {
+        self.planning_snapshot
+            .as_ref()
+            .unwrap_or(&self.repository.task_baseline.content)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +167,8 @@ pub enum WorkflowEvent {
     },
     ReplanRequested {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        planning_snapshot: Option<ContentSnapshot>,
     },
     ImplementationSubmitted {
         implementation: ArtifactEnvelope<ImplementationArtifact>,
@@ -185,10 +205,16 @@ pub enum WorkflowEvent {
     Cancelled {
         reason: String,
     },
+    Resumed,
 }
 
 pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun> {
-    if run.stage.is_terminal() {
+    if run.stage.is_terminal()
+        && !matches!(
+            (&event, run.stage),
+            (WorkflowEvent::Resumed, WorkflowStage::Blocked)
+        )
+    {
         bail!(
             "workflow '{}' is already terminal at {:?}",
             run.id,
@@ -271,13 +297,19 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
                 run.stage = WorkflowStage::PlanRevision;
             }
         }
-        WorkflowEvent::ReplanRequested { reason } => {
+        WorkflowEvent::ReplanRequested {
+            reason,
+            planning_snapshot,
+        } => {
             require_stage(
                 run.stage,
                 &[WorkflowStage::Implementing, WorkflowStage::Repairing],
                 "request replan",
             )?;
             required("replan reason", reason)?;
+            if let Some(planning_snapshot) = planning_snapshot {
+                run.planning_snapshot = Some(planning_snapshot);
+            }
             run.plan = None;
             run.plan_review = None;
             run.implementation = None;
@@ -422,6 +454,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             ) {
                 bail!("blocked workflow requires a blocked outcome");
             }
+            run.paused_stage = Some(run.stage);
             run.stage = WorkflowStage::Blocked;
             run.outcome = Some(outcome);
             run.blocked_reason = Some(required("blocked reason", reason)?);
@@ -434,13 +467,24 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
                 bail!("failed workflow cannot use a success/cancel outcome");
             }
             run.stage = WorkflowStage::Failed;
+            run.paused_stage = None;
             run.outcome = Some(outcome);
             run.blocked_reason = Some(required("failure reason", reason)?);
         }
         WorkflowEvent::Cancelled { reason } => {
             run.stage = WorkflowStage::Cancelled;
+            run.paused_stage = None;
             run.outcome = Some(WorkflowOutcome::Cancelled);
             run.blocked_reason = Some(required("cancellation reason", reason)?);
+        }
+        WorkflowEvent::Resumed => {
+            require_stage(run.stage, &[WorkflowStage::Blocked], "resume workflow")?;
+            run.stage = run
+                .paused_stage
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("blocked workflow has no resumable prior stage"))?;
+            run.outcome = None;
+            run.blocked_reason = None;
         }
     }
     Ok(run)

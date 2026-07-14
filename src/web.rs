@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -133,6 +134,13 @@ pub struct SessionListItem {
     pub handoff_outcome: Option<HandoffOutcome>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_stage: Option<crate::workflow::WorkflowStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
+    pub strict_workflow: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -200,6 +208,9 @@ pub struct SessionDetails {
     pub events: Vec<EventEnvelope>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::workflow::WorkflowSummary>,
+    pub strict_workflow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +294,9 @@ struct SessionState {
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     metrics: Option<SessionMetricsSnapshot>,
+    workflow: Option<crate::workflow::WorkflowCheckpoint>,
+    completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    cancel_token: Arc<AtomicBool>,
     updated_at_ms: u64,
 }
 
@@ -330,6 +344,7 @@ pub async fn run_server_with_ready(
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/resume", post(resume_session))
+        .route("/api/sessions/{id}/cancel", post(cancel_session))
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
         .route("/api/projects", get(list_projects))
@@ -544,6 +559,7 @@ async fn start_session_inner(
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
     request.workflow_policy = Some(workflow_policy);
     request.workflow_stage = None;
+    request.workflow_checkpoint = None;
     request.turn_id = new_turn_id(&session_id);
     if req.proposal_id.is_some() {
         bail!("a new session cannot cite a proposal from an unrelated conversation");
@@ -588,6 +604,9 @@ async fn start_session_inner(
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
         metrics: None,
+        workflow: None,
+        completed_workflows: Vec::new(),
+        cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
     };
 
@@ -604,6 +623,8 @@ async fn start_session_inner(
         request.workdir.clone(),
         SessionStatus::Queued,
         &empty_history,
+        None,
+        Vec::new(),
     );
 
     dispatch_next_session(state.clone());
@@ -756,6 +777,7 @@ async fn continue_session(
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
     request.workflow_policy = Some(workflow_policy);
     request.workflow_stage = None;
+    request.workflow_checkpoint = None;
     request.turn_id = new_turn_id(&id);
     let cited_proposal = {
         let history = session
@@ -792,11 +814,14 @@ async fn continue_session(
     session.paused = false;
     session.status = SessionStatus::Queued;
     session.pending_question = None;
+    session.workflow = None;
+    session.cancel_token.store(false, Ordering::SeqCst);
     session.updated_at_ms = now_millis();
 
     let history = Arc::clone(&session.history);
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
+    let completed_workflows = session.completed_workflows.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -805,6 +830,8 @@ async fn continue_session(
         workdir,
         SessionStatus::Queued,
         &history,
+        None,
+        completed_workflows,
     );
     dispatch_next_session(state.clone());
 
@@ -844,17 +871,29 @@ impl std::error::Error for ResumeSessionError {}
 async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResponse> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(ResumeSessionError::NotFound)?;
-    if session.status != SessionStatus::Paused || session.pending_question.is_some() {
+    let blocked_workflow = session
+        .workflow
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked);
+    if (!matches!(session.status, SessionStatus::Paused)
+        && !(session.status == SessionStatus::Failed && blocked_workflow))
+        || session.pending_question.is_some()
+    {
         anyhow::bail!(ResumeSessionError::Conflict);
     }
     session.running = false;
     session.paused = false;
     session.status = SessionStatus::Queued;
     session.updated_at_ms = now_millis();
-    let request = session.request_template.clone();
+    session.cancel_token.store(false, Ordering::SeqCst);
+    let mut request = session.request_template.clone();
+    request.workflow_checkpoint = session.workflow.clone();
+    session.request_template = request.clone();
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let history = Arc::clone(&session.history);
+    let workflow = session.workflow.clone();
+    let completed_workflows = session.completed_workflows.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -863,8 +902,106 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         workdir,
         SessionStatus::Queued,
         &history,
+        workflow,
+        completed_workflows,
     );
     dispatch_next_session(state.clone());
+    Ok(SessionResponse { session_id: id })
+}
+
+async fn cancel_session(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    cancel_session_inner(state, id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::CONFLICT)
+}
+
+async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResponse> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(&id)
+        .with_context(|| format!("session not found: {id}"))?;
+    if matches!(session.status, SessionStatus::Completed)
+        || (session.status == SessionStatus::Failed
+            && session.workflow.as_ref().is_none_or(|checkpoint| {
+                checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
+            }))
+    {
+        bail!("session is not cancellable");
+    }
+    session.cancel_token.store(true, Ordering::SeqCst);
+    session.pending_question.take();
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::Correction {
+            message: "Cancellation requested. Repository content and workflow evidence will be preserved."
+                .to_string(),
+            summary: "Cancellation requested".to_string(),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+
+    if !session.running {
+        if let Some(checkpoint) = session.workflow.take() {
+            let mut run = checkpoint.run;
+            if run.stage == crate::workflow::WorkflowStage::Blocked {
+                run.apply(crate::workflow::WorkflowEvent::Resumed)?;
+            }
+            if !run.stage.is_terminal() {
+                run.apply(crate::workflow::WorkflowEvent::Cancelled {
+                    reason: "cancelled by user; repository content and evidence were preserved"
+                        .to_string(),
+                })?;
+            }
+            let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
+            let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
+            if session
+                .completed_workflows
+                .last()
+                .is_none_or(|existing| existing.id != summary.id)
+            {
+                session.completed_workflows.push(summary);
+            }
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::WorkflowCompleted {
+                    workflow_id: checkpoint.run.id,
+                    outcome: crate::workflow::WorkflowOutcome::Cancelled,
+                    checkpoint_sha256: checkpoint.sha256,
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+        }
+        session.request_template.workflow_checkpoint = None;
+        session.running = false;
+        session.paused = false;
+        session.status = SessionStatus::Completed;
+    }
+    session.updated_at_ms = now_millis();
+    let request = session.request_template.clone();
+    let branch = session.branch.clone();
+    let workdir = session.workdir.clone();
+    let history = Arc::clone(&session.history);
+    let workflow = session.workflow.clone();
+    let completed_workflows = session.completed_workflows.clone();
+    let status = session.status;
+    drop(sessions);
+    persist_session_snapshot(
+        &id,
+        &request,
+        branch,
+        workdir,
+        status,
+        &history,
+        workflow,
+        completed_workflows,
+    );
     Ok(SessionResponse { session_id: id })
 }
 
@@ -930,6 +1067,8 @@ async fn answer_question_inner(
     let request_template = session.request_template.clone();
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
+    let workflow = session.workflow.clone();
+    let completed_workflows = session.completed_workflows.clone();
     let question_id = req.question_id.clone();
     pending
         .responder
@@ -955,6 +1094,8 @@ async fn answer_question_inner(
         workdir,
         SessionStatus::Running,
         &history,
+        workflow,
+        completed_workflows,
     );
     Ok(SessionResponse { session_id: id })
 }
@@ -980,28 +1121,49 @@ fn latest_handoff_outcome(session: &SessionState) -> Option<HandoffOutcome> {
     })
 }
 
+fn latest_workflow_summary(session: &SessionState) -> Option<crate::workflow::WorkflowSummary> {
+    session
+        .workflow
+        .as_ref()
+        .map(|checkpoint| crate::workflow::WorkflowSummary::from(&checkpoint.run))
+        .or_else(|| session.completed_workflows.last().cloned())
+}
+
+fn strict_workflow_enabled(session: &SessionState) -> bool {
+    session.request_template.intent == Some(crate::workflow::TurnIntent::Deliver)
+        && session.request_template.workflow_policy.is_some()
+        && !session.request_template.turn_id.trim().is_empty()
+}
+
 async fn list_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<SessionListItem>> {
     let sessions = state.sessions.lock().await;
     let mut items = sessions
         .iter()
-        .map(|(session_id, session)| SessionListItem {
-            session_id: session_id.clone(),
-            task: session.task.clone(),
-            title: effective_session_title(session),
-            running: session.running,
-            paused: session.paused,
-            status: session.status,
-            intent: session.request_template.intent,
-            branch: session.branch.clone(),
-            workdir: session
-                .workdir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            handoff_outcome: latest_handoff_outcome(session),
-            updated_at_ms: session.updated_at_ms,
-            metrics: session.metrics.clone(),
+        .map(|(session_id, session)| {
+            let workflow = latest_workflow_summary(session);
+            SessionListItem {
+                session_id: session_id.clone(),
+                task: session.task.clone(),
+                title: effective_session_title(session),
+                running: session.running,
+                paused: session.paused,
+                status: session.status,
+                intent: session.request_template.intent,
+                branch: session.branch.clone(),
+                workdir: session
+                    .workdir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                handoff_outcome: latest_handoff_outcome(session),
+                updated_at_ms: session.updated_at_ms,
+                metrics: session.metrics.clone(),
+                workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
+                workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
+                workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
+                strict_workflow: strict_workflow_enabled(session),
+            }
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
@@ -1022,6 +1184,7 @@ async fn get_session(
             history[start..].to_vec()
         })
         .unwrap_or_default();
+    let workflow = latest_workflow_summary(session);
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
@@ -1040,6 +1203,8 @@ async fn get_session(
         events,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
+        workflow,
+        strict_workflow: strict_workflow_enabled(session),
     }))
 }
 
@@ -1168,6 +1333,9 @@ struct WebEventSink {
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     persisted_branch: Option<String>,
     persisted_workdir: Option<PathBuf>,
+    workflow: Option<crate::workflow::WorkflowCheckpoint>,
+    completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    cancel_token: Arc<AtomicBool>,
 }
 
 impl EventSink for WebEventSink {
@@ -1229,7 +1397,57 @@ impl EventSink for WebEventSink {
             self.persisted_workdir.clone(),
             SessionStatus::Running,
             &self.history,
+            self.workflow.clone(),
+            self.completed_workflows.clone(),
         );
+    }
+
+    fn checkpoint_workflow(
+        &mut self,
+        checkpoint: &crate::workflow::WorkflowCheckpoint,
+    ) -> Result<()> {
+        checkpoint.validate()?;
+        let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
+        if checkpoint.run.stage.is_terminal()
+            && checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
+        {
+            if self
+                .completed_workflows
+                .last()
+                .is_none_or(|existing| existing.id != summary.id)
+            {
+                self.completed_workflows.push(summary);
+            }
+            self.workflow = None;
+        } else {
+            self.workflow = Some(checkpoint.clone());
+        }
+        tokio::runtime::Handle::current().block_on(async {
+            let mut sessions = self.state.sessions.lock().await;
+            let session = sessions
+                .get_mut(&self.session_id)
+                .with_context(|| format!("session not found: {}", self.session_id))?;
+            session.workflow = self.workflow.clone();
+            session.completed_workflows = self.completed_workflows.clone();
+            session.request_template.workflow_checkpoint = session.workflow.clone();
+            session.updated_at_ms = now_millis();
+            Ok::<(), anyhow::Error>(())
+        })?;
+        persist_session_snapshot(
+            &self.session_id,
+            &self.request_template,
+            self.persisted_branch.clone(),
+            self.persisted_workdir.clone(),
+            SessionStatus::Running,
+            &self.history,
+            self.workflow.clone(),
+            self.completed_workflows.clone(),
+        );
+        Ok(())
+    }
+
+    fn should_cancel(&self) -> bool {
+        self.cancel_token.load(Ordering::SeqCst)
     }
 
     fn ask_user(&mut self, question: &str) -> Result<String> {
@@ -1273,12 +1491,20 @@ impl EventSink for WebEventSink {
                 session.workdir.clone(),
                 SessionStatus::Paused,
                 &session.history,
+                session.workflow.clone(),
+                session.completed_workflows.clone(),
             );
             Ok::<(), anyhow::Error>(())
         })?;
 
-        rx.recv()
-            .context("session stopped before the user answered the question")
+        rx.recv().map_err(|error| {
+            if self.cancel_token.load(Ordering::SeqCst) {
+                anyhow::anyhow!("workflow cancellation requested")
+            } else {
+                anyhow::anyhow!(error)
+                    .context("session stopped before the user answered the question")
+            }
+        })
     }
 }
 
@@ -1313,10 +1539,12 @@ fn dispatch_next_session(state: AppState) {
                 session.branch.clone(),
                 session.workdir.clone(),
                 Arc::clone(&session.history),
+                session.workflow.clone(),
+                session.completed_workflows.clone(),
             )
         };
 
-        let (session_id, request, branch, workdir, history) = next;
+        let (session_id, request, branch, workdir, history, workflow, completed_workflows) = next;
         persist_session_snapshot(
             &session_id,
             &request,
@@ -1324,6 +1552,8 @@ fn dispatch_next_session(state: AppState) {
             workdir,
             SessionStatus::Running,
             &history,
+            workflow,
+            completed_workflows,
         );
         spawn_agent_run(state, session_id, request);
     });
@@ -1331,7 +1561,7 @@ fn dispatch_next_session(state: AppState) {
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
     tokio::spawn(async move {
-        let (models_root, sender, history) = {
+        let (models_root, sender, history, workflow, completed_workflows, cancel_token) = {
             let sessions = state.sessions.lock().await;
             let Some(session) = sessions.get(&session_id) else {
                 return;
@@ -1343,6 +1573,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     .unwrap_or_else(crate::default_models_dir),
                 session.sender.clone(),
                 Arc::clone(&session.history),
+                session.workflow.clone(),
+                session.completed_workflows.clone(),
+                Arc::clone(&session.cancel_token),
             )
         };
 
@@ -1358,6 +1591,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 history,
                 persisted_branch: request_for_run.branch.clone(),
                 persisted_workdir: request_for_run.workdir.clone(),
+                workflow,
+                completed_workflows,
+                cancel_token,
             };
             run_agent(request_for_run.clone(), &models_root, sink)
         })
@@ -1377,6 +1613,23 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     session.request_template.workspace_graph = run_result.workspace_graph.clone();
                     session.branch = Some(run_result.branch);
                     session.workdir = Some(run_result.focus_root);
+                    if let Some(checkpoint) = run_result.workflow.clone() {
+                        if checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked {
+                            session.workflow = Some(checkpoint.clone());
+                            session.request_template.workflow_checkpoint = Some(checkpoint);
+                        } else {
+                            let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
+                            if session
+                                .completed_workflows
+                                .last()
+                                .is_none_or(|existing| existing.id != summary.id)
+                            {
+                                session.completed_workflows.push(summary);
+                            }
+                            session.workflow = None;
+                            session.request_template.workflow_checkpoint = None;
+                        }
+                    }
                     if let Some(handoff) = run_result.requested_delivery {
                         session.request_template.intent =
                             Some(crate::workflow::TurnIntent::Deliver);
@@ -1385,6 +1638,10 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         session.request_template.workflow_stage = None;
                         session.task = session.request_template.task.clone();
                         final_status = SessionStatus::Queued;
+                    } else if run_result.termination_reason
+                        == crate::events::TerminationReason::Cancelled
+                    {
+                        final_status = SessionStatus::Completed;
                     } else if !run_result.reached_final
                         || run_result.termination_reason != crate::events::TerminationReason::Final
                     {
@@ -1418,6 +1675,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     );
                 }
             }
+            session.cancel_token.store(false, Ordering::SeqCst);
             session.status = final_status;
             persist_session_snapshot(
                 &session_id,
@@ -1426,6 +1684,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.workdir.clone(),
                 final_status,
                 &session.history,
+                session.workflow.clone(),
+                session.completed_workflows.clone(),
             );
         }
         drop(sessions);
@@ -1763,6 +2023,14 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
     let session_id = persisted.session_id.clone();
     let title = latest_session_title(&persisted.events).or(persisted.title);
     let history = Arc::new(StdMutex::new(persisted.events));
+    let interrupted = persisted.running || persisted.status == Some(SessionStatus::Running);
+    let status = if interrupted {
+        SessionStatus::Paused
+    } else {
+        persisted.status.unwrap_or(SessionStatus::Completed)
+    };
+    let mut request_template = persisted.request_template;
+    request_template.workflow_checkpoint = persisted.workflow.clone();
     (
         session_id,
         SessionState {
@@ -1770,14 +2038,17 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             title,
             branch: persisted.branch,
             workdir: persisted.workdir,
-            request_template: persisted.request_template,
+            request_template,
             running: false,
-            paused: persisted.status == Some(SessionStatus::Paused),
-            status: persisted.status.unwrap_or(SessionStatus::Completed),
+            paused: status == SessionStatus::Paused,
+            status,
             pending_question: None,
             sender,
             history,
             metrics: persisted.metrics,
+            workflow: persisted.workflow,
+            completed_workflows: persisted.completed_workflows,
+            cancel_token: Arc::new(AtomicBool::new(false)),
             updated_at_ms: persisted.updated_at_ms,
         },
     )
@@ -1798,12 +2069,14 @@ fn persist_session_snapshot(
     workdir: Option<PathBuf>,
     status: SessionStatus,
     history: &StdMutex<Vec<EventEnvelope>>,
+    workflow: Option<crate::workflow::WorkflowCheckpoint>,
+    completed_workflows: Vec<crate::workflow::WorkflowSummary>,
 ) {
     let events = history
         .lock()
         .map(|history| history.clone())
         .unwrap_or_default();
-    let persisted = PersistedSession::from_parts(
+    let mut persisted = PersistedSession::from_parts(
         session_id.to_string(),
         request_template.clone(),
         branch,
@@ -1812,6 +2085,8 @@ fn persist_session_snapshot(
         status,
         events,
     );
+    persisted.workflow = workflow;
+    persisted.completed_workflows = completed_workflows;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
@@ -1821,22 +2096,29 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
     let sessions = state.sessions.lock().await;
     let mut items = sessions
         .iter()
-        .map(|(session_id, session)| SessionListItem {
-            session_id: session_id.clone(),
-            task: session.task.clone(),
-            title: effective_session_title(session),
-            running: session.running,
-            paused: session.paused,
-            status: session.status,
-            intent: session.request_template.intent,
-            branch: session.branch.clone(),
-            workdir: session
-                .workdir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            handoff_outcome: latest_handoff_outcome(session),
-            updated_at_ms: session.updated_at_ms,
-            metrics: session.metrics.clone(),
+        .map(|(session_id, session)| {
+            let workflow = latest_workflow_summary(session);
+            SessionListItem {
+                session_id: session_id.clone(),
+                task: session.task.clone(),
+                title: effective_session_title(session),
+                running: session.running,
+                paused: session.paused,
+                status: session.status,
+                intent: session.request_template.intent,
+                branch: session.branch.clone(),
+                workdir: session
+                    .workdir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                handoff_outcome: latest_handoff_outcome(session),
+                updated_at_ms: session.updated_at_ms,
+                metrics: session.metrics.clone(),
+                workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
+                workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
+                workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
+                strict_workflow: strict_workflow_enabled(session),
+            }
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
@@ -1865,6 +2147,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
             history[start..].to_vec()
         })
         .unwrap_or_default();
+    let workflow = latest_workflow_summary(session);
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
@@ -1883,6 +2166,8 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         events,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
+        workflow,
+        strict_workflow: strict_workflow_enabled(session),
     })
 }
 
@@ -2034,5 +2319,188 @@ fn publish_event(
             let overflow = entries.len() - MAX_HISTORY_EVENTS;
             entries.drain(..overflow);
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+
+    fn request(workdir: &std::path::Path) -> AgentRequest {
+        AgentRequest {
+            task: "deliver safely".to_string(),
+            turn_id: "turn-web-workflow".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Deliver),
+            workflow_policy: Some(
+                crate::workflow::WorkflowConfigDocument::default()
+                    .compile()
+                    .unwrap(),
+            ),
+            workflow_stage: None,
+            workflow_checkpoint: None,
+            conversation_handoff: None,
+            model: "model.gguf".to_string(),
+            model_dir: None,
+            workdir: Some(workdir.to_path_buf()),
+            branch: Some("pb/test".to_string()),
+            max_steps: 1,
+            max_tokens: 1,
+            turn_max_tokens_cap: None,
+            tool_allowlist: None,
+            accept_existing_workspace_changes: false,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            temperature: 0.0,
+            profile: AgentProfile::Build,
+            infer_profile: false,
+            sub_agent_depth: 0,
+            repository_less: false,
+            top_k: 1,
+            seed: 0,
+            environment: None,
+            workspace_graph: None,
+            repository_context: None,
+            prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
+            session_id: "session-web-workflow".to_string(),
+            attachments: Vec::new(),
+            contract: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_workflow_keeps_exact_checkpoint_and_projects_stage_separately() {
+        let repo = tempfile::tempdir().unwrap();
+        let output = Command::new("git")
+            .arg("init")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let request = request(repo.path());
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let run = crate::workflow::WorkflowRun::start(
+            "workflow-web-restore",
+            request.turn_id.clone(),
+            request.task.clone(),
+            request.workflow_policy.clone().unwrap(),
+            repository,
+        )
+        .unwrap();
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run).unwrap();
+        let mut persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request.clone(),
+            request.branch.clone(),
+            request.workdir.clone(),
+            true,
+            SessionStatus::Running,
+            Vec::new(),
+        );
+        persisted.workflow = Some(checkpoint.clone());
+        let (session_id, restored) = session_from_persisted(persisted);
+
+        assert_eq!(restored.status, SessionStatus::Paused);
+        assert!(restored.paused);
+        assert_eq!(restored.workflow.as_ref(), Some(&checkpoint));
+        assert_eq!(
+            restored.request_template.workflow_checkpoint.as_ref(),
+            Some(&checkpoint)
+        );
+
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let list = session_list_snapshot(&state).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, SessionStatus::Paused);
+        assert_eq!(
+            list[0].workflow_stage,
+            Some(crate::workflow::WorkflowStage::Planning)
+        );
+        assert!(list[0].strict_workflow);
+        let details = session_details_snapshot(&state, &session_id).await.unwrap();
+        assert_eq!(details.workflow.unwrap().id, "workflow-web-restore");
+        assert!(details.strict_workflow);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_blocked_workflow_preserves_content_and_records_terminal_outcome() {
+        let repo = tempfile::tempdir().unwrap();
+        let output = Command::new("git")
+            .arg("init")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let request = request(repo.path());
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-web-cancel",
+            request.turn_id.clone(),
+            request.task.clone(),
+            request.workflow_policy.clone().unwrap(),
+            repository,
+        )
+        .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+            reason: "executor unavailable".to_string(),
+        })
+        .unwrap();
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run).unwrap();
+        let mut persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request.clone(),
+            request.branch.clone(),
+            request.workdir.clone(),
+            false,
+            SessionStatus::Failed,
+            Vec::new(),
+        );
+        persisted.workflow = Some(checkpoint);
+        let (session_id, restored) = session_from_persisted(persisted);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+        };
+        std::fs::write(repo.path().join("in-progress.txt"), "preserve me\n").unwrap();
+
+        cancel_session_inner(state.clone(), session_id.clone())
+            .await
+            .unwrap();
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert!(session.workflow.is_none());
+        assert_eq!(
+            session.completed_workflows.last().unwrap().outcome,
+            Some(crate::workflow::WorkflowOutcome::Cancelled)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("in-progress.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(
+            session
+                .history
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(
+                    envelope.event,
+                    AgentEvent::WorkflowCompleted {
+                        outcome: crate::workflow::WorkflowOutcome::Cancelled,
+                        ..
+                    }
+                ))
+        );
     }
 }

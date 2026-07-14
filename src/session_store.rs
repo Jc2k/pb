@@ -328,6 +328,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            workflow_checkpoint: None,
             conversation_handoff: None,
             model: "model.gguf".to_string(),
             model_dir: None,

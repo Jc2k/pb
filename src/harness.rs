@@ -46,6 +46,7 @@ struct ScratchLayout {
     run_journal: PathBuf,
     task_baseline: PathBuf,
     adoptions: PathBuf,
+    workflow_checkpoint: PathBuf,
     resumed: bool,
 }
 
@@ -148,6 +149,7 @@ struct JournalState {
     summary: CapturedSummary,
     audit: HarnessRunAudit,
     write_error: Option<String>,
+    workflow_checkpoint: PathBuf,
 }
 
 #[derive(Clone)]
@@ -156,7 +158,7 @@ struct HarnessEventSink {
 }
 
 impl HarnessEventSink {
-    fn new(cumulative_path: &Path, run_path: &Path) -> Result<Self> {
+    fn new(cumulative_path: &Path, run_path: &Path, workflow_checkpoint: &Path) -> Result<Self> {
         let cumulative_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -186,6 +188,7 @@ impl HarnessEventSink {
                 summary: CapturedSummary::default(),
                 audit: HarnessRunAudit::default(),
                 write_error: None,
+                workflow_checkpoint: workflow_checkpoint.to_path_buf(),
             })),
         })
     }
@@ -373,6 +376,22 @@ impl EventSink for HarnessEventSink {
             state.write_error = Some(write_errors.join("; "));
         }
     }
+
+    fn checkpoint_workflow(
+        &mut self,
+        checkpoint: &crate::workflow::WorkflowCheckpoint,
+    ) -> Result<()> {
+        checkpoint.validate()?;
+        let path = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?
+            .workflow_checkpoint
+            .clone();
+        let bytes = serde_json::to_vec_pretty(checkpoint)
+            .context("failed to serialize harness workflow checkpoint")?;
+        atomic_write(&path, &bytes)
+    }
 }
 
 fn write_event_line(writer: &mut BufWriter<File>, encoded: &[u8]) -> std::io::Result<()> {
@@ -439,12 +458,26 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .map(|contract| contract.compile_workspace_graph(base_workspace_graph.clone()))
         .transpose()?
         .unwrap_or(base_workspace_graph);
+    let resumed_workflow = load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)?;
+    if let Some(checkpoint) = resumed_workflow.as_ref()
+        && checkpoint.run.task != args.task
+    {
+        bail!(
+            "active harness workflow task differs from --task; finish or cancel '{}' before starting '{}'",
+            checkpoint.run.task,
+            args.task
+        );
+    }
     let request = AgentRequest {
         task: args.task.clone(),
-        turn_id: format!("harness-turn-{}", layout.run_id),
+        turn_id: resumed_workflow
+            .as_ref()
+            .map(|checkpoint| checkpoint.run.source_turn_id.clone())
+            .unwrap_or_else(|| format!("harness-turn-{}", layout.run_id)),
         intent: Some(args.intent),
         workflow_policy: Some(workflow_policy),
         workflow_stage: None,
+        workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,
         model: args
             .model
@@ -497,7 +530,11 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
 
     write_running_journal(&layout, &args.task, workspace_config_metadata.as_ref())?;
     append_run_index_started(&layout, &args.task, workspace_config_metadata.as_ref())?;
-    let sink = HarnessEventSink::new(&layout.events, &layout.run_events)?;
+    let sink = HarnessEventSink::new(
+        &layout.events,
+        &layout.run_events,
+        &layout.workflow_checkpoint,
+    )?;
     let run_result = run_agent(request, &models_root, sink.clone());
     let (mut observations, summary, audit) = sink.snapshot()?;
     add_run_observations(&mut observations, &run_result, &layout.workspace, &summary);
@@ -626,6 +663,35 @@ fn load_check_evidence(path: &Path) -> Result<crate::checks::CheckEvidenceLedger
         events.push(envelope.event);
     }
     Ok(crate::checks::CheckEvidenceLedger::from_events(&events))
+}
+
+fn load_resumable_workflow_checkpoint(
+    path: &Path,
+) -> Result<Option<crate::workflow::WorkflowCheckpoint>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read harness workflow checkpoint {}",
+            path.display()
+        )
+    })?;
+    let checkpoint: crate::workflow::WorkflowCheckpoint = serde_json::from_slice(&bytes)
+        .with_context(|| {
+            format!(
+                "failed to parse harness workflow checkpoint {}",
+                path.display()
+            )
+        })?;
+    checkpoint.validate()?;
+    if checkpoint.run.stage.is_terminal()
+        && checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
+    {
+        Ok(None)
+    } else {
+        Ok(Some(checkpoint))
+    }
 }
 
 fn harness_outcome_succeeded(result: &AgentRunResult) -> bool {
@@ -837,6 +903,7 @@ fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
         run_journal: run_dir.join("journal.md"),
         task_baseline: root.join("task-baseline.json"),
         adoptions: root.join("adoptions.jsonl"),
+        workflow_checkpoint: root.join("workflow-checkpoint.json"),
         run_id,
         root,
         workspace,
@@ -1478,6 +1545,69 @@ mod tests {
     }
 
     #[test]
+    fn harness_checkpoint_round_trip_resumes_active_and_blocked_workflows_only() {
+        let parent = tempfile::tempdir().unwrap();
+        let layout = prepare_scratch(Some(&parent.path().join("run"))).unwrap();
+        let repository = harness_repository_context(&layout).unwrap();
+        let policy = crate::workflow::WorkflowConfigDocument::default()
+            .compile()
+            .unwrap();
+        let run = crate::workflow::WorkflowRun::start(
+            "workflow-harness-resume",
+            "turn-harness-resume",
+            "deliver safely",
+            policy,
+            repository,
+        )
+        .unwrap();
+        let mut sink = HarnessEventSink::new(
+            &layout.events,
+            &layout.run_events,
+            &layout.workflow_checkpoint,
+        )
+        .unwrap();
+
+        let active = crate::workflow::WorkflowCheckpoint::new(run.clone()).unwrap();
+        sink.checkpoint_workflow(&active).unwrap();
+        assert_eq!(
+            load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)
+                .unwrap()
+                .unwrap(),
+            active
+        );
+
+        let mut blocked_run = run.clone();
+        blocked_run
+            .apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                reason: "configured executor is unavailable".to_string(),
+            })
+            .unwrap();
+        let blocked = crate::workflow::WorkflowCheckpoint::new(blocked_run).unwrap();
+        sink.checkpoint_workflow(&blocked).unwrap();
+        assert_eq!(
+            load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)
+                .unwrap()
+                .unwrap(),
+            blocked
+        );
+
+        let mut cancelled_run = run;
+        cancelled_run
+            .apply(crate::workflow::WorkflowEvent::Cancelled {
+                reason: "cancelled".to_string(),
+            })
+            .unwrap();
+        sink.checkpoint_workflow(&crate::workflow::WorkflowCheckpoint::new(cancelled_run).unwrap())
+            .unwrap();
+        assert!(
+            load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn resumed_scratch_preserves_task_baseline_and_records_adoption() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
@@ -1510,7 +1640,12 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let events = parent.path().join("events.jsonl");
         let run_events = parent.path().join("run-events.jsonl");
-        let mut sink = HarnessEventSink::new(&events, &run_events).unwrap();
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
         sink.emit(AgentEvent::CheckResult {
             check_id: "logic".to_string(),
             exit_status: 0,
@@ -1619,7 +1754,12 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let events = parent.path().join("events.jsonl");
         let run_events = parent.path().join("run-events.jsonl");
-        let sink = HarnessEventSink::new(&events, &run_events).unwrap();
+        let sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
         let mut emitter = sink.clone();
         emitter.emit(AgentEvent::Started {
             task: "task".to_string(),
@@ -1646,7 +1786,12 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let events = parent.path().join("events.jsonl");
         let run_events = parent.path().join("run-events.jsonl");
-        let mut sink = HarnessEventSink::new(&events, &run_events).unwrap();
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
         sink.emit(AgentEvent::ExecutorStarted {
             executor_id: "web".to_string(),
             kind: "local".to_string(),
@@ -1734,7 +1879,12 @@ mod tests {
     fn finish_test_run(layout: &ScratchLayout, task: &str, branch: &str) {
         write_running_journal(layout, task, None).unwrap();
         append_run_index_started(layout, task, None).unwrap();
-        let sink = HarnessEventSink::new(&layout.events, &layout.run_events).unwrap();
+        let sink = HarnessEventSink::new(
+            &layout.events,
+            &layout.run_events,
+            &layout.workflow_checkpoint,
+        )
+        .unwrap();
         let mut emitter = sink.clone();
         emitter.emit(AgentEvent::Started {
             task: task.to_string(),

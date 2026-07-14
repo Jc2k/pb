@@ -48,6 +48,7 @@ pub enum TerminationReason {
     ExecutorUnavailable,
     RepairExhausted,
     CommitBlocked,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +137,7 @@ impl TerminationReason {
             Self::ExecutorUnavailable => "executor_unavailable",
             Self::RepairExhausted => "repair_exhausted",
             Self::CommitBlocked => "commit_blocked",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -231,6 +233,13 @@ pub enum AgentEvent {
         workflow_id: String,
         source_turn_id: String,
         policy_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    WorkflowResumed {
+        workflow_id: String,
+        stage: crate::workflow::WorkflowStage,
+        checkpoint_sha256: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -627,6 +636,20 @@ impl EventEnvelope {
                     workflow_id,
                     source_turn_id,
                     policy_sha256,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::WorkflowResumed {
+                workflow_id,
+                stage,
+                checkpoint_sha256,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::WorkflowResumed {
+                    workflow_id,
+                    stage,
+                    checkpoint_sha256,
                     timestamp_ms: Some(now),
                 },
             },

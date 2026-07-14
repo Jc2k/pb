@@ -671,6 +671,32 @@ export function MessageBubble({
         </article>
       );
 
+    case "workflow_challenge_raised":
+      return (
+        <article className="session-correction" aria-label="Workflow challenge">
+          <strong>{e.severity.toUpperCase()} challenge</strong>
+          <span>{e.summary}</span>
+          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+        </article>
+      );
+
+    case "workflow_blocked":
+      return (
+        <article className="session-error" aria-label="Workflow blocked">
+          <strong>Delivery needs help</strong>
+          <span>{e.reason}</span>
+          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+        </article>
+      );
+
+    case "workflow_evidence_invalidated":
+      return (
+        <article className="session-correction" aria-label="Workflow evidence invalidated">
+          <span>{e.reason}</span>
+          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+        </article>
+      );
+
     case "correction":
       return <CorrectionNotice event={e} />;
 
@@ -769,6 +795,12 @@ export function MessageBubble({
       return null;
 
     case "executor_started":
+    case "workflow_started":
+    case "workflow_resumed":
+    case "workflow_stage_started":
+    case "workflow_stage_completed":
+    case "workflow_artifact_accepted":
+    case "workflow_completed":
     case "check_result":
     case "commit_result":
     case "handoff_summary":
@@ -868,20 +900,27 @@ export function SessionCard({
     ) : (
       <span className="badge bg-warning text-dark">Paused after restart</span>
     );
-  } else if (session.handoff_outcome === "no_change") {
+  } else if (session.workflow_outcome === "no_change" || session.handoff_outcome === "no_change") {
     badge = <span className="badge bg-secondary">No code changes</span>;
-  } else if (session.handoff_outcome === "ready") {
+  } else if (session.workflow_outcome === "ready" || session.handoff_outcome === "ready") {
     badge = <span className="badge bg-success">Ready</span>;
   } else if (
+    session.workflow_outcome === "checks_failed" ||
+    session.workflow_outcome === "review_failed" ||
+    session.workflow_outcome === "repair_cycles_exhausted" ||
     session.handoff_outcome === "checks_failed" ||
     session.handoff_outcome === "repair_exhausted"
   ) {
     badge = <span className="badge bg-warning text-dark">Needs another pass</span>;
   } else if (
+    session.workflow_outcome === "executor_unavailable" ||
+    session.workflow_outcome === "commit_blocked" ||
     session.handoff_outcome === "executor_unavailable" ||
     session.handoff_outcome === "commit_blocked"
   ) {
     badge = <span className="badge bg-danger">Needs help</span>;
+  } else if (session.workflow_outcome === "cancelled") {
+    badge = <span className="badge bg-secondary">Cancelled</span>;
   } else if (session.status === "failed") {
     badge = <span className="badge bg-danger">Stopped</span>;
   } else if (session.branch) {

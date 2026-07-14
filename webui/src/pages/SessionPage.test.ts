@@ -1,7 +1,12 @@
 /// <reference lib="deno.ns" />
 import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
-import { latestPendingDeliveryProposal } from "./SessionPage.tsx";
+import {
+  latestPendingDeliveryProposal,
+  workflowOutcomeLabel,
+  workflowProgressLabel,
+  workflowStageLabel,
+} from "./SessionPage.tsx";
 import type { EventEnvelope } from "../types/index.ts";
 
 Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
@@ -39,6 +44,35 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
     },
   });
   equal(latestPendingDeliveryProposal(events), undefined);
+});
+
+Deno.test("strict workflow stages and outcomes use compact truthful labels", () => {
+  equal(workflowStageLabel("planning"), "Planning");
+  equal(workflowStageLabel("plan_review"), "Challenging the plan");
+  equal(workflowStageLabel("checking"), "Running checks");
+  equal(workflowStageLabel("code_review"), "Challenging the code");
+  equal(workflowStageLabel("committing"), "Creating reviewed commit");
+  equal(workflowOutcomeLabel("no_change"), "No code changes");
+  equal(workflowOutcomeLabel("review_failed"), "Needs another pass");
+  equal(workflowOutcomeLabel("commit_blocked"), "Needs help");
+  equal(workflowOutcomeLabel("cancelled"), "Cancelled — work preserved");
+  equal(workflowProgressLabel("ready", "ready"), "Ready");
+});
+
+Deno.test("workflow controls preserve work and restore conversation after terminal outcomes", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+
+  ok(page.includes("`/api/sessions/${sessionId}/cancel`"));
+  ok(page.includes("`/api/sessions/${sessionId}/resume`"));
+  ok(page.includes('session.workflow?.stage === "blocked"'));
+  ok(page.includes("resume from the preserved stage"));
+  ok(page.includes('setIntent("discuss")'));
+  ok(
+    page.includes(
+      '!isRunning && (session.status === "completed" || session.status === "failed")',
+    ),
+  );
+  ok(page.includes("<IntentControl intent={intent} onChange={setIntent} />"));
 });
 
 Deno.test("paused session composer keeps resume action at intrinsic width", async () => {

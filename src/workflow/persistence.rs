@@ -5,6 +5,29 @@ use sha2::{Digest, Sha256};
 use super::{WorkflowOutcome, WorkflowRun, WorkflowStage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowGitControlState {
+    pub head: String,
+    pub index_sha256: String,
+    pub refs_sha256: String,
+}
+
+impl WorkflowGitControlState {
+    pub fn difference(&self, current: &Self) -> String {
+        let mut changed = Vec::new();
+        if self.head != current.head {
+            changed.push("HEAD");
+        }
+        if self.index_sha256 != current.index_sha256 {
+            changed.push("index");
+        }
+        if self.refs_sha256 != current.refs_sha256 {
+            changed.push("refs");
+        }
+        changed.join(", ")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowCheckpoint {
     pub sha256: String,
     pub run: WorkflowRun,
@@ -27,6 +50,12 @@ impl WorkflowCheckpoint {
         }
         if self.run.policy.sha256 != self.run.policy_sha256 {
             bail!("workflow checkpoint policy hash does not match compiled policy");
+        }
+        if self.run.stage == WorkflowStage::Blocked && self.run.paused_stage.is_none() {
+            bail!("blocked workflow checkpoint has no resumable prior stage");
+        }
+        if self.run.stage != WorkflowStage::Blocked && self.run.paused_stage.is_some() {
+            bail!("non-blocked workflow checkpoint contains a paused stage");
         }
         self.run.policy.validate()?;
         Ok(())

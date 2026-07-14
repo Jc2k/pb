@@ -134,6 +134,33 @@ struct WebSearchResult {
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
 
+    /// Persist a complete workflow checkpoint synchronously. Delivery calls this before any next
+    /// stage/model invocation so an event stream cannot claim a transition that recovery loses.
+    fn checkpoint_workflow(
+        &mut self,
+        _checkpoint: &crate::workflow::WorkflowCheckpoint,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn should_cancel(&self) -> bool {
+        false
+    }
+
+    /// Strict delivery uses these hooks to durably reserve workflow-wide resources at the same
+    /// boundary as the in-memory budget. Default sinks retain legacy, non-workflow behavior.
+    fn workflow_model_invocation_started(&mut self, _nesting_depth: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn workflow_generated_tokens(&mut self, _generated_tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn workflow_advisory_started(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn ask_user(&mut self, _question: &str) -> Result<String> {
         bail!("ask_user is not available in this execution context")
     }
@@ -491,6 +518,11 @@ pub struct AgentRequest {
     /// snapshotted policy; callers cannot supply an arbitrary capability set.
     #[serde(default)]
     pub workflow_stage: Option<crate::workflow::WorkflowStage>,
+    /// Durable harness-owned checkpoint used only to resume an existing delivery workflow. A
+    /// caller cannot use this to grant capabilities: the digest, policy, repository, Git control
+    /// state, and stage are reconciled before another model invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_checkpoint: Option<crate::workflow::WorkflowCheckpoint>,
     /// Bounded, auditable conversation facts selected as input to a delivery workflow. This is
     /// data, not authority: the planning stage must still map it into explicit requirements.
     #[serde(default)]
@@ -3181,6 +3213,24 @@ fn run_agent_steps(
     }
 
     while step <= effective_max_steps {
+        if sink.should_cancel() {
+            sink.emit(AgentEvent::Correction {
+                message: "The user cancelled this run; repository content and collected evidence are being preserved."
+                    .to_string(),
+                summary: "Run cancelled".to_string(),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            return Ok(StepRunOutcome {
+                reached_final: false,
+                contract_status: incomplete_contract_status(args),
+                verified_completed: false,
+                termination_reason: TerminationReason::Cancelled,
+                final_content: Some("Cancelled by user".to_string()),
+                metrics,
+                gate_state: gate_state.into_inner(),
+            });
+        }
         sink.emit(AgentEvent::StepStarted {
             step,
             max_steps: effective_max_steps,
@@ -3962,6 +4012,7 @@ fn run_final_grace(
         }
     };
     grace_args.turn_max_tokens_cap = Some(FINAL_GRACE_MAX_TOKENS);
+    sink.workflow_model_invocation_started(nesting_depth)?;
     let completion = match generator.generate(&grace_args, messages, &[]) {
         Ok(completion) => completion,
         Err(error) => {
@@ -3996,6 +4047,7 @@ fn run_final_grace(
     run_budget
         .borrow_mut()
         .record_generated_tokens(completion.generated_tokens);
+    sink.workflow_generated_tokens(completion.generated_tokens)?;
     record_completion_metrics(&completion, grace_step, nesting_depth, &mut metrics, sink);
 
     let action = if completion.finish_reason == CompletionFinishReason::EndOfGeneration
@@ -4281,6 +4333,7 @@ fn run_step_limit_monitor(
         });
         return Ok(None);
     }
+    sink.workflow_advisory_started()?;
     let monitor_task = format!(
         "The primary {} agent has just used its configured step budget ({}) without a final response. Audit the current transcript for loops, off-track behavior, blockers, and whether it should receive a small extra step grant. Return status, evidence, immediate next action, whether to grant more steps, and stop conditions.",
         args.profile.as_str(),
@@ -5021,6 +5074,193 @@ struct DeliveryRunOutcome {
 
 const MAX_IDENTICAL_WORKFLOW_VALIDATION_FAILURES: usize = 3;
 
+fn workflow_graph_sha256(graph: &crate::workspace::WorkspaceGraph) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(graph).context("failed to serialize normalized workspace graph")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn checkpoint_delivery(run: &crate::workflow::WorkflowRun, sink: &mut dyn EventSink) -> Result<()> {
+    let checkpoint = crate::workflow::WorkflowCheckpoint::new(run.clone())?;
+    sink.checkpoint_workflow(&checkpoint)
+}
+
+struct WorkflowCheckpointingSink<'a> {
+    run: &'a mut crate::workflow::WorkflowRun,
+    sink: &'a mut dyn EventSink,
+}
+
+impl WorkflowCheckpointingSink<'_> {
+    fn record_usage(&mut self, usage: crate::workflow::WorkflowUsage) -> Result<()> {
+        self.run
+            .apply(crate::workflow::WorkflowEvent::UsageRecorded { usage })?;
+        checkpoint_delivery(self.run, self.sink)
+    }
+}
+
+impl EventSink for WorkflowCheckpointingSink<'_> {
+    fn emit(&mut self, event: AgentEvent) {
+        self.sink.emit(event);
+    }
+
+    fn checkpoint_workflow(
+        &mut self,
+        checkpoint: &crate::workflow::WorkflowCheckpoint,
+    ) -> Result<()> {
+        self.sink.checkpoint_workflow(checkpoint)
+    }
+
+    fn should_cancel(&self) -> bool {
+        self.sink.should_cancel()
+    }
+
+    fn workflow_model_invocation_started(&mut self, nesting_depth: usize) -> Result<()> {
+        self.record_usage(crate::workflow::WorkflowUsage {
+            stage_steps: usize::from(nesting_depth == 0),
+            model_invocations: 1,
+            generated_tokens: 0,
+            advisory_calls: 0,
+        })
+    }
+
+    fn workflow_generated_tokens(&mut self, generated_tokens: usize) -> Result<()> {
+        self.record_usage(crate::workflow::WorkflowUsage {
+            generated_tokens,
+            ..crate::workflow::WorkflowUsage::default()
+        })
+    }
+
+    fn workflow_advisory_started(&mut self) -> Result<()> {
+        self.record_usage(crate::workflow::WorkflowUsage {
+            advisory_calls: 1,
+            ..crate::workflow::WorkflowUsage::default()
+        })
+    }
+
+    fn ask_user(&mut self, question: &str) -> Result<String> {
+        self.sink.ask_user(question)
+    }
+
+    fn ask_multiple_choice(&mut self, question: &str, choices: &[String]) -> Result<String> {
+        self.sink.ask_multiple_choice(question, choices)
+    }
+}
+
+fn validate_resumed_delivery_content(
+    run: &crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+) -> Result<()> {
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    match run.stage {
+        crate::workflow::WorkflowStage::Planning
+        | crate::workflow::WorkflowStage::PlanReview
+        | crate::workflow::WorkflowStage::PlanRevision => {
+            if current.fingerprint != run.planning_content().fingerprint {
+                bail!("planning content changed outside an accepted implementation stage");
+            }
+        }
+        crate::workflow::WorkflowStage::Implementing
+        | crate::workflow::WorkflowStage::Repairing => {
+            let plan = run
+                .plan
+                .as_ref()
+                .context("resumed implementation stage has no accepted plan")?;
+            let planned = plan
+                .artifact
+                .steps
+                .iter()
+                .flat_map(|step| step.paths.iter().map(|path| path.path.as_str()))
+                .collect::<HashSet<_>>();
+            let outside_plan = run
+                .repository
+                .task_baseline
+                .content
+                .changed_paths(&current)
+                .into_iter()
+                .filter(|path| !planned.contains(path.as_str()))
+                .collect::<Vec<_>>();
+            if !outside_plan.is_empty() {
+                bail!(
+                    "resumed implementation contains path(s) outside the accepted plan: {}",
+                    outside_plan.join(", ")
+                );
+            }
+        }
+        crate::workflow::WorkflowStage::Checking
+        | crate::workflow::WorkflowStage::CodeReview
+        | crate::workflow::WorkflowStage::Committing => {
+            if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
+                bail!("resumed deterministic/review stage content fingerprint is stale");
+            }
+        }
+        stage => bail!("workflow stage {stage:?} is not resumable"),
+    }
+    Ok(())
+}
+
+fn resumed_commit_matches_reviewed_delta(
+    run: &crate::workflow::WorkflowRun,
+    expected_control: &GitControlState,
+    workspace_root: &Path,
+) -> Result<bool> {
+    if run.stage != crate::workflow::WorkflowStage::Committing
+        || expected_control.head == "<unborn>"
+    {
+        return Ok(false);
+    }
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
+        return Ok(false);
+    }
+    let parent = git_run(&["rev-parse", "HEAD^"], workspace_root).unwrap_or_default();
+    if parent.trim() != expected_control.head {
+        return Ok(false);
+    }
+    let expected_subject = run
+        .implementation
+        .as_ref()
+        .map(|implementation| implementation.artifact.semantic_commit_subject.as_str())
+        .unwrap_or_default();
+    let actual_subject = git_run(&["log", "-1", "--pretty=%s"], workspace_root)?;
+    if actual_subject.trim() != expected_subject {
+        return Ok(false);
+    }
+    let output = Command::new("git")
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "HEAD",
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .context("failed to inspect potentially completed managed commit")?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let committed_paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).replace('\\', "/"))
+        .collect::<BTreeSet<_>>();
+    let task_paths = run
+        .repository
+        .task_changed_paths()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if committed_paths != task_paths {
+        return Ok(false);
+    }
+    let status = git_status_porcelain(workspace_root)?;
+    Ok(!status.lines().any(|line| {
+        let path = line.get(3..).unwrap_or_default().trim();
+        task_paths.contains(path)
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_delivery_workflow(
     generator: &mut dyn CompletionEngine,
@@ -5052,29 +5292,102 @@ fn run_delivery_workflow(
         .workspace_graph
         .as_ref()
         .context("delivery requires a normalized workspace graph")?;
-    let workflow_id = format!(
-        "workflow-{:016x}",
-        stable_hash(&format!(
-            "{}\0{}\0{}\0{}",
-            args.session_id, args.turn_id, repository.task_baseline.id, policy.sha256
-        ))
-    );
-    let mut run = crate::workflow::WorkflowRun::start(
-        workflow_id,
-        args.turn_id.clone(),
-        args.task.clone(),
-        policy.clone(),
-        repository,
-    )?;
-    sink.emit(AgentEvent::WorkflowStarted {
-        workflow_id: run.id.clone(),
-        source_turn_id: run.source_turn_id.clone(),
-        policy_sha256: run.policy_sha256.clone(),
-        timestamp_ms: Some(now_millis()),
-    });
-    let workflow_control_baseline = git_control_state(workspace_root)?;
+    let graph_sha256 = workflow_graph_sha256(graph)?;
+    let current_control = git_control_state(workspace_root)?;
+    let mut resumed = false;
+    let mut resume_block_reason = None;
+    let mut run = if let Some(checkpoint) = args.workflow_checkpoint.as_ref() {
+        checkpoint.validate()?;
+        let mut run = checkpoint.run.clone();
+        if run.policy_sha256 != policy.sha256 {
+            bail!("workflow checkpoint policy hash differs from the requested policy");
+        }
+        if run.workspace_graph_sha256.is_empty() || run.workspace_graph_sha256 != graph_sha256 {
+            bail!("workflow checkpoint workspace graph differs from the normalized request graph");
+        }
+        if run.task != args.task {
+            bail!("workflow checkpoint task differs from the resumed request");
+        }
+        if run.repository.task_baseline.id != repository.task_baseline.id
+            || run.repository.repo_root != repository.repo_root
+        {
+            bail!("workflow checkpoint repository baseline differs from the resumed workspace");
+        }
+        if run.stage == crate::workflow::WorkflowStage::Blocked {
+            run.apply(crate::workflow::WorkflowEvent::Resumed)?;
+        } else if run.stage.is_terminal() {
+            bail!("completed workflow {:?} cannot be resumed", run.stage);
+        }
+        let expected_control = run
+            .git_control
+            .clone()
+            .context("workflow checkpoint has no Git control baseline")?;
+        if expected_control != current_control {
+            if resumed_commit_matches_reviewed_delta(&run, &expected_control, workspace_root)? {
+                run.git_control = Some(current_control.clone());
+            } else {
+                resume_block_reason = Some(format!(
+                    "Git control state differs from the workflow checkpoint ({})",
+                    expected_control.difference(&current_control)
+                ));
+            }
+        } else if let Err(error) = validate_resumed_delivery_content(&run, workspace_root) {
+            resume_block_reason = Some(format!("workspace cannot safely resume: {error:#}"));
+        }
+        resumed = true;
+        run
+    } else {
+        let workflow_id = format!(
+            "workflow-{:016x}",
+            stable_hash(&format!(
+                "{}\0{}\0{}\0{}",
+                args.session_id, args.turn_id, repository.task_baseline.id, policy.sha256
+            ))
+        );
+        let mut run = crate::workflow::WorkflowRun::start(
+            workflow_id,
+            args.turn_id.clone(),
+            args.task.clone(),
+            policy.clone(),
+            repository,
+        )?;
+        run.workspace_graph_sha256 = graph_sha256;
+        run.git_control = Some(current_control.clone());
+        run
+    };
+    let workflow_control_baseline = run
+        .git_control
+        .clone()
+        .context("delivery workflow has no Git control baseline")?;
+    if let Some(reason) = resume_block_reason {
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            reason,
+        })?;
+    }
+    if resumed {
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run.clone())?;
+        sink.emit(AgentEvent::WorkflowResumed {
+            workflow_id: run.id.clone(),
+            stage: run.paused_stage.unwrap_or(run.stage),
+            checkpoint_sha256: checkpoint.sha256,
+            timestamp_ms: Some(now_millis()),
+        });
+    } else {
+        sink.emit(AgentEvent::WorkflowStarted {
+            workflow_id: run.id.clone(),
+            source_turn_id: run.source_turn_id.clone(),
+            policy_sha256: run.policy_sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+    checkpoint_delivery(&run, sink)?;
 
-    let run_budget = RefCell::new(RunBudget::for_workflow(policy.limits));
+    let mut budget = RunBudget::for_workflow(policy.limits);
+    budget.advisory_calls = run.counters.advisory_calls;
+    budget.model_invocations = run.counters.model_invocations;
+    budget.generated_tokens = run.counters.generated_tokens;
+    let run_budget = RefCell::new(budget);
     let mut check_runtime = WorkspaceCheckRuntime::new(
         workspace_root,
         graph,
@@ -5089,6 +5402,13 @@ fn run_delivery_workflow(
     let mut repair_context: Option<String> = None;
 
     loop {
+        if sink.should_cancel() && !run.stage.is_terminal() {
+            run.apply(crate::workflow::WorkflowEvent::Cancelled {
+                reason: "cancelled by user; repository content and evidence were preserved"
+                    .to_string(),
+            })?;
+            checkpoint_delivery(&run, sink)?;
+        }
         if run.stage.is_terminal() {
             return delivery_terminal_outcome(run, metrics, sink);
         }
@@ -5177,7 +5497,7 @@ fn run_delivery_workflow(
             let isolated = prepare_isolated_review_workspace(workspace_root)?;
             let snapshot = crate::workspace::ContentSnapshot::capture(&isolated.root)?;
             let expected = if stage == crate::workflow::WorkflowStage::PlanReview {
-                run.repository.task_baseline.content.fingerprint.as_str()
+                run.planning_content().fingerprint.as_str()
             } else {
                 run.content_fingerprint
                     .as_deref()
@@ -5193,32 +5513,82 @@ fn run_delivery_workflow(
         let stage_root = isolated_review
             .as_ref()
             .map_or(workspace_root, |isolated| isolated.root.as_path());
-        let stage_outcome = run_stage(
-            generator,
-            text_backend,
-            llamacpp,
-            args,
-            &contract,
-            context,
-            stage_root,
-            models_root,
-            matches!(
-                stage,
-                crate::workflow::WorkflowStage::Implementing
-                    | crate::workflow::WorkflowStage::Repairing
-            )
-            .then_some(command_backend)
-            .flatten(),
-            env_config,
-            todo_memory,
-            mcp_registry,
-            lsp_registry,
-            policy_config,
-            personal_memory_repo,
-            &run_budget,
-            sink,
-        )?;
+        let usage_before = (
+            run.counters.stage_steps.get(&stage).copied().unwrap_or(0),
+            run.counters.model_invocations,
+            run.counters.generated_tokens,
+            run.counters.advisory_calls,
+        );
+        let stage_outcome = {
+            let mut checkpointing_sink = WorkflowCheckpointingSink {
+                run: &mut run,
+                sink,
+            };
+            run_stage(
+                generator,
+                text_backend,
+                llamacpp,
+                args,
+                &contract,
+                context,
+                stage_root,
+                models_root,
+                matches!(
+                    stage,
+                    crate::workflow::WorkflowStage::Implementing
+                        | crate::workflow::WorkflowStage::Repairing
+                )
+                .then_some(command_backend)
+                .flatten(),
+                env_config,
+                todo_memory,
+                mcp_registry,
+                lsp_registry,
+                policy_config,
+                personal_memory_repo,
+                &run_budget,
+                &mut checkpointing_sink,
+            )?
+        };
+        let persisted_usage = crate::workflow::WorkflowUsage {
+            stage_steps: run
+                .counters
+                .stage_steps
+                .get(&stage)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(usage_before.0),
+            model_invocations: run
+                .counters
+                .model_invocations
+                .saturating_sub(usage_before.1),
+            generated_tokens: run.counters.generated_tokens.saturating_sub(usage_before.2),
+            advisory_calls: run.counters.advisory_calls.saturating_sub(usage_before.3),
+        };
+        if persisted_usage != stage_outcome.usage {
+            bail!(
+                "durable workflow usage diverged from the stage runner: persisted {persisted_usage:?}, observed {:?}",
+                stage_outcome.usage
+            );
+        }
         metrics.add(&stage_outcome.metrics);
+        if matches!(
+            stage,
+            crate::workflow::WorkflowStage::Planning
+                | crate::workflow::WorkflowStage::PlanRevision
+                | crate::workflow::WorkflowStage::PlanReview
+        ) {
+            let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+            if current.fingerprint != run.planning_content().fingerprint {
+                run.apply(crate::workflow::WorkflowEvent::Blocked {
+                    outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    reason: format!(
+                        "repository content changed while the read-only {stage:?} stage was running"
+                    ),
+                })?;
+                return delivery_terminal_outcome(run, metrics, sink);
+            }
+        }
         let current_control = git_control_state(workspace_root)?;
         if workflow_control_baseline != current_control {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
@@ -5241,9 +5611,7 @@ fn run_delivery_workflow(
                 return delivery_terminal_outcome(run, metrics, sink);
             }
         }
-        run.apply(crate::workflow::WorkflowEvent::UsageRecorded {
-            usage: stage_outcome.usage,
-        })?;
+        checkpoint_delivery(&run, sink)?;
         if run.stage.is_terminal() {
             return delivery_terminal_outcome(run, metrics, sink);
         }
@@ -5257,6 +5625,13 @@ fn run_delivery_workflow(
             return delivery_terminal_outcome(run, metrics, sink);
         }
         let Some(submission) = stage_outcome.submission else {
+            if stage_outcome.termination_reason == TerminationReason::Cancelled {
+                run.apply(crate::workflow::WorkflowEvent::Cancelled {
+                    reason: "cancelled by user; repository content and evidence were preserved"
+                        .to_string(),
+                })?;
+                return delivery_terminal_outcome(run, metrics, sink);
+            }
             let workflow_outcome =
                 workflow_outcome_for_termination(stage_outcome.termination_reason);
             run.apply(crate::workflow::WorkflowEvent::Failed {
@@ -5277,10 +5652,7 @@ fn run_delivery_workflow(
                 crate::workflow::StageSubmission::Plan { plan },
             ) => plan
                 .validate_digest()
-                .and_then(|_| {
-                    plan.artifact
-                        .validate(graph, &run.repository.task_baseline.content)
-                })
+                .and_then(|_| plan.artifact.validate(graph, run.planning_content()))
                 .and_then(|_| {
                     run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan: plan.clone() })
                 })
@@ -5326,8 +5698,10 @@ fn run_delivery_workflow(
                 crate::workflow::StageSubmission::Replan { reason },
             ) => {
                 let digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
+                let planning_snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
                 run.apply(crate::workflow::WorkflowEvent::ReplanRequested {
                     reason: reason.clone(),
+                    planning_snapshot: Some(planning_snapshot),
                 })
                 .map(|_| {
                     (
@@ -5416,6 +5790,7 @@ fn run_delivery_workflow(
                     stage,
                     timestamp_ms: Some(now_millis()),
                 });
+                checkpoint_delivery(&run, sink)?;
             }
             Err(error) => {
                 let feedback = format!("structured {stage:?} submission was rejected: {error:#}");
@@ -5453,6 +5828,7 @@ fn run_delivery_workflow(
                     return delivery_terminal_outcome(run, metrics, sink);
                 }
                 validation_feedback = Some(feedback);
+                checkpoint_delivery(&run, sink)?;
             }
         }
     }
@@ -5565,6 +5941,7 @@ fn run_delivery_checks(
                     outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
                     reason: format!("failed to select affected checks: {error:#}"),
                 })?;
+                checkpoint_delivery(run, sink)?;
                 return Ok(None);
             }
         };
@@ -5575,6 +5952,7 @@ fn run_delivery_checks(
                 outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
                 reason: format!("affected check executor unavailable: {error:#}"),
             })?;
+            checkpoint_delivery(run, sink)?;
             return Ok(None);
         }
     };
@@ -5587,6 +5965,7 @@ fn run_delivery_checks(
                 control_baseline.difference(&current_control)
             ),
         })?;
+        checkpoint_delivery(run, sink)?;
         return Ok(None);
     }
     let content_after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
@@ -5596,6 +5975,7 @@ fn run_delivery_checks(
             reason: "project checks changed reviewable repository content; use a declared run_task output or make checks side-effect-free"
                 .to_string(),
         })?;
+        checkpoint_delivery(run, sink)?;
         return Ok(None);
     }
     let evidence = runtime.ledger().clone();
@@ -5610,6 +5990,7 @@ fn run_delivery_checks(
             stage,
             timestamp_ms: Some(now_millis()),
         });
+        checkpoint_delivery(run, sink)?;
         return Ok(None);
     }
 
@@ -5647,6 +6028,7 @@ fn run_delivery_checks(
         stage,
         timestamp_ms: Some(now_millis()),
     });
+    checkpoint_delivery(run, sink)?;
     Ok(Some(truncate_chars(&feedback, 12_000)))
 }
 
@@ -5866,6 +6248,7 @@ fn run_delivery_commit(
                 control_baseline.difference(&current_control)
             ),
         })?;
+        checkpoint_delivery(run, sink)?;
         return Ok(());
     }
     let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
@@ -5874,6 +6257,7 @@ fn run_delivery_commit(
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
             reason: "repository content changed after code review".to_string(),
         })?;
+        checkpoint_delivery(run, sink)?;
         return Ok(());
     }
     for check_id in &run.selected_checks {
@@ -5882,6 +6266,7 @@ fn run_delivery_commit(
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
                 reason: format!("check '{check_id}' is stale before commit"),
             })?;
+            checkpoint_delivery(run, sink)?;
             return Ok(());
         }
     }
@@ -5896,6 +6281,7 @@ fn run_delivery_commit(
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
                 reason: format!("managed commit failed: {error:#}"),
             })?;
+            checkpoint_delivery(run, sink)?;
             return Ok(());
         }
         Ok(ManagedCommitOutcome::Created(commit) | ManagedCommitOutcome::Reused(commit)) => commit,
@@ -5904,6 +6290,7 @@ fn run_delivery_commit(
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
                 reason,
             })?;
+            checkpoint_delivery(run, sink)?;
             return Ok(());
         }
         Ok(ManagedCommitOutcome::NoChange) => {
@@ -5912,6 +6299,7 @@ fn run_delivery_commit(
                 reason: "delta-bearing reviewed workflow had no task-owned change at commit"
                     .to_string(),
             })?;
+            checkpoint_delivery(run, sink)?;
             return Ok(());
         }
     };
@@ -5924,6 +6312,7 @@ fn run_delivery_commit(
         stage,
         timestamp_ms: Some(now_millis()),
     });
+    checkpoint_delivery(run, sink)?;
     Ok(())
 }
 
@@ -5958,7 +6347,7 @@ fn delivery_stage_context(
                 user_prompt: format!(
                     "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{handoff_note}{correction}",
                     run.task,
-                    run.repository.task_baseline.content.fingerprint,
+                    run.planning_content().fingerprint,
                 ),
             })
         }
@@ -5973,7 +6362,7 @@ fn delivery_stage_context(
                 user_prompt: format!(
                     "Task:\n{}\n\nExact proposed plan:\n{plan_json}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\n{handoff_note}{correction}",
                     run.task,
-                    run.repository.task_baseline.content.fingerprint,
+                    run.planning_content().fingerprint,
                 ),
             })
         }
@@ -6044,6 +6433,7 @@ fn workflow_outcome_for_termination(reason: TerminationReason) -> crate::workflo
             crate::workflow::WorkflowOutcome::ExecutorUnavailable
         }
         TerminationReason::CommitBlocked => crate::workflow::WorkflowOutcome::CommitBlocked,
+        TerminationReason::Cancelled => crate::workflow::WorkflowOutcome::Cancelled,
         _ => crate::workflow::WorkflowOutcome::EngineError,
     }
 }
@@ -6068,6 +6458,7 @@ fn delivery_terminal_outcome(
             TerminationReason::RepairExhausted
         }
         crate::workflow::WorkflowOutcome::CommitBlocked => TerminationReason::CommitBlocked,
+        crate::workflow::WorkflowOutcome::Cancelled => TerminationReason::Cancelled,
         _ if matches!(
             outcome,
             crate::workflow::WorkflowOutcome::Ready | crate::workflow::WorkflowOutcome::NoChange
@@ -6100,6 +6491,7 @@ fn delivery_terminal_outcome(
         checkpoint_sha256: checkpoint.sha256.clone(),
         timestamp_ms: Some(now_millis()),
     });
+    sink.checkpoint_workflow(&checkpoint)?;
     Ok(DeliveryRunOutcome {
         step: StepRunOutcome {
             reached_final,
@@ -6634,10 +7026,12 @@ fn generate_and_parse_action_with_retries(
         request.max_tokens = run_budget
             .borrow_mut()
             .reserve_model_invocation(max_tokens)?;
+        sink.workflow_model_invocation_started(nesting_depth)?;
         let completion = generator.generate(&request, messages, tools)?;
         run_budget
             .borrow_mut()
             .record_generated_tokens(completion.generated_tokens);
+        sink.workflow_generated_tokens(completion.generated_tokens)?;
         metrics.llm_invocations += 1;
         metrics.llm_runtime_ms = metrics
             .llm_runtime_ms
@@ -8509,28 +8903,7 @@ fn bound_workflow_command_output(output: String) -> String {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitControlState {
-    head: String,
-    index_sha256: String,
-    refs_sha256: String,
-}
-
-impl GitControlState {
-    fn difference(&self, current: &Self) -> String {
-        let mut changed = Vec::new();
-        if self.head != current.head {
-            changed.push("HEAD");
-        }
-        if self.index_sha256 != current.index_sha256 {
-            changed.push("index");
-        }
-        if self.refs_sha256 != current.refs_sha256 {
-            changed.push("refs");
-        }
-        changed.join(", ")
-    }
-}
+type GitControlState = crate::workflow::WorkflowGitControlState;
 
 fn git_control_state(workdir: &Path) -> Result<GitControlState> {
     let head = Command::new("git")
@@ -8549,7 +8922,9 @@ fn git_control_state(workdir: &Path) -> Result<GitControlState> {
         &[
             "for-each-ref",
             "--format=%(refname)%00%(objectname)%00",
-            "refs",
+            "refs/heads",
+            "refs/tags",
+            "refs/remotes",
         ],
     )?;
     Ok(GitControlState {
@@ -9094,6 +9469,7 @@ fn run_sub_agent(
         .and_then(Value::as_str)
         .context("sub_agent requires string argument: task")?;
     context.run_budget.borrow_mut().reserve_advisory_call()?;
+    sink.workflow_advisory_started()?;
     let max_steps = arguments
         .get("max_steps")
         .and_then(Value::as_u64)
@@ -11423,6 +11799,7 @@ mod tests {
             intent: None,
             workflow_policy: None,
             workflow_stage: None,
+            workflow_checkpoint: None,
             conversation_handoff: None,
             model: "model.gguf".to_string(),
             model_dir: None,
@@ -11953,6 +12330,32 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CapturingWorkflowSink {
+        events: Vec<AgentEvent>,
+        checkpoints: Vec<crate::workflow::WorkflowCheckpoint>,
+        cancel_requested: bool,
+    }
+
+    impl EventSink for CapturingWorkflowSink {
+        fn emit(&mut self, event: AgentEvent) {
+            self.events.push(event);
+        }
+
+        fn checkpoint_workflow(
+            &mut self,
+            checkpoint: &crate::workflow::WorkflowCheckpoint,
+        ) -> Result<()> {
+            checkpoint.validate()?;
+            self.checkpoints.push(checkpoint.clone());
+            Ok(())
+        }
+
+        fn should_cancel(&self) -> bool {
+            self.cancel_requested
+        }
+    }
+
     fn run_scripted_delivery_workflow(
         request: &AgentRequest,
         workspace: &Path,
@@ -12003,6 +12406,289 @@ mod tests {
             .fingerprint;
         std::fs::write(absolute, original).unwrap();
         fingerprint
+    }
+
+    #[test]
+    fn delivery_checkpoint_resumes_exact_stage_artifacts_and_global_budget() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let expected_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "resumed\n");
+        let graph = crate::workspace::WorkspaceGraph::legacy(&["test -s existing.txt".to_string()]);
+        let check_id = graph.checks.keys().next().unwrap().clone();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            vec![check_id],
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph = Some(graph);
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-durable-resume".to_string();
+        let mut first_generator = ScriptedCompletionEngine {
+            completions: VecDeque::from([
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+            ]),
+            generation_tool_counts: Vec::new(),
+            generation_max_tokens: Vec::new(),
+            generation_tool_names: Vec::new(),
+        };
+        let todo = RefCell::new(TodoMemory::default());
+        let mcp = McpToolRegistry::default();
+        let lsp = LspToolRegistry::default();
+        let policy = PolicyConfig::default();
+        let mut first_sink = CapturingWorkflowSink::default();
+        let paused = run_delivery_workflow(
+            &mut first_generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            &request,
+            repo.path(),
+            repo.path(),
+            None,
+            None,
+            &todo,
+            &mcp,
+            &lsp,
+            &policy,
+            None,
+            Some(crate::workflow::WorkflowStage::Implementing),
+            &mut first_sink,
+        )
+        .unwrap();
+        assert_eq!(
+            paused.checkpoint.run.stage,
+            crate::workflow::WorkflowStage::Implementing
+        );
+        assert_eq!(paused.checkpoint.run.counters.model_invocations, 2);
+        assert!(first_sink.checkpoints.iter().any(|checkpoint| {
+            checkpoint.run.counters.model_invocations == 1
+                && checkpoint.run.counters.generated_tokens == 0
+        }));
+        assert!(first_sink.checkpoints.iter().any(|checkpoint| {
+            checkpoint.run.counters.model_invocations == 1
+                && checkpoint.run.counters.generated_tokens == 1
+        }));
+        assert_eq!(first_sink.checkpoints.last().unwrap(), &paused.checkpoint);
+
+        request.workflow_checkpoint = Some(paused.checkpoint.clone());
+        let (completed, _, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "resumed\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &expected_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &expected_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            completed.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready)
+        );
+        assert_eq!(completed.checkpoint.run.id, paused.checkpoint.run.id);
+        assert_eq!(
+            completed.checkpoint.run.counters.model_invocations, 7,
+            "the resumed run must retain the two pre-restart invocations"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowResumed {
+                stage: crate::workflow::WorkflowStage::Implementing,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn delivery_cancellation_preserves_a_terminal_checkpoint_without_model_work() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-cancel-delivery".to_string();
+        let mut generator = ScriptedCompletionEngine {
+            completions: VecDeque::new(),
+            generation_tool_counts: Vec::new(),
+            generation_max_tokens: Vec::new(),
+            generation_tool_names: Vec::new(),
+        };
+        let todo = RefCell::new(TodoMemory::default());
+        let mcp = McpToolRegistry::default();
+        let lsp = LspToolRegistry::default();
+        let policy = PolicyConfig::default();
+        let mut sink = CapturingWorkflowSink {
+            cancel_requested: true,
+            ..CapturingWorkflowSink::default()
+        };
+
+        let outcome = run_delivery_workflow(
+            &mut generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            &request,
+            repo.path(),
+            repo.path(),
+            None,
+            None,
+            &todo,
+            &mcp,
+            &lsp,
+            &policy,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Cancelled)
+        );
+        assert_eq!(
+            outcome.step.termination_reason,
+            TerminationReason::Cancelled
+        );
+        assert!(generator.generation_tool_names.is_empty());
+        assert_eq!(sink.checkpoints.last().unwrap(), &outcome.checkpoint);
+    }
+
+    #[test]
+    fn committing_resume_reconciles_a_managed_commit_completed_after_checkpoint() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let expected_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "committed\n");
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-commit-reconciliation".to_string();
+        let mut generator = ScriptedCompletionEngine {
+            completions: VecDeque::from([
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "committed\n"}),
+                ),
+                text_completion(implementation_submission(
+                    &plan,
+                    &expected_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &expected_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ]),
+            generation_tool_counts: Vec::new(),
+            generation_max_tokens: Vec::new(),
+            generation_tool_names: Vec::new(),
+        };
+        let todo = RefCell::new(TodoMemory::default());
+        let mcp = McpToolRegistry::default();
+        let lsp = LspToolRegistry::default();
+        let policy = PolicyConfig::default();
+        let mut first_sink = CapturingWorkflowSink::default();
+        let paused = run_delivery_workflow(
+            &mut generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            &request,
+            repo.path(),
+            repo.path(),
+            None,
+            None,
+            &todo,
+            &mcp,
+            &lsp,
+            &policy,
+            None,
+            Some(crate::workflow::WorkflowStage::Committing),
+            &mut first_sink,
+        )
+        .unwrap();
+        assert_eq!(
+            paused.checkpoint.run.stage,
+            crate::workflow::WorkflowStage::Committing
+        );
+
+        let commit = managed_commit(
+            &paused.checkpoint.run.repository,
+            "feat: deliver requested behavior",
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(matches!(commit, ManagedCommitOutcome::Created(_)));
+
+        request.workflow_checkpoint = Some(paused.checkpoint);
+        let mut resumed_generator = ScriptedCompletionEngine {
+            completions: VecDeque::new(),
+            generation_tool_counts: Vec::new(),
+            generation_max_tokens: Vec::new(),
+            generation_tool_names: Vec::new(),
+        };
+        let mut resumed_sink = CapturingWorkflowSink::default();
+        let resumed = run_delivery_workflow(
+            &mut resumed_generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            &request,
+            repo.path(),
+            repo.path(),
+            None,
+            None,
+            &todo,
+            &mcp,
+            &lsp,
+            &policy,
+            None,
+            None,
+            &mut resumed_sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resumed.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready)
+        );
+        assert!(resumed_generator.generation_tool_names.is_empty());
+        assert!(resumed_sink.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CommitResult {
+                success: true,
+                reused: true,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -12158,6 +12844,96 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn implementation_replan_binds_the_new_plan_and_review_to_current_content() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let replanned_fingerprint =
+            fingerprint_with_file_content(repo.path(), "existing.txt", "replanned\n");
+        let first_plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let revised_plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-implementation-replan".to_string();
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&first_plan)),
+                text_completion(plan_review_submission(&first_plan)),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "existing.txt", "content": "replanned\n"}),
+                ),
+                tool_completion(
+                    "request_replan",
+                    json!({"reason": "The discovered architecture requires a revised plan"}),
+                ),
+                text_completion(plan_envelope_submission(&revised_plan)),
+                text_completion(plan_review_submission(&revised_plan)),
+                text_completion(implementation_submission(
+                    &revised_plan,
+                    &replanned_fingerprint,
+                    vec!["existing.txt"],
+                    false,
+                )),
+                tool_completion("read_file", json!({"path": "existing.txt"})),
+                text_completion(code_review_submission(
+                    &replanned_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{}\nevents: {events:#?}",
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("no blocked reason")
+        );
+        assert_eq!(
+            outcome
+                .checkpoint
+                .run
+                .planning_snapshot
+                .as_ref()
+                .unwrap()
+                .fingerprint,
+            replanned_fingerprint
+        );
+        assert!(generator.completions.is_empty());
+        let planning_starts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::WorkflowStageStarted {
+                        stage: crate::workflow::WorkflowStage::Planning,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(planning_starts, 2);
     }
 
     #[test]
@@ -15772,6 +16548,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            workflow_checkpoint: None,
             conversation_handoff: None,
             model: "model.gguf".to_string(),
             model_dir: None,
@@ -15842,6 +16619,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            workflow_checkpoint: None,
             conversation_handoff: None,
             model: "model.gguf".to_string(),
             model_dir: None,

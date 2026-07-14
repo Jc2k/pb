@@ -14,6 +14,64 @@ export type AgentEvent =
       timestamp_ms?: number;
     }
   | {
+      type: "workflow_started";
+      workflow_id: string;
+      source_turn_id: string;
+      policy_sha256: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_resumed";
+      workflow_id: string;
+      stage: WorkflowStage;
+      checkpoint_sha256: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_stage_started" | "workflow_stage_completed";
+      workflow_id: string;
+      stage: WorkflowStage;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_artifact_accepted";
+      workflow_id: string;
+      artifact_kind: string;
+      artifact_id: string;
+      sha256: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_challenge_raised";
+      workflow_id: string;
+      challenge_id: string;
+      severity: "p0" | "p1" | "p2" | "p3";
+      summary: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_evidence_invalidated";
+      workflow_id: string;
+      previous_fingerprint: string;
+      current_fingerprint: string;
+      reason: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_blocked";
+      workflow_id: string;
+      outcome: WorkflowOutcome;
+      reason: string;
+      timestamp_ms?: number;
+    }
+  | {
+      type: "workflow_completed";
+      workflow_id: string;
+      outcome: WorkflowOutcome;
+      checkpoint_sha256: string;
+      timestamp_ms?: number;
+    }
+  | {
       type: "started";
       task: string;
       model: string;
@@ -272,6 +330,44 @@ export interface EventEnvelope {
 
 export type SessionStatus = "queued" | "running" | "paused" | "completed" | "failed";
 export type TurnIntent = "discuss" | "deliver" | "auto";
+export type WorkflowStage =
+  | "planning"
+  | "plan_review"
+  | "plan_revision"
+  | "implementing"
+  | "checking"
+  | "code_review"
+  | "repairing"
+  | "committing"
+  | "ready"
+  | "failed"
+  | "blocked"
+  | "cancelled";
+export type WorkflowOutcome =
+  | "ready"
+  | "no_change"
+  | "plan_rejected"
+  | "plan_cycles_exhausted"
+  | "checks_failed"
+  | "review_failed"
+  | "repair_cycles_exhausted"
+  | "executor_unavailable"
+  | "commit_blocked"
+  | "step_limit"
+  | "invocation_limit"
+  | "token_limit"
+  | "engine_error"
+  | "cancelled";
+
+export interface WorkflowSummary {
+  id: string;
+  source_turn_id: string;
+  task: string;
+  stage: WorkflowStage;
+  outcome?: WorkflowOutcome;
+  policy_sha256: string;
+  commit_oid?: string;
+}
 
 export interface SessionItem {
   session_id: string;
@@ -287,6 +383,10 @@ export interface SessionItem {
   pending_question?: { question_id: string; question: string; choices?: string[] };
   updated_at_ms: number;
   metrics?: SessionMetricsSnapshot | null;
+  workflow_id?: string;
+  workflow_stage?: WorkflowStage;
+  workflow_outcome?: WorkflowOutcome;
+  strict_workflow?: boolean;
 }
 
 export interface SessionDetails {
@@ -304,6 +404,8 @@ export interface SessionDetails {
   events: EventEnvelope[];
   updated_at_ms: number;
   metrics?: SessionMetricsSnapshot | null;
+  workflow?: WorkflowSummary;
+  strict_workflow?: boolean;
 }
 
 export interface ProjectEntry {

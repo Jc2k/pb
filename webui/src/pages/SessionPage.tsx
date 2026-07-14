@@ -97,6 +97,14 @@ export function SessionPage() {
   const resumeSession = async () => {
     await fetch(`/api/sessions/${sessionId}/resume`, { method: "POST" });
     setSessionRunning(false);
+    await fetchSession();
+  };
+
+  const cancelSession = async () => {
+    await fetch(`/api/sessions/${sessionId}/cancel`, { method: "POST" });
+    setSessionRunning(false);
+    setIntent("discuss");
+    await fetchSession();
   };
 
   const shareSession = async () => {
@@ -215,7 +223,9 @@ export function SessionPage() {
             <div className="status-line">
               {isRunning && <span className="live-dot" />}
               <span>
-                {session.status === "running"
+                {session.strict_workflow && session.workflow
+                  ? workflowProgressLabel(session.workflow.stage, session.workflow.outcome)
+                  : session.status === "running"
                   ? "Running"
                   : session.status === "queued"
                     ? "Queued"
@@ -257,7 +267,8 @@ export function SessionPage() {
           </div>
           <button
             className="btn btn-danger rounded-pill"
-            onClick={() => window.location.reload()}
+            onClick={() => void cancelSession()}
+            disabled={!isRunning && session.status !== "paused"}
           >
             <i className="bi bi-stop-fill me-1"></i>Stop
           </button>
@@ -341,6 +352,14 @@ export function SessionPage() {
           </aside>
         </div>
 
+        {session.strict_workflow && session.workflow ? (
+          <div className="workflow-progress" role="status" aria-live="polite">
+            <i className="bi bi-diagram-3"></i>
+            <strong>{workflowStageLabel(session.workflow.stage)}</strong>
+            <span>{workflowOutcomeLabel(session.workflow.outcome)}</span>
+          </div>
+        ) : null}
+
         {deliveryProposal && !isRunning && session.status === "completed" && (
           <div className="delivery-proposal-card" role="status">
             <div>
@@ -404,11 +423,13 @@ export function SessionPage() {
               </>
             )}
           </form>
-        ) : session.status === "paused" ? (
+        ) : session.status === "paused" ||
+          (session.status === "failed" && session.workflow?.stage === "blocked") ? (
           <footer className="composer paused-composer">
             <div className="paused-composer-copy small text-body-secondary">
-              This session was restored after a daemon restart and is paused
-              until you resume it.
+              {session.workflow?.stage === "blocked"
+                ? "Delivery needs help. Resolve the reported prerequisite, then resume from the preserved stage."
+                : "This session was restored after a daemon restart and is paused until you resume it."}
             </div>
             <button
               className="btn btn-warning composer-action"
@@ -450,6 +471,42 @@ export interface PendingDeliveryProposal {
   proposal_id: string;
   source_turn_id: string;
   task_summary: string;
+}
+
+export function workflowStageLabel(stage: string): string {
+  switch (stage) {
+    case "planning": return "Planning";
+    case "plan_review": return "Challenging the plan";
+    case "plan_revision": return "Revising the plan";
+    case "implementing": return "Implementing";
+    case "checking": return "Running checks";
+    case "code_review": return "Challenging the code";
+    case "repairing": return "Repairing";
+    case "committing": return "Creating reviewed commit";
+    case "ready": return "Ready";
+    case "blocked": return "Needs help";
+    case "cancelled": return "Cancelled";
+    default: return "Stopped";
+  }
+}
+
+export function workflowOutcomeLabel(outcome?: string): string {
+  switch (outcome) {
+    case "ready": return "Ready";
+    case "no_change": return "No code changes";
+    case "checks_failed":
+    case "review_failed":
+    case "repair_cycles_exhausted": return "Needs another pass";
+    case "executor_unavailable":
+    case "commit_blocked": return "Needs help";
+    case "cancelled": return "Cancelled — work preserved";
+    case undefined: return "Strict delivery in progress";
+    default: return "Stopped safely";
+  }
+}
+
+export function workflowProgressLabel(stage: string, outcome?: string): string {
+  return outcome ? workflowOutcomeLabel(outcome) : workflowStageLabel(stage);
 }
 
 export function latestPendingDeliveryProposal(

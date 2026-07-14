@@ -922,6 +922,7 @@ async fn run_serve() -> Result<()> {
         intent: Some(crate::workflow::TurnIntent::Discuss),
         workflow_policy: None,
         workflow_stage: None,
+        workflow_checkpoint: None,
         conversation_handoff: None,
         model: user_config.effective_model(),
         model_dir: user_config.effective_model_dir(),

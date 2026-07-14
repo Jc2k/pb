@@ -29,6 +29,9 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::WorkflowStarted { workflow_id, .. } => {
             print_header("workflow", &format!("{workflow_id} started"));
         }
+        AgentEvent::WorkflowResumed { stage, .. } => {
+            print_header("workflow", &format!("resumed at {stage:?}"));
+        }
         AgentEvent::WorkflowStageStarted { stage, .. } => {
             print_header("workflow stage", &format!("{stage:?}"));
         }
